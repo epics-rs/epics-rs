@@ -306,11 +306,12 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - C: `processFactory.cc:227-242` (`readFromFd` sets `_markedForDeletion` on EOF/err) → `~processClass` SIGKILLs the group
 - Impact: When the child closes its controlling tty but keeps running, C marks it dead → destructor SIGKILLs the group, ending the child. Rust's reader task just stops while the reaper blocks on `waitpid`; the child is neither killed nor reported and output forwarding silently stops. Edge case (child detaching its tty while alive).
 
-#### PS-34 Listen backlog differs (C=5, Rust=tokio default ~1024)
+#### PS-34 Listen backlog differs (C=5, Rust=tokio default ~1024) — CLEARED (intentional divergence, doc-only)
 - Severity: NOTE
 - Rust: `src/procserv/listener.rs:30/:70` (mio default backlog 1024)
 - C: `acceptFactory.cc:216,363` (`listen(_fd, 5)`)
 - Impact: Under a connection burst, C refuses past the 6th queued connection; Rust queues ~1024. Observable only as different refusal thresholds; no data divergence.
+- Disposition: kept at 1024 (a named `LISTEN_BACKLOG` const, listener.rs:17-21, with the C-citation + rationale already in source). C's `listen(fd, 5)` is a historically tiny limit; queuing a burst rather than refusing past the 6th pending connection is strictly more tolerant and never loses data — declining C's small backlog, not bug-copying it down to 5. No code change. (Steering: find divergences, don't copy C's limitations.)
 
 #### PS-35 Accept-error handling: C rebuilds the listen socket, Rust retries with no backoff
 - Severity: NOTE (Rust correctly declines a C misbehavior, but adds a busy-loop risk)

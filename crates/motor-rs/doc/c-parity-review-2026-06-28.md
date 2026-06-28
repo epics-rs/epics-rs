@@ -46,8 +46,10 @@ SET_ENC_RATIO is a real controller-config command but no in-repo controller
 consumes it; hook spec recorded in the finding for when a driver needs it).
 **Rejected (1):** R42 (empirically falsified — the MIP_EXTERNAL detector fires
 during init via the default `dmov=true`, so the boot-mid-motion axis closes the
-loop; no defect). **Remaining open (0):** all 22 findings cleared,
-dispositioned, or rejected — converged.
+loop; no defect). **Remaining open (1):** R65 (idle DIFF/RDIF over-post — a new
+finding surfaced by the 01KW5QV confirming round on R61; design under review, see
+below). The original 22 audit findings are all cleared, dispositioned, or
+rejected; R65 is downstream of the R61 always-on poller.
 
 ---
 
@@ -517,6 +519,66 @@ routes into `plan_absolute_move`. No defect.
   attempt to resume toward it. Distinct trigger from R1 (commanded Pause vs positional
   auto-completion); fixing it changes Pause-at-limit from resumable to terminal, so it needs the
   review round to confirm reachability before any edit. Found during the R1 defect-family sweep.
+
+#### R65 — Idle poll re-processes a stationary axis every period, re-posting DIFF/RDIF; C posts nothing
+- **Severity:** CONCERN (monitor-semantics + CPU divergence; not a wrong-value bug). Surfaced by the
+  `01KW5QV` confirming round on R61 (the always-on idle poller). Downstream of R61: once the idle
+  poller never stops, the unconditional notify path turns "poller alive" into "record processed
+  every period".
+- **Rust:** `poll_loop.rs` `poll_and_notify` (pre-fix) bumped `status_seq` and pulsed `io_intr`
+  on **every** poll, including an autonomous idle poll of a settled axis whose status did not
+  change. `status_update.rs:234` marks `diff_rdif_marked=true` unconditionally on each status
+  update, so every idle period drives a full record process that re-posts DIFF/RDIF (and runs the
+  whole `do_work` chain) on a stationary axis.
+- **C:** `asynMotorAxis::callParamCallbacks` (asynMotorAxis.cpp:316-322) fires the generic-pointer
+  status callback — which routes through devMotorAsyn `statusCallback` → `dbProcess` → record
+  process — **only when `statusChanged_` is set**. `statusChanged_` is set only when a status field
+  actually changed (`setIntegerParam`:261 `if(status!=status_.status)`; `setDoubleParam`:282/287/292
+  for position/encoderPosition/velocity). On an unchanged idle poll C posts nothing and never
+  processes the record. The forced path is separate: `motorUpdateStatus_` (asynMotorController.cpp:
+  217-222, what STUP/GET_INFO triggers) runs `poll(); pAxis->poll(); pAxis->statusChanged_=1;` —
+  forcing a callback regardless of value change, so STUP=BUSY clears even on a stationary axis.
+- **Divergence:** Rust re-processes + re-posts every idle period on a settled axis; C is silent
+  until a real field change or a forced refresh. Extra CPU + monitor traffic proportional to
+  `idle_poll_interval` (default 1 s) for every idle motor in the IOC.
+- **Candidate fix (WIP, uncommitted at the time of this entry — under review, do NOT treat as
+  blessed):** add change-detection to `poll_and_notify`: an autonomous poll (`force=false`) bumps
+  the seq / pulses `io_intr` only when the freshly polled `MotorStatus` differs from the last one
+  delivered (C `statusChanged_` gate); a forced poll (`force=true`) always notifies (C
+  `motorUpdateStatus_`). Forcing is reached via a new `PollDirective::Refresh` for
+  `request_poll` / `status_refresh` (STUP, implicit GET_INFO, settle-resume, startup), which
+  `device_support` always re-sends as `StartPolling` (no `polling_active` dedup, unlike `Start`).
+  Requires `MotorStatus: PartialEq` (asyn-rs, cross-crate).
+- **Why a naïve value-gate is INSUFFICIENT — the held-jog interaction (the crux for the round):**
+  STUP=BUSY clears only on a fresh seq (`status_update.rs:55-58`, inside `if let Some(stamped)`),
+  so the forced path above is mandatory or STUP strands. Separately, the close-enough completion
+  branch (`state_machine.rs:688-709`) finalizes a positional move **without** setting `request_poll`
+  and **without** re-firing a held jog same-pass (unlike the give-up branch at `:637-653`, which
+  calls `dispatch_latent_collection` same-pass). The Rust test
+  `close_enough_defers_held_jog_to_next_idle_poll` (tests/scenarios.rs:1613) asserts the held jog
+  resumes on the **next process pass** — which production currently guarantees only because the
+  idle poll pulses `io_intr` unconditionally. A blanket change-gate suppresses that unchanged idle
+  poll on a now-stationary axis → the held jog would never resume. The test masks this by calling
+  `check_completion()` directly twice, bypassing the poll loop.
+- **C ground truth on the held jog (established in this round's prep):** C **strands** this held
+  jog. `special()` arms `MIP_JOG_REQ` from JOGF only at `mip==MIP_DONE` (motorRecord.cc:3045); an
+  operator pressing JOGF *during* a positional move (`mip != MIP_DONE`) never arms it, and it is
+  never re-armed afterward (no new `dbPutField`). The jog-fire section requires `MIP_JOG_REQ`
+  (motorRecord.cc:2081-2082), and the steady-SPMG re-arm at `:1916` is gated on
+  `spmg != lspg || stop` (`:1854`) so it does not run on a steady-Go close-enough completion. So C
+  never auto-resumes a jog held across a positional completion. The Rust resume is therefore a
+  **divergence-toward-better**, not a C behavior — which makes "should the change-gate preserve it?"
+  a genuine semantic fork for the round (per "don't copy C's bugs"), not a clear regression.
+- **Structural direction to validate in the round:** if the resume is to be preserved, the
+  close-enough deferral (and every sibling "resume on the next idle poll" deferral site) must route
+  its follow-up through an explicit `request_poll`/`Refresh` rather than relying on an autonomous
+  unchanged idle poll. Defect-family anchor for that audit: `rg 'request_poll'` in
+  `record/` cross-referenced against every `finalize_motion` call site that leaves a held
+  button/jog/queued-motion pending without same-pass dispatch.
+- **Impact:** stationary axes do redundant work and emit redundant DIFF/RDIF monitors every idle
+  period; the fix must not regress STUP clearing or the held-jog resume. Needs the review round to
+  (1) validate the change-gate against C `statusChanged_`, (2) rule on preserve-vs-match-C for the
+  held jog, (3) enumerate the full deferral family before any edit.
 
 ---
 

@@ -339,3 +339,68 @@ Wire/observable path is faithful for the common case (numeric/text payloads,
 QoS/retain/keepAlive, topic grammar, JSON field search, digital mask, NUL
 truncation). The defects cluster in connection-state gating (MQ1), the
 record-processing model (MQ46), and accept/reject + byte-encoding boundaries.
+
+---
+
+## Fix log — round 1 (2026-06-28)
+
+Cleared (one commit per finding, mqtt-rs-local, C-right):
+
+- **MQ46 — CLEARED** `6010b1e4` — `PortFlags.can_block` → `false`
+  (`drvMqtt.cpp:122` `setBlocking(false)`); the write path is non-blocking.
+- **MQ17 — CLEARED** `3eb95863` — `parse_format_type` matches FORMAT:TYPE
+  case-sensitively (drop `to_ascii_uppercase`), rejecting lowercase like C and
+  removing the canonicalisation-vs-lookup inconsistency. Test
+  `parse_case_insensitive` flipped to `parse_rejects_lowercase_format_type`.
+- **MQ41 — CLEARED** `f0e44ea9` — scalar-float NaN encodes as lowercase `"nan"`
+  to match glibc `%f` (`drvMqtt.cpp:651`); ±inf already matched.
+- **MQ34 — CLEARED** `fb96dbbd` — DIGITAL decode rejects a leading `+`
+  (`isInteger(val, isSigned=false)`, `drvMqtt.cpp:294`). Regression test added.
+- **MQ1 — CLEARED** `53a35a11` — `Arc<AtomicBool>` connection gate: the event
+  loop is the single writer (`mark_connected` ⇒ up, poll-error arm ⇒ down), the
+  driver `publish_value` returns `MqttError::NotConnected` (→ asynError) while
+  down instead of buffering on the unbounded channel. Regression test added.
+
+Intentional-divergence asides — **kept** (Rust declines a C bug / is more robust;
+no fix):
+
+- **MQ35** — Rust rejects an out-of-`u32` DIGITAL value where C wraps via
+  `stoul`→cast (silent truncation UB). Keep.
+- **MQ37** — Rust rejects C99 hex-float / `nan(seq)` float syntax that no broker
+  emits. Keep.
+- **MQ31** — Rust trims a trailing separator/newline (handles line-buffered
+  `\n`); C rejects. Rust more robust. Keep.
+- **MQ33** — Rust strips unbalanced brackets where C rejects. Rust more lenient.
+  Keep.
+- **MQ16** — Rust accepts any-Unicode-whitespace JSON separator; C only ASCII
+  space. Rust more permissive. Keep.
+- **MQ18** quoted-topic extension (spaces-in-JSON-topic) — kept; the residual
+  `"`-leading-topic divergence is documented.
+
+NOTE — low-priority documented divergences (no fix this round): MQ3, MQ4, MQ5,
+MQ36, MQ48, MQ49.
+
+**Deferred — fixable, batch 2:**
+
+- **MQ40** — JSON composite carrier serialized in doc order vs C sorted-key
+  `dump()` (STRING-topic only); needs a recursive sorted re-serialize. Niche.
+- **MQ32** — array double-space (`"1  2"`) rejected where C accepts; fix is to
+  collapse empty split elements, but must avoid turning an empty payload into
+  `[]` — needs the C empty-payload behaviour checked first.
+
+**Structural / framework — asyn-rs contract change, design sign-off (the SAME
+asyn-rs gap as modbus R34/R52/R54):**
+
+- **MQ2 (=MQ50)** — subscribe/dispatch only to I/O-Intr interrupt variables
+  (needs asyn-rs interrupt-variable tracking + `setAutoInterrupts(false)` model).
+- **MQ47** — on-demand param creation from a record's resolved `INP/OUT`
+  (`drv_user_create(&self)` cannot create params; C autoparam does).
+- **MQ38 / MQ39** — full octet byte-fidelity (inbound store + outbound publish of
+  non-UTF-8 bytes); the cache side is blocked because `ParamSetValue::Octet` is a
+  `String`, not `Vec<u8>`. Local mitigations exist (inbound `from_utf8_lossy`
+  instead of whole-message drop; outbound raw bytes on the wire for FLAT octet),
+  but byte-identical parity needs the framework `Octet=Vec<u8>` change.
+
+**Verification-blocked — Autoparam source absent under `/Users/stevek/codes`:**
+MQ51 (write-side cache-update parity), MQ19 (whether autoparam trims
+`arguments`). Need the autoparam module path to resolve.

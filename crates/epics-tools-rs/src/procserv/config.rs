@@ -54,7 +54,9 @@ pub struct KeyBindings {
     pub toggle_restart: Option<u8>,
     /// Restart child once after manual kill (default `Ctrl-R` = `0x12`).
     pub restart: Option<u8>,
-    /// Shut down procserv entirely (default disabled in C).
+    /// Shut down procserv entirely. C `quitChar` = `^Q` (`0x11`),
+    /// always enabled and never exposed on the CLI (procServ.cc:69);
+    /// it fires only while the child is shut down.
     pub quit: Option<u8>,
     /// Disconnect this client only (default `Ctrl-]` = `0x1d`).
     pub logout: Option<u8>,

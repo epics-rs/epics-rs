@@ -227,7 +227,11 @@ mod app {
                 kill: nz(args.kill_char),
                 toggle_restart: nz(args.toggle_restart_char),
                 restart: Some(0x12), // Ctrl-R when child dead
-                quit: None,
+                // C `quitChar` = ^Q (0x11), hardwired and never exposed
+                // on the CLI (procServ.cc:69; absent from long_options).
+                // Fires only while the child is shut down
+                // (clientFactory.cc:214-217); the menu scan gates it.
+                quit: Some(0x11),
                 logout: nz(args.logout_char),
             },
             child,
@@ -336,6 +340,16 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.restart.max_restarts, u32::MAX);
+        }
+
+        /// C hardwires the quit key to `^Q` (`0x11`) and never exposes it
+        /// on the CLI (procServ.cc:69; absent from `long_options`); the
+        /// port must default it enabled, not `None`.
+        #[test]
+        fn quit_key_defaults_to_ctrl_q() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.keys.quit, Some(0x11));
         }
 
         /// Opting in caps the count at the requested value.

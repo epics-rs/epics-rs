@@ -32,16 +32,19 @@ struct Args {
     #[arg(short = 'D')]
     describe: bool,
 
-    /// Verbose: print the effective PVA client configuration before
-    /// the type output. pvxs `tools/info.cpp:76-79` implements `-v` as
-    /// `Effective config` + the client context configuration.
+    /// Verbose: print the effective PVA client configuration before the
+    /// type output, then the server's peer credentials before each PV.
+    /// pvxs-TLS `tools/info.cpp:76-79` prints the `Effective config` under
+    /// `-v`, and `:88-90` prints the `# <PeerCredentials>` line under the
+    /// same `-v`, so verbose couples both.
     #[arg(short = 'v')]
     verbose: bool,
 
     /// Print the server's peer credentials (TLS X.509 identity, or the
-    /// anonymous account on a plain TCP connection) before each PV's
-    /// type. Rust-specific diagnostic — pvxs `pvxinfo` has no such
-    /// flag; `-v` there is effective-config output, not credentials.
+    /// anonymous account on a plain TCP connection) before each PV's type,
+    /// without `-v`'s effective-config dump. pvxs-TLS couples credentials
+    /// to `-v` (`info.cpp:88-90`); this Rust-only flag is the creds-only
+    /// opt-in, and `-v` is a superset of it.
     #[arg(long = "show-credentials")]
     show_credentials: bool,
 
@@ -50,6 +53,14 @@ struct Args {
     /// Level::Debug)` (`tools/info.cpp:47-66`).
     #[arg(short = 'd')]
     debug: bool,
+}
+
+/// Whether to print the server's peer-credentials (`# <cred>`) line.
+/// pvxs-TLS gates it on verbose `-v` (`tools/info.cpp:88-90`); the Rust
+/// port additionally honours the creds-only `--show-credentials` opt-in,
+/// so `-v` is a superset.
+fn show_credentials_for(verbose: bool, show_credentials: bool) -> bool {
+    verbose || show_credentials
 }
 
 /// Build the host-troubleshooting report `-D` prints, the Rust analogue
@@ -189,14 +200,13 @@ async fn main() {
             let pv_name = &args.pv_names[idx];
             match result {
                 Ok((desc, server_addr, cred)) => {
-                    // Under `--show-credentials`, print the server's peer
-                    // identity line first. pvxs
-                    // `operator<<(PeerCredentials)` formats as
-                    // `TLS method:authority/account@peer`; the `TLS`
-                    // prefix and `authority` segment are omitted when not
-                    // applicable. (pvxs reserves `-v` for effective config,
-                    // so this Rust diagnostic gets its own flag.)
-                    if args.show_credentials {
+                    // Under `-v` or `--show-credentials`, print the server's
+                    // peer identity line first. pvxs-TLS prints this under
+                    // verbose `-v` (info.cpp:88-90) via
+                    // `operator<<(PeerCredentials)`, formatted as
+                    // `TLS method:authority/account@peer`; the `TLS` prefix
+                    // and `authority` segment are omitted when not applicable.
+                    if show_credentials_for(args.verbose, args.show_credentials) {
                         match &cred {
                             Some(c) => {
                                 let authority = if c.authority.is_empty() {
@@ -259,20 +269,36 @@ mod tests {
         );
     }
 
-    /// `-v` is effective-config output (pvxs `pvxinfo -v`), and must
-    /// NOT pull in the credential diagnostic — that lives behind
-    /// `--show-credentials`. The two flags are independent.
+    /// pvxs-TLS prints the peer-credentials line under verbose `-v`
+    /// (`tools/info.cpp:88-90`); the Rust port keeps a creds-only
+    /// `--show-credentials` opt-in too. The flags parse independently
+    /// (neither sets the other's field), and either one drives the
+    /// credential line via `show_credentials_for` — with `-v` a superset.
     #[test]
-    fn verbose_and_credentials_are_independent_flags() {
+    fn verbose_drives_credentials_and_flags_parse_independently() {
         let v = Args::parse_from(["pvinfo-rs", "-v", "PV"]);
         assert!(v.verbose, "-v sets verbose (effective config)");
-        assert!(!v.show_credentials, "-v must not imply credential output");
+        assert!(
+            !v.show_credentials,
+            "-v does not set the show_credentials field"
+        );
+        assert!(
+            show_credentials_for(v.verbose, v.show_credentials),
+            "-v drives the credential line (pvxs-TLS info.cpp:88-90)"
+        );
 
         let c = Args::parse_from(["pvinfo-rs", "--show-credentials", "PV"]);
         assert!(c.show_credentials, "--show-credentials sets the flag");
         assert!(
             !c.verbose,
-            "--show-credentials must not imply effective config"
+            "--show-credentials does not set verbose (no effective-config dump)"
+        );
+        assert!(show_credentials_for(c.verbose, c.show_credentials));
+
+        let neither = Args::parse_from(["pvinfo-rs", "PV"]);
+        assert!(
+            !show_credentials_for(neither.verbose, neither.show_credentials),
+            "no flag -> no credential line"
         );
 
         let both = Args::parse_from(["pvinfo-rs", "-v", "--show-credentials", "PV"]);

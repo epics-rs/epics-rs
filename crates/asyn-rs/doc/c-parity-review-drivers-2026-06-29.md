@@ -196,4 +196,11 @@ contracts / behavioral models, not just a driver site.
   the new command (cross-transaction stale-data leak; SyncIO/streamDevice were
   shielded by their flush-before-read, raw asynOctet consumers were not). Test:
   `write_discards_staged_read_carry`.
+- **DRV-51** (LOW, prologix connect doesn't clear read_carry) — CLEARED. Sibling
+  of DRV-48 in the F6 invariant. `connect` reset the address cache
+  (last_primary/last_secondary) but not `read_carry`; C `prologixConnect` also
+  resets `bufCount=0`. A reconnect driven without an intervening `disconnect`
+  (e.g. the inner ip_port auto-disconnected on a read error, then reconnect)
+  would leak the dead session's tail into the first read. Routed through the
+  same `clear_read_carry()` owner. Test: `connect_discards_staged_read_carry`.
 

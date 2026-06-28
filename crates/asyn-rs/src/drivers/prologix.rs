@@ -288,6 +288,12 @@ impl PortDriver for DrvAsynPrologixPort {
             s.last_primary = -1;
             s.last_secondary = -1;
         }
+        // C parity: prologixConnect also resets bufCount=0 — a fresh session
+        // must not serve a previous connection's staged reply tail (the F6
+        // staged-read-discard invariant). disconnect clears it, but a
+        // reconnect driven without an intervening disconnect (e.g. the inner
+        // ip_port auto-disconnected on a read error) would otherwise leak it.
+        self.clear_read_carry();
         // Port-level connect: address < 0 in C asyn. For per-device
         // connect (address >= 0) C asyn does nothing protocol-side
         // beyond announcing the exception, since GPIB devices live
@@ -645,6 +651,27 @@ mod tests {
         assert!(
             drv.state.lock().unwrap().read_carry.is_empty(),
             "DRV-48: write_octet must clear the staged read_carry"
+        );
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
+    #[test]
+    fn connect_discards_staged_read_carry() {
+        // DRV-51: a fresh session (connect) must discard a prior
+        // connection's staged reply tail (C prologixConnect resets
+        // bufCount=0), so a reconnect without an intervening disconnect does
+        // not leak stale bytes into the first read.
+        let (port, _rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+
+        // Stale tail from a hypothetical prior session.
+        drv.state.lock().unwrap().read_carry = b"OLD_SESSION_TAIL".to_vec();
+
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        assert!(
+            drv.state.lock().unwrap().read_carry.is_empty(),
+            "DRV-51: connect must clear the staged read_carry"
         );
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }

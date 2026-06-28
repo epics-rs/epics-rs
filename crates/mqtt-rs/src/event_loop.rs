@@ -153,8 +153,9 @@ async fn publish_task(
             retained,
         } = req;
         let qos: rumqttc::v5::mqttbytes::QoS = qos.into();
-        // v5 publish wants `P: Into<Bytes>`; the owned `String` payload
-        // satisfies it directly (no borrow held across the await).
+        // v5 publish wants `P: Into<Bytes>`; the owned `Vec<u8>` payload
+        // satisfies it directly (no borrow held across the await), carrying raw
+        // non-UTF-8 octet bytes through unchanged.
         if let Err(e) = client.publish(&topic, qos, retained, payload).await {
             tracing::warn!("MQTT publish to '{topic}' failed: {e}");
         }

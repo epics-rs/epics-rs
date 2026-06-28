@@ -38,6 +38,18 @@ pub fn octet_cstr(s: &str) -> &str {
     }
 }
 
+/// Byte-level twin of [`octet_cstr`]: the prefix of `data` up to the first NUL
+/// byte. C's outbound `stringWrite` publishes `std::string(stringData.data())`
+/// (drvMqtt.cpp:716), built from a `char*`, i.e. the raw bytes up to the first
+/// NUL with no UTF-8 re-encoding. Returns the slice so a non-UTF-8 octet write
+/// reaches the wire byte-for-byte.
+pub fn octet_bytes_cstr(data: &[u8]) -> &[u8] {
+    match data.iter().position(|&b| b == 0) {
+        Some(i) => &data[..i],
+        None => data,
+    }
+}
+
 /// Encode a value for publishing according to the topic address format.
 ///
 /// If `addr.normalize_on_off` is true, string values are normalized

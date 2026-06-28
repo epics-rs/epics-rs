@@ -8,16 +8,22 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 use tokio::sync::mpsc;
 
-use crate::address::TopicAddress;
+use crate::address::{PayloadFormat, TopicAddress};
 use crate::config::{MqttConfig, QoS};
 use crate::error::MqttError;
-use crate::payload::{DecodedValue, encode_payload, octet_cstr};
+use crate::payload::{DecodedValue, encode_payload, octet_bytes_cstr};
 
 /// Request to publish a message to the MQTT broker.
+///
+/// `payload` is raw bytes, not a `String`: a FLAT octet write must carry the
+/// raw octet bytes (up to the first NUL) on the wire, which need not be valid
+/// UTF-8 (C `stringWrite` publishes `std::string(stringData.data())`,
+/// drvMqtt.cpp:714-716). Text encodings (`encode_payload`) become bytes via
+/// `into_bytes()`.
 #[derive(Debug, Clone)]
 pub struct PublishRequest {
     pub topic: String,
-    pub payload: String,
+    pub payload: Vec<u8>,
     pub qos: QoS,
     pub retained: bool,
 }
@@ -145,26 +151,27 @@ impl MqttDriver {
         }
     }
 
-    /// Encode and publish a value for the given parameter reason.
-    /// Uses FLAT or JSON encoding depending on the topic address format.
-    fn publish_value(&self, reason: usize, value: &DecodedValue) -> AsynResult<()> {
+    /// Gate, resolve the topic for `reason`, and enqueue a publish with the
+    /// already-encoded `payload` bytes. Single owner of the connection gate and
+    /// the channel send for every write handler.
+    fn publish_bytes(&self, reason: usize, payload: Vec<u8>) -> AsynResult<()> {
         // Gate before touching the unbounded publish channel. The five
         // commit-after-publish handlers reach the gate here first; the digital
         // handler (which commits its cache before publishing) gates explicitly
         // at its top.
         self.ensure_connected()?;
 
-        let addr = self
+        let topic = self
             .reason_to_addr
             .get(reason)
             .and_then(|a| a.as_ref())
-            .ok_or_else(|| AsynError::ParamNotFound(format!("reason {reason}")))?;
-
-        let payload = encode_payload(value, addr);
+            .ok_or_else(|| AsynError::ParamNotFound(format!("reason {reason}")))?
+            .topic
+            .clone();
 
         self.publish_tx
             .send(PublishRequest {
-                topic: addr.topic.clone(),
+                topic,
                 payload,
                 qos: self.default_qos,
                 retained: false,
@@ -172,6 +179,20 @@ impl MqttDriver {
             .map_err(|_| MqttError::PublishChannelClosed)?;
 
         Ok(())
+    }
+
+    /// Encode and publish a value for the given parameter reason.
+    /// Uses FLAT or JSON encoding depending on the topic address format.
+    fn publish_value(&self, reason: usize, value: &DecodedValue) -> AsynResult<()> {
+        let addr = self
+            .reason_to_addr
+            .get(reason)
+            .and_then(|a| a.as_ref())
+            .ok_or_else(|| AsynError::ParamNotFound(format!("reason {reason}")))?;
+        // encode_payload is pure (no observable side effect), so resolving the
+        // addr and encoding before the gate inside publish_bytes is safe.
+        let payload = encode_payload(value, addr).into_bytes();
+        self.publish_bytes(reason, payload)
     }
 }
 
@@ -212,13 +233,40 @@ impl PortDriver for MqttDriver {
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         // asyn octet values are NUL-terminated C-strings: C stringWrite publishes
-        // std::string(stringData.data()), terminating the payload at the first NUL
-        // (drvMqtt.cpp:716). Truncate at the first NUL so the published payload
-        // (and the cached value, which holds the same octet) matches.
-        let full = String::from_utf8_lossy(data).into_owned();
-        let s = octet_cstr(&full).to_string();
-        self.publish_value(user.reason, &DecodedValue::String(s.clone()))?;
-        self.base.params.set_string(user.reason, user.addr, s)?;
+        // std::string(stringData.data()), terminating the payload at the first
+        // NUL (drvMqtt.cpp:714-716). Take the raw bytes up to that NUL.
+        let raw = octet_bytes_cstr(data);
+        // Copy the format (Copy enum) so the immutable reason_to_addr borrow is
+        // dropped before the mutable cache store below.
+        let format = self
+            .reason_to_addr
+            .get(user.reason)
+            .and_then(|a| a.as_ref())
+            .ok_or_else(|| AsynError::ParamNotFound(format!("reason {}", user.reason)))?
+            .format;
+        match format {
+            // FLAT publishes the raw octet bytes verbatim — they need not be
+            // valid UTF-8, and C does no re-encoding. Earlier the path forced
+            // them through String::from_utf8_lossy, corrupting a binary /
+            // waveform-CHAR write to U+FFFD on the wire (MQ39).
+            PayloadFormat::Flat => self.publish_bytes(user.reason, raw.to_vec())?,
+            // JSON octet write is unimplemented in C (stringWrite throws
+            // logic_error, drvMqtt.cpp:720-722) and a JSON string value must be
+            // UTF-8 anyway, so this path keeps the String encoding.
+            PayloadFormat::Json => {
+                let s = String::from_utf8_lossy(raw).into_owned();
+                self.publish_value(user.reason, &DecodedValue::String(s))?;
+            }
+        }
+        // The asyn param library cache is String-bound (ParamSetValue::Octet is
+        // a String), so the readback stores the lossy view truncated at the
+        // first NUL (C setStringParam(val.c_str()), drvMqtt.cpp:299). Byte
+        // fidelity of the *cache* is the MQ38 framework residual; this fixes
+        // only the *wire* bytes.
+        let cached = String::from_utf8_lossy(raw).into_owned();
+        self.base
+            .params
+            .set_string(user.reason, user.addr, cached)?;
         self.base.call_param_callbacks(user.addr)
     }
 
@@ -339,7 +387,7 @@ mod tests {
         // Once the event loop marks the session up, the same write publishes.
         connected.store(true, Ordering::Release);
         driver.write_int32(&mut user, 42).unwrap();
-        assert_eq!(rx.try_recv().unwrap().payload, "42");
+        assert_eq!(rx.try_recv().unwrap().payload, b"42");
     }
 
     /// The digital handler commits its param cache before publishing, so the
@@ -393,7 +441,7 @@ mod tests {
         driver
             .write_uint32_digital(&mut user, 0x00f0, 0xFFFF_FFFF)
             .unwrap();
-        assert_eq!(rx.try_recv().unwrap().payload, "240");
+        assert_eq!(rx.try_recv().unwrap().payload, b"240");
     }
 
     #[test]
@@ -446,7 +494,7 @@ mod tests {
 
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/int_topic");
-        assert_eq!(req.payload, "42");
+        assert_eq!(req.payload, b"42");
     }
 
     #[test]
@@ -462,7 +510,7 @@ mod tests {
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/float_topic");
         // C `std::to_string(double)` = "%f", fixed 6 decimals (drvMqtt.cpp:651).
-        assert_eq!(req.payload, "3.150000");
+        assert_eq!(req.payload, b"3.150000");
     }
 
     #[test]
@@ -477,7 +525,7 @@ mod tests {
 
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/str_topic");
-        assert_eq!(req.payload, "hello");
+        assert_eq!(req.payload, b"hello");
     }
 
     /// C parity: stringWrite publishes std::string(stringData.data()), which
@@ -495,7 +543,28 @@ mod tests {
 
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/str_topic");
-        assert_eq!(req.payload, "hi");
+        assert_eq!(req.payload, b"hi");
+    }
+
+    /// MQ39: a non-UTF-8 FLAT octet write reaches the wire byte-for-byte. C
+    /// publishes std::string(stringData.data()) — raw bytes up to the first NUL
+    /// with no re-encoding (drvMqtt.cpp:714-716). The old from_utf8_lossy path
+    /// turned each invalid byte into U+FFFD (0xEF 0xBF 0xBD), corrupting a
+    /// binary / waveform-CHAR payload.
+    #[test]
+    fn write_octet_flat_publishes_raw_non_utf8_bytes() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/bin"]);
+        let reason = driver.drv_user_create("FLAT:STRING test/bin").unwrap();
+        let mut user = AsynUser::new(reason);
+
+        // 0xFF 0xFE 0x01 is not valid UTF-8; it must pass through unchanged.
+        driver.write_octet(&mut user, &[0xFF, 0xFE, 0x01]).unwrap();
+        let req = rx.try_recv().unwrap();
+        assert_eq!(req.payload, vec![0xFF, 0xFE, 0x01]);
+
+        // NUL truncation still applies to the raw bytes.
+        driver.write_octet(&mut user, &[0xFF, 0x00, 0xFE]).unwrap();
+        assert_eq!(rx.try_recv().unwrap().payload, vec![0xFF]);
     }
 
     /// C parity: a partial-mask DIGITAL write before any current value is
@@ -535,7 +604,7 @@ mod tests {
             .unwrap();
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/bits");
-        assert_eq!(req.payload, "240"); // 0x00f0
+        assert_eq!(req.payload, b"240"); // 0x00f0
 
         // Partial mask now merges into the known 0x00f0:
         // (0x00f0 & ~0x000f) | (0x0005 & 0x000f) = 0x00f5 = 245.
@@ -543,7 +612,7 @@ mod tests {
             .write_uint32_digital(&mut user, 0x0005, 0x000f)
             .unwrap();
         let req = rx.try_recv().unwrap();
-        assert_eq!(req.payload, "245");
+        assert_eq!(req.payload, b"245");
     }
 
     #[test]

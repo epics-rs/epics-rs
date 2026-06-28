@@ -82,6 +82,12 @@ pub struct ChildConfig {
     /// Characters to discard from PTY-master writes (`--ignore`).
     /// Empty = no filtering.
     pub ignore_chars: Vec<u8>,
+    /// Core-dump size limit (`RLIMIT_CORE` soft limit) applied to the
+    /// child before `exec` (`--coresize`). `None` leaves the inherited
+    /// limit untouched, matching C's `setCoreSize` flag which is only
+    /// honored for `coresize >= 0` (`procServ.cc:279-285`,
+    /// `processFactory.cc:206-210`).
+    pub core_size: Option<u64>,
 }
 
 /// Sidecar/log configuration.

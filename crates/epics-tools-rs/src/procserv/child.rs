@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::ForkptyResult;
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{Pid, chdir, execvp};
@@ -65,6 +66,9 @@ pub struct ChildSpec {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub ignore_chars: Vec<u8>,
+    /// `RLIMIT_CORE` soft limit to set in the child before `exec`
+    /// (`--coresize`). `None` ⇒ leave the inherited limit untouched.
+    pub core_size: Option<u64>,
 }
 
 /// Handle to a running child process. Cloning is cheap (Arcs inside).
@@ -229,6 +233,17 @@ impl ChildHandle {
 /// NOT call `setsid` here again — it would return `EPERM` because
 /// we're already a session leader.
 fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
+    // Apply the core-dump rlimit before chdir/exec, matching C's order
+    // (processFactory.cc:206-210): `getrlimit` to keep the hard limit,
+    // set only the soft limit (`rlim_cur`) to `coreSize`. Best-effort —
+    // C ignores the setrlimit return too. getrlimit/setrlimit are
+    // async-signal-safe, so this is safe in the post-forkpty child.
+    if let Some(core) = spec.core_size
+        && let Ok((_, hard)) = getrlimit(Resource::RLIMIT_CORE)
+    {
+        let _ = setrlimit(Resource::RLIMIT_CORE, core, hard);
+    }
+
     if let Some(ref cwd) = spec.cwd {
         let c_cwd = match CString::new(cwd.as_os_str().as_encoded_bytes()) {
             Ok(c) => c,
@@ -394,6 +409,7 @@ mod tests {
             args: vec!["hello procserv".into()],
             cwd: None,
             ignore_chars: Vec::new(),
+            core_size: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -436,6 +452,7 @@ mod tests {
             args: vec!["-c".into(), "exit 3".into()],
             cwd: None,
             ignore_chars: Vec::new(),
+            core_size: None,
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -453,6 +470,7 @@ mod tests {
             args: vec!["30".into()],
             cwd: None,
             ignore_chars: Vec::new(),
+            core_size: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         // Let the child reach its sleep, then SIGKILL its group.
@@ -472,6 +490,7 @@ mod tests {
             args: vec![],
             cwd: None,
             ignore_chars: vec![b'X'],
+            core_size: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
 
@@ -494,5 +513,55 @@ mod tests {
             !text.contains('X'),
             "X bytes should not appear, got: {text:?}"
         );
+    }
+
+    /// `core_size` must set the child's `RLIMIT_CORE` soft limit before
+    /// exec (C `setCoreSize`, processFactory.cc:206-210). Verify via
+    /// `ulimit -c`, which prints the soft limit in 512- or 1024-byte
+    /// blocks (platform-dependent). When the inherited hard limit allows
+    /// a distinctive 1 MiB soft cap, assert the reported block count
+    /// matches; otherwise just assert the child still execs with the
+    /// limit applied (no clean distinctive value is settable).
+    #[tokio::test]
+    async fn core_size_applies_rlimit_core_to_child() {
+        let (_soft, hard) = getrlimit(Resource::RLIMIT_CORE).expect("getrlimit");
+        let one_mib: u64 = 1024 * 1024;
+        let strong = hard >= one_mib; // can set a clean, distinctive cap
+        let target = if strong { one_mib } else { hard };
+
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "ulimit -c".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: Some(target),
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
+        let text = String::from_utf8_lossy(&output);
+        let reported = text
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+
+        if strong {
+            // 1 MiB ÷ 512 = 2048 blocks; ÷ 1024 = 1024 blocks.
+            let blocks_512 = (target / 512).to_string();
+            let blocks_1024 = (target / 1024).to_string();
+            assert!(
+                reported == blocks_512 || reported == blocks_1024,
+                "child ulimit -c should reflect the 1 MiB core_size \
+                 ({blocks_512} or {blocks_1024} blocks); got {reported:?}"
+            );
+        } else {
+            // Hard limit too small for a distinctive cap — just prove the
+            // child execed and produced ulimit output with the limit set.
+            assert!(
+                !reported.is_empty(),
+                "child should exec and report its core limit; got {text:?}"
+            );
+        }
     }
 }

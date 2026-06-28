@@ -170,7 +170,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: In daemon mode C's child chdir's to the procServ startup directory by default. Rust's `fork_and_go` chdir's the supervisor to `/`, and a child started without `--chdir` inherits `/` instead of the launch directory — relative paths in `st.cmd`/`dbLoadRecords` break. Foreground mode unaffected.
 
 #### PS-16 `--coresize` / `-C` option and RLIMIT_CORE absent
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (this round)
+- Resolution: added `ChildConfig.core_size: Option<u64>` → `ChildSpec.core_size`, applied in `in_child_setup_and_exec` before chdir/exec via `getrlimit`/`setrlimit(RLIMIT_CORE)` (nix `resource` feature), keeping the hard limit and setting only the soft (`rlim_cur`) — exact mirror of `processFactory.cc:206-210`. Added the `--coresize <n>` flag (long-only in C; `-C` convenience short like `-F`/`-S`); `build_config` applies C's `l >= 0` gate (`procServ.cc:279-285`), mapping negative/absent → `None` (inherit). Tests: bin `coresize_absent_leaves_core_limit_untouched`/`coresize_nonnegative_sets_limit`/`coresize_negative_is_inert`; child integration `core_size_applies_rlimit_core_to_child` (1 MiB cap read back via `ulimit -c`).
 - Rust: `src/procserv/config.rs` (no coresize field); `procserv_rs.rs` (no flag)
 - C: `procServ.cc:233,279-285` (`--coresize <n>`), `processFactory.cc:206-210` (`setrlimit(RLIMIT_CORE)` in child)
 - Impact: C applies `--coresize` to the child's core-dump rlimit. Rust has no option or field, so operators relying on `--coresize` get no effect (and clap rejects the unknown flag).

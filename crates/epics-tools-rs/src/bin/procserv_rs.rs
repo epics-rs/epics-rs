@@ -148,6 +148,14 @@ mod app {
         #[arg(long, default_value_t = 0)]
         logout_char: u8,
 
+        /// Core-dump size limit (bytes) applied to the child's
+        /// `RLIMIT_CORE` soft limit before exec (C `--coresize`,
+        /// long-only; `-C` is a Rust convenience short like `-F`/`-S`).
+        /// Honored only for a non-negative value (C `l >= 0` gate,
+        /// procServ.cc:279-285); omitted ⇒ inherit the existing limit.
+        #[arg(short = 'C', long = "coresize", value_name = "BYTES")]
+        coresize: Option<i64>,
+
         /// Signal sent to the child on the `^X` kill keystroke and on
         /// shutdown teardown (C `--killsig`, default SIGKILL = 9). C
         /// exposes this long-only; `-K` is a Rust convenience short like
@@ -260,12 +268,19 @@ mod app {
             None => libc::SIGKILL,
         };
 
+        // C `--coresize` (procServ.cc:279-285): `l = atol(optarg)`; only
+        // `l >= 0` is honored (`setCoreSize = true`), a negative value
+        // leaves the flag inert. Map non-negative → Some(limit),
+        // negative/absent → None (inherit the existing RLIMIT_CORE).
+        let core_size = args.coresize.filter(|&l| l >= 0).map(|l| l as u64);
+
         let child = ChildConfig {
             name: display_name,
             program,
             args: argv,
             cwd: args.chdir,
             kill_signal,
+            core_size,
             // Explicit `--ignore` bytes only; the supervisor auto-adds the
             // command keys (kill/toggle/logout) on top at spawn time.
             ignore_chars: args
@@ -523,6 +538,37 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "--killsig=-2", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.kill_signal, 2);
+        }
+
+        /// No `--coresize` → no RLIMIT_CORE change (C `setCoreSize`
+        /// stays false, procServ.cc:72).
+        #[test]
+        fn coresize_absent_leaves_core_limit_untouched() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.core_size, None);
+        }
+
+        /// `--coresize <n>` for `n >= 0` sets the limit; `-C` is the
+        /// convenience short. Zero is a valid limit (disable core dumps).
+        #[test]
+        fn coresize_nonnegative_sets_limit() {
+            let args = Args::try_parse_from(["procserv-rs", "--coresize", "1048576", "/bin/echo"])
+                .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.core_size, Some(1_048_576));
+
+            let zero = Args::try_parse_from(["procserv-rs", "-C", "0", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(zero).unwrap().child.core_size, Some(0));
+        }
+
+        /// A negative `--coresize` is inert (C honors only `l >= 0`,
+        /// procServ.cc:281-284), leaving the inherited limit untouched.
+        #[test]
+        fn coresize_negative_is_inert() {
+            let args = Args::try_parse_from(["procserv-rs", "--coresize=-1", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.core_size, None);
         }
 
         /// `-n`/`--name` still overrides the default.

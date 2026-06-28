@@ -596,6 +596,7 @@ impl SupervisorState {
                 &self.config.child.ignore_chars,
                 &self.config.keys,
             ),
+            core_size: self.config.child.core_size,
         };
         let (handle, rx) = ChildHandle::spawn(&spec)?;
 

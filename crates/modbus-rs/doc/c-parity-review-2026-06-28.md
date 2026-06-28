@@ -238,15 +238,20 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   `drv_user_create` has no `addr`, so the connect path is where the per-record offset lives). Test
   `connect_addr_rejects_out_of_range_offset`.
 
-### R53 — modbusInterposeConfig accepts timeoutMsec + writeDelayMsec but silently drops both
+### R53 — modbusInterposeConfig accepts timeoutMsec + writeDelayMsec but silently drops both — CLEARED (c17c1c2c)
 - **Severity:** CONCERN (configured timeout + inter-frame write delay ignored)
-- **Rust:** `ioc.rs:1001-1015` (reads only `args[0]` port, `args[1]` link; `args[2]` timeout,
-  `args[3]` writeDelay never read); transport uses fixed `READ_TIMEOUT` (`driver.rs:22-23`,
-  `ioc.rs:1151`), no write delay
+- **Rust:** `modbus_interpose_config_command` read only `args[0]` port, `args[1]` link; `args[2]`
+  timeout, `args[3]` writeDelay never read; transport used fixed `READ_TIMEOUT`, no write delay
 - **C:** `modbusInterpose.c:122-135` (`timeout=timeoutMsec/1000`, `writeDelay=writeDelayMsec/1000`);
   write delay is a pre-write `epicsThreadSleep` at `:246`
-- A user-set read timeout and the inter-frame write delay (needed by slow serial PLCs) are
-  discarded; the arg slots are accepted so there is no error signalling the loss.
+- A user-set read timeout and the inter-frame write delay (needed by slow serial PLCs) were
+  discarded; the arg slots were accepted so there was no error signalling the loss.
+- **Fix:** new `InterposeSettings {link, timeout, write_delay}` carries all three per octet port
+  (`record_interpose`/`take_interpose`). `parse_interpose_args` reads `timeoutMsec` (default
+  `READ_TIMEOUT`=2 s when 0/unset, C `DEFAULT_TIMEOUT`) and `writeDelayMsec` (zero when 0/unset).
+  `SyncIoTransport` sleeps `write_delay` before each `write_frame` (blocking sync-I/O thread =
+  C `epicsThreadSleep`), and the `SyncIOHandle` is built with the configured timeout. Test
+  `parse_interpose_args_reads_timeout_and_write_delay`.
 
 ### R54 — single Float64/Octet param per data reason collapses C's per-interface I/O-Intr callbacks (CONFIRMED DEFECT)
 - **Severity:** DEFECT (wrong VAL on I/O-Intr integer-interface records) — structural, spans the

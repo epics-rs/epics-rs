@@ -159,7 +159,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C binds `-p <file>` to the PID file and `-P <endpoint>` to the control port. Rust reassigns `-p` to the TCP port and provides no `-P`. A wrapper `procServ -p /run/x.pid -P 4051 …` treats `/run/x.pid` as a (rejected) port and fails on `-P`. Silent semantic inversion of a core flag.
 
 #### PS-15 Daemon `chdir("/")` leaks into the child's working directory
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (fecfd0f9)
+- Resolution: dropped the `chdir("/")` from `fork_and_go` so the daemon stays in the launch dir (C `forkAndGo` never chdir's). Child `cwd=None` inheritance + the supervisor's startup-dir capture now both land on the launch directory. Re-found as PS-R2-2 by the round-2 caucus review.
 - Rust: `src/procserv/daemon.rs:63` (`chdir("/")`) + `child.rs:217-229` (child chdir only when `cwd.is_some()`) + `procserv_rs.rs:190` (`cwd: args.chdir`, default `None`)
 - C: `procServ.cc:220-221` (`chDir = myDir` = startup cwd), `processFactory.cc:211` (child always `chdir(chDir)`); `forkAndGo` never chdir's
 - Impact: In daemon mode C's child chdir's to the procServ startup directory by default. Rust's `fork_and_go` chdir's the supervisor to `/`, and a child started without `--chdir` inherits `/` instead of the launch directory — relative paths in `st.cmd`/`dbLoadRecords` break. Foreground mode unaffected.
@@ -333,6 +334,34 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - C: `processFactory.cc:204`; `processFactory.cc:48-56`
 - Impact: (a) C redundantly calls `setsid()` in the child after `forkpty` (returns EPERM, harmless); Rust correctly skips it since `forkpty` already creates the session — same resulting pgid. (b) `RestartTracker` has no C analog; default `max_restarts = u32::MAX` keeps parity with C's never-give-up. Neither is a parity defect; flagged so they aren't re-reported. (`sidecar.rs` is pure pid/info/log/env file management — C `writePidFile`/`writeInfoFile`/`setEnvVar`/`openLogFile`, not a child-lifecycle counterpart.)
 
+#### PS-43 Default child name was the program basename; C uses the whole command string
+- Severity: DEFECT — CLEARED (1a0a9587)
+- Found: round-2 caucus review (PS-R2-1) of the PS-6 banner landing
+- Rust: `src/bin/procserv_rs.rs` `build_config` (`display_name = program.file_name()…`)
+- C: `procServ.cc:455-457` (`childName = command` = `argv[optind]`) → `:579-586`, `clientFactory.cc:138`, `processFactory.cc:191`
+- Resolution: default the display name to the whole program string so `name == command` and the banner shows C's bare `@@@ Child started as: <cmd>` / `@@@ Child "<cmd>" PID: N` form; `-n` still overrides. The `messages` builders were already correct — only the wiring fed a basename. Bin unit tests pin the default + override.
+
+#### PS-44 Dead OneShot relaunch arm / `has_run_once` (no-op cleanup)
+- Severity: NOTE — CLEARED (d0b3b6cc)
+- Found: round-2 caucus review carryover (rev-ps-process)
+- Rust: `src/procserv/supervisor.rs` OneShot arm + `has_run_once`
+- C: `procServ.cc:656-658`, `processFactory.cc:51` (`oneshot && !firstRun` → shutdown on first exit)
+- Resolution: `has_run_once` was set on every spawn, so the `!has_run_once` "relaunch once" branch was unreachable and its intent did not match C (which shuts down on the first oneshot exit). Behaviour already matched C; collapsed the arm to unconditional shutdown and removed the field. RESIDUAL (documented, not fixed): C gates the oneshot shutdown behind the holdoff, so a sub-holdoff crash makes C wait `holdoff − uptime`; the port exits immediately. Reachable only with oneshot + a crash inside the holdoff.
+
+#### PS-45 Welcome version token is the crate semver, not C's PACKAGE_STRING (intentional)
+- Severity: CONCERN (intentional divergence — keep the Rust version)
+- Found: round-2 caucus review (PS-R2-3)
+- Rust: `src/procserv/supervisor.rs` (`version: env!("CARGO_PKG_VERSION")`) → `messages::welcome`
+- C: `clientFactory.cc:100` (`PROCSERV_VERSION_STRING` = `PACKAGE_STRING` = `"procServ Process Server 2.9.0-dev"`)
+- Disposition: the greeting keeps the C-exact shape `@@@ Welcome to procServ (<version>)` but reports the Rust crate version, so operators see the actual running build. The `procServ (` prefix still matches liveness scrapers; only a front-end pinned to C's exact version string would differ. Kept deliberately — do not hardcode a C-compat version.
+
+#### PS-46 `ctl_sc` emits 2-byte UTF-8 for key bytes ≥ 128 (residual)
+- Severity: NOTE (unreachable with default keys — all command keys are control chars < 32)
+- Found: round-2 caucus review (PS-R2-5)
+- Rust: `src/procserv/messages.rs` `ctl_sc` (`(c as char).to_string()` UTF-8-encodes `c ≥ 0x80` as two bytes)
+- C: `procServ.h:67` (`CTL_SC` `%c` writes the raw byte)
+- Disposition: a key bound to a byte ≥ 0x80 renders as a 2-byte UTF-8 sequence vs C's one raw byte. Not reachable with default keys; left as a documented residual rather than reworking the `String`-based builders for an exotic binding.
+
 ---
 
 ## Review Log
@@ -402,3 +431,37 @@ Thematic clusters (each points at a structural gap, not isolated bugs):
 Doc committed doc-only before any fix work. Fix phase next: per-finding
 commits, severity order (DEFECT → CONCERN → NOTE), marking each `cleared` here
 as it lands, driving caucus opus convergence rounds.
+
+### Round 2 — 2026-06-28 — console + control-key cluster review (caucus round 01KW775WKGGMZEE8F1Z42E07GP)
+
+Two read-only opus reviewers re-checked the landed console/control-key cluster
+(PS-2/PS-6/PS-7/PS-11/PS-15 plus the new `messages.rs` module) against
+`procServ.cc`/`clientFactory.cc`/`processFactory.cc`. Both confirmed the `@@@`
+console vocabulary and the `^Q`/logout-default fixes land byte-faithfully; all
+structural checks PASS.
+
+Two new DEFECTs found and fixed in this round:
+
+- **PS-43** (conn panel, PS-R2-1) — the default child name was the program
+  *basename*; C names the child after the whole command string. Fixed in
+  `1a0a9587` (wiring only; the `messages` builders were already correct).
+- **PS-15** (conn panel, PS-R2-2) — re-found the daemon `chdir("/")` leak.
+  Fixed in `fecfd0f9` by dropping the `chdir` so the daemon stays in the
+  launch dir (C `forkAndGo` never chdir's).
+
+One dead-code cleanup:
+
+- **PS-44** (process panel) — the `has_run_once`/OneShot relaunch arm was
+  unreachable; collapsed to unconditional shutdown matching C. `d0b3b6cc`.
+
+Intentional / residual, no code change:
+
+- **PS-45** (PS-R2-3) — the welcome version token is the Rust crate semver, not
+  C's `PACKAGE_STRING`; kept deliberately so operators see the running build.
+- **PS-46** (PS-R2-5) — `ctl_sc` renders a key byte ≥ 0x80 as 2-byte UTF-8 vs
+  C's one raw byte; unreachable with default control-char keys.
+- **PS-39 reconfirmed** (PS-R2-4) — the dead-child kill broadcast is the same
+  intentional divergence already recorded as PS-39; no new action.
+
+`epics-tools-rs` after this round: 74 nextest green, clippy `-D warnings`
+clean. Nothing pushed.

@@ -146,7 +146,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   nibble; Rust drops it. Valid 0–9999 byte-identical. Rust declining a C overflow
   quirk on invalid input — keep.
 
-### R46 — POLL_DELAY write errors out; poll period can never change at runtime
+### R46 — POLL_DELAY write errors out; poll period can never change at runtime — CLEARED (53d126b7)
 - **Severity:** CONCERN (control param broken; valid write returns alarm)
 - **Rust:** `ioc.rs:804-810` (`write_float64` does `datatype_of(reason)?` first, so the
   non-data POLL_DELAY reason → `Err`); poller uses a fixed `poll_delay` (`ioc.rs:1167-1177`)

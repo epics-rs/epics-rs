@@ -20,6 +20,14 @@ use crate::procserv::error::{ProcServError, ProcServResult};
 /// divergence (PS-34), not bug-copied down to 5.
 const LISTEN_BACKLOG: u32 = 1024;
 
+/// Backoff after a transient accept error. A *persistent* failure (e.g.
+/// `EMFILE` until a descriptor frees) would otherwise tight-loop
+/// `accept → warn → accept`, burning a core until an fd is available. C
+/// re-enters its 0.5s `pselect` between attempts; we keep the bound
+/// listener (unlike C's `remakeConnection` teardown, `acceptFactory.cc:396`)
+/// and just pause briefly so a stuck error doesn't busy-spin (PS-35).
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Run the TCP listener loop until the supervisor's `out` channel
 /// closes. Each accepted socket is wrapped in [`IncomingClient`] and
 /// forwarded.
@@ -53,7 +61,9 @@ pub async fn run_tcp(
                 // Per-accept errors (e.g. EMFILE) are recoverable;
                 // log and keep listening so a transient
                 // file-descriptor exhaustion doesn't kill the gateway.
+                // Pause first so a *persistent* error doesn't busy-spin.
                 tracing::warn!(error = %e, "procserv-rs: TCP accept error");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -119,7 +129,10 @@ pub async fn run_unix(
                 }
             }
             Err(e) => {
+                // Same recoverable-but-don't-busy-spin handling as the TCP
+                // loop above (PS-35).
                 tracing::warn!(error = %e, "procserv-rs: UNIX accept error");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }

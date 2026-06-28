@@ -313,11 +313,12 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: Under a connection burst, C refuses past the 6th queued connection; Rust queues ~1024. Observable only as different refusal thresholds; no data divergence.
 - Disposition: kept at 1024 (a named `LISTEN_BACKLOG` const, listener.rs:17-21, with the C-citation + rationale already in source). C's `listen(fd, 5)` is a historically tiny limit; queuing a burst rather than refusing past the 6th pending connection is strictly more tolerant and never loses data — declining C's small backlog, not bug-copying it down to 5. No code change. (Steering: find divergences, don't copy C's limitations.)
 
-#### PS-35 Accept-error handling: C rebuilds the listen socket, Rust retries with no backoff
+#### PS-35 Accept-error handling: C rebuilds the listen socket, Rust retries with no backoff — CLEARED
 - Severity: NOTE (Rust correctly declines a C misbehavior, but adds a busy-loop risk)
 - Rust: `src/procserv/listener.rs:48-53/:86-88` (log `warn!` and continue on the same listener)
 - C: `acceptFactory.cc:396-399` (`remakeConnection()` — close + re-socket/bind/listen)
 - Impact: On a transient accept failure (EMFILE) C tears down and re-creates the whole listen socket (briefly unbinding, dropping queued connections — questionable); Rust correctly keeps the bound listener. Aside: Rust's retry has no backoff, so a *persistent* error tight-loops `accept→warn→accept` burning CPU until an fd frees; C re-enters `pselect` (0.5s) between attempts. A small backoff would close the busy-loop without copying C's unbind.
+- Resolution: added a 100ms `ACCEPT_ERROR_BACKOFF` sleep after a logged accept error in **both** accept loops (TCP + UNIX — same defect, fixed at both sites), so a persistent `EMFILE`/`ENFILE` no longer busy-spins a core; recovery is within 100ms of an fd freeing. We keep declining C's `remakeConnection` unbind (the bound listener and its queued connections survive); the backoff only closes the busy-loop the audit flagged. `cargo clippy`/`nextest` on `epics-tools-rs` clean.
 
 #### PS-36 UNIX socket file not unlinked on shutdown
 - Severity: NOTE

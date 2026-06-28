@@ -258,7 +258,9 @@ impl IoStatistics {
     /// "zero the histogram" transition that C performs on an ENABLE_HISTOGRAM
     /// OFF→ON edge (drvModbusAsyn.cpp:636-638) and on a HISTOGRAM_BIN_TIME
     /// change (:799-800), so stale counts are neither carried across a
-    /// re-enable nor misattributed when the bin width changes.
+    /// re-enable nor misattributed when the bin width changes. Only the `ioc`
+    /// histogram-control write arms invoke it, so it is gated with them.
+    #[cfg(feature = "ioc")]
     pub(crate) fn clear_histogram(&mut self) {
         self.histogram.fill(0);
     }

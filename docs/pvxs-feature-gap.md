@@ -34,6 +34,7 @@
 | `beffbb85` | §2.3 `serverInfo`/`server` PV 표기 정정 | Rust 서버가 `server_native::server_info::ServerInfoSource`로 `server` PV를 이미 호스팅함을 doc에 반영 |
 | `3b1733b0` | §5-8 `ca_gateway` preload_path 주석 stale 정정 | lazy-resolution은 `install_search_resolver`로 동작 중; preload는 opt-in eager-prefetch |
 | `cf52451c` | §4.2/§5-2 pvalink `MSS` 처분 정정 | `MSS→MS`는 **pvxs 자체 aliasing**(`pvalink.h:83-86` MSS 변형 없음, `pvalink_jlif.cpp:179-183` 명시 매핑). Rust 한계 아님 = 정확한 parity |
+| `593f2027` | §4.1 iocsh `pvxsr` 없음 → ✅ | QSRV iocsh `pvxsr [<detail>]` 추가(pvxs `iochooks.cpp:188-214` casr 대응). native `PvaServer`가 bind 직후 `ServerReportHandle`(공유 peer 레지스트리 + bound-port/config + abort 핸들)를 `watch` 채널로 publish → 양 shell 경로(`run_with_shell`/`run_with_source_and_shell`)가 autosave처럼 자동 등록. 구조 변경 sign-off 받고 진행 |
 
 ### 의도적 잔존 (residual) — 처분과 근거
 
@@ -41,13 +42,12 @@
 |---|---|---|
 | `reExec`/`autoExec` Expert API (§2.1) | 잔존 (M, expert-only) | pvxs `reExecGet`/`reExecPut`는 전문가용 재실행 API. 영향 낮음, 일반 GET/PUT 경로는 동등 |
 | `pvxsi` (QSRV iocsh target_information 덤프) | 잔존 (cosmetic) | 진단용 자격증명/타깃 정보 출력. 와이어/기능 영향 없음 |
-| `pvxsr` (QSRV iocsh 서버 리포트, casr 대응) | **잔존 — 구조 변경 sign-off 대기** | 데이터(`PvaServer::report()→ServerReport`)는 존재하나, native `PvaServer`(peers/config/bound-port)가 `run_pva_server`(`runtime.rs:449`) **안에서 생성·`wait()`로 소비**되어 iocsh `register_fn` 경계(2계층 위)에서 핸들 접근 불가. 게다가 bound tcp/tls 포트는 bind **이후**에만 확정. casr는 `CaServer.stats:Arc<ServerStats>` 필드라 가능했지만, PVA는 진단 상태가 spawn된 태스크 내부에서 태어남. 채우려면 `ServerReportHandle`를 bind 직후 `run_pva_server`→`run_with_source`→등록 경계로 publish하는 **3개 함수 시그니처 변경 + 신규 cross-crate 공개 API** 필요 → "독립 변경 규모의 구조 수정"이라 사용자 승인 후 진행 |
 | `EPICS_PVA_MAX_SEARCH_PERIOD` (§2.2, 이슈 #155) | 격차 아님 | pvxs도 제안 단계로 미구현 — 양쪽 모두 없음 |
 | `SSLKEYLOGFILE` open-failure 진단 | 잔존 (minor) | `6eabcaae`는 enable 시 NOTICE 출력. pvxs는 파일 열기 실패 시 추가 Warning. rustls `KeyLogFile`이 열기/쓰기를 내부 처리하므로 실패 경고 경로만 미세 차이 |
 
-> pvxsr를 제외한 나머지 잔존은 모두 cosmetic/expert-only/양쪽-공통 부재로,
-> 와이어·기능 parity에 영향 없음. pvxsr만 실질 casr-격차이며 구조 변경
-> 규모 때문에 승인 대기 상태로 둔다.
+> 남은 잔존은 모두 cosmetic/expert-only/양쪽-공통 부재로 와이어·기능
+> parity에 영향 없음. (casr-격차였던 `pvxsr`은 `593f2027`에서 구조 변경
+> 승인 후 구현 완료 — 위 표로 이동.)
 
 ---
 

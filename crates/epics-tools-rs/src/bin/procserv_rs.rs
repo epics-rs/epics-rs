@@ -75,6 +75,23 @@ mod app {
         #[arg(short = 'f', long)]
         foreground: bool,
 
+        /// Debug mode (`-d` / `--debug`, C `inDebugMode`,
+        /// procServ.cc:291-292). Keeps the child in the foreground (the
+        /// daemonize gate is `!inFgMode && !inDebugMode`, procServ.cc:549)
+        /// and raises diagnostic verbosity — C's `PRINTF` macro is
+        /// `if (inDebugMode) printf` (procServ.h:30), mapped here to a
+        /// debug-level tracing default. Also enabled by a present
+        /// `PROCSERV_DEBUG` env var (procServ.cc:225).
+        #[arg(short = 'd', long)]
+        debug: bool,
+
+        /// Suppress informational server output (`-q` / `--quiet`, C
+        /// `quiet`, procServ.cc:390-391): the no-log-file warning emitted
+        /// when daemonizing (procServ.cc:889-893). Does not affect the
+        /// child or the party-line, only the server's own stderr notices.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+
         /// Log file (`-L` / `--logfile`). The value `-` logs to stdout
         /// (C `openLogFile`, procServ.cc:920-922) rather than creating a
         /// file literally named `-`.
@@ -412,7 +429,11 @@ mod app {
         };
 
         Ok(ProcServConfig {
-            foreground: args.foreground,
+            // Debug mode keeps the child in the foreground — C's daemonize
+            // gate is `!inFgMode && !inDebugMode` (procServ.cc:549). The
+            // env-driven half of `inDebugMode` (PROCSERV_DEBUG) is OR'd in
+            // by `entry`, which also reads the env for the tracing default.
+            foreground: args.foreground || args.debug,
             listen,
             keys: KeyBindings {
                 kill: nz(kill_char),
@@ -443,22 +464,51 @@ mod app {
     }
 
     pub fn entry() -> ExitCode {
+        let args = Args::parse();
+
+        // C `inDebugMode`: `-d`/`--debug` OR a present `PROCSERV_DEBUG`
+        // env var (procServ.cc:225,291-292). It raises the diagnostic
+        // verbosity (C's `PRINTF` = `if (inDebugMode) printf`,
+        // procServ.h:30 → a debug-level tracing default, still overridable
+        // by RUST_LOG) and keeps the child in the foreground.
+        let debug = args.debug || std::env::var_os("PROCSERV_DEBUG").is_some();
+        let quiet = args.quiet;
+
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(if debug { "debug" } else { "info" })
+                }),
             )
             .try_init();
 
-        let args = Args::parse();
-        let foreground = args.foreground;
-        let cfg = match build_config(args) {
+        let mut cfg = match build_config(args) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "procserv-rs: invalid config");
                 return ExitCode::FAILURE;
             }
         };
+        // The `-d` flag already forced foreground in `build_config`; OR in
+        // the env-only half of `inDebugMode` here.
+        cfg.foreground = cfg.foreground || debug;
+        let foreground = cfg.foreground;
+
+        // C warns (unless `quiet`) when it is about to daemonize with no
+        // log file, naming whether a log *port* exists either
+        // (procServ.cc:889-893). Foreground/debug mode does not daemonize,
+        // so it does not warn. (The daemon-spawn pid notice C also prints
+        // here needs the forking rework tracked as PS-32.)
+        if !foreground && cfg.logging.log_path.is_none() && !quiet {
+            eprintln!(
+                "Warning: No log file{} specified.",
+                if cfg.listen.log.is_some() {
+                    ""
+                } else {
+                    " and no port for log connections"
+                }
+            );
+        }
 
         // Daemonize BEFORE starting the tokio runtime — the runtime's
         // worker threads don't survive fork(). After fork_and_go
@@ -684,6 +734,31 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.keys.quit, Some(0x11));
+        }
+
+        /// PS-28: `-d`/`--debug` and `-q`/`--quiet` must be accepted (C
+        /// rejected wrappers passing them under clap previously).
+        #[test]
+        fn debug_and_quiet_flags_parse() {
+            let d = Args::try_parse_from(["procserv-rs", "-d", "/bin/echo"]).unwrap();
+            assert!(d.debug && !d.quiet);
+            let d_long = Args::try_parse_from(["procserv-rs", "--debug", "/bin/echo"]).unwrap();
+            assert!(d_long.debug);
+            let q = Args::try_parse_from(["procserv-rs", "-q", "/bin/echo"]).unwrap();
+            assert!(q.quiet && !q.debug);
+            let q_long = Args::try_parse_from(["procserv-rs", "--quiet", "/bin/echo"]).unwrap();
+            assert!(q_long.quiet);
+        }
+
+        /// C's daemonize gate is `!inFgMode && !inDebugMode`
+        /// (procServ.cc:549), so `-d` keeps the child in the foreground
+        /// exactly like `-f`.
+        #[test]
+        fn debug_forces_foreground() {
+            let plain = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            assert!(!build_config(plain).unwrap().foreground);
+            let dbg = Args::try_parse_from(["procserv-rs", "-d", "/bin/echo"]).unwrap();
+            assert!(build_config(dbg).unwrap().foreground);
         }
 
         /// With no `-n`, C sets `childName == command` (the whole argv

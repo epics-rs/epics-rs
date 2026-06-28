@@ -66,6 +66,8 @@ Everything after `--` is the child program and its argv.
 | `--restrict` | Restrict the log port to localhost | off |
 | `--unixpath <PATH>` | UNIX-domain socket path | — |
 | `-f, --foreground` | Do not daemonize | off |
+| `-d, --debug` | Keep child in foreground + debug-level logging (also `PROCSERV_DEBUG` env) | off |
+| `-q, --quiet` | Suppress the no-log-file warning when daemonizing | off |
 | `-L, --logfile <PATH>` | Log file (`-` logs to stdout) | — |
 | `-S, --logstamp[=FMT]` | Timestamp each log line (FMT attached with `=`) | off |
 | `-F, --timefmt <FMT>` | strftime for banner / start-time lines | `%c` |

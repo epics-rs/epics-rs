@@ -147,32 +147,68 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
 /// "reopen the log file" (logrotate), which the supervisor owns; if it
 /// were folded into the shutdown set a logrotate `kill -HUP` would tear
 /// the IOC down.
-pub async fn install_signal_handlers() -> ProcServResult<ShutdownSignal> {
+///
+/// Registration is non-fatal. C installs every handler in the foreground
+/// parent before `forkAndGo` (`procServ.cc:477,551`) with **unchecked**
+/// `sigaction` (`procServ.cc:496-509`). Rust must register post-fork — the
+/// tokio reactor can't survive `fork()` — so a failure here lands in the
+/// daemon child, after the parent already reported success and wrote the
+/// pidfile; aborting would be a headless-daemon false-success. Match C's
+/// "never checks": a failed registration is logged and the corresponding
+/// handler is dropped, leaving the daemon running. Hence the infallible
+/// return type — sibling of the PS-48 pidfile/log warn-continue policy.
+pub async fn install_signal_handlers() -> ShutdownSignal {
     // SIGPIPE → ignore. tokio::signal doesn't expose SIG_IGN
     // directly, so use nix.
     // SAFETY: signal(SIGPIPE, SIG_IGN) is async-signal-safe and
     // disposition-only — no userspace handler installed.
     unsafe {
-        signal(Signal::SIGPIPE, SigHandler::SigIgn)
-            .map_err(|e| ProcServError::Forkpty(format!("ignore SIGPIPE: {e}")))?;
+        if let Err(e) = signal(Signal::SIGPIPE, SigHandler::SigIgn) {
+            tracing::error!(error = %e, "procserv-rs: unable to ignore SIGPIPE; continuing");
+        }
     }
 
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(ProcServError::Io)?;
-    let mut intr = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(ProcServError::Io)?;
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::error!(error = %e, "procserv-rs: unable to register SIGTERM handler; graceful SIGTERM shutdown disabled");
+            None
+        }
+    };
+    let mut intr = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::error!(error = %e, "procserv-rs: unable to register SIGINT handler; graceful SIGINT shutdown disabled");
+            None
+        }
+    };
 
     let (tx, rx) = oneshot::channel::<ShutdownReason>();
 
     tokio::spawn(async move {
         let reason = tokio::select! {
-            _ = term.recv() => ShutdownReason::Terminate,
-            _ = intr.recv() => ShutdownReason::Interrupt,
+            _ = recv_optional_signal(&mut term) => ShutdownReason::Terminate,
+            _ = recv_optional_signal(&mut intr) => ShutdownReason::Interrupt,
         };
         let _ = tx.send(reason);
     });
 
-    Ok(ShutdownSignal { rx })
+    ShutdownSignal { rx }
+}
+
+/// Await an optional signal stream, parking forever when the stream is
+/// absent. A `None` arises only when the handler failed to register: C's
+/// `sigaction` calls are unchecked (`procServ.cc:496-509`), so a
+/// registration failure must not abort the daemon — instead the matching
+/// `select!` arm never fires and that handler is silently dropped, exactly
+/// as C would run without a working handler.
+pub(crate) async fn recv_optional_signal(s: &mut Option<tokio::signal::unix::Signal>) {
+    match s {
+        Some(sig) => {
+            sig.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Why the shutdown signal fired. SIGHUP is intentionally absent — it
@@ -201,8 +237,30 @@ impl ShutdownSignal {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // We don't unit-test fork_and_go (forking from cargo test is
-    // hostile) or signal handlers (process-wide state). Both are
-    // exercised by the integration test that spawns procserv-rs as
-    // a child.
+    // hostile) or live signal *delivery* (process-wide state, and a
+    // registration failure can't be forced deterministically — like
+    // PS-32's fork path, this is covered by inspection). What we can
+    // pin is the degradation contract introduced for PS-50.
+
+    /// PS-50: a `None` signal stream — the state left when registration
+    /// failed and we warned-and-continued — must park forever so its
+    /// `select!` arm never fires. If it instead resolved, the supervisor
+    /// would hot-loop `reopen_log()` (or the shutdown task would fire a
+    /// spurious shutdown). The daemon must simply run without that handler.
+    #[tokio::test]
+    async fn recv_optional_signal_none_never_fires() {
+        let mut absent: Option<tokio::signal::unix::Signal> = None;
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            recv_optional_signal(&mut absent),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "an absent (failed-to-register) signal stream must never resolve"
+        );
+    }
 }

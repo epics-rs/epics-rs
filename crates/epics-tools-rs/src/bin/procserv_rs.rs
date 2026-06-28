@@ -585,13 +585,11 @@ mod app {
                 }
             };
 
-            let shutdown = match install_signal_handlers().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "procserv-rs: signal handler install failed");
-                    return ExitCode::FAILURE;
-                }
-            };
+            // Registration is non-fatal (PS-50): a failed handler is logged
+            // and dropped inside `install_signal_handlers`, never aborting
+            // the already-daemonized child. Matches C's unchecked sigaction
+            // (procServ.cc:496-509).
+            let shutdown = install_signal_handlers().await;
 
             // Race the supervisor against the shutdown signal. The
             // supervisor's own `quit` keystroke also returns from

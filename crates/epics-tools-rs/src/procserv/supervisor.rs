@@ -45,6 +45,7 @@ use crate::procserv::client::{
     ClientId, ClientMeta, InboundEvent, IncomingClient, OutboundFrame, spawn_client,
 };
 use crate::procserv::config::{KeyBindings, ProcServConfig};
+use crate::procserv::daemon::recv_optional_signal;
 use crate::procserv::error::{ProcServError, ProcServResult};
 use crate::procserv::listener::{PreboundListener, bind_endpoints};
 use crate::procserv::menu::{Action, scan as menu_scan};
@@ -128,7 +129,9 @@ struct SupervisorState {
     /// (`procServ.cc:641-645`). The supervisor owns this rather than the
     /// daemon's shutdown-signal layer so a `kill -HUP` rotates the log
     /// instead of killing the IOC.
-    sighup: tokio::signal::unix::Signal,
+    /// `None` if SIGHUP failed to register (PS-50): the daemon runs
+    /// without log-reopen-on-HUP rather than aborting startup.
+    sighup: Option<tokio::signal::unix::Signal>,
     /// Last child exit code, returned as procserv's own process exit
     /// status on shutdown. Mirrors C `childExitCode`: updated only on a
     /// normal exit (`WIFEXITED`), so a signal death leaves the prior
@@ -279,8 +282,18 @@ impl SupervisorState {
 
         // SIGHUP → reopen the log (logrotate). Registered here, not in
         // the daemon shutdown layer, so a hangup never tears down the IOC.
-        let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .map_err(ProcServError::Io)?;
+        // This runs post-fork in the daemon child; C installs its SIGHUP
+        // handler pre-fork and unchecked (procServ.cc:501). A failure must
+        // not abort the already-daemonized child (PS-50, sibling of the
+        // PS-48 pidfile/log warn-continue policy) — log it and run without
+        // log-reopen-on-HUP.
+        let sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "procserv-rs: unable to register SIGHUP handler; log reopen on HUP disabled");
+                None
+            }
+        };
 
         let mut state = Self {
             restart_mode: config.restart_mode,
@@ -387,7 +400,7 @@ impl SupervisorState {
                 // 4. SIGHUP → reopen the log file (logrotate). Never a
                 //    shutdown — the loop continues. C OnSigHup →
                 //    openLogFile() (procServ.cc:641-645).
-                _ = self.sighup.recv() => {
+                _ = recv_optional_signal(&mut self.sighup) => {
                     self.reopen_log().await;
                 }
 
@@ -954,8 +967,10 @@ impl SupervisorState {
         let restart_mode = config.restart_mode;
         let (inbound_tx, inbound_rx) = mpsc::channel(8);
         let (_incoming_tx, incoming_rx) = mpsc::channel(8);
-        let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .expect("register SIGHUP in test runtime");
+        let sighup = Some(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("register SIGHUP in test runtime"),
+        );
         Self {
             restart_mode,
             config: Arc::new(config),

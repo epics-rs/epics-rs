@@ -229,6 +229,16 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
             if let Some(b) = boolean_payload_to_int(raw) {
                 return Ok(DecodedValue::UInt32(b as u32));
             }
+            // C parity: DIGITAL parses with `isInteger(val, isSigned=false)`
+            // (drvMqtt.cpp:294,376-387), which treats a leading '+'/'-' as a
+            // non-digit and rejects it (only all-digit payloads pass). Rust's
+            // `u32::from_str` rejects '-' but *accepts* a leading '+', so guard
+            // it explicitly to match C's accept set.
+            if raw.starts_with('+') {
+                return Err(MqttError::ValueConversion(
+                    "DIGITAL parse: leading '+' not allowed (unsigned)".into(),
+                ));
+            }
             let v: u32 = raw
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("DIGITAL parse: {e}")))?;
@@ -429,6 +439,19 @@ mod tests {
         let addr = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
         let val = decode_payload("255", &addr).unwrap();
         assert_eq!(val, DecodedValue::UInt32(255));
+    }
+
+    /// C parity: DIGITAL uses `isInteger(val, isSigned=false)` (drvMqtt.cpp:294),
+    /// so a leading sign is a non-digit and the payload is rejected. Rust's
+    /// `u32::from_str` accepts a leading '+', so it must be guarded out.
+    #[test]
+    fn decode_flat_digital_rejects_leading_plus() {
+        let addr = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
+        assert!(decode_payload("+5", &addr).is_err());
+        // '-5' is rejected by u32::from_str already; confirm it stays rejected.
+        assert!(decode_payload("-5", &addr).is_err());
+        // A plain unsigned digit string still decodes.
+        assert_eq!(decode_payload("5", &addr).unwrap(), DecodedValue::UInt32(5));
     }
 
     #[test]

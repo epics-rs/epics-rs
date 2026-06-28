@@ -951,8 +951,13 @@ impl PortDriver for DrvAsynIPPort {
             // epicsStrDup(hostInfo); store the verbatim spec so a later
             // getOption("hostInfo") echoes the new endpoint, not the old.
             self.host_info = value.to_string();
-        } else {
-            self.base.options.insert(key.to_string(), value.to_string());
+        } else if !key.is_empty() {
+            // C drvAsynIPPort.c::setOption (lines 941-945): any non-empty
+            // unsupported key returns asynError "Unsupported key"; the empty
+            // key is a silent no-op (the `epicsStrCaseCmp(key,"") != 0`
+            // guard). The real handlers above own every supported key, so
+            // there is no generic option store to fall into.
+            return Err(AsynError::OptionNotFound(key.to_string()));
         }
         Ok(())
     }
@@ -1427,6 +1432,22 @@ mod tests {
         // contract for set and get (C getOption -> "Y"/"N").
         drv.set_option("DISCONNECTONREADTIMEOUT", "Y").unwrap();
         assert_eq!(drv.get_option("disconnectonreadtimeout").unwrap(), "Y");
+    }
+
+    #[test]
+    fn unsupported_option_key_is_rejected() {
+        // C drvAsynIPPort.c::setOption (941-945) / getOption (902-906)
+        // reject any non-empty unsupported key (asynError "Unsupported key")
+        // and never store it, so a later getOption cannot echo it back; the
+        // empty key is a silent no-op.
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        let err = drv.set_option("bogusKey", "value").unwrap_err();
+        assert!(matches!(err, AsynError::OptionNotFound(_)));
+        assert!(drv.get_option("bogusKey").is_err());
+
+        // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
+        drv.set_option("", "ignored").unwrap();
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---

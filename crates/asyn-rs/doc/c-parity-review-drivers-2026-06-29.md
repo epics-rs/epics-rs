@@ -203,4 +203,20 @@ contracts / behavioral models, not just a driver site.
   (e.g. the inner ip_port auto-disconnected on a read error, then reconnect)
   would leak the dead session's tail into the first read. Routed through the
   same `clear_read_carry()` owner. Test: `connect_discards_staged_read_carry`.
+- **DRV-9 / DRV-36** (CONCERN, option dispatch leaks unknown keys) — CLEARED. F4
+  family. Both `ip_port`/`serial_port` override `set_option` with a known-key
+  chain, then a catch-all that inserted unknown keys into the generic
+  `base.options` map and returned Ok, so a later `get_option` echoed the
+  arbitrary value back. C `drvAsynIPPort.c::setOption` (941-945) / `getOption`
+  (902-906) and `drvAsynSerialPort.c::setOption` (594-598) instead return
+  asynError "Unsupported key" for any non-empty unsupported key; only the empty
+  key is a silent no-op (`epicsStrCaseCmp(key,"") != 0` guard). The catch-all
+  now applies that contract (empty → no-op, else → `OptionNotFound`); the real
+  handlers own every supported key so nothing populates the generic map and
+  `get_option` can no longer echo. Tests: `unsupported_option_key_is_rejected`
+  (ip), `test_set_option_unknown` (serial, rewritten from asserting the leak).
+  Distinct (not fixed here): the shared default trait `set_option`
+  (port.rs:875) used by `ip_server`/`prologix`, whose C drivers register no
+  `asynOption` interface at all — an interface-advertisement question for the
+  F7/interface sign-off, not the known-key-chain leak.
 

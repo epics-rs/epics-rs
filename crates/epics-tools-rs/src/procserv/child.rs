@@ -62,6 +62,8 @@ pub enum ChildEvent {
 /// [`crate::procserv::config::ChildConfig`] this module needs.
 #[derive(Debug, Clone)]
 pub struct ChildSpec {
+    /// The positional command — presented as argv[0] to the child, and
+    /// the exec target unless [`Self::child_exec`] overrides it.
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -69,6 +71,11 @@ pub struct ChildSpec {
     /// `RLIMIT_CORE` soft limit to set in the child before `exec`
     /// (`--coresize`). `None` ⇒ leave the inherited limit untouched.
     pub core_size: Option<u64>,
+    /// Override executable to `exec` instead of [`Self::program`]
+    /// (`--exec`). `None` ⇒ exec `program`. argv[0] stays `program`
+    /// regardless, so a different binary runs under the original
+    /// command line.
+    pub child_exec: Option<PathBuf>,
 }
 
 /// Handle to a running child process. Cloning is cheap (Arcs inside).
@@ -258,15 +265,31 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
         }
     }
 
-    let prog = match CString::new(spec.program.as_os_str().as_encoded_bytes()) {
+    // argv[0] presented to the child is always the positional command
+    // (`spec.program`), so a `--exec` override runs a different binary
+    // under the original command line. C `childExec` (procServ.cc:62,
+    // 459-462); C's argv[0]-is-the-prior-token quirk is not reproduced.
+    let arg0 = match CString::new(spec.program.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
         Err(_) => {
             eprintln!("procserv child: program name contains NUL");
             std::process::exit(126);
         }
     };
+    // The binary actually exec'd: the `--exec` override if set, else the
+    // command itself. `execvp` PATH-searches a slashless name, like C.
+    let exec_target = match &spec.child_exec {
+        Some(exe) => match CString::new(exe.as_os_str().as_encoded_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("procserv child: exec path contains NUL");
+                std::process::exit(126);
+            }
+        },
+        None => arg0.clone(),
+    };
     let mut argv: Vec<CString> = Vec::with_capacity(1 + spec.args.len());
-    argv.push(prog.clone());
+    argv.push(arg0);
     for a in &spec.args {
         match CString::new(a.as_bytes()) {
             Ok(c) => argv.push(c),
@@ -278,12 +301,12 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
     }
 
     let argv_refs: Vec<&std::ffi::CStr> = argv.iter().map(|c| c.as_c_str()).collect();
-    match execvp(prog.as_c_str(), &argv_refs) {
+    match execvp(exec_target.as_c_str(), &argv_refs) {
         Ok(infallible) => match infallible {},
         Err(e) => {
             eprintln!(
                 "procserv child: execvp({}) failed: {e}",
-                spec.program.display()
+                spec.child_exec.as_ref().unwrap_or(&spec.program).display()
             );
             std::process::exit(127);
         }
@@ -410,6 +433,7 @@ mod tests {
             cwd: None,
             ignore_chars: Vec::new(),
             core_size: None,
+            child_exec: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -453,6 +477,7 @@ mod tests {
             cwd: None,
             ignore_chars: Vec::new(),
             core_size: None,
+            child_exec: None,
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -471,6 +496,7 @@ mod tests {
             cwd: None,
             ignore_chars: Vec::new(),
             core_size: None,
+            child_exec: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         // Let the child reach its sleep, then SIGKILL its group.
@@ -491,6 +517,7 @@ mod tests {
             cwd: None,
             ignore_chars: vec![b'X'],
             core_size: None,
+            child_exec: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
 
@@ -535,6 +562,7 @@ mod tests {
             cwd: None,
             ignore_chars: Vec::new(),
             core_size: Some(target),
+            child_exec: None,
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -563,5 +591,31 @@ mod tests {
                 "child should exec and report its core limit; got {text:?}"
             );
         }
+    }
+
+    /// `child_exec` (`--exec`) runs a different binary than the positional
+    /// command while presenting argv[0] = the command (C `childExec`,
+    /// procServ.cc:459-462). `program` is a bare display name (not a real
+    /// binary) and `child_exec` is `/bin/sh`: the shell must run (proving
+    /// the exec target is `/bin/sh`, not the name) and `echo $0` must print
+    /// the display name (proving argv[0]).
+    #[tokio::test]
+    async fn child_exec_runs_override_binary_with_command_as_argv0() {
+        let spec = ChildSpec {
+            program: PathBuf::from("ioc-display-name"),
+            args: vec!["-c".into(), "echo $0".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: Some(PathBuf::from("/bin/sh")),
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("ioc-display-name"),
+            "child_exec should run /bin/sh with argv[0]=program; got {text:?}"
+        );
     }
 }

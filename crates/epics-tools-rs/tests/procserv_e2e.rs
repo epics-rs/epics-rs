@@ -49,6 +49,7 @@ fn cat_config(port: u16) -> ProcServConfig {
             kill_signal: 9,
             ignore_chars: Vec::new(),
             core_size: None,
+            child_exec: None,
         },
         logging: LoggingConfig {
             log_path: None,

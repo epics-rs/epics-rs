@@ -184,7 +184,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C can start directly in no-restart or one-shot mode. Rust hardcodes `OnExit`; these modes are reachable only via the runtime toggle key. `procServ --oneshot …` / `procServ -N …` wrappers lose their startup mode.
 
 #### PS-18 `-e` / `--exec` (separate child executable) absent
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (this round)
+- Resolution: added `ChildConfig.child_exec` / `ChildSpec.child_exec: Option<PathBuf>` and the `-e`/`--exec <path>` flag (real C short). `in_child_setup_and_exec` now keeps argv[0] = the positional command and execs `child_exec` when set, else the command itself — so a wrapper runs under the original command line (C `childExec`, procServ.cc:295-296,459-462). **Intentional divergence (C bug not copied):** C's `childArgv = argv + optind - 1` makes argv[0] the token *before* the command (the port / previous option value — garbage as argv[0]); the help text's documented intent is "specify child executable (default arg0 of command)", so the Rust port presents argv[0] = the command's arg0 instead. Tests: bin `exec_absent_runs_the_command_itself`, `exec_overrides_exec_target_only`; child integration `child_exec_runs_override_binary_with_command_as_argv0` (program is a bare name, `/bin/sh` runs and `echo $0` prints the name).
 - Rust: `src/bin/procserv_rs.rs:156` (`program = cmd[0]` always)
 - C: `procServ.cc:236,295-297,457-462` (`-e <str>` sets `childExec` distinct from `command`/`childName`)
 - Impact: C execs `childExec` while passing the original command as argv. Rust always execs `cmd[0]`, so `-e` deployments (launch a wrapper while presenting a different argv[0]) are unsupported.

@@ -133,6 +133,14 @@ mod app {
         #[arg(long)]
         name: Option<String>,
 
+        /// Executable to launch instead of the positional command
+        /// (`-e` / `--exec`, C `childExec`, procServ.cc:295-296,459-462).
+        /// The child still presents argv[0] = the command, so a wrapper
+        /// runs under the original command line. Default: exec the
+        /// command itself.
+        #[arg(short = 'e', long = "exec", value_name = "PATH")]
+        exec: Option<PathBuf>,
+
         /// Restart-policy max attempts inside `--restart-window`.
         /// Unset means unlimited: C procServ has no restart-count cap —
         /// `processFactoryNeedsRestart()` (processFactory.cc:48-56) gates
@@ -295,6 +303,7 @@ mod app {
             cwd: args.chdir,
             kill_signal,
             core_size,
+            child_exec: args.exec,
             // Explicit `--ignore` bytes only; the supervisor auto-adds the
             // command keys (kill/toggle/logout) on top at spawn time.
             ignore_chars: args
@@ -564,6 +573,38 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "--killsig=-2", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.kill_signal, 2);
+        }
+
+        /// No `--exec` → exec the positional command itself
+        /// (C default `childExec = command`, procServ.cc:461).
+        #[test]
+        fn exec_absent_runs_the_command_itself() {
+            let args = Args::try_parse_from(["procserv-rs", "/opt/ioc/st.cmd"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.child_exec, None);
+            assert_eq!(cfg.child.program, PathBuf::from("/opt/ioc/st.cmd"));
+        }
+
+        /// `-e`/`--exec <path>` overrides the exec target while leaving the
+        /// positional command as the displayed program / argv[0]
+        /// (C `childExec`, procServ.cc:295-296,459-462).
+        #[test]
+        fn exec_overrides_exec_target_only() {
+            let args = Args::try_parse_from([
+                "procserv-rs",
+                "--exec",
+                "/usr/bin/softIoc",
+                "/opt/ioc/st.cmd",
+            ])
+            .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(
+                cfg.child.child_exec,
+                Some(PathBuf::from("/usr/bin/softIoc"))
+            );
+            assert_eq!(cfg.child.program, PathBuf::from("/opt/ioc/st.cmd"));
+            // Display name still defaults to the command, not the exec.
+            assert_eq!(cfg.child.name, "/opt/ioc/st.cmd");
         }
 
         /// No mode flag → C default `restart` (Rust `OnExit`,

@@ -597,6 +597,7 @@ impl SupervisorState {
                 &self.config.keys,
             ),
             core_size: self.config.child.core_size,
+            child_exec: self.config.child.child_exec.clone(),
         };
         let (handle, rx) = ChildHandle::spawn(&spec)?;
 

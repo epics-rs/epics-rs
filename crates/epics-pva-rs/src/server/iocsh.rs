@@ -1,9 +1,21 @@
 //! iocsh commands for the pvAccess server — currently `pvxsr`.
 //!
-//! Mirrors pvxs `pvxsr(int detail)` (`ioc/iochooks.cpp:188-214`), which
-//! streams the running `server()` with `Detailed(strm, detail)`: a
-//! summary of the server's bound endpoints plus, at higher detail, the
-//! live per-connection channel/byte counters.
+//! Mirrors pvxs `pvxsr(int detail)` (`ioc/iochooks.cpp:188-195`), which
+//! streams the running `server()` through `operator<<(Server)` at the
+//! raw detail level (`src/server.cpp:281-379`). The detail thresholds
+//! follow that operator exactly:
+//!   - **always**: the server-config summary (pvxs prints `config()` plus
+//!     the registered-source list, `server.cpp:289-305`);
+//!   - **`detail >= 2`**: the per-connection block (`server.cpp:308`
+//!     `if(detail<2) return`), one line per peer with its auth *method*
+//!     (`server.cpp:335-338`);
+//!   - **`detail >= 3`**: the full per-peer credentials (`server.cpp:339`
+//!     `if(detail>2)`) and the per-channel tx/rx listing
+//!     (`server.cpp:342` `if(detail<=2) continue`).
+//!
+//! `ServerReport` does not model pvxs's env dump, registered-source list,
+//! or per-peer backlog/state, so the config level here is the
+//! bound-endpoint summary and those pvxs lines are omitted.
 //!
 //! Wiring is automatic — [`PvaServer::run_with_shell`] and
 //! [`PvaServer::run_with_source_and_shell`] register `pvxsr` themselves
@@ -19,11 +31,12 @@ use crate::server_native::ServerReportHandle;
 
 /// `pvxsr [<detail>]` — report the running pvAccess server.
 ///
-/// With no argument prints the summary line (bound endpoints, beacon
-/// period, active-connection count). `detail >= 1` adds one line per live
-/// connection (channels, byte counters, validated credentials);
-/// `detail >= 2` additionally lists each channel's name and tx/rx bytes.
-/// Mirrors pvxs `pvxsr`'s `Detailed` levels (`ioc/iochooks.cpp:188-214`).
+/// Detail thresholds track pvxs `operator<<(Server)`
+/// (`src/server.cpp:281-379`), which `pvxsr` invokes with the raw detail
+/// (`iochooks.cpp:188-195`): `detail < 2` prints only the server-config
+/// summary; `detail >= 2` adds one line per live connection (channels,
+/// byte counters, auth method); `detail >= 3` adds the full credentials
+/// and each channel's tx/rx bytes.
 ///
 /// `report_rx` carries the server's [`ServerReportHandle`], published the
 /// moment the listeners bind. In the brief startup window before that the
@@ -56,12 +69,10 @@ pub fn pvxsr_command(report_rx: watch::Receiver<Option<ServerReportHandle>>) -> 
 
             let updown = |alive: bool| if alive { "up" } else { "down" };
 
+            // Config-level summary — pvxs prints config()+source list at
+            // every level (server.cpp:289-305); this is the modeled subset.
             ctx.println(&format!(
-                "pvAccess server: {} active connection(s)",
-                report.peer_count
-            ));
-            ctx.println(&format!(
-                "    tcp :{} ({}), udp :{} ({}), beacon period {}s",
+                "pvAccess server: tcp :{} ({}), udp :{} ({}), beacon period {}s",
                 report.tcp_port,
                 updown(report.tcp_alive),
                 report.udp_port,
@@ -78,22 +89,35 @@ pub fn pvxsr_command(report_rx: watch::Receiver<Option<ServerReportHandle>>) -> 
                 ctx.println(&format!("    ignoring {} address(es)", report.ignore_addrs));
             }
 
-            if detail >= 1 {
+            // Per-connection block — pvxs gates this at detail >= 2
+            // (server.cpp:308 `if(detail<2) return`). The connection count
+            // and peer lines are part of this block, not the config level.
+            if detail >= 2 {
+                ctx.println(&format!("{} active connection(s)", report.peer_count));
                 for (addr, peer) in &report.peers {
-                    let creds = peer
+                    // Peer line carries only the auth *method* at this level
+                    // (server.cpp:338 `auth=<method>`); the account is part
+                    // of the full credential dump gated below.
+                    let method = peer
                         .credentials
                         .as_ref()
-                        .map(|(account, method)| format!("{account}/{method}"))
-                        .unwrap_or_else(|| "unvalidated".to_string());
+                        .map(|(_account, method)| method.as_str())
+                        .unwrap_or("unvalidated");
                     ctx.println(&format!(
-                        "  peer {addr}: {} channel(s), bytes in={} out={}, {}{}",
+                        "  peer {addr}: {} channel(s), bytes in={} out={}, auth={}{}",
                         peer.channels,
                         peer.bytes_in,
                         peer.bytes_out,
-                        creds,
+                        method,
                         if peer.tls { ", tls" } else { "" },
                     ));
-                    if detail >= 2 {
+                    // Full credentials + per-channel listing — pvxs gates
+                    // both at detail > 2 (server.cpp:339 full cred,
+                    // server.cpp:342 per-channel).
+                    if detail >= 3 {
+                        if let Some((account, method)) = &peer.credentials {
+                            ctx.println(&format!("    credentials: {account}/{method}"));
+                        }
                         for ch in &peer.channels_detail {
                             ctx.println(&format!("      {} tx={} rx={}", ch.name, ch.tx, ch.rx));
                         }

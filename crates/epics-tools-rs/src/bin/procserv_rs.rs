@@ -35,8 +35,10 @@ mod app {
         version
     )]
     struct Args {
-        /// TCP port to listen on (`-p` / `--port` in C procServ).
-        #[arg(short = 'p', long)]
+        /// TCP port to listen on (`-P` / `--port` in C procServ,
+        /// procServ.cc:251,264). Note `-P` (uppercase): C binds the
+        /// control port to `-P` and the PID file to `-p` (lowercase).
+        #[arg(short = 'P', long)]
         port: Option<u16>,
 
         /// Bind to all interfaces; default is localhost only.
@@ -94,8 +96,10 @@ mod app {
         #[arg(short = 'F', long = "timefmt", value_name = "FMT")]
         timefmt: Option<String>,
 
-        /// PID file (`--pidfile`).
-        #[arg(long)]
+        /// PID file (`-p` / `--pidfile` in C procServ,
+        /// procServ.cc:250,264). Note `-p` (lowercase): C binds the PID
+        /// file to `-p` and the control port to `-P` (uppercase).
+        #[arg(short = 'p', long)]
         pidfile: Option<PathBuf>,
 
         /// Info file (`--info-file`).
@@ -573,6 +577,38 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "--killsig=-2", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.kill_signal, 2);
+        }
+
+        /// C binds `-P` (uppercase) to the control port and `-p`
+        /// (lowercase) to the PID file (procServ.cc:250-251,264). The
+        /// Rust shorts must match: `-P 4051` → port, `-p /run/x.pid` →
+        /// pidfile — the inverse of the old port-on-`-p` assignment.
+        #[test]
+        fn short_p_is_pidfile_and_short_uppercase_p_is_port() {
+            let args = Args::try_parse_from([
+                "procserv-rs",
+                "-P",
+                "4051",
+                "-p",
+                "/run/ioc.pid",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.listen.tcp_port, Some(4051));
+            assert_eq!(cfg.logging.pid_path, Some(PathBuf::from("/run/ioc.pid")));
+        }
+
+        /// `-p` no longer parses as the port: a path value is rejected by
+        /// the u16 port parser only if mis-routed, but here `-p` must take
+        /// the pidfile path and leave the port unset.
+        #[test]
+        fn short_p_does_not_set_the_port() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "-p", "/run/ioc.pid", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.listen.tcp_port, None);
+            assert_eq!(cfg.logging.pid_path, Some(PathBuf::from("/run/ioc.pid")));
         }
 
         /// No `--exec` → exec the positional command itself

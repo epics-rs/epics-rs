@@ -157,7 +157,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C accepts multiple `-P` endpoints + richer syntax: bind a specific NIC (`192.168.1.5:4051`), several ports at once, a group-restricted UNIX socket (`unix:ioc:operators:0660:/run/ioc.sock`), or an abstract socket (`unix:@name`). Rust takes one numeric `--port` (localhost or 0.0.0.0 only) + a bare-path `--unixpath`. Interface-specific binds, multi-endpoint configs, UNIX access-control, and abstract sockets are all impossible (and a `user:grp:perm:` path either fails to bind or silently loses access-control intent).
 
 #### PS-14 `-p` / `-P` short-option letters swapped (pidfile vs port)
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (this round)
+- Resolution: swapped the short letters to match C (procServ.cc:250-251,264): `--port` now takes `-P` (was `-p`), `--pidfile` now takes `-p` (was long-only). A wrapper `procServ -p /run/x.pid -P 4051 …` now routes the pidfile and port to the correct fields. **Breaking CLI change**, per the locked C-faithful CLI decision. Tests: `short_p_is_pidfile_and_short_uppercase_p_is_port`, `short_p_does_not_set_the_port`. (`-P`'s value stays a `u16` here; PS-13 expands it to the full endpoint-spec surface.)
 - Rust: `src/bin/procserv_rs.rs:39` (`-p`/`--port`), `:96-97` (`--pidfile`, long-only)
 - C: `procServ.cc:250-251,264,381-388` (`-p`/`--pidfile`, `-P`/`--port`)
 - Impact: C binds `-p <file>` to the PID file and `-P <endpoint>` to the control port. Rust reassigns `-p` to the TCP port and provides no `-P`. A wrapper `procServ -p /run/x.pid -P 4051 …` treats `/run/x.pid` as a (rejected) port and fails on `-P`. Silent semantic inversion of a core flag.

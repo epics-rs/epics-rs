@@ -250,4 +250,11 @@ contracts / behavioral models, not just a driver site.
   the first. Added the guard at the top of `connect` (mirror: `io.inner.is_some()`).
   Reconnect is unaffected — the F1 teardown clears `io.inner` before the actor's
   `!connected`-gated reconnect runs. Test: `connect_rejects_double_open`.
+- **DRV-40** (LOW, serial connect double-open guard) — CLEARED. Sibling of
+  DRV-12 in the F6 "reject double-open" half. C `drvAsynSerialPort.c::connectIt`
+  (694-698) returns asynError "Link already open!" when `tty->fd >= 0`; the Rust
+  `connect` called `libc::open` unconditionally, overwriting `io.fd` (leaking the
+  old fd) and `saved_termios` (losing the original device settings). Added the
+  guard at the top of `connect` (mirror: `io.fd.is_some()`). Test:
+  `test_pty_connect_rejects_double_open`.
 

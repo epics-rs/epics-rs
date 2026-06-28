@@ -569,6 +569,15 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        // C drvAsynSerialPort.c::connectIt (694-698): reject a connect on
+        // an already-open link ("Link already open!") rather than opening a
+        // second fd and leaking the first (along with its saved termios).
+        if self.io.fd.is_some() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{}: Link already open!", self.base.port_name),
+            });
+        }
         // 1. Open device
         let c_path =
             std::ffi::CString::new(self.config.device.as_str()).map_err(|_| AsynError::Status {
@@ -1640,6 +1649,34 @@ mod tests {
         let t = drv.get_current_termios().unwrap();
         let actual_speed = unsafe { libc::cfgetospeed(&t) };
         assert_eq!(actual_speed, libc::B115200);
+    }
+
+    #[test]
+    fn test_pty_connect_rejects_double_open() {
+        // C drvAsynSerialPort.c::connectIt (694-698) returns asynError
+        // "Link already open!" on a connect to an already-open link,
+        // rather than opening a second fd and leaking the first.
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        let first_fd = drv.io.fd;
+        assert!(first_fd.is_some());
+
+        let err = drv.connect(&user).unwrap_err();
+        assert!(matches!(err, AsynError::Status { .. }));
+        // The original fd (and its saved termios) is left intact.
+        assert_eq!(drv.io.fd, first_fd);
+        assert!(drv.saved_termios.is_some());
     }
 
     #[test]

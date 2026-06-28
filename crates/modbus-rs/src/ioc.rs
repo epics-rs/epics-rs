@@ -14,8 +14,12 @@
 //!
 //! Per the confirmed `drvUser` model, the C `pasynUser->drvUser` per-record
 //! `{dataType, len}` struct has no asyn-rs equivalent: the data type is
-//! encoded in the reason and the optional `=N` string length is dropped — a
-//! string record's length comes from its own record buffer (`NELM`).
+//! encoded in the reason and the optional `=N` string length value is dropped
+//! — a string record's length comes from its own record buffer (`NELM`)
+//! (R34, structurally blocked by the `drv_user_create -> usize` contract). The
+//! `=N` *validation* is still enforced (R51): the suffix is legal only for the
+//! eight string types and must be a non-negative integer, so an invalid
+//! `drvInfo` fails record init as in C rather than being silently accepted.
 //!
 //! # Absolute addressing
 //!
@@ -516,6 +520,40 @@ impl ModbusPortDriver {
     }
 }
 
+/// Parse a drvUser `=N` string-length suffix the way C does
+/// (drvModbusAsyn.cpp:398-404): `strtol(suffix, &endptr, 0)` then reject if
+/// `endptr[0] != '\0'` (trailing junk) or the value is negative. Base 0 means
+/// `0x`/`0X` → hex, a leading `0` → octal, otherwise decimal. An empty suffix
+/// (`TYPE=`) parses as 0, which C accepts. Returns the parsed non-negative
+/// length, or `None` if C would reject the suffix. The length value is
+/// currently discarded by the caller (R34); only the accept/reject result is
+/// used (R51).
+fn parse_drvuser_string_len(suffix: &str) -> Option<i64> {
+    // C `strtol` skips leading whitespace and honours a leading sign; a real
+    // drvInfo carries neither, but mirror the accept set so parity holds.
+    let s = suffix.trim_start_matches([' ', '\t']);
+    if s.is_empty() {
+        // `strtol("")` returns 0 with `endptr` at the terminator → C accepts.
+        return Some(0);
+    }
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let value = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        i64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse::<i64>().ok()?
+    };
+    let value = if negative { -value } else { value };
+    (value >= 0).then_some(value)
+}
+
 impl PortDriver for ModbusPortDriver {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -526,12 +564,46 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
-        // Everything after a '=' is the optional string length — parsed and
-        // dropped (see the module docs).
-        let base_info = drv_info.split('=').next().unwrap_or(drv_info).trim();
-        self.base
+        // C `drvUserCreate` (drvModbusAsyn.cpp:368-433) strips everything after
+        // the first '=' to resolve the data-type name, then validates the
+        // optional `=N` string-length suffix: it is legal ONLY for the eight
+        // string types (`strtol` base 0, non-negative); a non-string type with
+        // a suffix, or a garbage/negative length, is rejected with `asynError`
+        // (:399-412). The parsed length itself has no asyn-rs home — the reason
+        // carries only the data type (R34) — so it is dropped, but the
+        // validation is kept so an invalid `drvInfo` fails record init as in C
+        // rather than being silently accepted (R51).
+        let mut parts = drv_info.splitn(2, '=');
+        let base_info = parts.next().unwrap_or(drv_info).trim();
+        let suffix = parts.next();
+        let reason = self
+            .base
             .find_param(base_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))
+            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+        if let Some(suffix) = suffix {
+            let is_string = self
+                .reason_to_datatype
+                .get(reason)
+                .copied()
+                .flatten()
+                .is_some_and(|dt| dt.is_string());
+            if !is_string {
+                // C: the `=` length suffix is invalid for a non-string type.
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("invalid drvUser (length suffix on non-string): {drv_info}"),
+                });
+            }
+            if parse_drvuser_string_len(suffix).is_none() {
+                // C: `strtol` base 0 with the `endptr[0] != '\0' || len < 0`
+                // guard rejects garbage or a negative length.
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("invalid string length: {suffix}"),
+                });
+            }
+        }
+        Ok(reason)
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
@@ -1391,6 +1463,59 @@ mod tests {
         )
         .expect("absolute addressing port must build");
         assert!(driver.is_absolute());
+    }
+
+    /// R51: the drvUser `=N` suffix is validated as C does — legal only for
+    /// the eight string types, where it must be a non-negative integer
+    /// (`strtol` base 0). A bare type, a valid string length, hex, and an empty
+    /// suffix resolve; garbage, a negative length, and any suffix on a
+    /// non-string type are rejected so record init fails (drvModbusAsyn.cpp
+    /// :387-412).
+    #[test]
+    fn drv_user_create_validates_string_length_suffix() {
+        let driver = ModbusPortDriver::new(
+            "MB_DRVUSER",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        // Accepted.
+        assert!(driver.drv_user_create("STRING_HIGH").is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=5").is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=0x10").is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=010").is_ok());
+        assert!(
+            driver.drv_user_create("STRING_HIGH=").is_ok(),
+            "empty length parses as 0, which C accepts"
+        );
+        assert!(driver.drv_user_create("INT16").is_ok());
+        // Rejected: garbage / negative length on a string type.
+        assert!(driver.drv_user_create("STRING_HIGH=abc").is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=5x").is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=-3").is_err());
+        // Rejected: a length suffix on a non-string type.
+        assert!(driver.drv_user_create("INT16=5").is_err());
+        assert!(driver.drv_user_create("UINT16=0").is_err());
+        // Still rejected: an unknown type name.
+        assert!(driver.drv_user_create("NOPE").is_err());
+    }
+
+    /// Unit-level coverage of the `strtol` base-0 accept/reject set the
+    /// drvUser validator depends on (drvModbusAsyn.cpp:398-404).
+    #[test]
+    fn parse_drvuser_string_len_matches_strtol_base0() {
+        assert_eq!(parse_drvuser_string_len("5"), Some(5));
+        assert_eq!(parse_drvuser_string_len("0"), Some(0));
+        assert_eq!(parse_drvuser_string_len(""), Some(0));
+        assert_eq!(parse_drvuser_string_len("0x10"), Some(16));
+        assert_eq!(parse_drvuser_string_len("0X1f"), Some(31));
+        assert_eq!(parse_drvuser_string_len("010"), Some(8)); // octal
+        assert_eq!(parse_drvuser_string_len("+7"), Some(7));
+        assert_eq!(parse_drvuser_string_len("abc"), None);
+        assert_eq!(parse_drvuser_string_len("5x"), None);
+        assert_eq!(parse_drvuser_string_len("-3"), None);
+        assert_eq!(parse_drvuser_string_len("-"), None);
     }
 
     /// Absolute-mode `read_int32`: the record's asyn `addr` is the absolute

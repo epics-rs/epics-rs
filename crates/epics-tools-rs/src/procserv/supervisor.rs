@@ -438,7 +438,16 @@ impl SupervisorState {
                 Ok(ChildLoopOutcome::Continue)
             }
             ChildEvent::Exited { exit } => {
-                let started_at = self.child.take().map(|slot| slot.started_at);
+                let started_at = self.child.take().map(|slot| {
+                    // C ~processClass SIGKILLs the child's whole process
+                    // group on every death to reap grandchildren the child
+                    // spawned, before the next launch (processFactory.cc:117).
+                    // Hardcoded SIGKILL, independent of killSig. The pgid
+                    // equals the (now-reaped) leader pid and stays valid
+                    // while any group member survives.
+                    let _ = slot.handle.signal(libc::SIGKILL);
+                    slot.started_at
+                });
                 // C's SIGCHLD reaper distinguishes a normal exit from a
                 // signal death (procServ.cc:794-805); never collapse a
                 // signal into 128+sig.

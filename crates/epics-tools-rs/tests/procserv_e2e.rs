@@ -536,6 +536,57 @@ async fn two_clients_share_same_party_line() {
 }
 
 #[tokio::test]
+async fn child_exit_sigkills_orphaned_process_group() {
+    // C ~processClass SIGKILLs the child's process group on death so a
+    // grandchild the child backgrounded does not survive
+    // (processFactory.cc:117). The shell backgrounds a long `sleep`
+    // (same process group — no job control in a non-interactive shell),
+    // records its PID to a file, then exits; the group SIGKILL must reap
+    // the sleep.
+    let port = pick_port().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("gpid");
+    let pf = pidfile.to_str().unwrap().to_string();
+
+    let mut cfg = cat_config(port); // Disabled: child exits, server stays up
+    cfg.child.program = PathBuf::from("/bin/sh");
+    cfg.child.args = vec!["-c".into(), format!("sleep 30 & echo $! > '{pf}'; exit 0")];
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    // Wait for the grandchild PID to be recorded.
+    let gpid: i32 = {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Some(p) = s.split_whitespace().next().and_then(|x| x.parse().ok())
+            {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "grandchild pid never recorded");
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    // Give the supervisor time to reap the child and SIGKILL the group,
+    // and init/launchd time to reap the killed grandchild.
+    sleep(Duration::from_millis(700)).await;
+
+    let still_alive = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -0 {gpid} 2>/dev/null"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        !still_alive,
+        "grandchild {gpid} must be SIGKILLed with the child's process group"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn norestart_keeps_server_alive_after_child_exit() {
     // C `norestart` (Rust RestartMode::Disabled): the child exits but
     // the SERVER stays up — only `oneshot` sets shutdownServer. The

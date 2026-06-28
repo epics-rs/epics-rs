@@ -28,6 +28,21 @@ const LISTEN_BACKLOG: u32 = 1024;
 /// and just pause briefly so a stuck error doesn't busy-spin (PS-35).
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Removes a filesystem UNIX-socket node when its listener task ends,
+/// mirroring C's `~acceptItemUNIX` destructor (`acceptFactory.cc:331-335`,
+/// `unlink(addr.sun_path)` for non-abstract sockets). Held across the
+/// accept loop, it fires on normal return AND on task abort / runtime
+/// teardown alike — the future, and this guard with it, is dropped at the
+/// suspended `.await` — so the socket file never outlives the listener.
+/// Abstract sockets have no filesystem presence and get no guard (PS-36).
+struct UnlinkOnDrop(std::path::PathBuf);
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Run the TCP listener loop until the supervisor's `out` channel
 /// closes. Each accepted socket is wrapped in [`IncomingClient`] and
 /// forwarded.
@@ -106,6 +121,11 @@ pub async fn run_unix(
     out: mpsc::Sender<IncomingClient>,
 ) -> ProcServResult<()> {
     let listener = bind_unix(&ep)?;
+    // Unlink the filesystem socket node when this task ends, so a clean
+    // shutdown leaves no stale node behind (C `~acceptItemUNIX`,
+    // acceptFactory.cc:331-335). Abstract sockets have no filesystem
+    // presence, so they get no guard (PS-36).
+    let _unlink_guard = (!ep.abstract_socket).then(|| UnlinkOnDrop(ep.name.clone()));
     // `ClientPeer::Unix` is display-only; an abstract socket has no
     // filesystem path, so report `None` for it.
     let peer_path = (!ep.abstract_socket).then(|| ep.name.clone());
@@ -306,6 +326,31 @@ mod tests {
         assert_eq!(buf[0], b'y');
 
         server.abort();
+    }
+
+    /// PS-36: a filesystem socket node must be unlinked when the listener
+    /// task ends (clean shutdown leaves nothing behind), mirroring C's
+    /// `~acceptItemUNIX` destructor. Aborting the task drops its future and
+    /// the in-scope `UnlinkOnDrop` guard with it.
+    #[tokio::test]
+    async fn unix_socket_file_unlinked_when_listener_task_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ioc.sock");
+        let ep = UnixEndpoint::filesystem(path.clone());
+
+        let (tx, _rx) = mpsc::channel(4);
+        let server = tokio::spawn(async move { run_unix(ep, false, tx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(path.exists(), "socket file should exist while listening");
+
+        // Abort the listener task; awaiting the handle lets the runtime drop
+        // the future (and the unlink guard) before we re-check the path.
+        server.abort();
+        let _ = server.await;
+        assert!(
+            !path.exists(),
+            "socket file should be unlinked after the listener task ends"
+        );
     }
 
     /// PS-24: C `chmod`s a filesystem socket to its `perms` after bind

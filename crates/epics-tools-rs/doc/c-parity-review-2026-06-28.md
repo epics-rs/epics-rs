@@ -320,11 +320,12 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: On a transient accept failure (EMFILE) C tears down and re-creates the whole listen socket (briefly unbinding, dropping queued connections — questionable); Rust correctly keeps the bound listener. Aside: Rust's retry has no backoff, so a *persistent* error tight-loops `accept→warn→accept` burning CPU until an fd frees; C re-enters `pselect` (0.5s) between attempts. A small backoff would close the busy-loop without copying C's unbind.
 - Resolution: added a 100ms `ACCEPT_ERROR_BACKOFF` sleep after a logged accept error in **both** accept loops (TCP + UNIX — same defect, fixed at both sites), so a persistent `EMFILE`/`ENFILE` no longer busy-spins a core; recovery is within 100ms of an fd freeing. We keep declining C's `remakeConnection` unbind (the bound listener and its queued connections survive); the backoff only closes the busy-loop the audit flagged. `cargo clippy`/`nextest` on `epics-tools-rs` clean.
 
-#### PS-36 UNIX socket file not unlinked on shutdown
+#### PS-36 UNIX socket file not unlinked on shutdown — CLEARED
 - Severity: NOTE
 - Rust: `src/procserv/listener.rs:63-91` (removes a stale file only at startup `:69`; no unlink on drop, despite the `:58-62` comment claiming "best-effort unlink here too")
 - C: `acceptFactory.cc:331-335` (`~acceptItemUNIX` → `unlink(addr.sun_path)` for non-abstract)
 - Impact: After a clean Rust shutdown the socket file is left on disk; C removes it. Self-corrects on next start, but between runs a liveness check testing the socket file's existence sees a stale node. (Stale comment to fix or implement.)
+- Resolution: added an `UnlinkOnDrop(PathBuf)` RAII guard, created in `run_unix` for filesystem (non-abstract) sockets and held across the accept loop. It mirrors C's `~acceptItemUNIX` destructor and fires on both exit paths — the supervisor dropping `incoming_rx` (`out.send` fails → normal return) and runtime/abort teardown (the future, and the guard with it, is dropped at the suspended `.await`) — so the socket node never outlives the listener. Abstract sockets have no filesystem presence and get no guard. The "stale comment" the finding cites no longer exists (line numbers had shifted; the surviving comments at `:89-92`/`:135-137` already correctly describe the *startup* unlink). New test `unix_socket_file_unlinked_when_listener_task_ends`. 146/146 nextest pass.
 
 #### PS-37 SIGPIPE notice is never broadcast (C announces it to all clients)
 - Severity: NOTE

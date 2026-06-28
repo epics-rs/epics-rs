@@ -903,8 +903,20 @@ impl PortDriver for DrvAsynIPPort {
                 stream.set_nodelay(enabled)?;
             }
         } else if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
-            self.disconnect_on_read_timeout =
-                value == "Y" || value == "y" || value == "1" || value == "yes";
+            // C drvAsynIPPort.c::setOption (924-935): only "Y"/"N"
+            // (case-insensitive) are valid; any other value returns
+            // asynError "Invalid disconnectOnReadTimeout value." rather
+            // than silently coercing the unknown text to "off".
+            if value.eq_ignore_ascii_case("Y") {
+                self.disconnect_on_read_timeout = true;
+            } else if value.eq_ignore_ascii_case("N") {
+                self.disconnect_on_read_timeout = false;
+            } else {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("Invalid disconnectOnReadTimeout value: '{value}'"),
+                });
+            }
         } else if key.eq_ignore_ascii_case("hostInfo") {
             // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
             //
@@ -1330,6 +1342,29 @@ mod tests {
         let mut buf = [0u8; 32];
         let _ = drv.read_octet(&user, &mut buf);
         assert!(!drv.base().connected);
+    }
+
+    #[test]
+    fn test_disconnect_on_read_timeout_value_validation() {
+        // C drvAsynIPPort.c::setOption (924-935) accepts only "Y"/"N"
+        // (case-insensitive) and returns asynError for anything else,
+        // rather than silently coercing unknown text to "off".
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+        drv.set_option("disconnectOnReadTimeout", "n").unwrap();
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+
+        // Values C never accepts must now error instead of mapping to "off".
+        for bad in ["1", "yes", "true", "", "maybe"] {
+            assert!(
+                drv.set_option("disconnectOnReadTimeout", bad).is_err(),
+                "value {bad:?} should be rejected"
+            );
+        }
+        // The last accepted value (N) is unchanged by the rejected sets.
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
     }
 
     // --- hostInfo option tests ---

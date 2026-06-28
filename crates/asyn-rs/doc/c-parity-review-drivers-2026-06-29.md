@@ -219,4 +219,28 @@ contracts / behavioral models, not just a driver site.
   (port.rs:875) used by `ip_server`/`prologix`, whose C drivers register no
   `asynOption` interface at all — an interface-advertisement question for the
   F7/interface sign-off, not the known-key-chain leak.
+- **DRV-10** (LOW, disconnectOnReadTimeout value validation) — CLEARED. The
+  `disconnectOnReadTimeout` branch coerced any value to a bool via a lenient
+  truthy parse (`"Y"|"y"|"1"|"yes"` → true, everything else → false) and never
+  errored. C `drvAsynIPPort.c::setOption` (924-935) accepts only "Y"/"N"
+  (case-insensitive) and returns asynError "Invalid disconnectOnReadTimeout
+  value." for anything else. The branch now validates strictly and errors on
+  any non-Y/N value (including the empty string), matching C and the "Y"/"N"
+  shape that `get_option` already reports. Test:
+  `test_disconnect_on_read_timeout_value_validation`. Defect-family anchor: the
+  same lenient parse also drives `noDelay` (ip_port.rs:900); that one is
+  DISTINCT — C has no `noDelay` option key (DRV-8), so there is no C
+  value-validation contract; its parse is part of the DRV-8 superset.
+- **DRV-8** (CONCERN, noDelay is a non-C option key) — KEPT as an intentional
+  Rust superset (documented divergence, no code change). C
+  `drvAsynIPPort.c:525-534` sets TCP_NODELAY unconditionally on every TCP/INET
+  socket with no option key. Rust's `no_delay` defaults to `true` for every
+  TCP port built via `IpPortConfig::parse` (ip_port.rs:110), so the default
+  behavior already matches C (NODELAY on); the `noDelay` option only adds the
+  ability to turn it off, a superset feature like the IPv6/Unix-socket
+  extensions. This is not a C-bug copy (C's lack of a toggle is not a bug, and
+  the Rust default matches C's behavior), so it is recorded as an intentional
+  divergence rather than fixed. The HTTP path (ip_port.rs:740) sets NODELAY
+  unconditionally like C; the conditional only governs the configurable
+  TCP/TcpReusePort path.
 

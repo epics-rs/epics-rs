@@ -46,10 +46,12 @@ SET_ENC_RATIO is a real controller-config command but no in-repo controller
 consumes it; hook spec recorded in the finding for when a driver needs it).
 **Rejected (1):** R42 (empirically falsified — the MIP_EXTERNAL detector fires
 during init via the default `dmov=true`, so the boot-mid-motion axis closes the
-loop; no defect). **Remaining open (1):** R65 (idle DIFF/RDIF over-post — a new
-finding surfaced by the 01KW5QV confirming round on R61; design under review, see
-below). The original 22 audit findings are all cleared, dispositioned, or
-rejected; R65 is downstream of the R61 always-on poller.
+loop; no defect). **Remaining open (0): converged.** R65 (idle DIFF/RDIF
+over-post — surfaced by the 01KW5QV confirming round on R61) is CLEARED in
+`8568f173`, validated by the 01KW5SS round (3 opus panels: change-gate
+C-faithful, C strands the held jog, preserve-the-resume the decisive call).
+The original 22 audit findings are all cleared, dispositioned, or rejected;
+R65 was downstream of the R61 always-on poller.
 
 ---
 
@@ -521,6 +523,18 @@ routes into `plan_absolute_move`. No defect.
   review round to confirm reachability before any edit. Found during the R1 defect-family sweep.
 
 #### R65 — Idle poll re-processes a stationary axis every period, re-posting DIFF/RDIF; C posts nothing
+- **Status: CLEARED** in `8568f173`, validated by round `01KW5SS` (3 opus panels). Resolution:
+  the change-gate (`poll_and_notify` notifies only on a real `MotorStatus` change = C `statusChanged_`;
+  `PollDirective::Refresh` forces a notify for `request_poll`/`status_refresh` = C `motorUpdateStatus_`)
+  is C-faithful (Panel A VERIFIED-CORRECT; Panel C found no other suppressed path). The held-jog
+  interaction was resolved by **preserving** the Rust resume (Panel B decisive: C strands a jog held
+  across a positional completion — `special()` arms `MIP_JOG_REQ` only at `mip==MIP_DONE`,
+  motorRecord.cc:3045 — and stranding an actively-held button is user-hostile, so per "don't copy C's
+  bugs" the resume stays). Structural single-owner fix: `finalize_motion` requests one bounded forced
+  poll when a dispatchable button (jog/home/tweak) is held, closing the whole deferral family Panel B
+  enumerated (`state_machine.rs:63/205/270/315/340/364/708`, `command_planner.rs:867`). The prior unit
+  test passed for the wrong reason (called `check_completion()` directly); a real-poll-loop integration
+  test now drives the record only on `io_intr` and fails without the forced poll.
 - **Severity:** CONCERN (monitor-semantics + CPU divergence; not a wrong-value bug). Surfaced by the
   `01KW5QV` confirming round on R61 (the always-on idle poller). Downstream of R61: once the idle
   poller never stops, the unconditional notify path turns "poller alive" into "record processed

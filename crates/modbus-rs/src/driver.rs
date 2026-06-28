@@ -253,6 +253,15 @@ impl IoStatistics {
             self.histogram[bin] = self.histogram[bin].saturating_add(1);
         }
     }
+
+    /// Erase the read-time histogram counts. The single owner of the
+    /// "zero the histogram" transition that C performs on an ENABLE_HISTOGRAM
+    /// OFF→ON edge (drvModbusAsyn.cpp:636-638) and on a HISTOGRAM_BIN_TIME
+    /// change (:799-800), so stale counts are neither carried across a
+    /// re-enable nor misattributed when the bin width changes.
+    pub(crate) fn clear_histogram(&mut self) {
+        self.histogram.fill(0);
+    }
 }
 
 /// A byte-stream transport — the underlying `asyn-rs` octet port the framed

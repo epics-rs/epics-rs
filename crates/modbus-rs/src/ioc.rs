@@ -832,7 +832,15 @@ impl PortDriver for ModbusPortDriver {
     ) -> AsynResult<()> {
         // ENABLE_HISTOGRAM toggles read-time histogram accumulation.
         if user.reason == self.enable_histogram_reason {
-            self.engine.stats.histogram_enabled = value != 0;
+            // C `writeUInt32Digital` (drvModbusAsyn.cpp:633-641): on an OFF→ON
+            // transition, erase the existing counts before enabling so a
+            // re-enable starts clean. A no-op when already enabled or on
+            // disable.
+            let enabling = value != 0;
+            if enabling && !self.engine.stats.histogram_enabled {
+                self.engine.stats.clear_histogram();
+            }
+            self.engine.stats.histogram_enabled = enabling;
             return Ok(());
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -1412,6 +1420,36 @@ mod tests {
             driver.read_int32(&AsynUser::new(read_ok_reason)).unwrap(),
             0,
         );
+    }
+
+    /// R47: re-enabling the histogram (OFF→ON) must erase stale counts first
+    /// (C drvModbusAsyn.cpp:633-641). Disabling, or re-asserting ENABLE while
+    /// already on, must NOT clear.
+    #[test]
+    fn enable_histogram_rising_edge_clears_counts() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_HIST_EN",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        let reason = driver.base.find_param(PARAM_ENABLE_HISTOGRAM).unwrap();
+        let mut user = AsynUser::new(reason);
+
+        // Enable, then stash a count as if an I/O had been timed.
+        driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
+        driver.engine.stats.histogram[3] = 5;
+        // Re-asserting ENABLE while already on must NOT clear (no rising edge).
+        driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
+        assert_eq!(driver.engine.stats.histogram[3], 5);
+        // Disabling must NOT clear (C clears only on the OFF→ON edge).
+        driver.write_uint32_digital(&mut user, 0, 0xFFFF).unwrap();
+        assert_eq!(driver.engine.stats.histogram[3], 5);
+        // OFF→ON re-enable must erase the stale count.
+        driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
+        assert_eq!(driver.engine.stats.histogram[3], 0);
+        assert!(driver.engine.stats.histogram_enabled);
     }
 
     /// Absolute-mode `read_octet` for a single-byte string encoding

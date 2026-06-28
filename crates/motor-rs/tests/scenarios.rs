@@ -1633,6 +1633,14 @@ fn close_enough_defers_held_jog_to_next_idle_poll() {
         "close-enough must NOT re-fire the jog in the completion pass, got {:?}",
         effects.commands
     );
+    // ...but it MUST request the forced poll that delivers the resume pass —
+    // otherwise the change-gate suppresses the unchanged settle poll and the
+    // held jog strands. (This is the unit-level guard of the R65 fix; the
+    // second check_completion below only proves the resume given a pass.)
+    assert!(
+        effects.request_poll,
+        "completion with a held jog must request the forced settle poll"
+    );
 
     // The next idle poll (level-triggered) re-fires the held jog.
     complete_move(&mut rec, 10.0);
@@ -1648,6 +1656,33 @@ fn close_enough_defers_held_jog_to_next_idle_poll() {
         )),
         "idle poll must resume the held jog, got {:?}",
         effects.commands
+    );
+}
+
+/// The SET-mode pp-resync early-return (state_machine.rs:401) quiesces the axis
+/// WITHOUT finalize_motion and dispatches nothing — a formerly-bypassing member
+/// of the held-button deferral family. With the idle-poll change-gate it would
+/// strand a held jog. The shared `request_poll_for_held_button` owner now closes
+/// it too: the pp-resync must request the forced poll.
+#[test]
+fn pp_resync_requests_forced_poll_for_held_jog() {
+    let mut rec = make_record();
+    // dispatch_res_reanchor (SET && !IGSET) armed pp + a forced poll; the
+    // forced poll lands on this Idle-arm pp-resync with a jog still held.
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.internal.pp = true;
+    rec.ctrl.jogf = true;
+    // Reached only with the axis already done and idle (make_record sets
+    // msta=DONE; a fresh record is Idle with movn=false).
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(!rec.stat.movn);
+
+    let effects = rec.check_completion();
+
+    assert!(!rec.internal.pp, "the pp-resync consumes pp");
+    assert!(
+        effects.request_poll,
+        "the pp-resync early-return must request a forced poll so the held jog is not stranded by the change-gate"
     );
 }
 

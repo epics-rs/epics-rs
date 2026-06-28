@@ -456,3 +456,34 @@ asyn-rs gap as modbus R34/R52/R54):**
 **Verification-blocked — Autoparam source absent under `/Users/stevek/codes`:**
 MQ51 (write-side cache-update parity), MQ19 (whether autoparam trims
 `arguments`). Need the autoparam module path to resolve.
+
+---
+
+## Review Log
+
+### Round 1 (2026-06-28) — 4-panel opus audit
+Categories: connection/lifecycle, address grammar, payload codec, IOC wiring.
+Produced MQ1–MQ51. Themes: connection-state gating (MQ1), record-processing
+model (MQ46/MQ51), accept/reject + byte-encoding boundaries (MQ16/MQ31–MQ41),
+and the recurring asyn-rs framework gap (MQ2/MQ38/MQ47, same as modbus
+R34/R52/R54). Doc committed before any fix (`566e4881`).
+
+### Round 2 (2026-06-28) — fix + 2-panel opus convergence
+Fixed the 5 clean round-1 findings (MQ46/MQ17/MQ41/MQ34/MQ1), then batch 2
+(MQ32/MQ40/MQ39). A round-1 verification round caught a **defect in the MQ1
+fix** (digital handler committed its cache before the gate); closed structurally
+in `f8dd9fb4` (single-owner `ensure_connected()` called at the top of
+`write_uint32_digital`). The round-2 convergence round (parity + adversarial,
+opus) returned **CONVERGED** on all four batch-2 commits with no regressions,
+and surfaced two pre-existing items now documented: **MQ52** (Rust implements
+JSON writes C leaves unimplemented — z2m extension) and a precise restatement of
+the MQ32 kept comma/bracket leniencies (cross-ref MQ33).
+
+**Remaining open (not fixable without out-of-band input):**
+- asyn-rs framework contract (MQ2/MQ47/MQ38) — needs design sign-off; same gap
+  as modbus R34/R52/R54.
+- Verification-blocked (MQ51/MQ19) — Autoparam source absent under
+  `/Users/stevek/codes`.
+
+Per-crate `cargo nextest -p mqtt-rs` (101 pass) + `clippy -D warnings` green;
+full-workspace pass owed before any push. Nothing pushed.

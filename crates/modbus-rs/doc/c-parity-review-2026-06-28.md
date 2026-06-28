@@ -115,13 +115,16 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   A CHAR/UCHAR waveform gets `NORD=strlen` vs C `strlen+1`; asyn octet
   `ASYN_EOM_CNT` is one short.
 
-### R32 — float→integer saturates instead of C's truncating cast
-- **Severity:** CONCERN (boundary/NaN only; in-range exact)
+### R32 — float→integer saturates instead of C's truncating cast — CLEARED (bf98cffa, intentional divergence)
+- **Severity:** NOTE — intentional-divergence aside, **not a defect**
 - **Rust:** `datatype.rs:379` (`f as i32 as i64`; also `write_float` `:504`)
 - **C:** `drvModbusAsyn.cpp:2572` (`(epicsInt32)fValue`)
 - `f as i32` saturates (NaN→0, overflow→INT32_MAX); the C truncating cast yields
-  INT_MIN (0x80000000) on x86 for NaN / out-of-range. The `read_int64` doc comment
-  claiming "exactly as the C code does" is imprecise at this boundary.
+  INT_MIN (0x80000000) on x86 for NaN / out-of-range — UB the standard does not pin.
+  Per "do not copy C's bugs" the saturating result is kept; in-range values are
+  byte-identical. The original disposition was a CONCERN only because the doc comments
+  overclaimed bit-exactness ("exactly as the C code does", "matching C"); bf98cffa
+  rewrites those comments to state the deliberate boundary difference. No behaviour change.
 
 ### R33 — (DUPLICATE of R16) Acknowledge bumps READ_OK/WRITE_OK — CLEARED (with R16)
 - Folded into **R16**. Same defect, found independently by the datatype reviewer

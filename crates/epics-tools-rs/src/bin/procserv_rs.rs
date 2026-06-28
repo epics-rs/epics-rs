@@ -139,8 +139,11 @@ mod app {
         #[arg(long, default_value_t = 20)]
         toggle_restart_char: u8,
 
-        /// Logout character (Ctrl-] = 29). 0 to disable.
-        #[arg(long, default_value_t = 29)]
+        /// Logout character. Disabled by default to match C, whose
+        /// `logoutChar` starts at `0x00` and is enabled only by
+        /// `--logoutcmd` (procServ.cc:70,403). Give a non-zero byte to
+        /// enable `^]`-style client logout; `0` keeps it off.
+        #[arg(long, default_value_t = 0)]
         logout_char: u8,
 
         /// Program to launch + its arguments. Everything after `--`.
@@ -350,6 +353,16 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.keys.quit, Some(0x11));
+        }
+
+        /// C starts `logoutChar` at `0x00` (disabled) and enables it only
+        /// via `--logoutcmd` (procServ.cc:70,403); a stock server must not
+        /// disconnect a client on `0x1d`, a byte many telnet clients send.
+        #[test]
+        fn logout_key_disabled_by_default() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.keys.logout, None);
         }
 
         /// Opting in caps the count at the requested value.

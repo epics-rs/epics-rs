@@ -58,7 +58,9 @@ pub struct KeyBindings {
     /// always enabled and never exposed on the CLI (procServ.cc:69);
     /// it fires only while the child is shut down.
     pub quit: Option<u8>,
-    /// Disconnect this client only (default `Ctrl-]` = `0x1d`).
+    /// Disconnect this client only. C `logoutChar` starts at `0x00`
+    /// (disabled) and is enabled only by `--logoutcmd` (procServ.cc:70);
+    /// `^]` (`0x1d`) is merely the value the docs suggest, not a default.
     pub logout: Option<u8>,
 }
 

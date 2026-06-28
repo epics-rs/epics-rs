@@ -124,7 +124,9 @@ mod app {
 
         /// PID file (`-p` / `--pidfile` in C procServ,
         /// procServ.cc:250,264). Note `-p` (lowercase): C binds the PID
-        /// file to `-p` and the control port to `-P` (uppercase).
+        /// file to `-p` and the control port to `-P` (uppercase). When
+        /// absent, the path falls back to the `PROCSERV_PID` env var
+        /// (procServ.cc:224); an empty value means no pidfile.
         #[arg(short = 'p', long)]
         pidfile: Option<PathBuf>,
 
@@ -270,6 +272,16 @@ mod app {
         out
     }
 
+    /// Resolve the PID-file path with C's precedence: `-p`/`--pidfile`
+    /// overrides the `PROCSERV_PID` env var, which provides the default
+    /// when the flag is absent (`procServ.cc:224,382`). An empty value
+    /// (flag or env) means "no pidfile", matching C's
+    /// `!pidFile || strlen(pidFile)==0` guard (`procServ.cc:125`).
+    fn resolve_pidfile(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+        flag.or_else(|| env.map(PathBuf::from))
+            .filter(|p| !p.as_os_str().is_empty())
+    }
+
     /// Parse a single command-key character with C's `getOptionChar`
     /// semantics (`procServ.cc:142-152`): empty → `0` (disabled), `^^` →
     /// `^`, `^A`..`^Z` → the control byte (letter − 64), anything else →
@@ -391,7 +403,7 @@ mod app {
 
         let logging = LoggingConfig {
             log_path: args.logfile,
-            pid_path: args.pidfile,
+            pid_path: resolve_pidfile(args.pidfile, std::env::var_os("PROCSERV_PID")),
             info_path: args.info_file,
             stamp_log,
             time_format,
@@ -759,6 +771,32 @@ mod app {
             assert!(!build_config(plain).unwrap().foreground);
             let dbg = Args::try_parse_from(["procserv-rs", "-d", "/bin/echo"]).unwrap();
             assert!(build_config(dbg).unwrap().foreground);
+        }
+
+        /// PS-30: C pidfile precedence is `-p` over `PROCSERV_PID` env over
+        /// none, with an empty value meaning no pidfile
+        /// (procServ.cc:125,224,382).
+        #[test]
+        fn pidfile_resolves_flag_over_env_over_none() {
+            use std::ffi::OsString;
+            // Flag wins over env.
+            assert_eq!(
+                resolve_pidfile(
+                    Some(PathBuf::from("/run/flag.pid")),
+                    Some(OsString::from("/env"))
+                ),
+                Some(PathBuf::from("/run/flag.pid"))
+            );
+            // Env provides the default when the flag is absent.
+            assert_eq!(
+                resolve_pidfile(None, Some(OsString::from("/run/env.pid"))),
+                Some(PathBuf::from("/run/env.pid"))
+            );
+            // Neither → no pidfile.
+            assert_eq!(resolve_pidfile(None, None), None);
+            // Empty value (flag or env) → no pidfile.
+            assert_eq!(resolve_pidfile(None, Some(OsString::from(""))), None);
+            assert_eq!(resolve_pidfile(Some(PathBuf::from("")), None), None);
         }
 
         /// With no `-n`, C sets `childName == command` (the whole argv

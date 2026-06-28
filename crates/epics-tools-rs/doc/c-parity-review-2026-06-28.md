@@ -278,7 +278,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: In the default C build `--allow` is refused and the control port stays localhost-only (a deliberate security default). Rust honors `--allow` always. A wrapper carrying `--allow` that was inert on stock procServ now exposes the control console to the network.
 
 #### PS-30 `PROCSERV_PID` env not consulted for the pidfile default
-- Severity: CONCERN
+- Severity: CONCERN — CLEARED (this round)
+- Resolution: `build_config` now resolves the pidfile through a pure `resolve_pidfile(flag, env)` helper applying C's precedence — `-p`/`--pidfile` overrides `PROCSERV_PID`, which provides the default when the flag is absent (procServ.cc:224,382) — and an empty value (flag or env) means "no pidfile", matching C's `!pidFile || strlen(pidFile)==0` guard (procServ.cc:125). The env read happens at the build_config call site (`std::env::var_os("PROCSERV_PID")`); the precedence logic is the pure helper, so it is tested without env pollution (`pidfile_resolves_flag_over_env_over_none`: flag>env>none + both empty-cases). `--pidfile` doc comment updated.
 - Rust: `src/procserv/*` (no `PROCSERV_PID` read; pidfile only from `--pidfile`)
 - C: `procServ.cc:224` (`pidFile = getenv("PROCSERV_PID")` when `-p`/`--pidfile` absent)
 - Impact: C lets the PID-file path come from `PROCSERV_PID` (used by some service wrappers). Rust ignores the env entirely, so an environment-driven pidfile is never written.

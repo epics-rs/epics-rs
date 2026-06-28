@@ -942,3 +942,51 @@ async fn toggle_into_oneshot_grants_one_more_run() {
         .expect("supervisor should exit after the spent oneshot")
         .expect("server task join");
 }
+
+#[tokio::test]
+async fn banner_precedes_telnet_negotiation() {
+    // PS-26. C writes the greeting/info banner first and only THEN calls
+    // telnet_negotiate (clientFactory.cc:153-174), so the first bytes on
+    // the wire are the ASCII banner and the IAC (0xFF) negotiation follows.
+    // The Rust port used to send the IAC handshake ahead of the greeting.
+    let port = pick_port().await;
+    let cfg = cat_config(port);
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect: {e}"),
+            }
+        }
+    };
+
+    // Read the raw connect bytes WITHOUT stripping IAC.
+    let raw = read_for(&mut conn, Duration::from_millis(500)).await;
+    assert!(!raw.is_empty(), "server sent nothing on connect");
+
+    // The stream must not open with IAC, and the greeting must appear
+    // entirely before the first IAC byte.
+    assert_ne!(
+        raw.first(),
+        Some(&0xFF),
+        "connect stream must start with the banner, not IAC"
+    );
+    let first_iac = raw
+        .iter()
+        .position(|&b| b == 0xFF)
+        .expect("server must send the telnet IAC negotiation");
+    let before_iac = String::from_utf8_lossy(&raw[..first_iac]);
+    assert!(
+        before_iac.contains("Welcome to procServ"),
+        "the banner must precede the IAC negotiation; bytes before first IAC: {before_iac:?}"
+    );
+
+    server_task.abort();
+}

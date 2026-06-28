@@ -249,7 +249,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C bounds a stuck/dead client's blocking write at 10s, then marks it `_markedForDeletion` and continues; KEEPALIVE surfaces silently-dropped peers. Rust has neither: a silently dead client (cable pull) is never detected, its 64-deep channel fills, and the supervisor's `fanout_*().await` blocks the **entire party-line** (no other client gets output, child PTY processing stalls, new connections can't be accepted) for as long as the OS keeps the TCP write pending — potentially minutes.
 
 #### PS-26 Telnet IAC negotiation written before the banner (order reversed vs C)
-- Severity: CONCERN
+- Severity: CONCERN — CLEARED (this round)
+- Resolution: removed the negotiation prelude from the client write task and moved it into the supervisor's `handle_new_client`, which now enqueues the banner `Bytes` frame *then* the `RawIac(initial_negotiation())` frame — the FIFO outbound channel writes them in that order, so the peer sees `[banner][IAC WILL ECHO][IAC DO LINEMODE]`, matching C's ctor order (write greeting/info, then `telnet_negotiate`, clientFactory.cc:153-174). The write task is now a pure drain loop. C negotiates with every client (the telopt loop is unconditional), so the supervisor enqueues the IAC frame for readonly clients too. Tests: e2e `banner_precedes_telnet_negotiation` (raw connect bytes: stream does not start with `0xFF`, and "Welcome to procServ" appears entirely before the first IAC byte); the three `client.rs` unit tests that skipped the old 6-byte prelude were updated (a bare `spawn_client` now sends nothing until a frame is queued).
 - Merged from: conn PS-36, telnet PS-57
 - Rust: `src/procserv/client.rs:198-210` (write task sends `initial_negotiation()` first, then drains the banner frame)
 - C: `clientFactory.cc:153-174` (constructor `write()`s greeting/info first, then `telnet_init`+`telnet_negotiate`)

@@ -664,7 +664,18 @@ impl SupervisorState {
     async fn handle_new_client(&mut self, incoming: IncomingClient) {
         let (meta, out_tx) = spawn_client(incoming, self.inbound_tx.clone());
         let banner = self.welcome_banner(meta.readonly);
+        // C order (clientFactory.cc:153-174): write the greeting/info
+        // banner first, THEN telnet_negotiate. Enqueue the two frames in
+        // that order so the peer sees `[banner][IAC WILL ECHO][IAC DO
+        // LINEMODE]`, not the IAC bytes ahead of the greeting (PS-26). C
+        // negotiates with every client, readonly included, so this is
+        // unconditional.
         let _ = out_tx.send(OutboundFrame::Bytes(banner.into_bytes())).await;
+        let _ = out_tx
+            .send(OutboundFrame::RawIac(
+                crate::procserv::telnet::initial_negotiation(),
+            ))
+            .await;
         self.clients.insert(
             meta.id,
             ClientEntry {

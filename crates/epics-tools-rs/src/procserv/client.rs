@@ -229,19 +229,13 @@ fn spawn_split<S>(
         let _ = inbound.send((id, InboundEvent::Disconnected)).await;
     });
 
-    // Write task: drain outbound_rx → IAC-escape → socket.
+    // Write task: drain outbound_rx → IAC-escape → socket. The telnet
+    // negotiation is NOT a write-task prelude — C writes the greeting/info
+    // banner first and only then calls `telnet_negotiate`
+    // (clientFactory.cc:153-174), so the supervisor enqueues the banner
+    // `Bytes` frame followed by the negotiation `RawIac` frame (PS-26).
+    // This loop just drains them in order.
     tokio::spawn(async move {
-        // Send initial IAC negotiation as the first thing the peer
-        // sees, mirroring C `clientItem::clientItem` end-of-ctor calls
-        // to telnet_negotiate.
-        let init = crate::procserv::telnet::initial_negotiation();
-        if writer.write_all(&init).await.is_err() {
-            return;
-        }
-        if writer.flush().await.is_err() {
-            return;
-        }
-
         while let Some(frame) = outbound_rx.recv().await {
             match frame {
                 OutboundFrame::Bytes(b) => {
@@ -321,11 +315,10 @@ mod tests {
             in_tx,
         );
 
-        // The client first sees the server's negotiation handshake;
-        // skip past it.
-        let mut neg = [0u8; 6];
-        client.read_exact(&mut neg).await.unwrap();
-
+        // The write task no longer emits a negotiation prelude (PS-26:
+        // the supervisor enqueues the banner then the IAC frame); a raw
+        // `spawn_client` sends nothing until a frame is queued, so there
+        // is nothing to skip here.
         client.write_all(b"hi\n").await.unwrap();
         let event = timeout(Duration::from_secs(1), in_rx.recv())
             .await
@@ -351,8 +344,6 @@ mod tests {
             in_tx,
         );
 
-        let mut neg = [0u8; 6];
-        client.read_exact(&mut neg).await.unwrap();
         client.write_all(b"ignored\n").await.unwrap();
 
         // No Data event should arrive; allow up to 200ms.
@@ -373,10 +364,8 @@ mod tests {
             in_tx,
         );
 
-        // Skip the negotiation handshake.
-        let mut neg = [0u8; 6];
-        client.read_exact(&mut neg).await.unwrap();
-
+        // No negotiation prelude (PS-26): the first bytes on the wire are
+        // this payload, IAC-escaped.
         // Send a payload containing a literal 0xFF — must be doubled
         // on the wire.
         out_tx

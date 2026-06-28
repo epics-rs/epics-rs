@@ -62,7 +62,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 ### DEFECTS
 
 #### PS-1 `--noautorestart` / OFF mode shuts the whole server down on child exit
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (629c57c9)
+- Resolution: `handle_child_event`'s `RestartMode::Disabled` arm now returns `ChildLoopOutcome::Continue` (`supervisor.rs:533-543`) — the child stays dead but the server stays up, mirroring C `processFactoryNeedsRestart()` returning false forever after the first launch (`processFactory.cc:51`) so `shutdownServer` is never set; only `oneshot` exits the server. e2e `norestart_keeps_server_alive_after_child_exit` pins it. (Doc CLEARED-marker added retroactively; fix landed in an earlier round.)
 - Rust: `src/procserv/supervisor.rs:470-473` (`RestartMode::Disabled` → `ChildLoopOutcome::Shutdown`)
 - C: `processFactory.cc:51-54` + `procServ.cc:599,654-669`
 - Impact: In C, `norestart` makes `processFactoryNeedsRestart()` return false forever after the first launch, so on child exit the server **stays alive** with the child dead — operators reconnect, inspect, manually `^R` to relaunch; `shutdownServer` is never set. Only `oneshot` exits the server in C, never `norestart`. Rust tears the entire supervisor down on the first child exit in OFF mode (e.g. operator pressed `^T` once ON→OFF intending "stop auto-restarting", child later exits → Rust kills procserv-rs and drops every client). Headline lifecycle divergence.
@@ -76,20 +77,23 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: Every byte differs — missing the `@@@ @@@ @@@ @@@ @@@` separator, missing PID, missing the mode-dependent shutdown-reason line and command-help refresh, wrong wording, and a Rust-`{:?}`-debug-formatted status (`@@@ Child exited (status: "exit status: 0")`) no C consumer/log scraper keyed on `Received a sigChild` / `The PID of new child` will recognize.
 
 #### PS-3 Signaled death encoded as `128+sig`, losing "killed by signal N"
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (1b8922bd)
+- Resolution: the reaper now maps `WaitStatus::Signaled(_,sig,_)` to `ChildExit::Signaled(sig)` (`child.rs:389`), a distinct variant from `ChildExit::Exited(code)`; `messages::child_reaped` renders the signal arm as `" The process was killed by signal N"` (`messages.rs:109`, C `procServ.cc:801-804`), never `128+sig`. `child_exit_code` is updated only under the `Exited` arm (`supervisor.rs:481`, C `WIFEXITED`-only). (Doc CLEARED-marker added retroactively; fix landed in an earlier round.)
 - Rust: `src/procserv/child.rs:333-334` + `make_exit_status` `:343-349`
 - C: `procServ.cc:801-805` (`WIFSIGNALED`→`WTERMSIG` → `" The process was killed by signal N"`)
 - Impact: The reaper maps `WaitStatus::Signaled(_,sig,_)` to `make_exit_status(128+sig)`, collapsing a signal death into a fake normal exit. A child SIGKILLed (the default kill key) is reported by Rust as `exit status: 137` rather than "killed by signal 9"; the `WIFSIGNALED` branch never reaches any message. Data-loss root behind part of PS-2.
 
 #### PS-4 Child exit code not propagated as procserv's own exit status (always exits 0)
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (ad7dd347)
+- Resolution: `SupervisorState::run` returns `ProcServResult<i32>` carrying `child_exit_code` (updated on each `WIFEXITED` reap, `supervisor.rs:481`; returned at both shutdown exits `:301/:310`), and `procserv_rs.rs:493` converts it to `ExitCode::from(code as u8)` so `procserv-rs -o /bin/false` exits 1 like C (`childExitCode`, `procServ.cc:701`). (Doc CLEARED-marker added retroactively; fix landed in an earlier round.)
 - Merged from: process PS-4, config PS-95
 - Rust: `src/procserv/supervisor.rs:431-475` (status discarded) + `src/bin/procserv_rs.rs:309-319` (`Ok(())`→`ExitCode::SUCCESS`)
 - C: `procServ.cc:76-77,701,794-798` (`childExitCode = WEXITSTATUS(...)`; `main` returns it)
 - Impact: `procServ -o /bin/false` (oneshot) exits **1** in C (wrapper/systemd see the failure); procserv-rs exits **0** regardless of how the child exited, masking IOC failure for any script keyed on procServ's exit code.
 
 #### PS-5 No SIGKILL of the child's process group on child exit → orphaned grandchildren
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (1e4e9bfe)
+- Resolution: the `ChildEvent::Exited` arm now SIGKILLs the child's whole process group (`slot.handle.signal(libc::SIGKILL)`, `supervisor.rs:472`) on every reap before the next launch, reaping grandchildren — mirroring C `~processClass`'s unconditional `kill(-_pid, SIGKILL)` (`processFactory.cc:117`). Independent of `killSig` (hardcoded SIGKILL, as in C). (Doc CLEARED-marker added retroactively; fix landed in an earlier round.)
 - Rust: `src/procserv/supervisor.rs:431-432` (`ChildEvent::Exited` just `self.child.take()`)
 - C: `processFactory.cc:117` (`~processClass`: `if (_pid>0) kill(-_pid, SIGKILL)`)
 - Impact: C's destructor runs on every child death and SIGKILLs the whole process group to reap stragglers before the next launch. Rust signals the group only on supervisor `Drop` (shutdown) and explicit kill keystroke — a normal child exit leaves grandchildren running, accumulating across a crash-loop.

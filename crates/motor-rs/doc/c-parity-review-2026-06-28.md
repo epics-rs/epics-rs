@@ -545,6 +545,13 @@ routes into `plan_absolute_move`. No defect.
   the integration-test rationale was corrected (the Phase-2 drain, not the move speed, is load-bearing;
   runtime pinned to `current_thread`). Panel A VERIFIED-CORRECT, Panel B TEST SOUND, Panel C 3/4
   attacks SAFE with the 4th (pp-resync) now closed.
+- **Final convergence round `01KW5WQB`** (3 opus panels, pinned to HEAD after the `90d9fd2d`+`640aa84e`
+  fixes landed) re-verified the post-fix code directly: Panel A CONVERGED (the `request_poll_for_held_button`
+  extraction is behavior-preserving — predicate byte-identical to the prior inline form, `:408`/`:494` on
+  mutually exclusive phase arms, no double-fire); Panel C CONVERGED (re-classified all 14 `return effects`
+  sites + every `do_process_inner` settle entry against current line numbers, the 5 prior SAFE sites
+  un-regressed, no 10th hole — "the deferral family is closed"); Panel B's empirical guard stands (the
+  real-poll-loop integration test fails 17/17 with the fix reverted, passes with it). **R65 fully converged.**
 - **Severity:** CONCERN (monitor-semantics + CPU divergence; not a wrong-value bug). Surfaced by the
   `01KW5QV` confirming round on R61 (the always-on idle poller). Downstream of R61: once the idle
   poller never stops, the unconditional notify path turns "poller alive" into "record processed

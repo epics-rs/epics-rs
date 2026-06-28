@@ -101,11 +101,6 @@ struct SupervisorState {
     /// daemon's shutdown-signal layer so a `kill -HUP` rotates the log
     /// instead of killing the IOC.
     sighup: tokio::signal::unix::Signal,
-    /// Set after first successful child spawn. Used by `OneShot`
-    /// mode: it allows the FIRST exit to be honored by re-checking
-    /// the policy (so `OneShot` selected mid-run still launches
-    /// once); subsequent exits with `OneShot` exit the supervisor.
-    has_run_once: bool,
     /// Last child exit code, returned as procserv's own process exit
     /// status on shutdown. Mirrors C `childExitCode`: updated only on a
     /// normal exit (`WIFEXITED`), so a signal death leaves the prior
@@ -238,7 +233,6 @@ impl SupervisorState {
             restart_tracker: RestartTracker::new(),
             log,
             sighup,
-            has_run_once: false,
             child_exit_code: 0,
             pending_restart: None,
             proc_started: Local::now(),
@@ -515,15 +509,15 @@ impl SupervisorState {
                         }
                     }
                     RestartMode::OneShot => {
-                        if !self.has_run_once {
-                            // First-ever exit under OneShot —
-                            // permitted to relaunch once more.
-                            self.has_run_once = true;
-                            self.schedule_restart(started_at);
-                            Ok(ChildLoopOutcome::Continue)
-                        } else {
-                            Ok(ChildLoopOutcome::Shutdown)
-                        }
+                        // C `oneshot`: the child launches once, and the
+                        // first exit shuts the server down — `needsRestart`
+                        // sees `oneshot && !firstRun` (firstRun is cleared
+                        // right after the first launch) and sets
+                        // `shutdownServer` (procServ.cc:656-658,
+                        // processFactory.cc:51). The supervisor only reaches
+                        // this arm after a real spawn, so the child has
+                        // already run once; exit ⟹ shut down.
+                        Ok(ChildLoopOutcome::Shutdown)
                     }
                     RestartMode::Disabled => {
                         // C `norestart`: the child stays dead but the
@@ -588,7 +582,6 @@ impl SupervisorState {
             let _ = write_info_file(p, &info);
         }
 
-        self.has_run_once = true;
         // A child is now running, so any holdoff that was waiting to
         // relaunch one is satisfied — clear it here (the single owner of
         // this transition) so a manual restart that fires mid-holdoff

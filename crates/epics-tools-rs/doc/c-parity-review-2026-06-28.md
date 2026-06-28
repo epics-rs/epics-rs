@@ -333,11 +333,12 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - C: `procServ.cc:628-631` (`SendToAll("@@@ Got a sigPipe signal: Did the child close its tty?\r\n", NULL)`)
 - Impact: When the child closes its tty and a write raises SIGPIPE, C emits a diagnostic line to every console; Rust silently ignores it. Loss of an operator-visible diagnostic, no functional impact.
 
-#### PS-38 Read-only client telnet *replies* are still processed (C discards all logger input)
+#### PS-38 Read-only client telnet *replies* are still processed (C discards all logger input) — CLEARED
 - Severity: NOTE
 - Rust: `src/procserv/client.rs:163-185` — `TelnetEvent::Data` is gated on `!readonly` `:166` but `TelnetEvent::Reply` is **not** `:176-184`
 - C: `clientFactory.cc:192` (`else if (!_readonly) telnet_recv(...)` — a logger's input never reaches the telnet state machine)
 - Impact: A logger that sends IAC negotiation gets telnet responses from Rust but silence from C. A log-capture tool on the readonly port could receive unexpected IAC sequences mid-stream under Rust.
+- Resolution: structural — the per-event `!readonly` gate (which only suppressed `Data`, letting `Reply` through) is replaced by an early `if readonly { continue; }` that skips `parser.feed` entirely. The read loop still runs (so EOF/disconnect is detected) but a logger's bytes never reach the telnet state machine, exactly as C's `else if (!_readonly) telnet_recv`. No data is forwarded and no IAC reply is emitted for readonly clients. New test `readonly_client_telnet_negotiation_gets_no_reply` proves the same `IAC DO <opt>` bytes yield a `TelnetReply` on a control client but nothing on a readonly one (so the gate, not inert input, is what suppresses it). `epics-tools-rs` clippy/nextest clean.
 
 #### PS-39 Dead-child killChar drops C's "@@@ Got a kill command" broadcast (intentional-divergence candidate)
 - Severity: NOTE

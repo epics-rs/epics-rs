@@ -195,18 +195,25 @@ fn spawn_split<S>(
             match reader.read(&mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
+                    // A logger (readonly) client's input never reaches the
+                    // telnet state machine: C only calls `telnet_recv` for
+                    // `!_readonly` (clientFactory.cc:192). We still read (to
+                    // detect EOF/disconnect) but discard the bytes without
+                    // parsing, so a logger that sends IAC gets no telnet
+                    // replies and no data is forwarded (PS-38).
+                    if readonly {
+                        continue;
+                    }
                     for ev in parser.feed(&buf[..n]) {
                         match ev {
                             TelnetEvent::Data(d) => {
-                                if !readonly
-                                    && inbound
-                                        .send((id, InboundEvent::Data { bytes: d }))
-                                        .await
-                                        .is_err()
+                                if inbound
+                                    .send((id, InboundEvent::Data { bytes: d }))
+                                    .await
+                                    .is_err()
                                 {
                                     return;
                                 }
-                                // readonly: silently discard
                             }
                             TelnetEvent::Reply(r) => {
                                 if inbound
@@ -349,6 +356,60 @@ mod tests {
         // No Data event should arrive; allow up to 200ms.
         let res = timeout(Duration::from_millis(200), in_rx.recv()).await;
         assert!(res.is_err(), "readonly client must not produce Data events");
+    }
+
+    /// PS-38: a readonly (logger) client's input never reaches the telnet
+    /// state machine, so an IAC negotiation it sends gets no reply — C only
+    /// runs `telnet_recv` for `!_readonly` (clientFactory.cc:192). The same
+    /// bytes DO produce a reply on a control client, proving the readonly
+    /// gate is what suppresses it (not inert input).
+    #[tokio::test]
+    async fn readonly_client_telnet_negotiation_gets_no_reply() {
+        // IAC DO <unsupported opt 0x42> — a control client replies WONT.
+        const IAC_DO_UNSUPPORTED: &[u8] = &[0xFF, 0xFD, 0x42];
+
+        // Control client: the negotiation yields a TelnetReply.
+        {
+            let (server, mut client) = paired_streams().await;
+            let (in_tx, mut in_rx) = mpsc::channel(8);
+            let (_meta, _out_tx) = spawn_client(
+                IncomingClient {
+                    stream: ClientStream::Tcp(server),
+                    peer: ClientPeer::Tcp("127.0.0.1:1".parse().unwrap()),
+                    readonly: false,
+                },
+                in_tx,
+            );
+            client.write_all(IAC_DO_UNSUPPORTED).await.unwrap();
+            let event = timeout(Duration::from_secs(1), in_rx.recv())
+                .await
+                .expect("control client should reply to IAC")
+                .unwrap();
+            assert!(
+                matches!(event, (_, InboundEvent::TelnetReply { .. })),
+                "control client must produce a telnet reply, got {event:?}"
+            );
+        }
+
+        // Readonly client: the same bytes produce nothing.
+        {
+            let (server, mut client) = paired_streams().await;
+            let (in_tx, mut in_rx) = mpsc::channel(8);
+            let (_meta, _out_tx) = spawn_client(
+                IncomingClient {
+                    stream: ClientStream::Tcp(server),
+                    peer: ClientPeer::Tcp("127.0.0.1:1".parse().unwrap()),
+                    readonly: true,
+                },
+                in_tx,
+            );
+            client.write_all(IAC_DO_UNSUPPORTED).await.unwrap();
+            let res = timeout(Duration::from_millis(200), in_rx.recv()).await;
+            assert!(
+                res.is_err(),
+                "readonly client must not produce a telnet reply"
+            );
+        }
     }
 
     #[tokio::test]

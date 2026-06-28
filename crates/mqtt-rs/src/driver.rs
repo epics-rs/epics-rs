@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
@@ -42,6 +44,14 @@ pub struct MqttDriver {
     default_qos: QoS,
     /// Param index for connection status (0=disconnected, 1=connected)
     pub connected_param: usize,
+    /// Live broker-connection flag, written only by the event loop.
+    ///
+    /// C parity: `MqttClient::publish` throws "MQTT client not connected" when
+    /// `!is_connected()` (mqttClient.cpp:70-72), which the `*Write` handlers
+    /// surface as `asynError` (drvMqtt.cpp:590-595). The write path reads this
+    /// flag to fail a publish while the broker is down instead of silently
+    /// buffering it on the unbounded channel.
+    connected: Arc<AtomicBool>,
 }
 
 impl MqttDriver {
@@ -54,6 +64,7 @@ impl MqttDriver {
         config: &MqttConfig,
         topics: Vec<TopicAddress>,
         publish_tx: mpsc::UnboundedSender<PublishRequest>,
+        connected: Arc<AtomicBool>,
     ) -> Self {
         // C parity: drvMqtt sets `.setBlocking(false)` (drvMqtt.cpp:122) — the
         // MQTT port is non-blocking. The Rust write path only `send`s on an
@@ -103,6 +114,7 @@ impl MqttDriver {
             publish_tx,
             default_qos: config.qos,
             connected_param,
+            connected,
         }
     }
 
@@ -119,6 +131,16 @@ impl MqttDriver {
     /// Encode and publish a value for the given parameter reason.
     /// Uses FLAT or JSON encoding depending on the topic address format.
     fn publish_value(&self, reason: usize, value: &DecodedValue) -> AsynResult<()> {
+        // C parity: a publish while the broker is down throws
+        // "MQTT client not connected" (mqttClient.cpp:70-72), surfaced as
+        // asynError by the *Write handlers (drvMqtt.cpp:590-595/632-637) so the
+        // output record fails with a WRITE/INVALID alarm. Gate here — before
+        // touching the unbounded publish channel — so a disconnected write fails
+        // (and is not silently buffered) exactly as in C.
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(MqttError::NotConnected.into());
+        }
+
         let addr = self
             .reason_to_addr
             .get(reason)
@@ -263,8 +285,39 @@ mod tests {
             .iter()
             .map(|s| TopicAddress::parse(s).unwrap())
             .collect();
-        let driver = MqttDriver::new("TEST", &config, addrs, tx);
+        // These tests exercise the publish path, so start connected; the event
+        // loop owns this flag at runtime. The disconnected gate is covered by
+        // `write_while_disconnected_fails_and_does_not_publish`.
+        let connected = Arc::new(AtomicBool::new(true));
+        let driver = MqttDriver::new("TEST", &config, addrs, tx, connected);
         (driver, rx)
+    }
+
+    /// C parity: a publish while the broker is down throws "MQTT client not
+    /// connected" (mqttClient.cpp:70-72), surfaced as asynError by the *Write
+    /// handlers (drvMqtt.cpp:590-595). The write must fail (WRITE alarm) and
+    /// must not buffer the value, rather than silently returning asynSuccess.
+    #[test]
+    fn write_while_disconnected_fails_and_does_not_publish() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let config = MqttConfig::default();
+        let connected = Arc::new(AtomicBool::new(false));
+        let addrs = vec![TopicAddress::parse("FLAT:INT test/int_topic").unwrap()];
+        let mut driver = MqttDriver::new("TEST", &config, addrs, tx, connected.clone());
+        let reason = driver.drv_user_create("FLAT:INT test/int_topic").unwrap();
+        let mut user = AsynUser::new(reason);
+
+        let r = driver.write_int32(&mut user, 42);
+        assert!(r.is_err(), "disconnected write must fail, got {r:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a failed write must not enqueue a publish"
+        );
+
+        // Once the event loop marks the session up, the same write publishes.
+        connected.store(true, Ordering::Release);
+        driver.write_int32(&mut user, 42).unwrap();
+        assert_eq!(rx.try_recv().unwrap().payload, "42");
     }
 
     #[test]

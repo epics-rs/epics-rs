@@ -184,7 +184,12 @@ impl CommandHandler for MqttConfigHandler {
         }
 
         let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel();
-        let driver = MqttDriver::new(&port_name, &config, topics, publish_tx);
+        // Shared broker-connection flag: the event loop is the sole writer, the
+        // driver write path the reader (C parity: publish fails while
+        // disconnected, mqttClient.cpp:70-72). Starts down until the first
+        // ConnAck.
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let driver = MqttDriver::new(&port_name, &config, topics, publish_tx, connected.clone());
         let subscribed_topics = driver.subscribed_topics();
         let topic_map = driver.topic_map().clone();
         let connected_param = driver.connected_param;
@@ -258,6 +263,7 @@ impl CommandHandler for MqttConfigHandler {
                 port_handle,
                 publish_rx,
                 connected_param,
+                connected,
             )
             .await;
         });

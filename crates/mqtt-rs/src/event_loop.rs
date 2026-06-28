@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use asyn_rs::port_handle::PortHandle;
@@ -24,6 +26,7 @@ pub async fn mqtt_event_loop(
     port_handle: PortHandle,
     publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
     connected_param: usize,
+    connected: Arc<AtomicBool>,
 ) {
     let mut mqttoptions =
         MqttOptions::new(&config.client_id, &config.broker_host, config.broker_port);
@@ -57,7 +60,7 @@ pub async fn mqtt_event_loop(
                     tracing::debug!(
                         "MQTT Publish received while Connected=0 — restoring Connected=1"
                     );
-                    mark_connected(&port_handle, connected_param).await;
+                    mark_connected(&port_handle, connected_param, &connected).await;
                     is_connected = true;
                 }
                 // v5 Publish.topic is raw bytes; a declared topic_map key (the
@@ -73,7 +76,7 @@ pub async fn mqtt_event_loop(
             }
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 tracing::info!("MQTT connected, subscribing to {} topics", topics.len());
-                mark_connected(&port_handle, connected_param).await;
+                mark_connected(&port_handle, connected_param, &connected).await;
                 is_connected = true;
                 // Spawn subscribe so we return to `poll()` immediately — the
                 // event loop is the only thing that drains rumqttc's command
@@ -90,12 +93,15 @@ pub async fn mqtt_event_loop(
                     tracing::debug!(
                         "MQTT PingResp received while Connected=0 — restoring Connected=1"
                     );
-                    mark_connected(&port_handle, connected_param).await;
+                    mark_connected(&port_handle, connected_param, &connected).await;
                     is_connected = true;
                 }
             }
             Err(e) => {
                 tracing::error!("MQTT connection error: {e}");
+                // Close the publish gate first so a concurrent write fails fast
+                // (C: publish throws while disconnected) instead of buffering.
+                connected.store(false, Ordering::Release);
                 let _ = port_handle
                     .set_params_and_notify(
                         0,
@@ -114,8 +120,12 @@ pub async fn mqtt_event_loop(
     }
 }
 
-/// Set the Connected PV to 1.
-async fn mark_connected(port_handle: &PortHandle, connected_param: usize) {
+/// Mark the session up: raise the internal publish-gate flag and the
+/// EPICS-visible Connected PV together. The event loop is the single writer of
+/// both, so the driver write path (which reads `connected`) and the Connected
+/// PV never disagree.
+async fn mark_connected(port_handle: &PortHandle, connected_param: usize, connected: &AtomicBool) {
+    connected.store(true, Ordering::Release);
     let _ = port_handle
         .set_params_and_notify(
             0,

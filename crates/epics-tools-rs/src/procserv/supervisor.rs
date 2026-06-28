@@ -44,7 +44,7 @@ use crate::procserv::child::{ChildEvent, ChildExit, ChildHandle, ChildSpec};
 use crate::procserv::client::{
     ClientId, ClientMeta, InboundEvent, IncomingClient, OutboundFrame, spawn_client,
 };
-use crate::procserv::config::ProcServConfig;
+use crate::procserv::config::{KeyBindings, ProcServConfig};
 use crate::procserv::error::{ProcServError, ProcServResult};
 use crate::procserv::menu::{Action, scan as menu_scan};
 use crate::procserv::messages;
@@ -582,12 +582,20 @@ impl SupervisorState {
         )
         .await;
 
-        // Spawn — child inherits the env var.
+        // Spawn — child inherits the env var. The child's stdin ignore set
+        // is the operator's explicit `--ignore` list PLUS the always-active
+        // command keys, so a kill/toggle/logout keystroke triggers its
+        // action but never reaches the child (C auto-appends these to
+        // `ignChars`, procServ.cc:431-438). Computed here — the single
+        // ChildSpec construction site — so it holds for every config source.
         let spec = ChildSpec {
             program: self.config.child.program.clone(),
             args: self.config.child.args.clone(),
             cwd: self.config.child.cwd.clone(),
-            ignore_chars: self.config.child.ignore_chars.clone(),
+            ignore_chars: effective_ignore_chars(
+                &self.config.child.ignore_chars,
+                &self.config.keys,
+            ),
         };
         let (handle, rx) = ChildHandle::spawn(&spec)?;
 
@@ -810,6 +818,31 @@ enum Origin {
     Client,
 }
 
+/// The child's effective stdin ignore set: the operator's explicit
+/// `--ignore` bytes plus the always-active command keys C auto-appends
+/// to `ignChars` (`procServ.cc:431-438`) — kill, toggle-restart, and
+/// logout. Those three are scanned and consumed on every keystroke, so
+/// they must be stripped before the byte reaches the child. The
+/// child-dead-only keys (restart, quit) are deliberately excluded:
+/// C omits them (`procServ.cc:433-438`), and correctly so, since they
+/// fire only while `processClass::exists()` is false
+/// (`clientFactory.cc:207-217`) — when there is no child stdin to leak
+/// into. Disabled keys (`None`) contribute nothing; duplicates are
+/// folded (the child-side filter is a membership test, so order and
+/// repetition are irrelevant).
+fn effective_ignore_chars(explicit: &[u8], keys: &KeyBindings) -> Vec<u8> {
+    let mut set = explicit.to_vec();
+    for key in [keys.kill, keys.toggle_restart, keys.logout]
+        .into_iter()
+        .flatten()
+    {
+        if !set.contains(&key) {
+            set.push(key);
+        }
+    }
+    set
+}
+
 /// Remaining restart holdoff for a child that ran `uptime` before
 /// exiting: `holdoff - uptime`, clamped at zero. Mirrors C
 /// `processFactoryNeedsRestart`, which permits a restart once
@@ -837,8 +870,56 @@ impl Drop for SupervisorState {
 
 #[cfg(test)]
 mod tests {
-    use super::remaining_holdoff;
+    use super::{effective_ignore_chars, remaining_holdoff};
+    use crate::procserv::config::KeyBindings;
     use std::time::Duration;
+
+    fn full_keys() -> KeyBindings {
+        KeyBindings {
+            kill: Some(0x18),           // ^X
+            toggle_restart: Some(0x14), // ^T
+            restart: Some(0x12),        // ^R
+            quit: Some(0x11),           // ^Q
+            logout: Some(0x1d),         // ^]
+        }
+    }
+
+    #[test]
+    fn ignore_set_auto_appends_kill_toggle_logout_only() {
+        // C appends killChar/toggleRestartChar/logoutChar — the keys
+        // scanned on every keystroke — but NOT restartChar/quitChar, which
+        // only fire when the child is already gone (procServ.cc:431-438).
+        let set = effective_ignore_chars(&[], &full_keys());
+        assert!(set.contains(&0x18), "kill key must be stripped");
+        assert!(set.contains(&0x14), "toggle key must be stripped");
+        assert!(set.contains(&0x1d), "logout key must be stripped");
+        assert!(!set.contains(&0x12), "restart key must NOT be stripped");
+        assert!(!set.contains(&0x11), "quit key must NOT be stripped");
+    }
+
+    #[test]
+    fn ignore_set_unions_explicit_then_command_keys_without_dups() {
+        // Explicit `--ignore` bytes come first; a command key already in
+        // the explicit list is not duplicated (the child filter is a
+        // membership test, but we keep the set minimal).
+        let set = effective_ignore_chars(&[b'Z', 0x18], &full_keys());
+        assert_eq!(set.iter().filter(|&&b| b == 0x18).count(), 1);
+        assert!(set.contains(&b'Z'));
+        assert!(set.contains(&0x14) && set.contains(&0x1d));
+    }
+
+    #[test]
+    fn ignore_set_skips_disabled_keys() {
+        // A disabled (None) command key contributes nothing.
+        let keys = KeyBindings {
+            kill: Some(0x18),
+            toggle_restart: None,
+            restart: None,
+            quit: None,
+            logout: None,
+        };
+        assert_eq!(effective_ignore_chars(&[], &keys), vec![0x18]);
+    }
 
     // Boundaries of `_restartTime = child_start + holdoff`: the wait is
     // `holdoff - uptime`, clamped at zero (C processFactory.cc:51-54,188).

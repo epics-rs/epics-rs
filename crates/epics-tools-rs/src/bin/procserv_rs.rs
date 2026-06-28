@@ -146,9 +146,47 @@ mod app {
         #[arg(long, default_value_t = 0)]
         logout_char: u8,
 
+        /// Characters to strip from the child's stdin (`-i` / `--ignore`).
+        /// `^`-escaping mirrors C (procServ.cc:322-336): `^A`..`^Z` → the
+        /// control byte (letter − 64), `^^` → a literal `^`, any other byte
+        /// verbatim. The always-active command keys (kill / toggle-restart /
+        /// logout) are auto-added on top by the supervisor, so this is only
+        /// for EXTRA bytes the child should never see.
+        #[arg(short = 'i', long = "ignore", value_name = "CHARS")]
+        ignore: Option<String>,
+
         /// Program to launch + its arguments. Everything after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
+    }
+
+    /// Parse a `--ignore` value into the bytes to strip, applying C's
+    /// `^`-escaping (`procServ.cc:322-336`): `^A`..`^Z` → control byte,
+    /// `^^` → literal `^`, anything else verbatim. Lowercase after `^`
+    /// is NOT a control escape (C gates on `>= 'A' && <= 'Z'`), so `^a`
+    /// yields the two bytes `^`, `a`.
+    fn parse_ignore_chars(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'^' && i + 1 < bytes.len() {
+                let next = bytes[i + 1];
+                if next == b'^' {
+                    out.push(b'^');
+                    i += 2;
+                    continue;
+                }
+                if next.is_ascii_uppercase() {
+                    out.push(next - 64);
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        out
     }
 
     fn build_config(args: Args) -> Result<ProcServConfig, String> {
@@ -196,7 +234,13 @@ mod app {
             args: argv,
             cwd: args.chdir,
             kill_signal: 9, // SIGKILL — match C default
-            ignore_chars: Vec::new(),
+            // Explicit `--ignore` bytes only; the supervisor auto-adds the
+            // command keys (kill/toggle/logout) on top at spawn time.
+            ignore_chars: args
+                .ignore
+                .as_deref()
+                .map(parse_ignore_chars)
+                .unwrap_or_default(),
         };
 
         // C `timeFormat` defaults to "%c" (procServ.cc:80), overridable by
@@ -369,6 +413,39 @@ mod app {
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.name, "/opt/ioc/st.cmd");
             assert_eq!(cfg.child.name, cfg.child.program.display().to_string());
+        }
+
+        /// `--ignore` applies C's `^`-escaping: `^A`..`^Z` → control byte,
+        /// `^^` → literal `^`, anything else verbatim; lowercase after `^`
+        /// is not an escape (procServ.cc:322-336).
+        #[test]
+        fn ignore_chars_apply_caret_escaping() {
+            // ^X → 0x18, ^^ → '^', plain bytes verbatim.
+            assert_eq!(parse_ignore_chars("^X"), vec![0x18]);
+            assert_eq!(parse_ignore_chars("^^"), vec![b'^']);
+            assert_eq!(parse_ignore_chars("ab"), vec![b'a', b'b']);
+            // Two control escapes in a row: ^X → 0x18, ^A → 0x01.
+            assert_eq!(parse_ignore_chars("^X^A"), vec![0x18, 0x01]);
+            // Only A..Z map to control bytes — C gates on `>= 'A' && <= 'Z'`,
+            // so `^]` (']' = 0x5d, above 'Z') is a literal '^' then ']', NOT
+            // the 0x1d logout byte. (The logout key is stripped anyway via
+            // the supervisor auto-append, independent of this parser.)
+            assert_eq!(parse_ignore_chars("^]"), vec![b'^', b']']);
+            // Lowercase after ^ is NOT a control escape (C gates on A..Z).
+            assert_eq!(parse_ignore_chars("^a"), vec![b'^', b'a']);
+            // A trailing lone ^ is a literal caret.
+            assert_eq!(parse_ignore_chars("a^"), vec![b'a', b'^']);
+        }
+
+        /// `--ignore` flows into the child's explicit ignore set; the
+        /// command keys are added later by the supervisor, so the config
+        /// holds only the operator's bytes here.
+        #[test]
+        fn ignore_flag_populates_explicit_child_ignore_chars() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--ignore", "^X", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.ignore_chars, vec![0x18]);
         }
 
         /// `-n`/`--name` still overrides the default.

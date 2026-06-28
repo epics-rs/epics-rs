@@ -651,6 +651,49 @@ async fn client_keystrokes_are_not_forwarded_to_other_clients() {
 }
 
 #[tokio::test]
+async fn ignored_chars_are_stripped_from_child_stdin() {
+    // PS-10: bytes in the ignore set are filtered before reaching the
+    // child's stdin (C `processClass::Send`, processFactory.cc:256-265).
+    // `cat` echoes its input, so a client that types "haZllo" sees "hallo"
+    // — the 'Z' never reaches cat — proving the supervisor routes client
+    // input through the ignore filter. A plain letter keeps the assertion
+    // free of control-byte / PTY-special-char confounds; the always-active
+    // command keys join this same set via the supervisor auto-append.
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    cfg.child.ignore_chars = vec![b'Z'];
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut c = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("connect: {e}"),
+            }
+        }
+    };
+    let _ = read_for(&mut c, Duration::from_millis(400)).await;
+
+    c.write_all(b"haZllo\n").await.unwrap();
+    let seen = read_until(&mut c, "hallo", Duration::from_secs(2)).await;
+    assert!(
+        seen.contains("hallo"),
+        "filtered input must reach the child as 'hallo': {seen:?}"
+    );
+    assert!(
+        !seen.contains("haZllo"),
+        "ignored byte 'Z' must not reach the child: {seen:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn child_exit_sigkills_orphaned_process_group() {
     // C ~processClass SIGKILLs the child's process group on death so a
     // grandchild the child backgrounded does not survive

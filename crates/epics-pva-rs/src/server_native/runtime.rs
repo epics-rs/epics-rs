@@ -1054,7 +1054,12 @@ impl PvaServer {
     /// so a subsequent report returns the deltas since this one. Channel
     /// membership and credentials are not reset.
     pub fn report_zeroed(&self, zero: bool) -> ServerReport {
-        ServerReport {
+        // Liveness from the owned JoinHandles (a `None` handle — taken by
+        // `run`/`wait` — reads as not-alive). `ServerReportHandle::report`
+        // resolves the same booleans from the cloned AbortHandles; both
+        // feed the single [`assemble_report`] builder so the struct shape
+        // can never drift between the two paths.
+        assemble_report(ReportFields {
             tcp_port: self.bound_tcp_port,
             udp_port: self.effective_config.udp_port,
             tls_port: self.bound_tls_port,
@@ -1076,9 +1081,9 @@ impl PvaServer {
                 .as_ref()
                 .map(|h| !h.is_finished())
                 .unwrap_or(false),
-            peers: self.peers.snapshot_zeroed(zero),
-            peer_count: self.peers.len(),
-        }
+            peers: &self.peers,
+            zero,
+        })
     }
 
     /// A cheap, cloneable handle that reproduces [`Self::report`] from
@@ -1189,6 +1194,45 @@ pub struct ServerReport {
     pub peer_count: usize,
 }
 
+/// Resolved inputs to [`assemble_report`]. Liveness booleans are already
+/// computed by the caller (from JoinHandles in [`PvaServer::report_zeroed`],
+/// from AbortHandles in [`ServerReportHandle::report`]); everything else is
+/// read straight through.
+struct ReportFields<'a> {
+    tcp_port: u16,
+    udp_port: u16,
+    tls_port: u16,
+    tls_enabled: bool,
+    ignore_addrs: usize,
+    beacon_period_secs: u64,
+    udp_alive: bool,
+    udp_v6_alive: bool,
+    tcp_alive: bool,
+    peers: &'a crate::server_native::peers::PeerRegistry,
+    zero: bool,
+}
+
+/// The single owner of [`ServerReport`] construction. Both
+/// [`PvaServer::report_zeroed`] and [`ServerReportHandle::report`] route
+/// through here, so the snapshot/count pair and the struct's field set
+/// cannot drift between the two paths — a new `ServerReport` field is added
+/// in exactly one place.
+fn assemble_report(f: ReportFields<'_>) -> ServerReport {
+    ServerReport {
+        tcp_port: f.tcp_port,
+        udp_port: f.udp_port,
+        tls_port: f.tls_port,
+        tls_enabled: f.tls_enabled,
+        ignore_addrs: f.ignore_addrs,
+        beacon_period_secs: f.beacon_period_secs,
+        udp_alive: f.udp_alive,
+        udp_v6_alive: f.udp_v6_alive,
+        tcp_alive: f.tcp_alive,
+        peers: f.peers.snapshot_zeroed(f.zero),
+        peer_count: f.peers.len(),
+    }
+}
+
 /// Cheap, cloneable, `Send + Sync` handle to a running [`PvaServer`]'s
 /// diagnostics, produced by [`PvaServer::report_handle`].
 ///
@@ -1220,7 +1264,7 @@ impl ServerReportHandle {
     /// handle (`zero = false`); the resetting variant stays on
     /// [`PvaServer::report_zeroed`], which owns the JoinHandles.
     pub fn report(&self) -> ServerReport {
-        ServerReport {
+        assemble_report(ReportFields {
             tcp_port: self.bound_tcp_port,
             udp_port: self.udp_port,
             tls_port: self.bound_tls_port,
@@ -1234,9 +1278,9 @@ impl ServerReportHandle {
                 .map(|a| !a.is_finished())
                 .unwrap_or(false),
             tcp_alive: !self.tcp_abort.is_finished(),
-            peers: self.peers.snapshot_zeroed(false),
-            peer_count: self.peers.len(),
-        }
+            peers: &self.peers,
+            zero: false,
+        })
     }
 }
 
@@ -1324,6 +1368,7 @@ mod tcp_fallback_tests {
         assert_eq!(via_handle.peer_count, direct.peer_count);
         assert_eq!(via_handle.tcp_alive, direct.tcp_alive);
         assert_eq!(via_handle.udp_alive, direct.udp_alive);
+        assert_eq!(via_handle.udp_v6_alive, direct.udp_v6_alive);
         assert!(
             via_handle.tcp_alive,
             "tcp task must be live on a fresh server"

@@ -227,19 +227,45 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   The length *value* is still discarded — no asyn-rs home (R34). Tests
   `drv_user_create_validates_string_length_suffix`, `parse_drvuser_string_len_matches_strtol_base0`.
 
-### R52 — drvUser bind does not reject an out-of-range offset (error deferred to first I/O) — CLEARED (e633e601)
-- **Severity:** CONCERN (error at I/O time instead of init)
+### R52 — drvUser bind does not reject an out-of-range offset at connect — STRUCTURAL BLOCK (asyn-rs contract; sign-off, sibling of R34/R54)
+- **Severity:** CONCERN (error at I/O time instead of connect time)
 - **Rust:** `drv_user_create` runs no `checkOffset` (it has no `addr` — the asyn-rs
-  `drv_user_create -> usize` contract resolves a shared reason, not a per-record bind); offsets
-  were validated only per accessor.
+  `drv_user_create -> usize` contract resolves a shared reason, not a per-record bind); offsets are
+  validated only per accessor.
 - **C:** `drvModbusAsyn.cpp:378-384` (`drvUserCreate` `getAddr`+`checkOffset`) **and** `connect`
-  (`:455-467`, the per-pasynUser offset gate) both reject an over-range offset with `asynError`.
-- An over-range `addr` failed record init in C; in Rust it initialized and alarmed on every I/O.
-- **Fix:** modbus is a multi-device port (`ASYN_MULTIDEVICE`), so the framework drives the per-`addr`
-  connect through `connect_addr`. The driver overrides it to run `check_offset` and reject before
-  marking the address connected — the faithful analogue of C's `connect` offset gate (the asyn-rs
-  `drv_user_create` has no `addr`, so the connect path is where the per-record offset lives). Test
-  `connect_addr_rejects_out_of_range_offset`.
+  (`:455-470`, the per-pasynUser offset gate) reject an over-range offset with `asynError`; an
+  over-range `addr` fails record init in C.
+- **e633e601 attempt — does NOT clear the finding (round-2 convergence, D-records + A-protocol
+  panels, ground-verified):** the commit added a `connect_addr` override that runs `check_offset`
+  before marking the address connected. The override's *internal* logic is correct, but it is
+  **dormant** — nothing in the framework ever drives `connect_addr` for a normally-bound modbus
+  record:
+  - The only `RequestOp::ConnectAddr` emitter is `asyn-rs/port_handle.rs:693
+    connect_addr_blocking`, which has **zero callers**; no record/adapter init seeds `device_states`
+    or issues a per-addr connect.
+  - Auto-connect (`port_actor.rs:305`) calls `connect_addr` only when the addr is already in
+    `device_states` **and** disconnected; a missing addr is treated as connected (`map_or(true)`),
+    so the block is skipped. `check_ready_addr` (`port.rs:429`) likewise only gates an existing,
+    disconnected addr.
+  - So a bad-offset record: addr absent → auto-connect skipped → I/O dispatches → the per-accessor
+    `engine.check_offset` (14 sites: `ioc.rs:652,672,689,714,728,803,851,890,931,971,979,999,1024,
+    1099`) returns `Err` → the record alarms on **every** I/O. That protective outcome already
+    existed before e633e601; the override changed no observable behavior, and C's connect-time
+    rejection is not reproduced.
+  - The unit test `connect_addr_rejects_out_of_range_offset` calls `connect_addr` **directly**,
+    bypassing the framework dispatch that never calls it — green test, no end-to-end coverage.
+  - **Secondary divergence (A-protocol 3b):** the override rejects `offset < 0` (`check_offset`
+    semantics) but C's **`connect`** allows `offset == -1` (`drvModbusAsyn.cpp:462`,
+    `if (offset < -1) return asynError`, the connect-all port bind). The override therefore matches
+    C's per-I/O `checkOffset`, not the C `connect` it cites. Latent today (asyn-rs routes a `-1`
+    port connect through `RequestOp::Connect → driver.connect`, which modbus does not override, so
+    `-1` never reaches `connect_addr`).
+- **Why structural:** like R34/R54, the real gap is that asyn-rs has **no record-init per-addr
+  connect path** (a `connectDevice` analogue that seeds `device_states` and routes through
+  `connect_addr`). Without that, the connect-time offset rejection cannot fire. This is the *same*
+  asyn-rs contract gap as R34/R54 — A-protocol's recommendation is to sign all three off as one
+  framework work item. The dormant override + its `-1` bound are held pending that decision (do not
+  patch the dormant path or revert e633e601 unilaterally).
 
 ### R53 — modbusInterposeConfig accepts timeoutMsec + writeDelayMsec but silently drops both — CLEARED (c17c1c2c)
 - **Severity:** CONCERN (configured timeout + inter-frame write delay ignored)
@@ -255,6 +281,13 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   `SyncIoTransport` sleeps `write_delay` before each `write_frame` (blocking sync-I/O thread =
   C `epicsThreadSleep`), and the `SyncIOHandle` is built with the configured timeout. Test
   `parse_interpose_args_reads_timeout_and_write_delay`.
+- **Round-2 follow-up (A-protocol 3a, FIXED a649050d):** C applies `writeDelay` only in `writeIt`
+  (`:246`); the UDP read-failure retransmit resends via the raw `pasynOctet->write` (`:358`),
+  bypassing the delay. The first c17c1c2c implementation slept on *every* `write_frame`, so
+  `transact`'s retransmit also slept. Fixed by routing the retransmit through a new no-delay
+  `OctetTransport::resend_frame` (overridden in `SyncIoTransport` to skip the sleep); the initial
+  send still paces. Tests `udp_retransmit_resends_via_no_delay_path` +
+  `udp_retransmits_at_most_four_times_then_gives_up` (initial/retransmit split).
 
 ### R54 — single Float64/Octet param per data reason collapses C's per-interface I/O-Intr callbacks (CONFIRMED DEFECT)
 - **Severity:** DEFECT (wrong VAL on I/O-Intr integer-interface records) — structural, spans the
@@ -364,3 +397,31 @@ in transmitted bytes.
 
 Fix phase: per-finding commits, `cleared` marked here as each lands; convergence rounds after each
 cluster.
+
+### Round 2 — 2026-06-28 (convergence, 4 opus reviewers, adversarial cross-cut)
+
+Re-verified the landed fixes against the cited C. Per-finding panels (B-driver, C-datatype,
+D-records) plus one adversarial cross-cut (A-protocol) tasked to *break* the batch.
+
+- **CONFIRMED converged (no change):** R1 (short-frame skip — 3 checks confirm), R31 (octet
+  `strlen` vs C `strlen+1`), R32 (float→int saturation vs C UB cast), R51 (drvUser `=N` strtol
+  base-0 accept/reject set, verified input-by-input), R53 (interpose timeout/writeDelay — defaults,
+  dual-path timeout, dedicated-thread blocking-sleep safety), R55 (always-CNT EOM).
+- **R34 / R54 STRUCTURAL BLOCKS — CONFIRMED sound.** A-protocol tried every named avenue
+  (`AsynUser.user_data`, `reason_to_datatype`, synthetic per-`(type,len)` reason) and found no
+  modbus-rs-local fix; both are the *same* asyn-rs gap viewed twice (per-record / per-interface
+  driver data the `drv_user_create -> usize` + single-valued interrupt contract cannot carry). One
+  asyn-rs contract change closes both → sign off as one work item.
+- **R52 RECLASSIFIED** from CLEARED to STRUCTURAL BLOCK (sibling of R34/R54). Ground-verified: the
+  `connect_addr` override is dormant (no framework caller seeds `device_states` / drives per-addr
+  connect); the protective outcome already exists via 14 per-I/O `check_offset` sites; the override
+  also uses the `checkOffset` bound where C `connect` allows `offset == -1` (3b). See the R52 entry.
+- **NEW finding 3a (R53 retransmit delay) — FIXED a649050d.** A-protocol caught that the c17c1c2c
+  `write_delay` slept on the UDP retransmit too, where C bypasses it (raw write at
+  `modbusInterpose.c:358`). Fixed via a no-delay `OctetTransport::resend_frame`. See the R53 entry.
+- **`clear_histogram` ioc gate (0e0c1875) — CONFIRMED correct AND complete.** It is the *only*
+  `pub(crate)` fn in the four non-ioc files; no sibling helper is missing the cfg gate.
+
+Net: data path remains wire-clean. Open after Round 2: R34, R52, R54 — one asyn-rs framework
+work item (record-init per-addr connect + per-record/per-interface driver data), awaiting design
+sign-off. No further modbus-rs-local fixes outstanding.

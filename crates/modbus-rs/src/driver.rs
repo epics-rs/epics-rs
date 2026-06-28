@@ -485,6 +485,11 @@ impl ModbusEngine {
         let is_udp = self.framer.link_type() == LinkType::Udp;
 
         let started = Instant::now();
+        // The transport write/read cycle. C `doModbusIO` increments
+        // `IOErrors_`/`currentIOErrors_` ONLY here, gated on the `writeRead`
+        // transport status (drvModbusAsyn.cpp:2204-2208) — it is the single
+        // I/O-error site. A Modbus exception response or a malformed frame is
+        // not a transport failure and must never reach it.
         let response_pdu = match self.transact(transport, &framed, expected_txid, is_udp) {
             Ok(pdu) => pdu,
             Err(e) => {
@@ -493,43 +498,42 @@ impl ModbusEngine {
                 return Err(e);
             }
         };
+        // Transport succeeded: record the cycle time (C updates LastIOTime /
+        // MaxIOTime / the histogram on every successful writeRead, before the
+        // exception check, drvModbusAsyn.cpp:2211-2225) and clear the
+        // consecutive-error counter (C resets `currentIOErrors_` on the
+        // error→success transport edge, :2200; an unconditional reset on
+        // success yields the same observable value — it stays 0 across further
+        // successes — so no `prevIOStatus_` field is needed).
         self.stats.record_timing(started.elapsed());
+        self.stats.current_io_errors = 0;
 
-        // Decode the response PDU, tolerating the "Acknowledge" exception
-        // (code 5) — the C code treats it as a non-fatal warning.
+        // Decode the response PDU. A Modbus exception response (`fcode & 0x80`)
+        // is not a transport error: C `goto done` past the OK switch without
+        // touching readOK_/writeOK_/IOErrors_ (drvModbusAsyn.cpp:2229-2246).
+        // Exception 5 ("Acknowledge" — the command will take a long time)
+        // returns asynSuccess with no data; any other exception returns
+        // asynError. Either way no counter moves.
         let resp = match ResponsePdu::parse(&response_pdu) {
             Ok(resp) => resp,
-            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => {
-                if function.is_read() {
-                    self.stats.read_ok += 1;
-                } else {
-                    self.stats.write_ok += 1;
-                }
-                self.stats.current_io_errors = 0;
-                return Ok(Vec::new());
-            }
-            Err(e) => {
-                self.stats.io_errors += 1;
-                self.stats.current_io_errors += 1;
-                return Err(e);
-            }
+            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
 
-        let words = match self.parse_response(function, len, &resp) {
-            Ok(words) => words,
-            Err(e) => {
-                self.stats.io_errors += 1;
-                self.stats.current_io_errors += 1;
-                return Err(e);
-            }
-        };
+        // A real (non-exception) response of this function class arrived. C
+        // bumps readOK_/writeOK_ at the TOP of each function case, BEFORE the
+        // per-function content validation (`readOK_++` at drvModbusAsyn.cpp:
+        // 2254/2278/2300, `writeOK_++` at :2325/2333/2341). A frame whose word
+        // count then fails to match still counts as readOK_ and returns
+        // asynError with no IOErrors_ bump (:2284-2290/2306-2312) — so the OK
+        // counter must move before `parse_response` runs its `nread == len`
+        // check.
         if function.is_read() {
             self.stats.read_ok += 1;
         } else {
             self.stats.write_ok += 1;
         }
-        self.stats.current_io_errors = 0;
-        Ok(words)
+        self.parse_response(function, len, &resp)
     }
 
     /// Transmit `framed` and receive the matching response PDU. For TCP the
@@ -1045,7 +1049,12 @@ mod tests {
             err,
             ModbusError::Exception(ExceptionCode::IllegalDataAddress)
         ));
-        assert_eq!(engine.stats.io_errors, 1);
+        // C parity (drvModbusAsyn.cpp:2239-2246): a non-Acknowledge Modbus
+        // exception sets asynError and `goto done` past the OK switch. It is
+        // NOT a transport `writeRead` failure (the only IOErrors_ site,
+        // :2204-2208), so neither IOErrors_ nor readOK_ moves.
+        assert_eq!(engine.stats.io_errors, 0);
+        assert_eq!(engine.stats.read_ok, 0);
     }
 
     #[test]
@@ -1068,7 +1077,10 @@ mod tests {
             )
             .unwrap();
         assert!(words.is_empty());
-        assert_eq!(engine.stats.write_ok, 1);
+        // C parity (drvModbusAsyn.cpp:2231-2238/2245): exception 5 sets
+        // asynSuccess and `goto done` past the writeOK_/readOK_ switch — no OK
+        // counter moves, and it is not a transport error so IOErrors_ stays 0.
+        assert_eq!(engine.stats.write_ok, 0);
         assert_eq!(engine.stats.io_errors, 0);
     }
 
@@ -1182,6 +1194,11 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ModbusError::MalformedResponse(_)));
+        // C parity (drvModbusAsyn.cpp:2278-2290): readOK_++ runs before the
+        // register `nread != len` check, so the mismatch frame counts as
+        // readOK_ and returns asynError with no IOErrors_ bump.
+        assert_eq!(engine.stats.read_ok, 1);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]
@@ -1222,7 +1239,12 @@ mod tests {
             .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 1)
             .unwrap_err();
         assert!(matches!(err, ModbusError::MalformedResponse(_)));
-        assert_eq!(engine.stats.io_errors, 1);
+        // C parity (drvModbusAsyn.cpp:2300-2312): readOK_++ runs at the top of
+        // the REPORT_SLAVE_ID case BEFORE the `nread != len` check, so a
+        // count-mismatch frame still counts as readOK_ then returns asynError
+        // via `goto done` — with no IOErrors_ bump (that is transport-only).
+        assert_eq!(engine.stats.read_ok, 1);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]

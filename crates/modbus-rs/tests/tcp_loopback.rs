@@ -214,5 +214,10 @@ fn modbus_exception_surfaces_over_tcp() {
         )
         .unwrap_err();
     assert!(matches!(err, ModbusError::Exception(_)));
-    assert_eq!(engine.stats.io_errors, 1);
+    // C parity (drvModbusAsyn.cpp:2239-2246): a Modbus exception response sets
+    // asynError and `goto done` past the OK switch. It is not a transport
+    // `writeRead` failure (the only IOErrors_ site, :2204-2208), so neither
+    // IOErrors_ nor readOK_ moves.
+    assert_eq!(engine.stats.io_errors, 0);
+    assert_eq!(engine.stats.read_ok, 0);
 }

@@ -186,4 +186,14 @@ contracts / behavioral models, not just a driver site.
   transports — promote to a shared owner only if a third caller appears). Test:
   `test_pty_read_error_disconnects` (close pty master → fatal read → connected
   flips false).
+- **DRV-48** (DEFECT, prologix write leaves stale read_carry) — CLEARED. F6
+  invariant: every transaction/session boundary must discard staged read data.
+  Added a single owner `clear_read_carry()` and called it at the start of
+  `write_octet` (C `prologixWrite` sets `bufCount=0` at the start of every
+  write); routed the existing `io_flush`/`disconnect` clears through the same
+  owner. Without it, when a reply overflowed the caller buffer the tail stayed
+  in `read_carry` and the next plain write+read returned it as the response to
+  the new command (cross-transaction stale-data leak; SyncIO/streamDevice were
+  shielded by their flush-before-read, raw asynOctet consumers were not). Test:
+  `write_discards_staged_read_carry`.
 

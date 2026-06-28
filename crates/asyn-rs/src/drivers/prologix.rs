@@ -100,6 +100,16 @@ pub struct DrvAsynPrologixPort {
 }
 
 impl DrvAsynPrologixPort {
+    /// Discard any staged read remainder (`read_carry`). C parity:
+    /// `drvPrologixGPIB.c` resets `bufCount = 0` on every transaction
+    /// boundary (write begin/end) and session boundary (connect) so a reply
+    /// tail left unconsumed by a too-small read buffer never leaks into the
+    /// next command's response. Single owner for that invariant — called
+    /// from `write_octet`, `connect`, `io_flush`, and `disconnect`.
+    fn clear_read_carry(&self) {
+        self.state.lock().unwrap().read_carry.clear();
+    }
+
     /// Construct a new Prologix driver. Mirrors C asyn
     /// `prologixGPIBConfigure(portName, host, priority, noAutoConnect)`.
     /// `host` may be `"hostname"` (default port 1234 appended) or
@@ -329,7 +339,7 @@ impl PortDriver for DrvAsynPrologixPort {
         }
         // Drop any buffered read remainder — it belongs to the old
         // connection and must not leak into the next session.
-        self.state.lock().unwrap().read_carry.clear();
+        self.clear_read_carry();
         self.base.set_connected(false);
         Ok(())
     }
@@ -339,12 +349,17 @@ impl PortDriver for DrvAsynPrologixPort {
         // The transport flush cannot see `read_carry` (an application
         // buffer), so clear it here too or a stale carry would be
         // returned as the response to the new command.
-        self.state.lock().unwrap().read_carry.clear();
+        self.clear_read_carry();
         self.inner.io_flush(user)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         self.base.check_ready()?;
+        // C parity: prologixWrite sets bufCount=0 at the start of every
+        // write, discarding any reply tail the previous read left staged —
+        // otherwise the next read returns that stale data as the response to
+        // *this* command (cross-transaction leak).
+        self.clear_read_carry();
         self.set_address(user)?;
         let eos = self.state.lock().unwrap().eos;
         let mut out: Vec<u8> = Vec::with_capacity(data.len() + 4);
@@ -607,6 +622,31 @@ mod tests {
             post, "++addr 7\n*IDN?\n*IDN?\n++addr 12\nVAL?\n",
             "post-init wire bytes wrong: {post:?}"
         );
+    }
+
+    #[test]
+    fn write_discards_staged_read_carry() {
+        // DRV-48: a new write must discard any reply tail the previous read
+        // left staged (C prologixWrite sets bufCount=0 at the start), or the
+        // next read returns that stale data as the response to *this*
+        // command.
+        let (port, _rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        // Simulate a prior small-buffer read that left a tail staged.
+        drv.state.lock().unwrap().read_carry = b"STALE_TAIL".to_vec();
+
+        let mut user_w = AsynUser::default()
+            .with_addr(3)
+            .with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user_w, b"*IDN?").unwrap();
+
+        assert!(
+            drv.state.lock().unwrap().read_carry.is_empty(),
+            "DRV-48: write_octet must clear the staged read_carry"
+        );
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }
 
     /// `read_octet` end-to-end: driver sends `++read eoi\n`, the

@@ -30,8 +30,11 @@
 //! poller is not spawned.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
@@ -161,6 +164,14 @@ pub struct ModbusPortDriver {
     read_histogram_reason: usize,
     histogram_bin_reason: usize,
     histogram_axis_reason: usize,
+    /// reason of the POLL_DELAY control parameter.
+    poll_delay_reason: usize,
+    /// Live poll period in milliseconds, shared with the poller task so a
+    /// runtime POLL_DELAY write retunes it (C `pollDelay_`).
+    poll_delay: Arc<AtomicU64>,
+    /// Wakes the poller when POLL_DELAY changes so the new period takes effect
+    /// immediately, not after the current sleep (C `readPollerEventId_`).
+    poll_wake: Arc<Notify>,
 }
 
 impl ModbusPortDriver {
@@ -219,7 +230,7 @@ impl ModbusPortDriver {
         let io_errors_reason = base.create_param(PARAM_IO_ERRORS, ParamType::Int32)?;
         let last_io_reason = base.create_param(PARAM_LAST_IO_TIME, ParamType::Int32)?;
         let max_io_reason = base.create_param(PARAM_MAX_IO_TIME, ParamType::Int32)?;
-        base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
+        let poll_delay_reason = base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
         let enable_histogram_reason =
             base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
         let read_histogram_reason =
@@ -241,6 +252,8 @@ impl ModbusPortDriver {
             base.set_int32_param(r, 0, 0)?;
         }
 
+        let poll_delay_ms = engine.config().poll_delay.as_millis() as u64;
+
         Ok(Self {
             base,
             engine,
@@ -257,6 +270,9 @@ impl ModbusPortDriver {
             read_histogram_reason,
             histogram_bin_reason,
             histogram_axis_reason,
+            poll_delay_reason,
+            poll_delay: Arc::new(AtomicU64::new(poll_delay_ms)),
+            poll_wake: Arc::new(Notify::new()),
         })
     }
 
@@ -843,6 +859,18 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        // POLL_DELAY retunes the read poller's period at runtime. C
+        // `writeFloat64` (drvModbusAsyn.cpp:1094-1099) sets `pollDelay_` and
+        // signals the poller event. The `ao` writes seconds; store the period
+        // in milliseconds and wake the poller so the new period takes effect
+        // immediately rather than after the current sleep. Checked before
+        // `datatype_of`, which would otherwise reject this non-data reason.
+        if user.reason == self.poll_delay_reason {
+            let ms = (value * 1000.0).max(0.0) as u64;
+            self.poll_delay.store(ms, Ordering::Relaxed);
+            self.poll_wake.notify_one();
+            return Ok(());
+        }
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_float(dt, value).map_err(to_asyn)?;
@@ -1187,7 +1215,7 @@ impl CommandHandler for ModbusConfigHandler {
         let (port_name, octet_port, config) =
             parse_configure_args(args).map_err(|e| e.to_string())?;
         let link = take_link(&octet_port);
-        let poll_delay = config.poll_delay;
+        let initial_poll_delay = config.poll_delay;
         // The read poller is started only for a relative-addressing read port.
         // An absolute-addressing port has no poller (drvModbusAsyn.cpp:1121,
         // `if (absoluteAddressing_) needReadThread = 0;`) — each record reads
@@ -1203,6 +1231,11 @@ impl CommandHandler for ModbusConfigHandler {
         let driver = ModbusPortDriver::new(&port_name, config, link, transport)
             .map_err(|e| e.to_string())?;
         let read_reason = driver.read_reason;
+        // Cloned before the driver moves into the runtime: the poller reads the
+        // live period from the shared atomic each cycle and the wake lets a
+        // POLL_DELAY write interrupt the current sleep (R46).
+        let poll_delay = driver.poll_delay.clone();
+        let poll_wake = driver.poll_wake.clone();
 
         let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime.port_handle().clone();
@@ -1213,11 +1246,17 @@ impl CommandHandler for ModbusConfigHandler {
 
         // Spawn the read poller — periodically triggers a poll cycle by
         // writing the MODBUS_READ parameter. Port of the `readPoller` thread.
-        if needs_poller && !poll_delay.is_zero() {
+        if needs_poller && !initial_poll_delay.is_zero() {
             let poller_handle = port_handle.clone();
             self.handle.spawn(async move {
                 loop {
-                    tokio::time::sleep(poll_delay).await;
+                    // Read the live period each cycle so a runtime POLL_DELAY
+                    // write retunes it. A wake (POLL_DELAY changed) ends the
+                    // wait early — C signals readPollerEventId_ and re-waits
+                    // with the new pollDelay_ — then we re-read the period.
+                    let ms = poll_delay.load(Ordering::Relaxed);
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(ms), poll_wake.notified()).await;
                     if poller_handle.write_int32(read_reason, 0, 1).await.is_err() {
                         break;
                     }
@@ -1539,6 +1578,33 @@ mod tests {
         assert_eq!(n, 5);
         // axis[i] = i * bin, bin = 4.
         assert_eq!(abuf, [0.0, 4.0, 8.0, 12.0, 16.0]);
+    }
+
+    /// R46: a POLL_DELAY write (the poll_delay.template `ao`, in seconds) must
+    /// succeed and retune the live poll period, not error out through
+    /// `datatype_of`. C `writeFloat64` sets `pollDelay_` and signals the poller
+    /// (drvModbusAsyn.cpp:1094-1099).
+    #[test]
+    fn poll_delay_write_retunes_period() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_POLL_DELAY",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        // Initial period seeded from test_config = 100 ms.
+        assert_eq!(driver.poll_delay.load(Ordering::Relaxed), 100);
+        let reason = driver.base.find_param(PARAM_POLL_DELAY).unwrap();
+        let mut user = AsynUser::new(reason);
+        // 2.5 s -> 2500 ms; the write must succeed (not a WRITE/INVALID alarm).
+        driver
+            .write_float64(&mut user, 2.5)
+            .expect("POLL_DELAY write must succeed");
+        assert_eq!(driver.poll_delay.load(Ordering::Relaxed), 2500);
+        // A negative value clamps to 0.
+        driver.write_float64(&mut user, -1.0).unwrap();
+        assert_eq!(driver.poll_delay.load(Ordering::Relaxed), 0);
     }
 
     /// Absolute-mode `read_octet` for a single-byte string encoding

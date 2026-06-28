@@ -68,7 +68,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: In C, `norestart` makes `processFactoryNeedsRestart()` return false forever after the first launch, so on child exit the server **stays alive** with the child dead — operators reconnect, inspect, manually `^R` to relaunch; `shutdownServer` is never set. Only `oneshot` exits the server in C, never `norestart`. Rust tears the entire supervisor down on the first child exit in OFF mode (e.g. operator pressed `^T` once ON→OFF intending "stop auto-restarting", child later exits → Rust kills procserv-rs and drops every client). Headline lifecycle divergence.
 
 #### PS-2 Child-lifecycle broadcast `@@@` messages diverge wholesale (exit / restart / shutdown)
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (24202067)
+- Resolution: four C-exact builders in `procserv::messages` (`child_reaped`, `child_shutting_down`, `restarting_child`, `new_child_pid`); `handle_child_event` emits reaper + shutdown blocks (single owner of the shutdown line), `respawn_child` is the single restart-announce site (`@@@ Restarting child` + `@@@ The PID of new child` + ruler). Non-C banners removed; `PendingRestart.banner`/`banner()` deleted. Byte-exact unit tests + 3 e2e assertions updated.
 - Merged from: process PS-2/PS-8/PS-9, conn PS-37, telnet PS-62, config PS-93
 - Rust: `src/procserv/supervisor.rs:431-439` (exit `"\r\n@@@ Child exited (status: {:?})\r\n"`), `:449/463/466/471` (restart banners), `:520` (`"@@@ Child started (pid N)"`)
 - C: `procServ.cc:788-807` (exit: `"\r\n"`, `"@@@ @@@ @@@ @@@ @@@\r\n"`, `"@@@ Received a sigChild for process N. Normal exit status = K\r\n"` / `" killed by signal N"`); `processFactory.cc:66-72,82-114,191-196` (restart `"@@@ Restarting child \"name\"\r\n"` + optional `"@@@    (as argv0)\r\n"`; post-fork `"@@@ The PID of new child \"name\" is: N\r\n"` + `@@@ @@@…` ruler; shutdown `"@@@ Current time: …\r\n"`, `"@@@ Child process is shutting down, <reason>\r\n"`, infoMessage3 redisplay unless oneshot)
@@ -94,14 +95,16 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C's destructor runs on every child death and SIGKILLs the whole process group to reap stragglers before the next launch. Rust signals the group only on supervisor `Drop` (shutdown) and explicit kill keystroke — a normal child exit leaves grandchildren running, accumulating across a crash-loop.
 
 #### PS-6 Connect-time welcome banner + infoMessage1/2/3 diverge / missing
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (87e96887)
+- Resolution: new `procserv::messages` single-owner module ports greeting1/greeting2/infoMessage1/2/3 byte-for-byte; `welcome_banner` delegates the text and supplies live state (PID, dirs, child PID/start, peer counts). Greeting now `@@@ Welcome to procServ (<version>)`. Byte-exact unit tests + e2e assertion updated.
 - Merged from: telnet PS-55/PS-56, config PS-92
 - Rust: `src/procserv/supervisor.rs:552-608` (`welcome_banner`)
 - C: `clientFactory.cc:100-163` (greeting1/greeting2) + `procServ.cc:442-450,572-595` (infoMessage1/2/3), `processFactory.cc:191` (infoMessage2)
 - Impact: Not byte-parity. C greeting1 `@@@ Welcome to procServ (<VERSION>)`; Rust `@@@ Welcome to procserv-rs` (no version, different product name). C greeting2 packs kill/restart-mode/toggle hints on combined lines; Rust emits a non-C `@@@ Wrapping: <name> (mode: …)` shape. Rust omits infoMessage1 (`@@@ procServ server PID`, server/child startup dirs, `Child started as`, `Child log file`), infoMessage2 (`@@@ Child "<name>" PID: N` / `is SHUT DOWN`), and infoMessage3 (the command menu `@@@ ^R or ^X restarts the child, ^Q quits the server`). A connecting operator never sees the command summary or the child PID/state line.
 
 #### PS-7 Quit keystroke `^Q` disabled by default and unreachable
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (679d2b6b)
+- Resolution: `build_config` now defaults `quit: Some(0x11)` (C `quitChar`, not CLI-settable); the two lying `config.rs` comments corrected; menu dispatch was already gated on child-dead. Bin unit test `quit_key_defaults_to_ctrl_q` pins it.
 - Merged from: process PS-11, telnet PS-51, config PS-85
 - Rust: `src/bin/procserv_rs.rs:230` (`quit: None`, no CLI flag) + wrong comment `config.rs:57-58` ("default disabled in C")
 - C: `procServ.cc:69` (`char quitChar = 0x11;` — ^Q, not even CLI-settable), dispatch `clientFactory.cc:214-217`, advertised in infoMessage3 `procServ.cc:443-444`
@@ -128,7 +131,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C strips the command bytes from PTY input — `^X`/`^T`/`^]` trigger the action but the byte never reaches the child. Rust leaves `ignore_chars` empty and exposes no flag, so `0x18`/`0x14`/`0x1d` fire the action **and** leak into the IOC shell's stdin.
 
 #### PS-11 logoutChar `^]` default inverted — enabled in Rust, disabled in C
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (842d2f39)
+- Resolution: `logout_char` default flipped `29 → 0` (C `logoutChar = 0x00`, opt-in via `--logoutcmd`); `config.rs` comment corrected. Bin unit test `logout_key_disabled_by_default`. The `--logout-char` flag rename + caret parsing is the separate PS-27.
 - Merged from: telnet PS-52, config PS-84
 - Rust: `src/bin/procserv_rs.rs:143` (`logout_char` `default_value_t = 29`) + wrong comment `config.rs:59`
 - C: `procServ.cc:70` (`char logoutChar = 0x00;`), set only by `--logoutcmd` `:403`

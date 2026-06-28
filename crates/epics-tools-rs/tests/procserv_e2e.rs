@@ -509,8 +509,11 @@ async fn two_clients_share_same_party_line() {
     let mut b = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let _ = read_for(&mut b, Duration::from_millis(300)).await;
 
-    // A types — both A and B see PTY output. Plus B sees A's bytes
-    // forwarded (echo to other clients).
+    // A types — `cat` echoes the line back through the PTY, and the
+    // supervisor broadcasts that child output to every client, so both A
+    // and B see it. B sees it via the PTY echo, NOT a direct client→client
+    // forward: C routes a client sender's bytes to the child only
+    // (PS-8, procServ.cc:754-756).
     a.write_all(b"shared input\n").await.unwrap();
 
     let a_out = read_for(&mut a, Duration::from_secs(2)).await;
@@ -519,19 +522,75 @@ async fn two_clients_share_same_party_line() {
     let a_clean = String::from_utf8_lossy(&strip_iac(&a_out)).to_string();
     let b_clean = String::from_utf8_lossy(&strip_iac(&b_out)).to_string();
 
-    // A should see the PTY echo (from cat), but NOT its own typed
-    // bytes echoed back through SendToAll (sender is excluded).
+    // A sees its line via the PTY echo (the cat output re-broadcast).
     assert!(
         a_clean.contains("shared input"),
         "A should see PTY echo: {a_clean:?}"
     );
 
-    // B should see both the PTY echo AND the bytes forwarded from A.
-    // In practice both contain "shared input" so we just check
-    // presence.
+    // B sees the line via the same PTY echo. With cat echoing, the content
+    // is identical whether B got it by echo or by a (now-removed) direct
+    // forward, so this only checks presence — the strict PS-8 regression
+    // (no direct client→client forward) is
+    // `client_keystrokes_are_not_forwarded_to_other_clients` below.
     assert!(
         b_clean.contains("shared input"),
-        "B should see A's input + PTY echo: {b_clean:?}"
+        "B should see the PTY echo of A's input: {b_clean:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn client_keystrokes_are_not_forwarded_to_other_clients() {
+    // PS-8: C `SendToAll(buf, len, this)` routes a client sender's bytes
+    // to the child ONLY (procServ.cc:754-756); other clients see typed
+    // input solely via the PTY echo re-broadcast, never a direct forward.
+    //
+    // Proof without the PTY-echo confound: run the child to exit and keep
+    // it dead (RestartMode::Disabled keeps the server up). With no child
+    // there is no PTY to echo through, so a second client must see NOTHING
+    // when the first types. Under the old `fanout_excluding(Some(sender))`
+    // the bytes were forwarded straight to the other client and this fails.
+    let port = pick_port().await;
+    let mut cfg = cat_config(port); // RestartMode::Disabled
+    cfg.child.program = PathBuf::from("/bin/sh");
+    cfg.child.args = vec!["-c".into(), "exit 0".into()];
+    let server = ProcServ::new(cfg).expect("build");
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Connect A (with retry while the listener comes up) and B.
+    let mut a = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("connect A: {e}"),
+            }
+        }
+    };
+    let mut b = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+    // Let the child exit and be reaped; Disabled mode never relaunches it.
+    sleep(Duration::from_millis(400)).await;
+    // Drain the welcome banners and any child-exit annotation from both.
+    let _ = read_for(&mut a, Duration::from_millis(300)).await;
+    let _ = read_for(&mut b, Duration::from_millis(300)).await;
+
+    // A types a plain line (no menu keys). With the child dead the bytes
+    // have nowhere to go — B must not receive them.
+    a.write_all(b"ghost-bytes\n").await.unwrap();
+    let b_after = read_for(&mut b, Duration::from_millis(500)).await;
+    let b_clean = String::from_utf8_lossy(&strip_iac(&b_after)).to_string();
+    assert!(
+        !b_clean.contains("ghost-bytes"),
+        "client B must NOT receive client A's keystrokes directly (PS-8): {b_clean:?}"
     );
 
     server_task.abort();

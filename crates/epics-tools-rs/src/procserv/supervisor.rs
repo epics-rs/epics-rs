@@ -25,13 +25,14 @@
 //! ```
 //!
 //! When client A types: A's read task → `inbound_tx` → supervisor
-//! receives, scans for menu keys, then forwards the bytes to every
-//! OTHER peer's `outbound_tx`. The "exclude sender" property comes
-//! for free because the supervisor knows which `ClientId` produced
-//! the message.
+//! receives, scans for menu keys, then forwards the bytes to the PTY
+//! child ONLY — never to the other clients. Every client (A included)
+//! then sees the keystroke once when the PTY echoes it back. This
+//! matches C `SendToAll(buf, len, this)`, where a client sender's bytes
+//! reach only the process recipient (`procServ.cc:754-756`).
 //!
 //! When the PTY emits output: child task → `child_rx` → supervisor
-//! → all clients' `outbound_tx`s + log file.
+//! → all clients' `outbound_tx`s + log file (never back to the child).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -384,7 +385,8 @@ impl SupervisorState {
                             // Only the live-kill path reaches here; a kill
                             // key on a dead child is a RestartChild action.
                             if self.child.is_some() {
-                                self.fanout_to_all(b"\r\n@@@ Got a kill command\r\n").await;
+                                self.send_to_all(b"\r\n@@@ Got a kill command\r\n", Origin::Server)
+                                    .await;
                                 if let Some(slot) = self.child.as_ref() {
                                     let _ = slot.handle.signal(self.config.child.kill_signal);
                                 }
@@ -409,7 +411,7 @@ impl SupervisorState {
                                 "\r\n@@@ Toggled auto restart mode to {}\r\n",
                                 self.restart_mode.label()
                             );
-                            self.fanout_to_all(msg.as_bytes()).await;
+                            self.send_to_all(msg.as_bytes(), Origin::Server).await;
                         }
                         Action::LogoutClient => {
                             if let Some(entry) = self.clients.remove(&client_id) {
@@ -422,9 +424,13 @@ impl SupervisorState {
                     }
                 }
 
-                // Echo / forward the bytes to all peers EXCEPT the
-                // sender. Matches C `SendToAll(buf, count, this)`.
-                self.fanout_excluding(&bytes, Some(client_id)).await;
+                // C `SendToAll(buf, len, this)` (clientFactory.cc:243):
+                // a client sender's bytes reach ONLY the child, not the
+                // other clients — every client (including this one) sees
+                // the keystroke once when the PTY echoes it back. C keys
+                // recipients on sender class, not identity, so there is
+                // no per-client exclusion.
+                self.send_to_all(&bytes, Origin::Client).await;
                 if quit {
                     return Ok(true);
                 }
@@ -437,15 +443,12 @@ impl SupervisorState {
     async fn handle_child_event(&mut self, event: ChildEvent) -> ProcServResult<ChildLoopOutcome> {
         match event {
             ChildEvent::Output(bytes) => {
-                // Fan out to all clients (PTY is the sender; clients
-                // are everyone else). C semantics: SendToAll(buf,
-                // len, this).
-                self.fanout_excluding(&bytes, None).await;
-                if let Some(log) = &self.log
-                    && let Err(e) = log.write_chunk(&bytes).await
-                {
-                    tracing::warn!(error = %e, "procserv-rs: log write failed");
-                }
+                // PTY output is a process sender: it reaches every
+                // client and the log, never the child itself (C SendToAll
+                // with the process as sender, procServ.cc:730 → :759-763).
+                // The log write is folded into `send_to_all`, the single
+                // owner of the process/server fan-out.
+                self.send_to_all(&bytes, Origin::Child).await;
                 Ok(ChildLoopOutcome::Continue)
             }
             ChildEvent::Exited { exit } => {
@@ -475,7 +478,7 @@ impl SupervisorState {
                 // C SIGCHLD reaper block (procServ.cc:788-807): blank line +
                 // ruler + the `Received a sigChild` line. Distinguishes a
                 // normal exit from a signal death; never 128+sig.
-                self.fanout_to_all(messages::child_reaped(pid, exit).as_bytes())
+                self.send_to_all(messages::child_reaped(pid, exit).as_bytes(), Origin::Server)
                     .await;
                 // C ~processClass shutdown block (processFactory.cc:111-114):
                 // current time + mode-dependent reason + the command menu
@@ -486,8 +489,9 @@ impl SupervisorState {
                 let now = Local::now()
                     .format(&self.config.logging.time_format)
                     .to_string();
-                self.fanout_to_all(
+                self.send_to_all(
                     messages::child_shutting_down(&now, self.restart_mode, &info3).as_bytes(),
+                    Origin::Server,
                 )
                 .await;
 
@@ -560,12 +564,14 @@ impl SupervisorState {
         // C `processFactory` announces the (re)launch BEFORE forking
         // (processFactory.cc:66-72), naming the executable when it differs
         // from the display name. C prints this on the first launch too,
-        // where it reaches only the log (no clients yet) — `fanout_to_all`
-        // does the same here. This is the single restart-announce site,
-        // matching C where every relaunch routes through processFactory.
+        // where it reaches only the log (no clients yet) — a server-origin
+        // `send_to_all` does the same here. This is the single
+        // restart-announce site, matching C where every relaunch routes
+        // through processFactory.
         let command = self.config.child.program.display().to_string();
-        self.fanout_to_all(
+        self.send_to_all(
             messages::restarting_child(&self.config.child.name, &command).as_bytes(),
+            Origin::Server,
         )
         .await;
 
@@ -589,8 +595,9 @@ impl SupervisorState {
         self.pending_restart = None;
         // C `processClass` ctor, parent branch (processFactory.cc:193-196):
         // the new child PID line followed by the ruler.
-        self.fanout_to_all(
+        self.send_to_all(
             messages::new_child_pid(&self.config.child.name, handle.pid()).as_bytes(),
+            Origin::Server,
         )
         .await;
         self.child = Some(ChildSlot {
@@ -679,14 +686,41 @@ impl SupervisorState {
         messages::welcome(&ctx)
     }
 
-    /// Send `bytes` to every connected client, and record them to the
-    /// log file. Used for server-originated `@@@` annotations (banners,
-    /// restart-mode toggles, child-exit notices). C `SendToAll` writes
-    /// to the log whenever the sender is NULL or the child process
-    /// (`procServ.cc:725`), so these supervisor messages land in the
-    /// log alongside child output; only client keystroke echo
-    /// (`fanout_excluding` with a sender) is kept out of the log.
-    async fn fanout_to_all(&self, bytes: &[u8]) {
+    /// Fan `bytes` out across the party-line per C `SendToAll`
+    /// (`procServ.cc:707-768`). The recipient set is a function of the
+    /// message [`Origin`] alone — C keys it on `sender==NULL` /
+    /// `sender->isProcess()`, never the sender's identity:
+    ///
+    /// - [`Origin::Client`] — a network client's keystrokes reach ONLY
+    ///   the PTY child (`procServ.cc:754-756`); the other clients (and
+    ///   the sender) see the input once when the PTY echoes it back.
+    ///   Nothing is written to the log/debug stream — C's log guard
+    ///   `sender==NULL || isProcess()` is false for a client sender
+    ///   (`procServ.cc:725`).
+    /// - [`Origin::Server`] / [`Origin::Child`] — a NULL (server `@@@`
+    ///   annotation) or process (child output) sender reaches every
+    ///   connected client (`procServ.cc:759-763`) and the log/debug
+    ///   stream (`procServ.cc:725-749`), never the child itself.
+    ///
+    /// This method is the single owner of the recipient matrix, so the
+    /// rule that a client's keystrokes never reach other clients holds
+    /// by construction rather than per call site.
+    async fn send_to_all(&self, bytes: &[u8], origin: Origin) {
+        if let Origin::Client = origin {
+            // Client → child only (C's loop forwards a non-process
+            // sender's bytes solely to the process recipient,
+            // procServ.cc:754-756). No fan-out to clients, no log write.
+            if let Some(slot) = self.child.as_ref()
+                && let Err(e) = slot.handle.write_stdin(bytes).await
+            {
+                tracing::debug!(error = %e, "procserv-rs: child stdin write failed");
+            }
+            return;
+        }
+
+        // Server or child sender → every network client + the log,
+        // never the child (C procServ.cc:759-763 for clients, :725 for
+        // the log; the child branch excludes a process/NULL sender).
         for entry in self.clients.values() {
             let _ = entry
                 .out_tx
@@ -697,32 +731,6 @@ impl SupervisorState {
             && let Err(e) = log.write_chunk(bytes).await
         {
             tracing::warn!(error = %e, "procserv-rs: log write failed");
-        }
-    }
-
-    /// Send `bytes` to every connected client except the originator.
-    /// `exclude == None` means "send to all" (used for PTY-output
-    /// fan-out where the sender is the child, not a client).
-    async fn fanout_excluding(&self, bytes: &[u8], exclude: Option<ClientId>) {
-        for (id, entry) in &self.clients {
-            if Some(*id) == exclude {
-                continue;
-            }
-            let _ = entry
-                .out_tx
-                .send(OutboundFrame::Bytes(bytes.to_vec()))
-                .await;
-        }
-        // Forward to PTY child too — but only for client-originated
-        // bytes (when the child isn't the sender). C semantics: every
-        // non-readonly client's input flows through the party-line
-        // and the PTY is one of the recipients, putting it on the
-        // child's stdin.
-        if exclude.is_some()
-            && let Some(slot) = self.child.as_ref()
-            && let Err(e) = slot.handle.write_stdin(bytes).await
-        {
-            tracing::debug!(error = %e, "procserv-rs: child stdin write failed");
         }
     }
 
@@ -753,6 +761,21 @@ impl SupervisorState {
 enum ChildLoopOutcome {
     Continue,
     Shutdown,
+}
+
+/// Originator of a party-line message — the Rust model of C
+/// `SendToAll`'s `sender` argument (`procServ.cc:707`). C picks the
+/// recipient set purely from the sender's class (`sender==NULL`,
+/// `sender->isProcess()`) and never compares identities, so this
+/// carries no `ClientId`.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// `sender == NULL`: a server-originated `@@@` annotation.
+    Server,
+    /// `sender->isProcess()`: the PTY child's output.
+    Child,
+    /// A network client's keystrokes.
+    Client,
 }
 
 /// Remaining restart holdoff for a child that ran `uptime` before

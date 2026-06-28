@@ -111,7 +111,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C enables `^Q` by default (fires only while the child is dead, gating verified) and advertises it. Rust hardwires `quit: None`, exposes no flag, so the in-band "shut the server down" keystroke does not exist; `menu.rs:70-74` quit logic is dead at runtime. The config comment is factually wrong.
 
 #### PS-8 Client keystrokes broadcast to other clients (C sends them only to the child)
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (see commit marking PS-8)
+- Resolution: replaced the three ad-hoc fanout helpers (`fanout_to_all` / `fanout_excluding`) with a single `send_to_all(bytes, Origin)` that encodes C `SendToAll`'s recipient matrix by construction (`Origin::Client` → child stdin only, no client fan-out, no log; `Origin::Server`/`Origin::Child` → every client + log, never the child). A client's keystrokes can no longer reach another client directly — the rule now holds in one owner instead of per call site. Deterministic regression `client_keystrokes_are_not_forwarded_to_other_clients` (dead child ⟹ no PTY echo ⟹ second client sees nothing). Logger network-stream stamping (PS-9) is the remaining `Origin::Server`/`Child` follow-up.
 - Merged from: conn PS-26, telnet PS-54
 - Rust: `src/procserv/supervisor.rs:405-407` (`fanout_excluding(&bytes, Some(client_id))`) → loop `:634-643`
 - C: `clientFactory.cc:243` (`SendToAll(buf,len,this)`) → `procServ.cc:753-767`

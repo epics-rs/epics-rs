@@ -353,13 +353,26 @@ Cleared (one commit per finding, mqtt-rs-local, C-right):
   removing the canonicalisation-vs-lookup inconsistency. Test
   `parse_case_insensitive` flipped to `parse_rejects_lowercase_format_type`.
 - **MQ41 — CLEARED** `f0e44ea9` — scalar-float NaN encodes as lowercase `"nan"`
-  to match glibc `%f` (`drvMqtt.cpp:651`); ±inf already matched.
+  to match glibc `%f` (`drvMqtt.cpp:651`); ±inf already matched. **Residual
+  (platform-dependent, unreached):** a sign-set NaN renders `"nan"` here while
+  glibc `%f` prints `"-nan"` (and macOS libc prints `"nan"` for both signs, so
+  hard-coding `"-nan"` would itself diverge there). epicsNAN is positive, so a
+  negative NaN only arises from a runtime `0.0/0.0`-style calc; left as a known
+  libc-dependent edge rather than a platform-specific hack. Shared with the array
+  non-finite path (`payload.rs:108-110`).
 - **MQ34 — CLEARED** `fb96dbbd` — DIGITAL decode rejects a leading `+`
   (`isInteger(val, isSigned=false)`, `drvMqtt.cpp:294`). Regression test added.
-- **MQ1 — CLEARED** `53a35a11` — `Arc<AtomicBool>` connection gate: the event
-  loop is the single writer (`mark_connected` ⇒ up, poll-error arm ⇒ down), the
-  driver `publish_value` returns `MqttError::NotConnected` (→ asynError) while
-  down instead of buffering on the unbounded channel. Regression test added.
+- **MQ1 — CLEARED** `53a35a11` + defect follow-up `f8dd9fb4` — `Arc<AtomicBool>`
+  connection gate: the event loop is the single writer (`mark_connected` ⇒ up,
+  poll-error arm ⇒ down), the driver returns `MqttError::NotConnected`
+  (→ asynError) while down instead of buffering on the unbounded channel.
+  Follow-up `f8dd9fb4` closes a defect the first commit introduced: the gate sat
+  inside `publish_value`, which the five commit-after-publish handlers reach
+  first, but `write_uint32_digital` commits its cache *before* publishing — so a
+  disconnected digital write left a phantom defined value that defeated the
+  uninitialized-masked-write guard. Single-sourced the gate in
+  `ensure_connected()` and called it at the top of `write_uint32_digital`, before
+  any side effect. Both paths have regression tests.
 
 Intentional-divergence asides — **kept** (Rust declines a C bug / is more robust;
 no fix):
@@ -387,6 +400,14 @@ MQ36, MQ48, MQ49.
 - **MQ32** — array double-space (`"1  2"`) rejected where C accepts; fix is to
   collapse empty split elements, but must avoid turning an empty payload into
   `[]` — needs the C empty-payload behaviour checked first.
+- **MQ39** — outbound octet publish corrupts non-UTF-8 bytes via
+  `String::from_utf8_lossy(data)` before NUL-truncation; C publishes
+  `std::string(stringData.data())` = raw bytes up to the first NUL
+  (`drvMqtt.cpp:716`). The wire path is **mqtt-rs-local**: `write_octet` already
+  receives `data: &[u8]`, so widening `PublishRequest.payload` to `Vec<u8>` and
+  encoding FLAT octet as the raw NUL-truncated bytes makes the wire
+  byte-identical with no framework change. (The write-side *cache* readback stays
+  `String`-lossy — that part belongs to the MQ38 octet family below.)
 
 **Structural / framework — asyn-rs contract change, design sign-off (the SAME
 asyn-rs gap as modbus R34/R52/R54):**
@@ -395,11 +416,12 @@ asyn-rs gap as modbus R34/R52/R54):**
   (needs asyn-rs interrupt-variable tracking + `setAutoInterrupts(false)` model).
 - **MQ47** — on-demand param creation from a record's resolved `INP/OUT`
   (`drv_user_create(&self)` cannot create params; C autoparam does).
-- **MQ38 / MQ39** — full octet byte-fidelity (inbound store + outbound publish of
-  non-UTF-8 bytes); the cache side is blocked because `ParamSetValue::Octet` is a
-  `String`, not `Vec<u8>`. Local mitigations exist (inbound `from_utf8_lossy`
-  instead of whole-message drop; outbound raw bytes on the wire for FLAT octet),
-  but byte-identical parity needs the framework `Octet=Vec<u8>` change.
+- **MQ38** — inbound octet byte-fidelity: a non-UTF-8 payload on an octet topic
+  is dropped whole (`from_utf8` fails) where C stores the raw bytes up to the
+  first NUL. A local `from_utf8_lossy` mitigation avoids the whole-message drop
+  but still corrupts the bytes (U+FFFD), so byte-identical storage is blocked by
+  `ParamSetValue::Octet` being a `String`, not `Vec<u8>`. (The outbound-wire half
+  is MQ39, fixable locally — see batch 2.)
 
 **Verification-blocked — Autoparam source absent under `/Users/stevek/codes`:**
 MQ51 (write-side cache-update parity), MQ19 (whether autoparam trims

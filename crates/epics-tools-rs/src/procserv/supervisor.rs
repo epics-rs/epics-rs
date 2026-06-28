@@ -125,9 +125,10 @@ struct SupervisorState {
     /// `processFactoryNeedsRestart()` every poll, so a manual restart
     /// (`restartOnce()` zeros `_restartTime`, `processFactory.cc:289-291`)
     /// or a kill is honored live rather than queued behind the sleep.
-    /// Invariant: `pending_restart.is_some()` ⟹ `child.is_none()` — set
-    /// only on child exit, cleared by [`Self::respawn_child`] (the single
-    /// owner of the "child now running" transition).
+    /// Invariant: `pending_restart.is_some()` ⟹ `child.is_none()` — set on
+    /// child exit or a failed (re)spawn ([`Self::schedule_spawn_retry`]),
+    /// cleared by [`Self::respawn_child`] (the single owner of the "child
+    /// now running" transition).
     pending_restart: Option<PendingRestart>,
     /// Wall-clock time the supervisor started, for the welcome banner's
     /// "@@@ procServ server started at:" line (C `procServStart`,
@@ -255,9 +256,17 @@ impl SupervisorState {
                 .unwrap_or_else(|_| ".".to_string()),
         };
 
-        // Initial child spawn unless `--wait` (manual start).
-        if !state.config.wait_for_manual_start {
-            state.respawn_child().await?;
+        // Initial child spawn unless `--wait` (manual start). A spawn
+        // failure here (forkpty/exec error — pty exhaustion, transient
+        // ENOENT) must NOT abort the supervisor: C treats a failed forkpty
+        // as a `markedForDeletion` child that still sets
+        // `_restartTime = holdoff + now` and retries on the next poll
+        // (processFactory.cc:158,188), never giving up. Schedule the
+        // holdoff retry instead of propagating the error.
+        if !state.config.wait_for_manual_start
+            && let Err(e) = state.respawn_child().await
+        {
+            state.schedule_spawn_retry(e)?;
         }
 
         Ok(state)
@@ -341,8 +350,13 @@ impl SupervisorState {
                 _ = restart_due => {
                     if self.pending_restart.take().is_some() {
                         // `respawn_child` emits C's `@@@ Restarting child`
-                        // announcement itself — no separate banner here.
-                        self.respawn_child().await?;
+                        // announcement itself — no separate banner here. A
+                        // failed (re)spawn reschedules behind the holdoff
+                        // rather than aborting the supervisor (C never gives
+                        // up on a forkpty failure, processFactory.cc:158,188).
+                        if let Err(e) = self.respawn_child().await {
+                            self.schedule_spawn_retry(e)?;
+                        }
                     }
                 }
             }
@@ -837,6 +851,66 @@ impl SupervisorState {
             at: tokio::time::Instant::now() + remaining,
         });
     }
+
+    /// Recover from a failed child (re)spawn the way C handles a `forkpty`
+    /// failure (`processFactory.cc:156-189`): log it, but do NOT abort the
+    /// supervisor — C builds a `markedForDeletion` child that still sets
+    /// `_restartTime = holdoff + now`, so the next poll retries. Schedule
+    /// the relaunch behind the full holdoff (no child ran, so there is no
+    /// uptime to subtract) and keep the server up.
+    ///
+    /// The retry is recorded against the Rust crash-loop cap
+    /// ([`RestartTracker`]), so a *persistent* spawn failure (binary
+    /// deleted, pty exhausted) with an explicit `--max-restarts` eventually
+    /// terminates instead of looping forever; when the cap is left at the
+    /// CLI default (unlimited, PS-41) it retries indefinitely, matching C's
+    /// never-give-up. Used only by the auto/initial spawn paths — the
+    /// manual `^R` path stays operator-driven (log-and-continue, no
+    /// auto-reschedule).
+    fn schedule_spawn_retry(&mut self, err: ProcServError) -> ProcServResult<()> {
+        tracing::error!(
+            error = %err,
+            "procserv-rs: child spawn failed; retrying after holdoff"
+        );
+        self.restart_tracker
+            .try_record(&self.config.restart)
+            .map_err(|(max, win)| ProcServError::RestartLimitExceeded {
+                attempts: max,
+                window_secs: win,
+            })?;
+        self.schedule_restart(None);
+        Ok(())
+    }
+
+    /// Minimal state for unit-testing the spawn-failure recovery
+    /// ([`Self::schedule_spawn_retry`]) without binding listeners, opening
+    /// a log, or forking a child. Only `config` (for `restart`/`holdoff`)
+    /// and the restart bookkeeping matter to the methods under test.
+    #[cfg(test)]
+    fn for_test(config: ProcServConfig) -> Self {
+        let restart_mode = config.restart_mode;
+        let (inbound_tx, inbound_rx) = mpsc::channel(8);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(8);
+        let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("register SIGHUP in test runtime");
+        Self {
+            restart_mode,
+            config: Arc::new(config),
+            inbound_tx,
+            inbound_rx,
+            incoming_rx,
+            clients: HashMap::new(),
+            child: None,
+            restart_tracker: RestartTracker::new(),
+            first_run: true,
+            log: None,
+            sighup,
+            child_exit_code: 0,
+            pending_restart: None,
+            proc_started: Local::now(),
+            startup_dir: ".".to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -994,10 +1068,13 @@ impl Drop for SupervisorState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitDisposition, effective_ignore_chars, exit_disposition, remaining_holdoff, send_bounded,
+        ExitDisposition, SupervisorState, effective_ignore_chars, exit_disposition,
+        remaining_holdoff, send_bounded,
     };
     use crate::procserv::client::OutboundFrame;
-    use crate::procserv::restart::RestartMode;
+    use crate::procserv::config::{ChildConfig, ProcServConfig};
+    use crate::procserv::error::ProcServError;
+    use crate::procserv::restart::{RestartMode, RestartPolicy};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -1010,6 +1087,31 @@ mod tests {
             restart: Some(0x12),        // ^R
             quit: Some(0x11),           // ^Q
             logout: Some(0x1d),         // ^]
+        }
+    }
+
+    /// A bare config sufficient for the spawn-retry tests; only `restart`
+    /// and `holdoff` are read by `schedule_spawn_retry`.
+    fn min_config() -> ProcServConfig {
+        ProcServConfig {
+            foreground: true,
+            listen: Default::default(),
+            keys: Default::default(),
+            child: ChildConfig {
+                name: "test".into(),
+                program: "/bin/true".into(),
+                args: Vec::new(),
+                cwd: None,
+                kill_signal: 9,
+                ignore_chars: Vec::new(),
+                core_size: None,
+                child_exec: None,
+            },
+            logging: Default::default(),
+            restart: RestartPolicy::default(),
+            restart_mode: RestartMode::OnExit,
+            holdoff: Duration::from_millis(10),
+            wait_for_manual_start: false,
         }
     }
 
@@ -1129,6 +1231,54 @@ mod tests {
         assert_eq!(
             exit_disposition(RestartMode::OneShot, false),
             ExitDisposition::Shutdown
+        );
+    }
+
+    // PS-21: a failed (re)spawn must schedule a holdoff retry instead of
+    // aborting the supervisor (C never gives up on a forkpty failure), and
+    // it must give up only when the explicit crash-loop cap is exceeded.
+    #[tokio::test]
+    async fn spawn_retry_schedules_holdoff_when_under_cap() {
+        let mut cfg = min_config();
+        cfg.restart = RestartPolicy {
+            max_restarts: 5,
+            ..RestartPolicy::default()
+        };
+        let mut state = SupervisorState::for_test(cfg);
+        assert!(state.pending_restart.is_none());
+
+        let r = state.schedule_spawn_retry(ProcServError::Forkpty("pty exhausted".into()));
+        assert!(r.is_ok(), "a spawn failure under the cap must not abort");
+        assert!(
+            state.pending_restart.is_some(),
+            "a spawn failure must schedule a holdoff retry, not give up"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_retry_gives_up_when_cap_exceeded() {
+        let mut cfg = min_config();
+        // Cap of 1: the first retry records and succeeds, the second
+        // exceeds the window and terminates the supervisor.
+        cfg.restart = RestartPolicy {
+            max_restarts: 1,
+            window: Duration::from_secs(600),
+            ..RestartPolicy::default()
+        };
+        let mut state = SupervisorState::for_test(cfg);
+
+        assert!(
+            state
+                .schedule_spawn_retry(ProcServError::Forkpty("boom".into()))
+                .is_ok(),
+            "first failure is within the cap"
+        );
+        let err = state
+            .schedule_spawn_retry(ProcServError::Forkpty("boom".into()))
+            .expect_err("second failure must exceed the cap");
+        assert!(
+            matches!(err, ProcServError::RestartLimitExceeded { .. }),
+            "exceeding the cap must surface RestartLimitExceeded, got: {err:?}"
         );
     }
 

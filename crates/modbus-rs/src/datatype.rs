@@ -310,8 +310,12 @@ fn need_regs(regs: &[u16], need: usize) -> ModbusResult<()> {
 ///
 /// Returns `(value, registers_consumed)`. Port of `readPlcInt64`; the
 /// `readPlcInt32` form is [`read_int32`]. For float types the register is
-/// decoded as a float and then truncated to `i32` before sign-extension,
-/// exactly as the C code does.
+/// decoded as a float and truncated to `i32` before sign-extension. This
+/// matches C `(epicsInt32)fValue` (drvModbusAsyn.cpp:2572) for every in-range
+/// value; at the boundary it deliberately differs — Rust's `as` cast
+/// saturates (NaN→0, |v|≥2^31→i32::MIN/MAX) where C's cast yields x86's
+/// INT_MIN "integer indefinite". The well-defined saturating result is kept
+/// rather than copying C's UB-adjacent boundary value.
 pub fn read_int64(dt: ModbusDataType, regs: &[u16]) -> ModbusResult<(i64, usize)> {
     use ModbusDataType::*;
     match dt {
@@ -375,7 +379,9 @@ pub fn read_int64(dt: ModbusDataType, regs: &[u16]) -> ModbusResult<(i64, usize)
         Float32Le | Float32LeBs | Float32Be | Float32BeBs | Float64Le | Float64LeBs | Float64Be
         | Float64BeBs => {
             let (f, words) = read_float(dt, regs)?;
-            // C: i64Result = (epicsInt32)fValue;
+            // C: i64Result = (epicsInt32)fValue (drvModbusAsyn.cpp:2572).
+            // `as i32` saturates at the boundary (see read_int64) rather than
+            // reproducing C's x86 INT_MIN; in-range results are identical.
             Ok((f as i32 as i64, words))
         }
         StringHigh | StringLow | StringHighLow | StringLowHigh | ZStringHigh | ZStringLow
@@ -497,7 +503,10 @@ pub fn write_int32(dt: ModbusDataType, value: i32) -> ModbusResult<Vec<u16>> {
 pub fn write_float(dt: ModbusDataType, value: f64) -> ModbusResult<Vec<u16>> {
     use ModbusDataType::*;
     match dt {
-        // Integer types: round-trip through the integer writer, matching C.
+        // Integer types: round-trip through the integer writer. C writePlcFloat
+        // casts `(epicsInt64)value`; the Rust `as i64`/`as u64` matches in
+        // range and saturates at the boundary instead of C's UB cast (see
+        // read_int64).
         UInt16 | Int16Sm | BcdSigned | BcdUnsigned | Int16 | Int32Le | Int32LeBs | Int32Be
         | Int32BeBs | Int64Le | Int64LeBs | Int64Be | Int64BeBs => write_int64(dt, value as i64),
         UInt32Le | UInt32LeBs | UInt32Be | UInt32BeBs | UInt64Le | UInt64LeBs | UInt64Be

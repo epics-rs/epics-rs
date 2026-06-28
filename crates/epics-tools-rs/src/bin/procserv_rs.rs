@@ -158,11 +158,15 @@ mod app {
         let mut iter = args.cmd.into_iter();
         let program = PathBuf::from(iter.next().unwrap());
         let argv: Vec<String> = iter.collect();
-        let display_name = args.name.unwrap_or_else(|| {
-            program
-                .file_name()
-                .map_or("child".into(), |s| s.to_string_lossy().into())
-        });
+        // C defaults `childName` to the WHOLE command string (argv[optind]),
+        // not its basename: with no `-n`, `childName == command`, so the
+        // banner shows the bare `@@@ Child started as: <cmd>` /
+        // `@@@ Child "<cmd>" PID: N` form (procServ.cc:455-457,579-586).
+        // Defaulting to `file_name()` would make `name != command` for any
+        // path with a directory component (the normal IOC case), flipping
+        // every name-bearing line to the wrong "named" form. Keep the full
+        // program string so the identity matches C.
+        let display_name = args.name.unwrap_or_else(|| program.display().to_string());
 
         let listen = ListenConfig {
             tcp_port: args.port,
@@ -353,6 +357,27 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.keys.quit, Some(0x11));
+        }
+
+        /// With no `-n`, C sets `childName == command` (the whole argv
+        /// string), so the display name must default to the full program
+        /// path — not its basename — and stay equal to the command
+        /// (procServ.cc:455-457).
+        #[test]
+        fn child_name_defaults_to_whole_command_not_basename() {
+            let args = Args::try_parse_from(["procserv-rs", "/opt/ioc/st.cmd"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.name, "/opt/ioc/st.cmd");
+            assert_eq!(cfg.child.name, cfg.child.program.display().to_string());
+        }
+
+        /// `-n`/`--name` still overrides the default.
+        #[test]
+        fn child_name_honors_explicit_name() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--name", "ioc", "/opt/ioc/st.cmd"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.name, "ioc");
         }
 
         /// C starts `logoutChar` at `0x00` (disabled) and enables it only

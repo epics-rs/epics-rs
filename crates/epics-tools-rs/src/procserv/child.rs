@@ -18,7 +18,6 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,6 +31,22 @@ use tokio::task::JoinHandle;
 
 use crate::procserv::error::{ProcServError, ProcServResult};
 
+/// Faithful child-exit classification, mirroring C procServ's
+/// `WIFEXITED` / `WIFSIGNALED` split in the SIGCHLD reaper
+/// (`procServ.cc:794-805`). A signal death must NOT be collapsed into a
+/// `128 + signo` exit code: C reports "killed by signal N" distinctly
+/// from "Normal exit status = N", and `main` returns the `WEXITSTATUS`
+/// (not `128+sig`) as procServ's own exit status (`procServ.cc:798,701`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExit {
+    /// `WIFEXITED` — child exited normally with this status code.
+    Exited(i32),
+    /// `WIFSIGNALED` — child was terminated by this signal number.
+    Signaled(i32),
+    /// `waitpid` failed or returned an unhandled status (stopped/continued).
+    Unknown,
+}
+
 /// Lifecycle event emitted by [`ChildHandle`] over its event channel.
 #[derive(Debug)]
 pub enum ChildEvent {
@@ -39,7 +54,7 @@ pub enum ChildEvent {
     Output(Vec<u8>),
     /// Child process terminated. The supervisor consults the restart
     /// policy and either re-spawns or exits.
-    Exited { status: Option<ExitStatus> },
+    Exited { exit: ChildExit },
 }
 
 /// Configuration for one child launch. Mirrors the subset of
@@ -329,23 +344,16 @@ fn spawn_reaper(pid: Pid, alive: Arc<AtomicBool>, tx: mpsc::Sender<ChildEvent>) 
         let res = tokio::task::spawn_blocking(move || waitpid(pid, None))
             .await
             .ok();
-        let exit_code = match res {
-            Some(Ok(WaitStatus::Exited(_, code))) => Some(make_exit_status(code)),
-            Some(Ok(WaitStatus::Signaled(_, sig, _))) => Some(make_exit_status(128 + sig as i32)),
-            _ => None,
+        // Preserve C's WIFEXITED/WIFSIGNALED distinction (procServ.cc:794-805):
+        // a signal death is reported as such, never folded into 128+sig.
+        let exit = match res {
+            Some(Ok(WaitStatus::Exited(_, code))) => ChildExit::Exited(code),
+            Some(Ok(WaitStatus::Signaled(_, sig, _))) => ChildExit::Signaled(sig as i32),
+            _ => ChildExit::Unknown,
         };
         alive.store(false, Ordering::Release);
-        let _ = tx.send(ChildEvent::Exited { status: exit_code }).await;
+        let _ = tx.send(ChildEvent::Exited { exit }).await;
     })
-}
-
-#[cfg(unix)]
-fn make_exit_status(code: i32) -> ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    // Pack code into the wait-status form. ExitStatusExt::from_raw
-    // takes a raw `wait()` status; for an "exited normally" status
-    // that's `code << 8`.
-    ExitStatus::from_raw(code << 8)
 }
 
 #[cfg(test)]
@@ -395,6 +403,64 @@ mod tests {
         assert!(!handle.is_alive(), "alive flag should flip false");
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("hello procserv"), "got: {text:?}");
+    }
+
+    /// Drain until the channel closes, returning the final exit
+    /// classification (the last `Exited` seen). Mirrors
+    /// [`drain_until_closed`] but keeps the [`ChildExit`] value.
+    async fn drain_for_exit(
+        rx: &mut mpsc::Receiver<ChildEvent>,
+        deadline: tokio::time::Instant,
+    ) -> Option<ChildExit> {
+        let mut exit = None;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(ChildEvent::Output(_)) => {}
+                    Some(ChildEvent::Exited { exit: e }) => exit = Some(e),
+                    None => break,
+                },
+                _ = sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        exit
+    }
+
+    /// A normal exit is classified `Exited(code)` carrying the real
+    /// status code — `/bin/sh -c 'exit 3'` reports `Exited(3)`, never
+    /// a signal (C WIFEXITED, procServ.cc:794-798).
+    #[tokio::test]
+    async fn normal_exit_reports_exit_code() {
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "exit 3".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let exit = drain_for_exit(&mut rx, deadline).await;
+        assert_eq!(exit, Some(ChildExit::Exited(3)), "got: {exit:?}");
+    }
+
+    /// A signal death is classified `Signaled(sig)` — NOT folded into a
+    /// `128 + sig` exit code (C WIFSIGNALED, procServ.cc:801-805).
+    /// SIGKILL (9) a `sleep` and confirm the reaper reports `Signaled(9)`.
+    #[tokio::test]
+    async fn signal_death_reports_signal_not_128_plus_sig() {
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["30".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+        };
+        let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        // Let the child reach its sleep, then SIGKILL its group.
+        sleep(Duration::from_millis(150)).await;
+        handle.signal(9).expect("signal");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let exit = drain_for_exit(&mut rx, deadline).await;
+        assert_eq!(exit, Some(ChildExit::Signaled(9)), "got: {exit:?}");
     }
 
     #[tokio::test]

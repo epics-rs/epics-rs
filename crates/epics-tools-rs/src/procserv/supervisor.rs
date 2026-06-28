@@ -39,7 +39,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Local};
 use tokio::sync::mpsc;
 
-use crate::procserv::child::{ChildEvent, ChildHandle, ChildSpec};
+use crate::procserv::child::{ChildEvent, ChildExit, ChildHandle, ChildSpec};
 use crate::procserv::client::{
     ClientId, ClientMeta, InboundEvent, IncomingClient, OutboundFrame, spawn_client,
 };
@@ -428,14 +428,17 @@ impl SupervisorState {
                 }
                 Ok(ChildLoopOutcome::Continue)
             }
-            ChildEvent::Exited { status } => {
+            ChildEvent::Exited { exit } => {
                 let started_at = self.child.take().map(|slot| slot.started_at);
-                let msg = format!(
-                    "\r\n@@@ Child exited (status: {:?})\r\n",
-                    status
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".into())
-                );
+                // C's SIGCHLD reaper distinguishes a normal exit from a
+                // signal death (procServ.cc:794-805); never collapse a
+                // signal into 128+sig.
+                let detail = match exit {
+                    ChildExit::Exited(code) => format!("exit status = {code}"),
+                    ChildExit::Signaled(sig) => format!("killed by signal {sig}"),
+                    ChildExit::Unknown => "unknown status".to_string(),
+                };
+                let msg = format!("\r\n@@@ Child exited ({detail})\r\n");
                 self.fanout_to_all(msg.as_bytes()).await;
 
                 match self.restart_mode {

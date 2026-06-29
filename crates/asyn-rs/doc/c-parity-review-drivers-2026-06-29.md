@@ -1050,3 +1050,23 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   falls back to 9600 only for a `SerialConfig` built directly with an
   unmappable rate. Tests: `baud_arbitrary_on_bsd_mapped_set_on_linux` plus
   the platform-aware `test_set_option_unsupported_baud`.
+  - **Round drv-s5 follow-up (DEFECT, FIXED 34b22ebc):** the rewrite kept a
+    `0 => libc::B0` arm in the Linux branch, so `setOption("baud","0")` on Linux
+    succeeded and programmed B0 (line hangup) where C returns asynError — C's
+    Linux switch starts at `case 50` with no `case 0` (drvAsynSerialPort.c:276-344).
+    Dropped the arm so 0 falls to `_ => return None` on Linux; macOS/BSD still
+    accept 0 via the literal passthrough (C-macOS `baudCode = baud = 0`). Tests
+    extended (baud 0: Some on macOS/BSD, None on Linux; 0 removed from the
+    roundtrip set).
+  - **Round drv-s5 CONCERN (residual, NOT a C-parity divergence):** the silent
+    9600 fallback is closed for the driver path (the only writers of
+    `config.baud` are `SerialConfig::parse` → always 9600 and `set_option` →
+    only after `baud_to_speed == Some`; `apply_to_termios` has one caller,
+    `connect`, on the private `config`), but `SerialConfig` is `pub` with a
+    `pub baud` field and `pub fn apply_to_termios`, so an external caller could
+    build `SerialConfig { baud: 28800, .. }` on Linux and call
+    `.apply_to_termios()` → silent B9600. No C equivalent (C has no public
+    config-apply), so not a wire divergence; both review panels marked it
+    non-blocking. Structural close would be a breaking API change (make
+    `apply_to_termios` fallible, or narrow it to `pub(crate)`); left for user
+    sign-off rather than breaking the public API unilaterally.

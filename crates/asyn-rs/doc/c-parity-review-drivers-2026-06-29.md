@@ -89,7 +89,7 @@ impact paragraphs in the round report
 | DRV-33 | CLEARED | serial_port.rs:681-682 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
 | DRV-34 | CLEARED | serial_port.rs:159-208,263-270 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing; Linux high rates rejected; silent 9600 fallback) — FIXED 7ef497b5 (see Fix Log) |
 | DRV-35 | CLEARED | serial_port.rs:830-1000 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value — FIXED fdf7d488 (commit self.config only after successful apply, all 5 arms) |
-| DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
+| DRV-36 | CLEARED | serial_port.rs:846-848 | drvAsynSerialPort.c:594-616 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored — both halves now closed (4436d8a8) |
 | DRV-37 | CLEARED | serial_port.rs:392-487 | drvAsynSerialPort.c:810-842 | write timeout applied per-poll-iteration, not single total deadline → write lives timeout×N (and a blocking write(fd,all) ignored the timeout entirely) — FIXED 92755a0f (single deadline + post-write check + non-blocking write loop) |
 | DRV-38 | CONCERN | serial_port.rs:373-378,621-634 | drvAsynSerialPort.c:843 | partial byte count dropped on write timeout/error (framework `write_octet -> ()` contract) |
 | DRV-39 | CLEARED | serial_port.rs:1131-1133 | drvAsynSerialPort.c:203-208 | getOption("break") errors instead of returning "off" — FIXED dbb9a127 ("break" arm returns "off") |
@@ -369,6 +369,20 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   (port.rs:875) used by `ip_server`/`prologix`, whose C drivers register no
   `asynOption` interface at all — an interface-advertisement question for the
   F7/interface sign-off, not the known-key-chain leak.
+- **DRV-36 empty-key re-apply** (CONCERN, second half of DRV-36) — CLEARED
+  (4436d8a8). The F4 fix above closed only the unknown-key half; the empty key
+  `""` was left a pure no-op even when connected. C `setOption` (:609-615) runs
+  `applyOptions` on the empty key when `fd >= 0`, which forces CREAD and
+  re-pushes the cached termios via `tcsetattr` (`applyOptions`, :119-126),
+  re-applying the configured line state — a restore if another process changed
+  the port out from under the driver. Closed structurally: extracted
+  `build_configured_termios()` (serial_port.rs) as the single owner of the
+  configured line state (cfmakeraw + fixed seeds + `self.config`), shared by
+  `connect` and the empty-key re-apply; like C's `applyOptions` it rebuilds from
+  the cached config (not a device read-back), so it overwrites an external
+  clobber. Test: `pty_empty_key_reapplies_configured_termios` flips CSTOPB
+  externally and confirms the empty key restores it; the disconnected no-op
+  stays covered by `test_set_option_unknown`.
 - **DRV-10** (LOW, disconnectOnReadTimeout value validation) — CLEARED. The
   `disconnectOnReadTimeout` branch coerced any value to a bool via a lenient
   truthy parse (`"Y"|"y"|"1"|"yes"` → true, everything else → false) and never

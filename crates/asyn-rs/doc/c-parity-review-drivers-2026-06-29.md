@@ -48,21 +48,21 @@ impact paragraphs in the round report
 
 | id | sev | Rust | C | one-line |
 |---|---|---|---|---|
-| DRV-1 | DEFECT | ip_port.rs:596-638 | drvAsynIPPort.c:513-523,656,775-789 | UDP socket is `connect()`-ed → inbound datagrams filtered to one peer; `udp*` broadcast replies dropped; SO_BROADCAST set after connect |
-| DRV-2 | DEFECT | iocsh.rs:441-505, ip_port.rs:471-493 | drvAsynIPPort.c:1065-1066 | EOS interpose never auto-installed; C installs `asynInterposeEos` by default → IEOS/OEOS dead on a fresh port |
-| DRV-3 | CONCERN | ip_port.rs:266-269 | drvAsynIPPort.c:814-831 | TCP EOF returns Disconnected error; C returns success+`ASYN_EOM_END`; END bit never emitted anywhere |
-| DRV-4 | DEFECT | ip_port.rs:296-299,782-804 | drvAsynIPPort.c:815 | empty UDP datagram treated as EOF → tears down socket (legit zero-len datagram kills the port) |
-| DRV-5 | DEFECT | ip_port.rs:810-828,357-379 | drvAsynIPPort.c:692-699 | write errors never close connection (asymmetric w/ read path); port wedges, no reconnect |
+| DRV-1 | CLEARED | ip_port.rs:596-638 | drvAsynIPPort.c:513-523,656,775-789 | UDP socket is `connect()`-ed → inbound datagrams filtered to one peer; `udp*` broadcast replies dropped; SO_BROADCAST set after connect — FIXED (F3, see Fix Log) |
+| DRV-2 | CLEARED | iocsh.rs:441-505, ip_port.rs:471-493 | drvAsynIPPort.c:1065-1066 | EOS interpose never auto-installed; C installs `asynInterposeEos` by default → IEOS/OEOS dead on a fresh port — FIXED (F7, see Fix Log) |
+| DRV-3 | CLEARED | ip_port.rs:266-269 | drvAsynIPPort.c:814-831 | TCP EOF returns Disconnected error; C returns success+`ASYN_EOM_END`; END bit never emitted anywhere — FIXED (F2, see Fix Log) |
+| DRV-4 | CLEARED | ip_port.rs:296-299,782-804 | drvAsynIPPort.c:815 | empty UDP datagram treated as EOF → tears down socket (legit zero-len datagram kills the port) — FIXED (F2, see Fix Log) |
+| DRV-5 | CLEARED | ip_port.rs:810-828,357-379 | drvAsynIPPort.c:692-699 | write errors never close connection (asymmetric w/ read path); port wedges, no reconnect — FIXED (F1, see Fix Log) |
 | DRV-6 | CONCERN | ip_port.rs:121-138,32-51 | drvAsynIPPort.c:364-367,1061-1064 | `COM` protocol suffix unsupported → silently downgraded to plain TCP, RFC 2217 interpose omitted |
 | DRV-7 | CLEARED | ip_port.rs:767-771,711-718 | drvAsynIPPort.c:214-217,557-558,815-819 | HTTP per-transaction disconnects after each read → truncates multi-segment responses + flaps Connect exception — FIXED 1629e3bb |
-| DRV-8 | CONCERN | ip_port.rs:861-866,665-667 | drvAsynIPPort.c:525-534,915-947 | `noDelay` is a non-C option key (C has none, sets TCP_NODELAY unconditionally) |
-| DRV-9 | CONCERN | ip_port.rs:916-945 | drvAsynIPPort.c:902-906,941-945 | setOption/getOption accept+echo arbitrary unknown keys; C closes dispatch (asynError) |
-| DRV-10 | LOW | ip_port.rs:867-869 | drvAsynIPPort.c:924-935 | `disconnectOnReadTimeout` parse accepts extra values, never errors (C: only Y/N) |
+| DRV-8 | DOC | ip_port.rs:861-866,665-667 | drvAsynIPPort.c:525-534,915-947 | `noDelay` is a non-C option key (C has none, sets TCP_NODELAY unconditionally) — KEPT, intentional extension (see Fix Log) |
+| DRV-9 | CLEARED | ip_port.rs:916-945 | drvAsynIPPort.c:902-906,941-945 | setOption/getOption accept+echo arbitrary unknown keys; C closes dispatch (asynError) — FIXED (F4, see Fix Log) |
+| DRV-10 | CLEARED | ip_port.rs:867-869 | drvAsynIPPort.c:924-935 | `disconnectOnReadTimeout` parse accepts extra values, never errors (C: only Y/N) — FIXED (see Fix Log) |
 | DRV-11 | CLEARED | ip_port.rs:264,792-794 | drvAsynIPPort.c:741-743,799 | `timeout==0` read → Duration::ZERO rejected by std → misclassified, disconnects (C floors to 1ms poll); missing `timeout>0` disconnect guard — FIXED a092a777 |
-| DRV-12 | LOW | ip_port.rs:661-731 | drvAsynIPPort.c:424-427 | `connect()` doesn't reject already-open link (C: "Link already open!") |
+| DRV-12 | CLEARED | ip_port.rs:661-731 | drvAsynIPPort.c:424-427 | `connect()` doesn't reject already-open link (C: "Link already open!") — FIXED (F6, see Fix Log) |
 | DRV-13 | DOC | ip_port.rs:92,109,553,575 | drvAsynIPPort.c:513-523 | hardcoded 5s connect timeout where C connect is OS-default blocking — intentional divergence, documented b2938e11 |
-| DRV-14 | LOW | ip_port.rs:368-371 | drvAsynIPPort.c:613-614 | zero-length write emits an empty UDP datagram; C returns before sending |
-| DRV-15 | LOW | ip_port.rs:810-828, port.rs:979 | drvAsynIPPort.c:678-705 | partial-write byte count dropped on error (framework `write_octet -> ()` contract) |
+| DRV-14 | CLEARED | ip_port.rs:368-371 | drvAsynIPPort.c:613-614 | zero-length write emits an empty UDP datagram; C returns before sending — FIXED (see Fix Log) |
+| DRV-15 | CLEARED | ip_port.rs:810-828, port.rs:979 | drvAsynIPPort.c:678-705 | partial-write byte count dropped on error (framework `write_octet -> ()` contract) — FIXED (F8, see Fix Log) |
 
 ### Category B — `ip_server_port.rs` ↔ `drvAsynIPServerPort.c`
 

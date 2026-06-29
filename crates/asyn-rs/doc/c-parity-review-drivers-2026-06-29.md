@@ -95,7 +95,7 @@ impact paragraphs in the round report
 | DRV-39 | CLEARED | serial_port.rs:1131-1133 | drvAsynSerialPort.c:203-208 | getOption("break") errors instead of returning "off" — FIXED dbb9a127 ("break" arm returns "off") |
 | DRV-40 | LOW | serial_port.rs:514-531 | drvAsynSerialPort.c:694-698 | connect() not guarded against double-open (fd + saved_termios leak) |
 | DRV-41 | CLEARED | serial_port.rs:695-742 | drvAsynSerialPort.c:713-729 | connect() omits FD_CLOEXEC and connect-time tcflush(TCIOFLUSH) — FIXED 77930ec3 (FD_CLOEXEC after open + tcflush(TCIOFLUSH) before blocking restore) |
-| DRV-42 | LOW | user.rs:16, serial_port.rs:309-333 | drvAsynSerialPort.c:906-909 | "wait-forever" (negative) timeout unrepresentable (framework `Duration` is unsigned) |
+| DRV-42 | DOC | user.rs:15-22 | drvAsynSerialPort.c:906-909 | "wait-forever" (negative) timeout unrepresentable (framework `AsynUser.timeout` is an unsigned `Duration` vs C's `double`) — DOC, intentional framework-wide divergence (every blocking op bounded); documented at user.rs timeout field. Sibling of DRV-59 |
 | DRV-43 | LOW | serial_port.rs:817-836,314-344 | drvAsynSerialPort.c:519-526,871-875 | disconnected `break` silently Ok; `maxchars==0` read misclassified as Disconnected |
 | DRV-44 | LOW | serial_port.rs (no report) | drvAsynSerialPort.c:666-680 | report() lacks serial diagnostics (fd, nWritten, nRead) |
 | DRV-45 | CONCERN | serial_port.rs:423-448 | drvAsynSerialPort.c:1032-1175 | no drvAsynSerialPortConfigure registrar; default EOS not installed; no priority/noAutoConnect knob |
@@ -187,8 +187,8 @@ cluster into structural families (the high-leverage fix units):
 - **F9 — ip_server interrupt push delivery (driver's documented purpose):**
   DRV-16, DRV-17. Plus DRV-18/19/20.
 - Singletons: DRV-6/7/11/13 (ip), DRV-32/33/34/35/37/39/41/42/43/44 (serial;
-  DRV-32/33/35/37/39/41 CLEARED, DRV-59 DOC), DRV-50/52/53/54 (prologix),
-  DRV-21/22/24 (ip_server).
+  DRV-32/33/35/37/39/41/43/44 CLEARED, DRV-42/59 DOC; only DRV-34 left),
+  DRV-50/52/53/54 (prologix), DRV-21/22/24 (ip_server).
 
 Fix-phase plan: start with F1 (DEFECT, local, established invariant), then
 F4/F5/F6 (local, clear contracts), then per-driver singletons. F7 (EOS+iocsh
@@ -990,3 +990,40 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   before restoring blocking mode, matching C's order. Test:
   `pty_connect_sets_cloexec` (F_GETFD shows FD_CLOEXEC after connect; the
   tcflush is on the same connect path, not separately asserted).
+
+- **DRV-43** (LOW — serial "break" set when disconnected) — CLEARED. FIXED
+  1d3db686. C `setOption` "break" (drvAsynSerialPort.c:507-528) validates
+  the value then calls `tcdrain`/`tcsendbreak` WITHOUT guarding on the fd,
+  so a break on a closed port fails (`tcsendbreak` EBADF → asynError). The
+  Rust arm gated the whole action behind `else if let Some(fd) =
+  self.io.fd`, so a break on a disconnected port silently returned Ok.
+  Restructured to C's order: "off" is a no-op; otherwise validate the
+  duration first ("" / "on" → 0, a number → that duration, else error),
+  then require the fd via `fd_or_err()` (Disconnected error) before
+  `tcdrain` + `tcsendbreak`. A bad duration is now rejected even when
+  disconnected. The `maxchars==0` half of DRV-43 was already closed by
+  DRV-57; this closes the "disconnected break silently Ok" half. Test:
+  `set_option_break_on_disconnected_errors_but_off_is_noop`.
+
+- **DRV-44** (LOW — serial report() diagnostics) — CLEARED. FIXED
+  64a5d4c0. C `report` (drvAsynSerialPort.c:666-680) prints the connection
+  state and, at details>=1, the fd plus cumulative characters written
+  (nWritten) and read (nRead). The Rust serial driver used the generic
+  default `report()` and tracked no byte counters. Added `n_read`/
+  `n_written` to `SerialIoState`, incremented per successful chunk
+  (mirroring C's `tty->nRead`/`nWritten += this{Read,Write}`, so partial
+  bytes before a timeout count too), and overrode `report()` to print the
+  "Serial line <dev>: Connected/Disconnected" header with fd + the two
+  counters at details>=1. Test: `pty_report_tracks_byte_counters`.
+
+- **DRV-42** (LOW — "wait forever" negative timeout) — DOC, intentional
+  framework-wide divergence (documented at the `AsynUser.timeout` field, no
+  behavioral change). C asyn's `pasynUser->timeout` is a `double` where a
+  negative value means "wait forever" (read VMIN=1 with no timer, write no
+  timer — drvAsynSerialPort.c:906-909). The Rust framework's
+  `AsynUser.timeout` is an unsigned `Duration`, so that sentinel is
+  unrepresentable and every blocking driver operation is supplied a finite
+  timeout. This is a deliberate, safer default — a stuck device cannot
+  wedge the port actor thread indefinitely — and it is the framework root
+  of the DRV-59 "every representable (non-negative) timeout" note. Left
+  as-is; documented in `crates/asyn-rs/src/user.rs`.

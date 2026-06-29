@@ -90,7 +90,7 @@ impact paragraphs in the round report
 | DRV-34 | CONCERN | serial_port.rs:263-270,645-658,159-208 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing) |
 | DRV-35 | CLEARED | serial_port.rs:830-1000 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value — FIXED fdf7d488 (commit self.config only after successful apply, all 5 arms) |
 | DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
-| DRV-37 | CONCERN | serial_port.rs:357-391 | drvAsynSerialPort.c:810-842 | write timeout applied per-poll-iteration, not single total deadline → write lives timeout×N |
+| DRV-37 | CLEARED | serial_port.rs:392-487 | drvAsynSerialPort.c:810-842 | write timeout applied per-poll-iteration, not single total deadline → write lives timeout×N (and a blocking write(fd,all) ignored the timeout entirely) — FIXED 92755a0f (single deadline + post-write check + non-blocking write loop) |
 | DRV-38 | CONCERN | serial_port.rs:373-378,621-634 | drvAsynSerialPort.c:843 | partial byte count dropped on write timeout/error (framework `write_octet -> ()` contract) |
 | DRV-39 | LOW | serial_port.rs:853-955 | drvAsynSerialPort.c:203-208 | getOption("break") errors instead of returning "off" |
 | DRV-40 | LOW | serial_port.rs:514-531 | drvAsynSerialPort.c:694-698 | connect() not guarded against double-open (fd + saved_termios leak) |
@@ -187,7 +187,8 @@ cluster into structural families (the high-leverage fix units):
 - **F9 — ip_server interrupt push delivery (driver's documented purpose):**
   DRV-16, DRV-17. Plus DRV-18/19/20.
 - Singletons: DRV-6/7/11/13 (ip), DRV-32/33/34/35/37/39/41/42/43/44 (serial;
-  DRV-32/33 CLEARED), DRV-50/52/53/54 (prologix), DRV-21/22/24 (ip_server).
+  DRV-32/33/35/37 CLEARED, DRV-59 DOC), DRV-50/52/53/54 (prologix),
+  DRV-21/22/24 (ip_server).
 
 Fix-phase plan: start with F1 (DEFECT, local, established invariant), then
 F4/F5/F6 (local, clear contracts), then per-driver singletons. F7 (EOS+iocsh
@@ -943,3 +944,28 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   rs485 take distinct paths. Test:
   `set_option_does_not_commit_cached_config_on_apply_failure` (non-tty fd
   → tcgetattr ENOTTY → apply fails → cached baud stays 9600).
+
+- **DRV-37** (CONCERN — serial write timeout per-poll, not total) —
+  CLEARED. FIXED 92755a0f. C `writeIt` (drvAsynSerialPort.c:815-842) arms
+  one timer for the whole `writeTimeout` before the loop and breaks when it
+  fires (`timeoutFlag`, :827), so the timeout bounds the TOTAL write. The
+  Rust write was unbounded two ways: (1) it reused the full per-call
+  `timeout_ms` on every `poll`, so a slowly-draining peer could keep a
+  multi-chunk write alive for up to timeout×iterations; (2) the driver fd
+  is blocking (connect clears O_NONBLOCK so reads block on poll), so
+  `write(fd, all_remaining)` blocked in-kernel until the *entire* buffer
+  was accepted — a stalled peer blocked the write far past the timeout and
+  the poll never timed it out. C unblocks a stuck write from its timer via
+  `tcflush(TCOFLUSH)` (:649); this driver has no timer. Fix: one `deadline`
+  + poll with the remaining budget each iteration + a post-write deadline
+  check (mirrors :827), and run the loop with the fd temporarily
+  non-blocking so each `write` returns immediately with what fit (or
+  EAGAIN) instead of blocking on the whole payload; blocking mode restored
+  on every exit path. `timeout==0` collapses to a single write attempt then
+  bail (matches `writeTimeout==0`). This is localized to `write()` — the
+  read path and the DRV-59 VMIN analysis are untouched. Mechanism diverges
+  from C (non-blocking poll loop vs blocking + timer/flush) but the
+  end-behavior — a write bounded by the timeout — matches. Test:
+  `pty_write_timeout_bounds_total_not_per_poll` (slow drain 4 KiB/10 ms;
+  512 KiB payload; per-poll behavior runs to completion ~1.3 s, the fix
+  times out at ~300 ms).

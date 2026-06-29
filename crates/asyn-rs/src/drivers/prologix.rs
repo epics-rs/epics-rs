@@ -383,6 +383,60 @@ impl PortDriver for DrvAsynPrologixPort {
         self.inner.io_flush(user)
     }
 
+    // C parity: prologix is an asynGpibPort whose octet EOS interface maps to
+    // prologixSetEos / prologixGetEos over the single driver `eos` field
+    // (drvPrologixGPIB.c:422-459), not to a generic base cache. The default
+    // PortDriver::{set,get}_input_eos write `base.input_eos` and forward to an
+    // (empty) interpose stack, so they would store EOS bytes the prologix
+    // read/write path never consults — `get_input_eos` would echo bytes with no
+    // protocol effect. Route the interface to `State.eos`, the field the read
+    // (`++read <eos>` vs `++read eoi`) and write (append-on-`eos>=0`) paths
+    // actually use.
+    fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+        // asynGpib's wrapper rejects eoslen > 1 ("only 1 is allowed",
+        // asynGpib.c:443) and prologixSetEos rejects the same with asynError
+        // "Invalid EOS" (drvPrologixGPIB.c:449-452); 0 disables EOS (eos < 0).
+        let new_eos = match eos.len() {
+            0 => None,
+            1 => Some(eos[0]),
+            _ => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "Invalid EOS".into(),
+                });
+            }
+        };
+        self.set_eos(new_eos)
+    }
+
+    fn get_input_eos(&self) -> Vec<u8> {
+        // C prologixGetEos (drvPrologixGPIB.c:422-437): eos < 0 reports
+        // eoslen 0; otherwise eoslen 1 carrying the single EOS byte.
+        match self.state.lock().unwrap().eos {
+            Some(c) => vec![c],
+            None => Vec::new(),
+        }
+    }
+
+    // C parity: asynGpib's octet vtable leaves setOutputEos / getOutputEos NULL
+    // (asynGpib.c:132 — `...setInputEos, getInputEos, 0, 0`), so a GPIB port has
+    // no output-EOS support; prologix appends its single `eos` on write
+    // (write_octet) rather than a separate output terminator. Reject
+    // set_output_eos instead of silently caching ineffective bytes in
+    // `base.output_eos`, and report none — the output twin of the input-EOS
+    // routing above (same defect family: the EOS interface must reflect the
+    // driver's real EOS state, never a dead base cache).
+    fn set_output_eos(&mut self, _eos: &[u8]) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "output EOS not supported on a GPIB port".into(),
+        })
+    }
+
+    fn get_output_eos(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
         // C parity: prologixWrite sets bufCount=0 at the start of every
@@ -722,6 +776,40 @@ mod tests {
             "DRV-51: connect must clear the staged read_carry"
         );
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
+    /// DRV-46: the octet EOS interface must reflect the driver's real `eos`
+    /// state (C prologixSetEos / prologixGetEos over `pdpvt->eos`), not the
+    /// dead `base.{input,output}_eos` cache. `set_input_eos` routes to
+    /// `State.eos`; `get_input_eos` reports it (eoslen 0 unset / 1 with the
+    /// byte); eoslen > 1 is rejected; output EOS is unsupported on a GPIB port
+    /// (asynGpib leaves the output-EOS vtable slots NULL).
+    #[test]
+    fn eos_interface_routes_to_driver_state() {
+        let mut drv = DrvAsynPrologixPort::new("p", "127.0.0.1:1234", false).unwrap();
+
+        // Default: no EOS -> eoslen 0 (C eos < 0).
+        assert!(drv.get_input_eos().is_empty());
+        assert_eq!(drv.eos(), None);
+
+        // A single EOS byte routes to State.eos and is echoed by get_input_eos.
+        drv.set_input_eos(b"\n").unwrap();
+        assert_eq!(drv.eos(), Some(b'\n'));
+        assert_eq!(drv.get_input_eos(), vec![b'\n']);
+
+        // Clearing (eoslen 0) returns to None.
+        drv.set_input_eos(b"").unwrap();
+        assert_eq!(drv.eos(), None);
+        assert!(drv.get_input_eos().is_empty());
+
+        // eoslen > 1 is rejected (asynGpib "only 1 is allowed" / "Invalid EOS").
+        assert!(drv.set_input_eos(b"\r\n").is_err());
+        // The rejected call must not have mutated the driver EOS state.
+        assert_eq!(drv.eos(), None);
+
+        // Output EOS is unsupported on a GPIB port (C asynGpib NULL vtable).
+        assert!(drv.set_output_eos(b"\n").is_err());
+        assert!(drv.get_output_eos().is_empty());
     }
 
     /// DRV-47: the end-of-message rule must match C `readIt`

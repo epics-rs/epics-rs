@@ -275,4 +275,16 @@ contracts / behavioral models, not just a driver site.
   path while genuine fatal errors still tear down via the Err branch. Test:
   `test_server_disconnect_eof` (rewritten: EOF → `(0, END)` + `!connected`).
   Full asyn-rs suite (654 tests) green.
+- **DRV-1** (DEFECT, UDP socket was connect()-ed) — CLEARED (sign-off, F3 UDP
+  redesign). C `drvAsynIPPort.c::connectIt` (513) never `connect()`s a
+  SOCK_DGRAM socket; it keeps the resolved remote (`tty->farAddr`) and uses
+  `sendto` (656) / `recvfrom` (775-789). Rust `connect()`-ed the UDP socket,
+  so inbound datagrams were filtered to the single connected peer — broadcast
+  (`udp*`) replies and multi-peer answers were silently dropped, and a device
+  that answers from a different source port was unreachable. Redesigned:
+  `IpIoInner::Udp` now carries the resolved peer `SocketAddr`; `connect_udp`
+  resolves the peer and binds an unconnected socket of the peer's address
+  family (no `connect()`); reads use `recv_from`, writes use `send_to(peer)`,
+  flush uses `recv_from`. Test: `test_udp_accepts_reply_from_any_peer` (a reply
+  from a peer never sent to is received — a connected socket would drop it).
 

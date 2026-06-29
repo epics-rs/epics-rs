@@ -210,7 +210,11 @@ fn parse_host_port(addr_part: &str, orig_spec: &str) -> AsynResult<(String, u16,
 /// Internal I/O state holding the transport socket.
 enum IpIoInner {
     Tcp(TcpStream),
-    Udp(UdpSocket),
+    // C drvAsynIPPort.c::connectIt (513) never connect()s a SOCK_DGRAM
+    // socket; it keeps the resolved remote (`tty->farAddr`) and uses
+    // sendto/recvfrom. We mirror that: the socket is left unconnected and
+    // the resolved peer is carried alongside it for `send_to`.
+    Udp(UdpSocket, std::net::SocketAddr),
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
 }
@@ -296,14 +300,18 @@ impl OctetNext for IpIoState {
                     Err(e) => Err(AsynError::Io(e)),
                 }
             }
-            IpIoInner::Udp(socket) => {
+            IpIoInner::Udp(socket, _peer) => {
                 socket.set_read_timeout(Some(user.timeout))?;
-                match socket.recv(buf) {
-                    Ok(0) => Err(AsynError::Status {
+                // C drvAsynIPPort.c::readRaw (775-789) uses recvfrom on the
+                // unconnected datagram socket so it accepts replies from any
+                // peer (broadcast/multi-peer); the source address is only
+                // used for trace, so we discard it.
+                match socket.recv_from(buf) {
+                    Ok((0, _src)) => Err(AsynError::Status {
                         status: AsynStatus::Disconnected,
                         message: "EOF".into(),
                     }),
-                    Ok(n) => Ok(OctetReadResult {
+                    Ok((n, _src)) => Ok(OctetReadResult {
                         nbytes_transferred: n,
                         // C parity: CNT means the requested count was
                         // reached. A short read leaves the reason empty
@@ -373,9 +381,11 @@ impl OctetNext for IpIoState {
                 stream.set_write_timeout(Some(user.timeout))?;
                 write_with_retry(stream, data, deadline)?;
             }
-            IpIoInner::Udp(socket) => {
+            IpIoInner::Udp(socket, peer) => {
                 socket.set_write_timeout(Some(user.timeout))?;
-                socket.send(data)?;
+                // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
+                // remote on the unconnected socket.
+                socket.send_to(data, *peer)?;
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
@@ -421,10 +431,10 @@ impl OctetNext for IpIoState {
                     let _ = stream.set_nonblocking(false);
                 }
             }
-            Some(IpIoInner::Udp(socket)) => {
+            Some(IpIoInner::Udp(socket, _peer)) => {
                 let restore = socket.set_nonblocking(true);
                 loop {
-                    match socket.recv(&mut scratch) {
+                    match socket.recv_from(&mut scratch) {
                         Ok(_) => continue,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -699,19 +709,32 @@ impl DrvAsynIPPort {
         }
     }
 
-    fn connect_udp(&mut self) -> AsynResult<UdpSocket> {
-        let bind_addr = if let Some(local_port) = self.config.local_port {
-            format!("0.0.0.0:{local_port}")
+    fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
+        use std::net::ToSocketAddrs;
+        // C drvAsynIPPort.c::connectIt (484-493) resolves the remote name to
+        // tty->farAddr but (513) does NOT connect() a SOCK_DGRAM socket.
+        // Resolve the peer once, then leave the socket unconnected and bind
+        // a local endpoint of the peer's address family.
+        let remote = format!("{}:{}", self.config.host, self.config.port);
+        let peer = remote
+            .to_socket_addrs()
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP resolve '{remote}': {e}"),
+            })?
+            .next()
+            .ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP resolve '{remote}': no addresses"),
+            })?;
+        let local_port = self.config.local_port.unwrap_or(0);
+        let bind_addr = if peer.is_ipv6() {
+            format!("[::]:{local_port}")
         } else {
-            "0.0.0.0:0".to_string()
+            format!("0.0.0.0:{local_port}")
         };
         let socket = UdpSocket::bind(&bind_addr)?;
-        let remote = format!("{}:{}", self.config.host, self.config.port);
-        socket.connect(&remote).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("UDP connect to '{remote}': {e}"),
-        })?;
-        Ok(socket)
+        Ok((socket, peer))
     }
 
     /// UDP variant builder — applies any combination of `SO_BROADCAST`
@@ -722,8 +745,8 @@ impl DrvAsynIPPort {
         &mut self,
         broadcast: bool,
         reuse_port: bool,
-    ) -> AsynResult<UdpSocket> {
-        let socket = self.connect_udp()?;
+    ) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
+        let (socket, peer) = self.connect_udp()?;
         if broadcast {
             socket.set_broadcast(true)?;
         }
@@ -740,7 +763,7 @@ impl DrvAsynIPPort {
                 })?;
             }
         }
-        Ok(socket)
+        Ok((socket, peer))
     }
 
     #[cfg(unix)]
@@ -796,20 +819,20 @@ impl PortDriver for DrvAsynIPPort {
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
             IpProtocol::Udp => {
-                let socket = self.connect_udp_with_options(false, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(false, false)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             IpProtocol::UdpReusePort => {
-                let socket = self.connect_udp_with_options(false, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(false, true)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             IpProtocol::UdpBroadcast => {
-                let socket = self.connect_udp_with_options(true, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(true, false)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             IpProtocol::UdpBroadcastReusePort => {
-                let socket = self.connect_udp_with_options(true, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(true, true)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             #[cfg(unix)]
             IpProtocol::Unix => {
@@ -1365,6 +1388,54 @@ mod tests {
         let mut buf = [0u8; 32];
         let n = drv.read_octet(&user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"ping");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_udp_accepts_reply_from_any_peer() {
+        // DRV-1: the datagram socket is left unconnected (C connectIt does
+        // not connect() a SOCK_DGRAM socket), so a reply may arrive from a
+        // different source address than the request was sent to — a device
+        // that answers from another port, or a broadcast request answered by
+        // several peers. A connect()-ed socket silently drops these.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        // Reserve a fixed local port for the driver so the "other peer"
+        // below knows where to answer.
+        let local_port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let (n, _src) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            // Answer from a DIFFERENT socket — a peer we never sent to.
+            let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+            other
+                .send_to(b"pong", format!("127.0.0.1:{local_port}"))
+                .unwrap();
+        });
+
+        let mut drv = DrvAsynIPPort::new(
+            "udptest",
+            &format!("127.0.0.1:{server_port}:{local_port} udp"),
+        )
+        .unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"ping").unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 32];
+        let n = drv.read_octet(&user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pong");
 
         handle.join().unwrap();
     }

@@ -146,6 +146,7 @@ impl OctetTransport for SyncIoTransport {
         }
         self.handle
             .write_octet(0, data)
+            .map(|_| ())
             .map_err(|e| ModbusError::Io(e.to_string()))
     }
 
@@ -155,6 +156,7 @@ impl OctetTransport for SyncIoTransport {
         // epicsThreadSleep(writeDelay) (:246). No pacing delay on a retransmit.
         self.handle
             .write_octet(0, data)
+            .map(|_| ())
             .map_err(|e| ModbusError::Io(e.to_string()))
     }
 

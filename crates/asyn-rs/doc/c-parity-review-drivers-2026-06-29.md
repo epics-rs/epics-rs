@@ -382,8 +382,14 @@ contracts / behavioral models, not just a driver site.
   `udp_drain_into` now delegates, count-only) reporting END on full drain / CNT
   on a buffer-limited drain / `(0, empty)` on an empty-cache poll; TCP forwards
   the slot read's real `eom_reason` from `base_read_octet`. The C off-by-one
-  (`maxchars - 1` copy with `+= maxchars` advance) and its dead `:234` CNT
-  branch are intentionally not reproduced (not C-bug copying). DISTINCT, not
+  (`maxchars - 1` copy with `+= maxchars` advance) is intentionally not
+  reproduced (not C-bug copying). Self-review refinement (commit follows): END
+  and CNT are modelled as two INDEPENDENT conditions (END = datagram fully
+  drained, CNT = caller buffer filled), so an exact-fit datagram reports
+  `END|CNT`. C's `:235` CNT branch is dead ONLY because the off-by-one short-
+  reads by one byte and never fills the buffer; with the off-by-one removed the
+  buffer-filled condition is live, and this also makes the rule uniform with the
+  prologix `read_eom` exact-fit = both behaviour. DISTINCT, not
   fixed: serial_port.rs (C drvAsynSerialPort.c:974-977 sets CNT-only, no native
   END — byte stream, default synthesis is C-faithful) and the ip_server TCP
   subport (byte stream, base behaviour == default synthesis). Regression test

@@ -847,9 +847,13 @@ impl DrvAsynIPServerPort {
     /// Drain the UDP cache and report the end-of-message reason. Single
     /// owner of the datagram-boundary decision shared by [`read_octet`]
     /// (count only) and [`io_read_octet_eom`] (count + EOM). Mirrors C
-    /// `readIt` (drvAsynIPServerPort.c:201-207): a fully-drained
-    /// datagram is `ASYN_EOM_END`; a buffer-limited drain that leaves
-    /// more of the datagram behind is `ASYN_EOM_CNT`. An empty cache
+    /// `readIt` (drvAsynIPServerPort.c:201-207,232-235) with two
+    /// independent conditions: `ASYN_EOM_END` when the datagram is fully
+    /// drained, and `ASYN_EOM_CNT` when the caller buffer is filled. A
+    /// datagram that exactly fills the buffer meets both. (C's `:235`
+    /// CNT branch is dead only because its `:196-200` off-by-one short-
+    /// reads by one byte; with the off-by-one removed the buffer-filled
+    /// CNT condition is live, so it is honoured here.) An empty cache
     /// yields `(0, empty)` — the caller polls (no boundary to report).
     ///
     /// [`read_octet`]: PortDriver::read_octet
@@ -863,14 +867,18 @@ impl DrvAsynIPServerPort {
         let n = avail.min(buf.len());
         buf[..n].copy_from_slice(&cache.data[cache.pos..cache.pos + n]);
         cache.pos += n;
-        let eom = if cache.is_empty() {
-            // Datagram fully consumed — end of message.
+        let mut eom = EomReason::empty();
+        if cache.is_empty() {
+            // Datagram fully consumed — end of message (C `:201-204`).
             cache.clear();
-            EomReason::END
-        } else {
-            // Caller buffer too small; the datagram has more to give.
-            EomReason::CNT
-        };
+            eom |= EomReason::END;
+        }
+        if n == buf.len() && !buf.is_empty() {
+            // Caller buffer filled (C `:232-235`, de-deadened). When the
+            // cache still holds more this is the sole reason; on an exact
+            // fit it accompanies END.
+            eom |= EomReason::CNT;
+        }
         (n, eom)
     }
 
@@ -1268,6 +1276,27 @@ mod tests {
         let (n, eom) = srv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(n, 0);
         assert!(eom.is_empty(), "empty cache poll reports no EOM");
+
+        // Exact fit: a datagram that exactly fills the caller buffer is
+        // both fully drained (END) and buffer-filled (CNT) — the two
+        // conditions are independent (C readIt:201-204 + :232-235,
+        // de-deadened off-by-one).
+        {
+            let mut cache = srv.udp_cache.lock();
+            cache.data = b"abcd".to_vec();
+            cache.pos = 0;
+        }
+        let mut exact = [0u8; 4];
+        let (n, eom) = srv.io_read_octet_eom(&user, &mut exact).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&exact, b"abcd");
+        assert!(eom.contains(EomReason::END), "exact fit must flag END");
+        assert!(eom.contains(EomReason::CNT), "exact fit must also flag CNT");
+        // And the datagram is gone afterwards (a poll returns empty).
+        let mut after = [0u8; 4];
+        let (n, eom) = srv.io_read_octet_eom(&user, &mut after).unwrap();
+        assert_eq!(n, 0);
+        assert!(eom.is_empty());
     }
 
     /// disconnect must stop the worker cleanly so a subsequent

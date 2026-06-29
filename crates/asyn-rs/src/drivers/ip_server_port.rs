@@ -252,6 +252,40 @@ impl ClientSlot {
     fn peer_addr(&self) -> Option<SocketAddr> {
         *self.peer.lock()
     }
+
+    /// Toss all pending input on this slot's TCP stream — the single
+    /// owner of the server flush drain, shared by the parent
+    /// ([`DrvAsynIPServerPort::io_flush`]) and the child
+    /// ([`DrvAsynIPSubport::io_flush`]) data paths.
+    ///
+    /// Mirrors C `drvAsynIPPort::flushIt` (drvAsynIPPort.c:846-861):
+    /// each accepted connection is served in C by a full `drvAsynIPPort`
+    /// child port (drvAsynIPServerPort.c:690), whose flush sets the
+    /// socket non-blocking and `recv`s until empty, discarding staged
+    /// input so a flush-then-read returns only the new reply. No-op when
+    /// the slot is unoccupied (C guards on `fd != INVALID_SOCKET`).
+    fn drain_input(&self) {
+        let mut g = self.stream.lock();
+        let Some(stream) = g.as_mut() else { return };
+        // C toggles non-blocking around the drain (setNonBlock 1 then 0);
+        // restore blocking afterwards so the next timed read behaves.
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        let mut buf = [0u8; 512];
+        loop {
+            match stream.read(&mut buf) {
+                // EOF (peer closed) or any bytes tossed: C breaks on
+                // `numRecv <= 0` and keeps looping while > 0. Stop on 0,
+                // continue on >0.
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let _ = stream.set_nonblocking(false);
+    }
 }
 
 /// Server-mode IP port driver.
@@ -796,9 +830,9 @@ impl PortDriver for DrvAsynIPServerPort {
         }
     }
 
-    fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+    fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
         if self.config.protocol == IpServerProtocol::Udp {
-            // C registers `flushIt` only for the UDP server
+            // C registers the UDP server's own `flushIt`
             // (drvAsynIPServerPort.c:655); it discards the cached
             // datagram by resetting `UDPbufferPos`/`UDPbufferSize`
             // (flushIt:244-245) so a flush-then-read waits for a fresh
@@ -806,9 +840,22 @@ impl PortDriver for DrvAsynIPServerPort {
             // the cache also lets the recv worker (which only refills
             // when the cache is empty) fetch the next datagram.
             self.udp_cache.lock().clear();
+            return Ok(());
         }
-        // TCP server mode registers no flush (the SOCK_DGRAM-only block
-        // at :652-656), so it keeps the framework default no-op.
+        // TCP: each accepted connection is served in C by a full
+        // `drvAsynIPPort` child (drvAsynIPServerPort.c:690) whose
+        // `flushIt` drains the socket (drvAsynIPPort.c:846-861). The Rust
+        // child `DrvAsynIPSubport` drains the same slot on its own flush;
+        // the parent also serves clients by `addr`, so drain the
+        // addressed slot here too. `addr < 0` (broadcast) drains every
+        // connected slot, symmetric with the broadcast write path.
+        if user.addr < 0 {
+            for slot in &self.slots {
+                slot.drain_input();
+            }
+        } else if let Ok(idx) = self.slot_index(user.addr) {
+            self.slots[idx].drain_input();
+        }
         Ok(())
     }
 }
@@ -1157,6 +1204,16 @@ impl PortDriver for DrvAsynIPSubport {
         })?;
         Ok(data.len())
     }
+
+    fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        // C parity: this child port is a full `drvAsynIPPort`
+        // (drvAsynIPServerPort.c:690) whose `flushIt` tosses all pending
+        // socket input (drvAsynIPPort.c:846-861) so a flush-then-read
+        // returns only the new reply. Drain this slot's stream through
+        // the shared owner.
+        self.slot.drain_input();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1322,14 +1379,95 @@ mod tests {
         );
     }
 
-    /// DRV-20: TCP server mode registers no flush in C (the SOCK_DGRAM-
-    /// only block at drvAsynIPServerPort.c:652-656), so `io_flush` is a
-    /// harmless no-op there.
+    /// DRV-20 (TCP sibling, found in adversarial review): a flush on a
+    /// TCP server connection drains staged socket input, matching C's
+    /// child `drvAsynIPPort::flushIt` (drvAsynIPPort.c:846-861) — each
+    /// server child is a full `drvAsynIPPort` (drvAsynIPServerPort.c:690).
+    /// Pre-fix the TCP flush was a no-op and a flush-then-read returned
+    /// the stale bytes. Exercises the parent's addr-routed flush path.
     #[test]
-    fn tcp_server_flush_is_noop() {
-        let mut srv = DrvAsynIPServerPort::new("tcp_flush", "127.0.0.1:0").unwrap();
+    fn tcp_server_flush_drains_staged_socket_input() {
+        use std::io::Write as _;
+        use std::net::TcpStream as ClientStream;
+
+        let mut srv = DrvAsynIPServerPort::new("tcp_flush_drain", "127.0.0.1:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let mut client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        let idx = srv.accept_one().unwrap();
+        client.write_all(b"stale-bytes").unwrap();
+        client.flush().unwrap();
+        // Let the bytes land on the server socket (instant on loopback).
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut user = AsynUser::default().with_addr(idx as i32);
+        srv.io_flush(&mut user).unwrap();
+
+        // The staged bytes were drained: a short-timeout read returns no
+        // data (times out) rather than the stale "stale-bytes".
+        let read_user = AsynUser::default()
+            .with_addr(idx as i32)
+            .with_timeout(Duration::from_millis(100));
+        let mut buf = [0u8; 64];
+        match srv.read_octet(&read_user, &mut buf) {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            }) => {}
+            Ok(0) => {}
+            other => panic!("expected drained (timeout / 0 bytes), got {other:?}"),
+        }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// DRV-20: a TCP flush with no connected client is a harmless no-op
+    /// (C guards the drain on `fd != INVALID_SOCKET`).
+    #[test]
+    fn tcp_server_flush_no_connection_is_harmless() {
+        let mut srv = DrvAsynIPServerPort::new("tcp_flush_empty", "127.0.0.1:0").unwrap();
         let mut user = AsynUser::default().with_addr(0);
         srv.io_flush(&mut user).unwrap();
+        // Broadcast addr also harmless with no slots occupied.
+        let mut bcast = AsynUser::default().with_addr(-1);
+        srv.io_flush(&mut bcast).unwrap();
+    }
+
+    /// DRV-20 (TCP sibling): the child subport's flush drains its slot's
+    /// socket through the same shared owner as the parent.
+    #[test]
+    fn subport_flush_drains_staged_socket_input() {
+        use std::io::Write as _;
+        use std::net::TcpStream as ClientStream;
+
+        let mut srv = DrvAsynIPServerPort::new("sub_flush_drain", "127.0.0.1:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        let mut client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        let idx = srv.accept_one().unwrap();
+        let mut sub = srv.make_subport(idx).unwrap();
+        sub.connect(&AsynUser::default()).unwrap();
+
+        client.write_all(b"stale").unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        sub.io_flush(&mut AsynUser::default()).unwrap();
+
+        let read_user = AsynUser::default().with_timeout(Duration::from_millis(100));
+        let mut buf = [0u8; 64];
+        match sub.read_octet(&read_user, &mut buf) {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            }) => {}
+            Ok(0) => {}
+            other => panic!("expected drained (timeout / 0 bytes), got {other:?}"),
+        }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
     }
 
     /// UDP-mode end-to-end: bind ephemeral, two clients each fire one

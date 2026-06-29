@@ -1067,14 +1067,22 @@ fn udp_recv_loop(
                 c.data.extend_from_slice(&buf[..n]);
                 c.pos = 0;
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // 200ms read-timeout wake — loop and re-check shutdown.
+            // DRV-56: a non-fatal recv error (200 ms read-timeout wake, or an
+            // EINTR signal interruption) must NOT exit the worker — loop and
+            // re-check shutdown. C's UDP worker (drvAsynIPServerPort.c:308-323)
+            // assigns `UDPbufferSize = recvfrom(...)` with no error check, so
+            // on EINTR it stores -1 and silently stops receiving; that is a C
+            // bug, not a contract — recover here by retrying instead of copying
+            // it. is_nonfatal_read_timeout is the shared owner of the
+            // EINTR/WouldBlock/TimedOut "retry, not fatal" set.
+            Err(e) if is_nonfatal_read_timeout(e.kind()) => {
                 continue;
             }
             Err(e) => {
+                // A genuine hard recv error: reception is dead either way (C
+                // would 1 ms-busy-spin a worker that never recvfrom's again
+                // once UDPbufferSize is stuck at -1). Cleanly exit the thread
+                // instead of spinning.
                 tracing::warn!(
                     target: "asyn_rs::ip_server_port",
                     port = %port_name,

@@ -3,7 +3,7 @@
 //! Uses `libc` termios directly for serial I/O. Unix-only (`#[cfg(unix)]`).
 
 use std::os::unix::io::RawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
@@ -391,52 +391,100 @@ impl OctetNext for SerialIoState {
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let fd = self.fd_or_err()?;
-        let timeout_ms = duration_to_poll_ms(user.timeout);
 
-        let mut total = 0usize;
-        while total < data.len() {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-
-            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(AsynError::Io(err));
-            }
-            if ret == 0 {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "serial write timeout".into(),
-                });
-            }
-
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    data[total..].as_ptr() as *const libc::c_void,
-                    data.len() - total,
-                )
-            };
-            if n < 0 {
-                // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted
-                    || err.kind() == std::io::ErrorKind::WouldBlock
-                {
-                    continue;
-                }
-                return Err(AsynError::Io(err));
-            }
-            total += n as usize;
+        // The driver fd is blocking (connect restores O_NONBLOCK off so reads
+        // can block on poll). A blocking `write(fd, all_remaining)` would not
+        // return until the *entire* buffer is accepted by the kernel, so a
+        // stalled or slow peer blocks the write past the timeout regardless of
+        // the poll below — C instead unblocks a stuck write from its timeout
+        // timer via tcflush(TCOFLUSH) (drvAsynSerialPort.c:649). This driver has
+        // no such timer, so make the fd non-blocking for the duration of the
+        // write: each `write` then returns immediately with what fit (or EAGAIN)
+        // and the poll/deadline loop bounds the whole write. Blocking mode is
+        // restored on every exit path.
+        let prev_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if prev_flags < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
         }
 
-        Ok(total)
+        // C parity (drvAsynSerialPort.c:815-842): writeIt arms a single timer
+        // for the whole writeTimeout *before* the loop and breaks when it fires,
+        // so the timeout bounds the TOTAL write, not each chunk. Bound total
+        // time with one deadline and poll with the remaining budget each
+        // iteration (the IP driver's write_with_retry total-deadline model).
+        // The previous code reused the full per-call timeout on every poll, so
+        // a slowly-draining peer could keep a multi-chunk write alive for up to
+        // timeout x iterations.
+        let deadline = Instant::now() + user.timeout;
+        let result = (|| -> AsynResult<usize> {
+            let mut total = 0usize;
+            while total < data.len() {
+                let poll_ms =
+                    duration_to_poll_ms(deadline.saturating_duration_since(Instant::now()));
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+
+                let ret = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(AsynError::Io(err));
+                }
+                if ret == 0 {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "serial write timeout".into(),
+                    });
+                }
+
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        data[total..].as_ptr() as *const libc::c_void,
+                        data.len() - total,
+                    )
+                };
+                if n < 0 {
+                    // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted
+                        || err.kind() == std::io::ErrorKind::WouldBlock
+                    {
+                        continue;
+                    }
+                    return Err(AsynError::Io(err));
+                }
+                total += n as usize;
+
+                // C parity (drvAsynSerialPort.c:827): after each write, if the
+                // total deadline has passed stop with asynTimeout even though
+                // some bytes went out. A non-blocking poll that finds free space
+                // (e.g. a slow peer that drains a little each gap) would
+                // otherwise let the write keep going past the deadline, since
+                // `poll(0)` returns POLLOUT instead of timing out. (timeout==0
+                // collapses to a single write attempt then bail, matching
+                // writeIt's `writeTimeout==0`.)
+                if total < data.len() && Instant::now() >= deadline {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "serial write timeout".into(),
+                    });
+                }
+            }
+            Ok(total)
+        })();
+
+        // Restore blocking mode on every exit path (success, timeout, error).
+        unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags) };
+        result
     }
 
     fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
@@ -2029,5 +2077,70 @@ mod tests {
         // Clean up the fd ourselves (the driver never owned a real connection).
         drv.io.fd = None;
         unsafe { libc::close(badfd) };
+    }
+
+    /// DRV-37: C writeIt (drvAsynSerialPort.c:815-842) arms one timer for the
+    /// whole write, so the timeout bounds TOTAL write time. The old Rust write
+    /// reused the full timeout on every poll, so a peer that drains a little at
+    /// a time (each gap under the timeout) would never trip a per-poll timeout
+    /// and the write would run to completion well past the deadline. A slow
+    /// drain (4 KiB / 10 ms ~= 400 KiB/s) keeps each POLLOUT gap far under the
+    /// 300 ms timeout while a 512 KiB payload needs ~1.3 s to drain: the
+    /// total-deadline fix times out at ~300 ms; the per-poll bug would complete.
+    #[test]
+    fn pty_write_timeout_bounds_total_not_per_poll() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_write_total", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop2.load(Ordering::Relaxed) {
+                let n =
+                    unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n <= 0 {
+                    break; // slave closed (EOF) or error
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let payload = vec![0x5Au8; 512 * 1024];
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_millis(300));
+        let start = Instant::now();
+        let res = drv.write_octet(&mut user, &payload);
+        let elapsed = start.elapsed();
+
+        // Close the slave fd so the reader's blocking read returns EOF and the
+        // thread exits, then join before the PtyGuard closes the master fd.
+        stop.store(true, Ordering::Relaxed);
+        drv.disconnect(&AsynUser::default()).ok();
+        let _ = reader.join();
+
+        match res {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            }) => {}
+            other => panic!("expected total-deadline Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "total write time must be bounded by ~the timeout, took {elapsed:?}"
+        );
     }
 }

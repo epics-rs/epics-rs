@@ -253,10 +253,36 @@ panels (parity + adversary).
   interrupt subsystem). Adversary noted the polled-cache vs interrupt-
   callback delivery as a pre-existing design choice, consistent with this.
 
-Reverify round on the DRV-20 TCP-sibling fix pending.
-
 asyn-rs `-p` clippy `--all-targets` + nextest (673) green per commit;
 full-workspace pre-push pass still owed.
+
+### Round 5 — 2026-06-29 (DRV-20 TCP-sibling reverify, 2 fresh opus panels) — CONVERGED
+
+Reverify of the DRV-20 TCP-flush-drain fix (9522b61b). Both fresh opus
+panels (parity + adversary) returned **DRV-20: CLEARED**.
+
+- `ClientSlot::drain_input` byte-matches C `drvAsynIPPort::flushIt`
+  (drvAsynIPPort.c:846-861): unoccupied-slot guard ↔ `fd != INVALID_SOCKET`,
+  non-blocking toggle/restore ↔ `setNonBlock(1)`/`setNonBlock(0)`,
+  recv-until-empty with `Ok(0)`/`WouldBlock`/`Err` breaks ↔ `numRecv<=0`
+  break, no error surfaced and no slot teardown on EOF during flush.
+- Both TCP flush entry points reach the drain: parent `io_flush` TCP
+  branch (addressed slot, or all slots on `addr<0`) and child
+  `DrvAsynIPSubport::io_flush`; the actor routes both `RequestOp::Flush`
+  and `OctetWriteRead{flush:true}` through `driver.io_flush`. No interpose
+  bypass (the server reads raw, no EOS read-ahead). UDP unaffected.
+- Adversary "could not break it." Three intentional, safe divergences:
+  (a) the Rust parent is a data-bearing `multi_device` TCP octet path with
+  no C counterpart (C parent TCP octet is all-NULL; data flows only
+  through child `parent:N`), so its flush drain is required by *that* Rust
+  design; (b) `addr<0` broadcast drain has no C equivalent but is
+  symmetric with the existing Rust broadcast write; (c) Rust bails on a
+  `set_nonblocking(true)` failure where C would risk a blocking-recv hang.
+  `set_nonblocking` (O_NONBLOCK) is orthogonal to `read_timeout`
+  (SO_RCVTIMEO), so the restore leaves no wrong mode behind.
+
+**F9 tractable findings (DRV-18/19/20 + TCP sibling) CONVERGED.** DRV-16/17
+remain OPEN for sign-off (octet-interface interrupt subsystem).
 
 ## Fix Log
 

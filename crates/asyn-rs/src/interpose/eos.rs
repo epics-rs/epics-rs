@@ -88,11 +88,15 @@ impl OctetInterpose for EosInterpose {
         buf: &mut [u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<OctetReadResult> {
-        // If no input EOS configured, just pass through
-        if self.config.input_eos.is_empty() {
-            return next.read(user, buf);
-        }
-
+        // C parity (`asynInterposeEos.c::readIt:191`): an installed EOS
+        // interpose is always `processEosIn==1`, so the read ALWAYS runs the
+        // buffering loop below — even with no terminator set. The "no EOS"
+        // case is handled by gating only the *match* on a non-empty
+        // terminator (mirroring C's `if (eosInLen > 0)` at readIt:199), NOT
+        // by short-circuiting to `next.read`. Short-circuiting would skip
+        // `in_buf`, stranding read-ahead bytes left by a prior EOS read when
+        // the terminator is later cleared (binary I/O or a runtime IEOS
+        // clear) — bytes C delivers from `inBuf` first.
         let maxchars = buf.len();
         if maxchars == 0 {
             // A zero-length destination buffer can store nothing — return
@@ -113,30 +117,37 @@ impl OctetInterpose for EosInterpose {
                 buf[n_read] = c;
                 n_read += 1;
 
-                let eos = &self.config.input_eos;
-                if c == eos[self.eos_in_match] {
-                    self.eos_in_match += 1;
-                    if self.eos_in_match == eos.len() {
-                        // Full EOS match — remove the EOS bytes from the
-                        // output count. Only the EOS bytes written into
-                        // *this* buffer can be removed: when a 2-byte EOS
-                        // straddles two read() calls, the leading byte was
-                        // already returned to the previous caller, so
-                        // `n_read` here may be smaller than `eos.len()`.
-                        // An unguarded `n_read -= eos.len()` underflows.
-                        self.eos_in_match = 0;
-                        n_read -= eos.len().min(n_read);
-                        eom |= EomReason::EOS;
-                        break;
-                    }
-                } else {
-                    // Resynchronize the search. Since asyn allows a maximum
-                    // two-character EOS, we only need to check if the current
-                    // character matches the first EOS character.
-                    if c == eos[0] {
-                        self.eos_in_match = 1;
+                // EOS matching only when a terminator is configured
+                // (C `asynInterposeEos.c::readIt:199` `if (eosInLen > 0)`).
+                // With an empty terminator we still deliver the buffered
+                // byte above, we just never match/strip — so cleared-EOS
+                // reads drain `in_buf` instead of dropping it.
+                if !self.config.input_eos.is_empty() {
+                    let eos = &self.config.input_eos;
+                    if c == eos[self.eos_in_match] {
+                        self.eos_in_match += 1;
+                        if self.eos_in_match == eos.len() {
+                            // Full EOS match — remove the EOS bytes from the
+                            // output count. Only the EOS bytes written into
+                            // *this* buffer can be removed: when a 2-byte EOS
+                            // straddles two read() calls, the leading byte was
+                            // already returned to the previous caller, so
+                            // `n_read` here may be smaller than `eos.len()`.
+                            // An unguarded `n_read -= eos.len()` underflows.
+                            self.eos_in_match = 0;
+                            n_read -= eos.len().min(n_read);
+                            eom |= EomReason::EOS;
+                            break;
+                        }
                     } else {
-                        self.eos_in_match = 0;
+                        // Resynchronize the search. Since asyn allows a maximum
+                        // two-character EOS, we only need to check if the current
+                        // character matches the first EOS character.
+                        if c == eos[0] {
+                            self.eos_in_match = 1;
+                        } else {
+                            self.eos_in_match = 0;
+                        }
                     }
                 }
 
@@ -383,6 +394,44 @@ mod tests {
         assert_eq!(interpose.in_buf_head, 0);
         assert_eq!(interpose.in_buf_tail, 0);
         assert_eq!(interpose.eos_in_match, 0);
+    }
+
+    /// C parity (`asynInterposeEos.c::readIt:191,199`): clearing the input
+    /// terminator on an installed interpose must NOT strand bytes already
+    /// read ahead into `in_buf` by a prior EOS read — the cleared-EOS read
+    /// still drains `in_buf` first (processEosIn stays on; only matching is
+    /// gated on a non-empty terminator). Reachable via `OctetReadBinary`,
+    /// which clears IEOS before the raw read (port_actor.rs).
+    #[test]
+    fn cleared_input_eos_still_drains_buffered_readahead() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        });
+        // One lower read returns the whole buffer; the EOS read returns "AB"
+        // and leaves "CD\n" stranded in in_buf.
+        let mut base = MockOctetBase::new(b"AB\nCD\n");
+        let user = AsynUser::default();
+
+        let mut buf = [0u8; 16];
+        let first = interpose.read(&user, &mut buf, &mut base).unwrap();
+        assert_eq!(&buf[..first.nbytes_transferred], b"AB");
+        assert!(first.eom_reason.contains(EomReason::EOS));
+        assert_ne!(
+            interpose.in_buf_tail, interpose.in_buf_head,
+            "read-ahead must leave CD\\n buffered"
+        );
+
+        // Clear IEOS (the binary-suppress path). The next read must deliver
+        // the buffered "CD\n", not skip to the (now empty) lower layer.
+        interpose.set_input_eos(b"");
+        let mut buf2 = [0u8; 16];
+        let second = interpose.read(&user, &mut buf2, &mut base).unwrap();
+        assert_eq!(
+            &buf2[..second.nbytes_transferred],
+            b"CD\n",
+            "cleared EOS must still drain buffered read-ahead bytes"
+        );
     }
 
     #[test]

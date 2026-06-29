@@ -1852,8 +1852,11 @@ mod tests {
         assert_eq!(drv.base().input_eos, b"\n");
 
         let user = AsynUser::default();
+        // "ab\n" exactly: the EOS read returns "ab" and leaves no read-ahead
+        // in the interpose buffer, so the cleared-EOS read below genuinely
+        // reads the next source fresh.
         let mut src = RawSource {
-            data: b"ab\ncd".to_vec(),
+            data: b"ab\n".to_vec(),
             pos: 0,
         };
         let mut buf = [0u8; 16];

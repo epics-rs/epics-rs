@@ -289,7 +289,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   send still paces. Tests `udp_retransmit_resends_via_no_delay_path` +
   `udp_retransmits_at_most_four_times_then_gives_up` (initial/retransmit split).
 
-### R54 — single Float64/Octet param per data reason collapses C's per-interface I/O-Intr callbacks (CONFIRMED DEFECT)
+### R54 — single Float64/Octet param per data reason collapses C's per-interface I/O-Intr callbacks — CLEARED (a3e2fee6)
 - **Severity:** DEFECT (wrong VAL on I/O-Intr integer-interface records) — structural, spans the
   `modbus-rs` ↔ `asyn-rs` boundary
 - **Rust:** `ioc.rs:186-213` registers each data reason as ONE param — numeric→Float64, string→Octet.
@@ -329,6 +329,17 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   interface-typed callbacks for one reason, or (b) modbus-rs registering per-interface reasons.
   **Surface for design sign-off before fixing** (per the structural-fix-needs-sign-off rule); do
   not collapse it into an unrelated commit.
+- **Fix (a3e2fee6, signed off — option (a)):** restored the interface dimension C keeps via
+  per-interface interrupt lists. `InterruptValue`/`InterruptFilter` gained
+  `iface: Option<InterfaceType>`; `matches` rejects only when both the value and the subscriber
+  name an interface and they differ, so an untyped value (the `call_param_callbacks` path) still
+  reaches every subscriber and single-value drivers are unaffected. New producer
+  `PortDriverBase::notify_interface_value` fires one interface-typed value; the `AsynDeviceSupport`
+  subscriptions tag their filter with the record's own interface. `poll_cycle` now decodes each
+  active register block once per interface and fires int32/int64/float64/raw-uInt32Digital-word
+  separately (the whole block decoded up front so a mid-decode error aborts before any partial
+  fire). Tests: `interrupt::tests::notify_routes_typed_values_per_interface` and
+  `ioc::tests::poll_cycle_fires_per_interface_typed_values`.
 
 ### R55 — readOctet always reports `ASYN_EOM_CNT`; the asyn-rs default only synthesises CNT when the buffer fills — CLEARED (8f15ba0d)
 - **Severity:** CONCERN (EOMR/eom-flag divergence; record string content unaffected)

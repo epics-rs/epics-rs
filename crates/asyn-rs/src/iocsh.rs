@@ -19,6 +19,7 @@ use epics_base_rs::server::iocsh::registry::{
 };
 
 use crate::drivers::ip_port::DrvAsynIPPort;
+use crate::drivers::prologix::DrvAsynPrologixPort;
 use crate::drivers::serial_port::DrvAsynSerialPort;
 use crate::error::AsynResult;
 use crate::manager::PortManager;
@@ -43,7 +44,8 @@ pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) ->
         app = app.register_shell_command(def);
     }
     app = app.register_startup_command(drv_asyn_ip_port_configure_command(trace.clone()));
-    app.register_startup_command(drv_asyn_serial_port_configure_command(trace))
+    app = app.register_startup_command(drv_asyn_serial_port_configure_command(trace.clone()));
+    app.register_startup_command(drv_asyn_prologix_port_configure_command(trace))
 }
 
 fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
@@ -105,7 +107,8 @@ pub fn register_asyn_commands_on_shell(
         shell.register(def);
     }
     shell.register(drv_asyn_ip_port_configure_command(trace.clone()));
-    shell.register(drv_asyn_serial_port_configure_command(trace));
+    shell.register(drv_asyn_serial_port_configure_command(trace.clone()));
+    shell.register(drv_asyn_prologix_port_configure_command(trace));
 }
 
 /// Build the six iocsh `CommandDef`s without binding them to a
@@ -607,6 +610,76 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
     )
 }
 
+/// Build the `prologixGPIBConfigure` iocsh command.
+///
+/// C parity: `drvPrologixGPIB.c::prologixGPIBConfigure(portName, host,
+/// priority, noAutoConnect)` (lines 547-628). `host` may be `"hostname"`
+/// (the bridge's fixed `:1234 TCP` is appended) or `"hostname:port"`; see
+/// [`DrvAsynPrologixPort::new`]. The created GPIB port is registered in the
+/// [`crate::asyn_record`] port registry so `asynRecord` device support
+/// resolves it by name.
+///
+/// As with the IP/serial commands, `priority` is accepted for startup-script
+/// compatibility but has no effect (the Rust runtime schedules port actors
+/// uniformly); `noAutoConnect` is honored. There is no `noProcessEos` arg —
+/// the prologix driver owns EOS itself (it passes `noProcessEos=1` to its
+/// inner `_TCP` IP port, mirroring C's `drvAsynIPPortConfigure(... 1)` at
+/// drvPrologixGPIB.c:575).
+pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+    CommandDef::new(
+        "prologixGPIBConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "host",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noAutoConnect",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "prologixGPIBConfigure portName host [priority] [noAutoConnect] \
+         - create a Prologix GPIB-Ethernet port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let host = arg_str(args, 1)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "host required".to_string())?;
+            let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
+
+            let driver = match DrvAsynPrologixPort::new(&port, &host, no_auto_connect) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("prologixGPIBConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+
+            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            keep_port_runtime(handle);
+            ctx.println(&format!(
+                "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +975,44 @@ mod tests {
             .call(&[ArgValue::String("iocsh_ip_cfg_nohost".into())], &ctx);
         assert!(result.is_err());
         assert!(crate::asyn_record::get_port("iocsh_ip_cfg_nohost").is_none());
+    }
+
+    /// DRV-49: `prologixGPIBConfigure` creates a Prologix GPIB port and
+    /// registers it in the asyn_record registry so it is reachable from a
+    /// startup script. `DrvAsynPrologixPort::new` only parses the host (no
+    /// connect), so no bridge is needed. C `prologixGPIBConfigure` takes 4
+    /// args (portName, host, priority, noAutoConnect); priority is dropped.
+    #[test]
+    fn drv_asyn_prologix_port_configure_registers_port() {
+        let cmd = drv_asyn_prologix_port_configure_command(Arc::new(TraceManager::new()));
+        assert_eq!(cmd.name, "prologixGPIBConfigure");
+        assert_eq!(cmd.args.len(), 4);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_prologix_cfg_test".into()),
+                ArgValue::String("127.0.0.1:1234".into()),
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_prologix_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// A missing required argument is rejected without creating a port.
+    #[test]
+    fn drv_asyn_prologix_port_configure_rejects_missing_host() {
+        let cmd = drv_asyn_prologix_port_configure_command(Arc::new(TraceManager::new()));
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[ArgValue::String("iocsh_prologix_cfg_nohost".into())],
+            &ctx,
+        );
+        assert!(result.is_err());
+        assert!(crate::asyn_record::get_port("iocsh_prologix_cfg_nohost").is_none());
     }
 }

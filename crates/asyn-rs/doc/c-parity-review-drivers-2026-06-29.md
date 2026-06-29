@@ -113,8 +113,10 @@ impact paragraphs in the round report
 | DRV-52 | LOW | prologix.rs:322,333 | drvPrologixGPIB.c:213,231 | per-device connect/disconnect toggles port-level state + announces addr −1 (ASYN_MULTIDEVICE) |
 | DRV-53 | LOW | prologix.rs:131-135 | drvPrologixGPIB.c:592-593 | port registered `destructible:true`; C registers no ASYN_DESTRUCTIBLE (over-grants shutdown rights) |
 | DRV-54 | LOW | prologix.rs:396-400 | drvPrologixGPIB.c:253 | zero read timeout coerced to 1s (C passes 0 = poll verbatim) |
-| DRV-55 | CLEARED | ip_port.rs:283-289, ip_server_port.rs:887-893,1169-1175 | drvAsynIPPort.c:736-740 | `maxchars==0` read guard unported → empty buffer reads Ok(0) → misread as peer EOF → healthy-connection teardown — FIXED 75654e2b (maxchars_zero_error guard at all 3 IP read entry points) |
+| DRV-55 | CLEARED | ip_port.rs:283-289, ip_server_port.rs:887-893,1169-1175,772-778,780-798 | drvAsynIPPort.c:736-740, drvAsynIPServerPort.c:180-184 | `maxchars==0` read guard unported → empty buffer reads Ok(0) → misread as peer EOF → healthy-connection teardown — FIXED 75654e2b (maxchars_zero_error at the 3 stream-read entries); UDP server read sibling FIXED efe9ae2a (read_octet + io_read_octet_eom UDP branches, C readIt:180-184, benign) |
 | DRV-56 | CLEARED | ip_server_port.rs:1064-1080 | drvAsynIPServerPort.c:308-323 | UDP recv worker broke loop on EINTR → benign signal permanently killed reception; C also stops on EINTR (UDPbufferSize=-1) = C bug not copied — FIXED 789ecc2a (EINTR routed to non-fatal continue) |
+| DRV-57 | CLEARED | serial_port.rs:321-333 | drvAsynSerialPort.c:871-875 | serial-driver sibling of DRV-55, ADVERSE: `SerialIoState::read` no `maxchars==0` guard → empty buf → `libc::read(fd,ptr,0)`==0 → misread as EOF → Disconnected → teardown of a live serial port — FIXED e83cc61d |
+| DRV-58 | DOC | ip_port.rs:239-271 | drvAsynIPPort.c:631-674 | `write_with_retry` bounds total write time from write-start; C `writeRaw` only bounds time from the FIRST EWOULDBLOCK (`haveStartTime` set once at :631, never reset) and is unbounded while sends progress. Rust's bound is stricter/safer (bounded write latency), identical to C at `timeout==0`; intentional divergence, not a C-bug copy — DOC, no change |
 
 NON-GAPs / parity-clean (Rust correctly declines C bugs or improves): ip_port
 ASIDES (IPv6 superset, null-term, DNS caching); ip_server DRV-25/26; serial
@@ -763,7 +765,17 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   teardown of a live connection) is adverse, so the guard closes the parity
   gap regardless of caller. Test:
   `zero_length_read_request_rejected_not_eof_teardown` (empty buffer →
-  asynError, socket stays connected).
+  asynError, socket stays connected). EXTENSION efe9ae2a — the drv-s3
+  review round found a 4th IP read entry the first commit missed: the UDP
+  server read bypasses `base_read_octet` (`read_octet`/`io_read_octet_eom`
+  call `udp_drain_into[_eom]` directly, returning `Ok(0)` on an empty
+  buffer). C's UDP read is a *separate* function, `readIt`
+  (drvAsynIPServerPort.c:180-184), with its own `maxchars==0 → asynError`
+  guard at the top (also what shields C from its own `(int)maxchars-1`
+  underflow at :196). Added the guard to both UDP read entries, path-local
+  so the maxchars-first order matches `readIt` (the TCP path keeps
+  `readRaw`'s disconnect-first order in `base_read_octet`). Benign (cache
+  poll-again, no teardown). Test: `udp_server_zero_length_read_rejected`.
 
 - **DRV-56** (CONCERN — UDP recv worker dies on EINTR) — CLEARED 789ecc2a.
   The server-port UDP recv worker (`udp_recv_loop`) treated any recv error
@@ -781,3 +793,48 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   1 ms-busy-spin a worker that can never receive again). Distinct from
   DRV-11: different C function (recv worker, not `readRaw`) and a different
   consequence (worker-thread death, not read-status misclassification).
+
+- **DRV-57** (DEFECT — serial `maxchars==0` guard, ADVERSE) — CLEARED
+  e83cc61d. Serial-driver sibling of DRV-55, surfaced by the drv-s3
+  adversarial reviewer. C `read` (drvAsynSerialPort.c:871-875) rejects
+  `maxchars == 0` with `asynError` right after the fd check and before
+  touching the device. `SerialIoState::read` had the fd check
+  (`fd_or_err`) but no maxchars guard: an empty buffer reaches
+  `libc::read(fd, ptr, 0)`, which returns 0, and the `n == 0` branch
+  classifies that as a disconnect ("serial port EOF",
+  `AsynStatus::Disconnected`) → `is_fatal_transport_error` →
+  `drop_connection()` tears down a live serial port — the exact adverse
+  DRV-55 consequence. Added the guard after the fd check, matching C order.
+  Message uses the serial driver's own wording ("maxchars 0 Why <=0?", no
+  period) per its C source rather than importing `ip_port::maxchars_zero
+  _error` (whose ". Why" matches the IP drivers) — consistent with the
+  DRV-31 decision to keep serial's read-error helpers local. Defect-family
+  sweep (anchor = octet read entries where `maxchars==0` misreads):
+  `SerialIoState::read` is the only same-defect site; prologix `read_octet`
+  delegates to the inner `DrvAsynIPPort` (inherits the guard); serial write
+  has no maxchars; the other `libc::read` calls are test code. Test:
+  `pty_zero_length_read_rejected_not_eof_teardown`.
+
+- **DRV-58** (CONCERN — write make-progress deadline vs C) — DOC,
+  intentional divergence (no change). Raised by the drv-s3 adversarial
+  reviewer. `write_with_retry` (ip_port.rs:239-271) checks `now > deadline`
+  at the top of every loop iteration, so the deadline (write-start +
+  `socket_poll_timeout(timeout)`) bounds the TOTAL write time. C `writeRaw`
+  (drvAsynIPPort.c:631-674) sets `haveStartTime` on the FIRST EWOULDBLOCK
+  only (line 631, never reset) and bounds time from there; while sends make
+  progress without blocking it has no time bound at all. So on a large
+  write to a slow/backpressured socket Rust can abort mid-write where C
+  keeps going. Pre-existing (not introduced by the DRV-11(b) deadline
+  floor), low severity, and at `timeout == 0` both behave nearly
+  identically. Rust's total-time bound is stricter and safer (bounded write
+  latency) — a defensible intentional divergence, not a C-bug copy, so left
+  as-is and documented here.
+
+- **Flush-drain EINTR (aside, no change)** — the drv-s3 parity reviewer
+  noted the two flush drains handle EINTR differently: client
+  `IpIoState::flush` (ip_port.rs:441/455/471) *continues* on `Interrupted`
+  (more thorough than C), while server `ClientSlot::drain_input`
+  (ip_server_port.rs:283/290) *breaks* on any error including EINTR
+  (C-faithful — C `flushIt` drvAsynIPPort.c:853-857 is `if (numRecv <= 0)
+  break`). Both are benign (DRV-20 flush family, already dispositioned);
+  neither leaks bytes nor tears anything down. No defect — left unaligned.

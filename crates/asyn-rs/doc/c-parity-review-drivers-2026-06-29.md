@@ -126,6 +126,28 @@ escaping list. See round report.
 
 ## Review Log
 
+### drv-s2..s4 convergence — 2026-06-29 (2 opus panels: parity + adversarial)
+
+ip_port singleton fixes DRV-7/11/13 reviewed, then driven to convergence.
+The adversarial lens reopened DRV-11 (the readRaw/writeRaw zero/edge family
+was not closed by the first commit) and then the maxchars==0 family:
+
+- DRV-11 closed across client + both server reads (read EINTR non-fatal via
+  the shared `is_nonfatal_read_timeout` owner) + zero-timeout write deadline
+  floor. DRV-56 (UDP recv worker EINTR-death) split out as distinct.
+- DRV-55 maxchars==0 grew from 3 IP stream reads → +UDP server read
+  (`readIt` sibling) → +serial read (DRV-57, the only *adverse* one:
+  empty-buf teardown). Final sweep across all 6 drivers: every syscall-backed
+  octet read entry is guarded; prologix + ftdi/usbtmc/vxi11 are non-members
+  (no C guard / no syscall, benign by construction).
+- DRV-58 (write make-progress deadline: total in Rust vs from-first-block in
+  C) and the client/server flush-drain EINTR asymmetry both dispositioned as
+  documented intentional/benign divergences (no code change).
+
+Both panels returned **converged: YES**. maxchars==0 family CLOSED; DRV-11
+family CLOSED. Round artefacts: `.caucus/.../rounds/01KW8S86GCEE7197SXZSQJ9262.md`
+(drv-s3) and `.../01KW8T7SCXT2VRN97YGQY4EEM6.md` (drv-s4).
+
 ### Round 1 — 2026-06-29 (4 opus panels, C-first)
 
 48 real findings: 4 DEFECT + ~19 CONCERN + ~25 LOW; 2 NON-GAP. The findings
@@ -810,10 +832,22 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   _error` (whose ". Why" matches the IP drivers) — consistent with the
   DRV-31 decision to keep serial's read-error helpers local. Defect-family
   sweep (anchor = octet read entries where `maxchars==0` misreads):
-  `SerialIoState::read` is the only same-defect site; prologix `read_octet`
-  delegates to the inner `DrvAsynIPPort` (inherits the guard); serial write
-  has no maxchars; the other `libc::read` calls are test code. Test:
+  `SerialIoState::read` is the only same-defect site; serial write has no
+  maxchars; the other `libc::read` calls are test code. Test:
   `pty_zero_length_read_rejected_not_eof_teardown`.
+  PROLOGIX CLARIFICATION (drv-s4 review corrected my first rationale) —
+  prologix `read_octet`/`io_read_octet_eom` do NOT inherit the inner
+  `DrvAsynIPPort` guard: they read the bridge into their own 4096-byte
+  `chunk` (prologix.rs:462), never the caller's `buf`, so an empty caller
+  buffer never reaches the inner read. The empty-buf path returns
+  `(0, eom)` with any device reply preserved in `read_carry` — benign (no
+  syscall on the caller buf, no teardown, no data loss). There is no C
+  guard to match either: C `drvPrologixGPIB.c` read (:240) has no
+  `maxchars==0` guard, only buffer clamping (:336,:342-343), so
+  `maxchars==0` → 0 bytes with no error — exactly the Rust behaviour. Not a
+  family member; no change. ftdi/usbtmc/vxi11 have no octet-read impl and
+  fall through to the default in-memory param-table `PortDriver::read_octet`
+  (no fd/syscall/teardown) — also not members.
 
 - **DRV-58** (CONCERN — write make-progress deadline vs C) — DOC,
   intentional divergence (no change). Raised by the drv-s3 adversarial

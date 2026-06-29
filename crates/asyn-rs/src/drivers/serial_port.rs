@@ -697,6 +697,52 @@ impl DrvAsynSerialPort {
         }
         Ok(())
     }
+
+    /// Build the fully-configured termios this driver pushes to the device:
+    /// `cfmakeraw` plus the fixed seeds (CREAD|CLOCAL, IGNBRK|IGNPAR,
+    /// VMIN/VTIME, VSTART/VSTOP) and the user config (baud/bits/parity/stop/
+    /// flow). It is rebuilt from `self.config` rather than read back from the
+    /// device, so the result is the canonical configured line state regardless
+    /// of what the kernel currently holds.
+    ///
+    /// This is the single source of that configured state, shared by `connect`
+    /// (initial setup) and the empty-key `set_option` re-apply (C
+    /// drvAsynSerialPort.c `applyOptions`, :105-130, which likewise re-pushes
+    /// its own cached termios, not the device's current one).
+    fn build_configured_termios(&self) -> AsynResult<libc::termios> {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe { libc::cfmakeraw(&mut t) };
+        // Enable receiver, local mode
+        t.c_cflag |= libc::CREAD | libc::CLOCAL;
+        // C parity (drvAsynSerialPort.c:1080): the default input flags are
+        // IGNBRK | IGNPAR. cfmakeraw clears IGNBRK (and never sets IGNPAR),
+        // so without this a line BREAK or a framing/parity error reaches
+        // the reader as a spurious 0x00 byte where C silently ignores it.
+        // apply_to_termios only touches c_iflag for XON/XOFF flow, so these
+        // survive the config layer.
+        t.c_iflag |= libc::IGNBRK | libc::IGNPAR;
+        // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte.
+        // Deliberate divergence from C (drvAsynSerialPort.c:1083 seeds
+        // VMIN=0 and reprograms VMIN/VTIME per read from the requested
+        // timeout, :899-908): C drives the read timeout through VTIME plus
+        // an epicsTimer, whereas this driver gates every read with
+        // poll(POLLIN, timeout) and only reads when data is ready. With that
+        // architecture VMIN=1 keeps `n == 0` meaning exactly EOF/hangup;
+        // VMIN=0 would make a spurious poll-wake return 0 and be misread as a
+        // disconnect. Every representable (non-negative) timeout is already
+        // bounded by the poll.
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        // C parity (drvAsynSerialPort.c:1085-1086): the XON/XOFF flow
+        // characters default to ^Q (0x11, VSTART) and ^S (0x13, VSTOP).
+        // `t` was zeroed before cfmakeraw and cfmakeraw leaves c_cc
+        // untouched, so without this FlowControl::Software (IXON|IXOFF)
+        // would drive flow with NUL bytes instead of ^Q/^S.
+        t.c_cc[libc::VSTART] = 0x11; // ^Q
+        t.c_cc[libc::VSTOP] = 0x13; // ^S
+        self.config.apply_to_termios(&mut t)?;
+        Ok(t)
+    }
 }
 
 impl PortDriver for DrvAsynSerialPort {
@@ -752,38 +798,10 @@ impl PortDriver for DrvAsynSerialPort {
             let saved = self.get_current_termios()?;
             self.saved_termios = Some(saved);
 
-            // 3. Configure: cfmakeraw + apply config
-            let mut t: libc::termios = unsafe { std::mem::zeroed() };
-            unsafe { libc::cfmakeraw(&mut t) };
-            // Enable receiver, local mode
-            t.c_cflag |= libc::CREAD | libc::CLOCAL;
-            // C parity (drvAsynSerialPort.c:1080): the default input flags are
-            // IGNBRK | IGNPAR. cfmakeraw clears IGNBRK (and never sets IGNPAR),
-            // so without this a line BREAK or a framing/parity error reaches
-            // the reader as a spurious 0x00 byte where C silently ignores it.
-            // apply_to_termios only touches c_iflag for XON/XOFF flow, so these
-            // survive the config layer.
-            t.c_iflag |= libc::IGNBRK | libc::IGNPAR;
-            // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte.
-            // Deliberate divergence from C (drvAsynSerialPort.c:1083 seeds
-            // VMIN=0 and reprograms VMIN/VTIME per read from the requested
-            // timeout, :899-908): C drives the read timeout through VTIME plus
-            // an epicsTimer, whereas this driver gates every read with
-            // poll(POLLIN, timeout) (read() below) and only reads when data is
-            // ready. With that architecture VMIN=1 keeps `n == 0` meaning
-            // exactly EOF/hangup; VMIN=0 would make a spurious poll-wake return
-            // 0 and be misread as a disconnect. Every representable (non-
-            // negative) timeout is already bounded by the poll above.
-            t.c_cc[libc::VMIN] = 1;
-            t.c_cc[libc::VTIME] = 0;
-            // C parity (drvAsynSerialPort.c:1085-1086): the XON/XOFF flow
-            // characters default to ^Q (0x11, VSTART) and ^S (0x13, VSTOP).
-            // `t` was zeroed before cfmakeraw and cfmakeraw leaves c_cc
-            // untouched, so without this FlowControl::Software (IXON|IXOFF)
-            // would drive flow with NUL bytes instead of ^Q/^S.
-            t.c_cc[libc::VSTART] = 0x11; // ^Q
-            t.c_cc[libc::VSTOP] = 0x13; // ^S
-            self.config.apply_to_termios(&mut t)?;
+            // 3. Configure: cfmakeraw + fixed seeds + user config. The full
+            // configured line state is owned by build_configured_termios so
+            // the empty-key set_option re-apply pushes exactly the same state.
+            let t = self.build_configured_termios()?;
             self.apply_termios(&t)?;
 
             // C parity (drvAsynSerialPort.c:729): discard any bytes that
@@ -1161,13 +1179,24 @@ impl PortDriver for DrvAsynSerialPort {
                 self.set_rs485_option(&key, value)?;
             }
             other => {
-                // C drvAsynSerialPort.c::setOption (lines 594-598): the empty
-                // key is a silent no-op (the `epicsStrCaseCmp(key,"") != 0`
-                // guard); any other unsupported key returns asynError
-                // "Unsupported key". The real handlers above own every
-                // supported key, so there is no generic option store.
+                // C drvAsynSerialPort.c::setOption (lines 594-616): any
+                // unsupported non-empty key returns asynError "Unsupported
+                // key" (the `epicsStrCaseCmp(key,"") != 0` guard at :594).
+                // The real handlers above own every supported key, so there
+                // is no generic option store.
                 if !other.is_empty() {
                     return Err(AsynError::OptionNotFound(other.to_string()));
+                }
+                // The empty key is not an error: when the port is open C still
+                // runs applyOptions (:609-615), which forces CREAD and
+                // re-pushes the cached termios via tcsetattr (applyOptions,
+                // :119-126). That re-applies the configured line state to the
+                // device — restoring it if another process changed the port
+                // out from under the driver. Mirror it by re-pushing the
+                // canonical configured termios when connected.
+                if self.io.fd.is_some() {
+                    let t = self.build_configured_termios()?;
+                    self.apply_termios(&t)?;
                 }
             }
         }
@@ -1766,15 +1795,16 @@ mod tests {
     fn test_set_option_unknown() {
         // C drvAsynSerialPort.c::setOption (594-598) rejects any non-empty
         // unsupported key (asynError "Unsupported key") and never stores it,
-        // so a later getOption cannot echo it back; the empty key is a
-        // silent no-op.
+        // so a later getOption cannot echo it back.
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
 
         let err = drv.set_option("custom", "value").unwrap_err();
         assert!(matches!(err, AsynError::OptionNotFound(_)));
         assert!(drv.get_option("custom").is_err());
 
-        // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
+        // The empty key is not an error. With no open fd there is nothing to
+        // re-apply, so it is a no-op here; the connected re-apply path is
+        // covered by pty_empty_key_reapplies_configured_termios.
         drv.set_option("", "ignored").unwrap();
     }
 
@@ -1916,6 +1946,71 @@ mod tests {
             drv.base().connected,
             "zero-length serial read must not tear down the connection"
         );
+    }
+
+    /// DRV-36: the empty `set_option` key is not an error and, when the port is
+    /// open, re-applies the configured line state to the device (C
+    /// drvAsynSerialPort.c setOption :609-615 → applyOptions :119-126, which
+    /// re-pushes the cached termios). Simulate another process clobbering the
+    /// port's line settings and confirm the empty key restores the driver's
+    /// configured state. CSTOPB is used as the observable: a single c_cflag bit
+    /// that pty termios stores faithfully (unlike baud, which hardware may
+    /// reject).
+    #[test]
+    fn pty_empty_key_reapplies_configured_termios() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_reapply", &slave_name).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        let fd = drv.io.fd.expect("connected fd");
+
+        let read_cstopb = |fd: RawFd| -> bool {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+            (t.c_cflag & libc::CSTOPB) != 0
+        };
+
+        // The stop-bit state the driver pushed at connect (per config).
+        let configured = read_cstopb(fd);
+
+        // Externally flip the stop-bit width, as another process sharing the
+        // port would, and confirm the clobber actually took effect.
+        {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+            if configured {
+                t.c_cflag &= !libc::CSTOPB;
+            } else {
+                t.c_cflag |= libc::CSTOPB;
+            }
+            assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) }, 0);
+        }
+        assert_eq!(
+            read_cstopb(fd),
+            !configured,
+            "external clobber must take effect before the re-apply"
+        );
+
+        // The empty key re-applies the configured termios, overwriting the
+        // clobber — C applyOptions re-pushes the cached config, not the
+        // device's current state.
+        drv.set_option("", "").unwrap();
+        assert_eq!(
+            read_cstopb(fd),
+            configured,
+            "empty-key set_option must restore the configured line state"
+        );
+
+        drv.disconnect(&user).unwrap();
     }
 
     #[test]

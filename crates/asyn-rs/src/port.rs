@@ -1269,7 +1269,14 @@ pub trait PortDriver: Send + Sync + 'static {
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        self.base_mut().input_eos = eos.to_vec();
+        // Single write owner for input EOS: `base.input_eos` is the
+        // queryable cache (`get_input_eos`, binary-suppress save/restore),
+        // and the same value is forwarded to the interpose stack so an
+        // installed `EosInterpose` actually terminates reads on it. Empty
+        // stack = no-op forward; C routes `setInputEos` the same way.
+        let base = self.base_mut();
+        base.input_eos = eos.to_vec();
+        base.interpose_octet.set_input_eos(eos);
         Ok(())
     }
 
@@ -1284,7 +1291,12 @@ pub trait PortDriver: Send + Sync + 'static {
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        self.base_mut().output_eos = eos.to_vec();
+        // Single write owner for output EOS (see `set_input_eos`): cache in
+        // base and forward to the interpose stack so `EosInterpose` appends
+        // the terminator on write.
+        let base = self.base_mut();
+        base.output_eos = eos.to_vec();
+        base.interpose_octet.set_output_eos(eos);
         Ok(())
     }
 
@@ -1797,6 +1809,78 @@ mod tests {
                 .push_octet_interpose(Box::new(NoopInterpose));
             assert_eq!(guard.base().interpose_octet.len(), 1);
         }
+    }
+
+    /// The `set_input_eos` write owner must forward the terminator to an
+    /// installed `EosInterpose`, not just cache it in `base.input_eos` —
+    /// otherwise a runtime IEOS change never terminates reads (the F7 gap).
+    #[test]
+    fn test_set_input_eos_reaches_installed_interpose() {
+        use crate::interpose::eos::EosInterpose;
+        use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+
+        struct RawSource {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl OctetNext for RawSource {
+            fn read(&mut self, _u: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                let avail = self.data.len() - self.pos;
+                let n = avail.min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(OctetReadResult {
+                    nbytes_transferred: n,
+                    eom_reason: EomReason::CNT,
+                })
+            }
+            fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self, _u: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut drv = TestDriver::new();
+        drv.base_mut()
+            .push_octet_interpose(Box::new(EosInterpose::default()));
+
+        // Set IEOS through the driver trait: caches in base AND must reach
+        // the interpose.
+        drv.set_input_eos(b"\n").unwrap();
+        assert_eq!(drv.base().input_eos, b"\n");
+
+        let user = AsynUser::default();
+        let mut src = RawSource {
+            data: b"ab\ncd".to_vec(),
+            pos: 0,
+        };
+        let mut buf = [0u8; 16];
+        let r = drv
+            .base_mut()
+            .interpose_octet
+            .dispatch_read(&user, &mut buf, &mut src)
+            .unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"ab");
+        assert!(r.eom_reason.contains(EomReason::EOS));
+
+        // Clearing IEOS (binary-suppress path) must also reach the interpose:
+        // the read then passes through with no EOS termination.
+        drv.set_input_eos(b"").unwrap();
+        assert_eq!(drv.base().input_eos, b"");
+        let mut src2 = RawSource {
+            data: b"xy\nz".to_vec(),
+            pos: 0,
+        };
+        let mut buf2 = [0u8; 16];
+        let r2 = drv
+            .base_mut()
+            .interpose_octet
+            .dispatch_read(&user, &mut buf2, &mut src2)
+            .unwrap();
+        assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
+        assert!(!r2.eom_reason.contains(EomReason::EOS));
     }
 
     #[test]

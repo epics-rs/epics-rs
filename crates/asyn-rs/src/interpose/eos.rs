@@ -62,21 +62,22 @@ impl EosInterpose {
         }
     }
 
-    pub fn set_input_eos(&mut self, eos: &[u8]) {
-        self.config.input_eos = eos.to_vec();
-        self.eos_in_match = 0;
-    }
-
-    pub fn set_output_eos(&mut self, eos: &[u8]) {
-        self.config.output_eos = eos.to_vec();
-    }
-
     pub fn get_input_eos(&self) -> &[u8] {
         &self.config.input_eos
     }
 
     pub fn get_output_eos(&self) -> &[u8] {
         &self.config.output_eos
+    }
+}
+
+impl Default for EosInterpose {
+    /// An EOS interpose with no terminator — a pass-through until
+    /// `set_input_eos`/`set_output_eos` configure one. This is the
+    /// auto-install form (C `asynInterposeEosConfig` installs the layer
+    /// with an empty EOS; the terminator arrives later via `setInputEos`).
+    fn default() -> Self {
+        Self::new(EosConfig::default())
     }
 }
 
@@ -218,6 +219,17 @@ impl OctetInterpose for EosInterpose {
         self.in_buf_tail = 0;
         self.eos_in_match = 0;
         next.flush(user)
+    }
+
+    fn set_input_eos(&mut self, eos: &[u8]) {
+        self.config.input_eos = eos.to_vec();
+        // Reset the resync state machine — a mid-stream terminator change
+        // must not carry a partial match from the old terminator.
+        self.eos_in_match = 0;
+    }
+
+    fn set_output_eos(&mut self, eos: &[u8]) {
+        self.config.output_eos = eos.to_vec();
     }
 }
 

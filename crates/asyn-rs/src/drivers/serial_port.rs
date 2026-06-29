@@ -664,6 +664,13 @@ impl PortDriver for DrvAsynSerialPort {
             // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte
             t.c_cc[libc::VMIN] = 1;
             t.c_cc[libc::VTIME] = 0;
+            // C parity (drvAsynSerialPort.c:1085-1086): the XON/XOFF flow
+            // characters default to ^Q (0x11, VSTART) and ^S (0x13, VSTOP).
+            // `t` was zeroed before cfmakeraw and cfmakeraw leaves c_cc
+            // untouched, so without this FlowControl::Software (IXON|IXOFF)
+            // would drive flow with NUL bytes instead of ^Q/^S.
+            t.c_cc[libc::VSTART] = 0x11; // ^Q
+            t.c_cc[libc::VSTOP] = 0x13; // ^S
             self.config.apply_to_termios(&mut t);
             self.apply_termios(&t)?;
 
@@ -1948,5 +1955,29 @@ mod tests {
             0,
             "IGNPAR must be set (C default, drvAsynSerialPort.c:1080)"
         );
+    }
+
+    /// DRV-33: C (drvAsynSerialPort.c:1085-1086) seeds the XON/XOFF flow
+    /// characters to ^Q (0x11, VSTART) and ^S (0x13, VSTOP). cfmakeraw leaves
+    /// c_cc untouched and `t` is zeroed first, so the driver must set them or
+    /// software flow control would use NUL instead of ^Q/^S.
+    #[test]
+    fn pty_termios_sets_xon_xoff_chars() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_xonxoff", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let t = drv.get_current_termios().unwrap();
+        assert_eq!(t.c_cc[libc::VSTART], 0x11, "VSTART must be ^Q (C default)");
+        assert_eq!(t.c_cc[libc::VSTOP], 0x13, "VSTOP must be ^S (C default)");
     }
 }

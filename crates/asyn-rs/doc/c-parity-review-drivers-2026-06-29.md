@@ -92,9 +92,9 @@ impact paragraphs in the round report
 | DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
 | DRV-37 | CLEARED | serial_port.rs:392-487 | drvAsynSerialPort.c:810-842 | write timeout applied per-poll-iteration, not single total deadline → write lives timeout×N (and a blocking write(fd,all) ignored the timeout entirely) — FIXED 92755a0f (single deadline + post-write check + non-blocking write loop) |
 | DRV-38 | CONCERN | serial_port.rs:373-378,621-634 | drvAsynSerialPort.c:843 | partial byte count dropped on write timeout/error (framework `write_octet -> ()` contract) |
-| DRV-39 | LOW | serial_port.rs:853-955 | drvAsynSerialPort.c:203-208 | getOption("break") errors instead of returning "off" |
+| DRV-39 | CLEARED | serial_port.rs:1131-1133 | drvAsynSerialPort.c:203-208 | getOption("break") errors instead of returning "off" — FIXED dbb9a127 ("break" arm returns "off") |
 | DRV-40 | LOW | serial_port.rs:514-531 | drvAsynSerialPort.c:694-698 | connect() not guarded against double-open (fd + saved_termios leak) |
-| DRV-41 | LOW | serial_port.rs:522-560 | drvAsynSerialPort.c:713-729 | connect() omits FD_CLOEXEC and connect-time tcflush(TCIOFLUSH) |
+| DRV-41 | CLEARED | serial_port.rs:695-742 | drvAsynSerialPort.c:713-729 | connect() omits FD_CLOEXEC and connect-time tcflush(TCIOFLUSH) — FIXED 77930ec3 (FD_CLOEXEC after open + tcflush(TCIOFLUSH) before blocking restore) |
 | DRV-42 | LOW | user.rs:16, serial_port.rs:309-333 | drvAsynSerialPort.c:906-909 | "wait-forever" (negative) timeout unrepresentable (framework `Duration` is unsigned) |
 | DRV-43 | LOW | serial_port.rs:817-836,314-344 | drvAsynSerialPort.c:519-526,871-875 | disconnected `break` silently Ok; `maxchars==0` read misclassified as Disconnected |
 | DRV-44 | LOW | serial_port.rs (no report) | drvAsynSerialPort.c:666-680 | report() lacks serial diagnostics (fd, nWritten, nRead) |
@@ -187,7 +187,7 @@ cluster into structural families (the high-leverage fix units):
 - **F9 — ip_server interrupt push delivery (driver's documented purpose):**
   DRV-16, DRV-17. Plus DRV-18/19/20.
 - Singletons: DRV-6/7/11/13 (ip), DRV-32/33/34/35/37/39/41/42/43/44 (serial;
-  DRV-32/33/35/37 CLEARED, DRV-59 DOC), DRV-50/52/53/54 (prologix),
+  DRV-32/33/35/37/39/41 CLEARED, DRV-59 DOC), DRV-50/52/53/54 (prologix),
   DRV-21/22/24 (ip_server).
 
 Fix-phase plan: start with F1 (DEFECT, local, established invariant), then
@@ -969,3 +969,24 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   `pty_write_timeout_bounds_total_not_per_poll` (slow drain 4 KiB/10 ms;
   512 KiB payload; per-poll behavior runs to completion ~1.3 s, the fix
   times out at ~300 ms).
+
+- **DRV-39** (LOW — serial getOption("break")) — CLEARED. FIXED dbb9a127.
+  C `getOption` (drvAsynSerialPort.c:204-207) reports the "break" key as
+  the literal "off" — a line break is a momentary action so a read always
+  returns off. The Rust `get_option` had no "break" arm and fell through to
+  the generic store lookup → `OptionNotFound`. Added the arm returning
+  "off". Test: `get_option_break_returns_off`.
+
+- **DRV-41** (LOW — serial connect FD_CLOEXEC + tcflush) — CLEARED. FIXED
+  77930ec3. C `connectIt` hardens a freshly-opened port two ways the Rust
+  connect omitted: (1) FD_CLOEXEC (drvAsynSerialPort.c:713-722) set right
+  after open so a later child process (e.g. an iocsh `system` call) does
+  not inherit the serial fd and hold the device open after this driver
+  closes it — set via `fcntl(F_SETFD, FD_CLOEXEC)` at the top of the
+  connect setup closure, so a failure routes through the existing
+  fd-closing error handler; (2) `tcflush(TCIOFLUSH)` (drvAsynSerialPort.c:
+  729) to discard bytes left in the kernel input/output buffers before the
+  port was configured, so the first read/write starts clean — done right
+  before restoring blocking mode, matching C's order. Test:
+  `pty_connect_sets_cloexec` (F_GETFD shows FD_CLOEXEC after connect; the
+  tcflush is on the same connect path, not separately asserted).

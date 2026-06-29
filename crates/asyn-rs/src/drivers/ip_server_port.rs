@@ -771,6 +771,15 @@ impl PortDriver for DrvAsynIPServerPort {
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         if self.config.protocol == IpServerProtocol::Udp {
+            // C readIt (drvAsynIPServerPort.c:180-184) rejects maxchars == 0
+            // with asynError at the top of the UDP server read, before
+            // draining the datagram cache (this is also what shields C from
+            // its own (int)maxchars-1 underflow at :196). The TCP server read
+            // floors maxchars in base_read_octet; the UDP path bypasses it, so
+            // guard it here too — uniform with the TCP and client reads.
+            if buf.is_empty() {
+                return Err(maxchars_zero_error());
+            }
             return Ok(self.udp_drain_into(buf));
         }
         let res = self.base_read_octet(user, buf)?;
@@ -783,6 +792,12 @@ impl PortDriver for DrvAsynIPServerPort {
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
         if self.config.protocol == IpServerProtocol::Udp {
+            // C readIt (drvAsynIPServerPort.c:180-184) rejects maxchars == 0
+            // before draining the datagram cache; mirror it on this entry too
+            // (see read_octet above for the rationale).
+            if buf.is_empty() {
+                return Err(maxchars_zero_error());
+            }
             // A UDP datagram is a message boundary: C `readIt`
             // (drvAsynIPServerPort.c:201-207) sets ASYN_EOM_END when the
             // datagram is fully drained, ASYN_EOM_CNT when the caller
@@ -1700,6 +1715,55 @@ mod tests {
         let (n, eom) = srv.io_read_octet_eom(&user, &mut after).unwrap();
         assert_eq!(n, 0);
         assert!(eom.is_empty());
+    }
+
+    /// DRV-55 (UDP-server sibling): C readIt (drvAsynIPServerPort.c:180-184)
+    /// rejects maxchars == 0 with asynError before draining the cache. The
+    /// UDP read entries (`read_octet`/`io_read_octet_eom`) bypass
+    /// `base_read_octet`, so they must carry the guard themselves — an empty
+    /// buffer must error, NOT silently return a zero-byte read that leaves the
+    /// cached datagram in place.
+    #[test]
+    fn udp_server_zero_length_read_rejected() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv_maxchars", "127.0.0.1:0 UDP").unwrap();
+        {
+            let mut cache = srv.udp_cache.lock();
+            cache.data = b"keepme".to_vec();
+            cache.pos = 0;
+        }
+        let user = AsynUser::default().with_addr(0);
+
+        let mut empty: [u8; 0] = [];
+        assert!(
+            matches!(
+                srv.read_octet(&user, &mut empty),
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    ..
+                })
+            ),
+            "UDP read_octet with maxchars==0 must return asynError"
+        );
+        let mut empty_eom: [u8; 0] = [];
+        assert!(
+            matches!(
+                srv.io_read_octet_eom(&user, &mut empty_eom),
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    ..
+                })
+            ),
+            "UDP io_read_octet_eom with maxchars==0 must return asynError"
+        );
+
+        // The cached datagram must be untouched by the rejected reads.
+        let mut buf = [0u8; 16];
+        let n = srv.read_octet(&user, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"keepme",
+            "rejected reads must not drain the cache"
+        );
     }
 
     /// disconnect must stop the worker cleanly so a subsequent

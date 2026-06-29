@@ -661,7 +661,16 @@ impl PortDriver for DrvAsynSerialPort {
             // apply_to_termios only touches c_iflag for XON/XOFF flow, so these
             // survive the config layer.
             t.c_iflag |= libc::IGNBRK | libc::IGNPAR;
-            // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte
+            // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte.
+            // Deliberate divergence from C (drvAsynSerialPort.c:1083 seeds
+            // VMIN=0 and reprograms VMIN/VTIME per read from the requested
+            // timeout, :899-908): C drives the read timeout through VTIME plus
+            // an epicsTimer, whereas this driver gates every read with
+            // poll(POLLIN, timeout) (read() below) and only reads when data is
+            // ready. With that architecture VMIN=1 keeps `n == 0` meaning
+            // exactly EOF/hangup; VMIN=0 would make a spurious poll-wake return
+            // 0 and be misread as a disconnect. Every representable (non-
+            // negative) timeout is already bounded by the poll above.
             t.c_cc[libc::VMIN] = 1;
             t.c_cc[libc::VTIME] = 0;
             // C parity (drvAsynSerialPort.c:1085-1086): the XON/XOFF flow

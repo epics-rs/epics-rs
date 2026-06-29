@@ -86,7 +86,7 @@ impact paragraphs in the round report
 |---|---|---|---|---|
 | DRV-31 | DEFECT | serial_port.rs:336-344,387-389 | drvAsynSerialPort.c:837,959,625-635 | hard read/write error + EOF never closes connection → no auto-reconnect; also no EINTR/EAGAIN retry |
 | DRV-32 | CLEARED | serial_port.rs:663 | drvAsynSerialPort.c:1080 | termios input flags: C `IGNBRK\|IGNPAR` vs Rust `cfmakeraw` → spurious 0x00 on BREAK/line errors — FIXED 2685bd6f (see Fix Log) |
-| DRV-33 | CLEARED | serial_port.rs:672-673 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
+| DRV-33 | CLEARED | serial_port.rs:681-682 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
 | DRV-34 | CONCERN | serial_port.rs:263-270,645-658,159-208 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing) |
 | DRV-35 | CONCERN | serial_port.rs:659-747 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value |
 | DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
@@ -117,6 +117,7 @@ impact paragraphs in the round report
 | DRV-56 | CLEARED | ip_server_port.rs:1064-1080 | drvAsynIPServerPort.c:308-323 | UDP recv worker broke loop on EINTR → benign signal permanently killed reception; C also stops on EINTR (UDPbufferSize=-1) = C bug not copied — FIXED 789ecc2a (EINTR routed to non-fatal continue) |
 | DRV-57 | CLEARED | serial_port.rs:321-333 | drvAsynSerialPort.c:871-875 | serial-driver sibling of DRV-55, ADVERSE: `SerialIoState::read` no `maxchars==0` guard → empty buf → `libc::read(fd,ptr,0)`==0 → misread as EOF → Disconnected → teardown of a live serial port — FIXED e83cc61d |
 | DRV-58 | DOC | ip_port.rs:239-271 | drvAsynIPPort.c:631-674 | `write_with_retry` bounds total write time from write-start; C `writeRaw` only bounds time from the FIRST EWOULDBLOCK (`haveStartTime` set once at :631, never reset) and is unbounded while sends progress. Rust's bound is stricter/safer (bounded write latency), identical to C at `timeout==0`; intentional divergence, not a C-bug copy — DOC, no change |
+| DRV-59 | DOC | serial_port.rs:674 | drvAsynSerialPort.c:1083,899-908 | termios-default sibling of DRV-32/33: C seeds `c_cc[VMIN]=0` and reprograms VMIN/VTIME per read from `pasynUser->timeout` (≥0 → VMIN=0 + VTIME/epicsTimer; <0 → VMIN=1). Rust uses a different read architecture — poll(POLLIN, timeout)-gated blocking read with static VMIN=1 — so `n==0 ⟺ EOF` is a clean invariant. Flipping to C's VMIN=0 would break that (spurious poll-wake → read 0 → false Disconnect). Architecture-coupled, every representable (non-negative) timeout is bounded by poll; intentional divergence, not a C-bug copy — DOC, no change |
 
 NON-GAPs / parity-clean (Rust correctly declines C bugs or improves): ip_port
 ASIDES (IPv6 superset, null-term, DNS caching); ip_server DRV-25/26; serial
@@ -899,3 +900,28 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   IXON/IXOFF/IXANY bits in `c_iflag`, never `c_cc`, so the seeded
   characters survive it. Test: `pty_termios_sets_xon_xoff_chars` (after
   connect, `get_current_termios` shows VSTART==0x11 and VSTOP==0x13).
+
+- **DRV-59** (DOC — serial VMIN default vs C) — DOC, intentional
+  architecture-coupled divergence (documented in source, no behavioral
+  change). Found during the DRV-32/33 termios-default family sweep: it is
+  the one remaining sibling of the C default-termios block
+  (drvAsynSerialPort.c:1077-1089) that Rust does not match. C seeds
+  `c_cc[VMIN]=0` (line 1083) and then *reprograms* VMIN/VTIME on every read
+  from `pasynUser->timeout` (`readIt`, lines 899-908): `timeout>0` →
+  VMIN=0/VTIME=(timeout*10)+1 capped 255, `timeout==0` → VMIN=0/VTIME=0 +
+  `O_NONBLOCK`, `timeout<0` → VMIN=1/VTIME=0. So C uses VMIN=0 for every
+  representable (non-negative) timeout and lets VTIME + an epicsTimer
+  govern the wait. The Rust driver uses a *different read architecture*:
+  every read is gated by `poll(POLLIN, timeout)` (serial_port.rs:341-361)
+  on a blocking fd, and only calls `read()` when poll signals readable.
+  With that gate, a static `VMIN=1` keeps the invariant `n == 0 ⟺
+  EOF/hangup` clean — `read()` returns ≥1 byte when data is present (the
+  normal post-poll case) and 0 only on a genuine hangup. Adopting C's
+  `VMIN=0` would re-introduce a dual meaning for `n == 0` (EOF *or*
+  spurious poll-wake with no data), turning a benign wake into a false
+  Disconnect+teardown. C's `VMIN=0` is coupled to C's VTIME-timer design,
+  not portable into the poll-gated design. The remaining termios defaults
+  all match C: `c_cflag` CS8|CLOCAL|CREAD (cfmakeraw CS8 + explicit
+  CREAD|CLOCAL + 8N1 config default), `c_oflag`/`c_lflag` 0 (zeroed +
+  cfmakeraw), VTIME 0, baud 9600 — only VMIN diverges, by design. Left
+  as-is, divergence documented at serial_port.rs:665-673.

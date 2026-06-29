@@ -105,8 +105,8 @@ impact paragraphs in the round report
 | id | sev | Rust | C | one-line |
 |---|---|---|---|---|
 | DRV-46 | CONCERN | prologix.rs:169 | drvPrologixGPIB.c:439,422,534-535 | EOS interface not wired to driver `eos` state; getInputEos echoes stored-but-ineffective bytes (C reports eoslen=0) |
-| DRV-47 | CONCERN | prologix.rs:361 | drvPrologixGPIB.c:334-349 | eomReason (END/EOS/CNT) never reported (no io_read_octet_eom override) |
-| DRV-48 | DEFECT | prologix.rs:346-359 | drvPrologixGPIB.c:386,409 | write_octet doesn't discard staged read remainder → next read returns stale bytes (cross-transaction leak) |
+| DRV-47 | CLEARED | prologix.rs:80,410,422 | drvPrologixGPIB.c:334-349 | eomReason (END/EOS/CNT) now reported via `io_read_octet_eom` owner + `read_eom` rule (see DRV-47 Fix Log) |
+| DRV-48 | CLEARED | prologix.rs:133,392 | drvPrologixGPIB.c:386,409 | staged read remainder now discarded at `write_octet` via `clear_read_carry()` owner (F6 invariant; see DRV-48 Fix Log) |
 | DRV-49 | CONCERN | prologix.rs:108, iocsh.rs:446 | drvPrologixGPIB.c:547-628 | no iocsh `prologixGPIBConfigure` command; `priority` dropped; unreachable from st.cmd |
 | DRV-50 | CONCERN | prologix.rs, interfaces/gpib.rs:58 | drvPrologixGPIB.c:461-525 | GPIB command interface absent (ifc/srqStatus real in C; AsynGpib has zero implementors) — scaffold |
 | DRV-51 | LOW | prologix.rs:272-324 | drvPrologixGPIB.c:166-168 | connect() doesn't clear `read_carry` (reconnect-without-disconnect returns stale bytes) |

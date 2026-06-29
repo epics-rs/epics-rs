@@ -101,12 +101,16 @@ impl SerialConfig {
     }
 
     /// Apply this configuration to a raw termios struct.
-    pub fn apply_to_termios(&self, t: &mut libc::termios) {
-        // `self.baud` is validated at set_option time (baud_to_speed is the
-        // single validation owner) and defaults to 9600, so this is always
-        // `Some` on a normal path; fall back to 9600 only if a SerialConfig was
-        // built directly with a rate this platform cannot map.
-        let baud = baud_to_speed(self.baud).unwrap_or(libc::B9600);
+    ///
+    /// Errors if `self.baud` is not settable on this platform. `baud_to_speed`
+    /// is the single validation owner; surfacing the error here (rather than a
+    /// silent `B9600` fallback) means an unmappable rate cannot be applied even
+    /// through a directly-built `SerialConfig`, not just via `set_option`.
+    pub fn apply_to_termios(&self, t: &mut libc::termios) -> AsynResult<()> {
+        let baud = baud_to_speed(self.baud).ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("unsupported baud rate: {}", self.baud),
+        })?;
         unsafe {
             libc::cfsetispeed(t, baud);
             libc::cfsetospeed(t, baud);
@@ -157,6 +161,7 @@ impl SerialConfig {
                 t.c_iflag |= libc::IXON | libc::IXOFF;
             }
         }
+        Ok(())
     }
 }
 
@@ -778,7 +783,7 @@ impl PortDriver for DrvAsynSerialPort {
             // would drive flow with NUL bytes instead of ^Q/^S.
             t.c_cc[libc::VSTART] = 0x11; // ^Q
             t.c_cc[libc::VSTOP] = 0x13; // ^S
-            self.config.apply_to_termios(&mut t);
+            self.config.apply_to_termios(&mut t)?;
             self.apply_termios(&t)?;
 
             // C parity (drvAsynSerialPort.c:729): discard any bytes that
@@ -1630,6 +1635,29 @@ mod tests {
                 "Linux rejects baud 0 (C switch has no case 0)"
             );
         }
+    }
+
+    #[test]
+    fn apply_to_termios_errors_on_unmappable_baud() {
+        // Round drv-s5 CONCERN fix: apply_to_termios surfaces an unmappable rate
+        // as an error rather than a silent B9600 fallback, even for a directly
+        // built SerialConfig that bypassed set_option validation.
+        let valid = SerialConfig::parse("/dev/ttyS0").unwrap();
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // A normal (9600) config applies cleanly on every platform.
+        assert!(valid.apply_to_termios(&mut t).is_ok());
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // 28800 is absent from C's Linux switch -> baud_to_speed None -> err.
+            let bad = SerialConfig {
+                baud: 28800,
+                ..SerialConfig::parse("/dev/ttyS0").unwrap()
+            };
+            assert!(bad.apply_to_termios(&mut t).is_err());
+        }
+        // macOS/BSD accept any rate via literal passthrough, so there is no
+        // unmappable baud to drive the error path there.
     }
 
     #[test]

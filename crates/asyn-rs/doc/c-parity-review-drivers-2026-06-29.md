@@ -387,6 +387,22 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   command was "punted to the next read/write path" (no such code existed).
   Tests: `eos_mode_toggles_bridge_eot_enable`,
   `eos_set_before_connect_seeds_eot_enable_off`.
+- **DRV-46(c)** (eos terminator strip — semantic) — CLEARED (user sign-off to
+  strip). The prologix read kept the matched eos terminator byte as data
+  (prologix.rs:578-583), whereas the standard Rust `EosInterpose` strips the
+  matched terminator (eos.rs:130-139), C's asynGpib read layer strips it
+  (asynGpib.c:415-419), and streamDevice/asynRecord expect it stripped. C's
+  prologix *driver* itself does not strip (its driver-level eos is dead; the
+  asynGpib layer one level up does), so there is no direct driver-level C
+  reference — but the *observable* C behavior a record sees is the stripped form.
+  Now strips uniformly: `if acc.last() == Some(&terminator)` removes the matched
+  terminator in BOTH modes (EOT marker in EOI mode — unchanged — and the eos byte
+  in EOS mode — new). EOM still flags EOS in EOS mode (read_eom sees the
+  shortened `remaining`). Flipped the deliberately-tested contract:
+  `read_with_eos_keeps_terminator_byte` → `read_with_eos_strips_terminator_byte`
+  (record now sees `OK`, not `OK\n`); the line-578 comment was rewritten. The
+  EOI-mode test (`read_strips_eot_marker_in_eoi_mode`) is unaffected — its `\n`
+  is payload, only the EOT marker strips.
 - **DRV-49** (CONCERN, no prologix iocsh registrar) — CLEARED (f82f4537). C
   `drvPrologixGPIB.c` registers `prologixGPIBConfigure(portName, host, priority,
   noAutoConnect)` (lines 547-628); the Rust prologix had no iocsh command, so

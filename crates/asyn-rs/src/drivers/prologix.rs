@@ -575,10 +575,13 @@ impl PortDriver for DrvAsynPrologixPort {
                 Err(e) => return Err(e),
             }
         }
-        // Drop trailing EOT marker when no eos char (it's framing,
-        // not data). When eos is set, the eos char IS data the
-        // record consumer expects, so we leave it.
-        if eos.is_none() && acc.last() == Some(&EOT_MARKER) {
+        // Strip the trailing terminator: the EOT marker in EOI mode (it's
+        // framing, not data) or the matched eos byte in EOS mode. Mirrors
+        // the asynGpib read layer (asynGpib.c:415-419) and the standard
+        // EosInterpose, both of which remove the matched terminator before
+        // the record sees the data; streamDevice and asynRecord expect the
+        // eos-stripped form.
+        if acc.last() == Some(&terminator) {
             acc.pop();
         }
         let remaining = acc.len();
@@ -1136,10 +1139,11 @@ mod tests {
     }
 
     /// `read_octet` with EOS char set: driver sends `++read <eos>\n`
-    /// and the eos char IS data — must NOT be stripped (it's the
-    /// payload terminator the consumer expects).
+    /// and the matched eos byte is stripped from the data the record
+    /// sees, mirroring the asynGpib read layer (asynGpib.c:415-419) and
+    /// the standard EosInterpose. The boundary still flags EOS.
     #[test]
-    fn read_with_eos_keeps_terminator_byte() {
+    fn read_with_eos_strips_terminator_byte() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
@@ -1181,8 +1185,8 @@ mod tests {
         let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
-            b"OK\n",
-            "eos char must be preserved as part of payload"
+            b"OK",
+            "matched eos byte must be stripped from the payload"
         );
         // DRV-47: with an EOS char configured the final chunk carries
         // ASYN_EOM_EOS (not END) per C readIt:337-338.

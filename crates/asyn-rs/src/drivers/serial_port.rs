@@ -2018,6 +2018,41 @@ mod tests {
     }
 
     #[test]
+    fn test_pty_write_error_disconnects() {
+        // DRV-31 (write side, symmetric with read): a fatal write error must
+        // tear the connection down so the actor's auto-reconnect re-opens the
+        // device — same closeConnection contract C applies in writeIt
+        // (drvAsynSerialPort.c:837).
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+
+        // Break the link: closing the master makes the driver's slave fd return
+        // a fatal error (EIO) on the next write.
+        unsafe { libc::close(master) };
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = drv.write_octet(&mut user, b"hello world").unwrap_err();
+        assert!(
+            is_fatal_transport_error(&err),
+            "expected a fatal transport error, got {err:?}"
+        );
+        assert!(
+            !drv.base().connected,
+            "DRV-31: fatal write error must set connected=false"
+        );
+    }
+
+    #[test]
     fn test_pty_eos_interpose() {
         use crate::interpose::eos::{EosConfig, EosInterpose};
 

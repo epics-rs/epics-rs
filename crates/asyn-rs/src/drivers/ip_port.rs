@@ -263,9 +263,15 @@ impl OctetNext for IpIoState {
             IpIoInner::Tcp(stream) => {
                 stream.set_read_timeout(Some(user.timeout))?;
                 match stream.read(buf) {
-                    Ok(0) => Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: "EOF".into(),
+                    // C drvAsynIPPort.c::readRaw (815-821): recv()==0 on a
+                    // SOCK_STREAM socket means the peer closed — report
+                    // success with ASYN_EOM_END and zero bytes (the driver
+                    // then closes the fd). Returning an error here would hide
+                    // END from close-delimited protocols (HTTP/1.0) that use
+                    // connection-close as the message terminator.
+                    Ok(0) => Ok(OctetReadResult {
+                        nbytes_transferred: 0,
+                        eom_reason: EomReason::END,
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
@@ -324,9 +330,11 @@ impl OctetNext for IpIoState {
             IpIoInner::Unix(stream) => {
                 stream.set_read_timeout(Some(user.timeout))?;
                 match stream.read(buf) {
-                    Ok(0) => Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: "EOF".into(),
+                    // Unix-domain stream EOF = peer closed = END, the same
+                    // stream semantics as the TCP arm above.
+                    Ok(0) => Ok(OctetReadResult {
+                        nbytes_transferred: 0,
+                        eom_reason: EomReason::END,
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
@@ -487,6 +495,80 @@ impl DrvAsynIPPort {
     fn drop_connection(&mut self) {
         self.io.inner = None;
         self.base.set_connected(false);
+    }
+
+    /// Shared read core for [`PortDriver::read_octet`] (which drops the EOM
+    /// reason) and [`PortDriver::io_read_octet_eom`] (which keeps it).
+    /// Dispatches the interpose chain once and applies the C
+    /// `closeConnection` teardown on a fatal error, a
+    /// `disconnectOnReadTimeout` timeout, or a TCP EOF (which the base read
+    /// reports as `ASYN_EOM_END`). Returning the real `eom_reason` here is
+    /// what lets END/EOS reach the actor — the `usize`-only `read_octet`
+    /// would otherwise discard it, so END was never emitted anywhere.
+    fn read_octet_core(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        // HTTP connect-per-transaction: reconnect if disconnected.
+        // Surface the connect failure cause (DNS, refused, TLS reset)
+        // rather than letting check_ready() mask it as a generic
+        // "port disconnected".
+        if self.config.protocol == IpProtocol::Http && !self.base.connected {
+            self.connect(&AsynUser::default())?;
+        }
+        self.base.check_ready()?;
+        let result = self
+            .base
+            .interpose_octet
+            .dispatch_read(user, buf, &mut self.io);
+        match result {
+            Ok(r) => {
+                asyn_trace_io!(
+                    Some(self.base.trace),
+                    &self.base.port_name,
+                    TraceMask::IO_DRIVER,
+                    &buf[..r.nbytes_transferred],
+                    "read"
+                );
+                // C drvAsynIPPort.c::readRaw (819): a TCP EOF (reported as
+                // ASYN_EOM_END by the base read) closes the connection so
+                // the actor's `!connected`-gated reconnect re-opens it. HTTP
+                // is connect-per-transaction and disconnects after every
+                // read regardless.
+                let eof = r.eom_reason.contains(EomReason::END);
+                if (eof || self.config.protocol == IpProtocol::Http) && self.base.connected {
+                    self.drop_connection();
+                }
+                Ok((r.nbytes_transferred, r.eom_reason))
+            }
+            Err(e) => {
+                let is_timeout = matches!(
+                    e,
+                    AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        ..
+                    }
+                );
+                // C parity: auto-disconnect on:
+                // 1. disconnectOnReadTimeout AND timeout error
+                // 2. Any fatal transport error (connection reset) —
+                //    `is_fatal_transport_error` is the single owner of that
+                //    classification, shared with the write path.
+                let should_disconnect =
+                    (self.disconnect_on_read_timeout && is_timeout) || is_fatal_transport_error(&e);
+                if should_disconnect && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "read error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Create a new IP port driver.
@@ -776,61 +858,18 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        // HTTP connect-per-transaction: reconnect if disconnected.
-        // Surface the connect failure cause (DNS, refused, TLS reset)
-        // rather than letting check_ready() mask it as a generic
-        // "port disconnected".
-        if self.config.protocol == IpProtocol::Http && !self.base.connected {
-            self.connect(&AsynUser::default())?;
-        }
-        self.base.check_ready()?;
-        let result = self
-            .base
-            .interpose_octet
-            .dispatch_read(user, buf, &mut self.io);
-        match result {
-            Ok(r) => {
-                asyn_trace_io!(
-                    Some(self.base.trace),
-                    &self.base.port_name,
-                    TraceMask::IO_DRIVER,
-                    &buf[..r.nbytes_transferred],
-                    "read"
-                );
-                // HTTP: disconnect after each read (connect-per-transaction)
-                if self.config.protocol == IpProtocol::Http {
-                    self.io.inner = None;
-                    self.base.set_connected(false);
-                }
-                Ok(r.nbytes_transferred)
-            }
-            Err(ref e) => {
-                let is_timeout = matches!(
-                    e,
-                    AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        ..
-                    }
-                );
-                // C parity: auto-disconnect on:
-                // 1. disconnectOnReadTimeout AND timeout error
-                // 2. Any fatal transport error (connection reset, EOF) —
-                //    `is_fatal_transport_error` is the single owner of that
-                //    classification, shared with the write path.
-                let should_disconnect =
-                    (self.disconnect_on_read_timeout && is_timeout) || is_fatal_transport_error(e);
-                if should_disconnect && self.base.connected {
-                    asyn_trace!(
-                        Some(self.base.trace),
-                        &self.base.port_name,
-                        TraceMask::FLOW,
-                        "read error, disconnecting: {e}"
-                    );
-                    self.drop_connection();
-                }
-                result.map(|r| r.nbytes_transferred)
-            }
-        }
+        self.read_octet_core(user, buf).map(|(n, _eom)| n)
+    }
+
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        // Override the synthetic default so the real END/EOS reason from the
+        // base read + interpose chain reaches the actor (C reports eomReason
+        // from readRaw; END marks a TCP EOF, EOS an input-EOS match).
+        self.read_octet_core(user, buf)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
@@ -1163,14 +1202,13 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
-        match err {
-            AsynError::Status {
-                status: AsynStatus::Disconnected,
-                ..
-            } => {}
-            other => panic!("expected Disconnected (EOF), got {other:?}"),
-        }
+        // C drvAsynIPPort.c::readRaw (815-821): a TCP EOF returns success
+        // with zero bytes and ASYN_EOM_END, then closes the connection.
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        assert!(eom.contains(EomReason::END));
+        // closeConnection ran, so the actor's reconnect can re-open it.
+        assert!(!drv.base().connected);
 
         handle.join().unwrap();
     }

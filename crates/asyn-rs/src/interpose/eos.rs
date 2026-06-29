@@ -164,17 +164,23 @@ impl OctetInterpose for EosInterpose {
             // even when partial data was buffered, matching C.
             let result = next.read(user, &mut self.in_buf[..])?;
 
+            // Filter out CNT from lower layer — the lower read may have set CNT
+            // because available data exceeded our buffer size. This is not a
+            // reason for us to stop reading. (C parity: eom &= ~ASYN_EOM_CNT)
+            //
+            // C parity (`asynInterposeEos.c:232,241,246,251`): the lower
+            // read sets `eom` even on a zero-byte read (e.g. ASYN_EOM_END on
+            // a TCP EOF), and `*eomReason = eom` propagates it after the
+            // loop. Capture the reason BEFORE the zero-byte break so END
+            // survives the interpose instead of being dropped.
+            eom = result.eom_reason & !EomReason::CNT;
+
             if result.nbytes_transferred == 0 {
                 break;
             }
 
             self.in_buf_tail = 0;
             self.in_buf_head = result.nbytes_transferred;
-
-            // Filter out CNT from lower layer — the lower read may have set CNT
-            // because available data exceeded our buffer size. This is not a
-            // reason for us to stop reading. (C parity: eom &= ~ASYN_EOM_CNT)
-            eom = result.eom_reason & !EomReason::CNT;
         }
 
         // Null terminate if there's room (C parity)

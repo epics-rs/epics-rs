@@ -257,4 +257,22 @@ contracts / behavioral models, not just a driver site.
   old fd) and `saved_termios` (losing the original device settings). Added the
   guard at the top of `connect` (mirror: `io.fd.is_some()`). Test:
   `test_pty_connect_rejects_double_open`.
+- **DRV-3** (CONCERN, TCP EOF = success+END; END never emitted) — CLEARED
+  (sign-off, read-contract change). C `drvAsynIPPort.c::readRaw` (815-821)
+  returns asynSuccess with zero bytes and ASYN_EOM_END on a TCP `recv()==0`
+  and runs `closeConnection`; Rust returned `Err(Disconnected,"EOF")` and the
+  END bit never reached a consumer (close-delimited protocols like HTTP/1.0
+  saw a read error at message end). The fix spans three sites (one finding):
+  (1) base `OctetNext::read` TCP + Unix-stream EOF now returns
+  `Ok((0, END))` instead of an error; (2) the EOS interpose
+  (`interpose/eos.rs`) now captures the lower read's `eom` BEFORE the
+  zero-byte break so END survives the chain (C `asynInterposeEos.c:232,241,246,251`
+  — `*eomReason = eom` after the loop); (3) ip_port factors `read_octet` and a
+  new `io_read_octet_eom` override through a shared `read_octet_core` that
+  returns the real `eom_reason` (closing the F5 propagation gap — `read_octet`
+  alone dropped it) and runs `drop_connection` when END is seen (C
+  closeConnection), so the F1 teardown moves from the error path to the END
+  path while genuine fatal errors still tear down via the Err branch. Test:
+  `test_server_disconnect_eof` (rewritten: EOF → `(0, END)` + `!connected`).
+  Full asyn-rs suite (654 tests) green.
 

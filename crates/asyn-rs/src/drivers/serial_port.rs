@@ -195,7 +195,11 @@ fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
     )))]
     {
         Some(match baud {
-            0 => libc::B0,
+            // C parity (drvAsynSerialPort.c:276-344): the Linux switch starts at
+            // `case 50` with no `case 0`, so baud 0 (which would program B0 — a
+            // line hangup) falls to the `default` asynError. macOS/BSD differ:
+            // there `baudCode = baud`, so 0 is accepted by the passthrough branch
+            // above (C-macOS does the same). No `0 => B0` arm here.
             50 => libc::B50,
             75 => libc::B75,
             110 => libc::B110,
@@ -1603,6 +1607,9 @@ mod tests {
             assert_eq!(baud_to_speed(28800), Some(28800 as libc::speed_t));
             assert_eq!(baud_to_speed(250000), Some(250000 as libc::speed_t));
             assert_eq!(baud_to_speed(115200), Some(115200 as libc::speed_t));
+            // 0 (B0, line hangup) is accepted here too, matching C-macOS
+            // (baudCode = baud = 0), unlike the Linux switch.
+            assert_eq!(baud_to_speed(0), Some(0 as libc::speed_t));
         }
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1615,6 +1622,12 @@ mod tests {
             assert!(
                 baud_to_speed(250000).is_none(),
                 "Linux rejects non-standard"
+            );
+            // C's Linux switch starts at case 50 — no case 0, so baud 0 falls
+            // to the default asynError (drvAsynSerialPort.c:276-344).
+            assert!(
+                baud_to_speed(0).is_none(),
+                "Linux rejects baud 0 (C switch has no case 0)"
             );
         }
     }
@@ -1755,8 +1768,10 @@ mod tests {
 
     #[test]
     fn test_baud_speed_roundtrip() {
+        // 0 is intentionally excluded: it maps only on macOS/BSD (passthrough),
+        // not on Linux, where C rejects it — see baud_arbitrary_on_bsd_mapped_set_on_linux.
         for baud in [
-            0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
+            50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
             57600, 115200, 230400,
         ] {
             let speed = baud_to_speed(baud).expect("standard rate must map");

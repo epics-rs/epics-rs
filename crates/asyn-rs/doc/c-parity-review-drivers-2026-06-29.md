@@ -403,6 +403,35 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   (record now sees `OK`, not `OK\n`); the line-578 comment was rewritten. The
   EOI-mode test (`read_strips_eot_marker_in_eoi_mode`) is unaffected — its `\n`
   is payload, only the EOT marker strips.
+- **DRV-46(c)-EOM** (EOM-flag sequencing on small/exact-fit buffers — NIT,
+  intentional divergence) — DOCUMENTED. The DRV-46(b)+(c) convergence round
+  (opus parity panel `converged: YES`; opus adversary raised this one item).
+  Scenario: EOS mode, eos=`\n`, reply `OK\n`, caller buffer 2. Rust returns
+  `OK`/`EOS|CNT` in ONE call (eager strip → `remaining`=2; `read_eom(2,2,true)`
+  sets both). The full C stack returns `OK`/`CNT` then ``/`END|EOS` across TWO
+  calls. Ground-traced against the real C: C's prologix *driver* eos is
+  initialized to `-1` (drvPrologixGPIB.c:560) and `prologixSetEos` never stores
+  `newEos` (drvPrologixGPIB.c:454-458 — writes `++eot_enable (pdpvt->eos<0)` off
+  the *stale* value, no assignment), so the driver is **permanently EOI mode**;
+  a record's IEOS sets the asynGpib **layer** eos (`pgpibPvt->eos` via
+  `asynGpib::setInputEos`, :447-451). `asynGpib::readIt` (:411-422) calls the
+  driver, then strips the layer-eos byte (`nt--`, ORs `ASYN_EOM_EOS`) and OR-s
+  `CNT` from the **post-strip** `nt`; the driver itself OR-s its eom from the
+  **pre-strip** count and flags `END` (not EOS) because its eos is `-1`. So C's
+  extra `END` on the strip call is a direct artifact of the dead-eos bug, and
+  the quirky `CNT` is C computing it on the pre-strip byte count in its
+  two-layer architecture. KEPT Rust's folded single-layer eager strip (data is
+  byte-identical; standard consumers — devAsynOctet, asynRecord, streamDevice —
+  key on EOS/END for completion and accept `EOS|CNT`; no hang, no corruption).
+  Copying C's sequencing would require relingering the eos byte and reproducing
+  the dead-eos `END` — i.e. re-introducing the dual-meaning patch and copying
+  the bug, both rejected. Also note the broader, accepted DRV-46 design choice:
+  Rust drives the *bridge* into EOS mode (`++read <eos>`, `++eot_enable 0`) when
+  IEOS is set — implementing what `prologixSetEos` *intended* (the
+  mode-switch command it issues) — whereas buggy C keeps the bridge in EOI mode
+  and strips at the layer. Same observable payload for terminator-emitting
+  instruments; divergence only for an EOI-without-terminator instrument, where
+  Rust realizes the intended design.
 - **DRV-49** (CONCERN, no prologix iocsh registrar) — CLEARED (f82f4537). C
   `drvPrologixGPIB.c` registers `prologixGPIBConfigure(portName, host, priority,
   noAutoConnect)` (lines 547-628); the Rust prologix had no iocsh command, so

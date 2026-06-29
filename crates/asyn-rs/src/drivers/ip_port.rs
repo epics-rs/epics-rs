@@ -534,13 +534,24 @@ pub(crate) fn socket_poll_timeout(timeout: Duration) -> Duration {
 }
 
 impl DrvAsynIPPort {
-    /// Tear down the live socket and mark the port disconnected so the
-    /// actor's auto-reconnect (`port_actor.rs`) re-establishes it on the
-    /// next request. C parity: `drvAsynIPPort.c::closeConnection`, which
-    /// closes the fd and fires `exceptionDisconnect`.
+    /// Tear down the live socket. C parity: `drvAsynIPPort.c::closeConnection`
+    /// (205-217) destroys the fd and fires `exceptionDisconnect` — but
+    /// **only** when the link is *not* connect-per-transaction
+    /// (`!(flags & FLAG_CONNECT_PER_TRANSACTION)`, line 214-216).
+    ///
+    /// For a normal link this drops `connected` to `false` so the actor's
+    /// auto-reconnect (`port_actor.rs`) re-establishes it on the next
+    /// request. For HTTP (connect-per-transaction) the socket churns once
+    /// per request/response, so the logical connection stays *up*: only the
+    /// socket (`io.inner`) is released, `connected` is left `true`, and the
+    /// `Connect` exception does not flap each transaction. The socket is
+    /// reopened lazily on the next write/read (gated on `io.inner.is_none()`,
+    /// not `!connected`).
     fn drop_connection(&mut self) {
         self.io.inner = None;
-        self.base.set_connected(false);
+        if self.config.protocol != IpProtocol::Http {
+            self.base.set_connected(false);
+        }
     }
 
     /// Shared read core for [`PortDriver::read_octet`] (which drops the EOM
@@ -556,11 +567,17 @@ impl DrvAsynIPPort {
         user: &AsynUser,
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
-        // HTTP connect-per-transaction: reconnect if disconnected.
-        // Surface the connect failure cause (DNS, refused, TLS reset)
+        // HTTP connect-per-transaction: (re)open the socket if there isn't
+        // one. Gated on socket presence (`io.inner.is_none()`), NOT on
+        // `!connected`: an HTTP link stays *logically* connected across
+        // transactions (drop_connection releases only the socket), so the
+        // post-EOF reopen must key off the missing socket. `connect()` is
+        // edge-guarded — it no-ops `set_connected(true)` when already
+        // connected, so reopening does not flap the Connect exception.
+        // Surfacing the connect failure cause (DNS, refused, TLS reset) here
         // rather than letting check_ready() mask it as a generic
         // "port disconnected".
-        if self.config.protocol == IpProtocol::Http && !self.base.connected {
+        if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
@@ -577,13 +594,20 @@ impl DrvAsynIPPort {
                     &buf[..r.nbytes_transferred],
                     "read"
                 );
-                // C drvAsynIPPort.c::readRaw (819): a TCP EOF (reported as
-                // ASYN_EOM_END by the base read) closes the connection so
-                // the actor's `!connected`-gated reconnect re-opens it. HTTP
-                // is connect-per-transaction and disconnects after every
-                // read regardless.
+                // C drvAsynIPPort.c::readRaw (815-819): a TCP EOF (reported
+                // as ASYN_EOM_END by the base read) is the *only* thing that
+                // closes the connection on a successful read. HTTP is
+                // connect-per-transaction but the response still ends on the
+                // server's close (HTTP/1.0 connection-close = EOF), so it
+                // must drop on EOF too — and ONLY on EOF. Dropping after
+                // every HTTP read (the old `|| Http`) truncated multi-segment
+                // responses: a first read returning one TCP segment (no END)
+                // tore the socket down before the caller could read the rest.
+                // `drop_connection` keeps the logical connection up for HTTP
+                // (no Connect-exception flap); the socket reopens lazily on
+                // the next write.
                 let eof = r.eom_reason.contains(EomReason::END);
-                if (eof || self.config.protocol == IpProtocol::Http) && self.base.connected {
+                if eof && self.base.connected {
                     self.drop_connection();
                 }
                 Ok((r.nbytes_transferred, r.eom_reason))
@@ -891,9 +915,15 @@ impl PortDriver for DrvAsynIPPort {
                 });
             }
             IpProtocol::Http => {
-                // C parity: HTTP uses TCP with connect-per-transaction semantics.
-                // Connection is established here, but io_write_octet disconnects after
-                // each write/read cycle.
+                // C parity: HTTP uses TCP with connect-per-transaction
+                // semantics. The socket is opened here on the first connect
+                // and reopened lazily by write_octet/read_octet_core after
+                // each transaction's EOF (`drop_connection` releases the
+                // socket but keeps the link logically connected). C opens the
+                // socket lazily at the first write rather than at connect;
+                // opening it eagerly here is a benign divergence (the idle
+                // socket is reused by the first write, HTTP/1.0 servers wait
+                // for the request).
                 let stream = self.connect_tcp()?;
                 stream.set_nodelay(true)?;
                 self.io.inner = Some(IpIoInner::Tcp(stream));
@@ -940,9 +970,15 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        // HTTP connect-per-transaction: reconnect if disconnected.
-        // Surface the connect failure cause rather than masking it.
-        if self.config.protocol == IpProtocol::Http && !self.base.connected {
+        // HTTP connect-per-transaction: (re)open the socket if there isn't
+        // one. Like the read path, gate on socket presence — an HTTP link
+        // stays logically connected across transactions, so the lazy reopen
+        // keys off `io.inner.is_none()`, not `!connected` (which would never
+        // fire post-EOF since `connected` is left `true`). This is the C
+        // `writeRaw` lazy `connectIt` on `fd == INVALID_SOCKET`
+        // (drvAsynIPPort.c:590-606). Surface the connect failure cause
+        // rather than masking it.
+        if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
@@ -1242,6 +1278,86 @@ mod tests {
         let mut buf = [0u8; 32];
         let n = drv.read_octet(&user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_multi_segment_response_not_truncated() {
+        // DRV-7: HTTP is connect-per-transaction, but the response ends on
+        // the server's EOF — not after the first read. The old code dropped
+        // the connection after *every* HTTP read, so a response read in
+        // chunks lost everything past the first chunk (the next read
+        // reconnected to a fresh socket). Fixed: the socket stays up until
+        // EOF, the logical connection never flaps, and the socket reopens
+        // lazily for the next transaction.
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            // Transaction 1: read request, send an 8-byte response, close.
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut req = [0u8; 64];
+            let _ = s1.read(&mut req).unwrap();
+            s1.write_all(b"AAAABBBB").unwrap();
+            drop(s1); // server close -> client's third read sees EOF
+            // Transaction 2: a fresh connection (the lazy reopen), send 4 B.
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.read(&mut req).unwrap();
+            s2.write_all(b"CCCC").unwrap();
+            drop(s2);
+        });
+
+        let mut drv = DrvAsynIPPort::new("httptest", &format!("127.0.0.1:{port} HTTP")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        // --- Transaction 1: write request, read the response in 4-B chunks.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"GET /1\r\n").unwrap();
+
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 4];
+        let (n1, eom1) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"AAAA");
+        assert!(!eom1.contains(EomReason::END), "first chunk is not EOF");
+        // The bug tore the socket down here; the fix keeps it up so the rest
+        // of the response is still readable.
+        assert!(
+            drv.base().connected,
+            "HTTP must stay connected mid-response (no truncation)"
+        );
+        assert!(
+            drv.io.inner.is_some(),
+            "socket must remain open mid-response"
+        );
+
+        let (n2, _) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n2],
+            b"BBBB",
+            "second chunk must be the rest of the response"
+        );
+
+        // Third read hits the server's EOF -> END; the socket is released but
+        // the logical connection stays up (connect-per-transaction = no flap).
+        let (n3, eom3) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        assert_eq!(n3, 0);
+        assert!(eom3.contains(EomReason::END));
+        assert!(
+            drv.base().connected,
+            "HTTP logical connection must not flap on per-transaction EOF"
+        );
+        assert!(drv.io.inner.is_none(), "socket released after EOF");
+
+        // --- Transaction 2: a new write lazily reopens the socket.
+        drv.write_octet(&mut wuser, b"GET /2\r\n").unwrap();
+        assert!(
+            drv.io.inner.is_some(),
+            "socket must reopen lazily for the next transaction"
+        );
+        let mut buf2 = [0u8; 16];
+        let (n4, _) = drv.io_read_octet_eom(&ruser, &mut buf2).unwrap();
+        assert_eq!(&buf2[..n4], b"CCCC");
 
         handle.join().unwrap();
     }

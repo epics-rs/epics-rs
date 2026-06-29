@@ -61,6 +61,23 @@ pub struct IpPortConfig {
     pub no_delay: bool,
 }
 
+/// Default TCP connect timeout.
+///
+/// Intentional divergence from C (DRV-13). C `drvAsynIPPort.c::connectIt`
+/// (513-523) issues a plain blocking `connect()` with no application-level
+/// timeout, so a connect to an unreachable host blocks on the OS-default SYN
+/// timeout (~75-130 s on Linux). In the Rust port-actor model that block
+/// stalls the port's reconnect cycle (the 2 s auto-reconnect throttle in
+/// `port_actor.rs` cannot fire while the actor is parked inside `connect()`),
+/// so we bound the connect at 5 s and let the actor fail fast into the
+/// retry loop — recovering from a transiently-unreachable device sooner than
+/// C's single long block. This is a deliberate robustness improvement, not a
+/// copied C bug; the trade-off is a device that genuinely needs >5 s to
+/// accept a TCP connection (pathological on a control LAN) would fail here
+/// where C's OS-default block might eventually succeed. C exposes no connect
+/// timeout option, so this is not runtime-settable either.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl IpPortConfig {
     /// Parse a connection specification string.
     ///
@@ -89,7 +106,7 @@ impl IpPortConfig {
                 port: 0,
                 local_port: None,
                 protocol: IpProtocol::Unix,
-                connect_timeout: Duration::from_secs(5),
+                connect_timeout: DEFAULT_CONNECT_TIMEOUT,
                 no_delay: false,
             });
         }
@@ -106,7 +123,7 @@ impl IpPortConfig {
             port,
             local_port,
             protocol: proto,
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             no_delay: true,
         })
     }
@@ -1124,8 +1141,10 @@ impl PortDriver for DrvAsynIPPort {
             self.config.port = new_config.port;
             self.config.local_port = new_config.local_port;
             self.config.protocol = new_config.protocol;
-            // connect_timeout / no_delay are first-set-only in C
-            // too — parseHostInfo doesn't touch them.
+            // connect_timeout / no_delay are not re-applied on a hostInfo
+            // reparse: C parseHostInfo touches neither (no_delay is set
+            // unconditionally in connectIt; C has no connect-timeout option
+            // at all — see DEFAULT_CONNECT_TIMEOUT / DRV-13).
             //
             // C parseHostInfo replaces tty->IPDeviceName with
             // epicsStrDup(hostInfo); store the verbatim spec so a later

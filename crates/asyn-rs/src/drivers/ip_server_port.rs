@@ -362,7 +362,18 @@ impl DrvAsynIPServerPort {
     /// Create from an explicit config (skips the spec parser, useful
     /// for callers building config programmatically — tests, etc.).
     pub fn with_config(port_name: &str, config: IpServerConfig) -> AsynResult<Self> {
-        let max = config.max_clients.max(1);
+        // C `drvAsynIPServerPortConfigure` rejects `maxClients == 0` with
+        // "No clients." and returns -1 (drvAsynIPServerPort.c:545-548) —
+        // unconditionally, before the protocol is even parsed — because a
+        // server with zero client slots is useless. Mirror that instead
+        // of silently coercing 0 to 1, which hid the caller's mistake.
+        if config.max_clients == 0 {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "maxClients must be > 0 (C drvAsynIPServerPort: \"No clients.\")".into(),
+            });
+        }
+        let max = config.max_clients;
         let mut base = PortDriverBase::new(
             port_name,
             max,
@@ -1257,6 +1268,41 @@ mod tests {
         assert_eq!(cfg.protocol, IpServerProtocol::Udp);
         let cfg2 = IpServerConfig::parse("0.0.0.0:7000").unwrap();
         assert_eq!(cfg2.protocol, IpServerProtocol::Tcp, "default is TCP");
+    }
+
+    /// DRV-22: `maxClients == 0` is rejected, matching C
+    /// `drvAsynIPServerPortConfigure` "No clients." (drvAsynIPServerPort.c:545-548),
+    /// not silently coerced to 1. Applies in both TCP and UDP mode (C
+    /// checks before parsing the protocol).
+    #[test]
+    fn with_config_rejects_zero_max_clients() {
+        let cfg = IpServerConfig {
+            bind_host: "127.0.0.1".into(),
+            bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
+            max_clients: 0,
+            read_timeout: None,
+        };
+        match DrvAsynIPServerPort::with_config("zero_clients", cfg) {
+            Err(AsynError::Status { message, .. }) => {
+                assert!(
+                    message.contains("maxClients"),
+                    "expected maxClients rejection, got: {message}"
+                );
+            }
+            Ok(_) => panic!("expected maxClients==0 to be rejected"),
+            Err(other) => panic!("wrong error variant: {other:?}"),
+        }
+
+        // A positive count still builds.
+        let ok = IpServerConfig {
+            bind_host: "127.0.0.1".into(),
+            bind_port: 0,
+            protocol: IpServerProtocol::Tcp,
+            max_clients: 1,
+            read_timeout: None,
+        };
+        assert!(DrvAsynIPServerPort::with_config("one_client", ok).is_ok());
     }
 
     /// DRV-19: bind-host resolution. C `createServerSocket`

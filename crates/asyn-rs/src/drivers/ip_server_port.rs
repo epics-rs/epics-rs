@@ -12,14 +12,17 @@
 //!
 //! `"host:port [TCP|UDP]"` — matches C `drvAsynIPServerPort.c`
 //! `sscanf(":%u %5s", &portNumber, protocol)` (lines 580-600). Only
-//! `tcp` (default) / `udp` are accepted as the protocol token.
-//! `SO_REUSEADDR` is set unconditionally on the listening socket
-//! (`drvAsynIPServerPort.c:430`); there is **no `SO_REUSEPORT` token
-//! in upstream C asyn** — earlier versions of this module accepted
-//! one but it has been removed for parity. See [the audit doc] for
-//! the divergence note.
+//! `tcp` (default) / `udp` are accepted as the protocol token; there is
+//! **no `SO_REUSEPORT` token in upstream C asyn** (earlier versions of
+//! this module accepted one — removed for parity). `SO_REUSEADDR` is set
+//! unconditionally on the listening socket (`drvAsynIPServerPort.c:430`).
+//! In **UDP** mode the socket additionally enables `SO_REUSEPORT` for
+//! datagram fanout — C calls `epicsSocketEnableAddressUseForDatagramFanout`
+//! for `SOCK_DGRAM` (`drvAsynIPServerPort.c:426-429`) so multiple IOCs can
+//! share the port; the TCP listener does not.
 //!
-//! - `host` may be `"0.0.0.0"` (all IPv4) or a specific bind address.
+//! - `host` may be empty / `"0.0.0.0"` (all IPv4), `"localhost"` (also
+//!   all IPv4 — C does not map it to loopback), a bind IP, or a hostname.
 //!
 //! # Connection lifecycle
 //!
@@ -389,9 +392,18 @@ impl DrvAsynIPServerPort {
                 status: AsynStatus::Error,
                 message: format!("UDP socket() failed: {e}"),
             })?;
-        // C asyn sets SO_REUSEADDR unconditionally on the bound
-        // socket (drvAsynIPServerPort.c:430). No SO_REUSEPORT — that
-        // was an invented extension and has been removed.
+        // C enables datagram fanout on the UDP server socket
+        // (drvAsynIPServerPort.c:426-429): for SOCK_DGRAM it calls
+        // `epicsSocketEnableAddressUseForDatagramFanout`, which sets
+        // SO_REUSEPORT (where available) followed by SO_REUSEADDR — so
+        // multiple IOCs can bind the same UDP port and the kernel fans
+        // each datagram out to them. The TCP listener gets only
+        // SO_REUSEADDR (:430); the fanout helper is SOCK_DGRAM-only.
+        #[cfg(unix)]
+        sock.set_reuse_port(true).map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("UDP SO_REUSEPORT failed: {e}"),
+        })?;
         sock.set_reuse_address(true)
             .map_err(|e| AsynError::Status {
                 status: AsynStatus::Error,
@@ -1222,6 +1234,43 @@ mod tests {
         srv.connect(&AsynUser::default()).unwrap();
         assert!(srv.local_port() > 0, "listener bound to an ephemeral port");
         srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// DRV-18: the UDP server socket enables SO_REUSEPORT (datagram
+    /// fanout) while the TCP listener does not. C calls
+    /// `epicsSocketEnableAddressUseForDatagramFanout` (SO_REUSEPORT +
+    /// SO_REUSEADDR) for SOCK_DGRAM only (drvAsynIPServerPort.c:426-429);
+    /// the TCP path gets SO_REUSEADDR alone (:430). Read the option back
+    /// off the bound socket so the assertion does not depend on the
+    /// platform's permissive double-bind behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_port_set_for_udp_only_not_tcp() {
+        use socket2::SockRef;
+
+        let mut udp = DrvAsynIPServerPort::new("rp_udp", "127.0.0.1:0 UDP").unwrap();
+        udp.connect(&AsynUser::default()).unwrap();
+        {
+            let g = udp.udp_socket.lock();
+            let s = g.as_ref().expect("udp socket bound");
+            assert!(
+                SockRef::from(&**s).reuse_port().unwrap(),
+                "UDP server must enable SO_REUSEPORT (C datagram-fanout helper)"
+            );
+        }
+        udp.disconnect(&AsynUser::default()).unwrap();
+
+        let mut tcp = DrvAsynIPServerPort::new("rp_tcp", "127.0.0.1:0").unwrap();
+        tcp.connect(&AsynUser::default()).unwrap();
+        {
+            let g = tcp.listener.lock();
+            let s = g.as_ref().expect("tcp listener bound");
+            assert!(
+                !SockRef::from(s).reuse_port().unwrap(),
+                "TCP listener must NOT set SO_REUSEPORT (fanout is UDP-only in C)"
+            );
+        }
+        tcp.disconnect(&AsynUser::default()).unwrap();
     }
 
     /// UDP-mode end-to-end: bind ephemeral, two clients each fire one

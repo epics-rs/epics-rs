@@ -60,7 +60,7 @@ impact paragraphs in the round report
 | DRV-10 | LOW | ip_port.rs:867-869 | drvAsynIPPort.c:924-935 | `disconnectOnReadTimeout` parse accepts extra values, never errors (C: only Y/N) |
 | DRV-11 | CLEARED | ip_port.rs:264,792-794 | drvAsynIPPort.c:741-743,799 | `timeout==0` read → Duration::ZERO rejected by std → misclassified, disconnects (C floors to 1ms poll); missing `timeout>0` disconnect guard — FIXED a092a777 |
 | DRV-12 | LOW | ip_port.rs:661-731 | drvAsynIPPort.c:424-427 | `connect()` doesn't reject already-open link (C: "Link already open!") |
-| DRV-13 | LOW | ip_port.rs:92,109,553,575 | drvAsynIPPort.c:513-523 | hardcoded 5s connect timeout where C connect is OS-default blocking |
+| DRV-13 | DOC | ip_port.rs:92,109,553,575 | drvAsynIPPort.c:513-523 | hardcoded 5s connect timeout where C connect is OS-default blocking — intentional divergence, documented b2938e11 |
 | DRV-14 | LOW | ip_port.rs:368-371 | drvAsynIPPort.c:613-614 | zero-length write emits an empty UDP datagram; C returns before sending |
 | DRV-15 | LOW | ip_port.rs:810-828, port.rs:979 | drvAsynIPPort.c:678-705 | partial-write byte count dropped on error (framework `write_octet -> ()` contract) |
 
@@ -709,3 +709,15 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   `set_connected(true)` (no flap). Aside: Rust opens the HTTP socket eagerly
   at connect vs C's lazy-at-first-write — benign (idle socket reused by the
   first write). Test: `http_multi_segment_response_not_truncated`.
+
+- **DRV-13** (LOW — hardcoded 5s connect timeout) — DOC, intentional
+  divergence (no behavior change). C `connectIt` (drvAsynIPPort.c:513-523)
+  does a plain blocking `connect()` (OS-default SYN timeout ~75-130s); Rust
+  caps at 5s so the port actor fails fast into its 2s auto-reconnect cycle
+  instead of parking ~75s inside `connect()` on an unreachable device. Not a
+  C-bug copy (OS-default blocking isn't a bug); the trade-off (a device that
+  genuinely needs >5s to accept — pathological on a control LAN — fails where
+  C might eventually succeed) is documented at `DEFAULT_CONNECT_TIMEOUT`. The
+  value is centralized into that const (was two magic `from_secs(5)`
+  literals) and C exposes no connect-timeout option, so it is not
+  runtime-settable.

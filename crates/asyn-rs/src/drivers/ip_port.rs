@@ -977,7 +977,24 @@ impl PortDriver for DrvAsynIPPort {
         // configured for the old endpoint. The keys form an if/else chain
         // exactly like C's `epicsStrCaseCmp` cascade.
         if key.eq_ignore_ascii_case("noDelay") {
-            let enabled = value == "Y" || value == "y" || value == "1" || value == "yes";
+            // `noDelay` has no counterpart in C drvAsynIPPort.c::setOption
+            // (which recognizes only `disconnectOnReadTimeout`/`hostInfo`):
+            // C enables TCP_NODELAY unconditionally in connectIt (525-528)
+            // with no runtime toggle. This key is a deliberate Rust extension
+            // (default on via IpPortConfig::parse, matching C; settable off
+            // here). Its value is validated strictly Y/N (case-insensitive)
+            // like every other option value, so a typo errors instead of
+            // silently coercing to "off".
+            let enabled = if value.eq_ignore_ascii_case("Y") {
+                true
+            } else if value.eq_ignore_ascii_case("N") {
+                false
+            } else {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("Invalid noDelay value: '{value}'"),
+                });
+            };
             self.config.no_delay = enabled;
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
@@ -1367,8 +1384,12 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
         drv.set_option("noDelay", "Y").unwrap();
         assert!(drv.config.no_delay);
-        drv.set_option("noDelay", "0").unwrap();
+        drv.set_option("noDelay", "n").unwrap();
         assert!(!drv.config.no_delay);
+        // Value is validated strictly Y/N (case-insensitive); the old loose
+        // coercion silently treated any other token (incl. "0"/"1") as off.
+        assert!(drv.set_option("noDelay", "1").is_err());
+        assert!(drv.set_option("noDelay", "maybe").is_err());
     }
 
     // --- UDP tests ---

@@ -228,9 +228,11 @@ contracts / behavioral models, not just a driver site.
   any non-Y/N value (including the empty string), matching C and the "Y"/"N"
   shape that `get_option` already reports. Test:
   `test_disconnect_on_read_timeout_value_validation`. Defect-family anchor: the
-  same lenient parse also drives `noDelay` (ip_port.rs:900); that one is
-  DISTINCT — C has no `noDelay` option key (DRV-8), so there is no C
-  value-validation contract; its parse is part of the DRV-8 superset.
+  same lenient parse also drove `noDelay` (ip_port.rs:980). That one has no C
+  value-validation contract (C has no `noDelay` key, DRV-8), but a typo silently
+  coercing to "off" is a latent footgun and validating one Y/N option strictly
+  while another stayed loose is a non-uniform rule — tightened to strict Y/N in
+  DRV-61 (the `noDelay` key itself remains the DRV-8 superset).
 - **DRV-8** (CONCERN, noDelay is a non-C option key) — KEPT as an intentional
   Rust superset (documented divergence, no code change). C
   `drvAsynIPPort.c:525-534` sets TCP_NODELAY unconditionally on every TCP/INET
@@ -307,4 +309,16 @@ contracts / behavioral models, not just a driver site.
   so reaching the base with empty data means there is genuinely nothing to
   send. Test: `test_udp_zero_length_write_sends_nothing`. F3 (DRV-1/4/14) now
   complete; full asyn-rs suite (657 tests) green.
-
+- **DRV-61** (CONCERN, noDelay value parse looser than C strict Y/N; review
+  round DIV-1) — CLEARED. Follow-up of DRV-8/DRV-10. The `noDelay` value used
+  the lenient coercion (`"Y"|"y"|"1"|"yes"` → on, everything else silently →
+  off) — the same shape DRV-10 removed from `disconnectOnReadTimeout`. C has no
+  `noDelay` key so there is no parity contract for the value, but (a) silently
+  coercing a typo to "off" is a latent footgun and (b) validating one Y/N
+  option strictly while another stayed loose is a non-uniform rule. Tightened
+  to strict Y/N (case-insensitive), erroring on anything else, matching the
+  `disconnectOnReadTimeout` branch. The `noDelay` *key* itself remains the
+  intentional Rust superset of DRV-8 (default on via `IpPortConfig::parse`,
+  matching C's unconditional TCP_NODELAY; only the off-toggle is the
+  extension). Test: `test_set_option_nodelay` (extended to assert `"1"`/typo
+  now error).

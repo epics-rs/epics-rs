@@ -194,6 +194,38 @@ Note: the caucus driver-review panels wedged on a display/SIGWINCH event this
 session; restart-resume left them untracked (briefs never landed). This round
 ran on two freshly-spawned panels — the reliable path.
 
+### Round 3 — 2026-06-29 (F7 EOS family, 2 opus panels + 1 verify pass) — CONVERGED
+
+Review of the F7 EOS auto-install family (6 commits: routing enabler +
+ip/serial/ftdi install + serial iocsh + doc).
+
+- **drv-eos-install: CLEARED.** All four auto-install/suppression paths
+  byte-checked against C (`drvAsynIPPort.c:1065-1066`,
+  `drvAsynSerialPort.c:1126`, `drvAsynFTDIPort.cpp:616,622-623`); both DISTINCT
+  no-install sites confirmed correct (prologix inner `_TCP` via
+  `DrvAsynIPPort::new`; ip_server `0,0,0`).
+- **drv-eos-routing: 1 DEFECT, then FIXED.** `EosInterpose::read`
+  short-circuited to `next.read` on an empty terminator, conflating C's
+  construction-time `processEosIn==0` ("never process") with `eosInLen==0`
+  ("terminator cleared"). For an always-`processEosIn==1` installed interpose
+  this stranded read-ahead bytes in `in_buf` when IEOS was cleared
+  (reachable via `OctetReadBinary` / runtime IEOS clear after a line read).
+  Fixed in **f921dafd**: remove the short-circuit so `read` always runs the
+  buffering loop, gate only the *match* on a non-empty terminator (mirror C
+  `readIt:191` + `:199`). Regression test
+  `cleared_input_eos_still_drains_buffered_readahead`.
+- **Verification pass (re-finder + fresh adversary): both CLEARED.** The
+  adversary could not break the fix across read-ahead, END/CNT
+  capture/override/propagation, zero-byte END survival, 2-byte-EOS straddle,
+  `maxchars==0`, and UDP/TCP/serial/ftdi datagram semantics. It also confirmed
+  two deliberate Rust divergences that *fix* real C bugs (not copied): the
+  straddle `n_read -= eos.len().min(n_read)` guard vs C's `SIZE_MAX` underflow
+  (`readIt:203`), and the `maxchars==0` early return vs C's one-byte write into
+  a zero-length buffer (`readIt:197`).
+
+asyn-rs `-p` clippy `--all-targets` + nextest (666) green per commit;
+full-workspace pre-push pass still owed.
+
 ## Fix Log
 
 - **DRV-5** (DEFECT, ip_port write-side teardown) — CLEARED. Added a single

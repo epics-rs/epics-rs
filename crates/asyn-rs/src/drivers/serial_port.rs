@@ -506,6 +506,32 @@ impl DrvAsynSerialPort {
         })
     }
 
+    /// Configure a serial port the way C `drvAsynSerialPortConfigure`
+    /// does (`drvAsynSerialPort.c:1031-1126`): parse the device, honor
+    /// `noAutoConnect`, and enable EOS processing by default unless
+    /// `noProcessEos`. C does this by passing `(noProcessEos ? 0 : 1)` to
+    /// `pasynOctetBase->initialize`; the Rust octet stack expresses EOS
+    /// through the interpose layer, so the equivalent is to auto-install
+    /// an `EosInterpose` (empty terminator until `setInputEos`/`OEOS`).
+    ///
+    /// `new` stays the parse-only constructor (no EOS), matching the
+    /// lower-level C octet init without the `Configure` wrapper.
+    pub fn configure(
+        port_name: &str,
+        config_str: &str,
+        no_auto_connect: bool,
+        no_process_eos: bool,
+    ) -> AsynResult<Self> {
+        let mut driver = Self::new(port_name, config_str)?;
+        if no_auto_connect {
+            driver.base.auto_connect = false;
+        }
+        if !no_process_eos {
+            driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        }
+        Ok(driver)
+    }
+
     /// Push an interpose layer onto the octet I/O stack.
     pub fn push_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
         self.base.push_octet_interpose(layer);
@@ -1279,6 +1305,31 @@ mod tests {
         assert!(!drv.base().connected);
         assert!(drv.base().auto_connect);
         assert!(drv.base().flags.can_block);
+        // `new` is parse-only: no EOS interpose (DRV-45).
+        assert_eq!(drv.base().interpose_octet.len(), 0);
+    }
+
+    /// C drvAsynSerialPort.c:1126 enables EOS by default in Configure
+    /// unless noProcessEos; `configure` is the Rust analogue (DRV-45).
+    #[test]
+    fn test_configure_installs_eos_unless_suppressed_and_honors_no_auto_connect() {
+        let default_port =
+            DrvAsynSerialPort::configure("s_eos_default", "/dev/ttyS0", false, false).unwrap();
+        assert_eq!(
+            default_port.base().interpose_octet.len(),
+            1,
+            "default serial port must auto-install the EOS interpose"
+        );
+        assert!(default_port.base().auto_connect);
+
+        let suppressed =
+            DrvAsynSerialPort::configure("s_eos_off", "/dev/ttyS0", true, true).unwrap();
+        assert_eq!(
+            suppressed.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
+        );
+        assert!(!suppressed.base().auto_connect);
     }
 
     #[test]

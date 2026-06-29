@@ -226,6 +226,38 @@ ip/serial/ftdi install + serial iocsh + doc).
 asyn-rs `-p` clippy `--all-targets` + nextest (666) green per commit;
 full-workspace pre-push pass still owed.
 
+### Round 4 — 2026-06-29 (F9 ip_server local fixes, 2 fresh opus panels) — 1 DEFECT, fixed; reverify pending
+
+Review of the three tractable F9 fixes (DRV-18 UDP SO_REUSEPORT, DRV-19
+bind-host resolution, DRV-20 UDP flush). Ran on two freshly-spawned opus
+panels (parity + adversary).
+
+- **DRV-18 / DRV-19: CLEARED by both panels.** Byte-checked against C
+  `createServerSocket` (drvAsynIPServerPort.c:403-419,426-430) and
+  `osdSockAddrReuse.cpp:60-68`. Empty/`localhost`→`0.0.0.0` confirmed
+  faithful (C comment :407-411 refuses loopback mapping); SO_REUSEPORT
+  UDP-only confirmed; no stray bare `SocketAddr::parse` bind site remains.
+  Adversary asides (not defects): a multi-record hostname `.next()` may
+  bind IPv6 where C's IPv4-only `hostToIPAddr` binds IPv4 — consistent
+  with the whole asyn-rs resolver, exotic for a bind interface; Rust
+  `trim()`s host whitespace C would reject (more lenient); `#[cfg(unix)]`
+  SO_REUSEPORT on Solaris/illumos is a non-target.
+- **DRV-20: DEFECT found by the adversary, then FIXED (9522b61b).** The
+  UDP-cache half was correct, but the TCP data path was left a no-op while
+  C drains it: each accepted connection is a full `drvAsynIPPort` child
+  (drvAsynIPServerPort.c:690) whose `flushIt` tosses all pending socket
+  input (drvAsynIPPort.c:846-861). Closed via a shared
+  `ClientSlot::drain_input` owner wired into both the child subport flush
+  and the parent's addr-routed TCP flush (see Fix Log).
+- **DRV-16 / DRV-17: untouched, OPEN for sign-off** (octet-interface
+  interrupt subsystem). Adversary noted the polled-cache vs interrupt-
+  callback delivery as a pre-existing design choice, consistent with this.
+
+Reverify round on the DRV-20 TCP-sibling fix pending.
+
+asyn-rs `-p` clippy `--all-targets` + nextest (673) green per commit;
+full-workspace pre-push pass still owed.
+
 ## Fix Log
 
 - **DRV-5** (DEFECT, ip_port write-side teardown) — CLEARED. Added a single
@@ -552,11 +584,26 @@ full-workspace pre-push pass still owed.
   only for the UDP server (drvAsynIPServerPort.c:655) and it resets
   `UDPbufferPos`/`UDPbufferSize` (flushIt:244-245). Added an `io_flush`
   override clearing `udp_cache` in UDP mode (which also lets the recv
-  worker, refilling only when empty, fetch the next datagram); TCP server
-  mode registers no flush in C (the SOCK_DGRAM-only block at :652-656) so
-  it keeps the default no-op. Tests:
-  `udp_server_flush_discards_cached_datagram`, `tcp_server_flush_is_noop`.
-  asyn-rs clippy `--all-targets` + nextest (671) green.
+  worker, refilling only when empty, fetch the next datagram). Test:
+  `udp_server_flush_discards_cached_datagram`.
+  - **TCP sibling** (9522b61b, found by adversarial caucus review of the
+    UDP-only commit). The original commit wrongly claimed TCP server mode
+    has no flush in C and left it a no-op. C serves each accepted
+    connection through a full `drvAsynIPPort` child port
+    (drvAsynIPServerPort.c:690) whose `flushIt` drains the socket
+    (non-blocking `recv`-until-empty, drvAsynIPPort.c:846-861). Both Rust
+    TCP data paths skipped it — the child `DrvAsynIPSubport` had no
+    `io_flush` (default no-op) and the parent's addr-routed TCP `io_flush`
+    was an explicit no-op — so a flush-then-read returned stale bytes.
+    Added a single `ClientSlot::drain_input` owner (non-blocking
+    recv-until-empty, blocking restored after, no-op on an unoccupied
+    slot = C's `fd != INVALID_SOCKET` guard); routed the child flush and
+    the parent's TCP flush (addressed slot, or every slot on broadcast
+    `addr<0`) through it. Tests:
+    `tcp_server_flush_drains_staged_socket_input`,
+    `subport_flush_drains_staged_socket_input`,
+    `tcp_server_flush_no_connection_is_harmless`. asyn-rs clippy
+    `--all-targets` + nextest (673) green.
 
 - **DRV-16 / DRV-17** (CONCERN — ip_server octet-interrupt push: new-TCP-
   connection name and UDP datagram bytes) — OPEN, surfaced for sign-off.

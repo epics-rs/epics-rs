@@ -58,7 +58,7 @@ impact paragraphs in the round report
 | DRV-8 | DOC | ip_port.rs:861-866,665-667 | drvAsynIPPort.c:525-534,915-947 | `noDelay` is a non-C option key (C has none, sets TCP_NODELAY unconditionally) — KEPT, intentional extension (see Fix Log) |
 | DRV-9 | CLEARED | ip_port.rs:916-945 | drvAsynIPPort.c:902-906,941-945 | setOption/getOption accept+echo arbitrary unknown keys; C closes dispatch (asynError) — FIXED (F4, see Fix Log) |
 | DRV-10 | CLEARED | ip_port.rs:867-869 | drvAsynIPPort.c:924-935 | `disconnectOnReadTimeout` parse accepts extra values, never errors (C: only Y/N) — FIXED (see Fix Log) |
-| DRV-11 | CLEARED | ip_port.rs:264,792-794 | drvAsynIPPort.c:741-743,799 | `timeout==0` read → Duration::ZERO rejected by std → misclassified, disconnects (C floors to 1ms poll); missing `timeout>0` disconnect guard — FIXED a092a777 |
+| DRV-11 | CLEARED | ip_port.rs:264,792-794 | drvAsynIPPort.c:741-743,799 | `timeout==0` read → Duration::ZERO rejected by std → misclassified, disconnects (C floors to 1ms poll); missing `timeout>0` disconnect guard — FIXED a092a777; convergence bff0263d (read EINTR non-fatal + zero-timeout write deadline floor) |
 | DRV-12 | CLEARED | ip_port.rs:661-731 | drvAsynIPPort.c:424-427 | `connect()` doesn't reject already-open link (C: "Link already open!") — FIXED (F6, see Fix Log) |
 | DRV-13 | DOC | ip_port.rs:92,109,553,575 | drvAsynIPPort.c:513-523 | hardcoded 5s connect timeout where C connect is OS-default blocking — intentional divergence, documented b2938e11 |
 | DRV-14 | CLEARED | ip_port.rs:368-371 | drvAsynIPPort.c:613-614 | zero-length write emits an empty UDP datagram; C returns before sending — FIXED (see Fix Log) |
@@ -687,6 +687,25 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   `Duration` (DRV-42, separate finding). Tests:
   `socket_poll_timeout_floors_zero_to_one_ms`,
   `zero_timeout_read_polls_without_disconnect`.
+  CONVERGENCE bff0263d — the adversary review found the readRaw/writeRaw
+  zero/edge-handling family was not yet closed by (a)/(b) above. Two more
+  same-family sites fixed: (a') read-path EINTR teardown. C readRaw:798-800
+  excludes BOTH `EWOULDBLOCK` *and* `EINTR` from the fatal disjunct, so a
+  signal-interrupted read is a non-fatal timeout; the Rust read arms mapped
+  only `TimedOut`/`WouldBlock` to `Timeout` and routed `Interrupted` into
+  `Io(_)` (fatal → teardown of a healthy socket). Extracted
+  `classify_read_error` as the single owner of read-error classification,
+  mapping `Interrupted` onto the same non-fatal `Timeout` path as
+  `WouldBlock`, and collapsed the three duplicated TCP/UDP/Unix Err arms.
+  (b') zero-timeout write deadline defeated. C writeRaw:615-617 floors the
+  zero timeout to a 1 ms poll then attempts the send, so a `timeout == 0`
+  write of a writable socket succeeds; the Rust write path floored
+  `set_write_timeout` but built the retry deadline from the raw
+  `user.timeout`, so the deadline was `now` and `write_with_retry`'s
+  top-of-loop `now > deadline` check returned `Timeout` before ever calling
+  `write()`. Floored the deadline with `socket_poll_timeout` too. Tests:
+  `classify_read_error_eintr_and_wouldblock_are_nonfatal_timeout`,
+  `zero_timeout_write_attempts_send_not_instant_timeout`.
 
 - **DRV-7** (CONCERN — HTTP connect-per-transaction) — CLEARED 1629e3bb.
   Structural: `base.connected` conflated "logically connected" (exception /

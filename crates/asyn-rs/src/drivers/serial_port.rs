@@ -320,6 +320,18 @@ fn duration_to_poll_ms(d: Duration) -> i32 {
 impl OctetNext for SerialIoState {
     fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let fd = self.fd_or_err()?;
+        // C readIt (drvAsynSerialPort.c:871-875): reject maxchars == 0 with
+        // asynError right after the fd check and before touching the device.
+        // An empty buffer would otherwise reach libc::read(fd, ptr, 0), which
+        // returns 0 and is misclassified below (n == 0) as a disconnect (EOF)
+        // — tearing down a live serial port. (Message matches the serial
+        // driver's own wording, which omits the period the IP driver carries.)
+        if buf.is_empty() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "maxchars 0 Why <=0?".into(),
+            });
+        }
         let timeout_ms = duration_to_poll_ms(user.timeout);
 
         // C parity (drvAsynSerialPort.c): retry poll/read on EINTR (a signal
@@ -1553,6 +1565,46 @@ mod tests {
 
         drv.disconnect(&user).unwrap();
         assert!(!drv.base().connected);
+    }
+
+    /// DRV-57: a zero-length serial read request must be rejected with
+    /// asynError (C drvAsynSerialPort.c:871-875), NOT fall through to
+    /// libc::read(fd, ptr, 0) -> 0 -> EOF -> disconnect, which would tear
+    /// down a live serial port. The connection must stay up.
+    #[test]
+    fn pty_zero_length_read_rejected_not_eof_teardown() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_maxchars", &slave_name).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut empty: [u8; 0] = [];
+        let res = drv.read_octet(&ruser, &mut empty);
+        assert!(
+            matches!(
+                res,
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    ..
+                })
+            ),
+            "zero-length serial read must be rejected with asynError, got {res:?}"
+        );
+        assert!(
+            drv.base().connected,
+            "zero-length serial read must not tear down the connection"
+        );
     }
 
     #[test]

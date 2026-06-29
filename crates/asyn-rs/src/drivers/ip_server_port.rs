@@ -688,6 +688,26 @@ impl PortDriver for DrvAsynIPServerPort {
         Ok(res.nbytes_transferred)
     }
 
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        if self.config.protocol == IpServerProtocol::Udp {
+            // A UDP datagram is a message boundary: C `readIt`
+            // (drvAsynIPServerPort.c:201-207) sets ASYN_EOM_END when the
+            // datagram is fully drained, ASYN_EOM_CNT when the caller
+            // buffer is too small and more of the datagram remains. The
+            // default synthesis reports CNT-only and never END, so the
+            // EOS interpose / `asynRecord::EOMR` never see the boundary.
+            return Ok(self.udp_drain_into_eom(buf));
+        }
+        // TCP: surface the real end-of-message reason from the slot read
+        // (CNT when the caller buffer filled, empty on a short read).
+        let res = self.base_read_octet(user, buf)?;
+        Ok((res.nbytes_transferred, res.eom_reason))
+    }
+
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         if self.config.protocol == IpServerProtocol::Udp {
             // C asyn `writeIt` for UDP server is a one-line
@@ -821,18 +841,37 @@ impl DrvAsynIPServerPort {
     /// behaviour, simplified to drop the off-by-one C bug
     /// (`maxchars - 1` copy with `+= maxchars` advance).
     fn udp_drain_into(&self, buf: &mut [u8]) -> usize {
+        self.udp_drain_into_eom(buf).0
+    }
+
+    /// Drain the UDP cache and report the end-of-message reason. Single
+    /// owner of the datagram-boundary decision shared by [`read_octet`]
+    /// (count only) and [`io_read_octet_eom`] (count + EOM). Mirrors C
+    /// `readIt` (drvAsynIPServerPort.c:201-207): a fully-drained
+    /// datagram is `ASYN_EOM_END`; a buffer-limited drain that leaves
+    /// more of the datagram behind is `ASYN_EOM_CNT`. An empty cache
+    /// yields `(0, empty)` — the caller polls (no boundary to report).
+    ///
+    /// [`read_octet`]: PortDriver::read_octet
+    /// [`io_read_octet_eom`]: PortDriver::io_read_octet_eom
+    fn udp_drain_into_eom(&self, buf: &mut [u8]) -> (usize, EomReason) {
         let mut cache = self.udp_cache.lock();
         if cache.is_empty() {
-            return 0;
+            return (0, EomReason::empty());
         }
         let avail = cache.data.len() - cache.pos;
         let n = avail.min(buf.len());
         buf[..n].copy_from_slice(&cache.data[cache.pos..cache.pos + n]);
         cache.pos += n;
-        if cache.is_empty() {
+        let eom = if cache.is_empty() {
+            // Datagram fully consumed — end of message.
             cache.clear();
-        }
-        n
+            EomReason::END
+        } else {
+            // Caller buffer too small; the datagram has more to give.
+            EomReason::CNT
+        };
+        (n, eom)
     }
 
     /// Signal the UDP recv worker to stop and join it. Single owner
@@ -1180,6 +1219,55 @@ mod tests {
         let n = srv.read_octet(&user, &mut buf).unwrap();
         assert_eq!(n, 0, "empty UDP cache must return 0 bytes, not error");
         srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// DRV-23 regression: a UDP datagram is a message boundary.
+    /// `io_read_octet_eom` must report `ASYN_EOM_END` when the datagram
+    /// is fully drained and `ASYN_EOM_CNT` when the caller buffer is too
+    /// small and more of the datagram remains (C drvAsynIPServerPort.c
+    /// readIt:201-207). The default synthesis reports CNT-only, never END.
+    #[test]
+    fn udp_server_read_eom_reports_end_at_datagram_boundary() {
+        let mut srv = DrvAsynIPServerPort::new("udp_srv_eom", "127.0.0.1:0 UDP").unwrap();
+        // Seed the cache directly so the assertion is deterministic (no
+        // datagram-arrival race).
+        {
+            let mut cache = srv.udp_cache.lock();
+            cache.data = b"hello".to_vec();
+            cache.pos = 0;
+        }
+        let user = AsynUser::default().with_addr(0);
+
+        // Caller buffer too small (3 < 5): partial drain -> CNT, no END.
+        let mut small = [0u8; 3];
+        let (n, eom) = srv.io_read_octet_eom(&user, &mut small).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&small[..3], b"hel");
+        assert!(eom.contains(EomReason::CNT), "partial drain must flag CNT");
+        assert!(
+            !eom.contains(EomReason::END),
+            "partial drain must NOT flag END"
+        );
+
+        // Remainder fits: full drain -> END, no CNT.
+        let mut rest = [0u8; 16];
+        let (n, eom) = srv.io_read_octet_eom(&user, &mut rest).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&rest[..2], b"lo");
+        assert!(
+            eom.contains(EomReason::END),
+            "datagram boundary must flag END"
+        );
+        assert!(
+            !eom.contains(EomReason::CNT),
+            "full drain must NOT flag CNT"
+        );
+
+        // Empty cache -> (0, empty): a poll, no boundary to report.
+        let mut buf = [0u8; 16];
+        let (n, eom) = srv.io_read_octet_eom(&user, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        assert!(eom.is_empty(), "empty cache poll reports no EOM");
     }
 
     /// disconnect must stop the worker cleanly so a subsequent

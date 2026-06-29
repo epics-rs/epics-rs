@@ -369,3 +369,23 @@ contracts / behavioral models, not just a driver site.
   count on error would require an `AsynError`-restructure that breaks the
   read/write symmetry. Workspace clippy `--all-targets` clean; full-workspace
   nextest (7311) + doctests green. Both `write_octet -> ()` findings closed.
+
+- **DRV-23** (F5-remaining — UDP read drops `ASYN_EOM_END` at the datagram
+  boundary) — CLEARED. C `readIt` (drvAsynIPServerPort.c:201-207) treats a UDP
+  datagram as a message boundary: `ASYN_EOM_END` once the datagram is fully
+  drained, `ASYN_EOM_CNT` when the caller buffer is too small and more of the
+  datagram remains. The Rust UDP path had no `io_read_octet_eom` override, so
+  the default actor synthesis (port.rs:1180) reported CNT-only and never END —
+  the EOS interpose and `asynRecord::EOMR` never saw the boundary. Added an
+  `io_read_octet_eom` override on `DrvAsynIPServerPort`: UDP routes through a
+  new single-owner `udp_drain_into_eom` (drain + END/CNT decision; the old
+  `udp_drain_into` now delegates, count-only) reporting END on full drain / CNT
+  on a buffer-limited drain / `(0, empty)` on an empty-cache poll; TCP forwards
+  the slot read's real `eom_reason` from `base_read_octet`. The C off-by-one
+  (`maxchars - 1` copy with `+= maxchars` advance) and its dead `:234` CNT
+  branch are intentionally not reproduced (not C-bug copying). DISTINCT, not
+  fixed: serial_port.rs (C drvAsynSerialPort.c:974-977 sets CNT-only, no native
+  END — byte stream, default synthesis is C-faithful) and the ip_server TCP
+  subport (byte stream, base behaviour == default synthesis). Regression test
+  `udp_server_read_eom_reports_end_at_datagram_boundary`. asyn-rs clippy
+  `--all-targets` + nextest (658) green.

@@ -108,7 +108,7 @@ impact paragraphs in the round report
 | DRV-47 | CLEARED | prologix.rs:80,410,422 | drvPrologixGPIB.c:334-349 | eomReason (END/EOS/CNT) now reported via `io_read_octet_eom` owner + `read_eom` rule (see DRV-47 Fix Log) |
 | DRV-48 | CLEARED | prologix.rs:133,392 | drvPrologixGPIB.c:386,409 | staged read remainder now discarded at `write_octet` via `clear_read_carry()` owner (F6 invariant; see DRV-48 Fix Log) |
 | DRV-49 | CLEARED | iocsh.rs:628-680 | drvPrologixGPIB.c:547-628 | `prologixGPIBConfigure` iocsh command added (priority accepted-but-ignored, IP/serial-command parity) (f82f4537) |
-| DRV-50 | CONCERN | prologix.rs, interfaces/gpib.rs:58 | drvPrologixGPIB.c:461-525 | GPIB command interface absent (ifc/srqStatus real in C; AsynGpib has zero implementors) — scaffold |
+| DRV-50 | CLEARED | prologix.rs:571-639 | drvPrologixGPIB.c:461-525 | `AsynGpib` now implemented for prologix (ifc/srqStatus real, rest unimplemented per C); devGpib discovery wiring is a separate gap (4732abce) |
 | DRV-51 | LOW | prologix.rs:272-324 | drvPrologixGPIB.c:166-168 | connect() doesn't clear `read_carry` (reconnect-without-disconnect returns stale bytes) |
 | DRV-52 | LOW | prologix.rs:322,333 | drvPrologixGPIB.c:213,231 | per-device connect/disconnect toggles port-level state + announces addr −1 (ASYN_MULTIDEVICE) |
 | DRV-53 | LOW | prologix.rs:131-135 | drvPrologixGPIB.c:592-593 | port registered `destructible:true`; C registers no ASYN_DESTRUCTIBLE (over-grants shutdown rights) |
@@ -381,6 +381,21 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   port lands in the `asyn_record` registry so `asynRecord` resolves it by name.
   Tests: `drv_asyn_prologix_port_configure_registers_port`,
   `drv_asyn_prologix_port_configure_rejects_missing_host`.
+- **DRV-50** (CONCERN, GPIB command interface absent — `AsynGpib` scaffold with
+  zero implementors) — CLEARED (4732abce). C prologix exposes an `asynGpibPort`
+  vtable (`prologixMethods`, drvPrologixGPIB.c:527-545) whose GPIB bus-control
+  operations are mostly unimplemented by the bridge; only `ifc` and `srqStatus`
+  are real. Implemented `AsynGpib for DrvAsynPrologixPort` matching that vtable:
+  `ifc` writes `++ifc\n` to the TCP transport (prologixIfc:476-484); `srq_status`
+  reports not-asserted (`*srqStatus = 0`, :493-498); `srq_enable` is a no-op
+  success (:500-504); `addressed_cmd` / `universal_cmd` / `ren` / `serial_poll`
+  return asynError unimplemented (:461-491, :513-518). C's diagnostic printf in
+  the serial-poll stubs is not copied (the error carries the same info). RESIDUAL
+  (not closed here, separate larger gap): there is no Rust devGpib /
+  `findInterface(asynGpibType)` discovery layer, so nothing in the stack reaches
+  this interface — it provides the bridge's real GPIB behavior for a future GPIB
+  device-support layer. Tests: `gpib_ifc_writes_bridge_command`,
+  `gpib_command_interface_matches_c_methods`.
 - **DRV-9 / DRV-36** (CONCERN, option dispatch leaks unknown keys) — CLEARED. F4
   family. Both `ip_port`/`serial_port` override `set_option` with a known-key
   chain, then a catch-all that inserted unknown keys into the generic

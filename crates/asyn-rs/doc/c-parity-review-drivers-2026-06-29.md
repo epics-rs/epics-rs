@@ -87,7 +87,7 @@ impact paragraphs in the round report
 | DRV-31 | DEFECT | serial_port.rs:336-344,387-389 | drvAsynSerialPort.c:837,959,625-635 | hard read/write error + EOF never closes connection → no auto-reconnect; also no EINTR/EAGAIN retry |
 | DRV-32 | CLEARED | serial_port.rs:663 | drvAsynSerialPort.c:1080 | termios input flags: C `IGNBRK\|IGNPAR` vs Rust `cfmakeraw` → spurious 0x00 on BREAK/line errors — FIXED 2685bd6f (see Fix Log) |
 | DRV-33 | CLEARED | serial_port.rs:681-682 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
-| DRV-34 | CONCERN | serial_port.rs:263-270,645-658,159-208 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing) |
+| DRV-34 | CLEARED | serial_port.rs:159-208,263-270 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing; Linux high rates rejected; silent 9600 fallback) — FIXED 7ef497b5 (see Fix Log) |
 | DRV-35 | CLEARED | serial_port.rs:830-1000 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value — FIXED fdf7d488 (commit self.config only after successful apply, all 5 arms) |
 | DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
 | DRV-37 | CLEARED | serial_port.rs:392-487 | drvAsynSerialPort.c:810-842 | write timeout applied per-poll-iteration, not single total deadline → write lives timeout×N (and a blocking write(fd,all) ignored the timeout entirely) — FIXED 92755a0f (single deadline + post-write check + non-blocking write loop) |
@@ -187,7 +187,7 @@ cluster into structural families (the high-leverage fix units):
 - **F9 — ip_server interrupt push delivery (driver's documented purpose):**
   DRV-16, DRV-17. Plus DRV-18/19/20.
 - Singletons: DRV-6/7/11/13 (ip), DRV-32/33/34/35/37/39/41/42/43/44 (serial;
-  DRV-32/33/35/37/39/41/43/44 CLEARED, DRV-42/59 DOC; only DRV-34 left),
+  DRV-32/33/34/35/37/39/41/43/44 CLEARED, DRV-42/59 DOC; all serial singletons closed),
   DRV-50/52/53/54 (prologix), DRV-21/22/24 (ip_server).
 
 Fix-phase plan: start with F1 (DEFECT, local, established invariant), then
@@ -1027,3 +1027,26 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   wedge the port actor thread indefinitely — and it is the framework root
   of the DRV-59 "every representable (non-negative) timeout" note. Left
   as-is; documented in `crates/asyn-rs/src/user.rs`.
+
+- **DRV-34** (CONCERN — baud range narrower than C) — CLEARED. FIXED
+  7ef497b5. C `setOption` "baud" (drvAsynSerialPort.c:271-345) sets the
+  termios speed platform-conditionally: where the `Bxxx` constants equal the
+  literal rate (macOS/BSD, `B9600 == 9600`) it uses the baud value directly
+  as the speed code (`baudCode = baud`, :273-274) so any rate is settable;
+  on Linux (encoded codes) it maps a fixed `switch` set and returns
+  asynError "Unsupported data rate" (:340-343) for the rest (`#ifdef B28800`
+  is false on Linux, so 28800 is unsupported there in C too). The Rust port
+  used one fixed table on every platform with a silent `_ => B9600`
+  fallback, and the set_option gate (`is_supported_baud` over
+  `SUPPORTED_BAUDS`) listed only 0..230400 — narrower than C on macOS/BSD (no
+  arbitrary rate; 28800/250000 rejected) and narrower than the table itself
+  on Linux (460800..4000000 mappable yet rejected). An unmapped rate that
+  passed the gate was silently coerced to 9600. `baud_to_speed` now returns
+  `Option<speed_t>` and is the single source of truth: arbitrary passthrough
+  on macOS/BSD, the mapped standard set (incl. the high Linux rates)
+  otherwise, `None` for an unknown rate. `set_option` derives validation and
+  the speed lookup from one `ok_or` so they cannot disagree; `SUPPORTED_BAUDS`
+  and the redundant `is_supported_baud` helper are removed; `apply_to_termios`
+  falls back to 9600 only for a `SerialConfig` built directly with an
+  unmappable rate. Tests: `baud_arbitrary_on_bsd_mapped_set_on_linux` plus
+  the platform-aware `test_set_option_unsupported_baud`.

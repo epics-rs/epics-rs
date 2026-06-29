@@ -368,6 +368,25 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   output EOS is rejected (asynGpib leaves the output-EOS vtable slots NULL,
   asynGpib.c:132 `...setInputEos, getInputEos, 0, 0`) rather than silently
   caching ineffective bytes. Test: `eos_interface_routes_to_driver_state`.
+- **DRV-46(b)** (follow-up DEFECT surfaced by the convergence round, adv panel
+  `converged: NO`) — CLEARED (b68d08d5). The wiring above made the driver's
+  EOS-mode read (`++read <eos>`) reachable via the standard IEOS interface, but
+  the bridge stayed pinned at `++eot_enable 1` (set once at connect). With EOT
+  enabled, a GPIB instrument that asserts EOI together with its terminator makes
+  the bridge append the EOT marker after the eos char (`...\n\xEF`); the
+  eos-mode read loop breaks only on the eos byte, so it never sees its
+  terminator and the read times out. C `prologixSetEos` *design* re-issues
+  `++eot_enable (eos<0)` on every eos change (drvPrologixGPIB.c:456) — EOI mode
+  enable=1, EOS mode enable=0 — but C's never-store bug leaves its driver eos
+  dead so the path never runs (bug not copied; the command it sends is the
+  design). Realized it: `eot_enable_arg(eos)` (None→1, Some→0); `set_eos` (now
+  `&mut self`, single owner, commits `State.eos` only after a successful bridge
+  write per the DRV-35 rule) re-issues it when connected; the connect handshake
+  derives the init burst's `++eot_enable` from `State.eos` (so an eos set before
+  connect is honored). Also replaced the false `set_eos` comment claiming the
+  command was "punted to the next read/write path" (no such code existed).
+  Tests: `eos_mode_toggles_bridge_eot_enable`,
+  `eos_set_before_connect_seeds_eot_enable_off`.
 - **DRV-49** (CONCERN, no prologix iocsh registrar) — CLEARED (f82f4537). C
   `drvPrologixGPIB.c` registers `prologixGPIBConfigure(portName, host, priority,
   noAutoConnect)` (lines 547-628); the Rust prologix had no iocsh command, so

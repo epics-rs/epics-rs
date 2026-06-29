@@ -85,8 +85,8 @@ impact paragraphs in the round report
 | id | sev | Rust | C | one-line |
 |---|---|---|---|---|
 | DRV-31 | DEFECT | serial_port.rs:336-344,387-389 | drvAsynSerialPort.c:837,959,625-635 | hard read/write error + EOF never closes connection → no auto-reconnect; also no EINTR/EAGAIN retry |
-| DRV-32 | CONCERN | serial_port.rs:542-549 | drvAsynSerialPort.c:1080 | termios input flags: C `IGNBRK\|IGNPAR` vs Rust `cfmakeraw` → spurious 0x00 on BREAK/line errors |
-| DRV-33 | CONCERN | serial_port.rs:542-548,151-154 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) |
+| DRV-32 | CLEARED | serial_port.rs:663 | drvAsynSerialPort.c:1080 | termios input flags: C `IGNBRK\|IGNPAR` vs Rust `cfmakeraw` → spurious 0x00 on BREAK/line errors — FIXED 2685bd6f (see Fix Log) |
+| DRV-33 | CLEARED | serial_port.rs:672-673 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
 | DRV-34 | CONCERN | serial_port.rs:263-270,645-658,159-208 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing) |
 | DRV-35 | CONCERN | serial_port.rs:659-747 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value |
 | DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
@@ -185,8 +185,8 @@ cluster into structural families (the high-leverage fix units):
   sign-off.**
 - **F9 — ip_server interrupt push delivery (driver's documented purpose):**
   DRV-16, DRV-17. Plus DRV-18/19/20.
-- Singletons: DRV-6/7/11/13 (ip), DRV-32/33/34/35/37/39/41/42/43/44 (serial),
-  DRV-50/52/53/54 (prologix), DRV-21/22/24 (ip_server).
+- Singletons: DRV-6/7/11/13 (ip), DRV-32/33/34/35/37/39/41/42/43/44 (serial;
+  DRV-32/33 CLEARED), DRV-50/52/53/54 (prologix), DRV-21/22/24 (ip_server).
 
 Fix-phase plan: start with F1 (DEFECT, local, established invariant), then
 F4/F5/F6 (local, clear contracts), then per-driver singletons. F7 (EOS+iocsh
@@ -872,3 +872,30 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   (C-faithful — C `flushIt` drvAsynIPPort.c:853-857 is `if (numRecv <= 0)
   break`). Both are benign (DRV-20 flush family, already dispositioned);
   neither leaks bytes nor tears anything down. No defect — left unaligned.
+
+- **DRV-32** (CONCERN — serial termios input flags) — CLEARED. FIXED
+  2685bd6f. C `drvAsynSerialPort.c` (line 1080) seeds the default input
+  flags `IGNBRK | IGNPAR`, so a line BREAK and framing/parity errors are
+  silently dropped. The Rust `connect` configured the port with
+  `cfmakeraw`, which clears `IGNBRK` (and `BRKINT`) and never sets
+  `IGNPAR`, so a BREAK or a line error reached the reader as a spurious
+  `0x00` byte where C delivers nothing. Set `t.c_iflag |= IGNBRK | IGNPAR`
+  (serial_port.rs:663) after `cfmakeraw`, before the config layer.
+  `apply_to_termios` only touches `c_iflag` for the XON/XOFF flow bits, so
+  the flags survive it and coexist with `FlowControl::Software`'s
+  `IXON|IXOFF`. Test: `pty_termios_sets_ignbrk_ignpar` (after connect,
+  `get_current_termios` shows both flags set).
+
+- **DRV-33** (CONCERN — serial XON/XOFF flow characters) — CLEARED. FIXED
+  117e612e. C `drvAsynSerialPort.c` (lines 1085-1086) seeds the XON/XOFF
+  flow characters `c_cc[VSTART]=0x11` (^Q) and `c_cc[VSTOP]=0x13` (^S). The
+  Rust `connect` zeroes the termios struct before `cfmakeraw`, and
+  `cfmakeraw` leaves `c_cc` untouched, so `VSTART`/`VSTOP` stayed `0`. With
+  `FlowControl::Software` (IXON|IXOFF) the kernel would then drive flow
+  control with NUL bytes instead of ^Q/^S, breaking interop with any peer
+  expecting the standard control characters. Set `t.c_cc[VSTART]=0x11` and
+  `t.c_cc[VSTOP]=0x13` (serial_port.rs:672-673) after the VMIN/VTIME seed,
+  before the config layer; `apply_to_termios` only toggles the
+  IXON/IXOFF/IXANY bits in `c_iflag`, never `c_cc`, so the seeded
+  characters survive it. Test: `pty_termios_sets_xon_xoff_chars` (after
+  connect, `get_current_termios` shows VSTART==0x11 and VSTOP==0x13).

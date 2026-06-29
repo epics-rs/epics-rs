@@ -795,6 +795,22 @@ impl PortDriver for DrvAsynIPServerPort {
             }
         }
     }
+
+    fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        if self.config.protocol == IpServerProtocol::Udp {
+            // C registers `flushIt` only for the UDP server
+            // (drvAsynIPServerPort.c:655); it discards the cached
+            // datagram by resetting `UDPbufferPos`/`UDPbufferSize`
+            // (flushIt:244-245) so a flush-then-read waits for a fresh
+            // datagram instead of re-returning the stale one. Clearing
+            // the cache also lets the recv worker (which only refills
+            // when the cache is empty) fetch the next datagram.
+            self.udp_cache.lock().clear();
+        }
+        // TCP server mode registers no flush (the SOCK_DGRAM-only block
+        // at :652-656), so it keeps the framework default no-op.
+        Ok(())
+    }
 }
 
 impl DrvAsynIPServerPort {
@@ -1271,6 +1287,49 @@ mod tests {
             );
         }
         tcp.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// DRV-20: a flush on the UDP server discards the cached datagram (C
+    /// `flushIt` resets `UDPbufferPos`/`UDPbufferSize`,
+    /// drvAsynIPServerPort.c:244-245), so a flush-then-read waits for a
+    /// fresh datagram instead of re-returning the stale one.
+    #[test]
+    fn udp_server_flush_discards_cached_datagram() {
+        let mut srv = DrvAsynIPServerPort::new("udp_flush", "127.0.0.1:0 UDP").unwrap();
+        // Seed a datagram directly so the assertion is deterministic.
+        {
+            let mut cache = srv.udp_cache.lock();
+            cache.data = b"stale".to_vec();
+            cache.pos = 0;
+        }
+        assert_eq!(srv.udp_cache_pending(), 5);
+
+        let mut user = AsynUser::default().with_addr(0);
+        srv.io_flush(&mut user).unwrap();
+        assert_eq!(
+            srv.udp_cache_pending(),
+            0,
+            "flush must discard the cached datagram"
+        );
+
+        let mut buf = [0u8; 16];
+        let n = srv
+            .read_octet(&AsynUser::default().with_addr(0), &mut buf)
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "flush-then-read must not re-return the stale datagram"
+        );
+    }
+
+    /// DRV-20: TCP server mode registers no flush in C (the SOCK_DGRAM-
+    /// only block at drvAsynIPServerPort.c:652-656), so `io_flush` is a
+    /// harmless no-op there.
+    #[test]
+    fn tcp_server_flush_is_noop() {
+        let mut srv = DrvAsynIPServerPort::new("tcp_flush", "127.0.0.1:0").unwrap();
+        let mut user = AsynUser::default().with_addr(0);
+        srv.io_flush(&mut user).unwrap();
     }
 
     /// UDP-mode end-to-end: bind ephemeral, two clients each fire one

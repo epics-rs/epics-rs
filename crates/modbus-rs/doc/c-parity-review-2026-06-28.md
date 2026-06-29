@@ -319,8 +319,13 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
     wrong VAL for any masked/multi-bit field.
   - asynInt32 `ai` with `ESLO` linearization — the RVAL store + forward convert is bypassed →
     VAL holds the raw float, unconverted.
-  - asynInt64 `int64in` — not handled in `store_read_value` at all → `set_val(Double)`; values
-    `> 2^53` lose precision the polled `read_int64` keeps exact.
+  - asynInt64 `int64in` — bridged through `EpicsValue::Double(v as f64)`, so values `> 2^53` lose
+    precision. (Correction: this is NOT an I/O-Intr-vs-polled divergence — the polled path narrows
+    identically at `result_to_value` (`adapter.rs:1226`, `asynInt64 => EpicsValue::Double(v as
+    f64)`), and the post-fix typed `Int64` fire is collapsed the same way at
+    `param_value_to_epics_value` (`adapter.rs:919`). The int64 `>2^53` narrowing is a uniform,
+    pre-existing asyn-rs consumer-bridge limitation affecting every driver, tracked separately from
+    R54's interface-routing scope.)
   - Plain `longin` (no ESLO/readback) and asynFloat64 `ai` are unaffected (the Double coerces to
     the right value).
 - **Fix level:** structural, and larger than a modbus-rs patch — asyn-rs's interrupt layer is
@@ -356,6 +361,48 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 - **Fix:** `ModbusPortDriver::io_read_octet_eom` override returns `EomReason::CNT` for every
   successful P_Data octet read, mirroring C. Distinct from R31's count semantics. Test
   `read_octet_eom_always_flags_cnt_for_short_string` pins the not-full-buffer case (8f15ba0d).
+
+### R56 — I/O-Intr array waveforms (asynInt32Array/asynFloat64Array) never fired by the poller — OPEN (sign-off)
+- **Severity:** DEFECT (an I/O-Intr array waveform never updates) — pre-existing, surfaced by the
+  R54 fix review. NOT introduced by R54.
+- **Rust:** `poll_cycle` (`ioc.rs:409`) fires only the scalar interfaces
+  (int32/int64/float64/uInt32Digital) + octet per active reason — it never fires `Int32Array` or
+  `Float64Array`. An `intarray_in`/`floatarray_in` waveform (`db/intarray_in.template`
+  asynInt32ArrayIn, `db/floatarray_in.template` asynFloat64ArrayIn) with `SCAN="I/O Intr"` registers
+  a mailbox subscriber on iface `Int32Array`/`Float64Array` (`adapter.rs:2533/2543`,
+  `from_asyn_name`), which after R54 correctly REJECTS the scalar fires → the record receives
+  nothing and never updates.
+- **C:** `readPoller` fires the int32Array (`drvModbusAsyn.cpp:1841-1858`, on change) and
+  float64Array (`:1860-1894`, unconditional) interrupt lists, decoding the whole register block
+  from the record's offset (`readPlcInt32`/`readPlcFloat` per element).
+- **Pre-existing:** before R54 the array record's filter had no iface and received the untyped
+  scalar `Float64` — also wrong (a scalar delivered to an array record). R54 made the failure clean
+  (rejected) but did not add the array fan-out. Periodic-`SCAN` array reads via `read_int32_array`/
+  `read_float64_array` (`ioc.rs:838/889`) are CORRECT and unaffected — only `SCAN="I/O Intr"`
+  arrays are dead.
+- **Fix level:** extend `poll_cycle` to fire `ParamValue::Int32Array`/`Float64Array` (whole block
+  decoded from offset, reusing the `read_int32_array`/`read_float64_array` element loop) tagged
+  `Int32Array`/`Float64Array`. Two caveats make this a self-contained feature, not a one-line
+  completion: (1) the I/O-Intr array *consumer* path (mailbox → `interrupt_fifo` → waveform store)
+  has never been exercised by a real array fire and needs verification/possible fix; (2) a
+  subscriber-presence gate avoids decoding a full array at every scalar addr. **Surface for sign-off
+  before implementing.**
+
+### R57 — uInt32Digital I/O-Intr fired unconditionally vs C's on-change gate — OPEN (CONCERN, documented)
+- **Severity:** CONCERN (extra record processing; no wrong value, identical wire-visible monitor
+  output).
+- **Rust:** `poll_cycle` (`ioc.rs:489-501`) fires the uInt32Digital interface UNCONDITIONALLY each
+  poll (`uint32_changed_mask = !0`) and relies on the record's monitor deadband to suppress
+  unchanged posts.
+- **C:** `readPoller:1700` fires uInt32Digital only on `forceCallback_ || (masked newValue != masked
+  prevValue)`. (int32/int64/float64 are fired unconditionally by BOTH C and Rust — C comment: "called
+  even if the data has not changed, because we could be doing ADC averaging"; only uInt32Digital is
+  on-change in C.)
+- **Impact:** a uInt32Digital I/O-Intr record (bi/mbbi/mbbiDirect) processes every poll in Rust vs
+  only-on-change in C. CA monitor posts are identical (the record's deadband suppresses unchanged
+  VAL); the divergence is extra record processing each poll (forward links / .PROC side effects fire
+  every poll). A faithful fix needs per-offset prev-value tracking in `poll_cycle` to gate the fire.
+  Documented in the `ioc.rs` poll_cycle comment.
 
 ---
 

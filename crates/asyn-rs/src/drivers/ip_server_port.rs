@@ -57,7 +57,7 @@ use std::time::Duration;
 // and take out the port (std::sync::Mutex would).
 use parking_lot::Mutex;
 
-use crate::drivers::ip_port::socket_poll_timeout;
+use crate::drivers::ip_port::{is_nonfatal_read_timeout, socket_poll_timeout};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::{EomReason, OctetReadResult};
@@ -923,15 +923,15 @@ impl DrvAsynIPServerPort {
                     EomReason::empty()
                 },
             }),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
-                })
-            }
+            // C parity: the server data read flows through a child
+            // `drvAsynIPPort` whose `readRaw` (798-800) treats EINTR as a
+            // non-fatal timeout, identically to EWOULDBLOCK — `Interrupted`
+            // must not surface as a hard read error. Shared owner of the
+            // non-fatal-read-error set: `is_nonfatal_read_timeout`.
+            Err(e) if is_nonfatal_read_timeout(e.kind()) => Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }),
             Err(e) => Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("read failed: {e}"),
@@ -1199,15 +1199,14 @@ impl PortDriver for DrvAsynIPSubport {
                 })
             }
             Ok(n) => Ok(n),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
-                })
-            }
+            // C parity: a child `drvAsynIPPort` `readRaw` (798-800) treats
+            // EINTR as a non-fatal timeout, identically to EWOULDBLOCK —
+            // `Interrupted` must not surface as a hard read error. Shared
+            // owner of the non-fatal-read-error set: `is_nonfatal_read_timeout`.
+            Err(e) if is_nonfatal_read_timeout(e.kind()) => Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }),
             Err(e) => Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("read failed: {e}"),

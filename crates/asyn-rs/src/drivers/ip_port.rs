@@ -490,23 +490,36 @@ pub struct DrvAsynIPPort {
     host_info: String,
 }
 
-/// Classify a failed socket read. C `readRaw` (drvAsynIPPort.c:798-800)
-/// excludes BOTH `EWOULDBLOCK` and `EINTR` from the fatal-disconnect
-/// disjunct, so a would-block timeout AND a signal-interrupted read both
-/// surface as `asynTimeout` with the socket left intact (the caller retries);
-/// any other error is a real transport failure (`Io`) that the read path's
-/// teardown treats as fatal. Single owner of read-error classification for
-/// the TCP/UDP/Unix read arms — keeps `Interrupted` (EINTR) on the
-/// timeout/non-fatal path identically to `WouldBlock`, exactly as C does.
-fn classify_read_error(e: std::io::Error) -> AsynError {
-    match e.kind() {
+/// True for a socket read error that C `readRaw` treats as a non-fatal
+/// timeout — the socket is left intact and the caller retries. C
+/// (drvAsynIPPort.c:798-800) excludes BOTH `EWOULDBLOCK` *and* `EINTR` from
+/// the fatal-disconnect disjunct, so a would-block / poll timeout AND a
+/// signal-interrupted read are equally non-fatal. Single owner of that rule,
+/// shared by the IP client read arms (`classify_read_error`) and the IP
+/// server read arms (`ip_server_port`), so "EINTR is non-fatal like
+/// WouldBlock" is defined in exactly one place.
+pub(crate) fn is_nonfatal_read_timeout(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
         std::io::ErrorKind::TimedOut
-        | std::io::ErrorKind::WouldBlock
-        | std::io::ErrorKind::Interrupted => AsynError::Status {
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Classify a failed socket read for the IP client read arms. A non-fatal
+/// timeout (see [`is_nonfatal_read_timeout`]) surfaces as `asynTimeout` with
+/// the socket left intact; any other error is a real transport failure
+/// (`Io`) that the read path's teardown treats as fatal. Single owner of
+/// read-error classification for the TCP/UDP/Unix read arms.
+fn classify_read_error(e: std::io::Error) -> AsynError {
+    if is_nonfatal_read_timeout(e.kind()) {
+        AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        },
-        _ => AsynError::Io(e),
+        }
+    } else {
+        AsynError::Io(e)
     }
 }
 

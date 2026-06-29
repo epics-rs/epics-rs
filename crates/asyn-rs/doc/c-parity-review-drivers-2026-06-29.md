@@ -389,3 +389,20 @@ contracts / behavioral models, not just a driver site.
   subport (byte stream, base behaviour == default synthesis). Regression test
   `udp_server_read_eom_reports_end_at_datagram_boundary`. asyn-rs clippy
   `--all-targets` + nextest (658) green.
+
+- **DRV-47** (F5-remaining — prologix read drops eomReason END/EOS/CNT) —
+  CLEARED. C `readIt` (drvPrologixGPIB.c:334-349) buffers the whole device
+  message, serves it in caller-sized chunks, and returns `eomReason` per chunk:
+  the final chunk (caller buffer holds the rest) is `ASYN_EOM_EOS` when an EOS
+  char is configured else `ASYN_EOM_END` (binary/EOI), a buffer-limited chunk
+  is `ASYN_EOM_CNT`, and an exact fit sets both. The Rust prologix had no
+  `io_read_octet_eom` override, so the default actor synthesis reported CNT-only
+  and lost the GPIB EOI/EOS boundary. `io_read_octet_eom` is now the single
+  owner of the read path (the old `read_octet` body moved into it; `read_octet`
+  delegates and discards the EOM); both serve points (staged `read_carry`
+  remainder and a fresh bridge read) compute the EOM through one free
+  `read_eom(remaining, maxchars, eos_set)` helper that encodes the C rule.
+  Tests: `read_eom_rule_matches_c_readit` (per-boundary unit test of the rule),
+  `read_eom_carry_path_reports_boundary` (carry-drain CNT→END), plus END/EOS
+  assertions added to the two end-to-end read tests. asyn-rs clippy
+  `--all-targets` + nextest (660) green.

@@ -52,6 +52,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interpose::EomReason;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -67,6 +68,29 @@ pub const DEFAULT_TCP_PORT: u16 = 1234;
 /// Initial output staging buffer capacity. Matches C asyn
 /// `pdpvt->bufCapacity = 4096`. Read path grows as needed.
 pub const DEFAULT_BUF_CAPACITY: usize = 4096;
+
+/// End-of-message reason for a prologix read chunk. Single owner of
+/// the C `readIt` rule (drvPrologixGPIB.c:334-345): the device message
+/// is fully buffered, then served in caller-sized chunks. The final
+/// chunk — the caller buffer (`maxchars`) holds the rest of the
+/// message (`remaining`) — carries `ASYN_EOM_EOS` when an EOS char is
+/// configured, else `ASYN_EOM_END` (binary/EOI mode). A buffer-limited
+/// chunk carries `ASYN_EOM_CNT`; an exact fit (`remaining == maxchars`)
+/// sets both.
+fn read_eom(remaining: usize, maxchars: usize, eos_set: bool) -> EomReason {
+    let mut eom = EomReason::empty();
+    if maxchars >= remaining {
+        eom |= if eos_set {
+            EomReason::EOS
+        } else {
+            EomReason::END
+        };
+    }
+    if remaining >= maxchars {
+        eom |= EomReason::CNT;
+    }
+    eom
+}
 
 /// Mutable per-driver state — last-sent GPIB address (so `++addr`
 /// is suppressed when unchanged), EOS char (or `None` for "let the
@@ -384,6 +408,22 @@ impl PortDriver for DrvAsynPrologixPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.io_read_octet_eom(user, buf).map(|(n, _)| n)
+    }
+
+    /// Octet read that also reports the end-of-message reason. Single
+    /// owner of the prologix read path; [`read_octet`] delegates here
+    /// and discards the EOM. C `readIt` (drvPrologixGPIB.c:334-349)
+    /// returns `eomReason` (END/EOS/CNT) alongside the byte count; the
+    /// default actor synthesis would report CNT-only and lose the GPIB
+    /// EOI / EOS message boundary.
+    ///
+    /// [`read_octet`]: PortDriver::read_octet
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
         self.base.check_ready()?;
         // Drain bytes left over from a previous read whose buffer was
         // too small before issuing a new bridge `++read` — otherwise
@@ -392,10 +432,12 @@ impl PortDriver for DrvAsynPrologixPort {
         {
             let mut st = self.state.lock().unwrap();
             if !st.read_carry.is_empty() {
-                let n = st.read_carry.len().min(buf.len());
+                let remaining = st.read_carry.len();
+                let n = remaining.min(buf.len());
                 buf[..n].copy_from_slice(&st.read_carry[..n]);
                 st.read_carry.drain(..n);
-                return Ok(n);
+                let eom = read_eom(remaining, buf.len(), st.eos.is_some());
+                return Ok((n, eom));
             }
         }
         self.set_address(user)?;
@@ -459,14 +501,16 @@ impl PortDriver for DrvAsynPrologixPort {
         if eos.is_none() && acc.last() == Some(&EOT_MARKER) {
             acc.pop();
         }
-        let n = acc.len().min(buf.len());
+        let remaining = acc.len();
+        let n = remaining.min(buf.len());
         buf[..n].copy_from_slice(&acc[..n]);
-        if n < acc.len() {
+        if n < remaining {
             // Caller's buffer was too small — stash the remainder so the
             // next read_octet returns it instead of dropping device data.
             self.state.lock().unwrap().read_carry = acc.split_off(n);
         }
-        Ok(n)
+        let eom = read_eom(remaining, buf.len(), eos.is_some());
+        Ok((n, eom))
     }
 }
 
@@ -680,6 +724,72 @@ mod tests {
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }
 
+    /// DRV-47: the end-of-message rule must match C `readIt`
+    /// (drvPrologixGPIB.c:334-345) at every boundary — full fit flags
+    /// the boundary (EOS if configured, else END), a buffer-limited
+    /// chunk flags CNT, and an exact fit flags both.
+    #[test]
+    fn read_eom_rule_matches_c_readit() {
+        // Full fit, binary/EOI mode -> END only.
+        let e = read_eom(5, 16, false);
+        assert!(e.contains(EomReason::END));
+        assert!(!e.contains(EomReason::EOS));
+        assert!(!e.contains(EomReason::CNT));
+        // Full fit, EOS configured -> EOS only.
+        let e = read_eom(5, 16, true);
+        assert!(e.contains(EomReason::EOS));
+        assert!(!e.contains(EomReason::END));
+        assert!(!e.contains(EomReason::CNT));
+        // Buffer-limited (more of the message remains) -> CNT, no boundary.
+        let e = read_eom(20, 8, false);
+        assert!(e.contains(EomReason::CNT));
+        assert!(!e.contains(EomReason::END));
+        assert!(!e.contains(EomReason::EOS));
+        // Exact fit -> boundary AND CNT (C sets both when remaining == maxchars).
+        let e = read_eom(8, 8, false);
+        assert!(e.contains(EomReason::END));
+        assert!(e.contains(EomReason::CNT));
+        let e = read_eom(8, 8, true);
+        assert!(e.contains(EomReason::EOS));
+        assert!(e.contains(EomReason::CNT));
+    }
+
+    /// DRV-47: serving a staged `read_carry` remainder through
+    /// `io_read_octet_eom` must report the boundary — CNT while the
+    /// caller buffer is too small, END once the remainder is fully
+    /// drained (binary/EOI mode, no eos char).
+    #[test]
+    fn read_eom_carry_path_reports_boundary() {
+        let (port, _rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        // Stage a remainder (EOT marker already stripped, so its end is
+        // the true end of message).
+        drv.state.lock().unwrap().read_carry = b"RESULT".to_vec();
+        let user = AsynUser::default()
+            .with_addr(3)
+            .with_timeout(Duration::from_secs(2));
+
+        // Buffer too small (4 < 6): partial -> CNT, no END.
+        let mut small = [0u8; 4];
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut small).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&small[..4], b"RESU");
+        assert!(eom.contains(EomReason::CNT));
+        assert!(!eom.contains(EomReason::END));
+
+        // Remainder fits -> END, no CNT.
+        let mut rest = [0u8; 16];
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut rest).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&rest[..2], b"LT");
+        assert!(eom.contains(EomReason::END));
+        assert!(!eom.contains(EomReason::CNT));
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
     /// `read_octet` end-to-end: driver sends `++read eoi\n`, the
     /// bridge replies with payload + EOT_MARKER, the driver returns
     /// the payload with the marker stripped. Covers the no-EOS path
@@ -725,11 +835,22 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"42.5\n",
             "EOT marker should be stripped, leaving `42.5\\n`"
+        );
+        // DRV-47: binary/EOI mode, the whole message fits the buffer ->
+        // ASYN_EOM_END (not EOS, no CNT) per C readIt:339-340.
+        assert!(
+            eom.contains(EomReason::END),
+            "EOI message boundary must flag END"
+        );
+        assert!(!eom.contains(EomReason::EOS));
+        assert!(
+            !eom.contains(EomReason::CNT),
+            "full-fit read must NOT flag CNT"
         );
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }
@@ -777,12 +898,19 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"OK\n",
             "eos char must be preserved as part of payload"
         );
+        // DRV-47: with an EOS char configured the final chunk carries
+        // ASYN_EOM_EOS (not END) per C readIt:337-338.
+        assert!(
+            eom.contains(EomReason::EOS),
+            "EOS-mode message boundary must flag EOS"
+        );
+        assert!(!eom.contains(EomReason::END));
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }
 

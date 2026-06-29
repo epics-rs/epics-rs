@@ -196,22 +196,41 @@ impl DrvAsynPrologixPort {
         self.state.lock().unwrap().eos
     }
 
-    /// Set EOS char (`Some(c)`) or disable (`None` — EOT marker
-    /// fallback). Mirrors C asyn `prologixSetEos`. The actual wire
-    /// effect is applied lazily on the next read/write — same as C
-    /// asyn which only re-issues `++eot_enable` when toggling
-    /// between "EOS-driven" and "EOT-marker" modes.
-    pub fn set_eos(&self, eos: Option<u8>) -> AsynResult<()> {
-        let mut s = self.state.lock().unwrap();
-        if s.eos == eos {
+    /// The `++eot_enable` argument the bridge needs for the given EOS mode.
+    /// C `prologixSetEos` (drvPrologixGPIB.c:456) sends `++eot_enable (eos<0)`:
+    /// in EOI mode (no eos char) the bridge must append the EOT marker on EOI
+    /// detection so the reader can find the end of message (enable=1); in EOS
+    /// mode the read terminates on the eos char, so the EOT marker must be
+    /// disabled (enable=0) — otherwise the bridge trails it after the eos byte
+    /// and the eos-terminated read never sees its terminator. (C computes this
+    /// from the *stale* pre-update eos and never stores the new value — a bug
+    /// not copied; we derive it from the live state.)
+    fn eot_enable_arg(eos: Option<u8>) -> u8 {
+        u8::from(eos.is_none())
+    }
+
+    /// Set EOS char (`Some(c)`) or disable (`None` — EOI / EOT-marker mode).
+    /// Mirrors C asyn `prologixSetEos` (drvPrologixGPIB.c:439-459), but realizes
+    /// the intent C's never-store bug dropped: the driver-level `eos` actually
+    /// changes, and the bridge's `++eot_enable` is re-issued to follow it (1 in
+    /// EOI mode, 0 in EOS mode, see [`Self::eot_enable_arg`]) so the EOT marker
+    /// never collides with an eos-terminated read. Single owner of the eos
+    /// transition (also reached via `set_input_eos`).
+    pub fn set_eos(&mut self, eos: Option<u8>) -> AsynResult<()> {
+        if self.state.lock().unwrap().eos == eos {
             return Ok(());
         }
-        // C asyn sends `++eot_enable %d` with the *previous* eos<0
-        // boolean to flip the bridge between "use EOI/EOT marker" and
-        // "trust user EOS char". The inner write requires &mut self
-        // routing — we punt the bridge command to the next read/write
-        // path which already knows how to send `++` lines.
-        s.eos = eos;
+        // Re-issue the bridge EOT mode only while connected; otherwise the
+        // connect handshake applies it (it derives `++eot_enable` from this
+        // state). Commit `State.eos` only after a successful bridge write, so a
+        // failed write never leaves the cached mode out of sync with the
+        // device (the DRV-35 commit-after-apply rule).
+        if self.base.connected {
+            let cmd = format!("++eot_enable {}\n", Self::eot_enable_arg(eos));
+            let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
+            self.inner.write_octet(&mut bridge_user, cmd.as_bytes())?;
+        }
+        self.state.lock().unwrap().eos = eos;
         Ok(())
     }
 
@@ -326,10 +345,16 @@ impl PortDriver for DrvAsynPrologixPort {
         if user.addr < 0 {
             self.inner.connect(user)?;
             // 8-line init burst — sent as one TCP write to match
-            // C asyn (single `pasynOctetSyncIO->write`).
+            // C asyn (single `pasynOctetSyncIO->write`). C hardcodes
+            // `++eot_enable 1` here (drvPrologixGPIB.c:182) because its
+            // driver-level eos is always -1 (the never-store bug). This port
+            // does eos at the driver level, so the EOT mode must follow the
+            // configured eos even when it was set before connect: derive it
+            // from State.eos (default None -> 1, matching C's common case).
+            let eot_enable = Self::eot_enable_arg(self.state.lock().unwrap().eos);
             let init = format!(
                 "++savecfg 0\n++mode 1\n++ifc\n++eos 3\n++eoi 1\n\
-                 ++eot_char {EOT_MARKER}\n++eot_enable 1\n++ver\n",
+                 ++eot_char {EOT_MARKER}\n++eot_enable {eot_enable}\n++ver\n",
             );
             let mut tu = AsynUser::default().with_timeout(Duration::from_secs(1));
             self.inner.write_octet(&mut tu, init.as_bytes())?;
@@ -925,6 +950,58 @@ mod tests {
         // Output EOS is unsupported on a GPIB port (C asynGpib NULL vtable).
         assert!(drv.set_output_eos(b"\n").is_err());
         assert!(drv.get_output_eos().is_empty());
+    }
+
+    /// DRV-46(b): the bridge `++eot_enable` must follow the configured eos so
+    /// the EOT marker never collides with an eos-terminated read (C
+    /// prologixSetEos design, drvPrologixGPIB.c:456). Setting an eos char while
+    /// connected issues `++eot_enable 0`; clearing it restores `++eot_enable 1`.
+    #[test]
+    fn eos_mode_toggles_bridge_eot_enable() {
+        let (port, rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        drv.set_eos(Some(b'\n')).unwrap(); // enter EOS mode -> eot_enable 0
+        drv.set_eos(None).unwrap(); // leave EOS mode -> eot_enable 1
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+        let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let s = String::from_utf8_lossy(&captured).to_string();
+        // Strip the init burst (its own ++eot_enable) to focus on the post-init
+        // transitions.
+        let init_end = s.find("++ver\n").unwrap() + "++ver\n".len();
+        assert_eq!(
+            &s[init_end..],
+            "++eot_enable 0\n++eot_enable 1\n",
+            "eos set/clear must toggle the bridge EOT mode: {:?}",
+            &s[init_end..]
+        );
+    }
+
+    /// DRV-46(b): an eos char configured before connect makes the connect init
+    /// burst select `++eot_enable 0` — the handshake derives the EOT mode from
+    /// State.eos (C's always-1 connect is only correct because its eos is
+    /// permanently -1).
+    #[test]
+    fn eos_set_before_connect_seeds_eot_enable_off() {
+        let (port, rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        // Set eos while disconnected: no bridge write, just cached state.
+        drv.set_eos(Some(b'\n')).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+        let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let s = String::from_utf8_lossy(&captured).to_string();
+        assert!(
+            s.contains("++eot_enable 0\n"),
+            "init burst must select ++eot_enable 0 when eos preset: {s:?}"
+        );
+        assert!(
+            !s.contains("++eot_enable 1\n"),
+            "no ++eot_enable 1 should appear when eos preset: {s:?}"
+        );
     }
 
     /// DRV-47: the end-of-message rule must match C `readIt`

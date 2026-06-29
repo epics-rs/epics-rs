@@ -654,6 +654,13 @@ impl PortDriver for DrvAsynSerialPort {
             unsafe { libc::cfmakeraw(&mut t) };
             // Enable receiver, local mode
             t.c_cflag |= libc::CREAD | libc::CLOCAL;
+            // C parity (drvAsynSerialPort.c:1080): the default input flags are
+            // IGNBRK | IGNPAR. cfmakeraw clears IGNBRK (and never sets IGNPAR),
+            // so without this a line BREAK or a framing/parity error reaches
+            // the reader as a spurious 0x00 byte where C silently ignores it.
+            // apply_to_termios only touches c_iflag for XON/XOFF flow, so these
+            // survive the config layer.
+            t.c_iflag |= libc::IGNBRK | libc::IGNPAR;
             // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte
             t.c_cc[libc::VMIN] = 1;
             t.c_cc[libc::VTIME] = 0;
@@ -1909,5 +1916,37 @@ mod tests {
             }
             unsafe { libc::close(fd2) };
         }
+    }
+
+    /// DRV-32: C (drvAsynSerialPort.c:1080) sets the default input flags to
+    /// IGNBRK | IGNPAR so a line BREAK / framing-parity error is ignored
+    /// rather than delivered as a spurious 0x00 byte. cfmakeraw clears IGNBRK
+    /// and never sets IGNPAR, so the driver must restore them after cfmakeraw.
+    #[test]
+    fn pty_termios_sets_ignbrk_ignpar() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_ignbrk", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let t = drv.get_current_termios().unwrap();
+        assert_ne!(
+            t.c_iflag & libc::IGNBRK,
+            0,
+            "IGNBRK must be set (C default, drvAsynSerialPort.c:1080)"
+        );
+        assert_ne!(
+            t.c_iflag & libc::IGNPAR,
+            0,
+            "IGNPAR must be set (C default, drvAsynSerialPort.c:1080)"
+        );
     }
 }

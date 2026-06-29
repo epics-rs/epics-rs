@@ -162,6 +162,32 @@ architecture), F8 (write_octet count contract), and F3 (UDP redesign) are
 surfaced for sign-off before implementation because they change framework
 contracts / behavioral models, not just a driver site.
 
+### Round 2 — 2026-06-29 (verification, 2 fresh opus panels) — CONVERGED
+
+Verification round on the F5-remaining + F8 + DIV (DRV-61/62) batch. Both
+panels returned **CLEARED on every item, zero DEFECT, zero CONCERN requiring
+code change**:
+
+- DRV-23 ip_server UDP eom (incl. the effc2766 exact-fit `END|CNT` refinement),
+  DRV-47 prologix eom, F8 `write_octet -> usize` contract + per-driver and
+  downstream counts, DRV-61 noDelay strict Y/N, DRV-62 serial bool/parity strict
+  — all byte-exact against C.
+- Confirmed Rust correctly declines three C bugs (not copying): the UDP readIt
+  off-by-one (drvAsynIPServerPort.c:196-200) + its dead :235 CNT branch; the
+  modbus Z-string `--*nActual` under-report / SIZE_MAX underflow
+  (drvModbusAsyn.cpp:1552); and (documented, acceptable) the write-error
+  partial-count omission.
+- **Unverifiable-pending-source:** mqtt `write_octet` exact `*nbytesTransfered`
+  for an embedded-NUL payload is owned by the `autoparamDriver` framework, which
+  is not vendored locally (only drvMqtt.cpp/.h under epics-modules/mqtt/, and
+  autoparamDriver.h is absent from ~/codes entirely). `raw.len()` is
+  semantically correct (published, NUL-truncated length) but mid-string-NUL
+  byte-exactness needs that source to close.
+
+Note: the caucus driver-review panels wedged on a display/SIGWINCH event this
+session; restart-resume left them untracked (briefs never landed). This round
+ran on two freshly-spawned panels — the reliable path.
+
 ## Fix Log
 
 - **DRV-5** (DEFECT, ip_port write-side teardown) — CLEARED. Added a single

@@ -70,9 +70,9 @@ impact paragraphs in the round report
 |---|---|---|---|---|
 | DRV-16 | CONCERN | ip_server_port.rs:529-535 | drvAsynIPServerPort.c:373-383 | new-TCP-connection octet-interrupt callback never delivered (the driver's documented purpose) |
 | DRV-17 | CONCERN | ip_server_port.rs:887-893,683-689 | drvAsynIPServerPort.c:311-320 | UDP datagram octet-interrupt push delivery missing → I/O Intr record never fires |
-| DRV-18 | CONCERN | ip_server_port.rs:408-415 | drvAsynIPServerPort.c:426-429 | UDP datagram-fanout SO_REUSEPORT not set; comment wrongly asserts parity |
-| DRV-19 | CONCERN | ip_server_port.rs:451-457,391-397 | drvAsynIPServerPort.c:403-419 | host/iface not resolved — bare `SocketAddr::parse` rejects `localhost`/hostnames/empty-host (client driver resolves correctly) |
-| DRV-20 | CONCERN | ip_server_port.rs (no io_flush) | drvAsynIPServerPort.c:240-247,655 | UDP `flush` doesn't discard cached datagram → stale datagram on flush-then-read |
+| DRV-18 | CLEARED | ip_server_port.rs:408-415 | drvAsynIPServerPort.c:426-429 | UDP datagram-fanout SO_REUSEPORT not set; comment wrongly asserts parity — FIXED 4dc28663 |
+| DRV-19 | CLEARED | ip_server_port.rs:451-457,391-397 | drvAsynIPServerPort.c:403-419 | host/iface not resolved — bare `SocketAddr::parse` rejects `localhost`/hostnames/empty-host (client driver resolves correctly) — FIXED e502ccfb |
+| DRV-20 | CLEARED | ip_server_port.rs (no io_flush) | drvAsynIPServerPort.c:240-247,655 | UDP `flush` doesn't discard cached datagram → stale datagram on flush-then-read — FIXED d890bafa |
 | DRV-21 | LOW | ip_server_port.rs:486 | drvAsynIPServerPort.c:447 | listen backlog hardcoded 128 not `maxClients` (intentional/documented) |
 | DRV-22 | LOW | ip_server_port.rs:328 | drvAsynIPServerPort.c:545-548 | `maxClients==0` coerced to 1 instead of rejected |
 | DRV-23 | LOW | ip_server_port.rs:683-689,823-836 | drvAsynIPServerPort.c:201-207,232-236 | UDP read drops `ASYN_EOM_END` at datagram boundary |
@@ -512,3 +512,62 @@ full-workspace pre-push pass still owed.
   - DISTINCT (C does not auto-install, not part of this family, still open):
     prologix DRV-46 (own in-driver `eos`, no interpose), DRV-49 (prologix
     iocsh command), ip_server (`drvAsynIPServerPort.c:659` `0,0,0`).
+
+- **DRV-19** (CONCERN — ip_server bind host not resolved) — CLEARED
+  e502ccfb. Both the TCP (`bind_with_options`) and UDP
+  (`open_udp_listener`) paths parsed `host:port` with a bare
+  `SocketAddr::parse`, which only accepts IP literals — empty host,
+  `localhost`, and every DNS hostname were rejected, so a server could
+  never bind a named interface. C `createServerSocket`
+  (drvAsynIPServerPort.c:403-419) defaults the address to `INADDR_ANY`
+  (:404) and overrides it only for a host that is non-empty AND not
+  `localhost` (:412-413), resolving that name via `hostToIPAddr` (:414).
+  C deliberately maps both empty and `localhost` to `INADDR_ANY` (its
+  comment directs callers to `127.0.0.1` for loopback) — faithful parity,
+  not a copied bug. Added one `resolve_bind_addr` owner shared by both
+  paths: empty/`localhost` (case-insensitive) → `0.0.0.0`; IP literal →
+  verbatim (preserves the explicit IPv4/IPv6 paths, no lookup); other
+  name → resolved like the client driver. `bind_with_options` now takes
+  the resolved `SocketAddr`. Tests:
+  `resolve_bind_addr_maps_localhost_and_empty_to_inaddr_any`,
+  `connect_localhost_named_host_binds`.
+- **DRV-18** (CONCERN — UDP datagram-fanout SO_REUSEPORT not set) —
+  CLEARED 4dc28663. The UDP server socket set only SO_REUSEADDR and a
+  comment wrongly claimed upstream C never uses SO_REUSEPORT. C
+  `createServerSocket` calls
+  `epicsSocketEnableAddressUseForDatagramFanout(tty->fd)` for SOCK_DGRAM
+  (drvAsynIPServerPort.c:426-429), which sets SO_REUSEPORT (where
+  available) + SO_REUSEADDR so multiple IOCs can bind the same UDP port
+  and the kernel fans each datagram out. The TCP listener keeps
+  SO_REUSEADDR alone (:430) — the fanout helper is SOCK_DGRAM-only.
+  Verified by reading `osdSockAddrReuse.cpp` (sets SO_REUSEPORT then
+  SO_REUSEADDR). Set SO_REUSEPORT on the UDP socket before bind (unix);
+  the "no SO_REUSEPORT *token*" doc note stays accurate (no config-string
+  token; the option is enabled directly). Test (reads the option back off
+  the bound socket): `reuse_port_set_for_udp_only_not_tcp`.
+- **DRV-20** (CONCERN — UDP flush doesn't discard cached datagram) —
+  CLEARED d890bafa. `DrvAsynIPServerPort` had no `io_flush` override, so
+  the framework default no-op left the cached datagram in place — a
+  flush-then-read re-returned the stale datagram. C registers `flushIt`
+  only for the UDP server (drvAsynIPServerPort.c:655) and it resets
+  `UDPbufferPos`/`UDPbufferSize` (flushIt:244-245). Added an `io_flush`
+  override clearing `udp_cache` in UDP mode (which also lets the recv
+  worker, refilling only when empty, fetch the next datagram); TCP server
+  mode registers no flush in C (the SOCK_DGRAM-only block at :652-656) so
+  it keeps the default no-op. Tests:
+  `udp_server_flush_discards_cached_datagram`, `tcp_server_flush_is_noop`.
+  asyn-rs clippy `--all-targets` + nextest (671) green.
+
+- **DRV-16 / DRV-17** (CONCERN — ip_server octet-interrupt push: new-TCP-
+  connection name and UDP datagram bytes) — OPEN, surfaced for sign-off.
+  This is the driver's documented purpose: C `drvAsynIPServerPort.c`
+  issues an `asynOctet` *interface* interrupt to every `octetCallbackPvt`
+  user with the new client's port name on TCP accept (:373-383) and with
+  the datagram bytes on each UDP `recvfrom` (:311-320). asyn-rs models
+  only **parameter** interrupts (`InterruptManager` /
+  `InterruptValue{reason,…}`); there is no asynOctet-interface interrupt
+  list, no `registerInterruptSource(octet)` analogue, and no consumer
+  (devAsynOctet I/O Intr). Closing this is a new framework subsystem
+  (interrupt source + push + a consuming device-support path), not a local
+  driver fix — modelling only the push without a consumer would be fake
+  parity. Deferred pending sign-off, same as F3/F8.

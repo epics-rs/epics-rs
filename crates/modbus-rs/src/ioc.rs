@@ -41,8 +41,9 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::EomReason;
-use asyn_rs::param::ParamType;
+use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -417,7 +418,6 @@ impl ModbusPortDriver {
         self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
 
         let active: Vec<(usize, i32)> = self.active.iter().copied().collect();
-        let mut addrs: HashSet<i32> = HashSet::new();
         for (reason, addr) in active {
             let Ok(dt) = self.datatype_of(reason) else {
                 continue;
@@ -435,26 +435,79 @@ impl ModbusPortDriver {
                 let (bytes, _) =
                     datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
                 let s = String::from_utf8_lossy(&bytes).into_owned();
-                self.base.set_string_param(reason, addr, s)?;
+                // C `readPoller` fires only the octet interrupt list for a string
+                // offset (drvModbusAsyn.cpp:1894-1921); asynOctet records are the
+                // sole subscribers, so a single typed fire suffices.
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Octet,
+                    ParamValue::Octet(s),
+                    0,
+                );
             } else {
-                let (v, _) = datatype::read_float(dt, regs).map_err(to_asyn)?;
-                self.base.set_float64_param(reason, addr, v)?;
+                // C `readPoller` decodes the SAME register block separately per
+                // scalar interface and fires each interface's own interrupt list
+                // (drvModbusAsyn.cpp:1736 int32 / 1772 int64 / 1808 float64 / 1706
+                // uInt32Digital). One Modbus offset can be bound at once by an
+                // asynInt32 ai (ESLO convert), an asynInt64 int64in, an
+                // asynFloat64 ai (ASLO/SMOO), and an asynUInt32Digital bi (mask),
+                // each needing the value in its own type — collapsing to one
+                // Float64 (the old path) delivered a wrong-typed value to all but
+                // the asynFloat64 record. Decode all up front so a mid-decode
+                // error aborts the poll before any partial fire; the interrupt
+                // iface filter routes each tagged value to only its interface's
+                // records.
+                let i32v = datatype::read_int32(dt, regs).map_err(to_asyn)?.0;
+                let i64v = datatype::read_int64(dt, regs).map_err(to_asyn)?.0;
+                let f64v = datatype::read_float(dt, regs).map_err(to_asyn)?.0;
+                // Raw register word for UInt32Digital; the record applies its own
+                // @asynMask via `apply_raw_readback`, matching the polled
+                // `read_uint32_digital` which delivers the unmasked word.
+                let word = regs.first().copied().unwrap_or(0) as u32;
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Int32,
+                    ParamValue::Int32(i32v),
+                    0,
+                );
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Int64,
+                    ParamValue::Int64(i64v),
+                    0,
+                );
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Float64,
+                    ParamValue::Float64(f64v),
+                    0,
+                );
+                // C fires uInt32Digital on change (`forceCallback_ || newValue !=
+                // prevValue`, drvModbusAsyn.cpp:1700); modbus-rs polls
+                // unconditionally and lets the record's monitor deadband suppress
+                // unchanged posts. `!0` (all bits changed) overlaps any record
+                // `@asynMask` so the mask filter never gates the value out
+                // (asynPortDriver.cpp:720).
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::UInt32Digital,
+                    ParamValue::UInt32Digital(word),
+                    !0,
+                );
             }
-            self.base.mark_param_changed(reason, addr)?;
-            addrs.insert(addr);
         }
         self.publish_stats()?;
-        // The statistics/control params are all set at asyn addr 0 (their
-        // `statistics.template` records bind `@asyn($(PORT) 0)`). Their
-        // changed-param list lives in addr 0's bucket, so flush addr 0 every
-        // cycle regardless of whether a data record happens to sit there —
-        // otherwise the statistics monitors never post.
+        // The statistics/control params are set at asyn addr 0 (their
+        // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
+        // through the param-cache callback path — they are single-interface
+        // control values, not per-interface data points. Flush addr 0 every
+        // cycle so the statistics monitors post.
         self.base.call_param_callbacks(0)?;
-        for addr in addrs {
-            if addr != 0 {
-                self.base.call_param_callbacks(addr)?;
-            }
-        }
         Ok(())
     }
 
@@ -2901,6 +2954,86 @@ mod tests {
         assert!(
             saw_read_ok,
             "READ_OK statistics monitor must post at addr 0 after a poll cycle"
+        );
+    }
+
+    /// R54: one Modbus offset feeds several asyn interfaces, each needing the
+    /// value in its own type. A poll cycle must fire a separately-decoded value
+    /// per interface — int32 / int64 / float64 / the raw uInt32Digital word —
+    /// not one collapsed Float64. Port of `readPoller`'s per-interface fan-out
+    /// (drvModbusAsyn.cpp:1700-1815): an asynUInt32Digital `bi` sees the raw
+    /// register word while an asynInt32 `ai` sees the multi-register integer.
+    #[test]
+    fn poll_cycle_fires_per_interface_typed_values() {
+        // 4 holding registers: 0x0001, 0x0002, 0x0003, 0x0004.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = ModbusPortDriver::new(
+            "MB_PER_IFACE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+
+        // Activate the INT32_LE reason at addr 0. As a 32-bit little-endian
+        // value the two-register decode (0x0002_0001 = 131073) differs from the
+        // raw word (regs[0] = 1) the uInt32Digital interface delivers — so the
+        // per-interface decode is observable, not the same number typed four
+        // ways. `datatype_of` is per-reason, so the value is decoded as
+        // Int32Le even though the port's config datatype is UInt16.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+        let mut ruser = AsynUser::new(reason);
+        ruser.addr = 0;
+        assert!(driver.read_int32(&ruser).is_ok());
+
+        let mut rx = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+
+        let mut int32 = None;
+        let mut int64 = None;
+        let mut float64 = None;
+        let mut uint32 = None;
+        while let Ok(iv) = rx.try_recv() {
+            if iv.reason != reason || iv.addr != 0 {
+                continue;
+            }
+            match (iv.iface, &iv.value) {
+                (Some(InterfaceType::Int32), ParamValue::Int32(v)) => int32 = Some(*v),
+                (Some(InterfaceType::Int64), ParamValue::Int64(v)) => int64 = Some(*v),
+                (Some(InterfaceType::Float64), ParamValue::Float64(v)) => float64 = Some(*v),
+                (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                    assert_eq!(
+                        iv.uint32_changed_mask, !0,
+                        "uInt32Digital fire must mark all bits changed so no @asynMask gates it out"
+                    );
+                    uint32 = Some(*v);
+                }
+                other => panic!("unexpected per-interface fire: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            int32,
+            Some(0x0002_0001),
+            "asynInt32 must see the 32-bit Int32Le decode"
+        );
+        assert_eq!(
+            int64,
+            Some(0x0002_0001),
+            "asynInt64 must see the widened integer"
+        );
+        assert_eq!(
+            float64,
+            Some(131073.0),
+            "asynFloat64 must see the float decode"
+        );
+        assert_eq!(
+            uint32,
+            Some(1),
+            "asynUInt32Digital must see the raw register word, not the collapsed value"
         );
     }
 

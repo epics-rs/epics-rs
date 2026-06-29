@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 
 use crate::error::AsynStatus;
+use crate::interfaces::InterfaceType;
 use crate::param::ParamValue;
 
 /// Filter for selecting which interrupts to receive.
@@ -18,6 +19,20 @@ pub struct InterruptFilter {
     /// If set, only interrupts where changed bits overlap this mask are forwarded.
     /// C parity: pInterrupt->mask in asynUInt32DigitalInterrupt.
     pub uint32_mask: Option<u32>,
+    /// If set, only receive interrupts whose value was produced for this asyn
+    /// interface. `None` = accept any interface (the legacy/untyped path).
+    ///
+    /// C asyn keeps a separate interrupt list per interface type
+    /// (`int32InterruptList` / `float64InterruptList` /
+    /// `uInt32DigitalInterruptList` …, asynManager interruptBase is allocated
+    /// per interface), so one reason delivers an interface-correct value to
+    /// each record by the interface its DTYP bound. A record subscribes with
+    /// its own interface here; a driver that fires per-interface values
+    /// (`PortDriverBase::notify_interface_value`) tags each, and only the
+    /// matching records receive it. A driver that fires a single untyped value
+    /// (`call_param_callbacks`) leaves the value's `iface` `None`, which every
+    /// subscriber still accepts — preserving the pre-per-interface behaviour.
+    pub iface: Option<InterfaceType>,
 }
 
 impl InterruptFilter {
@@ -37,6 +52,18 @@ impl InterruptFilter {
         }
         if let Some(m) = self.uint32_mask {
             if iv.uint32_changed_mask & m == 0 {
+                return false;
+            }
+        }
+        // Per-interface routing: a typed value (driver fired it for a specific
+        // interface) reaches only subscribers on that interface. An untyped
+        // value (`iv.iface == None`, the `call_param_callbacks` path) reaches
+        // every subscriber, and a subscriber with no interface filter
+        // (`self.iface == None`) accepts every value — so the gate fires only
+        // when both sides name an interface and they differ. This mirrors C's
+        // per-interface interrupt lists without changing single-value drivers.
+        if let (Some(want), Some(got)) = (self.iface, iv.iface) {
+            if want != got {
                 return false;
             }
         }
@@ -75,6 +102,10 @@ pub struct InterruptValue {
     pub alarm_status: u16,
     /// C parity: `pasynUser->alarmSeverity` (asynPortDriver.cpp:635).
     pub alarm_severity: u16,
+    /// The asyn interface this value was decoded for, or `None` when the
+    /// driver fired a single untyped value (the `call_param_callbacks` path).
+    /// See [`InterruptFilter::iface`] for the per-interface routing contract.
+    pub iface: Option<InterfaceType>,
 }
 
 impl Default for InterruptValue {
@@ -88,6 +119,7 @@ impl Default for InterruptValue {
             aux_status: AsynStatus::Success,
             alarm_status: 0,
             alarm_severity: 0,
+            iface: None,
         }
     }
 }
@@ -744,5 +776,92 @@ mod tests {
         assert_eq!(im.notify_count(), n as u64);
         // n-1 overwrites of the slot before the consumer drained it.
         assert_eq!(im.coalesce_count(), (n - 1) as u64);
+    }
+
+    /// Per-interface routing (the modbus R54 fix): one reason+addr firing
+    /// several interface-typed values delivers each only to the subscriber on
+    /// that interface, and an untyped value reaches every subscriber.
+    #[tokio::test]
+    async fn notify_routes_typed_values_per_interface() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+        let (_si, mut rx_int) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::Int32),
+            ..Default::default()
+        });
+        let (_su, mut rx_uint) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::UInt32Digital),
+            uint32_mask: Some(0xFF),
+        });
+
+        // One reason fires two interface-typed values (the per-interface shape
+        // `PortDriverBase::notify_interface_value` emits).
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::Int32(7),
+            iface: Some(InterfaceType::Int32),
+            ..Default::default()
+        });
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::UInt32Digital(0xAB),
+            iface: Some(InterfaceType::UInt32Digital),
+            uint32_changed_mask: !0,
+            ..Default::default()
+        });
+
+        let dur = std::time::Duration::from_millis(100);
+        // The Int32 subscriber sees the Int32 value...
+        let vi = tokio::time::timeout(dur, rx_int.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(vi.value, ParamValue::Int32(7)),
+            "got {:?}",
+            vi.value
+        );
+        // ...and the UInt32Digital subscriber sees the UInt32 value.
+        let vu = tokio::time::timeout(dur, rx_uint.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(vu.value, ParamValue::UInt32Digital(0xAB)),
+            "got {:?}",
+            vu.value
+        );
+        // Each received ONLY its own interface's value (the other was filtered
+        // out, not merely coalesced): a second recv has nothing to deliver.
+        let short = std::time::Duration::from_millis(30);
+        assert!(
+            tokio::time::timeout(short, rx_int.recv()).await.is_err(),
+            "Int32 subscriber must not receive the UInt32 fire"
+        );
+        assert!(
+            tokio::time::timeout(short, rx_uint.recv()).await.is_err(),
+            "UInt32 subscriber must not receive the Int32 fire"
+        );
+
+        // An untyped value (the `call_param_callbacks` path, iface None) still
+        // reaches an interface-filtered subscriber — backward compatibility.
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::Int32(99),
+            iface: None,
+            ..Default::default()
+        });
+        let vi = tokio::time::timeout(dur, rx_int.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(vi.value, ParamValue::Int32(99)));
     }
 }

@@ -53,9 +53,10 @@ impl Default for DeviceState {
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
+use crate::interfaces::InterfaceType;
 use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
 use crate::interrupt::{InterruptManager, InterruptValue};
-use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType};
+use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
@@ -749,6 +750,9 @@ impl PortDriverBase {
                 aux_status,
                 alarm_status,
                 alarm_severity,
+                // Untyped: a single cached value per (reason,addr) reaches
+                // every subscribing interface (the pre-per-interface path).
+                iface: None,
             });
         }
         Ok(())
@@ -790,6 +794,8 @@ impl PortDriverBase {
                 aux_status,
                 alarm_status,
                 alarm_severity,
+                // Untyped (see `call_param_callbacks`).
+                iface: None,
             });
         }
         Ok(())
@@ -801,6 +807,49 @@ impl PortDriverBase {
     /// `read_*_array()` overrides rather than the param cache (e.g. pixel data).
     pub fn mark_param_changed(&mut self, index: usize, addr: i32) -> AsynResult<()> {
         self.params.mark_changed(index, addr)
+    }
+
+    /// Fire one per-interface I/O Intr callback carrying an interface-typed value.
+    ///
+    /// `call_param_callbacks` stores **one** value per `(reason, addr)` and
+    /// notifies it untyped, so every record on that reason — whatever its DTYP's
+    /// interface — receives the same value. For a driver whose single raw datum
+    /// is exposed on several asyn interfaces at once (e.g. a Modbus register read
+    /// by an `asynInt32` ai, an `asynUInt32Digital` bi, and an `asynFloat64` ai
+    /// simultaneously), that collapse delivers a wrong-typed value to all but one
+    /// of them. C's `drvModbusAsyn::readPoller` instead decodes the one register
+    /// block **separately per interface** and invokes each interface's own
+    /// interrupt list (`int32`/`uInt32Digital`/`float64`,
+    /// drvModbusAsyn.cpp:1706/1736/1808). This is the analogue: the driver
+    /// decodes per interface and fires each value tagged with its `iface`, so the
+    /// interrupt filter routes it only to records on that interface
+    /// ([`InterruptFilter::iface`]). `uint32_changed_mask` is the changed-bit
+    /// mask for the `UInt32Digital` interface (a record's `@asynMask` gates on it,
+    /// `asynPortDriver.cpp:720`); pass `0` for the other interfaces, whose
+    /// subscribers carry no mask filter.
+    pub fn notify_interface_value(
+        &self,
+        reason: usize,
+        addr: i32,
+        iface: InterfaceType,
+        value: ParamValue,
+        uint32_changed_mask: u32,
+    ) {
+        let ts = self.current_timestamp();
+        self.interrupts.notify(InterruptValue {
+            reason,
+            addr,
+            value,
+            timestamp: ts,
+            uint32_changed_mask,
+            // A successful per-interface decode (the caller fires only after the
+            // raw read succeeded); a transport failure aborts the poll before
+            // any fire, matching C's `if (ioStatus_) ... return` in readPoller.
+            aux_status: AsynStatus::Success,
+            alarm_status: 0,
+            alarm_severity: 0,
+            iface: Some(iface),
+        });
     }
 }
 

@@ -2323,6 +2323,11 @@ impl DeviceSupport for AsynDeviceSupport {
                 reason: Some(self.reason),
                 addr: Some(self.addr),
                 uint32_mask: None,
+                // Per-interface routing: a driver that fires interface-typed
+                // values (e.g. Modbus) must reach this accumulating callback
+                // with only this record's interface, or a single poll's several
+                // typed fires would each be accumulated as separate samples.
+                iface: self.iface,
             };
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let sub = self
@@ -2391,6 +2396,10 @@ impl DeviceSupport for AsynDeviceSupport {
                 reason: Some(self.reason),
                 addr: Some(self.addr),
                 uint32_mask: None,
+                // Averaging accumulates every sample; restrict to this record's
+                // interface so a per-interface driver's parallel typed fires for
+                // one poll are not each pushed as a separate sample.
+                iface: self.iface,
             };
             // asynInt32Average applies the same @asynMask nbits the polled
             // read does (devAsynInt32.c:537-540); asynFloat64Average has no mask.
@@ -2525,6 +2534,13 @@ impl DeviceSupport for AsynDeviceSupport {
             reason: Some(self.reason),
             addr: Some(self.addr),
             uint32_mask: if is_uint32 { Some(mask) } else { None },
+            // Per-interface routing (C's per-interface interrupt lists): a
+            // driver firing interface-typed values reaches this record only with
+            // its own interface, so an asynUInt32Digital bi gets the raw word to
+            // mask and an asynInt32 ai gets the int to ESLO-convert — not the one
+            // collapsed value. A single-value driver fires untyped and still
+            // reaches here (InterruptFilter::iface).
+            iface: self.iface,
         };
 
         let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
@@ -2665,6 +2681,11 @@ impl DeviceSupport for AsynDeviceSupport {
             reason: Some(self.reason),
             addr: Some(self.addr),
             uint32_mask: None,
+            // The enum table is re-propagated via the untyped
+            // `call_param_callbacks` path (iface `None`), which matches any
+            // filter; tagging with this record's interface stays consistent
+            // with the other subscriptions and never gates those fires out.
+            iface: self.iface,
         };
         let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
         self.enum_interrupt_sub = Some(sub);

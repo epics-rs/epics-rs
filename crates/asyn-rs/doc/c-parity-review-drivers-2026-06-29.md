@@ -84,7 +84,7 @@ impact paragraphs in the round report
 
 | id | sev | Rust | C | one-line |
 |---|---|---|---|---|
-| DRV-31 | DEFECT | serial_port.rs:336-344,387-389 | drvAsynSerialPort.c:837,959,625-635 | hard read/write error + EOF never closes connection → no auto-reconnect; also no EINTR/EAGAIN retry |
+| DRV-31 | CLEARED | serial_port.rs:566-574,868-934 | drvAsynSerialPort.c:837,959 | hard read/write error + EOF never closes connection → no auto-reconnect; also no EINTR/EAGAIN retry — resolved by later read-EINTR/EOF + DRV-37 write work; verified + write-test added e8b282af (see Fix Log) |
 | DRV-32 | CLEARED | serial_port.rs:663 | drvAsynSerialPort.c:1080 | termios input flags: C `IGNBRK\|IGNPAR` vs Rust `cfmakeraw` → spurious 0x00 on BREAK/line errors — FIXED 2685bd6f (see Fix Log) |
 | DRV-33 | CLEARED | serial_port.rs:681-682 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
 | DRV-34 | CLEARED | serial_port.rs:159-208,263-270 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing; Linux high rates rejected; silent 9600 fallback) — FIXED 7ef497b5 (see Fix Log) |
@@ -1073,3 +1073,21 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
     directly built `SerialConfig`. Breaking public-API change (approved). The
     one caller, `connect`, propagates with `?`. Test:
     `apply_to_termios_errors_on_unmappable_baud`.
+
+- **DRV-31** (DEFECT — hard read/write error + EOF no reconnect; no EINTR/EAGAIN
+  retry) — CLEARED (already resolved by later work; verified + write-test added
+  e8b282af). Ground-verified against current code rather than re-ported (the
+  inventory row was stale): the fix had landed across the read-EINTR/EOF work
+  and the DRV-37 write rewrite. `read_octet` (serial_port.rs:868-901) and
+  `write_octet` (:903-934) both route a fatal error through
+  `is_fatal_transport_error` (:566-574, `Disconnected | Io(_)`) →
+  `drop_connection` (:583-589: close fd, fd=None, set_connected(false)), the
+  closeConnection analogue C calls in `readIt`/`writeIt`
+  (drvAsynSerialPort.c:837,959) — so the actor's auto-reconnect re-opens the
+  device on the next request. EINTR/EWOULDBLOCK/EAGAIN are retried *inside*
+  `SerialIoState::read` (:386-435) and `::write` (:468-530), matching C's errno
+  exclusions, so anything reaching the wrapper is genuinely fatal. The read side
+  was already covered by `test_pty_read_error_disconnects`; added the symmetric
+  `test_pty_write_error_disconnects` for the write side DRV-31 also names. (The
+  read `n == 0` → `Disconnected "serial port EOF"` nuance vs C's loop-until-
+  timeout belongs to the DRV-57 family, already dispositioned, not DRV-31.)

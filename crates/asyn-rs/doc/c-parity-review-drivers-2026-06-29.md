@@ -73,10 +73,10 @@ impact paragraphs in the round report
 | DRV-18 | CLEARED | ip_server_port.rs:408-415 | drvAsynIPServerPort.c:426-429 | UDP datagram-fanout SO_REUSEPORT not set; comment wrongly asserts parity — FIXED 4dc28663 |
 | DRV-19 | CLEARED | ip_server_port.rs:451-457,391-397 | drvAsynIPServerPort.c:403-419 | host/iface not resolved — bare `SocketAddr::parse` rejects `localhost`/hostnames/empty-host (client driver resolves correctly) — FIXED e502ccfb |
 | DRV-20 | CLEARED | ip_server_port.rs (no io_flush) | drvAsynIPServerPort.c:240-247,655 | UDP `flush` doesn't discard cached datagram → stale datagram on flush-then-read — FIXED d890bafa |
-| DRV-21 | LOW | ip_server_port.rs:486 | drvAsynIPServerPort.c:447 | listen backlog hardcoded 128 not `maxClients` (intentional/documented) |
-| DRV-22 | LOW | ip_server_port.rs:328 | drvAsynIPServerPort.c:545-548 | `maxClients==0` coerced to 1 instead of rejected |
+| DRV-21 | DOC | ip_server_port.rs:486 | drvAsynIPServerPort.c:447 | listen backlog hardcoded 128 not `maxClients` — intentional divergence, documented in source |
+| DRV-22 | CLEARED | ip_server_port.rs:328 | drvAsynIPServerPort.c:545-548 | `maxClients==0` coerced to 1 instead of rejected — FIXED 526f3b17 |
 | DRV-23 | LOW | ip_server_port.rs:683-689,823-836 | drvAsynIPServerPort.c:201-207,232-236 | UDP read drops `ASYN_EOM_END` at datagram boundary |
-| DRV-24 | LOW | ip_server_port.rs:163-168 | drvAsynIPServerPort.c:582 | trailing tokens after protocol rejected (Rust stricter than C sscanf) |
+| DRV-24 | DOC | ip_server_port.rs:163-168 | drvAsynIPServerPort.c:582 | trailing tokens after protocol rejected (Rust stricter than C sscanf) — intentional divergence, documented in source |
 | DRV-25 | NON-GAP | ip_server_port.rs:638-645 | drvAsynIPServerPort.c:462-483 | Rust returns bind error; C reports success on failed bind (C bug not reproduced) |
 | DRV-26 | NON-GAP | ip_server_port.rs:823-836 | drvAsynIPServerPort.c:196-200 | C UDP readIt off-by-one (copy maxchars-1, advance maxchars) not reproduced |
 
@@ -644,3 +644,24 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   (interrupt source + push + a consuming device-support path), not a local
   driver fix — modelling only the push without a consumer would be fake
   parity. Deferred pending sign-off, same as F3/F8.
+
+- **DRV-22** (LOW — `maxClients==0` coerced to 1) — CLEARED 526f3b17.
+  `with_config` did `config.max_clients.max(1)`, silently accepting a
+  useless zero-slot server. C `drvAsynIPServerPortConfigure` rejects
+  `maxClients==0` with "No clients." and returns -1
+  (drvAsynIPServerPort.c:545-548), unconditionally before the protocol is
+  parsed. Now errors on `max_clients==0` (TCP and UDP). Test:
+  `with_config_rejects_zero_max_clients`.
+- **DRV-21** (LOW — listen backlog 128 not `maxClients`) — DOC, intentional
+  divergence (no code change). C `listen(fd, maxClients)`
+  (drvAsynIPServerPort.c:447) ties the kernel pending-connection queue to
+  the slot cap; Rust uses a fixed backlog of 128 (≈ SOMAXCONN) because the
+  slot cap bounds *concurrent accepted* clients, not the *pending* queue —
+  a small backlog made third-party `connect()` block in tests. Rationale
+  already in source (ip_server_port.rs `bind_with_options`).
+- **DRV-24** (LOW — trailing tokens rejected) — DOC, intentional
+  divergence (no code change). C `sscanf(":%u %5s", ...)`
+  (drvAsynIPServerPort.c:582) reads the port + one protocol token and
+  silently ignores trailing garbage; Rust rejects extra tokens to surface
+  config typos. Not a C-bug copy (C's leniency is not a bug, but matching
+  it would swallow typos); rationale added to source (`IpServerConfig::parse`).

@@ -164,6 +164,11 @@ impl IpServerConfig {
             }
         }
         if tokens.len() != 1 {
+            // Intentionally stricter than C: `sscanf(":%u %5s", ...)`
+            // (drvAsynIPServerPort.c:582) reads the port and one protocol
+            // token and silently ignores any trailing garbage. Rejecting
+            // it surfaces config typos instead of swallowing them; no
+            // valid C spec carries extra tokens.
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("unexpected tokens after host:port in '{spec}'"),

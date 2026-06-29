@@ -107,7 +107,7 @@ impact paragraphs in the round report
 | DRV-46 | CLEARED | prologix.rs:385-441 | drvPrologixGPIB.c:439,422,534-535 | octet EOS interface now routes to driver `eos` state; output EOS rejected (asynGpib NULL slot) (01395338) |
 | DRV-47 | CLEARED | prologix.rs:80,410,422 | drvPrologixGPIB.c:334-349 | eomReason (END/EOS/CNT) now reported via `io_read_octet_eom` owner + `read_eom` rule (see DRV-47 Fix Log) |
 | DRV-48 | CLEARED | prologix.rs:133,392 | drvPrologixGPIB.c:386,409 | staged read remainder now discarded at `write_octet` via `clear_read_carry()` owner (F6 invariant; see DRV-48 Fix Log) |
-| DRV-49 | CONCERN | prologix.rs:108, iocsh.rs:446 | drvPrologixGPIB.c:547-628 | no iocsh `prologixGPIBConfigure` command; `priority` dropped; unreachable from st.cmd |
+| DRV-49 | CLEARED | iocsh.rs:628-680 | drvPrologixGPIB.c:547-628 | `prologixGPIBConfigure` iocsh command added (priority accepted-but-ignored, IP/serial-command parity) (f82f4537) |
 | DRV-50 | CONCERN | prologix.rs, interfaces/gpib.rs:58 | drvPrologixGPIB.c:461-525 | GPIB command interface absent (ifc/srqStatus real in C; AsynGpib has zero implementors) — scaffold |
 | DRV-51 | LOW | prologix.rs:272-324 | drvPrologixGPIB.c:166-168 | connect() doesn't clear `read_carry` (reconnect-without-disconnect returns stale bytes) |
 | DRV-52 | LOW | prologix.rs:322,333 | drvPrologixGPIB.c:213,231 | per-device connect/disconnect toggles port-level state + announces addr −1 (ASYN_MULTIDEVICE) |
@@ -368,6 +368,19 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   output EOS is rejected (asynGpib leaves the output-EOS vtable slots NULL,
   asynGpib.c:132 `...setInputEos, getInputEos, 0, 0`) rather than silently
   caching ineffective bytes. Test: `eos_interface_routes_to_driver_state`.
+- **DRV-49** (CONCERN, no prologix iocsh registrar) — CLEARED (f82f4537). C
+  `drvPrologixGPIB.c` registers `prologixGPIBConfigure(portName, host, priority,
+  noAutoConnect)` (lines 547-628); the Rust prologix had no iocsh command, so
+  `DrvAsynPrologixPort` was unreachable from st.cmd. Added
+  `drv_asyn_prologix_port_configure_command` mirroring the IP/serial commands
+  (portName + host required; `priority` accepted-but-ignored — the Rust runtime
+  schedules port actors uniformly, same disposition as the IP/serial commands;
+  `noAutoConnect` honored). No `noProcessEos` arg: the prologix driver owns EOS
+  and passes `noProcessEos=1` to its inner `_TCP` IP port (C drvPrologixGPIB.c:
+  575). Registered on both the `IocApplication` and direct-`IocShell` paths; the
+  port lands in the `asyn_record` registry so `asynRecord` resolves it by name.
+  Tests: `drv_asyn_prologix_port_configure_registers_port`,
+  `drv_asyn_prologix_port_configure_rejects_missing_host`.
 - **DRV-9 / DRV-36** (CONCERN, option dispatch leaks unknown keys) — CLEARED. F4
   family. Both `ip_port`/`serial_port` override `set_option` with a known-key
   chain, then a catch-all that inserted unknown keys into the generic

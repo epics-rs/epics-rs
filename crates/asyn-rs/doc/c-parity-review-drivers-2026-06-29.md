@@ -297,4 +297,14 @@ contracts / behavioral models, not just a driver site.
   with an empty reason (no END, no teardown). Test:
   `test_udp_empty_datagram_is_not_eof` (0-byte datagram → `read==0`, still
   connected, next real datagram still read).
+- **DRV-14** (LOW, zero-length write emits an empty UDP datagram) — CLEARED
+  (sign-off, F3). C `drvAsynIPPort.c::writeRaw` (613-614) returns asynSuccess
+  immediately on a zero-length write (after the connection check), sending
+  nothing; Rust ran `send_to`/`write_with_retry` with the empty slice, which
+  for UDP emits a spurious empty datagram. Added the early return in
+  `OctetNext::write` after the connection check (so a disconnected port still
+  errors, matching C order) — output EOS is appended by the interpose above,
+  so reaching the base with empty data means there is genuinely nothing to
+  send. Test: `test_udp_zero_length_write_sends_nothing`. F3 (DRV-1/4/14) now
+  complete; full asyn-rs suite (657 tests) green.
 

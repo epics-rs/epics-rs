@@ -376,6 +376,14 @@ impl OctetNext for IpIoState {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
+        // C drvAsynIPPort.c::writeRaw (613-614): after the connection check,
+        // a zero-length write returns success immediately and sends nothing —
+        // in particular it must NOT emit an empty UDP datagram. (Any output
+        // EOS has already been appended by the interpose above, so reaching
+        // here with empty data means there is genuinely nothing to send.)
+        if data.is_empty() {
+            return Ok(0);
+        }
         let deadline = std::time::Instant::now() + user.timeout;
         match inner {
             IpIoInner::Tcp(stream) => {
@@ -1473,6 +1481,36 @@ mod tests {
         server.send_to(b"world", src).unwrap();
         let n = drv.read_octet(&ruser, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"world");
+    }
+
+    #[test]
+    fn test_udp_zero_length_write_sends_nothing() {
+        // DRV-14: C writeRaw (613-614) returns success on a zero-length
+        // write without sending — in particular no empty UDP datagram.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        let mut drv =
+            DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        // A zero-length write succeeds but must not put a datagram on the wire.
+        drv.write_octet(&mut wuser, b"").unwrap();
+        let mut sbuf = [0u8; 16];
+        assert!(
+            server.recv_from(&mut sbuf).is_err(),
+            "zero-length write must not emit a datagram"
+        );
+
+        // A real write still goes through.
+        drv.write_octet(&mut wuser, b"data").unwrap();
+        let (n, _src) = server.recv_from(&mut sbuf).unwrap();
+        assert_eq!(&sbuf[..n], b"data");
     }
 
     // --- disconnectOnReadTimeout tests ---

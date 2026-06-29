@@ -298,11 +298,19 @@ fn parse_bool_option(value: &str) -> AsynResult<bool> {
 
 struct SerialIoState {
     fd: Option<RawFd>,
+    /// Cumulative bytes successfully read / written, for `report()` diagnostics
+    /// (C tracks `tty->nRead` / `tty->nWritten`, drvAsynSerialPort.c).
+    n_read: u64,
+    n_written: u64,
 }
 
 impl SerialIoState {
     fn new() -> Self {
-        Self { fd: None }
+        Self {
+            fd: None,
+            n_read: 0,
+            n_written: 0,
+        }
     }
 
     fn fd_or_err(&self) -> AsynResult<RawFd> {
@@ -377,6 +385,7 @@ impl OctetNext for SerialIoState {
                 });
             }
 
+            self.n_read += n as u64; // C parity: tty->nRead += thisRead
             return Ok(OctetReadResult {
                 nbytes_transferred: n as usize,
                 // C parity: CNT only when the requested count was reached.
@@ -463,6 +472,7 @@ impl OctetNext for SerialIoState {
                     return Err(AsynError::Io(err));
                 }
                 total += n as usize;
+                self.n_written += n as u64; // C parity: tty->nWritten += thisWrite
 
                 // C parity (drvAsynSerialPort.c:827): after each write, if the
                 // total deadline has passed stop with asynTimeout even though
@@ -796,6 +806,26 @@ impl PortDriver for DrvAsynSerialPort {
 
         self.base.set_connected(false);
         Ok(())
+    }
+
+    fn report(&self, level: i32) {
+        // C parity (drvAsynSerialPort.c:666-680): report the connection state,
+        // and at details>=1 the fd plus cumulative bytes written/read.
+        eprintln!(
+            "Serial line {}: {}",
+            self.config.device,
+            if self.base.connected {
+                "Connected"
+            } else {
+                "Disconnected"
+            }
+        );
+        if level >= 1 {
+            eprintln!("                    fd: {}", self.io.fd.unwrap_or(-1));
+            eprintln!("    Characters written: {}", self.io.n_written);
+            eprintln!("       Characters read: {}", self.io.n_read);
+            self.base.report_params(level.saturating_sub(1));
+        }
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
@@ -2234,5 +2264,42 @@ mod tests {
             flags & libc::FD_CLOEXEC != 0,
             "FD_CLOEXEC must be set after connect (C parity)"
         );
+    }
+
+    /// DRV-44: C report (drvAsynSerialPort.c:666-680) shows cumulative
+    /// nWritten/nRead. Verify the counters track real I/O and report() runs at
+    /// every level without panicking.
+    #[test]
+    fn pty_report_tracks_byte_counters() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_report", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert_eq!(drv.io.n_written, 0);
+        assert_eq!(drv.io.n_read, 0);
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"hello").unwrap();
+        assert_eq!(drv.io.n_written, 5, "n_written must track bytes written");
+
+        let msg = b"world";
+        unsafe { libc::write(master, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut rbuf = [0u8; 32];
+        let n = drv.read_octet(&user, &mut rbuf).unwrap();
+        assert!(n > 0);
+        assert_eq!(drv.io.n_read, n as u64, "n_read must track bytes read");
+
+        // report() must not panic at any level.
+        drv.report(0);
+        drv.report(2);
     }
 }

@@ -280,6 +280,13 @@ impl OctetNext for IpIoState {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
+        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 *after*
+        // the connect check and *before* touching the socket, so a zero-length
+        // request never reaches `stream.read`, where an empty buffer would
+        // yield Ok(0) and be misread as a peer EOF (tearing down the socket).
+        if buf.is_empty() {
+            return Err(maxchars_zero_error());
+        }
         match inner {
             IpIoInner::Tcp(stream) => {
                 stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
@@ -505,6 +512,19 @@ pub(crate) fn is_nonfatal_read_timeout(kind: std::io::ErrorKind) -> bool {
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
     )
+}
+
+/// Error for a zero-length read request. C `readRaw` (drvAsynIPPort.c:736-740)
+/// rejects `maxchars == 0` with `asynError` ("maxchars %d. Why <=0?") before
+/// touching the socket. Without this guard a Rust `stream.read(&mut [])`
+/// returns `Ok(0)`, which the TCP read arm interprets as a peer EOF and tears
+/// down a perfectly healthy connection. Single owner of the empty-buffer
+/// rejection, shared by the IP client read and both IP server reads.
+pub(crate) fn maxchars_zero_error() -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: "maxchars 0. Why <=0?".into(),
+    }
 }
 
 /// Classify a failed socket read for the IP client read arms. A non-fatal
@@ -1851,6 +1871,44 @@ mod tests {
         assert_eq!(
             n, 1,
             "zero-timeout write of a writable socket must attempt the send, not instant-timeout"
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn zero_length_read_request_rejected_not_eof_teardown() {
+        // DRV-55: C readRaw (736-740) rejects maxchars == 0 with asynError
+        // before touching the socket. A Rust stream.read(&mut []) returns
+        // Ok(0), which the TCP arm would misread as a peer EOF and tear down a
+        // healthy connection. The guard must reject the empty request *and*
+        // leave the socket connected.
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (_s, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut empty: [u8; 0] = [];
+        let res = drv.read_octet(&ruser, &mut empty);
+        assert!(
+            matches!(
+                res,
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    ..
+                })
+            ),
+            "zero-length read must be rejected with asynError, got {res:?}"
+        );
+        assert!(
+            drv.base().connected,
+            "zero-length read must not tear down the connection"
         );
 
         handle.join().unwrap();

@@ -57,6 +57,7 @@ use std::time::Duration;
 // and take out the port (std::sync::Mutex would).
 use parking_lot::Mutex;
 
+use crate::drivers::ip_port::socket_poll_timeout;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::{EomReason, OctetReadResult};
@@ -884,14 +885,19 @@ impl DrvAsynIPServerPort {
             status: AsynStatus::Error,
             message: format!("slot {} stream gone", user.addr),
         })?;
-        if user.timeout > Duration::from_nanos(0) {
-            stream
-                .set_read_timeout(Some(user.timeout))
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("set_read_timeout failed: {e}"),
-                })?;
-        }
+        // C parity: the server-mode data read flows through a child
+        // `drvAsynIPPort` whose `readRaw` floors a zero request timeout to a
+        // 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on every
+        // read. `socket_poll_timeout` is the shared owner of that mapping;
+        // setting it unconditionally (rather than skipping on `timeout == 0`)
+        // keeps a poll request a 1 ms poll instead of blocking on the
+        // accept-time timeout.
+        stream
+            .set_read_timeout(Some(socket_poll_timeout(user.timeout)))
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_read_timeout failed: {e}"),
+            })?;
         match stream.read(buf) {
             Ok(0) => {
                 // Peer closed — drop the slot, surface as Disconnect.
@@ -1161,14 +1167,19 @@ impl PortDriver for DrvAsynIPSubport {
             status: AsynStatus::Disconnected,
             message: "subport slot has no client".into(),
         })?;
-        if user.timeout > Duration::from_nanos(0) {
-            stream
-                .set_read_timeout(Some(user.timeout))
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("set_read_timeout failed: {e}"),
-                })?;
-        }
+        // C parity: the server-mode data read flows through a child
+        // `drvAsynIPPort` whose `readRaw` floors a zero request timeout to a
+        // 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on every
+        // read. `socket_poll_timeout` is the shared owner of that mapping;
+        // setting it unconditionally (rather than skipping on `timeout == 0`)
+        // keeps a poll request a 1 ms poll instead of blocking on the
+        // accept-time timeout.
+        stream
+            .set_read_timeout(Some(socket_poll_timeout(user.timeout)))
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_read_timeout failed: {e}"),
+            })?;
         match stream.read(buf) {
             Ok(0) => {
                 drop(stream_guard);

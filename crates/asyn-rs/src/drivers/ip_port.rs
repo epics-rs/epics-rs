@@ -265,7 +265,7 @@ impl OctetNext for IpIoState {
         })?;
         match inner {
             IpIoInner::Tcp(stream) => {
-                stream.set_read_timeout(Some(user.timeout))?;
+                stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 match stream.read(buf) {
                     // C drvAsynIPPort.c::readRaw (815-821): recv()==0 on a
                     // SOCK_STREAM socket means the peer closed — report
@@ -301,7 +301,7 @@ impl OctetNext for IpIoState {
                 }
             }
             IpIoInner::Udp(socket, _peer) => {
-                socket.set_read_timeout(Some(user.timeout))?;
+                socket.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 // C drvAsynIPPort.c::readRaw (775-789) uses recvfrom on the
                 // unconnected datagram socket so it accepts replies from any
                 // peer (broadcast/multi-peer); the source address is only
@@ -337,7 +337,7 @@ impl OctetNext for IpIoState {
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
-                stream.set_read_timeout(Some(user.timeout))?;
+                stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 match stream.read(buf) {
                     // Unix-domain stream EOF = peer closed = END, the same
                     // stream semantics as the TCP arm above.
@@ -387,18 +387,18 @@ impl OctetNext for IpIoState {
         let deadline = std::time::Instant::now() + user.timeout;
         match inner {
             IpIoInner::Tcp(stream) => {
-                stream.set_write_timeout(Some(user.timeout))?;
+                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)?;
             }
             IpIoInner::Udp(socket, peer) => {
-                socket.set_write_timeout(Some(user.timeout))?;
+                socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
                 // remote on the unconnected socket.
                 socket.send_to(data, *peer)?;
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
-                stream.set_write_timeout(Some(user.timeout))?;
+                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)?;
             }
         }
@@ -506,6 +506,33 @@ fn is_fatal_transport_error(e: &AsynError) -> bool {
     )
 }
 
+/// Map an `AsynUser` timeout to the socket-level receive/send timeout,
+/// applying the C `drvAsynIPPort` poll-interval floor.
+///
+/// C `readRaw`/`writeRaw` compute `pollmsec = (int)(timeout * 1000)` and
+/// then `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:741-743 and
+/// 615-617): a zero timeout (a poll / non-blocking request) becomes a 1 ms
+/// poll, never an immediate-return zero interval. `std::net`'s
+/// `set_read_timeout`/`set_write_timeout` likewise reject a zero `Duration`
+/// (they return `InvalidInput`), so passing `user.timeout` verbatim would
+/// turn a `timeout == 0` request into a hard error instead of C's 1 ms
+/// poll. Flooring here is the single owner of that mapping for every
+/// IP-family socket-timeout site (client read/write plus the server-mode
+/// reads).
+///
+/// A negative "wait forever" timeout has no representation in the
+/// framework's unsigned `Duration` (DRV-42), so only the zero floor
+/// applies; a positive sub-millisecond timeout is passed through verbatim
+/// (Rust polls at sub-ms granularity where C coarsens to whole ms —
+/// strictly finer, not a regression).
+pub(crate) fn socket_poll_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        timeout
+    }
+}
+
 impl DrvAsynIPPort {
     /// Tear down the live socket and mark the port disconnected so the
     /// actor's auto-reconnect (`port_actor.rs`) re-establishes it on the
@@ -570,12 +597,20 @@ impl DrvAsynIPPort {
                     }
                 );
                 // C parity: auto-disconnect on:
-                // 1. disconnectOnReadTimeout AND timeout error
+                // 1. disconnectOnReadTimeout AND a timeout error AND a
+                //    positive request timeout. C gates this on
+                //    `(disconnectOnReadTimeout) && (timeout > 0)`
+                //    (drvAsynIPPort.c:799), so a `timeout == 0` poll (now a
+                //    1 ms socket poll via `socket_poll_timeout`) that expires
+                //    is reported as `asynTimeout` with the socket left intact,
+                //    never torn down.
                 // 2. Any fatal transport error (connection reset) —
                 //    `is_fatal_transport_error` is the single owner of that
                 //    classification, shared with the write path.
-                let should_disconnect =
-                    (self.disconnect_on_read_timeout && is_timeout) || is_fatal_transport_error(&e);
+                let should_disconnect = (self.disconnect_on_read_timeout
+                    && is_timeout
+                    && user.timeout > Duration::ZERO)
+                    || is_fatal_transport_error(&e);
                 if should_disconnect && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
@@ -1554,6 +1589,63 @@ mod tests {
         let mut buf = [0u8; 32];
         let _ = drv.read_octet(&user, &mut buf);
         assert!(!drv.base().connected);
+    }
+
+    #[test]
+    fn socket_poll_timeout_floors_zero_to_one_ms() {
+        // C drvAsynIPPort.c::readRaw/writeRaw floor `(int)(timeout*1000)==0`
+        // to a 1 ms poll; std rejects a zero Duration in set_read_timeout.
+        assert_eq!(
+            socket_poll_timeout(Duration::ZERO),
+            Duration::from_millis(1)
+        );
+        // Positive timeouts pass through verbatim (incl. sub-ms — Rust is
+        // strictly finer than C's whole-ms coarsening).
+        assert_eq!(
+            socket_poll_timeout(Duration::from_micros(500)),
+            Duration::from_micros(500)
+        );
+        assert_eq!(
+            socket_poll_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn zero_timeout_read_polls_without_disconnect() {
+        // C drvAsynIPPort.c::readRaw: a `timeout == 0` read becomes a 1 ms
+        // poll (line 742) and the disconnect-on-read-timeout teardown is
+        // gated on `timeout > 0` (line 799). So a zero-timeout read of a
+        // silent socket must return asynTimeout WITHOUT a hard
+        // Duration::ZERO error and WITHOUT tearing the connection down,
+        // even with disconnectOnReadTimeout enabled.
+        let (listener, port) = start_echo_server();
+        let _handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(5));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        let user = AsynUser::new(0).with_timeout(Duration::ZERO);
+        let mut buf = [0u8; 32];
+        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        match err {
+            AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            } => {}
+            other => panic!("expected Timeout (not a Duration::ZERO error), got {other:?}"),
+        }
+        // timeout == 0 → C `timeout > 0` guard is false → no teardown.
+        assert!(
+            drv.base().connected,
+            "zero-timeout read must not disconnect even with disconnectOnReadTimeout=Y"
+        );
     }
 
     #[test]

@@ -102,7 +102,11 @@ impl SerialConfig {
 
     /// Apply this configuration to a raw termios struct.
     pub fn apply_to_termios(&self, t: &mut libc::termios) {
-        let baud = baud_to_speed(self.baud);
+        // `self.baud` is validated at set_option time (baud_to_speed is the
+        // single validation owner) and defaults to 9600, so this is always
+        // `Some` on a normal path; fall back to 9600 only if a SerialConfig was
+        // built directly with a rate this platform cannot map.
+        let baud = baud_to_speed(self.baud).unwrap_or(libc::B9600);
         unsafe {
             libc::cfsetispeed(t, baud);
             libc::cfsetospeed(t, baud);
@@ -156,54 +160,90 @@ impl SerialConfig {
     }
 }
 
-fn baud_to_speed(baud: u32) -> libc::speed_t {
-    match baud {
-        0 => libc::B0,
-        50 => libc::B50,
-        75 => libc::B75,
-        110 => libc::B110,
-        134 => libc::B134,
-        150 => libc::B150,
-        200 => libc::B200,
-        300 => libc::B300,
-        600 => libc::B600,
-        1200 => libc::B1200,
-        1800 => libc::B1800,
-        2400 => libc::B2400,
-        4800 => libc::B4800,
-        9600 => libc::B9600,
-        19200 => libc::B19200,
-        38400 => libc::B38400,
-        57600 => libc::B57600,
-        115200 => libc::B115200,
-        230400 => libc::B230400,
-        // High baud rates: available on Linux/FreeBSD/NetBSD, not macOS.
-        // C parity: conditional on #ifdef B460800 etc.
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        460800 => libc::B460800,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        500000 => libc::B500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        576000 => libc::B576000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        921600 => libc::B921600,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        1000000 => libc::B1000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        1152000 => libc::B1152000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        1500000 => libc::B1500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        2000000 => libc::B2000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        2500000 => libc::B2500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        3000000 => libc::B3000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        3500000 => libc::B3500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        4000000 => libc::B4000000,
-        _ => libc::B9600, // fallback
+/// Map a baud rate to its termios speed code, or `None` if the rate is not
+/// settable on this platform.
+///
+/// C parity (drvAsynSerialPort.c:271-345): on systems where the termios `Bxxx`
+/// constants equal the literal baud rate — macOS and the BSDs, where
+/// `B9600 == 9600` — C uses the baud value itself as the speed code
+/// (`baudCode = baud`, line 274), so *any* rate is accepted including
+/// non-standard ones. Elsewhere (Linux, where the codes are small encoded
+/// integers) C maps the known standard rates with a `switch` and returns
+/// asynError ("Unsupported data rate", lines 340-343) for anything outside it.
+fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        // Bxxx == literal rate: the baud value is itself a valid speed code.
+        // `from` (not `as`) so this stays clean whether speed_t is u32 or u64.
+        Some(libc::speed_t::from(baud))
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        Some(match baud {
+            0 => libc::B0,
+            50 => libc::B50,
+            75 => libc::B75,
+            110 => libc::B110,
+            134 => libc::B134,
+            150 => libc::B150,
+            200 => libc::B200,
+            300 => libc::B300,
+            600 => libc::B600,
+            1200 => libc::B1200,
+            1800 => libc::B1800,
+            2400 => libc::B2400,
+            4800 => libc::B4800,
+            9600 => libc::B9600,
+            19200 => libc::B19200,
+            38400 => libc::B38400,
+            57600 => libc::B57600,
+            115200 => libc::B115200,
+            230400 => libc::B230400,
+            // High baud rates: C gates each with `#ifdef Bxxx`; on Linux the
+            // codes exist, while the arbitrary-rate branch above covers
+            // macOS/BSD. Linux defines no B28800, matching C's `#ifdef B28800`.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            460800 => libc::B460800,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            500000 => libc::B500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            576000 => libc::B576000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            921600 => libc::B921600,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            1000000 => libc::B1000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            1152000 => libc::B1152000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            1500000 => libc::B1500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            2000000 => libc::B2000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            2500000 => libc::B2500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            3000000 => libc::B3000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            3500000 => libc::B3500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            4000000 => libc::B4000000,
+            // C parity (drvAsynSerialPort.c:340-343): unknown rate -> asynError.
+            _ => return None,
+        })
     }
 }
 
@@ -255,18 +295,6 @@ fn speed_to_baud(speed: libc::speed_t) -> u32 {
         libc::B4000000 => 4000000,
         _ => 0,
     }
-}
-
-/// Supported baud rates. `baud_to_speed` returns the matching `libc::speed_t`,
-/// or falls back to B9600 for unsupported values. Use `is_supported_baud()` to
-/// check before setting.
-const SUPPORTED_BAUDS: &[u32] = &[
-    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
-    115200, 230400,
-];
-
-fn is_supported_baud(baud: u32) -> bool {
-    SUPPORTED_BAUDS.contains(&baud)
 }
 
 /// Parse a boolean option value.
@@ -910,18 +938,16 @@ impl PortDriver for DrvAsynSerialPort {
                     status: AsynStatus::Error,
                     message: format!("invalid baud rate: '{value}'"),
                 })?;
-                if !is_supported_baud(baud) {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!(
-                            "unsupported baud rate: {baud} (supported: {:?})",
-                            SUPPORTED_BAUDS
-                        ),
-                    });
-                }
+                // C parity (drvAsynSerialPort.c:340-343): reject an unsupported
+                // rate with asynError. baud_to_speed is the single source of
+                // truth for what is settable on this platform, so the
+                // validation and the speed lookup cannot disagree.
+                let speed = baud_to_speed(baud).ok_or_else(|| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("unsupported baud rate: {baud}"),
+                })?;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
-                    let speed = baud_to_speed(baud);
                     unsafe {
                         libc::cfsetispeed(&mut t, speed);
                         libc::cfsetospeed(&mut t, speed);
@@ -1519,11 +1545,77 @@ mod tests {
 
     #[test]
     fn test_set_option_unsupported_baud() {
+        // DRV-34: a non-standard rate (12345) is rejected only where the
+        // platform uses encoded Bxxx codes (Linux), matching C's switch default
+        // (drvAsynSerialPort.c:340-343). On macOS/BSD, where B9600 == 9600, C
+        // accepts any rate via `baudCode = baud` (:273-274), so the same value
+        // is settable there — see baud_arbitrary_on_bsd_mapped_set_on_linux.
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
-        let err = drv.set_option("baud", "12345").unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => assert!(message.contains("unsupported")),
-            _ => panic!("expected unsupported baud error"),
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        )))]
+        {
+            let err = drv.set_option("baud", "12345").unwrap_err();
+            match err {
+                AsynError::Status { message, .. } => assert!(message.contains("unsupported")),
+                _ => panic!("expected unsupported baud error"),
+            }
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            drv.set_option("baud", "12345").unwrap();
+            assert_eq!(drv.config.baud, 12345);
+            assert_eq!(drv.get_option("baud").unwrap(), "12345");
+        }
+    }
+
+    #[test]
+    fn baud_arbitrary_on_bsd_mapped_set_on_linux() {
+        // DRV-34: baud_to_speed is the single source of truth for which rates
+        // are settable. C (drvAsynSerialPort.c:271-345) accepts arbitrary rates
+        // where Bxxx == literal rate (macOS/BSD) and a fixed mapped set
+        // elsewhere (Linux), erroring on the rest.
+        assert!(baud_to_speed(9600).is_some(), "9600 is standard everywhere");
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            // Arbitrary rates accepted where the code is the literal rate; the
+            // speed code returned is the baud value itself (C: baudCode = baud).
+            assert_eq!(baud_to_speed(28800), Some(28800 as libc::speed_t));
+            assert_eq!(baud_to_speed(250000), Some(250000 as libc::speed_t));
+            assert_eq!(baud_to_speed(115200), Some(115200 as libc::speed_t));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Linux maps the high standard rates that the old fixed list (which
+            // capped at 230400) wrongly rejected, and still has no B28800.
+            assert!(baud_to_speed(460800).is_some(), "Linux maps 460800");
+            assert!(baud_to_speed(4000000).is_some(), "Linux maps 4000000");
+            assert!(baud_to_speed(28800).is_none(), "Linux has no B28800");
+            assert!(
+                baud_to_speed(250000).is_none(),
+                "Linux rejects non-standard"
+            );
         }
     }
 
@@ -1667,7 +1759,7 @@ mod tests {
             0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
             57600, 115200, 230400,
         ] {
-            let speed = baud_to_speed(baud);
+            let speed = baud_to_speed(baud).expect("standard rate must map");
             assert_eq!(
                 speed_to_baud(speed),
                 baud,

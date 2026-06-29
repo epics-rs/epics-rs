@@ -145,9 +145,15 @@ cluster into structural families (the high-leverage fix units):
 - **F6 — connect()/write() must reject double-open + discard staged read
   state:** DRV-12 (ip), DRV-40 (serial), DRV-48 (prologix write, DEFECT),
   DRV-51 (prologix connect). Invariant family.
-- **F7 — default EOS interpose + iocsh configure registrar:** DRV-2 (ip),
-  DRV-45 (serial), DRV-46/DRV-49 (prologix). **Larger architecture — how ports
-  auto-install EOS and register iocsh commands. Needs design sign-off.**
+- **F7 — default EOS interpose + iocsh configure registrar:** DONE (see Fix
+  Log). Family corrected after reading C: EOS auto-install = IP (DRV-2,
+  `asynInterposeEos`), serial (DRV-45, octetBase built-in EOS), ftdi
+  (`drvAsynFTDIPort.cpp:622-623`). prologix DRV-46 (own in-driver `eos`
+  state, no interpose in C) and DRV-49 (prologix iocsh command) are DISTINCT
+  — prologix manages EOS itself and is not part of the auto-install family;
+  they remain open as prologix-specific items. ip_server is DISTINCT too
+  (`drvAsynIPServerPort.c:659` passes `0,0,0`, vestigial `#include`, no
+  auto-install). Sign-off obtained 2026-06-29: full structural wiring.
 - **F8 — partial nbytesTransfered on error (framework `write_octet -> ()`):**
   DRV-15 (ip), DRV-38 (serial). **Framework-wide trait-signature change. Needs
   sign-off.**
@@ -438,3 +444,39 @@ ran on two freshly-spawned panels — the reliable path.
   `read_eom_carry_path_reports_boundary` (carry-drain CNT→END), plus END/EOS
   assertions added to the two end-to-end read tests. asyn-rs clippy
   `--all-targets` + nextest (660) green.
+
+- **F7** (default EOS interpose + iocsh configure registrar) — DONE
+  2026-06-29, 5 commits. Root cause found by reading C+Rust directly: EOS
+  was fully non-functional in production. `setInputEos`/`setOutputEos` wrote
+  `PortDriverBase::{input,output}_eos`, but the only EOS-matching layer
+  (`EosInterpose`) reads its own config and was never installed outside
+  tests, and the native read path falls through an empty interpose stack to
+  the raw socket. So IEOS/OEOS on any Rust ip/serial port did nothing.
+  - *a0c80be5 (enabler):* added `set_input_eos`/`set_output_eos` to the
+    `OctetInterpose` trait (default no-op) + `OctetInterposeStack` (forward
+    to every layer); `EosInterpose` overrides them + gained `Default`;
+    `PortDriver::set_input_eos`/`set_output_eos` now cache in base AND
+    forward to `base.interpose_octet` (one write owner), so runtime EOS and
+    the binary-suppress save/restore both reach an installed interpose.
+    C routes `setInputEos` down the interpose chain the same way.
+  - *8d228d1a (DRV-2, ip):* `drvAsynIPPortConfigure` installs
+    `EosInterpose::default()` unless `noProcessEos` (C
+    `drvAsynIPPort.c:1065-1066`), via shared `build_configured_ip_port`.
+    prologix's inner `_TCP` transport uses `DrvAsynIPPort::new` directly, so
+    it correctly does not auto-install.
+  - *7115a8fb (DRV-45, serial):* added `DrvAsynSerialPort::configure` (EOS by
+    default unless `noProcessEos`, honors `noAutoConnect`) mirroring ftdi;
+    `new` stays parse-only. C `drvAsynSerialPort.c:1126`.
+  - *d7da13df (ftdi):* `configure` now installs `EosInterpose::default()`
+    unless `no_process_eos` (C `drvAsynFTDIPort.cpp:616,622-623`); the stale
+    "no octet-stack counterpart yet" comment removed.
+  - *2ecb546c (DRV-45, serial iocsh):* added `drvAsynSerialPortConfigure`
+    iocsh command (mirrors IP; registered on both registration paths);
+    generalized `keep_ip_port_runtime` → `keep_port_runtime`.
+  - Tests: enabler end-to-end (set IEOS via driver → interpose terminates
+    read on EOS; clear IEOS → pass-through), per-driver install/suppress
+    assertions (ip helper, serial configure, ftdi configure), serial iocsh
+    registers-port. asyn-rs clippy `--all-targets` + nextest (665) green.
+  - DISTINCT (C does not auto-install, not part of this family, still open):
+    prologix DRV-46 (own in-driver `eos`, no interpose), DRV-49 (prologix
+    iocsh command), ip_server (`drvAsynIPServerPort.c:659` `0,0,0`).

@@ -693,6 +693,14 @@ impl PortDriver for DrvAsynSerialPort {
         // close the fd: `base.connected` is still false, so the `Drop`
         // impl would skip `disconnect()` and leak the descriptor.
         let setup = (|| -> AsynResult<()> {
+            // C parity (drvAsynSerialPort.c:713-722): set close-on-exec right
+            // after open so the serial fd is not inherited by child processes
+            // (e.g. an iocsh `system` call), which would otherwise hold the
+            // device open after this driver closes it.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(AsynError::Io(std::io::Error::last_os_error()));
+            }
+
             // 2. Save original termios
             let saved = self.get_current_termios()?;
             self.saved_termios = Some(saved);
@@ -730,6 +738,12 @@ impl PortDriver for DrvAsynSerialPort {
             t.c_cc[libc::VSTOP] = 0x13; // ^S
             self.config.apply_to_termios(&mut t);
             self.apply_termios(&t)?;
+
+            // C parity (drvAsynSerialPort.c:729): discard any bytes that
+            // accumulated in the kernel input/output buffers before the port
+            // was configured, so the first read/write starts from a clean
+            // device state. C does this right before turning blocking back on.
+            unsafe { libc::tcflush(fd, libc::TCIOFLUSH) };
 
             // 4. Restore blocking mode
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -2152,6 +2166,32 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(900),
             "total write time must be bounded by ~the timeout, took {elapsed:?}"
+        );
+    }
+
+    /// DRV-41: C connectIt (drvAsynSerialPort.c:713-722) sets FD_CLOEXEC on the
+    /// serial fd right after open so it is not inherited across exec.
+    #[test]
+    fn pty_connect_sets_cloexec() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_cloexec", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let fd = drv.io.fd.expect("connected fd");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "FD_CLOEXEC must be set after connect (C parity)"
         );
     }
 }

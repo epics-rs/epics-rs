@@ -19,6 +19,7 @@ use epics_base_rs::server::iocsh::registry::{
 };
 
 use crate::drivers::ip_port::DrvAsynIPPort;
+use crate::error::AsynResult;
 use crate::manager::PortManager;
 use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
@@ -438,11 +439,32 @@ fn keep_ip_port_runtime(handle: PortRuntimeHandle) {
 /// registry so `asynRecord` device support resolves it by name. The
 /// runtime handle is parked in a process-lifetime static.
 ///
-/// `priority` and `noProcessEos` are accepted for startup-script
-/// compatibility but have no effect: the Rust runtime schedules every
-/// port actor uniformly (priority is advisory in C too), and the IP
-/// driver never auto-installs an EOS interpose, so `noProcessEos` is
-/// already the default. `noAutoConnect` is honored.
+/// `priority` is accepted for startup-script compatibility but has no
+/// effect: the Rust runtime schedules every port actor uniformly
+/// (priority is advisory in C too). `noAutoConnect` and `noProcessEos`
+/// are honored — by default the command installs an EOS interpose (C
+/// `drvAsynIPPort.c:1065-1066` `asynInterposeEosConfig`), and a nonzero
+/// `noProcessEos` suppresses it.
+/// Build a configured IP port driver: parse host info, honor
+/// `noAutoConnect`, and install the default EOS interpose unless
+/// `noProcessEos` (C `drvAsynIPPort.c:1065-1066`). Shared by the iocsh
+/// command and its tests so the install decision has a single owner.
+fn build_configured_ip_port(
+    port: &str,
+    host: &str,
+    no_auto_connect: bool,
+    no_process_eos: bool,
+) -> AsynResult<DrvAsynIPPort> {
+    let mut driver = DrvAsynIPPort::new(port, host)?;
+    if no_auto_connect {
+        driver.base_mut().auto_connect = false;
+    }
+    if !no_process_eos {
+        driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+    }
+    Ok(driver)
+}
+
 pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
     CommandDef::new(
         "drvAsynIPPortConfigure",
@@ -483,17 +505,16 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "hostInfo required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
+            let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
 
-            let mut driver = match DrvAsynIPPort::new(&port, &host) {
-                Ok(d) => d,
-                Err(e) => {
-                    ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
-            if no_auto_connect {
-                driver.base_mut().auto_connect = false;
-            }
+            let driver =
+                match build_configured_ip_port(&port, &host, no_auto_connect, no_process_eos) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
             crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
@@ -743,6 +764,27 @@ mod tests {
         assert!(
             crate::asyn_record::get_port("iocsh_ip_cfg_test").is_some(),
             "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// C drvAsynIPPort.c:1065-1066: an IP port gets an EOS interpose by
+    /// default, suppressed by `noProcessEos`.
+    #[test]
+    fn build_configured_ip_port_installs_eos_unless_suppressed() {
+        let default_port =
+            build_configured_ip_port("ip_eos_default", "127.0.0.1:9100", false, false).unwrap();
+        assert_eq!(
+            default_port.base().interpose_octet.len(),
+            1,
+            "default IP port must auto-install the EOS interpose"
+        );
+
+        let suppressed =
+            build_configured_ip_port("ip_eos_off", "127.0.0.1:9100", false, true).unwrap();
+        assert_eq!(
+            suppressed.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
         );
     }
 

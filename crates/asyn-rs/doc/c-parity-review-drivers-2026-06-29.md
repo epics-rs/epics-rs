@@ -104,7 +104,7 @@ impact paragraphs in the round report
 
 | id | sev | Rust | C | one-line |
 |---|---|---|---|---|
-| DRV-46 | CONCERN | prologix.rs:169 | drvPrologixGPIB.c:439,422,534-535 | EOS interface not wired to driver `eos` state; getInputEos echoes stored-but-ineffective bytes (C reports eoslen=0) |
+| DRV-46 | CLEARED | prologix.rs:385-441 | drvPrologixGPIB.c:439,422,534-535 | octet EOS interface now routes to driver `eos` state; output EOS rejected (asynGpib NULL slot) (01395338) |
 | DRV-47 | CLEARED | prologix.rs:80,410,422 | drvPrologixGPIB.c:334-349 | eomReason (END/EOS/CNT) now reported via `io_read_octet_eom` owner + `read_eom` rule (see DRV-47 Fix Log) |
 | DRV-48 | CLEARED | prologix.rs:133,392 | drvPrologixGPIB.c:386,409 | staged read remainder now discarded at `write_octet` via `clear_read_carry()` owner (F6 invariant; see DRV-48 Fix Log) |
 | DRV-49 | CONCERN | prologix.rs:108, iocsh.rs:446 | drvPrologixGPIB.c:547-628 | no iocsh `prologixGPIBConfigure` command; `priority` dropped; unreachable from st.cmd |
@@ -353,6 +353,21 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   (e.g. the inner ip_port auto-disconnected on a read error, then reconnect)
   would leak the dead session's tail into the first read. Routed through the
   same `clear_read_carry()` owner. Test: `connect_discards_staged_read_carry`.
+- **DRV-46** (CONCERN, prologix octet EOS interface not wired to driver `eos`) —
+  CLEARED (01395338). C prologix is an `asynGpibPort` whose octet EOS interface
+  maps to `prologixSetEos`/`prologixGetEos` over the single `pdpvt->eos` field
+  (drvPrologixGPIB.c:422-459). The Rust prologix used the default
+  `PortDriver::{set,get}_input_eos`, which write `base.input_eos` and forward to
+  an (empty) interpose stack — bytes the read (`++read <eos>` vs `++read eoi`)
+  and write (append-on-`eos>=0`) paths never consult, so `set_input_eos` had no
+  protocol effect and `get_input_eos` echoed stored-but-ineffective bytes (C
+  reports eoslen from `pdpvt->eos`, default 0). Defect family — the EOS
+  interface must reflect the driver's real EOS state, never a dead base cache —
+  fixed at both sites: input EOS routes to `State.eos` (eoslen 0→None, 1→Some,
+  >1→asynError "Invalid EOS" per asynGpib.c:443 / prologixSetEos:449), and
+  output EOS is rejected (asynGpib leaves the output-EOS vtable slots NULL,
+  asynGpib.c:132 `...setInputEos, getInputEos, 0, 0`) rather than silently
+  caching ineffective bytes. Test: `eos_interface_routes_to_driver_state`.
 - **DRV-9 / DRV-36** (CONCERN, option dispatch leaks unknown keys) — CLEARED. F4
   family. Both `ip_port`/`serial_port` override `set_option` with a known-key
   chain, then a catch-all that inserted unknown keys into the generic

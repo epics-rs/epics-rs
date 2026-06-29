@@ -305,16 +305,7 @@ impl OctetNext for IpIoState {
                             EomReason::empty()
                         },
                     }),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Err(AsynError::Status {
-                            status: AsynStatus::Timeout,
-                            message: "read timeout".into(),
-                        })
-                    }
-                    Err(e) => Err(AsynError::Io(e)),
+                    Err(e) => Err(classify_read_error(e)),
                 }
             }
             IpIoInner::Udp(socket, _peer) => {
@@ -340,16 +331,7 @@ impl OctetNext for IpIoState {
                             EomReason::empty()
                         },
                     }),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Err(AsynError::Status {
-                            status: AsynStatus::Timeout,
-                            message: "read timeout".into(),
-                        })
-                    }
-                    Err(e) => Err(AsynError::Io(e)),
+                    Err(e) => Err(classify_read_error(e)),
                 }
             }
             #[cfg(unix)]
@@ -373,16 +355,7 @@ impl OctetNext for IpIoState {
                             EomReason::empty()
                         },
                     }),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Err(AsynError::Status {
-                            status: AsynStatus::Timeout,
-                            message: "read timeout".into(),
-                        })
-                    }
-                    Err(e) => Err(AsynError::Io(e)),
+                    Err(e) => Err(classify_read_error(e)),
                 }
             }
         }
@@ -401,7 +374,16 @@ impl OctetNext for IpIoState {
         if data.is_empty() {
             return Ok(0);
         }
-        let deadline = std::time::Instant::now() + user.timeout;
+        // Floor the write deadline with the same C poll-interval floor as the
+        // socket send timeout: C writeRaw (615-617) floors a zero timeout to a
+        // 1 ms poll and then attempts the send (poll POLLOUT then send), so a
+        // `timeout == 0` write of a writable socket succeeds. Without the
+        // floor the deadline would be `now`, and `write_with_retry`'s
+        // top-of-loop `now > deadline` check would return Timeout *before*
+        // ever attempting `write` — failing a zero-timeout write that C lets
+        // through. socket_poll_timeout is a no-op for any positive timeout, so
+        // this only affects the `timeout == 0` case.
+        let deadline = std::time::Instant::now() + socket_poll_timeout(user.timeout);
         match inner {
             IpIoInner::Tcp(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
@@ -506,6 +488,26 @@ pub struct DrvAsynIPPort {
     /// `getOption("hostInfo")` returns it verbatim. Kept so the IP driver's
     /// `get_option` can echo the live endpoint instead of the generic map.
     host_info: String,
+}
+
+/// Classify a failed socket read. C `readRaw` (drvAsynIPPort.c:798-800)
+/// excludes BOTH `EWOULDBLOCK` and `EINTR` from the fatal-disconnect
+/// disjunct, so a would-block timeout AND a signal-interrupted read both
+/// surface as `asynTimeout` with the socket left intact (the caller retries);
+/// any other error is a real transport failure (`Io`) that the read path's
+/// teardown treats as fatal. Single owner of read-error classification for
+/// the TCP/UDP/Unix read arms — keeps `Interrupted` (EINTR) on the
+/// timeout/non-fatal path identically to `WouldBlock`, exactly as C does.
+fn classify_read_error(e: std::io::Error) -> AsynError {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::Interrupted => AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        },
+        _ => AsynError::Io(e),
+    }
 }
 
 /// A transport error meaning the socket is broken and the connection must
@@ -1781,6 +1783,64 @@ mod tests {
             drv.base().connected,
             "zero-timeout read must not disconnect even with disconnectOnReadTimeout=Y"
         );
+    }
+
+    #[test]
+    fn classify_read_error_eintr_and_wouldblock_are_nonfatal_timeout() {
+        // C readRaw (798-800) excludes EWOULDBLOCK *and* EINTR from the fatal
+        // disjunct, so a signal-interrupted read must be a non-fatal timeout
+        // (socket intact), identical to a would-block — never an Io→teardown.
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+        ] {
+            let err = classify_read_error(Error::from(kind));
+            match err {
+                AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    ..
+                } => {}
+                other => panic!("{kind:?} must map to a non-fatal Timeout, got {other:?}"),
+            }
+            assert!(
+                !is_fatal_transport_error(&classify_read_error(Error::from(kind))),
+                "{kind:?} must not be a fatal transport error"
+            );
+        }
+        // A genuine transport failure stays fatal (Io) → teardown.
+        let reset = classify_read_error(Error::from(ErrorKind::ConnectionReset));
+        assert!(matches!(reset, AsynError::Io(_)));
+        assert!(is_fatal_transport_error(&reset));
+    }
+
+    #[test]
+    fn zero_timeout_write_attempts_send_not_instant_timeout() {
+        // DRV-11 (write side): C writeRaw floors a zero timeout to a 1 ms
+        // poll then attempts the send (615-617), so a `timeout == 0` write of
+        // a writable socket succeeds. The write deadline must be floored too,
+        // else write_with_retry's top-of-loop deadline check returns Timeout
+        // before ever calling write().
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16];
+            let _ = s.read(&mut buf);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::ZERO);
+        let n = drv.write_octet(&mut wuser, b"x").unwrap();
+        assert_eq!(
+            n, 1,
+            "zero-timeout write of a writable socket must attempt the send, not instant-timeout"
+        );
+
+        handle.join().unwrap();
     }
 
     #[test]

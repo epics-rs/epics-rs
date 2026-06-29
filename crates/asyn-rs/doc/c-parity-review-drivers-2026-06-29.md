@@ -287,4 +287,14 @@ contracts / behavioral models, not just a driver site.
   family (no `connect()`); reads use `recv_from`, writes use `send_to(peer)`,
   flush uses `recv_from`. Test: `test_udp_accepts_reply_from_any_peer` (a reply
   from a peer never sent to is received — a connected socket would drop it).
+- **DRV-4** (DEFECT, empty UDP datagram treated as EOF) — CLEARED (sign-off,
+  F3). C `drvAsynIPPort.c::readRaw` only treats `recv()==0` as a closed
+  connection for SOCK_STREAM (the EOF/closeConnection branch at line 815 is
+  `socketType == SOCK_STREAM`); a SOCK_DGRAM `recvfrom()==0` is a legitimate
+  zero-length datagram. Rust returned `Err(Disconnected,"EOF")` on a 0-byte
+  UDP read, which (post-F1) tore down the socket — a single empty datagram
+  killed the port. The UDP read arm now reports a successful zero-byte read
+  with an empty reason (no END, no teardown). Test:
+  `test_udp_empty_datagram_is_not_eof` (0-byte datagram → `read==0`, still
+  connected, next real datagram still read).
 

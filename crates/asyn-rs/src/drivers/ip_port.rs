@@ -307,10 +307,11 @@ impl OctetNext for IpIoState {
                 // peer (broadcast/multi-peer); the source address is only
                 // used for trace, so we discard it.
                 match socket.recv_from(buf) {
-                    Ok((0, _src)) => Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: "EOF".into(),
-                    }),
+                    // C drvAsynIPPort.c::readRaw: a SOCK_DGRAM recvfrom()==0
+                    // is a legitimate zero-length datagram, NOT a connection
+                    // close — the EOF/ASYN_EOM_END branch (line 815) is
+                    // SOCK_STREAM only. Report a successful zero-byte read and
+                    // leave the socket open (no teardown).
                     Ok((n, _src)) => Ok(OctetReadResult {
                         nbytes_transferred: n,
                         // C parity: CNT means the requested count was
@@ -1438,6 +1439,40 @@ mod tests {
         assert_eq!(&buf[..n], b"pong");
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_udp_empty_datagram_is_not_eof() {
+        // DRV-4: a zero-length UDP datagram is a legitimate read of 0 bytes,
+        // not a connection close. C readRaw only treats recv()==0 as EOF for
+        // SOCK_STREAM; a DGRAM 0-byte recvfrom leaves the port open.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        let mut drv =
+            DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        // Driver sends first so the server learns its source address.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"hello").unwrap();
+        let mut sbuf = [0u8; 16];
+        let (_n, src) = server.recv_from(&mut sbuf).unwrap();
+
+        // Reply with an empty datagram.
+        server.send_to(&[], src).unwrap();
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 32];
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        // The port must remain open — a 0-byte datagram is not EOF.
+        assert!(drv.base().connected);
+
+        // And it can still read a subsequent real datagram.
+        server.send_to(b"world", src).unwrap();
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"world");
     }
 
     // --- disconnectOnReadTimeout tests ---

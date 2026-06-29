@@ -827,7 +827,6 @@ impl PortDriver for DrvAsynSerialPort {
                         ),
                     });
                 }
-                self.config.baud = baud;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     let speed = baud_to_speed(baud);
@@ -837,6 +836,12 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     self.apply_termios(&t)?;
                 }
+                // C parity (drvAsynSerialPort.c:601-604): setOption restores the
+                // previous baud/termios if applyOptions fails. Commit the cached
+                // value only after a successful apply (or when the port is not
+                // open yet, where it is applied at the next connect), so
+                // getOption never reports a value the device rejected.
+                self.config.baud = baud;
             }
             "bits" => {
                 let bits = match value {
@@ -851,7 +856,6 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.config.data_bits = bits;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     t.c_cflag &= !libc::CSIZE;
@@ -863,6 +867,8 @@ impl PortDriver for DrvAsynSerialPort {
                     };
                     self.apply_termios(&t)?;
                 }
+                // Commit cached config only after a successful apply (see baud).
+                self.config.data_bits = bits;
             }
             "parity" => {
                 // C drvAsynSerialPort.c::setOption (379-395) accepts only
@@ -883,7 +889,6 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.config.parity = parity;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     match parity {
@@ -899,6 +904,8 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     self.apply_termios(&t)?;
                 }
+                // Commit cached config only after a successful apply (see baud).
+                self.config.parity = parity;
             }
             "stop" => {
                 let stop = match value {
@@ -911,7 +918,6 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.config.stop_bits = stop;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     match stop {
@@ -920,6 +926,8 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     self.apply_termios(&t)?;
                 }
+                // Commit cached config only after a successful apply (see baud).
+                self.config.stop_bits = stop;
             }
             "clocal" => {
                 let enabled = parse_bool_option(value)?;
@@ -935,11 +943,6 @@ impl PortDriver for DrvAsynSerialPort {
             }
             "crtscts" => {
                 let enabled = parse_bool_option(value)?;
-                if enabled {
-                    self.config.flow_control = FlowControl::Hardware;
-                } else if self.config.flow_control == FlowControl::Hardware {
-                    self.config.flow_control = FlowControl::None;
-                }
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     if enabled {
@@ -948,6 +951,12 @@ impl PortDriver for DrvAsynSerialPort {
                         t.c_cflag &= !libc::CRTSCTS;
                     }
                     self.apply_termios(&t)?;
+                }
+                // Commit cached config only after a successful apply (see baud).
+                if enabled {
+                    self.config.flow_control = FlowControl::Hardware;
+                } else if self.config.flow_control == FlowControl::Hardware {
+                    self.config.flow_control = FlowControl::None;
                 }
             }
             "ixon" => {
@@ -1988,5 +1997,37 @@ mod tests {
         let t = drv.get_current_termios().unwrap();
         assert_eq!(t.c_cc[libc::VSTART], 0x11, "VSTART must be ^Q (C default)");
         assert_eq!(t.c_cc[libc::VSTOP], 0x13, "VSTOP must be ^S (C default)");
+    }
+
+    /// DRV-35: C setOption (drvAsynSerialPort.c:601-604) restores the previous
+    /// baud/termios if applyOptions fails. The Rust driver must not leave the
+    /// cached config reporting a value the device rejected. Point the driver at
+    /// a non-tty fd so the apply path (tcgetattr/tcsetattr) fails, then assert
+    /// the cached baud is unchanged.
+    #[test]
+    fn set_option_does_not_commit_cached_config_on_apply_failure() {
+        let mut drv = DrvAsynSerialPort::new("rollback", "/dev/null").unwrap();
+        // A /dev/null fd is open but not a terminal: tcgetattr -> ENOTTY.
+        let badfd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        assert!(badfd >= 0, "could not open /dev/null");
+        drv.io.fd = Some(badfd);
+
+        // Default cached baud is 9600.
+        assert_eq!(drv.get_option("baud").unwrap(), "9600");
+
+        // The apply path fails (tcgetattr ENOTTY on /dev/null) ...
+        let r = drv.set_option("baud", "115200");
+        assert!(r.is_err(), "set_option must fail when apply fails");
+
+        // ... and the cached config must not have been mutated.
+        assert_eq!(
+            drv.get_option("baud").unwrap(),
+            "9600",
+            "cached baud must stay 9600 when apply fails (C restores baudPrev)"
+        );
+
+        // Clean up the fd ourselves (the driver never owned a real connection).
+        drv.io.fd = None;
+        unsafe { libc::close(badfd) };
     }
 }

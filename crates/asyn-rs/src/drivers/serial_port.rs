@@ -1058,15 +1058,14 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             "break" => {
-                // C parity: "off" = no-op, "" or "on" = standard break,
-                // numeric = break duration in ms
-                if value == "off" {
-                    // no-op
-                } else if let Some(fd) = self.io.fd {
-                    // Drain output first (C parity: tcdrain before tcsendbreak)
-                    if unsafe { libc::tcdrain(fd) } < 0 {
-                        return Err(AsynError::Io(std::io::Error::last_os_error()));
-                    }
+                // C parity (drvAsynSerialPort.c:507-528): "off" = no-op (early
+                // asynSuccess), "" or "on" = standard break (len 0), a number =
+                // break duration; anything else is "Bad number" (asynError).
+                // C validates the value and acts on the fd WITHOUT guarding on
+                // it being open, so a break on a closed port fails (tcsendbreak
+                // EBADF -> asynError) rather than silently succeeding. Mirror
+                // that order: validate first, then require the fd.
+                if value != "off" {
                     let duration = if value.is_empty() || value == "on" {
                         0 // standard break duration
                     } else {
@@ -1075,6 +1074,13 @@ impl PortDriver for DrvAsynSerialPort {
                             message: format!("invalid break duration: '{value}'"),
                         })?
                     };
+                    // Disconnected -> error (not a silent no-op); C reaches
+                    // tcdrain/tcsendbreak on the dead fd and returns asynError.
+                    let fd = self.io.fd_or_err()?;
+                    // Drain output first (C parity: tcdrain before tcsendbreak).
+                    if unsafe { libc::tcdrain(fd) } < 0 {
+                        return Err(AsynError::Io(std::io::Error::last_os_error()));
+                    }
                     let ret = unsafe { libc::tcsendbreak(fd, duration) };
                     if ret < 0 {
                         return Err(AsynError::Io(std::io::Error::last_os_error()));
@@ -1556,6 +1562,41 @@ mod tests {
         // "off" (a momentary line action), not an error.
         let drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
         assert_eq!(drv.get_option("break").unwrap(), "off");
+    }
+
+    #[test]
+    fn set_option_break_on_disconnected_errors_but_off_is_noop() {
+        // DRV-43: C setOption "break" (drvAsynSerialPort.c:507-528) does not
+        // guard on the fd, so a real break on a closed port fails
+        // (tcsendbreak EBADF -> asynError). The Rust arm previously skipped
+        // silently when disconnected. "off" stays a no-op (C asynSuccess), a
+        // bad duration is rejected before the fd is touched (C order).
+        let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
+
+        // "off" is a no-op even on a disconnected port.
+        drv.set_option("break", "off").unwrap();
+
+        // A real break on a disconnected port must error, not silently succeed.
+        let err = drv.set_option("break", "on").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    ..
+                }
+            ),
+            "break on a disconnected port must error, got {err:?}"
+        );
+
+        // A bad duration is rejected (validated before the fd, matching C).
+        let err = drv.set_option("break", "notanumber").unwrap_err();
+        match err {
+            AsynError::Status { message, .. } => {
+                assert!(message.contains("invalid break duration"))
+            }
+            other => panic!("expected invalid break duration error, got {other:?}"),
+        }
     }
 
     #[test]

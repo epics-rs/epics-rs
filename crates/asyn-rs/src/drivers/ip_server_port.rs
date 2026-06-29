@@ -43,7 +43,7 @@
 //! "what arrived last on the socket" cache.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -358,16 +358,11 @@ impl DrvAsynIPServerPort {
         if self.config.protocol == IpServerProtocol::Udp {
             return self.open_udp_listener();
         }
-        let bind_str = if self.config.bind_host.contains(':') {
-            // IPv6
-            format!("[{}]:{}", self.config.bind_host, self.config.bind_port)
-        } else {
-            format!("{}:{}", self.config.bind_host, self.config.bind_port)
-        };
+        let addr = self.resolve_bind_addr()?;
 
         // socket2 path so SO_REUSEADDR is set explicitly — mirrors
         // C asyn's unconditional setsockopt at drvAsynIPServerPort.c:430.
-        let listener = self.bind_with_options(&bind_str)?;
+        let listener = self.bind_with_options(addr)?;
         listener
             .set_nonblocking(false)
             .map_err(|e| AsynError::Status {
@@ -383,18 +378,7 @@ impl DrvAsynIPServerPort {
     /// worker. Mirrors C asyn's `connectIt` SOCK_DGRAM branch
     /// (drvAsynIPServerPort.c lines ~440-470).
     fn open_udp_listener(&mut self) -> AsynResult<()> {
-        let bind_str = if self.config.bind_host.contains(':') {
-            format!("[{}]:{}", self.config.bind_host, self.config.bind_port)
-        } else {
-            format!("{}:{}", self.config.bind_host, self.config.bind_port)
-        };
-        let addr: SocketAddr =
-            bind_str
-                .parse()
-                .map_err(|e: std::net::AddrParseError| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid UDP bind address '{bind_str}': {e}"),
-                })?;
+        let addr = self.resolve_bind_addr()?;
         let domain = if addr.is_ipv4() {
             socket2::Domain::IPV4
         } else {
@@ -415,7 +399,7 @@ impl DrvAsynIPServerPort {
             })?;
         sock.bind(&addr.into()).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("UDP bind '{bind_str}' failed: {e}"),
+            message: format!("UDP bind '{addr}' failed: {e}"),
         })?;
         let socket = UdpSocket::from(sock);
         // Read timeout caps shutdown latency — recv wakes every
@@ -447,14 +431,56 @@ impl DrvAsynIPServerPort {
         Ok(())
     }
 
-    fn bind_with_options(&self, bind_str: &str) -> AsynResult<TcpListener> {
-        let addr: SocketAddr =
-            bind_str
-                .parse()
-                .map_err(|e: std::net::AddrParseError| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid bind address '{bind_str}': {e}"),
-                })?;
+    /// Resolve the configured bind `host:port` to a concrete socket
+    /// address — the single owner of bind-address resolution shared by
+    /// the TCP ([`Self::bind_with_options`]) and UDP
+    /// ([`Self::open_udp_listener`]) paths.
+    ///
+    /// Mirrors C `createServerSocket` (drvAsynIPServerPort.c:403-419):
+    /// the server address defaults to `INADDR_ANY` (`0.0.0.0`, :404) and
+    /// is only overridden when the host is non-empty **and** not
+    /// `"localhost"` (:412-413), in which case it is resolved by name
+    /// (`hostToIPAddr`, :414). C deliberately maps both an empty host and
+    /// `"localhost"` to `INADDR_ANY` — its comment tells callers to use
+    /// `"127.0.0.1"` when they actually want the loopback interface — so
+    /// this is faithful parity, not a copied bug.
+    ///
+    /// An IP literal (IPv4, or bracketless IPv6 such as `::1`) binds
+    /// verbatim, preserving the existing explicit-address paths without a
+    /// name lookup; any other host name is resolved like the client
+    /// driver (`ip_port.rs::connect_udp`). The earlier
+    /// `SocketAddr::parse` of `host:port` rejected empty-host,
+    /// `localhost`, and every hostname.
+    fn resolve_bind_addr(&self) -> AsynResult<SocketAddr> {
+        let host = self.config.bind_host.trim();
+        let port = self.config.bind_port;
+        // Empty or "localhost" => INADDR_ANY, exactly as C (:404,
+        // :412-413). C is IPv4-only here (PF_INET / sockaddr_in), so the
+        // any-address is the IPv4 0.0.0.0.
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
+        }
+        // IP literal => bind verbatim (no lookup); covers explicit IPv4
+        // and bracketless IPv6.
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+        // Otherwise resolve the name (C hostToIPAddr, :414).
+        use std::net::ToSocketAddrs;
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("cannot resolve bind host '{host}': {e}"),
+            })?
+            .next()
+            .ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("cannot resolve bind host '{host}': no addresses"),
+            })
+    }
+
+    fn bind_with_options(&self, addr: SocketAddr) -> AsynResult<TcpListener> {
         let domain = if addr.is_ipv4() {
             socket2::Domain::IPV4
         } else {
@@ -475,7 +501,7 @@ impl DrvAsynIPServerPort {
             })?;
         socket.bind(&addr.into()).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("bind '{bind_str}' failed: {e}"),
+            message: format!("bind '{addr}' failed: {e}"),
         })?;
         // Backlog independent of `max_clients` — the slot cap bounds
         // *concurrent* accepted clients, not the kernel's pending-
@@ -1146,6 +1172,56 @@ mod tests {
         assert_eq!(cfg.protocol, IpServerProtocol::Udp);
         let cfg2 = IpServerConfig::parse("0.0.0.0:7000").unwrap();
         assert_eq!(cfg2.protocol, IpServerProtocol::Tcp, "default is TCP");
+    }
+
+    /// DRV-19: bind-host resolution. C `createServerSocket`
+    /// (drvAsynIPServerPort.c:403-419) defaults to `INADDR_ANY` and only
+    /// overrides it for a non-empty host that is not `"localhost"`. An
+    /// empty host and `"localhost"` (any case) both bind `0.0.0.0`; an IP
+    /// literal binds verbatim. The pre-fix bare `SocketAddr::parse` of
+    /// `host:port` rejected all three of empty/localhost/hostname.
+    #[test]
+    fn resolve_bind_addr_maps_localhost_and_empty_to_inaddr_any() {
+        let any = IpAddr::from([0, 0, 0, 0]);
+
+        let empty = DrvAsynIPServerPort::new("rb_empty", ":0").unwrap();
+        assert_eq!(
+            empty.resolve_bind_addr().unwrap().ip(),
+            any,
+            "empty host => INADDR_ANY"
+        );
+
+        let lh = DrvAsynIPServerPort::new("rb_localhost", "localhost:0").unwrap();
+        assert_eq!(
+            lh.resolve_bind_addr().unwrap().ip(),
+            any,
+            "localhost => INADDR_ANY (C does NOT map it to loopback)"
+        );
+
+        let lh_upper = DrvAsynIPServerPort::new("rb_localhost_upper", "LocalHost:0").unwrap();
+        assert_eq!(
+            lh_upper.resolve_bind_addr().unwrap().ip(),
+            any,
+            "localhost match is case-insensitive (C epicsStrCaseCmp)"
+        );
+
+        let explicit = DrvAsynIPServerPort::new("rb_explicit", "127.0.0.1:0").unwrap();
+        assert_eq!(
+            explicit.resolve_bind_addr().unwrap().ip(),
+            IpAddr::from([127, 0, 0, 1]),
+            "explicit IP literal binds verbatim"
+        );
+    }
+
+    /// DRV-19 end-to-end: a `localhost`-named server now binds and
+    /// listens. Pre-fix the bare `SocketAddr::parse("localhost:0")`
+    /// errored, so a named-host server could never `connect()`.
+    #[test]
+    fn connect_localhost_named_host_binds() {
+        let mut srv = DrvAsynIPServerPort::new("rb_connect_lh", "localhost:0").unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        assert!(srv.local_port() > 0, "listener bound to an ephemeral port");
+        srv.disconnect(&AsynUser::default()).unwrap();
     }
 
     /// UDP-mode end-to-end: bind ephemeral, two clients each fire one

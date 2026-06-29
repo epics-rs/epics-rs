@@ -322,3 +322,23 @@ contracts / behavioral models, not just a driver site.
   matching C's unconditional TCP_NODELAY; only the off-toggle is the
   extension). Test: `test_set_option_nodelay` (extended to assert `"1"`/typo
   now error).
+- **DRV-62** (CONCERN, serial bool/parity option values looser than C; review
+  round DIV-2) — CLEARED. The serial-side siblings of DRV-10/DRV-61 that the
+  earlier strict-validation fix did not cover (the IP fix was applied only to
+  `disconnectOnReadTimeout`). (a) `parse_bool_option` — the single owner of
+  `clocal`/`crtscts`/`ixon`/`ixoff`/`ixany` — accepted `y/yes/1/true` /
+  `n/no/0/false`, but C `drvAsynSerialPort.c::setOption` (410-504) accepts
+  strictly `Y`/`N` (`epicsStrCaseCmp`), else asynError "Invalid <key> value.";
+  tightened to strict Y/N (case-insensitive). (b) `parity` accepted single-char
+  aliases `n`/`e`/`o`, but C (379-395) accepts only `none`/`even`/`odd`, else
+  asynError "Invalid parity."; aliases dropped. These were accept-more-than-C
+  leniency divergences (all C-valid inputs still work); tightened for parity and
+  for uniformity with the IP Y/N options rather than recorded as intentional,
+  since validating one Y/N option strictly while a sibling stays loose is the
+  non-uniform rule the structural-fix guidance removes. Tests:
+  `test_parse_bool_option` (rewritten to strict Y/N), `test_set_option_parity`
+  / `test_set_option_parity_case_insensitive` (use full words, assert alias
+  rejected). DISTINCT, not touched: `bits`/`stop` (exact-match-or-error =
+  C-faithful), `baud` (numeric, narrower than C — separate pre-existing item),
+  rs485 options (Linux-only Rust extension, no C `setOption` counterpart),
+  prologix/ip_server (register no C `asynOption` interface).

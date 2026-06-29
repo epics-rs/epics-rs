@@ -275,15 +275,22 @@ fn is_supported_baud(baud: u32) -> bool {
 /// Accepted falsy values (case-insensitive): `n`, `no`, `0`, `false`.
 /// Returns `Err` for unrecognized values.
 fn parse_bool_option(value: &str) -> AsynResult<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" | "1" | "true" => Ok(true),
-        "n" | "no" | "0" | "false" => Ok(false),
-        _ => Err(AsynError::Status {
+    // C drvAsynSerialPort.c::setOption validates the boolean serial options
+    // (clocal/crtscts/ixon/ixoff/ixany, lines 410-504) strictly with
+    // epicsStrCaseCmp(val,"Y")/("N"): only "Y"/"N" (case-insensitive) are
+    // accepted; anything else returns asynError "Invalid <key> value."
+    // Match that strict accept-set instead of the looser y/yes/1/true
+    // coercion, so a typo errors rather than silently selecting the wrong
+    // setting (the same reason disconnectOnReadTimeout/noDelay are strict).
+    if value.eq_ignore_ascii_case("Y") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("N") {
+        Ok(false)
+    } else {
+        Err(AsynError::Status {
             status: AsynStatus::Error,
-            message: format!(
-                "invalid boolean value: '{value}' (expected y/yes/1/true or n/no/0/false)"
-            ),
-        }),
+            message: format!("invalid boolean value: '{value}' (expected Y or N)"),
+        })
     }
 }
 
@@ -797,11 +804,15 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             "parity" => {
+                // C drvAsynSerialPort.c::setOption (379-395) accepts only
+                // "none"/"even"/"odd" (case-insensitive); anything else is
+                // asynError "Invalid parity." The single-char aliases n/e/o
+                // were a Rust-only superset and are dropped to match C.
                 let val_lower = value.to_ascii_lowercase();
                 let parity = match val_lower.as_str() {
-                    "none" | "n" => Parity::None,
-                    "even" | "e" => Parity::Even,
-                    "odd" | "o" => Parity::Odd,
+                    "none" => Parity::None,
+                    "even" => Parity::Even,
+                    "odd" => Parity::Odd,
                     _ => {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
@@ -1292,7 +1303,7 @@ mod tests {
         drv.set_option("parity", "even").unwrap();
         assert_eq!(drv.config.parity, Parity::Even);
         assert_eq!(drv.get_option("parity").unwrap(), "even");
-        drv.set_option("parity", "O").unwrap();
+        drv.set_option("parity", "odd").unwrap();
         assert_eq!(drv.config.parity, Parity::Odd);
     }
 
@@ -1347,8 +1358,10 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
         drv.set_option("parity", "EVEN").unwrap();
         assert_eq!(drv.config.parity, Parity::Even);
-        drv.set_option("parity", "n").unwrap();
+        drv.set_option("parity", "None").unwrap();
         assert_eq!(drv.config.parity, Parity::None);
+        // Single-char aliases (n/e/o) are no longer accepted (C parity).
+        assert!(drv.set_option("parity", "n").is_err());
     }
 
     #[test]
@@ -1365,17 +1378,16 @@ mod tests {
 
     #[test]
     fn test_parse_bool_option() {
-        // Truthy
-        for v in &["y", "Y", "yes", "YES", "Yes", "1", "true", "TRUE", "True"] {
-            assert!(parse_bool_option(v).unwrap(), "expected true for '{v}'");
+        // C drvAsynSerialPort.c validates these options strictly Y/N
+        // (case-insensitive); the looser y/yes/1/true coercion is gone.
+        assert!(parse_bool_option("Y").unwrap());
+        assert!(parse_bool_option("y").unwrap());
+        assert!(!parse_bool_option("N").unwrap());
+        assert!(!parse_bool_option("n").unwrap());
+        // Tokens C rejects now error instead of silently coercing.
+        for v in &["yes", "1", "true", "no", "0", "false", "maybe", ""] {
+            assert!(parse_bool_option(v).is_err(), "expected err for '{v}'");
         }
-        // Falsy
-        for v in &["n", "N", "no", "NO", "No", "0", "false", "FALSE", "False"] {
-            assert!(!parse_bool_option(v).unwrap(), "expected false for '{v}'");
-        }
-        // Invalid
-        assert!(parse_bool_option("maybe").is_err());
-        assert!(parse_bool_option("").is_err());
     }
 
     #[test]

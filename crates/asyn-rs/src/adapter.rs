@@ -6494,7 +6494,7 @@ mod tests {
         fn drv_user_create(&self, _drv_info: &str) -> AsynResult<usize> {
             Ok(0)
         }
-        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             if self.fail {
                 // A generic asynError (not a specific Timeout/Overflow/…): this
                 // is the only arm whose alarm depends on the direction default,
@@ -6505,7 +6505,7 @@ mod tests {
                 });
             }
             self.writes.lock().unwrap().push(data.to_vec());
-            Ok(())
+            Ok(data.len())
         }
     }
 
@@ -6705,10 +6705,10 @@ mod tests {
             self.sequence.lock().unwrap().push("flush");
             Ok(())
         }
-        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.writes.lock().unwrap().push(data.to_vec());
             self.sequence.lock().unwrap().push("write");
-            Ok(())
+            Ok(data.len())
         }
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
             self.sequence.lock().unwrap().push("read");

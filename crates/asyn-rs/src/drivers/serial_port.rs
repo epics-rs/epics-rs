@@ -710,7 +710,7 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(result.nbytes_transferred)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
         asyn_trace_io!(
             Some(self.base.trace),
@@ -724,7 +724,7 @@ impl PortDriver for DrvAsynSerialPort {
             .interpose_octet
             .dispatch_write(user, data, &mut self.io)
         {
-            Ok(_) => Ok(()),
+            Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: closeConnection on a fatal write error so the
                 // next request reconnects (symmetric with read; matches

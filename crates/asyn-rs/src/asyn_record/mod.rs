@@ -3521,7 +3521,7 @@ mod tests {
                 &mut self,
                 _user: &mut AsynUser,
                 _data: &[u8],
-            ) -> crate::error::AsynResult<()> {
+            ) -> crate::error::AsynResult<usize> {
                 Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "write boom".into(),
@@ -3653,7 +3653,7 @@ mod tests {
                 &mut self,
                 _user: &mut AsynUser,
                 _data: &[u8],
-            ) -> crate::error::AsynResult<()> {
+            ) -> crate::error::AsynResult<usize> {
                 Err(boom())
             }
             fn io_read_int32(&mut self, _user: &AsynUser) -> crate::error::AsynResult<i32> {

@@ -342,3 +342,30 @@ contracts / behavioral models, not just a driver site.
   C-faithful), `baud` (numeric, narrower than C — separate pre-existing item),
   rs485 options (Linux-only Rust extension, no C `setOption` counterpart),
   prologix/ip_server (register no C `asynOption` interface).
+- **DRV-15 / DRV-38** (F8 — write byte count dropped by the `write_octet -> ()`
+  contract) — CLEARED (framework trait-signature change, sign-off). C
+  `asynOctet::write` fills `*nbytesTransfered`; the interpose layer and base
+  `OctetNext::write` already returned `usize`, but `PortDriver::write_octet`/
+  `io_write_octet` (and the public `PortHandle`/`SyncIO::write_octet`,
+  `AsynOctet::write_octet`) returned `()`, discarding the count
+  `dispatch_write` produced (drvAsynIPPort.c writeRaw 678-705 accumulates
+  `*nbytesTransfered`; drvAsynSerialPort.c:843). Changed the whole write
+  contract to `AsynResult<usize>` (success carries bytes written), the
+  write-side twin of the F5 read fix (`io_read_octet_eom`). The actor carries
+  it via the existing `RequestResult.nbytes` (`RequestResult::write_n`); the
+  public `PortHandle`/`SyncIO::write_octet` now return it. Per-driver counts:
+  ip/serial return `dispatch_write`'s count; prologix returns the caller's
+  `data.len()` (not the GPIB-framed `out` length); ip_server returns
+  `data.len()` (`write_all`, full write). Downstream impls updated:
+  `ad-core-rs` (`data.len()`), `mqtt-rs` (`raw.len()`, published payload),
+  `epics-modbus-rs` (`consumed.min(data.len())` — register-budget-capped, NUL
+  excluded, C `writeOctet` char count). DIVERGENCE (documented, not fixed):
+  the **error-path partial count** is NOT carried — on a partial-write-then-
+  error `Result<usize, AsynError>` returns `Err` with no count, where C
+  returns `(asynError, *nbytesTransfered=partial)`. This matches the read-side
+  contract (a read error carries no partial count either), the base
+  `write_with_retry` already discards its partial `offset` on the error
+  return, and a write error alarms the record regardless; carrying a partial
+  count on error would require an `AsynError`-restructure that breaks the
+  read/write symmetry. Workspace clippy `--all-targets` clean; full-workspace
+  nextest (7311) + doctests green. Both `write_octet -> ()` findings closed.

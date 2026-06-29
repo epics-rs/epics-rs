@@ -688,7 +688,7 @@ impl PortDriver for DrvAsynIPServerPort {
         Ok(res.nbytes_transferred)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         if self.config.protocol == IpServerProtocol::Udp {
             // C asyn `writeIt` for UDP server is a one-line
             // `return asynError;` — the server is read-only.
@@ -721,11 +721,11 @@ impl PortDriver for DrvAsynIPServerPort {
                         .announce_exception(AsynException::Connect, i as i32);
                 }
             }
-            return Ok(());
+            return Ok(data.len());
         }
         let arc = self.slot_arc(user.addr)?;
         match self.write_to_slot(&arc, data) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(data.len()),
             Err(e) => {
                 // Mark slot disconnected so the next read/write fails fast.
                 if let Ok(idx) = self.slot_index(user.addr) {
@@ -1040,7 +1040,7 @@ impl PortDriver for DrvAsynIPSubport {
         }
     }
 
-    fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let mut g = self.slot.stream.lock();
         let stream = g.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
@@ -1054,7 +1054,7 @@ impl PortDriver for DrvAsynIPSubport {
             status: AsynStatus::Error,
             message: format!("flush failed: {e}"),
         })?;
-        Ok(())
+        Ok(data.len())
     }
 }
 

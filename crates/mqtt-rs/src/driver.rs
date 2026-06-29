@@ -231,11 +231,14 @@ impl PortDriver for MqttDriver {
         self.base.call_param_callbacks(user.addr)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         // asyn octet values are NUL-terminated C-strings: C stringWrite publishes
         // std::string(stringData.data()), terminating the payload at the first
         // NUL (drvMqtt.cpp:714-716). Take the raw bytes up to that NUL.
         let raw = octet_bytes_cstr(data);
+        // Bytes transferred = bytes actually published to the wire (the
+        // payload up to the NUL), C `asynOctet::write`'s *nbytesTransfered.
+        let nbytes = raw.len();
         // Copy the format (Copy enum) so the immutable reason_to_addr borrow is
         // dropped before the mutable cache store below.
         let format = self
@@ -267,7 +270,8 @@ impl PortDriver for MqttDriver {
         self.base
             .params
             .set_string(user.reason, user.addr, cached)?;
-        self.base.call_param_callbacks(user.addr)
+        self.base.call_param_callbacks(user.addr)?;
+        Ok(nbytes)
     }
 
     fn write_uint32_digital(

@@ -111,15 +111,17 @@ impl SyncIOHandle {
         })
     }
 
-    pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<()> {
+    /// Returns the number of bytes transferred (C `asynOctet::write`'s
+    /// `*nbytesTransfered`).
+    pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<usize> {
         let user = self.user(reason);
-        self.handle.submit_blocking(
+        let result = self.handle.submit_blocking(
             RequestOp::OctetWrite {
                 data: data.to_vec(),
             },
             user,
         )?;
-        Ok(())
+        Ok(result.nbytes)
     }
 
     pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {

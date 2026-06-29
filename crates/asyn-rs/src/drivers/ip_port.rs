@@ -904,7 +904,7 @@ impl PortDriver for DrvAsynIPPort {
         self.read_octet_core(user, buf)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         // HTTP connect-per-transaction: reconnect if disconnected.
         // Surface the connect failure cause rather than masking it.
         if self.config.protocol == IpProtocol::Http && !self.base.connected {
@@ -923,7 +923,7 @@ impl PortDriver for DrvAsynIPPort {
             .interpose_octet
             .dispatch_write(user, data, &mut self.io)
         {
-            Ok(_) => Ok(()),
+            Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: drvAsynIPPort.c::writeIt closes the connection
                 // on a real send error (ECONNRESET/EPIPE) so the next
@@ -1298,7 +1298,7 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        let mut last = Ok(());
+        let mut last: AsynResult<usize> = Ok(0);
         for _ in 0..200 {
             last = drv.write_octet(&mut user, b"ping\n");
             if last.is_err() {

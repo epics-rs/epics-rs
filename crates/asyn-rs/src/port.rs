@@ -976,12 +976,13 @@ pub trait PortDriver: Send + Sync + 'static {
         Ok(n)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let s = String::from_utf8_lossy(data).into_owned();
         self.base_mut()
             .params
             .set_string(user.reason, user.addr, s)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        self.base_mut().call_param_callbacks(user.addr)?;
+        Ok(data.len())
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
@@ -1191,7 +1192,7 @@ pub trait PortDriver: Send + Sync + 'static {
         Ok((n, eom))
     }
 
-    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.write_octet(user, data)
     }
 

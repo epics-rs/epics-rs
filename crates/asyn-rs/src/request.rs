@@ -345,6 +345,17 @@ impl RequestResult {
         Self::base()
     }
 
+    /// Octet write result carrying the number of bytes transferred
+    /// (C `asynOctet::write`'s `*nbytesTransfered`). Used by
+    /// `PortHandle::write_octet` / `SyncIO::write_octet` to report how
+    /// many bytes the driver actually wrote on success.
+    pub fn write_n(nbytes: usize) -> Self {
+        Self {
+            nbytes,
+            ..Self::base()
+        }
+    }
+
     pub fn octet_read(buf: Vec<u8>, nbytes: usize) -> Self {
         Self {
             nbytes,

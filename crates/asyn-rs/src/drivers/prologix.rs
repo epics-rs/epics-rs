@@ -253,7 +253,7 @@ impl DrvAsynPrologixPort {
         let cmd = Self::addr_line(primary, secondary);
         let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
         match self.inner.write_octet(&mut bridge_user, cmd.as_bytes()) {
-            Ok(()) => {
+            Ok(_) => {
                 let mut s = self.state.lock().unwrap();
                 s.last_primary = primary;
                 s.last_secondary = secondary;
@@ -359,7 +359,7 @@ impl PortDriver for DrvAsynPrologixPort {
         self.inner.io_flush(user)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
         // C parity: prologixWrite sets bufCount=0 at the start of every
         // write, discarding any reply tail the previous read left staged —
@@ -376,7 +376,11 @@ impl PortDriver for DrvAsynPrologixPort {
             Self::stash_char(&mut out, c);
         }
         out.push(b'\n');
-        self.inner.write_octet(user, &out)
+        // Report the caller's data length as bytes transferred, not the
+        // GPIB-framed wire length (`out`): on a successful inner write all of
+        // `data` was accepted (C asyn reports the application payload count).
+        self.inner.write_octet(user, &out)?;
+        Ok(data.len())
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {

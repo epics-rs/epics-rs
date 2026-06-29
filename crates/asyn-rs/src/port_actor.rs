@@ -354,8 +354,8 @@ impl PortActor {
 
         let result = match op {
             RequestOp::OctetWrite { data } => {
-                self.driver.io_write_octet(user, data)?;
-                Ok(RequestResult::write_ok())
+                let n = self.driver.io_write_octet(user, data)?;
+                Ok(RequestResult::write_n(n))
             }
             RequestOp::OctetRead { buf_size } => {
                 let mut buf = vec![0u8; *buf_size];
@@ -373,8 +373,8 @@ impl PortActor {
                 self.driver.set_output_eos(&[])?;
                 let res = self.driver.io_write_octet(user, data);
                 let _ = self.driver.set_output_eos(&saved);
-                res?;
-                Ok(RequestResult::write_ok())
+                let n = res?;
+                Ok(RequestResult::write_n(n))
             }
             RequestOp::OctetReadBinary { buf_size } => {
                 // C parity: asynRecord binary input (asynRecord.c:1564-1577).
@@ -1031,9 +1031,9 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 *self.write_eos.lock() = self.base().output_eos.clone();
-                Ok(())
+                Ok(data.len())
             }
             fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
                 *self.read_eos.lock() = self.base().input_eos.clone();
@@ -1138,10 +1138,10 @@ mod tests {
                 self.sequence.lock().push("flush");
                 Ok(())
             }
-            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 self.write_calls.fetch_add(1, Ordering::Relaxed);
                 self.sequence.lock().push("write");
-                Ok(())
+                Ok(data.len())
             }
             fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
                 self.sequence.lock().push("read");

@@ -185,11 +185,11 @@ impl PortDriver for EchoDriver {
         &mut self.base
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let s = String::from_utf8_lossy(data).to_string();
         self.base.set_string_param(user.reason, user.addr, s)?;
         self.base.call_param_callbacks(user.addr)?;
-        Ok(())
+        Ok(data.len())
     }
 }
 

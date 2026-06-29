@@ -306,11 +306,14 @@ impl PortHandle {
         Ok((data, eom))
     }
 
-    pub async fn write_octet(&self, reason: usize, addr: i32, data: Vec<u8>) -> AsynResult<()> {
+    /// Returns the number of bytes transferred (C `asynOctet::write`'s
+    /// `*nbytesTransfered`).
+    pub async fn write_octet(&self, reason: usize, addr: i32, data: Vec<u8>) -> AsynResult<usize> {
         let user = AsynUser::new(reason).with_addr(addr);
-        self.submit_async(RequestOp::OctetWrite { data }, user)
+        let result = self
+            .submit_async(RequestOp::OctetWrite { data }, user)
             .await?;
-        Ok(())
+        Ok(result.nbytes)
     }
 
     pub async fn read_uint32_digital(

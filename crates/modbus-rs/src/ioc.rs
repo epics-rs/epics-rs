@@ -1086,7 +1086,7 @@ impl PortDriver for ModbusPortDriver {
         Ok(())
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let dt = self.datatype_of(user.reason)?;
         // C `writeOctet` (drvModbusAsyn.cpp:1545-1562) accepts only the
         // write-multiple-registers functions; any other function returns
@@ -1134,7 +1134,7 @@ impl PortDriver for ModbusPortDriver {
         } else {
             data
         };
-        let (regs, _) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
+        let (regs, consumed) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
         // Relative mode caches the value and fans out its monitor (see
         // `cache_write_numeric`); absolute mode has no parameter-table slot
@@ -1144,7 +1144,11 @@ impl PortDriver for ModbusPortDriver {
             self.base.set_string_param(user.reason, user.addr, s)?;
             self.base.call_param_callbacks(user.addr)?;
         }
-        Ok(())
+        // Bytes transferred = caller chars written, capped by the register
+        // budget and excluding the appended NUL terminator for Z-strings
+        // (C `writeOctet` reports the character count, not the NUL,
+        // drvModbusAsyn.cpp:1519-1529).
+        Ok(consumed.min(data.len()))
     }
 }
 

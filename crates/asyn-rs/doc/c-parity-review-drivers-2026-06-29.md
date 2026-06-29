@@ -54,7 +54,7 @@ impact paragraphs in the round report
 | DRV-4 | DEFECT | ip_port.rs:296-299,782-804 | drvAsynIPPort.c:815 | empty UDP datagram treated as EOF → tears down socket (legit zero-len datagram kills the port) |
 | DRV-5 | DEFECT | ip_port.rs:810-828,357-379 | drvAsynIPPort.c:692-699 | write errors never close connection (asymmetric w/ read path); port wedges, no reconnect |
 | DRV-6 | CONCERN | ip_port.rs:121-138,32-51 | drvAsynIPPort.c:364-367,1061-1064 | `COM` protocol suffix unsupported → silently downgraded to plain TCP, RFC 2217 interpose omitted |
-| DRV-7 | CONCERN | ip_port.rs:767-771,711-718 | drvAsynIPPort.c:214-217,557-558,815-819 | HTTP per-transaction disconnects after each read → truncates multi-segment responses + flaps Connect exception |
+| DRV-7 | CLEARED | ip_port.rs:767-771,711-718 | drvAsynIPPort.c:214-217,557-558,815-819 | HTTP per-transaction disconnects after each read → truncates multi-segment responses + flaps Connect exception — FIXED 1629e3bb |
 | DRV-8 | CONCERN | ip_port.rs:861-866,665-667 | drvAsynIPPort.c:525-534,915-947 | `noDelay` is a non-C option key (C has none, sets TCP_NODELAY unconditionally) |
 | DRV-9 | CONCERN | ip_port.rs:916-945 | drvAsynIPPort.c:902-906,941-945 | setOption/getOption accept+echo arbitrary unknown keys; C closes dispatch (asynError) |
 | DRV-10 | LOW | ip_port.rs:867-869 | drvAsynIPPort.c:924-935 | `disconnectOnReadTimeout` parse accepts extra values, never errors (C: only Y/N) |
@@ -687,3 +687,25 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   `Duration` (DRV-42, separate finding). Tests:
   `socket_poll_timeout_floors_zero_to_one_ms`,
   `zero_timeout_read_polls_without_disconnect`.
+
+- **DRV-7** (CONCERN — HTTP connect-per-transaction) — CLEARED 1629e3bb.
+  Structural: `base.connected` conflated "logically connected" (exception /
+  autoConnect state) with "has a live socket". C models HTTP via
+  `FLAG_CONNECT_PER_TRANSACTION` — the response ends on the server's EOF
+  (HTTP/1.0 close), the socket reopens lazily at the next write
+  (`writeRaw` `connectIt` on `fd==INVALID`, drvAsynIPPort.c:590-606), and
+  `closeConnection` suppresses `exceptionDisconnect` for cpt
+  (drvAsynIPPort.c:214-216) so the Connect exception never flaps. Two bugs
+  followed from the conflation: (1) read_octet_core dropped after EVERY HTTP
+  read (`eof || Http`) → multi-chunk responses lost everything past chunk 1
+  (next read reconnected to a fresh socket); (2) drop_connection set
+  `connected=false` each transaction and the lazy reconnect gated on
+  `!connected` → the Connect exception flapped per request. Fix separates the
+  meanings: `drop_connection` is now the C `closeConnection` (HTTP releases
+  only `io.inner`, keeps `connected` true; normal links still drop to false
+  for the actor's auto-reconnect); EOF drops on `eof` only (removed the
+  `|| Http`); both lazy reconnects gate on `io.inner.is_none()` not
+  `!connected`, and `connect()` is edge-guarded so reopening no-ops
+  `set_connected(true)` (no flap). Aside: Rust opens the HTTP socket eagerly
+  at connect vs C's lazy-at-first-write — benign (idle socket reused by the
+  first write). Test: `http_multi_segment_response_not_truncated`.

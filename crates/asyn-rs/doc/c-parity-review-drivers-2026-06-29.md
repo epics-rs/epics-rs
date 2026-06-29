@@ -113,6 +113,8 @@ impact paragraphs in the round report
 | DRV-52 | LOW | prologix.rs:322,333 | drvPrologixGPIB.c:213,231 | per-device connect/disconnect toggles port-level state + announces addr −1 (ASYN_MULTIDEVICE) |
 | DRV-53 | LOW | prologix.rs:131-135 | drvPrologixGPIB.c:592-593 | port registered `destructible:true`; C registers no ASYN_DESTRUCTIBLE (over-grants shutdown rights) |
 | DRV-54 | LOW | prologix.rs:396-400 | drvPrologixGPIB.c:253 | zero read timeout coerced to 1s (C passes 0 = poll verbatim) |
+| DRV-55 | CLEARED | ip_port.rs:283-289, ip_server_port.rs:887-893,1169-1175 | drvAsynIPPort.c:736-740 | `maxchars==0` read guard unported → empty buffer reads Ok(0) → misread as peer EOF → healthy-connection teardown — FIXED 75654e2b (maxchars_zero_error guard at all 3 IP read entry points) |
+| DRV-56 | CLEARED | ip_server_port.rs:1064-1080 | drvAsynIPServerPort.c:308-323 | UDP recv worker broke loop on EINTR → benign signal permanently killed reception; C also stops on EINTR (UDPbufferSize=-1) = C bug not copied — FIXED 789ecc2a (EINTR routed to non-fatal continue) |
 
 NON-GAPs / parity-clean (Rust correctly declines C bugs or improves): ip_port
 ASIDES (IPv6 superset, null-term, DNS caching); ip_server DRV-25/26; serial
@@ -740,3 +742,42 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   value is centralized into that const (was two magic `from_secs(5)`
   literals) and C exposes no connect-timeout option, so it is not
   runtime-settable.
+
+- **DRV-55** (CONCERN — `maxchars==0` read guard unported) — CLEARED 75654e2b.
+  C `readRaw` (drvAsynIPPort.c:736-740) rejects a `maxchars == 0` read
+  request with `asynError` ("maxchars %d. Why <=0?") *after* the connect
+  check and *before* touching the socket. The Rust IP reads had no guard: a
+  `stream.read(&mut [])` returns `Ok(0)`, which the TCP read arm interprets
+  as a peer EOF — the client read tears down the socket, the server reads
+  clear the slot and announce a spurious disconnect. Added
+  `maxchars_zero_error` (pub(crate), ip_port.rs) as the single owner of the
+  empty-buffer rejection and applied `if buf.is_empty()` at all three IP
+  octet read entry points (the C `readRaw` analogues): `IpIoState::read`,
+  `DrvAsynIPServerPort::base_read_octet`, `DrvAsynIPSubport::read_octet` —
+  each placed after the connect check and before the socket read, exactly as
+  C orders it. Distinct/skipped: the flush drains (`Ok(0)=>break` is the
+  drain's own end-of-data) and `write_octet`'s empty-data `Ok(0)` early
+  return (zero-byte writes are valid; C `writeRaw` has no maxchars guard).
+  Reachability through the framework's sized-buffer device support is
+  unconfirmed, but the C guard is unconditional and the alternative (silent
+  teardown of a live connection) is adverse, so the guard closes the parity
+  gap regardless of caller. Test:
+  `zero_length_read_request_rejected_not_eof_teardown` (empty buffer →
+  asynError, socket stays connected).
+
+- **DRV-56** (CONCERN — UDP recv worker dies on EINTR) — CLEARED 789ecc2a.
+  The server-port UDP recv worker (`udp_recv_loop`) treated any recv error
+  other than `WouldBlock`/`TimedOut` as fatal and broke out of the loop, so a
+  single EINTR (a benign signal interrupting `recv`) permanently killed UDP
+  reception for the port. C's UDP worker (drvAsynIPServerPort.c:308-323)
+  assigns `UDPbufferSize = recvfrom(...)` with no error check at all — on
+  EINTR it stores -1, fires the callback with a -1 size, and then never
+  `recvfrom`s again (UDPbufferSize stuck at -1 routes every later iteration
+  to the 1 ms sleep branch). That is a C bug (silent reception-death on a
+  benign signal), not a contract to copy. Routed EINTR into the existing
+  non-fatal `continue` arm via the shared `is_nonfatal_read_timeout` owner so
+  the worker retries the recv after a signal; a genuine hard recv error still
+  exits the thread cleanly (reception is dead either way — C would
+  1 ms-busy-spin a worker that can never receive again). Distinct from
+  DRV-11: different C function (recv worker, not `readRaw`) and a different
+  consequence (worker-thread death, not read-status misclassification).

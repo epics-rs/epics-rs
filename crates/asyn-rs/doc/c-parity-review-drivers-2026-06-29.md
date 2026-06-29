@@ -98,7 +98,7 @@ impact paragraphs in the round report
 | DRV-42 | DOC | user.rs:15-22 | drvAsynSerialPort.c:906-909 | "wait-forever" (negative) timeout unrepresentable (framework `AsynUser.timeout` is an unsigned `Duration` vs C's `double`) — DOC, intentional framework-wide divergence (every blocking op bounded); documented at user.rs timeout field. Sibling of DRV-59 |
 | DRV-43 | LOW | serial_port.rs:817-836,314-344 | drvAsynSerialPort.c:519-526,871-875 | disconnected `break` silently Ok; `maxchars==0` read misclassified as Disconnected |
 | DRV-44 | LOW | serial_port.rs (no report) | drvAsynSerialPort.c:666-680 | report() lacks serial diagnostics (fd, nWritten, nRead) |
-| DRV-45 | CONCERN | serial_port.rs:423-448 | drvAsynSerialPort.c:1032-1175 | no drvAsynSerialPortConfigure registrar; default EOS not installed; no priority/noAutoConnect knob |
+| DRV-45 | CLEARED | serial_port.rs:626-640; iocsh.rs:548-608 | drvAsynSerialPort.c:1032-1175 | drvAsynSerialPortConfigure registrar + default EOS + noAutoConnect/noProcessEos done (7115a8fb, 2ecb546c); priority accepted-but-ignored (documented, IP-command parity) |
 
 ### Category D — `prologix.rs` ↔ `drvPrologixGPIB.c`
 

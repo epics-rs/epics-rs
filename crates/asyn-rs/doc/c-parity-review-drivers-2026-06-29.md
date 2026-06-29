@@ -88,7 +88,7 @@ impact paragraphs in the round report
 | DRV-32 | CLEARED | serial_port.rs:663 | drvAsynSerialPort.c:1080 | termios input flags: C `IGNBRK\|IGNPAR` vs Rust `cfmakeraw` → spurious 0x00 on BREAK/line errors — FIXED 2685bd6f (see Fix Log) |
 | DRV-33 | CLEARED | serial_port.rs:681-682 | drvAsynSerialPort.c:1085-1086 | VSTART/VSTOP never set → XON/XOFF software flow control broken (NUL not ^Q/^S) — FIXED 117e612e (see Fix Log) |
 | DRV-34 | CONCERN | serial_port.rs:263-270,645-658,159-208 | drvAsynSerialPort.c:271-345 | baud set narrower than C (no arbitrary baud on macOS/BSD; 28800 missing) |
-| DRV-35 | CONCERN | serial_port.rs:659-747 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value |
+| DRV-35 | CLEARED | serial_port.rs:830-1000 | drvAsynSerialPort.c:254-256,599-605 | setOption mutates cached config before apply, no rollback on failure → get reports never-applied value — FIXED fdf7d488 (commit self.config only after successful apply, all 5 arms) |
 | DRV-36 | CONCERN | serial_port.rs:846-848 | drvAsynSerialPort.c:594-598 | unknown option keys silently accepted (C: asynError); empty-key re-apply not honored |
 | DRV-37 | CONCERN | serial_port.rs:357-391 | drvAsynSerialPort.c:810-842 | write timeout applied per-poll-iteration, not single total deadline → write lives timeout×N |
 | DRV-38 | CONCERN | serial_port.rs:373-378,621-634 | drvAsynSerialPort.c:843 | partial byte count dropped on write timeout/error (framework `write_octet -> ()` contract) |
@@ -925,3 +925,21 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   CREAD|CLOCAL + 8N1 config default), `c_oflag`/`c_lflag` 0 (zeroed +
   cfmakeraw), VTIME 0, baud 9600 — only VMIN diverges, by design. Left
   as-is, divergence documented at serial_port.rs:665-673.
+
+- **DRV-35** (CONCERN — serial setOption cached-config dual state) —
+  CLEARED. FIXED fdf7d488. C `setOption` (drvAsynSerialPort.c:601-604)
+  saves `baudPrev`/`termiosPrev` and restores them if `applyOptions`
+  fails, so `getOption` never reports a value the device rejected. The
+  Rust `set_option` committed `self.config.X` *before* the fallible
+  `apply_termios()?` at five arms (baud, bits, parity, stop, crtscts), so
+  an apply failure (tcgetattr/tcsetattr error) left the cached config
+  diverged from the device — a subsequent `get_option` returned a
+  never-applied value. Structural fix: move the `self.config.X` commit to
+  *after* the apply block in all five arms, so the cached value updates
+  only on the success path (or when the port is not open yet — applied at
+  the next connect). On any failure the cached config is untouched by
+  construction; no rollback window, no dual meaning. clocal/ixon/ixoff/
+  ixany do not persist to `self.config` (distinct, not members); break/
+  rs485 take distinct paths. Test:
+  `set_option_does_not_commit_cached_config_on_apply_failure` (non-tty fd
+  → tcgetattr ENOTTY → apply fails → cached baud stays 9600).

@@ -1179,6 +1179,9 @@ impl PortDriver for DrvAsynSerialPort {
                     Ok("N".to_string())
                 }
             }
+            // C getOption (drvAsynSerialPort.c:204-207): "break" is a momentary
+            // line action, so a read always reports "off" rather than erroring.
+            "break" => Ok("off".to_string()),
             #[cfg(target_os = "linux")]
             "rs485_enable"
             | "rs485_rts_on_send"
@@ -1531,6 +1534,14 @@ mod tests {
         for v in &["yes", "1", "true", "no", "0", "false", "maybe", ""] {
             assert!(parse_bool_option(v).is_err(), "expected err for '{v}'");
         }
+    }
+
+    #[test]
+    fn get_option_break_returns_off() {
+        // DRV-39: C getOption (drvAsynSerialPort.c:204-207) reports "break" as
+        // "off" (a momentary line action), not an error.
+        let drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
+        assert_eq!(drv.get_option("break").unwrap(), "off");
     }
 
     #[test]

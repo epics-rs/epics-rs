@@ -1058,15 +1058,18 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
     accept 0 via the literal passthrough (C-macOS `baudCode = baud = 0`). Tests
     extended (baud 0: Some on macOS/BSD, None on Linux; 0 removed from the
     roundtrip set).
-  - **Round drv-s5 CONCERN (residual, NOT a C-parity divergence):** the silent
-    9600 fallback is closed for the driver path (the only writers of
-    `config.baud` are `SerialConfig::parse` → always 9600 and `set_option` →
-    only after `baud_to_speed == Some`; `apply_to_termios` has one caller,
-    `connect`, on the private `config`), but `SerialConfig` is `pub` with a
-    `pub baud` field and `pub fn apply_to_termios`, so an external caller could
-    build `SerialConfig { baud: 28800, .. }` on Linux and call
+  - **Round drv-s5 CONCERN (residual, NOT a C-parity divergence) — FIXED
+    da0e0917.** The silent 9600 fallback was closed for the driver path (the
+    only writers of `config.baud` are `SerialConfig::parse` → always 9600 and
+    `set_option` → only after `baud_to_speed == Some`; `apply_to_termios` has
+    one caller, `connect`, on the private `config`), but `SerialConfig` is `pub`
+    with a `pub baud` field and `pub fn apply_to_termios`, so an external caller
+    could build `SerialConfig { baud: 28800, .. }` on Linux and call
     `.apply_to_termios()` → silent B9600. No C equivalent (C has no public
     config-apply), so not a wire divergence; both review panels marked it
-    non-blocking. Structural close would be a breaking API change (make
-    `apply_to_termios` fallible, or narrow it to `pub(crate)`); left for user
-    sign-off rather than breaking the public API unilaterally.
+    non-blocking. Closed structurally per user sign-off: `apply_to_termios` now
+    returns `AsynResult<()>` and errors (via `baud_to_speed`'s `ok_or`) instead
+    of the silent fallback — an unmappable rate cannot be applied even through a
+    directly built `SerialConfig`. Breaking public-API change (approved). The
+    one caller, `connect`, propagates with `?`. Test:
+    `apply_to_termios_errors_on_unmappable_baud`.

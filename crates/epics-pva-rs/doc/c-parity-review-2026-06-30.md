@@ -95,14 +95,14 @@ op-handlers, and beacon/search layout are byte-faithful.
 
 | Finding | Disposition |
 |---------|-------------|
-| PVX-21 | **Fix** — accept `0xfd`/`0xfe` cache markers in StructA/UnionA element position via recursive decode (interop with pvData-family peers). Contained. |
-| PVX-81 | **Fix** — set the SEARCH `Unicast` flag (`0x80`) per-destination for unicast dests (`isucast = !isMCast()`). Wire-parity. Contained. |
-| PVX-2  | **Fix (structural)** — thread `allow_null` through `decode_size` so null-rejection holds by construction (default faults; strings/selectors opt in), closing the convention-only gate incl. the `pvxvct-rs.rs:367` `.unwrap_or(0)` site. |
-| PVX-82 | **Fix (behavior change vs current Rust, matches pvxs)** — make INTF/IGNORE addr-list parse strict (hard-fail on malformed token) to close the silent over-broad-bind. Note the fail-loud change. |
-| PVX-42 | **Needs sign-off** — default-pipelined monitor changes every subscription's wire shape + overrun semantics. Defensible as a better flow-control default, but diverges from pvxs. User decides: match pvxs (non-pipelined default) vs keep + document. |
-| PVX-61 | **Round-2 candidate** — establish monitor subscription at INIT (pvxs `connectSub`) so INIT→START transitions queue instead of collapse. More involved server change. |
-| PVX-41 | **Low / round-2** — enum-by-label PUT via in-PUT `0x40` GetOPut instead of a separate GET op. Functionally equivalent; PUT state-machine change. |
-| PVX-1  | **Document / low** — Rust's status-decode strictness is a robustness regression on malformed peers; consider softening to pvxs decode-and-continue. Non-conforming-peer-only. |
+| PVX-21 | **CLEARED (`66149781`)** — Fix: accept `0xfd`/`0xfe` cache markers in StructA/UnionA element position via recursive decode (interop with pvData-family peers). Contained. |
+| PVX-81 | **CLEARED (`579e3e1b`)** — Fix: set the SEARCH `Unicast` flag (`0x80`) per-destination for unicast dests (`isucast = !isMCast()`). Wire-parity. Contained. |
+| PVX-2  | **CLEARED (`a71e168b`)** — Fix (structural): added `proto::size::decode_size_nonnull(cur, order, what)`, the non-null primitive (pvxs `from_wire(Size, allow_null=false)`) that holds the invariant by construction; routed the count-must-not-be-null family (encode.rs ×11, bitset, the `pvxvct-rs.rs:367` `.unwrap_or(0)` CLI bug) through it. Strings/union-selectors stay on `decode_size`. |
+| PVX-82 | **CLEARED (`03caa4d1`)** — Fix (behavior change vs prior Rust, matches pvxs): `server_intf_addr_list_checked` errors when every INTF token is unresolvable, recorded as `intf_addr_error` and surfaced as a hard `PvaServer::start` failure — closes the silent over-broad wildcard bind. Client-path `expand()` wildcard left as-is (DISTINCT — diagnostic, not a bind restriction). |
+| PVX-42 | **CLEARED (`1941d5e2`)** — Fixed by matching pvxs: default `pipeline_size = 0` so the default monitor is non-pipelined (plain `0x08` INIT, no credit trailer/options/ACKs). Pipelining stays opt-in via `pipeline_size(n)` or a pvRequest `record._options.pipeline`. Regression test pins the non-pipelined default. |
+| PVX-61 | **OPEN (round-2 candidate)** — establish monitor subscription at INIT (pvxs `connectSub`) so INIT→START transitions queue instead of collapse. More involved server change. |
+| PVX-41 | **OPEN (low / round-2)** — enum-by-label PUT via in-PUT `0x40` GetOPut instead of a separate GET op. Functionally equivalent; PUT state-machine change. |
+| PVX-1  | **DOCUMENTED (kept) — intentional divergence** — Rust's `Status::decode` rejecting out-of-range status type bytes is a deliberate strictness choice, NOT softened to pvxs's silent `type_t` coercion. Conforming pvxs peers emit only 0–3/`0xFF`, so no interop impact; the strictness rejects malformed peers rather than limping on a coerced failure code. Softening would adopt pvxs's lenient cast — declined per "don't copy C's looser behavior". |
 
 ---
 
@@ -118,3 +118,26 @@ genuine wire-shape divergences (PVX-42 pipelined-default monitor, PVX-81 SEARCH
 Unicast flag) and two narrow behavioral gaps (PVX-61 monitor-sub-at-START,
 PVX-41 PUT get-first). Disposition table above. Fixes proceed in per-finding
 commits; PVX-42 held for sign-off (changes every subscription's wire shape).
+
+### Round 2 (2026-06-30) — fix phase, first batch
+
+Applied the dispositioned fixes as per-finding commits:
+
+- **PVX-42** `1941d5e2` — default monitor non-pipelined (matched pvxs;
+  the sign-off resolved to "match pvxs default", not keep+document).
+- **PVX-82** `03caa4d1` — strict INTF addr-list: all-unresolvable list
+  fails `PvaServer::start` instead of binding the wildcard.
+- **PVX-21** `66149781` — StructA/UnionA element decode accepts
+  `0xfd`/`0xfe` type-cache markers via recursive decode.
+- **PVX-81** `579e3e1b` — SEARCH `Unicast` flag (`0x80`) set
+  per-destination for unicast UDP dests.
+- **PVX-2** `a71e168b` — structural `decode_size_nonnull` gate; the
+  count-must-not-be-null family (incl. the `pvxvct-rs.rs` CLI
+  `.unwrap_or(0)`) routed through it.
+- **PVX-1** — documented as an intentional strictness divergence;
+  kept (not softened to pvxs's lenient status-code coercion).
+
+Remaining open: **PVX-61** (monitor-sub-at-INIT) and **PVX-41**
+(in-PUT `0x40` GetOPut) — round-2 candidates, larger state-machine
+changes, deferred. A caucus opus verification round on this batch
+follows.

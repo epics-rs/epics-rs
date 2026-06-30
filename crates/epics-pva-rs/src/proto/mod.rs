@@ -33,7 +33,7 @@ pub use command::{Command, ControlCommand, MessageType, QosFlags};
 pub use header::{HeaderFlags, MAGIC, PVA_VERSION, PvaHeader};
 pub use ip::{ip_from_bytes, ip_from_bytes_allow_unspec, ip_to_bytes};
 pub use selector::Selector;
-pub use size::{NULL_MARKER, decode_size, encode_size, encode_size_into};
+pub use size::{NULL_MARKER, decode_size, decode_size_nonnull, encode_size, encode_size_into};
 pub use status::{Status, StatusKind};
 pub use string::{
     decode_string, decode_string_bytes, decode_string_value, encode_string,

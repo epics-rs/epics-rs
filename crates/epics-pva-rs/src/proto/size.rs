@@ -52,6 +52,25 @@ pub fn decode_size(cur: &mut Cursor<&[u8]>, order: ByteOrder) -> Result<Option<u
     }
 }
 
+/// Decode a size that must NOT be the null marker.
+///
+/// This is pvxs's *default* size decode — `from_wire(buf, Size, /*allow_null*/
+/// false)` (`pvaproto.h:299-304`), used for every count / length / required
+/// size on the wire. It faults on `0xFF` instead of returning `Ok(None)`, so
+/// the non-null invariant holds by construction: a caller that needs a
+/// concrete count cannot silently accept null (e.g. `.unwrap_or(0)`). Only the
+/// genuinely nullable fields — nullable strings, unselected union selectors —
+/// stay on [`decode_size`] and opt into `None`. `what` names the field for the
+/// fault message.
+pub fn decode_size_nonnull(
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    what: &str,
+) -> Result<u32, DecodeError> {
+    decode_size(cur, order)?
+        .ok_or_else(|| crate::decode_err!("{what} cannot be null (0xFF size marker)"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +116,26 @@ mod tests {
         let buf = vec![NULL_MARKER];
         let mut cur = Cursor::new(buf.as_slice());
         assert_eq!(decode_size(&mut cur, ByteOrder::Little).unwrap(), None);
+    }
+
+    /// PVX-2: the non-null decode faults on `0xFF` (pvxs `allow_null=false`)
+    /// instead of returning `None`, and passes a concrete value through.
+    #[test]
+    fn decode_size_nonnull_faults_on_null_marker() {
+        let mut cur = Cursor::new([NULL_MARKER].as_slice());
+        let err = decode_size_nonnull(&mut cur, ByteOrder::Little, "field count")
+            .expect_err("0xFF null marker must fault, not pass through as a value");
+        assert!(
+            err.0.contains("field count"),
+            "fault message must name the field: {err}"
+        );
+
+        let buf = encode_size(7, ByteOrder::Little);
+        let mut cur = Cursor::new(buf.as_slice());
+        assert_eq!(
+            decode_size_nonnull(&mut cur, ByteOrder::Little, "field count").unwrap(),
+            7
+        );
     }
 
     #[test]

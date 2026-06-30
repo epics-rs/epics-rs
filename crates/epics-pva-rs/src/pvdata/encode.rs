@@ -332,8 +332,8 @@ where
     }
 }
 use crate::proto::{
-    ByteOrder, DecodeError, ReadExt, WriteExt, decode_size, decode_string, decode_string_value,
-    encode_size_into, encode_string_bytes_into, encode_string_into,
+    ByteOrder, DecodeError, ReadExt, WriteExt, decode_size, decode_size_nonnull, decode_string,
+    decode_string_value, encode_size_into, encode_string_bytes_into, encode_string_into,
 };
 
 const TAG_STRUCTURE: u8 = 0x80;
@@ -802,8 +802,7 @@ fn decode_type_desc_cached_at_depth(
             // carries a bound, so re-encoding emits the plain `0x60` string
             // tag (normalized toward pvxs by construction).
             BoundedStringPolicy::Interop => {
-                decode_size(cur, order)?
-                    .ok_or_else(|| decode_err!("bounded string size cannot be null"))?;
+                decode_size_nonnull(cur, order, "bounded string size")?;
                 Ok(FieldDesc::Scalar(ScalarType::String))
             }
             // Strict pvxs: reject the tag (also rejects the legacy Rust-only
@@ -839,8 +838,7 @@ fn decode_structure_body_cached_at_depth(
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
-    let n = decode_size(cur, order)?
-        .ok_or_else(|| decode_err!("structure field count cannot be null"))? as usize;
+    let n = decode_size_nonnull(cur, order, "structure field count")? as usize;
     let mut fields = Vec::with_capacity(safe_capacity(n, cur));
     for _ in 0..n {
         fields.push(decode_field_desc_cached_at_depth(
@@ -860,8 +858,7 @@ fn decode_union_body_cached_at_depth(
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
-    let n = decode_size(cur, order)?
-        .ok_or_else(|| decode_err!("union variant count cannot be null"))? as usize;
+    let n = decode_size_nonnull(cur, order, "union variant count")? as usize;
     let mut variants = Vec::with_capacity(safe_capacity(n, cur));
     for _ in 0..n {
         variants.push(decode_field_desc_cached_at_depth(
@@ -1966,9 +1963,7 @@ fn walk_value_present(
     match desc {
         FieldDesc::Scalar(st) => advance_scalar(*st, cur, order)?,
         FieldDesc::ScalarArray(st) => {
-            let n = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("scalar array length cannot be null"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "scalar array length")? as usize;
             advance_scalar_array(*st, n, cur, order)?;
         }
         FieldDesc::Structure { fields, .. } => {
@@ -1977,9 +1972,7 @@ fn walk_value_present(
             }
         }
         FieldDesc::StructureArray { struct_id, fields } => {
-            let n = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("structure array length cannot be null"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "structure array length")? as usize;
             let element = FieldDesc::Structure {
                 struct_id: struct_id.clone(),
                 fields: fields.clone(),
@@ -2006,9 +1999,7 @@ fn walk_value_present(
             }
         }
         FieldDesc::UnionArray { variants, .. } => {
-            let n = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("union array length cannot be null"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "union array length")? as usize;
             for _ in 0..n {
                 match cur.get_u8()? {
                     0x00 => {}
@@ -2033,8 +2024,7 @@ fn walk_value_present(
         }
         FieldDesc::Variant => walk_any(cur, order, cache, cow, depth)?,
         FieldDesc::VariantArray => {
-            let n = decode_size(cur, order)?.ok_or_else(|| decode_err!("variant array length"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "variant array length")? as usize;
             for _ in 0..n {
                 match cur.get_u8()? {
                     0x00 => {}
@@ -2339,9 +2329,7 @@ fn decode_pv_field_at_depth(
     Ok(match desc {
         FieldDesc::Scalar(st) => PvField::Scalar(decode_scalar_value(*st, cur, order)?),
         FieldDesc::ScalarArray(st) => {
-            let n = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("scalar array length cannot be null"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "scalar array length")? as usize;
             // Fast path: decode straight into a typed Arc<[T]>
             // when the element is a fixed-size POD primitive. Single
             // memcpy when host endian matches wire; per-element
@@ -2365,9 +2353,7 @@ fn decode_pv_field_at_depth(
             PvField::Structure(s)
         }
         FieldDesc::StructureArray { struct_id, fields } => {
-            let n = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("structure array length cannot be null"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "structure array length")? as usize;
             let mut out = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
                 // pvxs dataencode.cpp:359-361 — `to_wire(buf, uint8_t(0u))`
@@ -2428,9 +2414,7 @@ fn decode_pv_field_at_depth(
             }
         }
         FieldDesc::UnionArray { variants, .. } => {
-            let n = decode_size(cur, order)?
-                .ok_or_else(|| decode_err!("union array length cannot be null"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "union array length")? as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
                 // pvxs `dataencode.cpp:624-650` reads a per-
@@ -2501,8 +2485,7 @@ fn decode_pv_field_at_depth(
             }
         }
         FieldDesc::VariantArray => {
-            let n = decode_size(cur, order)?.ok_or_else(|| decode_err!("variant array length"))?
-                as usize;
+            let n = decode_size_nonnull(cur, order, "variant array length")? as usize;
             let mut items = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
                 // pvxs `dataencode.cpp:656-674` reads a per-

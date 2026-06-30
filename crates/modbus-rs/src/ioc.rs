@@ -44,7 +44,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::EomReason;
 use asyn_rs::param::{ParamType, ParamValue};
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::sync_io::SyncIOHandle;
@@ -809,7 +809,7 @@ impl PortDriver for ModbusPortDriver {
         &mut self.base
     }
 
-    fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
+    fn drv_user_create(&mut self, drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
         // C `drvUserCreate` (drvModbusAsyn.cpp:368-433) strips everything after
         // the first '=' to resolve the data-type name, then validates the
         // optional `=N` string-length suffix: it is legal ONLY for the eight
@@ -826,13 +826,17 @@ impl PortDriver for ModbusPortDriver {
             .base
             .find_param(base_info)
             .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+        let datatype = self.reason_to_datatype.get(reason).copied().flatten();
+        if datatype.is_some() {
+            // C runs `getAddr` + `checkOffset` ONLY inside the data-type-match
+            // branch (:378-384), before the suffix switch; a non-data drvInfo
+            // (statistics/control) falls through to the base class with no offset
+            // check. Reject an out-of-range offset here at bind so the record
+            // fails init instead of binding and alarming on every I/O.
+            self.engine.check_offset(addr).map_err(to_asyn)?;
+        }
         if let Some(suffix) = suffix {
-            let is_string = self
-                .reason_to_datatype
-                .get(reason)
-                .copied()
-                .flatten()
-                .is_some_and(|dt| dt.is_string());
+            let is_string = datatype.is_some_and(|dt| dt.is_string());
             if !is_string {
                 // C: the `=` length suffix is invalid for a non-string type.
                 return Err(AsynError::Status {
@@ -849,7 +853,7 @@ impl PortDriver for ModbusPortDriver {
                 });
             }
         }
-        Ok(reason)
+        Ok(DrvUserInfo::from_reason(reason))
     }
 
     fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -1793,7 +1797,7 @@ mod tests {
     /// :387-412).
     #[test]
     fn drv_user_create_validates_string_length_suffix() {
-        let driver = ModbusPortDriver::new(
+        let mut driver = ModbusPortDriver::new(
             "MB_DRVUSER",
             test_config(0, 16),
             LinkType::Tcp,
@@ -1801,24 +1805,24 @@ mod tests {
         )
         .expect("relative config must build");
         // Accepted.
-        assert!(driver.drv_user_create("STRING_HIGH").is_ok());
-        assert!(driver.drv_user_create("STRING_HIGH=5").is_ok());
-        assert!(driver.drv_user_create("STRING_HIGH=0x10").is_ok());
-        assert!(driver.drv_user_create("STRING_HIGH=010").is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH", 0).is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=5", 0).is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=0x10", 0).is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=010", 0).is_ok());
         assert!(
-            driver.drv_user_create("STRING_HIGH=").is_ok(),
+            driver.drv_user_create("STRING_HIGH=", 0).is_ok(),
             "empty length parses as 0, which C accepts"
         );
-        assert!(driver.drv_user_create("INT16").is_ok());
+        assert!(driver.drv_user_create("INT16", 0).is_ok());
         // Rejected: garbage / negative length on a string type.
-        assert!(driver.drv_user_create("STRING_HIGH=abc").is_err());
-        assert!(driver.drv_user_create("STRING_HIGH=5x").is_err());
-        assert!(driver.drv_user_create("STRING_HIGH=-3").is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=abc", 0).is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=5x", 0).is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=-3", 0).is_err());
         // Rejected: a length suffix on a non-string type.
-        assert!(driver.drv_user_create("INT16=5").is_err());
-        assert!(driver.drv_user_create("UINT16=0").is_err());
+        assert!(driver.drv_user_create("INT16=5", 0).is_err());
+        assert!(driver.drv_user_create("UINT16=0", 0).is_err());
         // Still rejected: an unknown type name.
-        assert!(driver.drv_user_create("NOPE").is_err());
+        assert!(driver.drv_user_create("NOPE", 0).is_err());
     }
 
     /// R52: `connect_addr` rejects an out-of-range register offset (the asyn
@@ -1872,6 +1876,39 @@ mod tests {
                 .connect_addr(&AsynUser::new(0).with_addr(0x1_0000))
                 .is_err(),
             "0x10000 is one past the 16-bit wire range"
+        );
+    }
+
+    /// A data-type drvInfo with an out-of-range register offset (the asyn
+    /// `addr`) fails at `drv_user_create` (record bind), mirroring C
+    /// `drvUserCreate` (drvModbusAsyn.cpp:378-384) which runs `getAddr` +
+    /// `checkOffset` inside the data-type branch and returns `asynError`, so a
+    /// misconfigured record fails init rather than alarming on every I/O. A
+    /// non-data (statistics) drvInfo skips the check, as C falls through to the
+    /// base class with no offset validation (:433).
+    #[test]
+    fn drv_user_create_rejects_out_of_range_offset_for_data_reason() {
+        // Relative mode: valid offsets are 0..length (here 16).
+        let mut driver = ModbusPortDriver::new(
+            "MB_DU_OFF",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        // In-range data offset binds.
+        assert!(driver.drv_user_create("INT16", 5).is_ok());
+        // Out-of-range data offset fails at bind, not per-I/O.
+        assert!(
+            driver.drv_user_create("INT16", 16).is_err(),
+            "offset == length is out of range in relative mode"
+        );
+        assert!(driver.drv_user_create("INT16", 99).is_err());
+        // A non-data (statistics) reason carries no offset → C skips
+        // `checkOffset`, so an out-of-range addr must NOT reject it.
+        assert!(
+            driver.drv_user_create("READ_OK", 99).is_ok(),
+            "statistics params fall through to the base class with no offset check"
         );
     }
 

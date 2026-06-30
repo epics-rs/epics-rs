@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 use tokio::sync::mpsc;
 
@@ -205,16 +205,18 @@ impl PortDriver for MqttDriver {
         &mut self.base
     }
 
-    fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
+    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
         // Check topic registry first, then fall back to param name lookup
         // (for internal params like _MQTT_CONNECTED)
         if let Some((idx, _)) = self.registry.get(drv_info) {
-            return Ok(*idx);
+            return Ok(DrvUserInfo::from_reason(*idx));
         }
-        self.base()
+        let reason = self
+            .base()
             .params
             .find_param(drv_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))
+            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+        Ok(DrvUserInfo::from_reason(reason))
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -378,7 +380,10 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(false));
         let addrs = vec![TopicAddress::parse("FLAT:INT test/int_topic").unwrap()];
         let mut driver = MqttDriver::new("TEST", &config, addrs, tx, connected.clone());
-        let reason = driver.drv_user_create("FLAT:INT test/int_topic").unwrap();
+        let reason = driver
+            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         let r = driver.write_int32(&mut user, 42);
@@ -409,8 +414,9 @@ mod tests {
         let addrs = vec![TopicAddress::parse("FLAT:DIGITAL test/digital_topic").unwrap()];
         let mut driver = MqttDriver::new("TEST", &config, addrs, tx, connected.clone());
         let reason = driver
-            .drv_user_create("FLAT:DIGITAL test/digital_topic")
-            .unwrap();
+            .drv_user_create("FLAT:DIGITAL test/digital_topic", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         // Disconnected full-mask write: must fail, must not publish, must not
@@ -450,29 +456,29 @@ mod tests {
 
     #[test]
     fn drv_user_create_finds_registered_topics() {
-        let (driver, _rx) = make_driver(&[
+        let (mut driver, _rx) = make_driver(&[
             "FLAT:INT test/int_topic",
             "FLAT:FLOAT test/float_topic",
             "JSON:FLOAT sensors/data humidity",
         ]);
 
-        assert!(driver.drv_user_create("FLAT:INT test/int_topic").is_ok());
+        assert!(driver.drv_user_create("FLAT:INT test/int_topic", 0).is_ok());
         assert!(
             driver
-                .drv_user_create("FLAT:FLOAT test/float_topic")
+                .drv_user_create("FLAT:FLOAT test/float_topic", 0)
                 .is_ok()
         );
         assert!(
             driver
-                .drv_user_create("JSON:FLOAT sensors/data humidity")
+                .drv_user_create("JSON:FLOAT sensors/data humidity", 0)
                 .is_ok()
         );
     }
 
     #[test]
     fn drv_user_create_rejects_unknown() {
-        let (driver, _rx) = make_driver(&["FLAT:INT test/topic"]);
-        assert!(driver.drv_user_create("FLAT:FLOAT other/topic").is_err());
+        let (mut driver, _rx) = make_driver(&["FLAT:INT test/topic"]);
+        assert!(driver.drv_user_create("FLAT:FLOAT other/topic", 0).is_err());
     }
 
     #[test]
@@ -491,7 +497,10 @@ mod tests {
     #[test]
     fn write_int32_sends_publish_request() {
         let (mut driver, mut rx) = make_driver(&["FLAT:INT test/int_topic"]);
-        let reason = driver.drv_user_create("FLAT:INT test/int_topic").unwrap();
+        let reason = driver
+            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         driver.write_int32(&mut user, 42).unwrap();
@@ -505,8 +514,9 @@ mod tests {
     fn write_float64_sends_publish_request() {
         let (mut driver, mut rx) = make_driver(&["FLAT:FLOAT test/float_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:FLOAT test/float_topic")
-            .unwrap();
+            .drv_user_create("FLAT:FLOAT test/float_topic", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         driver.write_float64(&mut user, 3.15).unwrap();
@@ -521,8 +531,9 @@ mod tests {
     fn write_octet_sends_publish_request() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:STRING test/str_topic")
-            .unwrap();
+            .drv_user_create("FLAT:STRING test/str_topic", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         driver.write_octet(&mut user, b"hello").unwrap();
@@ -539,8 +550,9 @@ mod tests {
     fn write_octet_truncates_published_payload_at_first_nul() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
         let reason = driver
-            .drv_user_create("FLAT:STRING test/str_topic")
-            .unwrap();
+            .drv_user_create("FLAT:STRING test/str_topic", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         driver.write_octet(&mut user, b"hi\0there").unwrap();
@@ -558,7 +570,10 @@ mod tests {
     #[test]
     fn write_octet_flat_publishes_raw_non_utf8_bytes() {
         let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/bin"]);
-        let reason = driver.drv_user_create("FLAT:STRING test/bin").unwrap();
+        let reason = driver
+            .drv_user_create("FLAT:STRING test/bin", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         // 0xFF 0xFE 0x01 is not valid UTF-8; it must pass through unchanged.
@@ -578,7 +593,10 @@ mod tests {
     #[test]
     fn masked_digital_write_rejected_when_value_uninitialized() {
         let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
-        let reason = driver.drv_user_create("FLAT:DIGITAL test/bits").unwrap();
+        let reason = driver
+            .drv_user_create("FLAT:DIGITAL test/bits", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         let r = driver.write_uint32_digital(&mut user, 0x0005, 0x000f);
@@ -599,7 +617,10 @@ mod tests {
     #[test]
     fn masked_digital_write_merges_after_current_value_known() {
         let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
-        let reason = driver.drv_user_create("FLAT:DIGITAL test/bits").unwrap();
+        let reason = driver
+            .drv_user_create("FLAT:DIGITAL test/bits", 0)
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason);
 
         // Full mask supplies every bit → allowed with no prior value.

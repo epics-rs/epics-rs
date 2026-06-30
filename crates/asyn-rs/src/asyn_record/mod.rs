@@ -1782,10 +1782,13 @@ impl AsynRecord {
             Some(entry) => {
                 // Resolve drvinfo → reason if specified
                 if !self.drvinfo.is_empty() {
-                    match entry.handle.drv_user_create_blocking(&self.drvinfo) {
-                        Ok(r) => {
-                            self.resolved_reason = r;
-                            self.reason = r as i32;
+                    match entry
+                        .handle
+                        .drv_user_create_blocking(&self.drvinfo, self.addr)
+                    {
+                        Ok(info) => {
+                            self.resolved_reason = info.reason;
+                            self.reason = info.reason as i32;
                         }
                         Err(e) => {
                             self.errs = format!("drvUserCreate failed: {e}");

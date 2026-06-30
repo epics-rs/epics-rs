@@ -594,9 +594,9 @@ impl PortActor {
                 }
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::DrvUserCreate { drv_info } => {
-                let reason = self.driver.drv_user_create(drv_info)?;
-                Ok(RequestResult::drv_user_create(reason))
+            RequestOp::DrvUserCreate { drv_info, addr } => {
+                let info = self.driver.drv_user_create(drv_info, *addr)?;
+                Ok(RequestResult::drv_user_create(info.reason))
             }
             RequestOp::EnumRead => {
                 // Carry the driver's enum table (strings/values/severities)

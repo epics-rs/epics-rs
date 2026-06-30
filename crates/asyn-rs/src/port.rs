@@ -853,6 +853,26 @@ impl PortDriverBase {
     }
 }
 
+/// Result of resolving a record's driver-info string at bind time — the
+/// asyn-rs analogue of what C `drvUserCreate` writes into `pasynUser`.
+///
+/// `reason` is the shared parameter index (every record with the same drvInfo
+/// resolves to it). The struct exists so a driver can return **per-record**
+/// state the lookup derived from this particular drvInfo string (C stashes the
+/// same in `pasynUser->drvUser`) alongside the shared reason.
+#[derive(Debug, Default)]
+pub struct DrvUserInfo {
+    /// Shared parameter index for this drvInfo (C `pasynUser->reason`).
+    pub reason: usize,
+}
+
+impl DrvUserInfo {
+    /// A resolution carrying only the shared reason — the default-lookup result.
+    pub fn from_reason(reason: usize) -> Self {
+        Self { reason }
+    }
+}
+
 /// Port driver trait. All methods have default implementations that operate
 /// on the parameter cache (no actual I/O).
 ///
@@ -1363,13 +1383,23 @@ pub trait PortDriver: Send + Sync + 'static {
 
     // --- drvUser ---
 
-    /// Resolve a driver info string to a parameter index.
-    /// Default: look up by parameter name.
-    fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
-        self.base()
+    /// Resolve a record's driver-info string (and its asyn `addr`) to a
+    /// [`DrvUserInfo`] at bind time — the asyn-rs analogue of C `drvUserCreate`.
+    ///
+    /// Takes `&mut self` so a driver can register a parameter on demand from the
+    /// resolved drvInfo (C Autoparam lazy creation) rather than requiring it be
+    /// declared up front, and `addr` so a multi-device driver can reject an
+    /// out-of-range address at bind time (C `drvUserCreate` runs `checkOffset`,
+    /// drvModbusAsyn.cpp:378-384) instead of alarming on every I/O.
+    ///
+    /// Default: look up the shared reason by parameter name; ignore `addr`.
+    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+        let reason = self
+            .base()
             .params
             .find_param(drv_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))
+            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+        Ok(DrvUserInfo::from_reason(reason))
     }
 
     // --- Capabilities ---
@@ -1468,10 +1498,10 @@ mod tests {
 
     #[test]
     fn test_drv_user_create() {
-        let drv = TestDriver::new();
-        assert_eq!(drv.drv_user_create("VAL").unwrap(), 0);
-        assert_eq!(drv.drv_user_create("TEMP").unwrap(), 1);
-        assert!(drv.drv_user_create("NOPE").is_err());
+        let mut drv = TestDriver::new();
+        assert_eq!(drv.drv_user_create("VAL", 0).unwrap().reason, 0);
+        assert_eq!(drv.drv_user_create("TEMP", 0).unwrap().reason, 1);
+        assert!(drv.drv_user_create("NOPE", 0).is_err());
     }
 
     #[test]

@@ -1569,12 +1569,19 @@ impl AsynDeviceSupport {
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if !self.reason_set {
-            match self.handle.drv_user_create_blocking(&self.drv_info) {
-                Ok(reason) => {
-                    self.reason = reason;
+            // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
+            // rejects an out-of-range offset here at bind time (C `drvUserCreate`
+            // `checkOffset`) instead of alarming on every I/O.
+            match self
+                .handle
+                .drv_user_create_blocking(&self.drv_info, self.addr)
+            {
+                Ok(info) => {
+                    self.reason = info.reason;
                 }
                 Err(e) => {
-                    // Param not found — this record has no corresponding driver param.
+                    // Param not found, or the driver rejected the bind (e.g. an
+                    // out-of-range offset) — this record cannot bind to a param.
                     eprintln!(
                         "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
                         self.handle.port_name(),
@@ -6512,8 +6519,12 @@ mod tests {
         }
         // useDrvUser=1: the DRVINFO is a real param. Accept any name (reason 0) so
         // the test need not pre-register params on the mock.
-        fn drv_user_create(&self, _drv_info: &str) -> AsynResult<usize> {
-            Ok(0)
+        fn drv_user_create(
+            &mut self,
+            _drv_info: &str,
+            _addr: i32,
+        ) -> AsynResult<crate::port::DrvUserInfo> {
+            Ok(crate::port::DrvUserInfo::from_reason(0))
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             if self.fail {

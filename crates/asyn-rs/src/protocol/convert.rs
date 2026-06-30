@@ -85,8 +85,9 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::GetAutoConnect => Self::GetAutoConnect,
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
-            RequestOp::DrvUserCreate { drv_info } => Self::DrvUserCreate {
+            RequestOp::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
                 drv_info: drv_info.clone(),
+                addr: *addr,
             },
             RequestOp::CallParamCallbacks { addr, .. } => Self::CallParamCallbacks { addr: *addr },
             RequestOp::GetOption { key } => Self::GetOption { key: key.clone() },
@@ -184,8 +185,9 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::GetAutoConnect => Self::GetAutoConnect,
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
-            PortCommand::DrvUserCreate { drv_info } => Self::DrvUserCreate {
+            PortCommand::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
                 drv_info: drv_info.clone(),
+                addr: *addr,
             },
             PortCommand::CallParamCallbacks { addr } => Self::CallParamCallbacks {
                 addr: *addr,
@@ -343,6 +345,7 @@ mod tests {
             RequestOp::UnblockProcess,
             RequestOp::DrvUserCreate {
                 drv_info: "INFO".into(),
+                addr: 0,
             },
             RequestOp::GetOption { key: "baud".into() },
             RequestOp::SetOption {

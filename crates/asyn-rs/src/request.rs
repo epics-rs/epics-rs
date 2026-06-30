@@ -153,6 +153,9 @@ pub enum RequestOp {
     /// Resolve a driver info string to a parameter reason index.
     DrvUserCreate {
         drv_info: String,
+        /// The record's asyn `addr`, so a multi-device driver can reject an
+        /// out-of-range address at bind time (C `drvUserCreate` `checkOffset`).
+        addr: i32,
     },
     /// Read an enum value (index + string choices).
     EnumRead,

@@ -115,6 +115,8 @@ pub enum PortCommand {
     UnblockProcess,
     DrvUserCreate {
         drv_info: String,
+        /// The record's asyn `addr` (C `drvUserCreate` `checkOffset` input).
+        addr: i32,
     },
     CallParamCallbacks {
         addr: i32,
@@ -196,6 +198,7 @@ mod tests {
             PortCommand::UnblockProcess,
             PortCommand::DrvUserCreate {
                 drv_info: "MOTOR_STATUS".into(),
+                addr: 0,
             },
             PortCommand::CallParamCallbacks { addr: 0 },
             PortCommand::GetOption { key: "baud".into() },

@@ -147,7 +147,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   (`datatype.rs`/`driver.rs:503-507` ↔ `drvModbusAsyn.cpp:2237/2245`). Not counted
   separately; listed so the cross-reference is on record.
 
-### R34 — per-record drvUser string length cap (`LEN=N`) dropped — STRUCTURAL BLOCK (asyn-rs contract; sign-off, sibling of R54)
+### R34 — per-record drvUser string length cap (`LEN=N`) dropped — CLEARED (989505ff + 34714929 + e157e8a5)
 - **Severity:** NOTE → CONCERN (changes wire register count for LEN-configured records)
 - **Rust:** module docs (the `=N` length *value* is dropped; length comes from the record
   buffer `NELM` only)
@@ -165,6 +165,23 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   is **surfaced for design sign-off**, not patched. (`AsynUser.user_data: Option<Box<dyn Any>>`
   exists but `drv_user_create` neither receives the `AsynUser` nor returns per-user data, so there
   is no wiring path today.)
+- **Cleared (sign-off taken):** the `drv_user_create` contract was extended to
+  `(&mut self, drv_info, addr) -> DrvUserInfo { reason, max_octet_len }`. modbus parses `LEN=N`
+  into `max_octet_len`; `AsynDeviceSupport` resolves it once at bind and applies C `getStringLen`'s
+  `min(buffer, len)` at all **three** C sites:
+  - **read (`:1456`)** — `octet_max_size = min(SIZV, LEN)` feeds `OctetRead { buf_size }` (driver
+    caps). 34714929.
+  - **write (`:1521/1524/1531`)** — `cap_octet_write` truncates every `OctetWrite` payload to the
+    raw `octet_len_cap` (= `min(data_len, LEN)`; SIZV does **not** bound writes, matching C's
+    `getStringLen(maxChars)`). All 4 `OctetWrite` constructions; `OctetWriteRead` correctly excluded
+    (C `asynOctetCmdResponse` `useDrvUser=0` ⇒ uncapped). e157e8a5.
+  - **I/O-Intr poller (`:1914`)** — `cap_octet_read_value` truncates the ring-delivered octet
+    `String` to `octet_max_size` (= `min(buffer, LEN)`), consumer-side (the poller is per-reason,
+    shared by records with different LEN). e157e8a5.
+  Verified fully closed across two opus parity rounds (all 3 sites capped with the correct per-site
+  value; no copied bug, no new wire-divergence). Tests `drv_user_create_returns_octet_len_cap`,
+  `octet_len_cap_from_drv_user_create_reduces_buffer`, `octet_len_cap_truncates_write_payload`,
+  `octet_max_size_caps_io_intr_read_value`.
 
 ### R35 — BCD encode masks each digit to a nibble (intentional; aside)
 - **Severity:** NOTE — intentional-divergence aside, **not a defect**

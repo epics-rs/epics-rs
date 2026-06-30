@@ -442,10 +442,28 @@ MQ36, MQ48, MQ49.
 **Structural / framework — asyn-rs contract change, design sign-off (the SAME
 asyn-rs gap as modbus R34/R52/R54):**
 
-- **MQ2 (=MQ50)** — subscribe/dispatch only to I/O-Intr interrupt variables
-  (needs asyn-rs interrupt-variable tracking + `setAutoInterrupts(false)` model).
-- **MQ47** — on-demand param creation from a record's resolved `INP/OUT`
-  (`drv_user_create(&self)` cannot create params; C autoparam does).
+- **MQ2 (=MQ50) — CLEARED** `bdc30041` — subscribe/dispatch only to I/O-Intr
+  interrupt variables. The event loop derives the subscribe set on every ConnAck
+  from `PortHandle::interrupts().subscribed_bindings()` (asyn-rs analogue of
+  `getInterruptVariables()`) mapped reason→topic and deduped, and filters inbound
+  dispatch to interrupt-bound reasons — C `setAutoInterrupts(false)` + `onConnectCb`
+  / `onMessageCb` (`drvMqtt.cpp:123,207-213,250-255`). Connect is deferred to an
+  `AfterScanInit` init-hook so the first ConnAck sees the populated interrupt set
+  (C `setInitHook`→`connect`, `drvMqtt.cpp:124,186-189`). Round-3 opus review:
+  FAITHFUL, no open item.
+- **MQ47 — CLEARED** `9aebd3b9` — on-demand param creation from a record's
+  resolved `INP/OUT`. With the `drv_user_create(&mut self)` contract (R52),
+  `MqttDriver` is born empty and creates each topic param on demand at bind,
+  deduped by canonical `to_drv_info()`; the non-C `mqttAddTopic` command was
+  removed entirely, `PENDING_TOPICS` retained only as a Z2M `normalize_on_off`
+  config overlay. C `Autoparam::Driver::drvUserCreate`→`createParam` (dedup by
+  `DeviceAddress::operator==`). Round-3 opus review: FAITHFUL. One intentional
+  divergence (MQ47-B) logged below — Rust's dedup key includes the value type, a
+  strict refinement of C's value-type-blind `operator==`; it only changes the
+  pathological different-type-same-topic case, where C aliases to one param (then
+  fails the second record's handler dispatch) and Rust keeps two correct params.
+  Per the steer (don't copy C's bugs), kept as intentional-better; do NOT reintroduce
+  C's value-type-blind dedup.
 - **MQ38** — inbound octet byte-fidelity: a non-UTF-8 payload on an octet topic
   is dropped whole (`from_utf8` fails) where C stores the raw bytes up to the
   first NUL. A local `from_utf8_lossy` mitigation avoids the whole-message drop
@@ -453,9 +471,14 @@ asyn-rs gap as modbus R34/R52/R54):**
   `ParamSetValue::Octet` being a `String`, not `Vec<u8>`. (The outbound-wire half
   is MQ39, fixable locally — see batch 2.)
 
-**Verification-blocked — Autoparam source absent under `/Users/stevek/codes`:**
-MQ51 (write-side cache-update parity), MQ19 (whether autoparam trims
-`arguments`). Need the autoparam module path to resolve.
+**Autoparam source now present** (`~/codes/epics-modules/autoparamDriver/autoparamDriverSup/src/`,
+checked out 2026-06-30) — the earlier block is lifted:
+- **MQ19** — round-3 review opened `Autoparam::Driver::drvUserCreate`/`parseDeviceAddress`
+  and confirmed asyn delivers the user-param with no leading whitespace, so Rust's
+  `split_once`-based leading-whitespace rejection is unreachable in practice; logged as a
+  latent parse-leniency aside, not a live divergence.
+- **MQ51** (write-side cache-update parity) — still owed a dedicated verification round
+  against the now-present autoparam source; not in scope of the MQ2/MQ47 round.
 
 ---
 
@@ -486,4 +509,25 @@ the MQ32 kept comma/bracket leniencies (cross-ref MQ33).
   `/Users/stevek/codes`.
 
 Per-crate `cargo nextest -p mqtt-rs` (101 pass) + `clippy -D warnings` green;
+full-workspace pass owed before any push. Nothing pushed.
+
+### Round 3 (2026-06-30) — asyn-rs contract landed + MQ2/MQ47 fix + 1-panel opus convergence
+The asyn-rs `drv_user_create(&mut self) -> DrvUserInfo` contract (modbus R52/R34
+sign-off) unblocked the two structural mqtt findings. Fixed **MQ2** (`bdc30041`,
+interrupt-bound subscribe/dispatch + `AfterScanInit` deferred connect) and **MQ47**
+(`9aebd3b9`, born-empty driver + on-demand `drv_user_create`; `mqttAddTopic` removed,
+`PENDING_TOPICS` retained as a Z2M `normalize_on_off` overlay). The user checked out the
+**Autoparam source** (`~/codes/epics-modules/autoparamDriver/`), lifting the MQ19/MQ51
+block. The round-3 opus parity reviewer (opening `autoparamDriver.cpp` + `drvMqtt.cpp`
+directly) returned **CONVERGED**: MQ2 and MQ47 both FAITHFUL, zero open DEFECT/CONCERN.
+One intentional divergence logged — **MQ47-B**: Rust's canonical-`to_drv_info` dedup key
+includes the value type, a strict refinement of C's value-type-blind `DeviceAddress::operator==`;
+it only changes the pathological different-type-same-topic case (C aliases to one param and
+fails the second handler; Rust keeps two correct params), kept as intentional-better per the
+don't-copy-C-bugs steer. Two non-blocking notes: `_MQTT_CONNECTED` is a Rust-only additive PV
+(MQ49, correctly excluded from subscribe); MQ19 leading-whitespace rejection is unreachable
+(asyn delivers no leading whitespace). **MQ51 still owed** a dedicated round against the
+now-present autoparam source.
+
+Per-crate `cargo nextest -p mqtt-rs --features ioc` (106 pass) + `clippy -D warnings` green;
 full-workspace pass owed before any push. Nothing pushed.

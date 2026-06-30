@@ -857,19 +857,29 @@ impl PortDriverBase {
 /// asyn-rs analogue of what C `drvUserCreate` writes into `pasynUser`.
 ///
 /// `reason` is the shared parameter index (every record with the same drvInfo
-/// resolves to it). The struct exists so a driver can return **per-record**
-/// state the lookup derived from this particular drvInfo string (C stashes the
-/// same in `pasynUser->drvUser`) alongside the shared reason.
+/// resolves to it). The remaining fields carry **per-record** driver state the
+/// lookup derived from this particular drvInfo string (C stashes the same in
+/// `pasynUser->drvUser`), which the binding applies to that record's I/O.
 #[derive(Debug, Default)]
 pub struct DrvUserInfo {
     /// Shared parameter index for this drvInfo (C `pasynUser->reason`).
     pub reason: usize,
+    /// Optional per-record octet length cap — the asyn-rs home for C's
+    /// `modbusDrvUser_t.len` (`drvUserCreate` parses `TYPE=N`; `getStringLen`
+    /// caps the asyn octet `maxLen` to it, drvModbusAsyn.cpp:2367-2377). `None`
+    /// when the drvInfo carried no cap; the binding then uses the record buffer
+    /// length alone. The binding applies `min(buffer_len, cap)`.
+    pub max_octet_len: Option<usize>,
 }
 
 impl DrvUserInfo {
-    /// A resolution carrying only the shared reason — the default-lookup result.
+    /// A resolution carrying only the shared reason and no per-record cap — the
+    /// default-lookup result.
     pub fn from_reason(reason: usize) -> Self {
-        Self { reason }
+        Self {
+            reason,
+            ..Self::default()
+        }
     }
 }
 

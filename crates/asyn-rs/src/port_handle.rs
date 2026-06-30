@@ -474,7 +474,10 @@ impl PortHandle {
             status: AsynStatus::Error,
             message: "drv_user_create returned no reason".into(),
         })?;
-        Ok(DrvUserInfo::from_reason(reason))
+        Ok(DrvUserInfo {
+            reason,
+            max_octet_len: result.max_octet_len,
+        })
     }
 
     pub fn read_int32_blocking(&self, reason: usize, addr: i32) -> AsynResult<i32> {

@@ -265,6 +265,9 @@ pub struct RequestResult {
     pub uint_val: Option<u32>,
     /// Reason index (from DrvUserCreate).
     pub reason: Option<usize>,
+    /// Per-record octet length cap (from DrvUserCreate; C `modbusDrvUser_t.len`).
+    /// `None` when the drvInfo carried no cap.
+    pub max_octet_len: Option<usize>,
     /// Enum index (from EnumRead).
     pub enum_index: Option<usize>,
     /// Driver enum string/value/severity table (from EnumRead). C asyn
@@ -326,6 +329,7 @@ impl RequestResult {
             float_val: None,
             uint_val: None,
             reason: None,
+            max_octet_len: None,
             enum_index: None,
             enum_entries: None,
             int32_array: None,
@@ -409,9 +413,10 @@ impl RequestResult {
         }
     }
 
-    pub fn drv_user_create(reason: usize) -> Self {
+    pub fn drv_user_create(reason: usize, max_octet_len: Option<usize>) -> Self {
         Self {
             reason: Some(reason),
+            max_octet_len,
             ..Self::base()
         }
     }

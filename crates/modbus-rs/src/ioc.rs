@@ -12,14 +12,14 @@
 //! - `modbusInterposeConfig` records a link type for an octet port;
 //!   `drvModbusAsynConfigure` creates the driver and its poller.
 //!
-//! Per the confirmed `drvUser` model, the C `pasynUser->drvUser` per-record
-//! `{dataType, len}` struct has no asyn-rs equivalent: the data type is
-//! encoded in the reason and the optional `=N` string length value is dropped
-//! — a string record's length comes from its own record buffer (`NELM`)
-//! (R34, structurally blocked by the `drv_user_create -> usize` contract). The
-//! `=N` *validation* is still enforced (R51): the suffix is legal only for the
-//! eight string types and must be a non-negative integer, so an invalid
-//! `drvInfo` fails record init as in C rather than being silently accepted.
+//! The C `pasynUser->drvUser` per-record `{dataType, len}` struct maps onto two
+//! asyn-rs channels: the data type is encoded in the reason, and the optional
+//! `=N` string length is returned from `drv_user_create` as the per-record
+//! octet cap (`DrvUserInfo::max_octet_len`), which the binding applies to its
+//! octet buffer length — the asyn-rs analogue of C `getStringLen` capping the
+//! asyn octet `maxLen`. The `=N` suffix is validated as C does: it is legal
+//! only for the eight string types and must be a non-negative integer, so an
+//! invalid `drvInfo` fails record init rather than being silently accepted.
 //!
 //! # Absolute addressing
 //!
@@ -771,9 +771,8 @@ impl ModbusPortDriver {
 /// `endptr[0] != '\0'` (trailing junk) or the value is negative. Base 0 means
 /// `0x`/`0X` → hex, a leading `0` → octal, otherwise decimal. An empty suffix
 /// (`TYPE=`) parses as 0, which C accepts. Returns the parsed non-negative
-/// length, or `None` if C would reject the suffix. The length value is
-/// currently discarded by the caller (R34); only the accept/reject result is
-/// used (R51).
+/// length, or `None` if C would reject the suffix. The caller stashes the
+/// length as the per-record octet cap (C `drvUser->len`).
 fn parse_drvuser_string_len(suffix: &str) -> Option<i64> {
     // C `strtol` skips leading whitespace and honours a leading sign; a real
     // drvInfo carries neither, but mirror the accept set so parity holds.
@@ -815,10 +814,10 @@ impl PortDriver for ModbusPortDriver {
         // optional `=N` string-length suffix: it is legal ONLY for the eight
         // string types (`strtol` base 0, non-negative); a non-string type with
         // a suffix, or a garbage/negative length, is rejected with `asynError`
-        // (:399-412). The parsed length itself has no asyn-rs home — the reason
-        // carries only the data type (R34) — so it is dropped, but the
-        // validation is kept so an invalid `drvInfo` fails record init as in C
-        // rather than being silently accepted (R51).
+        // (:399-412). A valid length is stashed as the per-record octet cap
+        // (C `modbusDrvUser_t.len`); `getStringLen` later caps the asyn octet
+        // `maxLen` to it (:2367-2377), which the binding applies to its octet
+        // buffer length at init.
         let mut parts = drv_info.splitn(2, '=');
         let base_info = parts.next().unwrap_or(drv_info).trim();
         let suffix = parts.next();
@@ -835,6 +834,7 @@ impl PortDriver for ModbusPortDriver {
             // fails init instead of binding and alarming on every I/O.
             self.engine.check_offset(addr).map_err(to_asyn)?;
         }
+        let mut max_octet_len = None;
         if let Some(suffix) = suffix {
             let is_string = datatype.is_some_and(|dt| dt.is_string());
             if !is_string {
@@ -844,16 +844,24 @@ impl PortDriver for ModbusPortDriver {
                     message: format!("invalid drvUser (length suffix on non-string): {drv_info}"),
                 });
             }
-            if parse_drvuser_string_len(suffix).is_none() {
-                // C: `strtol` base 0 with the `endptr[0] != '\0' || len < 0`
-                // guard rejects garbage or a negative length.
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid string length: {suffix}"),
-                });
+            match parse_drvuser_string_len(suffix) {
+                // C stores the parsed length in `drvUser->len`; it is `>= 0`
+                // here (the parser rejects negatives), so the cap is exact.
+                Some(len) => max_octet_len = Some(len as usize),
+                None => {
+                    // C: `strtol` base 0 with the `endptr[0] != '\0' || len < 0`
+                    // guard rejects garbage or a negative length.
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("invalid string length: {suffix}"),
+                    });
+                }
             }
         }
-        Ok(DrvUserInfo::from_reason(reason))
+        Ok(DrvUserInfo {
+            reason,
+            max_octet_len,
+        })
     }
 
     fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -1909,6 +1917,56 @@ mod tests {
         assert!(
             driver.drv_user_create("READ_OK", 99).is_ok(),
             "statistics params fall through to the base class with no offset check"
+        );
+    }
+
+    /// A valid `TYPE=N` suffix on a string type yields the per-record octet cap
+    /// (C `drvUser->len`, consumed by `getStringLen`); no suffix yields no cap;
+    /// `TYPE=` yields 0 (C accepts `strtol("")` == 0). A non-string type never
+    /// carries a cap.
+    #[test]
+    fn drv_user_create_returns_octet_len_cap() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_DU_CAP",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH=5", 0)
+                .unwrap()
+                .max_octet_len,
+            Some(5)
+        );
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH=0x10", 0)
+                .unwrap()
+                .max_octet_len,
+            Some(16)
+        );
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH", 0)
+                .unwrap()
+                .max_octet_len,
+            None,
+            "no suffix → no cap (C leaves drvUser->len at -1)"
+        );
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH=", 0)
+                .unwrap()
+                .max_octet_len,
+            Some(0),
+            "TYPE= caps to 0 (C strtol(\"\") == 0)"
+        );
+        assert_eq!(
+            driver.drv_user_create("INT16", 0).unwrap().max_octet_len,
+            None,
+            "a non-string type never carries an octet cap"
         );
     }
 

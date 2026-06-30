@@ -300,6 +300,13 @@ pub struct AsynDeviceSupport {
     /// SIZV at init time when available; otherwise fall back to the
     /// stringin-grade 256-byte default.
     octet_max_size: usize,
+    /// Per-record octet length cap from `drv_user_create` (C
+    /// `modbusDrvUser_t.len` parsed from a `TYPE=N` drvInfo). `Some(n)` caps
+    /// `octet_max_size` to `min(octet_max_size, n)` at init, mirroring C
+    /// `getStringLen` (drvModbusAsyn.cpp:2367-2377); `None` leaves the buffer
+    /// length alone. Resolved once at bind because per-record driver state is
+    /// not threaded per-I/O in asyn-rs.
+    octet_len_cap: Option<usize>,
     /// `Some` ⟹ this is `asynOctetCmdResponse`: an escape-translated literal
     /// command (C `initCmdBuffer`, devAsynOctet.c) written before each read so
     /// the reply lands in VAL. `read_op` emits `OctetWriteRead` instead of a
@@ -638,6 +645,7 @@ impl AsynDeviceSupport {
             int32_mask: None,
             max_array_elements: 307200,
             octet_max_size: 256,
+            octet_len_cap: None,
             octet_cmd: None,
             last_alarm_status: 0,
             last_alarm_severity: 0,
@@ -1578,6 +1586,9 @@ impl DeviceSupport for AsynDeviceSupport {
             {
                 Ok(info) => {
                     self.reason = info.reason;
+                    // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
+                    // `octet_max_size` below, after SIZV finalizes the buffer.
+                    self.octet_len_cap = info.max_octet_len;
                 }
                 Err(e) => {
                     // Param not found, or the driver rejected the bind (e.g. an
@@ -1658,6 +1669,14 @@ impl DeviceSupport for AsynDeviceSupport {
             if sizv > 0 {
                 self.octet_max_size = sizv as usize;
             }
+        }
+
+        // Apply the per-record octet cap from `drv_user_create` after SIZV has
+        // finalized the buffer length, mirroring C `getStringLen`: the effective
+        // length is `min(buffer_len, drvUser->len)` (drvModbusAsyn.cpp:2367-2377).
+        // A driver with no cap returns `None`, leaving the buffer length intact.
+        if let Some(cap) = self.octet_len_cap {
+            self.octet_max_size = self.octet_max_size.min(cap);
         }
 
         // asynUInt32Digital MASK/SHFT propagation. C devAsynUInt32Digital.c
@@ -5311,6 +5330,83 @@ mod tests {
         rec.sizv = 1024;
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.octet_max_size, 1024);
+    }
+
+    /// A per-record octet cap from `drv_user_create` (DrvUserInfo.max_octet_len,
+    /// the asyn-rs home for C `modbusDrvUser_t.len`) reduces `octet_max_size` to
+    /// `min(buffer_len, cap)` at init, mirroring C `getStringLen`. The cap is
+    /// applied AFTER SIZV finalizes the buffer, and a cap that exceeds the
+    /// buffer leaves the length intact.
+    #[test]
+    fn octet_len_cap_from_drv_user_create_reduces_buffer() {
+        // A port whose drv_user_create returns a fixed octet cap.
+        struct CapPort {
+            base: PortDriverBase,
+            cap: usize,
+        }
+        impl PortDriver for CapPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn drv_user_create(
+                &mut self,
+                _drv_info: &str,
+                _addr: i32,
+            ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
+                Ok(crate::port::DrvUserInfo {
+                    reason: 0,
+                    max_octet_len: Some(self.cap),
+                })
+            }
+        }
+        fn adapter_with_cap(cap: usize) -> AsynDeviceSupport {
+            let mut base = PortDriverBase::new("capport", 1, PortFlags::default());
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            let driver = CapPort { base, cap };
+            let interrupts = Arc::new(InterruptManager::new(256));
+            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let actor = PortActor::new(Box::new(driver), rx);
+            std::thread::Builder::new()
+                .name("cap-actor".into())
+                .spawn(move || actor.run())
+                .unwrap();
+            let handle = PortHandle::new(tx, "capport".into(), interrupts);
+            let link = AsynLink {
+                port_name: "capport".into(),
+                addr: 0,
+                timeout: Duration::from_secs(1),
+                drv_info: "VAL".into(),
+            };
+            let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+            ads.set_record_info("TEST:CAP", ScanType::Passive);
+            ads
+        }
+
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        // cap 5 < default buffer 256 → reduced to 5.
+        let mut ads = adapter_with_cap(5);
+        let mut rec = LsiRecord::new("");
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 5);
+
+        // cap 512 applies to the SIZV-finalized buffer (1024) → 512, proving the
+        // cap runs after SIZV.
+        let mut ads = adapter_with_cap(512);
+        let mut rec = LsiRecord::new("");
+        rec.sizv = 1024;
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 512);
+
+        // cap 4096 > buffer 256 → buffer unchanged (C `getStringLen` only caps
+        // when drvUser->len < maxLen).
+        let mut ads = adapter_with_cap(4096);
+        let mut rec = LsiRecord::new("");
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 256);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -744,26 +744,47 @@ fn decode_type_desc_cached_at_depth(
                 .ok_or_else(|| decode_err!("typecache miss for slot {key}"))
         }
         TAG_STRUCTURE => {
-            decode_structure_body_cached_at_depth(cur, order, false, cache, policy, depth + 1)
+            decode_structure_body_cached_at_depth(cur, order, cache, policy, depth + 1)
         }
-        TAG_UNION => decode_union_body_cached_at_depth(cur, order, false, cache, policy, depth + 1),
+        TAG_UNION => decode_union_body_cached_at_depth(cur, order, cache, policy, depth + 1),
         TAG_STRUCTURE_ARRAY => {
-            let inner = cur.get_u8()?;
-            if inner != TAG_STRUCTURE {
-                return Err(decode_err!(
-                    "structure-array element tag 0x{inner:02X} (expected 0x80)"
-                ));
+            // pvxs decodes the StructA element through a full recursive
+            // `from_wire`, which accepts `0xFD` (FULL_WITH_ID) / `0xFE`
+            // (ONLY_ID) type-cache markers in element position — a
+            // pvData-family peer (pvAccessCPP/Java, pva2pva) may cache an
+            // element struct independently of the array carrying it — then
+            // validates the resolved element is a plain Structure
+            // (`dataencode.cpp:130-137`: `members[0].code == scalarOf()`).
+            // Recurse so a marker resolves, then lift the resolved
+            // Structure to its array form. The literal-`0x80` element is
+            // the same byte stream (tag + body) decoded by the same arm.
+            let elem = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
+            match elem {
+                FieldDesc::Structure { struct_id, fields } => {
+                    Ok(FieldDesc::StructureArray { struct_id, fields })
+                }
+                other => Err(decode_err!(
+                    "structure-array element resolved to a non-structure descriptor ({other:?})"
+                )),
             }
-            decode_structure_body_cached_at_depth(cur, order, true, cache, policy, depth + 1)
         }
         TAG_UNION_ARRAY => {
-            let inner = cur.get_u8()?;
-            if inner != TAG_UNION {
-                return Err(decode_err!(
-                    "union-array element tag 0x{inner:02X} (expected 0x81)"
-                ));
+            // Same as StructA — recurse (accepting `0xFD`/`0xFE` cache
+            // markers), then require the resolved element to be a plain
+            // Union.
+            let elem = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
+            match elem {
+                FieldDesc::Union {
+                    struct_id,
+                    variants,
+                } => Ok(FieldDesc::UnionArray {
+                    struct_id,
+                    variants,
+                }),
+                other => Err(decode_err!(
+                    "union-array element resolved to a non-union descriptor ({other:?})"
+                )),
             }
-            decode_union_body_cached_at_depth(cur, order, true, cache, policy, depth + 1)
         }
         TAG_VARIANT => Ok(FieldDesc::Variant),
         TAG_VARIANT_ARRAY => Ok(FieldDesc::VariantArray),
@@ -804,10 +825,15 @@ fn decode_type_desc_cached_at_depth(
     }
 }
 
+// Decode a struct body (id + field count + fields) into the *scalar*
+// `FieldDesc::Structure`. The array form (`StructA`, `0x88`) is produced by
+// its arm in [`decode_type_desc_cached_at_depth`], which decodes the
+// element through the recursive descriptor path (so `0xFD`/`0xFE` cache
+// markers resolve) and lifts the resulting Structure to `StructureArray` —
+// so this decoder never needs to know whether it sits under an array.
 fn decode_structure_body_cached_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
-    is_array: bool,
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
     depth: u32,
@@ -821,17 +847,14 @@ fn decode_structure_body_cached_at_depth(
             cur, order, cache, policy, depth,
         )?);
     }
-    Ok(if is_array {
-        FieldDesc::StructureArray { struct_id, fields }
-    } else {
-        FieldDesc::Structure { struct_id, fields }
-    })
+    Ok(FieldDesc::Structure { struct_id, fields })
 }
 
+// Union twin of [`decode_structure_body_cached_at_depth`] — decodes into
+// the scalar `FieldDesc::Union`; `UnionA` is lifted by the array arm.
 fn decode_union_body_cached_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
-    is_array: bool,
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
     depth: u32,
@@ -845,16 +868,9 @@ fn decode_union_body_cached_at_depth(
             cur, order, cache, policy, depth,
         )?);
     }
-    Ok(if is_array {
-        FieldDesc::UnionArray {
-            struct_id,
-            variants,
-        }
-    } else {
-        FieldDesc::Union {
-            struct_id,
-            variants,
-        }
+    Ok(FieldDesc::Union {
+        struct_id,
+        variants,
     })
 }
 
@@ -2822,6 +2838,106 @@ mod tests {
             let dec = decode_type_desc(&mut cur, order).unwrap();
             assert_eq!(format!("{dec}"), format!("{desc}"));
         }
+    }
+
+    /// PVX-21: a `StructA` whose element descriptor arrives as a type-cache
+    /// marker (`0xFD` define-inline or `0xFE` reference) must decode, matching
+    /// pvxs `dataencode.cpp:130-137` (which decodes the element through a full
+    /// recursive `from_wire`, then validates the resolved code is `Struct`). A
+    /// pvData-family peer (pvAccessCPP/Java, pva2pva) can cache an element
+    /// struct independently of the array carrying it; the pre-fix decoder
+    /// hard-required the literal element tag `0x80` and faulted the whole
+    /// descriptor on a marker.
+    #[test]
+    fn struct_array_element_accepts_type_cache_markers() {
+        let element = FieldDesc::Structure {
+            struct_id: "elem_t".into(),
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let expected = FieldDesc::StructureArray {
+            struct_id: "elem_t".into(),
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            // Inline element struct descriptor bytes (`0x80 ...`).
+            let mut elem_bytes = Vec::new();
+            encode_type_desc(&element, order, &mut elem_bytes);
+            let key: u16 = 7;
+            let key_bytes = match order {
+                ByteOrder::Little => key.to_le_bytes(),
+                ByteOrder::Big => key.to_be_bytes(),
+            };
+
+            // (a) `0x88 0xFD <key> <inline struct>` — the StructA element
+            //     defines a cache slot then supplies the struct inline.
+            let mut define = vec![TAG_STRUCTURE_ARRAY, 0xFD];
+            define.extend_from_slice(&key_bytes);
+            define.extend_from_slice(&elem_bytes);
+            let mut cache = TypeCache::new();
+            let mut cur = Cursor::new(define.as_slice());
+            let dec = decode_type_desc_cached(&mut cur, order, &mut cache)
+                .expect("StructA with 0xFD-define element must decode");
+            assert_eq!(dec, expected, "0xFD-define element ({order:?})");
+            assert_eq!(
+                cur.remaining(),
+                0,
+                "0xFD-define consumed all bytes ({order:?})"
+            );
+
+            // (b) `0x88 0xFE <key>` — the StructA element references the slot
+            //     just cached. Pre-fix this faulted with "expected 0x80".
+            let mut reference = vec![TAG_STRUCTURE_ARRAY, 0xFE];
+            reference.extend_from_slice(&key_bytes);
+            let mut cur = Cursor::new(reference.as_slice());
+            let dec = decode_type_desc_cached(&mut cur, order, &mut cache)
+                .expect("StructA with 0xFE-reference element must decode");
+            assert_eq!(dec, expected, "0xFE-reference element ({order:?})");
+            assert_eq!(
+                cur.remaining(),
+                0,
+                "0xFE-reference consumed all bytes ({order:?})"
+            );
+        }
+    }
+
+    /// PVX-21 union twin: a `UnionA` element delivered as a `0xFE` cache
+    /// reference must decode (same recursive-element path as StructA).
+    #[test]
+    fn union_array_element_accepts_type_cache_reference() {
+        let order = ByteOrder::Little;
+        let element = FieldDesc::Union {
+            struct_id: "u_t".into(),
+            variants: vec![
+                ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let expected = FieldDesc::UnionArray {
+            struct_id: "u_t".into(),
+            variants: vec![
+                ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let key: u16 = 3;
+        // Seed the cache with a standalone `0xFD <key> 0x81 ...` union define.
+        let mut union_bytes = Vec::new();
+        encode_type_desc(&element, order, &mut union_bytes);
+        let mut seed = vec![0xFD];
+        seed.extend_from_slice(&key.to_le_bytes());
+        seed.extend_from_slice(&union_bytes);
+        let mut cache = TypeCache::new();
+        let mut cur = Cursor::new(seed.as_slice());
+        decode_type_desc_cached(&mut cur, order, &mut cache).expect("seed union define decodes");
+
+        // `0x89 0xFE <key>` — UnionA referencing the cached union element.
+        let mut reference = vec![TAG_UNION_ARRAY, 0xFE];
+        reference.extend_from_slice(&key.to_le_bytes());
+        let mut cur = Cursor::new(reference.as_slice());
+        let dec = decode_type_desc_cached(&mut cur, order, &mut cache)
+            .expect("UnionA with 0xFE-reference element must decode");
+        assert_eq!(dec, expected);
+        assert_eq!(cur.remaining(), 0);
     }
 
     #[test]

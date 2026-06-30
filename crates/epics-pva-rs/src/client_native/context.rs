@@ -28,10 +28,10 @@ use crate::pvdata::{FieldDesc, PvField};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
-    op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
-    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
-    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
+    MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get, op_get_get, op_get_put,
+    op_monitor, op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
+    op_monitor_raw_frames_handle_with_request, op_process, op_process_with_request,
+    op_process_with_request_value, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::{ClientSearchConfig, SearchEngine};
 
@@ -104,6 +104,15 @@ pub struct PvaClientBuilder {
     server_addr: Option<SocketAddr>,
     user: Option<String>,
     host: Option<String>,
+    /// Default monitor pipeline window. `0` (the default) means the
+    /// default monitor is **non-pipelined**, matching pvxs
+    /// `MonitorBuilder` (`clientmon.cpp:50` — `pipeline=false`): the INIT
+    /// is a plain `0x08` with no credit trailer and the server free-flows
+    /// (squashing on overrun). Pipelining is opt-in, either via
+    /// [`PvaClientBuilder::pipeline_size`] or a pvRequest carrying
+    /// `record._options.pipeline` (honored by
+    /// `MonitorFlow::from_record_options`). A non-zero value here turns
+    /// every default monitor into a credit-windowed pipelined subscription.
     pipeline_size: u32,
     tls: Option<Arc<crate::auth::TlsClientConfig>>,
     name_servers: Vec<SocketAddr>,
@@ -151,7 +160,10 @@ impl PvaClientBuilder {
             server_addr: None,
             user: None,
             host: None,
-            pipeline_size: DEFAULT_PIPELINE_SIZE,
+            // pvxs default monitor is non-pipelined (clientmon.cpp:50
+            // `pipeline=false`); pipelining is opt-in via the builder or
+            // a pvRequest `record._options.pipeline`. See the field doc.
+            pipeline_size: 0,
             tls: None,
             name_servers: crate::config::env::name_servers(),
             priority: 0,
@@ -304,8 +316,9 @@ impl PvaClientBuilder {
         self
     }
 
-    /// Override the monitor pipeline size (default 4 — one ack per 4 events).
-    /// Set to 0 to disable pipelining.
+    /// Opt into pipelined (credit-windowed) monitors with window `n`
+    /// (one ACK per `n/2` events). Default `0` = non-pipelined, matching
+    /// pvxs; a pvRequest `record._options.pipeline` opts in per-request.
     pub fn pipeline_size(mut self, n: u32) -> Self {
         self.pipeline_size = n;
         self
@@ -3081,6 +3094,23 @@ impl Drop for ConnectHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PVX-42: the default monitor must be non-pipelined, matching pvxs
+    // `MonitorBuilder` (`clientmon.cpp:50` `pipeline=false`). The builder
+    // default `pipeline_size` is the single origin of the default-path
+    // `MonitorFlow::window(..)` decision, so pinning it to 0 keeps every
+    // default monitor INIT a plain `0x08` (no credit trailer / ACKs).
+    // Pre-fix this defaulted to DEFAULT_PIPELINE_SIZE (4) → every default
+    // subscription went out pipelined (`0x88`).
+    #[test]
+    fn default_monitor_is_non_pipelined() {
+        let b = PvaClientBuilder::new();
+        assert_eq!(b.pipeline_size, 0, "default monitor must be non-pipelined");
+        let flow = super::super::ops_v2::MonitorFlow::window(b.pipeline_size);
+        assert!(!flow.pipeline, "window(default) must yield a plain monitor");
+        // Opt-in still works: a non-zero builder window pipelines.
+        assert!(PvaClientBuilder::new().pipeline_size(4).pipeline_size > 0);
+    }
 
     // ── cache_clear CacheAction policy (pvxs Clean/Drop/Disconnect) ─────────
 

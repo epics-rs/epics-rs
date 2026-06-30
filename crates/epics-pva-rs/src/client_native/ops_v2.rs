@@ -84,7 +84,12 @@ fn alloc_ioid() -> u32 {
     NEXT_IOID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Default pipeline window for monitors. Tuned to match pvxs.
+/// Default credit window (`queueSize`) used **once a monitor is
+/// pipelined** but the pvRequest names no `queueSize` — pvxs
+/// `MonitorBuilder`'s `queueSize=4` default (`clientmon.cpp:50`). This is
+/// the fallback queue depth, NOT a default that turns pipelining on: the
+/// default monitor is non-pipelined (`PvaClientBuilder::pipeline_size`
+/// defaults to 0, matching pvxs `pipeline=false`).
 pub const DEFAULT_PIPELINE_SIZE: u32 = 4;
 
 /// MONITOR_ACK replenishment threshold for a pipeline window of

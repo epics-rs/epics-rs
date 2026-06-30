@@ -1021,6 +1021,53 @@ pub fn server_intf_addr_list() -> Vec<IpAddr> {
     list_intf_addresses()
 }
 
+/// PVX-82: presence-and-validity-aware server INTF resolver. pvxs parses
+/// `EPICS_PVAS_INTF_ADDR_LIST` with `required=true` (`config.cpp:418-424`
+/// → `151-176`, throwing at `172-174`), so a malformed endpoint aborts
+/// server config. The Rust resolver is intentionally lenient — it warns
+/// and drops an unresolvable token, which is fine for a *partially* valid
+/// list — but a list whose tokens **all** drop must NOT silently become an
+/// empty list, because the bind path ([`super::super::server_native`]'s
+/// `tcp_bind_addresses`) then promotes empty to the wildcard `0.0.0.0`,
+/// turning a typo'd bind-restriction into a listen-on-every-interface.
+/// Distinguish the three cases so the server can refuse that silent
+/// over-broad bind without failing on every benign typo in a partly-valid
+/// list:
+///
+/// - `Ok(None)` — neither var set, or the value is whitespace-only ⟹
+///   the operator wants the wildcard ("no addresses isn't interesting",
+///   `config.cpp:492-494`).
+/// - `Ok(Some(addrs))` — at least one token resolved.
+/// - `Err(msg)` — non-blank token(s) present but **none** resolved ⟹ the
+///   requested restriction is empty; fail loudly instead of binding all
+///   interfaces.
+pub fn server_intf_addr_list_checked() -> Result<Option<Vec<IpAddr>>, String> {
+    let raw = std::env::var("EPICS_PVAS_INTF_ADDR_LIST")
+        .ok()
+        .or_else(|| std::env::var("EPICS_PVA_INTF_ADDR_LIST").ok());
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    // `resolve_intf_addr_list` expands `$(VAR)` internally; expand here too
+    // so the "did the operator name any interface" test sees the same text
+    // (an env-ref that expands to nothing counts as unset → wildcard).
+    let had_token = expand_dollar_vars(&raw).split_whitespace().next().is_some();
+    if !had_token {
+        return Ok(None);
+    }
+    let addrs = resolve_intf_addr_list(&raw);
+    if addrs.is_empty() {
+        Err(format!(
+            "EPICS_PVA[S]_INTF_ADDR_LIST=\"{raw}\" named interface(s) but none \
+             resolved; refusing to silently bind the wildcard 0.0.0.0 (every \
+             interface). Fix the interface list, or unset it to bind all \
+             interfaces intentionally."
+        ))
+    } else {
+        Ok(Some(addrs))
+    }
+}
+
 /// Parse `EPICS_PVAS_IGNORE_ADDR_LIST` — server-side blocklist. Each
 /// entry pairs an IP with an optional port (`port == 0` matches any
 /// port from that IP). Connections (TCP) and search packets (UDP)
@@ -2004,6 +2051,51 @@ mod tests {
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             "EPICS_PVAS_INTF_ADDR_LIST=localhost must resolve to 127.0.0.1, not drop to []"
         );
+    }
+
+    /// PVX-82: [`server_intf_addr_list_checked`] separates "unset / blank"
+    /// (the operator wants the wildcard) from "named interface(s), none
+    /// resolved" (a misconfiguration). The middle case is the
+    /// security-relevant one — a typo'd bind restriction must surface as an
+    /// error so the server refuses to start, NOT silently fall back to
+    /// listening on every interface (`0.0.0.0`).
+    #[test]
+    fn server_intf_checked_errors_when_all_tokens_unresolvable() {
+        // Unset → Ok(None): caller keeps its own interfaces.
+        unsafe {
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+        }
+        assert_eq!(server_intf_addr_list_checked(), Ok(None));
+
+        // Whitespace-only → Ok(None): no interface named ⟹ wildcard intent.
+        unsafe {
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "   ");
+        }
+        assert_eq!(server_intf_addr_list_checked(), Ok(None));
+
+        // A resolvable interface → Ok(Some(addrs)).
+        unsafe {
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1");
+        }
+        assert_eq!(
+            server_intf_addr_list_checked(),
+            Ok(Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]))
+        );
+
+        // Named interface(s) that all fail to resolve (RFC 6761 reserves
+        // `.invalid` to always return NXDOMAIN) → Err: refuse the wildcard.
+        unsafe {
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "no-such-nic.invalid");
+        }
+        assert!(
+            server_intf_addr_list_checked().is_err(),
+            "an all-unresolvable INTF list must error, not drop to wildcard 0.0.0.0"
+        );
+
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+        }
     }
 
     /// Interface lists deduplicate after resolution, preserving

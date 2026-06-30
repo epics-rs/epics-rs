@@ -155,6 +155,15 @@ pub struct PvaServerConfig {
     /// Interfaces to bind UDP responder on. When empty, bind 0.0.0.0.
     /// From `EPICS_PVAS_INTF_ADDR_LIST`.
     pub interfaces: Vec<std::net::IpAddr>,
+    /// PVX-82: deferred config error set by [`Self::with_env`] when
+    /// `EPICS_PVA[S]_INTF_ADDR_LIST` named interface(s) that all failed to
+    /// resolve. `PvaServer::start` refuses to bind in that case rather than
+    /// silently promoting the (now-empty) `interfaces` to the wildcard
+    /// `0.0.0.0`. `None` on any programmatically-built config — an empty
+    /// `interfaces` set directly by a caller is an intentional wildcard.
+    /// Public only because the config is built with struct-update syntax
+    /// across the crate boundary; it is not a user-facing knob.
+    pub intf_addr_error: Option<String>,
     /// Emit `0xFD` / `0xFE` type-cache markers in INIT and RPC responses
     /// so repeated compound descriptors collapse to a 3-byte reference
     /// (saves 100-500 bytes per repeat for NTScalar / NTTable channels).
@@ -305,6 +314,7 @@ impl Default for PvaServerConfig {
             beacon_destinations: Vec::new(),
             auto_beacon: true,
             interfaces: Vec::new(),
+            intf_addr_error: None,
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
@@ -408,8 +418,15 @@ impl PvaServerConfig {
         if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {
             self.auto_beacon = v;
         }
-        if let Some(v) = env::server_intf_addr_list_opt() {
-            self.interfaces = v;
+        // PVX-82: a non-blank INTF list whose tokens all fail to resolve is
+        // a misconfiguration — record it so `PvaServer::start` refuses to
+        // bind rather than silently falling back to the wildcard. A blank /
+        // unset var leaves `interfaces` untouched (caller value preserved;
+        // empty ⟹ intentional wildcard at bind).
+        match env::server_intf_addr_list_checked() {
+            Ok(Some(v)) => self.interfaces = v,
+            Ok(None) => {}
+            Err(msg) => self.intf_addr_error = Some(msg),
         }
         if let Some(v) = env::send_timeout_secs_opt() {
             self.send_timeout = Duration::from_secs_f64(v);
@@ -644,6 +661,13 @@ impl PvaServer {
         // does.
         let mut config = config;
         config.guid = guid;
+        // PVX-82: refuse to start when the env named interface(s) that all
+        // failed to resolve — binding the wildcard `0.0.0.0` here would
+        // silently listen on every interface instead of the requested
+        // restriction (pvxs hard-fails such a config: `config.cpp:172-174`).
+        if let Some(msg) = config.intf_addr_error.take() {
+            return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
+        }
         // The live per-peer registry is created up-front so the
         // built-in server-info source can report connection counts.
         let peers = crate::server_native::peers::PeerRegistry::new();
@@ -1765,6 +1789,36 @@ mod tcp_fallback_tests {
                 .expect("connect timed out");
         let _stream = connect.expect("loopback TCP connect must succeed");
         drop(server);
+    }
+
+    /// PVX-82: when `with_env` recorded that `EPICS_PVA[S]_INTF_ADDR_LIST`
+    /// named interface(s) that all failed to resolve, `PvaServer::start`
+    /// must refuse to bind rather than silently promoting the empty
+    /// `interfaces` to the wildcard `0.0.0.0`. Deterministic — no DNS, no
+    /// real bind (it errors before any listener is created).
+    #[test]
+    fn start_refuses_when_intf_addr_error_recorded() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            interfaces: Vec::new(),
+            intf_addr_error: Some(
+                "EPICS_PVA[S]_INTF_ADDR_LIST=\"bad.invalid\" named interface(s) \
+                 but none resolved"
+                    .to_string(),
+            ),
+            auto_beacon: false,
+            ..Default::default()
+        };
+        // `PvaServer` is not `Debug`, so match on the result rather than
+        // `expect_err` (which would require the `Ok` type to be `Debug`).
+        let result = PvaServer::start(source, config);
+        assert!(
+            matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
+            "an unresolved INTF list must fail server start with the resolution \
+             error, not bind 0.0.0.0"
+        );
     }
 }
 

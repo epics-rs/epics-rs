@@ -89,6 +89,43 @@ fn to_asyn(e: ModbusError) -> AsynError {
     }
 }
 
+/// Decode a poller register block (from a record's offset to the block end)
+/// into an int32 array — the relative-mode decode of [`Ioc::read_int32_array`],
+/// one element per `register_count` registers. Mirrors C `readPoller`'s
+/// `for (i=0; offset<modbusLength_; i++) readPlcInt32(...)` array fan-out
+/// (drvModbusAsyn.cpp:1840-1843). A malformed element decode aborts the poll.
+fn decode_block_int32(dt: ModbusDataType, regs: &[u16]) -> AsynResult<Vec<i32>> {
+    let rc = dt.register_count().max(1);
+    let mut out = Vec::with_capacity(regs.len() / rc);
+    let mut n = 0;
+    while (n + 1) * rc <= regs.len() {
+        out.push(
+            datatype::read_int32(dt, &regs[n * rc..])
+                .map_err(to_asyn)?
+                .0,
+        );
+        n += 1;
+    }
+    Ok(out)
+}
+
+/// Float64 twin of [`decode_block_int32`] (C `readPlcFloat` fan-out,
+/// drvModbusAsyn.cpp:1875-1878).
+fn decode_block_float64(dt: ModbusDataType, regs: &[u16]) -> AsynResult<Vec<f64>> {
+    let rc = dt.register_count().max(1);
+    let mut out = Vec::with_capacity(regs.len() / rc);
+    let mut n = 0;
+    while (n + 1) * rc <= regs.len() {
+        out.push(
+            datatype::read_float(dt, &regs[n * rc..])
+                .map_err(to_asyn)?
+                .0,
+        );
+        n += 1;
+    }
+    Ok(out)
+}
+
 /// Whether a Modbus function may carry a record *array* write. C
 /// `writeInt32Array`/`writeFloat64Array` (drvModbusAsyn.cpp:1398-1428 /
 /// 1230-...) switch only on `MODBUS_WRITE_MULTIPLE_COILS` and
@@ -465,6 +502,44 @@ impl ModbusPortDriver {
                 // @asynMask via `apply_raw_readback`, matching the polled
                 // `read_uint32_digital` which delivers the unmasked word.
                 let word = regs.first().copied().unwrap_or(0) as u32;
+                // Array interfaces: C `readPoller` decodes the SAME register
+                // block from the record's offset to `modbusLength_` and fires the
+                // array interrupt lists — int32Array (drvModbusAsyn.cpp:1840-1851)
+                // and float64Array (:1875-1886) — so an asynInt32ArrayIn /
+                // asynFloat64ArrayIn waveform on `SCAN="I/O Intr"` updates every
+                // frame. Decode the whole block once per array interface a record
+                // is bound to; the subscriber-presence gate skips the decode when
+                // no array record exists, mirroring C iterating an empty interrupt
+                // list (the per-element `readPlcInt32`/`readPlcFloat` loop never
+                // runs). The waveform consumer caps the array at its NELM. Decode
+                // up front with the scalars so a mid-decode error aborts the poll
+                // before any partial fire.
+                //
+                // int32Array is fired UNCONDITIONALLY here; C gates it on
+                // `forceCallback_ || anyChanged` (:1824). That on-change cadence is
+                // the array sibling of the R57 gap (uInt32Digital/octet, also fired
+                // unconditionally) and closes with the same shared
+                // `prevData`/`anyChanged` primitive. float64Array already matches C
+                // (unconditional, :1857). The fired value is correct either way.
+                let int32_array =
+                    if self
+                        .base
+                        .interrupts
+                        .has_subscriber(reason, addr, InterfaceType::Int32Array)
+                    {
+                        Some(decode_block_int32(dt, regs)?)
+                    } else {
+                        None
+                    };
+                let float64_array = if self.base.interrupts.has_subscriber(
+                    reason,
+                    addr,
+                    InterfaceType::Float64Array,
+                ) {
+                    Some(decode_block_float64(dt, regs)?)
+                } else {
+                    None
+                };
                 self.base.notify_interface_value(
                     reason,
                     addr,
@@ -499,6 +574,24 @@ impl ModbusPortDriver {
                     ParamValue::UInt32Digital(word),
                     !0,
                 );
+                if let Some(arr) = int32_array {
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::Int32Array,
+                        ParamValue::Int32Array(arr.into()),
+                        0,
+                    );
+                }
+                if let Some(arr) = float64_array {
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::Float64Array,
+                        ParamValue::Float64Array(arr.into()),
+                        0,
+                    );
+                }
             }
         }
         self.publish_stats()?;
@@ -3035,6 +3128,110 @@ mod tests {
             Some(1),
             "asynUInt32Digital must see the raw register word, not the collapsed value"
         );
+    }
+
+    /// R56: a `SCAN="I/O Intr"` asynInt32ArrayIn / asynFloat64ArrayIn waveform
+    /// must update every poll. C `readPoller` fires the int32Array / float64Array
+    /// interrupt lists with the whole register block decoded from the record's
+    /// offset (drvModbusAsyn.cpp:1840-1886); the Rust poll fires the array
+    /// interfaces too — but only when a record is bound (the subscriber-presence
+    /// gate mirrors C iterating an empty interrupt list). This pins both the fire
+    /// (with correct whole-block contents) and the gate (silent when unbound).
+    #[test]
+    fn poll_cycle_fires_array_interfaces_only_when_a_record_is_bound() {
+        // 4 holding registers 0x0001..0x0004, replayed for two polls.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = ModbusPortDriver::new(
+            "MB_ARRAY_IOINTR",
+            test_config(0, 4),
+            LinkType::Tcp,
+            // Two polls: the framer increments the transaction ID per request
+            // (1 then 2), so the replies must carry the matching txid or the
+            // poll skips them as stale and times out.
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &pdu)),
+                Ok(tcp_response(2, &pdu)),
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        // Activate the INT32_LE reason at addr 0 (rc=2, two registers per
+        // element), so the 4-register block decodes to two elements.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+        let mut ruser = AsynUser::new(reason);
+        ruser.addr = 0;
+        assert!(driver.read_int32(&ruser).is_ok());
+
+        // --- Poll 1: array records ARE bound (mailbox subscribers present). ---
+        let (_sub_i, _rx_i) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                });
+        let (_sub_f, _rx_f) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+
+        let mut int32_arr = None;
+        let mut float64_arr = None;
+        while let Ok(iv) = rx.try_recv() {
+            match (iv.iface, iv.value) {
+                (Some(InterfaceType::Int32Array), ParamValue::Int32Array(a)) => {
+                    int32_arr = Some(a.to_vec());
+                }
+                (Some(InterfaceType::Float64Array), ParamValue::Float64Array(a)) => {
+                    float64_arr = Some(a.to_vec());
+                }
+                _ => {}
+            }
+        }
+        // INT32_LE: regs[0..2]=[1,2]=0x0002_0001=131073, regs[2..4]=[3,4]=
+        // 0x0004_0003=262147 — the whole block, one element per two registers.
+        assert_eq!(
+            int32_arr.as_deref(),
+            Some(&[131073i32, 262147][..]),
+            "asynInt32Array must get the whole-block per-element Int32Le decode"
+        );
+        assert_eq!(
+            float64_arr.as_deref(),
+            Some(&[131073.0f64, 262147.0][..]),
+            "asynFloat64Array must get the float decode of the same block"
+        );
+
+        // --- Poll 2: no array record bound (subscribers dropped) → gate skips. ---
+        drop(_sub_i);
+        drop(_sub_f);
+        drop(_rx_i);
+        drop(_rx_f);
+        let mut rx2 = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("second poll_cycle must succeed");
+        while let Ok(iv) = rx2.try_recv() {
+            assert!(
+                !matches!(
+                    iv.iface,
+                    Some(InterfaceType::Int32Array) | Some(InterfaceType::Float64Array)
+                ),
+                "no array interface may fire when no array record is bound \
+                 (subscriber-presence gate)"
+            );
+        }
     }
 
     #[test]

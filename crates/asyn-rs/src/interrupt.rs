@@ -69,6 +69,33 @@ impl InterruptFilter {
         }
         true
     }
+
+    /// Whether a value fired for `(reason, addr, iface)` could reach this
+    /// subscriber, ignoring the UInt32Digital changed-bit gate. This is the
+    /// *presence* predicate (would a fire ever land here), not the per-value
+    /// [`matches`](Self::matches) gate: a polling driver uses it to skip the
+    /// cost of decoding+firing an interface with no subscriber, mirroring C
+    /// `readPoller` iterating an empty interrupt list. The `uint32_mask` gate is
+    /// deliberately skipped — it depends on which bits *changed* this poll, a
+    /// per-value property, whereas presence is independent of the value.
+    fn accepts(&self, reason: usize, addr: i32, iface: InterfaceType) -> bool {
+        if let Some(r) = self.reason {
+            if reason != r {
+                return false;
+            }
+        }
+        if let Some(a) = self.addr {
+            if addr != a {
+                return false;
+            }
+        }
+        if let Some(want) = self.iface {
+            if want != iface {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Value delivered through the interrupt system.
@@ -427,6 +454,24 @@ impl InterruptManager {
             },
             InterruptReceiver { mailbox },
         )
+    }
+
+    /// True if any active mailbox subscription would receive a value fired for
+    /// `(reason, addr, iface)`.
+    ///
+    /// A polling driver (e.g. Modbus `readPoller`) uses this to skip the cost of
+    /// decoding+firing an interface that no record is bound to — mirroring C,
+    /// where an empty interrupt list means the per-element `readPlcInt32` /
+    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1822-1854). Only the
+    /// coalescing mailbox subscriptions (I/O Intr records) are consulted;
+    /// broadcast subscribers (`subscribe_async`, transport/tests) and sync
+    /// callbacks (averaging) are not record bindings and do not gate a poll.
+    pub fn has_subscriber(&self, reason: usize, addr: i32, iface: InterfaceType) -> bool {
+        self.state
+            .mailboxes
+            .lock()
+            .iter()
+            .any(|s| s.active.load(Ordering::Relaxed) && s.filter.accepts(reason, addr, iface))
     }
 
     // --- Metrics ---
@@ -863,5 +908,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(vi.value, ParamValue::Int32(99)));
+    }
+
+    /// The subscriber-presence gate a polling driver uses to skip an interface
+    /// with no record bound (R56 array fan-out): `has_subscriber` is true iff an
+    /// active mailbox filter would accept a fire for that `(reason, addr, iface)`,
+    /// an untyped (`iface == None`) subscriber accepts any interface, and a drop
+    /// unregisters.
+    #[tokio::test]
+    async fn has_subscriber_reports_presence_per_iface() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+        // No subscribers yet.
+        assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
+
+        let (sub, _rx) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::Int32Array),
+            ..Default::default()
+        });
+        // Present for the matching tuple; absent for a different iface/addr/reason.
+        assert!(im.has_subscriber(0, 0, InterfaceType::Int32Array));
+        assert!(!im.has_subscriber(0, 0, InterfaceType::Float64Array));
+        assert!(!im.has_subscriber(0, 1, InterfaceType::Int32Array));
+        assert!(!im.has_subscriber(1, 0, InterfaceType::Int32Array));
+
+        // An untyped subscriber (no iface filter) is present for every iface.
+        let (sub2, _rx2) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(5),
+            ..Default::default()
+        });
+        assert!(im.has_subscriber(5, 99, InterfaceType::Float64Array));
+
+        // Dropping the subscription unregisters it.
+        drop(sub);
+        assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
+        drop(sub2);
+        assert!(!im.has_subscriber(5, 99, InterfaceType::Float64Array));
     }
 }

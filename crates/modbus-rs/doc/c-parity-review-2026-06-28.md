@@ -244,7 +244,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   The length *value* is still discarded — no asyn-rs home (R34). Tests
   `drv_user_create_validates_string_length_suffix`, `parse_drvuser_string_len_matches_strtol_base0`.
 
-### R52 — drvUser bind does not reject an out-of-range offset at connect — STRUCTURAL BLOCK (asyn-rs contract; sign-off, sibling of R34/R54)
+### R52 — drvUser bind does not reject an out-of-range offset at connect — CLEARED (989505ff)
 - **Severity:** CONCERN (error at I/O time instead of connect time)
 - **Rust:** `drv_user_create` runs no `checkOffset` (it has no `addr` — the asyn-rs
   `drv_user_create -> usize` contract resolves a shared reason, not a per-record bind); offsets are
@@ -283,6 +283,20 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   asyn-rs contract gap as R34/R54 — A-protocol's recommendation is to sign all three off as one
   framework work item. The dormant override + its `-1` bound are held pending that decision (do not
   patch the dormant path or revert e633e601 unilaterally).
+- **Cleared (sign-off taken):** the `drv_user_create` contract now carries the record's `addr`
+  (`(&mut self, drv_info, addr) -> DrvUserInfo`), so modbus runs `engine.check_offset(addr)` at
+  **bind** — gated on the reason being a data type (`datatype.is_some()`), exactly mirroring C
+  `drvUserCreate`'s data-branch-only `getAddr`+`checkOffset` (`:378-384`): a non-data
+  (statistics/control) drvInfo falls through with no offset check, like C `:433`. An out-of-range
+  data-reason offset now fails record init instead of alarming on every I/O. This routes through the
+  **real** record-init path (`AsynDeviceSupport::init` → `drv_user_create_blocking`), unlike the
+  dormant `connect_addr` override (e633e601) which nothing drove — that override is now superseded
+  (safe to remove in a follow-up; left in place this round, not reverted unilaterally). The secondary
+  `-1` divergence is resolved: the bind mirrors C `drvUserCreate`'s `checkOffset` (rejects `< 0`),
+  NOT C `connect`'s `offset == -1` allowance — a `-1` port connect never routes through the
+  per-record bind, so the cited `connect` path is not the analogue. Verified across two opus parity
+  rounds. Tests `drv_user_create_rejects_out_of_range_offset_for_data_reason` (data reason rejected
+  at bind), `drv_user_create("READ_OK", 99).is_ok()` (non-data reason accepted, C base-class path).
 
 ### R53 — modbusInterposeConfig accepts timeoutMsec + writeDelayMsec but silently drops both — CLEARED (c17c1c2c)
 - **Severity:** CONCERN (configured timeout + inter-frame write delay ignored)

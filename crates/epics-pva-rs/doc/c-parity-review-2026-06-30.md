@@ -98,7 +98,7 @@ op-handlers, and beacon/search layout are byte-faithful.
 | PVX-21 | **CLEARED (`66149781`)** — Fix: accept `0xfd`/`0xfe` cache markers in StructA/UnionA element position via recursive decode (interop with pvData-family peers). Contained. |
 | PVX-81 | **CLEARED (`579e3e1b`)** — Fix: set the SEARCH `Unicast` flag (`0x80`) per-destination for unicast dests (`isucast = !isMCast()`). Wire-parity. Contained. |
 | PVX-2  | **CLEARED (`a71e168b`)** — Fix (structural): added `proto::size::decode_size_nonnull(cur, order, what)`, the non-null primitive (pvxs `from_wire(Size, allow_null=false)`) that holds the invariant by construction; routed the count-must-not-be-null family (encode.rs ×11, bitset, the `pvxvct-rs.rs:367` `.unwrap_or(0)` CLI bug) through it. Strings/union-selectors stay on `decode_size`. |
-| PVX-82 | **CLEARED (`03caa4d1`)** — Fix (behavior change vs prior Rust, matches pvxs): `server_intf_addr_list_checked` errors when every INTF token is unresolvable, recorded as `intf_addr_error` and surfaced as a hard `PvaServer::start` failure — closes the silent over-broad wildcard bind. Client-path `expand()` wildcard left as-is (DISTINCT — diagnostic, not a bind restriction). |
+| PVX-82 | **CLEARED (`03caa4d1` INTF + `da4b0be8` IGNORE)** — Fix (behavior change vs prior Rust, matches pvxs): `server_intf_addr_list_checked` / `server_ignore_addr_list_checked` error when every token in a non-blank server addr-list is unresolvable, recorded as `intf_addr_error` / `ignore_addr_error` and surfaced as a hard `PvaServer::start` failure — closes the silent over-broad wildcard bind (INTF) and the silently-empty blocklist (IGNORE). The finding named both lists; the IGNORE half was closed in the convergence round (`da4b0be8`). Client-path `expand()` wildcard left as-is (DISTINCT — diagnostic, pvxs client parse is `required=false`). **Residual (documented, accepted):** the gate is `all`-bad (fails only when every token is unresolvable), whereas pvxs `required=true` throws on `any` bad token — but the Rust gate is fail-closed (binds/blocks a subset, never a superset/wildcard), so no over-broad exposure. |
 | PVX-42 | **CLEARED (`1941d5e2`)** — Fixed by matching pvxs: default `pipeline_size = 0` so the default monitor is non-pipelined (plain `0x08` INIT, no credit trailer/options/ACKs). Pipelining stays opt-in via `pipeline_size(n)` or a pvRequest `record._options.pipeline`. Regression test pins the non-pipelined default. |
 | PVX-61 | **OPEN (round-2 candidate)** — establish monitor subscription at INIT (pvxs `connectSub`) so INIT→START transitions queue instead of collapse. More involved server change. |
 | PVX-41 | **OPEN (low / round-2)** — enum-by-label PUT via in-PUT `0x40` GetOPut instead of a separate GET op. Functionally equivalent; PUT state-machine change. |
@@ -141,3 +141,25 @@ Remaining open: **PVX-61** (monitor-sub-at-INIT) and **PVX-41**
 (in-PUT `0x40` GetOPut) — round-2 candidates, larger state-machine
 changes, deferred. A caucus opus verification round on this batch
 follows.
+
+#### Convergence (caucus opus verification round `01KWCC5K`)
+
+Three opus panels (pvdata / client / discovery) re-read each fix against
+the pvxs C++ directly. **All five CONFIRMED FIXED, 0 blocking CONCERN.**
+Three residuals surfaced, dispositioned:
+
+- **PVX-82 IGNORE missed sibling** — the finding named both server
+  addr-lists, but `03caa4d1` closed only INTF; `EPICS_PVAS_IGNORE_ADDR_LIST`
+  still dropped bad tokens silently where pvxs `config.cpp:422-423`
+  (`required=true`) throws. **Closed in `da4b0be8`** — `server_ignore_addr_list_checked`
+  + `ignore_addr_error` surfaced at `start`, mirroring the INTF gate, with
+  env + start-refusal regression tests.
+- **PVX-82 partial-list leniency** (all-bad gate vs pvxs per-token any-bad
+  throw) — accepted; fail-closed, no over-broad bind. Documented on the
+  PVX-82 row.
+- **PVX-2 framing-site DRY** — 3 framing null-reject sites
+  (`decode.rs:225`, `ops_v2.rs:3933`, `tcp.rs:4845`) hand-roll the
+  rejection instead of reusing `decode_size_nonnull`. Accepted — correctness
+  equivalent (they already fault), and they carry richer site-specific
+  diagnostics (`tcp.rs` is its own `PvaError`-returning primitive) that the
+  generic `what` message would flatten. No change.

@@ -642,3 +642,17 @@ low-severity findings, both dispositioned:
   re-arming `force_callback` (only the engine-poll error did), so an abort after a clean cycle could
   freeze the on-change baseline. FIXED structurally `af8991bd` (single finalizer: every Err re-arms
   through one owner). See R58.
+
+**R58 fix-verification round (`01KWB664`, 2 opus panels, 2026-06-30) — CONVERGED.** Both panels
+CONFIRMED-CORRECT with NO new findings. Finalizer-skip closed by construction: `run_poll_cycle` has
+exactly one caller (the `match` wrapper, one re-arm owner), all 9 fallible `?` route through it, the 2
+`continue`s stay in-loop, and the sole `Ok` exit is the finalizer — abort ⟹ baseline frozen + force
+re-armed; full success ⟹ baseline advanced + force cleared, mutually exclusive. The snapshot/clear
+reorder (now dead-last, after `publish_stats`/`call_param_callbacks`) matches C's cycle-end ordering
+(`:1928/1934`) and is value-identical on success; the consumer panel additionally noted C has NO
+`callParamCallbacks` in `drvModbusAsyn.cpp` at all (stats are `setIntegerParam`'d in `doModbusIO` and
+pulled on demand), so the Rust-only stats post conflicts with no C ordering. The one nuance — a
+`publish_stats`/`call_param_callbacks(0)` error now freezes+re-arms vs C's unconditional advance — is
+unreachable (the fixed addr-0 stats params cannot error) and over-fire-safe if reached; both panels
+ruled special-casing it out as the dual-owner shape that produced R58. mask==0 decline CONFIRMED
+against asynPortDriver.cpp:720. The new test proves the re-arm (fails under d78b01e0). R58 CLOSED.

@@ -4643,14 +4643,19 @@ fn value_target_is_enum(intro: &FieldDesc) -> bool {
 /// The `value.choices` labels from a previously-fetched value snapshot, used
 /// to resolve an enum write by label. `None` when the snapshot is absent or
 /// does not carry a `value.choices` string array.
+///
+/// A decoded wire value carries a string array as the canonical typed form
+/// [`PvField::ScalarArrayTyped`] — both the GET snapshot path and the in-PUT
+/// `GetOPut` path go through `decode_pv_field_with_bitset_cached`, which
+/// emits `ScalarArrayTyped` for `string[]`. Locally-built values may instead
+/// use the untyped [`PvField::ScalarArray`]. Resolving the label must accept
+/// either, else an enum-by-label put silently falls through to the integer
+/// fallback and rejects every real label.
 fn enum_choices_from_previous(previous: &PvField) -> Option<Vec<String>> {
+    let labels = |items: &[ScalarValue]| items.iter().map(|sv| sv.to_string()).collect::<Vec<_>>();
     match value_at_path(previous, &["value", "choices"])? {
-        PvField::ScalarArray(items) => Some(
-            items
-                .iter()
-                .map(|sv| sv.to_string())
-                .collect::<Vec<String>>(),
-        ),
+        PvField::ScalarArray(items) => Some(labels(&items)),
+        PvField::ScalarArrayTyped(a) => Some(labels(&a.to_scalar_values())),
         _ => None,
     }
 }
@@ -6082,6 +6087,45 @@ mod tests {
             // The container and the choices array must NOT be marked — else
             // the server would overwrite its menu with an empty array.
             assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
+        }
+
+        /// The wire decode yields `value.choices` as the canonical typed
+        /// array ([`PvField::ScalarArrayTyped`]), not the untyped
+        /// [`PvField::ScalarArray`] the other fixtures hand-build. Label
+        /// resolution must accept it too — otherwise an enum-by-label put
+        /// over the wire (where the get-first snapshot always decodes typed)
+        /// silently falls through to the integer fallback and rejects every
+        /// real label.
+        #[test]
+        fn label_resolves_via_typed_choices_array() {
+            let intro = nt_enum();
+            let mut enum_v = PvStructure::new("enum_t");
+            enum_v
+                .fields
+                .push(("index".to_string(), PvField::Scalar(ScalarValue::Int(0))));
+            enum_v.fields.push((
+                "choices".to_string(),
+                PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::String(
+                    ["OFF", "ON", "AUTO"]
+                        .into_iter()
+                        .map(epics_base_rs::types::PvString::from)
+                        .collect(),
+                )),
+            ));
+            let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
+            root.fields
+                .push(("value".to_string(), PvField::Structure(enum_v)));
+            let previous = PvField::Structure(root);
+
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["AUTO"]), Some(&previous)).unwrap();
+            assert_eq!(
+                index_of(&value),
+                2,
+                "typed-array choices must resolve the label to its position"
+            );
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
             assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
         }
 

@@ -245,6 +245,19 @@ impl PvaCodec {
         self.frame(false, CMD_PUT, p)
     }
 
+    /// PUT `GetOPut` phase — `subcmd=0x40` (`QosFlags::GET`), no value body.
+    /// pvxs `clientget.cpp:299-300` (`GPROp::GetOPut`): a get-first builder
+    /// (e.g. enum-by-label / read-modify-write) reads the current value
+    /// through *this* PUT op's own pvRequest mask on the same `ioid`, rather
+    /// than opening a separate `ChannelGet` with an empty all-fields request.
+    /// The server replies with the current value (it derives `isput =
+    /// !(subcmd & 0x40)`, `serverget.cpp:364`), then the client sends the
+    /// `0x00` exec frame with the built value.
+    pub fn build_put_get(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
+        let p = Self::op_payload(server_channel_id, ioid, QosFlags::GET, &[], self.order());
+        self.frame(false, CMD_PUT, p)
+    }
+
     // ─── MONITOR ─────────────────────────────────────────────────────────
 
     /// MONITOR INIT — `subcmd=0x08` (INIT) plus the pvRequest body.

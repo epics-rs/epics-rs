@@ -1539,9 +1539,13 @@ async fn op_put_inner(
 /// (pvput.cpp:409) so it can resolve an enum write by choice label
 /// (pvput.cpp:186-188); here the snapshot is fetched only for the
 /// prototypes that need it, so an ordinary scalar PUT keeps its single
-/// round trip and a write-only PV is not gated on a GET. A failed snapshot
-/// is best-effort (`None`): the builder still runs and falls back to the
-/// no-snapshot path.
+/// round trip and a write-only PV is not gated on a GET. The snapshot rides
+/// the put's own op as pvxs's `GPROp::GetOPut` phase (`subcmd=0x40` on the
+/// same `ioid`), not a separate `ChannelGet`. A snapshot that returns an
+/// error *status* is best-effort (`None`): the builder still runs and falls
+/// back to the no-snapshot path. A transport failure (send / timeout /
+/// malformed reply) fails the op instead, because the snapshot shares the
+/// op's frame stream and a late reply would desync the exec await.
 async fn op_put_inner_build<FB, WP>(
     channel: &Arc<Channel>,
     raw_pv_req: Option<&[u8]>,
@@ -1594,11 +1598,29 @@ where
 
     // Get-first snapshot for builders that resolve against the current
     // value (e.g. an enum write matched by choice label). Fetched only when
-    // the prototype calls for it, and best-effort — a failure leaves the
-    // builder to fall back to its no-snapshot path. pvput.cpp:409 (get=true)
-    // / pvput.cpp:186-188.
+    // the prototype calls for it. pvput.cpp:409 (get=true) / pvput.cpp:186-188.
+    //
+    // pvxs reads the snapshot via `GPROp::GetOPut` — a CMD_PUT data-phase
+    // frame with `subcmd=0x40` and no value body, on THIS put's own `ioid`,
+    // so the server returns the current value through the put's own
+    // pvRequest mask before the exec (clientget.cpp:258,299-300,536). The
+    // previous code opened a separate `ChannelGet` with an empty all-fields
+    // pvRequest — an extra op/RTT, a fresh ioid, and a wider field read than
+    // the put mask. An error STATUS reply stays best-effort (`None`): the
+    // builder runs and falls back to its no-snapshot path (an enum-by-label
+    // build then fails on its own). But because the snapshot now shares this
+    // op's frame stream, a transport failure (send / timeout / malformed
+    // reply) must fail the op rather than fall back — a late snapshot reply
+    // would desync the exec done-frame await. A malformed reply also resets
+    // the circuit (pvxs `M.fault()`), via `decode_op_or_reset`.
     let previous = if wants_previous(&intro) {
-        op_get(channel, &[], op_timeout).await.ok().map(|(_, v)| v)
+        let get_oput = codec.build_put_get(sid, ioid);
+        server.send_for_channel(sid, get_oput).await?;
+        let snap_frame = await_frame(&mut stream, op_timeout).await?;
+        match decode_op_or_reset(&server, &snap_frame, Some(&intro))? {
+            OpResponse::Data(d) => Some(d.value),
+            _ => None,
+        }
     } else {
         None
     };

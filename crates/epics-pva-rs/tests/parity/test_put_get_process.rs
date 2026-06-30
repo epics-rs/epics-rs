@@ -882,3 +882,161 @@ async fn get_put_and_get_get_project_distinct_legs() {
     server.stop();
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
+
+/// An NTEnum source for the PVX-41 in-PUT `GetOPut` path. `value` is an
+/// `enum_t { index, choices }`; `put_value` stores the put's `value.index`.
+/// `get_calls` counts how many times the server pulled the value — the put
+/// of an enum *label* (not an integer) can only succeed if a get-first
+/// snapshot delivered `value.choices` to resolve the label against.
+#[derive(Clone)]
+struct EnumSource {
+    index: Arc<Mutex<i32>>,
+    get_calls: Arc<AtomicU32>,
+}
+
+impl EnumSource {
+    fn new() -> Self {
+        Self {
+            index: Arc::new(Mutex::new(0)),
+            get_calls: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+fn nt_enum_desc() -> FieldDesc {
+    FieldDesc::Structure {
+        struct_id: "epics:nt/NTEnum:1.0".into(),
+        fields: vec![(
+            "value".into(),
+            FieldDesc::Structure {
+                struct_id: "enum_t".into(),
+                fields: vec![
+                    ("index".into(), FieldDesc::Scalar(ScalarType::Int)),
+                    ("choices".into(), FieldDesc::ScalarArray(ScalarType::String)),
+                ],
+            },
+        )],
+    }
+}
+
+impl ChannelSource for EnumSource {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+        async { vec!["enumdut".into()] }
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let n = n.to_string();
+        async move { n == "enumdut" }
+    }
+    fn get_introspection(
+        &self,
+        _: &str,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        async { Some(nt_enum_desc()) }
+    }
+    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        let idx = *self.index.lock();
+        async move {
+            let mut e = PvStructure::new("enum_t");
+            e.fields
+                .push(("index".into(), PvField::Scalar(ScalarValue::Int(idx))));
+            e.fields.push((
+                "choices".into(),
+                PvField::ScalarArray(vec![
+                    ScalarValue::String("Off".into()),
+                    ScalarValue::String("On".into()),
+                ]),
+            ));
+            let mut s = PvStructure::new("epics:nt/NTEnum:1.0");
+            s.fields.push(("value".into(), PvField::Structure(e)));
+            Some(PvField::Structure(s))
+        }
+    }
+    fn put_value(
+        &self,
+        _: &str,
+        value: PvField,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let store = self.index.clone();
+        async move {
+            // The enum-by-label delta marks (and carries) only value.index.
+            let idx = match &value {
+                PvField::Structure(s) => s
+                    .fields
+                    .iter()
+                    .find_map(|(k, v)| (k == "value").then_some(v))
+                    .and_then(|v| match v {
+                        PvField::Structure(e) => e
+                            .fields
+                            .iter()
+                            .find_map(|(k, f)| (k == "index").then_some(f))
+                            .and_then(|f| match f {
+                                PvField::Scalar(ScalarValue::Int(i)) => Some(*i),
+                                _ => None,
+                            }),
+                        _ => None,
+                    }),
+                _ => None,
+            }
+            .ok_or_else(|| "put value has no enum value.index".to_string())?;
+            *store.lock() = idx;
+            Ok(())
+        }
+    }
+    fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+        async { true }
+    }
+    fn subscribe(
+        &self,
+        _: &str,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        async { None }
+    }
+}
+
+/// PVX-41: an enum write by *label* drives the in-PUT `GetOPut` (subcmd
+/// `0x40`) snapshot. `pvput("On")` is not parseable as an integer index, so
+/// the only way it resolves to index 1 is if the get-first snapshot returned
+/// `value.choices = ["Off","On"]`. pvxs reads that snapshot as the PUT op's
+/// own `GetOPut` phase on the same `ioid` (clientget.cpp:299-300), which the
+/// Rust client now does too (was a separate ChannelGet). A successful store
+/// of index 1 proves the in-PUT snapshot round-tripped end-to-end.
+#[tokio::test]
+async fn enum_put_by_label_uses_in_put_getoput() {
+    let (port, udp) = alloc_port();
+    let cfg = PvaServerConfig {
+        tcp_port: port,
+        udp_port: udp,
+        ..Default::default()
+    };
+    let src = EnumSource::new();
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_to(port);
+    // `pvput_args` is the get-first put: an enum `.value` target makes
+    // `value_target_is_enum` true, which drives the in-PUT GetOPut snapshot
+    // (the bare `pvput` single-value path never snapshots). A non-integer
+    // token like "On" can only resolve via that snapshot's choices.
+    let on = ["On".to_string()];
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvput_args("enumdut", &on, None),
+    )
+    .await
+    .expect("pvput_args(\"On\") timed out")
+    .expect("pvput_args(\"On\") failed — the in-PUT GetOPut snapshot must deliver choices");
+
+    assert_eq!(
+        *src.index.lock(),
+        1,
+        "enum label \"On\" must resolve to index 1 via the get-first snapshot's choices"
+    );
+    assert!(
+        src.get_calls.load(Ordering::SeqCst) >= 1,
+        "the server must have served a get-first snapshot for the label resolution"
+    );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}

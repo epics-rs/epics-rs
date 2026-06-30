@@ -462,10 +462,17 @@ impl InterruptManager {
     /// A polling driver (e.g. Modbus `readPoller`) uses this to skip the cost of
     /// decoding+firing an interface that no record is bound to — mirroring C,
     /// where an empty interrupt list means the per-element `readPlcInt32` /
-    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1822-1854). Only the
-    /// coalescing mailbox subscriptions (I/O Intr records) are consulted;
-    /// broadcast subscribers (`subscribe_async`, transport/tests) and sync
-    /// callbacks (averaging) are not record bindings and do not gate a poll.
+    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1822-1854). This gates
+    /// only the expensive whole-block ARRAY decode, and array interfaces are
+    /// bound exclusively through coalescing mailbox subscriptions — so only
+    /// `mailboxes` are consulted. Sync-callback bindings (averaging /
+    /// time-series) are scalar-only and never bind an array interface, and
+    /// broadcast subscribers (`subscribe_async`, transports/tests) are
+    /// observers, not bindings; neither needs to gate an array decode. (For
+    /// *which offsets to poll at all*, both mailbox and sync-callback bindings
+    /// matter — see [`subscribed_bindings`].)
+    ///
+    /// [`subscribed_bindings`]: Self::subscribed_bindings
     pub fn has_subscriber(&self, reason: usize, addr: i32, iface: InterfaceType) -> bool {
         self.state
             .mailboxes
@@ -474,31 +481,54 @@ impl InterruptManager {
             .any(|s| s.active.load(Ordering::Relaxed) && s.filter.accepts(reason, addr, iface))
     }
 
-    /// The distinct `(reason, addr)` pairs of every active mailbox subscription
-    /// that pins a concrete reason AND address.
+    /// The distinct `(reason, addr)` pairs of every active record binding —
+    /// both coalescing mailbox subscriptions (I/O-Intr records) AND synchronous
+    /// callbacks (averaging / time-series device support) — that pins a
+    /// concrete reason AND address.
     ///
     /// A polling driver (Modbus `readPoller`) drives its fire set directly from
     /// this — exactly C's model, where `readPoller` fires every record on the
     /// interrupt list (populated at `registerInterruptUser`), with no
     /// dependence on whether the record was ever read. The interrupt registry
     /// is the single owner of "which records want a fire"; the driver holds no
-    /// parallel set to keep in sync. A wildcard subscription (reason or addr
-    /// `None`) names no single offset to poll and is skipped — every record
-    /// binding sets both (the asyn device support fills `reason`/`addr` from
-    /// its link), so none are lost. Broadcast and sync-callback subscribers are
-    /// not record bindings and are excluded, matching [`has_subscriber`].
+    /// parallel set to keep in sync.
     ///
-    /// [`has_subscriber`]: Self::has_subscriber
+    /// BOTH subscription kinds are record bindings and must be enumerated: an
+    /// averaging ai (`asynInt32Average`) or a time-series waveform registers
+    /// only a [`register_sync_callback`], no mailbox, so a mailbox-only set
+    /// would never poll it and the record would silently get zero samples.
+    /// Only the broadcast path (`subscribe_async`, used by transports/tests) is
+    /// excluded — it is an observer, not a record binding. A wildcard
+    /// subscription (reason or addr `None`) names no single offset to poll and
+    /// is skipped; every record binding sets both (the asyn device support
+    /// fills `reason`/`addr` from its link), so none are lost.
+    ///
+    /// [`register_sync_callback`]: Self::register_sync_callback
     pub fn subscribed_bindings(&self) -> Vec<(usize, i32)> {
+        let concrete = |f: &InterruptFilter| match (f.reason, f.addr) {
+            (Some(r), Some(a)) => Some((r, a)),
+            _ => None,
+        };
+        // Snapshot each list's concrete bindings under its own lock, then dedup
+        // outside the locks (a callback never re-enters these).
+        let mailbox_pairs: Vec<(usize, i32)> = {
+            let g = self.state.mailboxes.lock();
+            g.iter()
+                .filter(|s| s.active.load(Ordering::Relaxed))
+                .filter_map(|s| concrete(&s.filter))
+                .collect()
+        };
+        let sync_pairs: Vec<(usize, i32)> = {
+            let g = self.state.sync_callbacks.lock();
+            g.iter()
+                .filter(|c| c.active.load(Ordering::Relaxed))
+                .filter_map(|c| concrete(&c.filter))
+                .collect()
+        };
         let mut out: Vec<(usize, i32)> = Vec::new();
-        for s in self.state.mailboxes.lock().iter() {
-            if !s.active.load(Ordering::Relaxed) {
-                continue;
-            }
-            if let (Some(reason), Some(addr)) = (s.filter.reason, s.filter.addr) {
-                if !out.contains(&(reason, addr)) {
-                    out.push((reason, addr));
-                }
+        for p in mailbox_pairs.into_iter().chain(sync_pairs) {
+            if !out.contains(&p) {
+                out.push(p);
             }
         }
         out
@@ -1013,6 +1043,41 @@ mod tests {
             reason: Some(9),
             ..Default::default()
         });
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+
+        // Sync-callback bindings (averaging / time-series) MUST be enumerated
+        // too — they are record bindings, not observers. A sync callback at a
+        // fresh (reason, addr) adds a binding; one co-located with a mailbox
+        // binding dedups.
+        let sc_new = im.register_sync_callback(
+            InterruptFilter {
+                reason: Some(3),
+                addr: Some(1),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let sc_dup = im.register_sync_callback(
+            InterruptFilter {
+                reason: Some(2),
+                addr: Some(8),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8), (3, 1)]);
+
+        // Dropping the sync callback removes its binding; the co-located one
+        // leaves (2, 8) alive via the surviving mailbox subscription.
+        drop(sc_new);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+        drop(sc_dup);
         let mut got = im.subscribed_bindings();
         got.sort();
         assert_eq!(got, vec![(2, 7), (2, 8)]);

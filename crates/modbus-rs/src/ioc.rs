@@ -243,6 +243,13 @@ pub struct ModbusPortDriver {
     /// Wakes the poller when POLL_DELAY changes so the new period takes effect
     /// immediately, not after the current sleep (C `readPollerEventId_`).
     poll_wake: Arc<Notify>,
+    /// Previous poll's register block — the baseline for the on-change gate
+    /// (C `prevData`, drvModbusAsyn.cpp:1612/1934). Empty until the first poll.
+    prev_data: Vec<u16>,
+    /// Force the next successful poll's on-change callbacks regardless of
+    /// whether the data changed (C `forceCallback_`, :331/1654). Set for the
+    /// first cycle and after an I/O error; cleared at each cycle end (:1928).
+    force_callback: bool,
 }
 
 impl ModbusPortDriver {
@@ -343,6 +350,11 @@ impl ModbusPortDriver {
             poll_delay_reason,
             poll_delay: Arc::new(AtomicU64::new(poll_delay_ms)),
             poll_wake: Arc::new(Notify::new()),
+            prev_data: Vec::new(),
+            // C sets forceCallback_ = true when the read-poller thread is
+            // created (drvModbusAsyn.cpp:331), so the first cycle fires every
+            // interface unconditionally.
+            force_callback: true,
         })
     }
 
@@ -442,7 +454,25 @@ impl ModbusPortDriver {
         if !self.engine.config().function.is_read() {
             return Ok(());
         }
-        self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
+        if let Err(e) = self.engine.poll(self.transport.as_mut()) {
+            // C forces the next cycle's callbacks on an I/O-status transition
+            // (drvModbusAsyn.cpp:1654). The Rust poller aborts this cycle on a
+            // read error (it fires no stale data), so the faithful equivalent
+            // is to force the next successful cycle.
+            self.force_callback = true;
+            return Err(to_asyn(e));
+        }
+
+        // On-change gate, mirroring C `readPoller`. int32/int64/float64 and
+        // float64Array fire every cycle (ADC averaging, drvModbusAsyn.cpp:
+        // 1714/1858); uInt32Digital (:1700, per-offset masked change),
+        // int32Array (:1824) and octet (:1893) fire only on `forceCallback_ ||
+        // anyChanged`. `anyChanged` is the port-wide block compare (memcmp
+        // data_ vs prevData, :1658); `force` covers the first cycle and
+        // post-I/O-error recovery (:331/1654).
+        let force = self.force_callback;
+        let any_changed = self.prev_data.as_slice() != self.engine.data();
+        let port_gate = force || any_changed;
 
         // Fire every record on the interrupt list, exactly like C `readPoller`
         // (drvModbusAsyn.cpp:1600-1928), which walks the per-interface interrupt
@@ -466,19 +496,23 @@ impl ModbusPortDriver {
             }
             let regs = &data[addr as usize..];
             if dt.is_string() {
-                let (bytes, _) =
-                    datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
-                let s = String::from_utf8_lossy(&bytes).into_owned();
-                // C `readPoller` fires only the octet interrupt list for a string
-                // offset (drvModbusAsyn.cpp:1894-1921); asynOctet records are the
-                // sole subscribers, so a single typed fire suffices.
-                self.base.notify_interface_value(
-                    reason,
-                    addr,
-                    InterfaceType::Octet,
-                    ParamValue::Octet(s),
-                    0,
-                );
+                // C gates the octet interrupt list on `forceCallback_ ||
+                // anyChanged` (port-wide change, drvModbusAsyn.cpp:1893) and
+                // skips even the `readPlcString` when nothing changed. asynOctet
+                // records are the sole subscribers for a string offset
+                // (:1894-1921), so a single typed fire suffices.
+                if port_gate {
+                    let (bytes, _) =
+                        datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
+                    let s = String::from_utf8_lossy(&bytes).into_owned();
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::Octet,
+                        ParamValue::Octet(s),
+                        0,
+                    );
+                }
             } else {
                 // C `readPoller` decodes the SAME register block separately per
                 // scalar interface and fires each interface's own interrupt list
@@ -512,22 +546,22 @@ impl ModbusPortDriver {
                 // up front with the scalars so a mid-decode error aborts the poll
                 // before any partial fire.
                 //
-                // int32Array is fired UNCONDITIONALLY here; C gates it on
-                // `forceCallback_ || anyChanged` (:1824). That on-change cadence is
-                // the array sibling of the R57 gap (uInt32Digital/octet, also fired
-                // unconditionally) and closes with the same shared
-                // `prevData`/`anyChanged` primitive. float64Array already matches C
-                // (unconditional, :1857). The fired value is correct either way.
-                let int32_array =
-                    if self
+                // int32Array fires on `forceCallback_ || anyChanged` (port-wide
+                // change, drvModbusAsyn.cpp:1824); float64Array fires every cycle
+                // (ADC averaging, :1857). The `has_subscriber` gate skips the
+                // whole-block decode when no array record is bound, mirroring C
+                // iterating an empty interrupt list (the per-element
+                // `readPlcInt32`/`readPlcFloat` loop never runs).
+                let int32_array = if port_gate
+                    && self
                         .base
                         .interrupts
                         .has_subscriber(reason, addr, InterfaceType::Int32Array)
-                    {
-                        Some(decode_block_int32(dt, regs)?)
-                    } else {
-                        None
-                    };
+                {
+                    Some(decode_block_int32(dt, regs)?)
+                } else {
+                    None
+                };
                 let float64_array = if self.base.interrupts.has_subscriber(
                     reason,
                     addr,
@@ -558,19 +592,29 @@ impl ModbusPortDriver {
                     ParamValue::Float64(f64v),
                     0,
                 );
-                // C fires uInt32Digital on change (`forceCallback_ || newValue !=
-                // prevValue`, drvModbusAsyn.cpp:1700); modbus-rs polls
-                // unconditionally and lets the record's monitor deadband suppress
-                // unchanged posts. `!0` (all bits changed) overlaps any record
-                // `@asynMask` so the mask filter never gates the value out
-                // (asynPortDriver.cpp:720).
-                self.base.notify_interface_value(
-                    reason,
-                    addr,
-                    InterfaceType::UInt32Digital,
-                    ParamValue::UInt32Digital(word),
-                    !0,
-                );
+                // C fires uInt32Digital only on a per-offset masked change
+                // (`forceCallback_ || (newValue & mask != prevValue & mask)`,
+                // drvModbusAsyn.cpp:1695-1707). The asyn interrupt filter applies
+                // the same gate: a subscriber with `@asynMask` M passes iff
+                // `uint32_changed_mask & M != 0` (interrupt.rs `matches`;
+                // asynPortDriver.cpp:720). So pass the actually-changed bits
+                // `word ^ prev_word` as the changed mask — equivalent to C's
+                // per-subscriber `(new ^ prev) & mask` test — and skip the fire
+                // entirely when the offset's word is unchanged. `force` (first
+                // cycle / post-I/O-error) passes `!0` so every subscriber fires
+                // regardless, matching C `forceCallback_`.
+                let prev_word = self.prev_data.get(addr as usize).copied().unwrap_or(0) as u32;
+                let changed_bits = word ^ prev_word;
+                if force || changed_bits != 0 {
+                    let changed_mask = if force { !0 } else { changed_bits };
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::UInt32Digital,
+                        ParamValue::UInt32Digital(word),
+                        changed_mask,
+                    );
+                }
                 if let Some(arr) = int32_array {
                     self.base.notify_interface_value(
                         reason,
@@ -591,6 +635,12 @@ impl ModbusPortDriver {
                 }
             }
         }
+        // Snapshot this block as the baseline for the next on-change comparison
+        // and clear the one-shot force flag (C drvModbusAsyn.cpp:1928/1934).
+        let snapshot: Vec<u16> = self.engine.data().to_vec();
+        self.prev_data = snapshot;
+        self.force_callback = false;
+
         self.publish_stats()?;
         // The statistics/control params are set at asyn addr 0 (their
         // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
@@ -3084,9 +3134,13 @@ mod tests {
                 (Some(InterfaceType::Int64), ParamValue::Int64(v)) => int64 = Some(*v),
                 (Some(InterfaceType::Float64), ParamValue::Float64(v)) => float64 = Some(*v),
                 (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                    // This is the first (forced) cycle, so every bit is marked
+                    // changed (`!0`) and no `@asynMask` gates it out. The
+                    // per-offset masked-change cadence on later cycles is covered
+                    // by `poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change`.
                     assert_eq!(
                         iv.uint32_changed_mask, !0,
-                        "uInt32Digital fire must mark all bits changed so no @asynMask gates it out"
+                        "the forced first cycle marks all bits changed"
                     );
                     uint32 = Some(*v);
                 }
@@ -3217,6 +3271,348 @@ mod tests {
                  (subscriber-presence gate)"
             );
         }
+    }
+
+    /// Drain every buffered interrupt fire for `(reason, addr 0)`, in order.
+    /// The R57 on-change tests inspect which interfaces fired each poll.
+    fn drain_addr0_fires(
+        rx: &mut tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        reason: usize,
+    ) -> Vec<asyn_rs::interrupt::InterruptValue> {
+        let mut out = Vec::new();
+        while let Ok(iv) = rx.try_recv() {
+            if iv.reason == reason && iv.addr == 0 {
+                out.push(iv);
+            }
+        }
+        out
+    }
+
+    fn count_iface(fires: &[asyn_rs::interrupt::InterruptValue], iface: InterfaceType) -> usize {
+        fires.iter().filter(|iv| iv.iface == Some(iface)).count()
+    }
+
+    /// A 4-register ReadHoldingRegisters response PDU for the given words.
+    fn regs_pdu(words: [u16; 4]) -> Vec<u8> {
+        let mut p = vec![0x01u8, 0x03, 0x08];
+        for w in words {
+            p.push((w >> 8) as u8);
+            p.push((w & 0xff) as u8);
+        }
+        p
+    }
+
+    /// R57: a `uInt32Digital` I/O-Intr record fires only on a per-offset masked
+    /// change, mirroring C `readPoller` (drvModbusAsyn.cpp:1695-1707) — not every
+    /// poll. The first cycle forces (changed mask `!0`); an unchanged word is
+    /// suppressed even when a different offset changed (per-offset, not
+    /// port-wide); a changed word fires carrying only the changed bits, so a
+    /// record `@asynMask` that does not overlap them is gated out by the
+    /// interrupt filter.
+    #[test]
+    fn poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_U32D_ONCHANGE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))), // word@0 = 1
+                Ok(tcp_response(2, &regs_pdu([1, 9, 3, 4]))), // word@0 unchanged (only @1 changed)
+                Ok(tcp_response(3, &regs_pdu([5, 9, 3, 4]))), // word@0 1 -> 5 (changed bits 0x0004)
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        // UInt16 reason (rc=1) at addr 0 — the fired word is regs[0]. A mailbox
+        // subscriber enumerates the binding; the broadcast observer sees fires.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
+            fires
+                .iter()
+                .filter_map(|iv| match (iv.iface, &iv.value) {
+                    (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                        Some((*v, iv.uint32_changed_mask))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Poll 1: force -> fires word=1 with all bits marked changed.
+        driver.poll_cycle().expect("poll 1 must succeed");
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut rx, reason)),
+            vec![(1, !0)],
+            "first poll forces the uInt32Digital fire with all bits marked changed"
+        );
+
+        // Poll 2: word@0 unchanged though the block changed (regs[1]) -> no fire.
+        driver.poll_cycle().expect("poll 2 must succeed");
+        assert!(
+            u32d(&drain_addr0_fires(&mut rx, reason)).is_empty(),
+            "an unchanged word must not fire uInt32Digital even when another \
+             offset changed (per-offset gate, not port-wide)"
+        );
+
+        // Poll 3: word@0 1 -> 5, changed bits = 1 ^ 5 = 0x0004 -> fires that mask.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut rx, reason)),
+            vec![(5, 0x0004)],
+            "a changed word fires carrying only the changed bits as the mask"
+        );
+    }
+
+    /// R57: `int32Array` fires only on a port-wide change (C `forceCallback_ ||
+    /// anyChanged`, drvModbusAsyn.cpp:1824), while the int32/int64/float64
+    /// scalars AND `float64Array` fire every poll (ADC-averaging, :1714/1858).
+    /// An unchanged second poll must therefore drop int32Array but keep the
+    /// unconditional fires; a changed third poll fires int32Array again.
+    #[test]
+    fn poll_cycle_int32_array_gated_on_change_scalars_unconditional() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_ARR_ONCHANGE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))),
+                Ok(tcp_response(2, &regs_pdu([1, 2, 3, 4]))), // unchanged
+                Ok(tcp_response(3, &regs_pdu([7, 2, 3, 4]))), // regs[0] changed
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+        let (_si, _ri) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                });
+        let (_sf, _rf) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        // Poll 1 (force): int32Array + float64Array + scalars all fire.
+        driver.poll_cycle().expect("poll 1 must succeed");
+        let f1 = drain_addr0_fires(&mut rx, reason);
+        assert_eq!(
+            count_iface(&f1, InterfaceType::Int32Array),
+            1,
+            "poll 1 int32Array"
+        );
+        assert_eq!(
+            count_iface(&f1, InterfaceType::Float64Array),
+            1,
+            "poll 1 float64Array"
+        );
+        assert_eq!(
+            count_iface(&f1, InterfaceType::Int32),
+            1,
+            "poll 1 int32 scalar"
+        );
+
+        // Poll 2 (unchanged): int32Array gated OFF; float64Array + scalars stay
+        // on; uInt32Digital gated off (word unchanged).
+        driver.poll_cycle().expect("poll 2 must succeed");
+        let f2 = drain_addr0_fires(&mut rx, reason);
+        assert_eq!(
+            count_iface(&f2, InterfaceType::Int32Array),
+            0,
+            "int32Array must NOT fire on an unchanged poll (port-wide change gate)"
+        );
+        assert_eq!(
+            count_iface(&f2, InterfaceType::Float64Array),
+            1,
+            "float64Array fires every poll (unconditional, ADC averaging)"
+        );
+        assert_eq!(
+            count_iface(&f2, InterfaceType::Int32),
+            1,
+            "int32 scalar fires every poll (unconditional)"
+        );
+        assert_eq!(
+            count_iface(&f2, InterfaceType::UInt32Digital),
+            0,
+            "uInt32Digital must NOT fire on an unchanged word"
+        );
+
+        // Poll 3 (regs[0] changed): int32Array fires again.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        let f3 = drain_addr0_fires(&mut rx, reason);
+        assert_eq!(
+            count_iface(&f3, InterfaceType::Int32Array),
+            1,
+            "int32Array fires again once the block changes"
+        );
+    }
+
+    /// R57: an `asynOctet` I/O-Intr record fires only when the port data changes
+    /// (C `forceCallback_ || anyChanged`, drvModbusAsyn.cpp:1893) — not every
+    /// poll. First poll forces; an identical second poll is silent; a changed
+    /// third poll fires.
+    #[test]
+    fn poll_cycle_octet_fires_only_on_change() {
+        // StringHigh: each register's high byte is one ASCII char.
+        let str_pdu = |s: &[u8; 4]| -> Vec<u8> {
+            let mut p = vec![0x01u8, 0x03, 0x08];
+            for &c in s {
+                p.push(c);
+                p.push(0x00);
+            }
+            p
+        };
+        let mut cfg = test_config(0, 4);
+        cfg.data_type = ModbusDataType::StringHigh;
+        let mut driver = ModbusPortDriver::new(
+            "MB_OCTET_ONCHANGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &str_pdu(b"ABCD"))),
+                Ok(tcp_response(2, &str_pdu(b"ABCD"))), // unchanged
+                Ok(tcp_response(3, &str_pdu(b"ABCE"))), // last char changed
+            ])),
+        )
+        .expect("non-absolute string config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Octet),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        driver.poll_cycle().expect("poll 1 must succeed");
+        assert_eq!(
+            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            1,
+            "first poll forces the octet fire"
+        );
+
+        driver.poll_cycle().expect("poll 2 must succeed");
+        assert_eq!(
+            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            0,
+            "an unchanged poll must not fire octet (port-wide change gate)"
+        );
+
+        driver.poll_cycle().expect("poll 3 must succeed");
+        assert_eq!(
+            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            1,
+            "octet fires again once the string changes"
+        );
+    }
+
+    /// R57: an I/O error forces the next successful cycle's on-change callbacks
+    /// even if the data is unchanged, mirroring C's `forceCallback_` on an
+    /// I/O-status transition (drvModbusAsyn.cpp:1654). The Rust poller aborts the
+    /// failed cycle (returns Err, fires nothing), so the recovered cycle must
+    /// re-fire uInt32Digital with `!0` despite the word being identical.
+    #[test]
+    fn poll_cycle_io_error_forces_next_unchanged_cycle() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_FORCE_RECOVER",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))), // poll 1 ok
+                Err(ModbusError::Timeout),                    // poll 2 I/O error
+                Ok(tcp_response(3, &regs_pdu([1, 2, 3, 4]))), // poll 3 ok, UNCHANGED
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        driver.poll_cycle().expect("poll 1 must succeed");
+        let _ = drain_addr0_fires(&mut rx, reason); // discard the forced first fire
+
+        // Poll 2 errors: poll_cycle returns Err and fires nothing.
+        driver
+            .poll_cycle()
+            .expect_err("poll 2 must surface the I/O error");
+        assert_eq!(
+            count_iface(
+                &drain_addr0_fires(&mut rx, reason),
+                InterfaceType::UInt32Digital
+            ),
+            0,
+            "a failed poll fires nothing"
+        );
+
+        // Poll 3: data identical to poll 1, but the error forced a re-fire.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        let f3 = drain_addr0_fires(&mut rx, reason);
+        let u32d: Vec<(u32, u32)> = f3
+            .iter()
+            .filter_map(|iv| match (iv.iface, &iv.value) {
+                (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                    Some((*v, iv.uint32_changed_mask))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            u32d,
+            vec![(1, !0)],
+            "post-I/O-error recovery forces a uInt32Digital re-fire (mask !0) even \
+             though the word is unchanged"
+        );
     }
 
     #[test]

@@ -153,7 +153,11 @@ Three residuals surfaced, dispositioned:
   still dropped bad tokens silently where pvxs `config.cpp:422-423`
   (`required=true`) throws. **Closed in `da4b0be8`** — `server_ignore_addr_list_checked`
   + `ignore_addr_error` surfaced at `start`, mirroring the INTF gate, with
-  env + start-refusal regression tests.
+  env + start-refusal regression tests. A follow-up single-panel re-verify
+  (round `01KWCCT8`) **CONFIRMED all 4 axes**: faithful INTF mirror, routed
+  through the same single resolution source, no live bypass (the only other
+  `ignore_addrs` readers are the dead-API `Config::from_server_env` and the
+  diagnostic-only `cli.rs:313` display), fail-closed.
 - **PVX-82 partial-list leniency** (all-bad gate vs pvxs per-token any-bad
   throw) — accepted; fail-closed, no over-broad bind. Documented on the
   PVX-82 row.

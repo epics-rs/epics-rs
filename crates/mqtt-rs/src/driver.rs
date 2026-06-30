@@ -264,17 +264,19 @@ impl PortDriver for MqttDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.publish_value(user.reason, &DecodedValue::Int32(value))?;
-        self.base.params.set_int32(user.reason, user.addr, value)?;
-        self.base.call_param_callbacks(user.addr)
+        // C parity (MQ51): integerWrite (drvMqtt.cpp:573-598) is publish-only.
+        // drvMqtt runs setAutoInterrupts(false) (drvMqtt.cpp:123) and its write
+        // handlers leave processInterrupts at DEFAULT, so shouldProcessInterrupts
+        // is false (autoparamDriver.cpp:1033-1036,437-442): the base class skips
+        // setParam + callParamCallbacks. The cache + I/O Intr readback come only
+        // from the broker echo (onMessageCb), never from the write itself.
+        self.publish_value(user.reason, &DecodedValue::Int32(value))
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.publish_value(user.reason, &DecodedValue::Float64(value))?;
-        self.base
-            .params
-            .set_float64(user.reason, user.addr, value)?;
-        self.base.call_param_callbacks(user.addr)
+        // C parity (MQ51): floatWrite (drvMqtt.cpp:642-658) is publish-only — see
+        // `write_int32`. No cache commit, no post; readback is broker-echo-only.
+        self.publish_value(user.reason, &DecodedValue::Float64(value))
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -307,16 +309,10 @@ impl PortDriver for MqttDriver {
                 self.publish_value(user.reason, &DecodedValue::String(s))?;
             }
         }
-        // The asyn param library cache is String-bound (ParamSetValue::Octet is
-        // a String), so the readback stores the lossy view truncated at the
-        // first NUL (C setStringParam(val.c_str()), drvMqtt.cpp:299). Byte
-        // fidelity of the *cache* is the MQ38 framework residual; this fixes
-        // only the *wire* bytes.
-        let cached = String::from_utf8_lossy(raw).into_owned();
-        self.base
-            .params
-            .set_string(user.reason, user.addr, cached)?;
-        self.base.call_param_callbacks(user.addr)?;
+        // C parity (MQ51): stringWrite (drvMqtt.cpp:700-733) is publish-only —
+        // setAutoInterrupts(false) means a successful write neither commits the
+        // param cache nor posts; the octet readback comes only from the broker
+        // echo (onMessageCb → setStringParam). See `write_int32`.
         Ok(nbytes)
     }
 
@@ -326,49 +322,37 @@ impl PortDriver for MqttDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        // Unlike the other five write handlers, the digital path mutates the
-        // param cache (set_uint32 below marks the entry *defined*) before it
-        // publishes, so the gate inside publish_value would run too late: a
-        // disconnected write would leave a phantom value behind that defeats the
-        // uninitialized-masked-write guard on the next write. Gate here, before
-        // any side effect, so the invariant "no observable effect precedes the
-        // connection gate" holds on this handler too.
-        self.ensure_connected()?;
-
-        // C parity: MqttDriver::digitalWrite (drvMqtt.cpp:608-622) refuses a
-        // partial-mask digital write until the current full value is known.
-        // It reads getUIntDigitalParam(idx, &cur, 0xFFFFFFFF); if that returns
-        // asynParamUndefined it throws "Masked write attempted on uninitialized
-        // value" and returns asynError, because publishing only the masked bits
-        // would overwrite the unknown bits with an assumed zero. A full-mask
-        // (0xFFFFFFFF) write supplies every bit, so it may proceed with no prior
-        // value. The lower asyn param library otherwise starts an undefined
-        // UInt32Digital from zero (set_uint32), which is exactly what this guard
-        // must prevent for a masked publish.
-        if mask != 0xFFFF_FFFF {
-            // Surfaces ParamUndefined as an error (C asynParamUndefined),
-            // gating the start-from-zero merge below.
-            self.base.params.get_uint32_strict(user.reason, user.addr)?;
-        }
-        // Device write interface: no forced interrupt mask (interrupt_mask = 0).
-        self.base
-            .params
-            .set_uint32(user.reason, user.addr, value, mask, 0)?;
-        let full_val = self
-            .base
-            .params
-            .get_uint32(user.reason, user.addr)
-            .unwrap_or(value & mask);
-        self.publish_value(user.reason, &DecodedValue::UInt32(full_val))?;
-        self.base.call_param_callbacks(user.addr)
+        // C parity (MQ51): MqttDriver::digitalWrite (drvMqtt.cpp:600-639) is
+        // publish-only and merges a partial-mask write against the *current
+        // cached value* — which is populated solely by inbound broker messages,
+        // since a write never commits the cache (setAutoInterrupts(false), see
+        // `write_int32`). It reads getUIntDigitalParam(idx, &cur, 0xFFFFFFFF) and,
+        // if that value was never received (asynParamUndefined), throws "Masked
+        // write attempted on uninitialized value" rather than overwriting the
+        // unknown bits with an assumed zero. A full-mask write supplies every bit,
+        // so it needs no prior value. The merge reads but never writes the cache,
+        // and nothing is posted — the readback is the broker echo. The read
+        // precedes the publish, so (as in C) the uninitialized error surfaces
+        // before the connection gate inside `publish_value`.
+        let full_val = if mask == 0xFFFF_FFFF {
+            value
+        } else {
+            // Surfaces ParamUndefined as an error (C asynParamUndefined); the
+            // merge must not assume zero for the unknown bits.
+            let current = self.base.params.get_uint32_strict(user.reason, user.addr)?;
+            // C: auxVal |= (value & mask); auxVal &= (value | ~mask)
+            //  ≡ (current & ~mask) | (value & mask) (drvMqtt.cpp:620-621).
+            (current & !mask) | (value & mask)
+        };
+        self.publish_value(user.reason, &DecodedValue::UInt32(full_val))
     }
 
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
-        self.publish_value(user.reason, &DecodedValue::Int32Array(data.to_vec()))?;
-        self.base
-            .params
-            .set_int32_array(user.reason, user.addr, data.to_vec())?;
-        self.base.call_param_callbacks(user.addr)
+        // C parity (MQ51): writeArray (autoparamDriver.cpp:1071-1082) posts only
+        // when shouldProcessInterrupts holds, which is false under drvMqtt's
+        // setAutoInterrupts(false); the mqtt array write is publish-only. See
+        // `write_int32`. No cache commit, no post.
+        self.publish_value(user.reason, &DecodedValue::Int32Array(data.to_vec()))
     }
 
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
@@ -379,11 +363,8 @@ impl PortDriver for MqttDriver {
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
-        self.publish_value(user.reason, &DecodedValue::Float64Array(data.to_vec()))?;
-        self.base
-            .params
-            .set_float64_array(user.reason, user.addr, data.to_vec())?;
-        self.base.call_param_callbacks(user.addr)
+        // C parity (MQ51): publish-only — see `write_int32_array`.
+        self.publish_value(user.reason, &DecodedValue::Float64Array(data.to_vec()))
     }
 
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
@@ -443,13 +424,11 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().payload, b"42");
     }
 
-    /// The digital handler commits its param cache before publishing, so the
-    /// connection gate must run at its top — otherwise a disconnected write
-    /// leaves a phantom "defined" value behind that defeats the
-    /// uninitialized-masked-write guard. Prove the cache stays untouched: a
-    /// disconnected full-mask write fails without committing, so a later masked
-    /// write (after reconnect) still hits the uninitialized guard rather than
-    /// merging against a phantom.
+    /// C parity (MQ51): a write never commits the param cache — only an inbound
+    /// broker message does. This is most visible on the digital path's masked
+    /// guard: a disconnected full-mask write fails (and, like every write, would
+    /// not commit even if it succeeded), so a later masked write still hits the
+    /// uninitialized guard rather than merging against a phantom value.
     #[test]
     fn disconnected_digital_write_does_not_commit_cache() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -698,12 +677,13 @@ mod tests {
         );
     }
 
-    /// Once the current value is known (here via a full-mask write, which C
-    /// allows with no prior value), a partial-mask write merges the masked
-    /// bits into it and publishes the composite — matching C's
+    /// Once the current value is known — populated by an inbound broker message,
+    /// the ONLY path that sets the digital cache (C: a write is publish-only,
+    /// setAutoInterrupts(false)) — a partial-mask write merges the masked bits
+    /// into it and publishes the composite, matching C's
     /// auxVal |= (value & mask); auxVal &= (value | ~mask) (drvMqtt.cpp:620-621).
     #[test]
-    fn masked_digital_write_merges_after_current_value_known() {
+    fn masked_digital_write_merges_against_inbound_value() {
         let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
         let reason = driver
             .drv_user_create("FLAT:DIGITAL test/bits", 0)
@@ -711,21 +691,79 @@ mod tests {
             .reason;
         let mut user = AsynUser::new(reason);
 
-        // Full mask supplies every bit → allowed with no prior value.
+        // Simulate the broker echo arriving on the subscribed topic — the inbound
+        // path (onMessageCb → setUIntDigitalParam) is what populates the cache. A
+        // full-mask *write* does not, so the merge below reads this value only.
         driver
-            .write_uint32_digital(&mut user, 0x00f0, 0xffff_ffff)
+            .base
+            .params
+            .set_uint32(reason, 0, 0x00f0, 0xffff_ffff, 0)
             .unwrap();
-        let req = rx.try_recv().unwrap();
-        assert_eq!(req.topic, "test/bits");
-        assert_eq!(req.payload, b"240"); // 0x00f0
 
-        // Partial mask now merges into the known 0x00f0:
+        // Partial mask now merges into the inbound 0x00f0:
         // (0x00f0 & ~0x000f) | (0x0005 & 0x000f) = 0x00f5 = 245.
         driver
             .write_uint32_digital(&mut user, 0x0005, 0x000f)
             .unwrap();
         let req = rx.try_recv().unwrap();
+        assert_eq!(req.topic, "test/bits");
         assert_eq!(req.payload, b"245");
+    }
+
+    /// C parity (MQ51): a *successful* write is publish-only — it does NOT commit
+    /// the param cache (setAutoInterrupts(false) → shouldProcessInterrupts false,
+    /// no setParam/callParamCallbacks; autoparamDriver.cpp:1033-1036,437-442).
+    /// A full-mask write that publishes thus leaves the cache undefined, so a
+    /// following masked write hits the uninitialized guard exactly as in C —
+    /// where under the old optimistic-post behaviour it would have merged.
+    #[test]
+    fn successful_write_does_not_commit_cache() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
+        let reason = driver
+            .drv_user_create("FLAT:DIGITAL test/bits", 0)
+            .unwrap()
+            .reason;
+        let mut user = AsynUser::new(reason);
+
+        // Connected full-mask write: publishes, but must not commit the cache.
+        driver
+            .write_uint32_digital(&mut user, 0x00f0, 0xffff_ffff)
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().payload, b"240");
+
+        // Cache still undefined → the masked merge hits the guard (it would have
+        // merged against 0x00f0 under the old post-on-write behaviour).
+        let masked = driver.write_uint32_digital(&mut user, 0x0005, 0x000f);
+        assert!(
+            matches!(masked, Err(AsynError::ParamUndefined(_))),
+            "a write must not populate the cache; the masked merge must hit the \
+             uninitialized guard, got {masked:?}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// C parity (MQ51): the scalar handlers are publish-only too — a successful
+    /// `write_int32` publishes but leaves the param cache undefined (the readback
+    /// arrives only via the broker echo). Representative of the int32/float64/
+    /// octet/array family, which all drop the write-side commit + post.
+    #[test]
+    fn successful_scalar_write_does_not_commit_cache() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:INT test/int_topic"]);
+        let reason = driver
+            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .unwrap()
+            .reason;
+        let mut user = AsynUser::new(reason);
+
+        driver.write_int32(&mut user, 42).unwrap();
+        assert_eq!(rx.try_recv().unwrap().payload, b"42");
+        assert!(
+            matches!(
+                driver.base.params.get_int32_strict(reason, 0),
+                Err(AsynError::ParamUndefined(_))
+            ),
+            "a successful scalar write must not commit the param cache"
+        );
     }
 
     #[test]

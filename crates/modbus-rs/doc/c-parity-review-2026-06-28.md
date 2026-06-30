@@ -401,6 +401,15 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   real I/O-Intr path); `poll_cycle_fires_per_interface_typed_values` binds a mailbox subscriber;
   `poll_cycle_skips_out_of_range_subscriber_binding_without_panic`. Confirmed by both R56-review opus
   panels (consumer: active-gate false-negative; parity: standalone I/O-Intr array waveform never fires).
+- **Fix part 3 — sync-callback bindings (3ac7db5b):** the fix-verification round caught that
+  `subscribed_bindings()` was mailbox-ONLY. Averaging (`asynInt32Average`/`asynFloat64Average`) and
+  time-series device support register via `register_sync_callback` (the C `registerInterruptUser`
+  analogue) with NO mailbox — the average branch returns before `setup_io_intr`'s mailbox block — so
+  their `(reason, addr)` was missed and modbus `poll_cycle` never fired them (empirical: 0 samples).
+  C `readPoller` fires averaging via its registered interrupt user (`devAsynInt32.c:870-872`,
+  `readPoller:1714/1750/1786`). `subscribed_bindings()` now enumerates BOTH mailbox subscriptions and
+  sync callbacks; only the broadcast `subscribe_async` observer stays excluded. `has_subscriber`
+  stays mailbox-only by design (it gates the array decode; averaging/time-series are scalar-only).
 - **Benign divergence (kept, NOT a C bug to copy):** the block decode tail uses `floor`
   (`while (n+1)*rc <= len`), dropping a trailing partial element; C uses `ceil` and may OOB-read a
   partial register past `modbusLength_`. Rust's floor is strictly safer (no OOB) and differs only on

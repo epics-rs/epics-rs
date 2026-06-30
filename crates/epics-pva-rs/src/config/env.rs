@@ -1084,6 +1084,44 @@ pub fn server_ignore_addr_list_opt() -> Option<Vec<(IpAddr, u16)>> {
         .then(server_ignore_addr_list)
 }
 
+/// PVX-82 (IGNORE sibling of [`server_intf_addr_list_checked`]):
+/// presence-and-validity-aware server blocklist resolver. pvxs parses
+/// `EPICS_PVAS_IGNORE_ADDR_LIST` with `required=true` (`config.cpp:422-423`
+/// → `151-176`, throwing at `172-174`) exactly as it does the INTF list, so
+/// a malformed token aborts server config. Mirror the INTF treatment: a
+/// non-blank list whose tokens **all** fail to resolve is a misconfiguration
+/// — the operator named peers to block but none were understood, so the
+/// blocklist the operator asked for would silently be empty. Fail loudly
+/// instead of dropping every entry.
+///
+/// - `Ok(None)` — unset or whitespace-only ⟹ no blocklist (preserve a
+///   caller-supplied `ignore_addrs`).
+/// - `Ok(Some(entries))` — at least one token resolved.
+/// - `Err(msg)` — non-blank token(s) present but **none** resolved.
+///
+/// Like INTF this is the **all**-bad gate (not pvxs's per-token **any**-bad
+/// throw); the partial-list leniency is the documented shared residual.
+pub fn server_ignore_addr_list_checked() -> Result<Option<Vec<(IpAddr, u16)>>, String> {
+    let Ok(raw) = std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST") else {
+        return Ok(None);
+    };
+    let had_token = expand_dollar_vars(&raw).split_whitespace().next().is_some();
+    if !had_token {
+        return Ok(None);
+    }
+    let entries = server_ignore_addr_list();
+    if entries.is_empty() {
+        Err(format!(
+            "EPICS_PVAS_IGNORE_ADDR_LIST=\"{raw}\" named peer(s) to block but \
+             none resolved; refusing to start with the requested blocklist \
+             silently empty. Fix the ignore list, or unset it to disable peer \
+             filtering."
+        ))
+    } else {
+        Ok(Some(entries))
+    }
+}
+
 pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
     let Ok(raw) = std::env::var("EPICS_PVAS_IGNORE_ADDR_LIST") else {
         return Vec::new();
@@ -2095,6 +2133,48 @@ mod tests {
 
         unsafe {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+        }
+    }
+
+    /// PVX-82 (IGNORE sibling): the blocklist checked-resolver mirrors the
+    /// INTF one — unset/blank ⟹ `Ok(None)`, ≥1 resolved ⟹ `Ok(Some)`, all
+    /// non-blank tokens unresolvable ⟹ `Err` (refuse a silently-empty
+    /// blocklist) rather than dropping every entry.
+    #[test]
+    fn server_ignore_checked_errors_when_all_tokens_unresolvable() {
+        // Unset → Ok(None): caller keeps its own ignore_addrs.
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
+        }
+        assert_eq!(server_ignore_addr_list_checked(), Ok(None));
+
+        // Whitespace-only → Ok(None): no peer named ⟹ no blocklist.
+        unsafe {
+            std::env::set_var("EPICS_PVAS_IGNORE_ADDR_LIST", "   ");
+        }
+        assert_eq!(server_ignore_addr_list_checked(), Ok(None));
+
+        // A resolvable peer (bare IP ⟹ wildcard port 0) → Ok(Some).
+        unsafe {
+            std::env::set_var("EPICS_PVAS_IGNORE_ADDR_LIST", "127.0.0.1");
+        }
+        assert_eq!(
+            server_ignore_addr_list_checked(),
+            Ok(Some(vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)]))
+        );
+
+        // Named peer(s) that all fail to resolve → Err: refuse the empty
+        // blocklist instead of silently dropping the entries.
+        unsafe {
+            std::env::set_var("EPICS_PVAS_IGNORE_ADDR_LIST", "no-such-peer.invalid");
+        }
+        assert!(
+            server_ignore_addr_list_checked().is_err(),
+            "an all-unresolvable IGNORE list must error, not silently empty the blocklist"
+        );
+
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
         }
     }
 

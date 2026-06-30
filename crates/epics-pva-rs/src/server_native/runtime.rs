@@ -164,6 +164,14 @@ pub struct PvaServerConfig {
     /// Public only because the config is built with struct-update syntax
     /// across the crate boundary; it is not a user-facing knob.
     pub intf_addr_error: Option<String>,
+    /// PVX-82 (IGNORE sibling): deferred config error set by
+    /// [`Self::with_env`] when `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s)
+    /// to block that all failed to resolve. `PvaServer::start` refuses to
+    /// start rather than running with a silently-empty blocklist (pvxs
+    /// hard-fails the same config — `config.cpp:172-174`, `required=true`).
+    /// `None` on any programmatically-built config. Public for the same
+    /// struct-update reason as [`Self::intf_addr_error`]; not a user knob.
+    pub ignore_addr_error: Option<String>,
     /// Emit `0xFD` / `0xFE` type-cache markers in INIT and RPC responses
     /// so repeated compound descriptors collapse to a 3-byte reference
     /// (saves 100-500 bytes per repeat for NTScalar / NTTable channels).
@@ -315,6 +323,7 @@ impl Default for PvaServerConfig {
             auto_beacon: true,
             interfaces: Vec::new(),
             intf_addr_error: None,
+            ignore_addr_error: None,
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
@@ -445,8 +454,15 @@ impl PvaServerConfig {
             let scaled = (c * 4.0 / 3.0).max(2.0);
             self.idle_timeout = Duration::from_secs_f64(scaled);
         }
-        if let Some(v) = env::server_ignore_addr_list_opt() {
-            self.ignore_addrs = v;
+        // PVX-82 (IGNORE sibling): same all-unresolvable gate as INTF —
+        // a non-blank IGNORE list that resolves to nothing means the
+        // requested blocklist is silently empty; record it so
+        // `PvaServer::start` refuses rather than running unfiltered. A
+        // blank / unset var leaves a caller-supplied `ignore_addrs` intact.
+        match env::server_ignore_addr_list_checked() {
+            Ok(Some(v)) => self.ignore_addrs = v,
+            Ok(None) => {}
+            Err(msg) => self.ignore_addr_error = Some(msg),
         }
         self
     }
@@ -666,6 +682,13 @@ impl PvaServer {
         // silently listen on every interface instead of the requested
         // restriction (pvxs hard-fails such a config: `config.cpp:172-174`).
         if let Some(msg) = config.intf_addr_error.take() {
+            return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
+        }
+        // PVX-82 (IGNORE sibling): same refusal for an all-unresolvable
+        // blocklist — running with a silently-empty IGNORE list would let
+        // peers the operator meant to block through (pvxs `required=true`
+        // hard-fails this config at `config.cpp:172-174`).
+        if let Some(msg) = config.ignore_addr_error.take() {
             return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
         }
         // The live per-peer registry is created up-front so the
@@ -1818,6 +1841,33 @@ mod tcp_fallback_tests {
             matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
             "an unresolved INTF list must fail server start with the resolution \
              error, not bind 0.0.0.0"
+        );
+    }
+
+    /// PVX-82 (IGNORE sibling): when `with_env` recorded that
+    /// `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s) that all failed to
+    /// resolve, `PvaServer::start` must refuse rather than run with a
+    /// silently-empty blocklist. Same deterministic start-refusal as the
+    /// INTF case (errors before any listener is created).
+    #[test]
+    fn start_refuses_when_ignore_addr_error_recorded() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            ignore_addr_error: Some(
+                "EPICS_PVAS_IGNORE_ADDR_LIST=\"bad.invalid\" named peer(s) to \
+                 block but none resolved"
+                    .to_string(),
+            ),
+            auto_beacon: false,
+            ..Default::default()
+        };
+        let result = PvaServer::start(source, config);
+        assert!(
+            matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
+            "an unresolved IGNORE list must fail server start, not run with an \
+             empty blocklist"
         );
     }
 }

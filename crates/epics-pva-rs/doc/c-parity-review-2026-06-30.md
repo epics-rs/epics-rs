@@ -101,7 +101,7 @@ op-handlers, and beacon/search layout are byte-faithful.
 | PVX-82 | **CLEARED (`03caa4d1` INTF + `da4b0be8` IGNORE)** — Fix (behavior change vs prior Rust, matches pvxs): `server_intf_addr_list_checked` / `server_ignore_addr_list_checked` error when every token in a non-blank server addr-list is unresolvable, recorded as `intf_addr_error` / `ignore_addr_error` and surfaced as a hard `PvaServer::start` failure — closes the silent over-broad wildcard bind (INTF) and the silently-empty blocklist (IGNORE). The finding named both lists; the IGNORE half was closed in the convergence round (`da4b0be8`). Client-path `expand()` wildcard left as-is (DISTINCT — diagnostic, pvxs client parse is `required=false`). **Residual (documented, accepted):** the gate is `all`-bad (fails only when every token is unresolvable), whereas pvxs `required=true` throws on `any` bad token — but the Rust gate is fail-closed (binds/blocks a subset, never a superset/wildcard), so no over-broad exposure. |
 | PVX-42 | **CLEARED (`1941d5e2`)** — Fixed by matching pvxs: default `pipeline_size = 0` so the default monitor is non-pipelined (plain `0x08` INIT, no credit trailer/options/ACKs). Pipelining stays opt-in via `pipeline_size(n)` or a pvRequest `record._options.pipeline`. Regression test pins the non-pipelined default. |
 | PVX-61 | **OPEN (round-2 candidate)** — establish monitor subscription at INIT (pvxs `connectSub`) so INIT→START transitions queue instead of collapse. More involved server change. |
-| PVX-41 | **OPEN (low / round-2)** — enum-by-label PUT via in-PUT `0x40` GetOPut instead of a separate GET op. Functionally equivalent; PUT state-machine change. |
+| PVX-41 | **CLEARED (`345e57bf`)** — Fix: route the get-first put snapshot through the PUT op's own GetOPut phase (`CMD_PUT` subcmd `0x40`, empty body, same ioid) via new `codec.build_put_get`, replacing the separate all-fields `CMD_GET` op. Server `0x40` handler (`tcp.rs`) + client PUT_GET decode (`decode.rs`) already existed. Semantic note (signed off in-line): a snapshot transport failure (send/timeout/malformed) now fails the op rather than falling back, because the snapshot shares the op's frame stream and a late reply would desync the exec await; an error *status* reply stays best-effort. End-to-end interop test added. **Sibling found+fixed (`5429ff78`):** the end-to-end test surfaced a pre-existing latent bug — `enum_choices_from_previous` read `value.choices` only as untyped `ScalarArray`, but the wire decode emits the canonical `ScalarArrayTyped` for `string[]`, so every get-first enum-by-label put (old *and* new path) silently rejected the label. Now accepts both representations. |
 | PVX-1  | **DOCUMENTED (kept) — intentional divergence** — Rust's `Status::decode` rejecting out-of-range status type bytes is a deliberate strictness choice, NOT softened to pvxs's silent `type_t` coercion. Conforming pvxs peers emit only 0–3/`0xFF`, so no interop impact; the strictness rejects malformed peers rather than limping on a coerced failure code. Softening would adopt pvxs's lenient cast — declined per "don't copy C's looser behavior". |
 
 ---
@@ -167,3 +167,37 @@ Three residuals surfaced, dispositioned:
   equivalent (they already fault), and they carry richer site-specific
   diagnostics (`tcp.rs` is its own `PvaError`-returning primitive) that the
   generic `what` message would flatten. No change.
+
+### Round 3 (2026-06-30) — PVX-41 (in-PUT GetOPut) + sibling
+
+- **PVX-41** `345e57bf` — the get-first put snapshot now rides the PUT op's
+  own GetOPut phase (`CMD_PUT` subcmd `0x40`, empty body, same ioid) via new
+  `codec.build_put_get`, replacing the separate all-fields `CMD_GET` op. The
+  server `0x40` handler and the client PUT_GET decode already existed, so
+  this was purely the client *send* side. Semantic note signed off in-line:
+  a snapshot transport failure now fails the op (the snapshot shares the
+  op's frame stream; a late reply would desync the exec await), while an
+  error *status* reply stays best-effort. End-to-end interop test added
+  (`enum_put_by_label_uses_in_put_getoput`).
+- **enum-choices typed-array** `5429ff78` — writing the end-to-end test
+  surfaced a pre-existing latent bug independent of PVX-41:
+  `enum_choices_from_previous` matched `value.choices` only as the untyped
+  `PvField::ScalarArray`, but `decode_pv_field_with_bitset_cached` (used by
+  *both* the old `op_get` snapshot and the new in-PUT GetOPut) emits the
+  canonical `PvField::ScalarArrayTyped` for `string[]`. So every get-first
+  enum write by label silently fell through to the integer fallback and
+  rejected the label — the existing unit fixture masked it by hand-building
+  an untyped array. Fixed to accept both representations; added a unit test
+  using the typed form the wire actually produces. Committed separately
+  (one finding per commit).
+
+Remaining open: **PVX-61** (monitor-sub-at-INIT) — the last open PVA
+finding.
+
+**Pre-existing, out of scope (UNFIXED):** three interop suite tests fail
+on this machine because they require an installed pvxs C++ binary
+(`require_pvxs`): `interop_pvxs::put_cross_impl::interop_put_a_pvxput_writes_into_rust_server`,
+`testconfig_port::pvxs_parse_addr_list_comma_separator`,
+`testdiscover_port::pvxs_discover_emits_for_guid_change_same_server`.
+Confirmed pre-existing (fail identically with the PVX-41 changes stashed);
+none exercise the client PUT path.

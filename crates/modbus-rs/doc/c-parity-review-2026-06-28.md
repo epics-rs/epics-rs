@@ -362,7 +362,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   successful P_Data octet read, mirroring C. Distinct from R31's count semantics. Test
   `read_octet_eom_always_flags_cnt_for_short_string` pins the not-full-buffer case (8f15ba0d).
 
-### R56 — I/O-Intr array waveforms (asynInt32Array/asynFloat64Array) never fired by the poller — CLEARED (514807a1)
+### R56 — I/O-Intr array waveforms (asynInt32Array/asynFloat64Array) never fired by the poller — CLEARED (514807a1 + 9c136c32)
 - **Severity:** DEFECT (an I/O-Intr array waveform never updates) — pre-existing, surfaced by the
   R54 fix review. NOT introduced by R54.
 - **Rust:** `poll_cycle` (`ioc.rs:409`) fires only the scalar interfaces
@@ -380,15 +380,32 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   (rejected) but did not add the array fan-out. Periodic-`SCAN` array reads via `read_int32_array`/
   `read_float64_array` (`ioc.rs:838/889`) are CORRECT and unaffected — only `SCAN="I/O Intr"`
   arrays are dead.
-- **Fix (514807a1):** `poll_cycle` now decodes the whole block per array interface and fires
+- **Fix part 1 (514807a1):** `poll_cycle` decodes the whole block per array interface and fires
   `ParamValue::Int32Array`/`Float64Array` via `notify_interface_value`, reusing the relative-mode
-  decode shape of `read_int32_array` (`decode_block_int32`/`decode_block_float64`). The two caveats
-  resolved: (1) the I/O-Intr array *consumer* path (mailbox → `convert_param_array_to_iface` →
-  `store_read_value`, `adapter.rs:2135`) was already built and exercised by NDPluginStdArrays — this
-  was purely the modbus producer side, no consumer change needed; (2) a subscriber-presence gate
-  (`InterruptManager::has_subscriber`) skips the whole-block decode when no array record is bound,
-  mirroring C iterating an empty interrupt list. Tests: `poll_cycle_fires_array_interfaces_only_when_
-  a_record_is_bound` (fire + gate boundary) and `has_subscriber_reports_presence_per_iface`.
+  decode shape of `read_int32_array` (`decode_block_int32`/`decode_block_float64`). The consumer path
+  (mailbox → `convert_param_array_to_iface` → `store_read_value`, `adapter.rs:2135`) was already built
+  for NDPluginStdArrays — purely the modbus producer side, no consumer change. A subscriber-presence
+  gate (`InterruptManager::has_subscriber`) skips the whole-block decode when no array record is bound.
+- **Fix part 2 — the REAL blocker (9c136c32):** part 1 was INERT on its own. `poll_cycle` iterated
+  `self.active`, a HashSet seeded ONLY by `touch`-on-read in the five scalar read accessors. A
+  `SCAN="I/O Intr"` record never reads on its own (inputs do not auto-readback, `adapter.rs:2904`;
+  templates set no PINI; `setup_io_intr` registers a mailbox but issues no read), so its
+  `(reason, addr)` never entered `active` and the poller fired NOTHING for it — the array fire (part 1)
+  and EVERY scalar I/O-Intr fire alike. This was broader than the array fan-out: scalar I/O-Intr
+  modbus records were dead too. Structural fix — drive the fire set from the interrupt subscriber
+  registry (the single owner of "which records want a fire"), exactly C `readPoller` firing every
+  registered interrupt user. New `InterruptManager::subscribed_bindings()` returns the distinct
+  concrete bindings; `poll_cycle` iterates it; the `active` field + `touch` helper + its five call
+  sites are removed. Tests: `subscribed_bindings_enumerates_distinct_concrete_pairs` (asyn-rs);
+  `poll_cycle_fires_array_interfaces_only_when_a_record_is_bound` now fires with NO prior read (the
+  real I/O-Intr path); `poll_cycle_fires_per_interface_typed_values` binds a mailbox subscriber;
+  `poll_cycle_skips_out_of_range_subscriber_binding_without_panic`. Confirmed by both R56-review opus
+  panels (consumer: active-gate false-negative; parity: standalone I/O-Intr array waveform never fires).
+- **Benign divergence (kept, NOT a C bug to copy):** the block decode tail uses `floor`
+  (`while (n+1)*rc <= len`), dropping a trailing partial element; C uses `ceil` and may OOB-read a
+  partial register past `modbusLength_`. Rust's floor is strictly safer (no OOB) and differs only on
+  a non-`register_count`-aligned block (a malformed config). Per "do not copy C's bugs", the floor
+  stays.
 - **Residual (folded into R57):** `int32Array` is fired UNCONDITIONALLY where C gates it on
   `forceCallback_ || anyChanged` (`:1824`); `float64Array` matches C (unconditional, `:1857`). The
   int32Array on-change cadence is the array sibling of R57 and closes with the same shared
@@ -529,7 +546,12 @@ C-parity) converged:
 Open after Round 3: R34, R52 (asyn-rs contract, sign-off); R56 (array fan-out, sign-off); R57
 (on-change gating incl. octet, CONCERN). R54 CLEARED.
 
-**Post-round:** R56 signed off and CLEARED (`514807a1`) — `poll_cycle` now fires the int32Array/
-float64Array interfaces with a subscriber-presence gate; the consumer path was already built for
-NDPluginStdArrays. int32Array on-change cadence folded into R57. Open: R34, R52 (asyn-rs contract);
-R57 (on-change gating, now incl. int32Array).
+**Post-round:** R56 signed off and CLEARED in two parts. `514807a1` added the int32Array/float64Array
+fire mechanism (with a subscriber-presence gate), but a second R56-review round (2 fresh opus panels,
+2026-06-30) found it INERT: `poll_cycle` gated the fire on the read-seeded `active` set, which a
+`SCAN="I/O Intr"` record never enters (it never reads on its own) — so the array fire, AND every
+scalar I/O-Intr fire, were dead. Structural fix `9c136c32` (user-signed-off): drive the fire set from
+the interrupt subscriber registry (`InterruptManager::subscribed_bindings()`), exactly C `readPoller`;
+the `active`/`touch` primitive is removed. This also closed a broader latent bug — scalar I/O-Intr
+modbus records were dead too. int32Array on-change cadence folded into R57. Open: R34, R52 (asyn-rs
+contract); R57 (on-change gating, now incl. int32Array).

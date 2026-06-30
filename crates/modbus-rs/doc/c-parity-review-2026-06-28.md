@@ -516,6 +516,26 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   transition (`:1654`). Boundary test
   `poll_cycle_mid_loop_decode_error_rearms_force_for_recovery`.
 
+### R59 — remote modbus string record loses the `LEN=N` octet cap over the proxy transport — LATENT (sign-off deferred; no binding path today)
+- **Severity:** CONCERN (latent — manifests only on a not-yet-existing path; no live defect)
+- **Found:** R34/R52 contract-change review round (contract-consumers panel, 2026-06-30).
+- **Rust:** `asyn-rs/src/protocol/convert.rs` `result_to_reply` collapses a `DrvUserCreate` result to
+  `ReplyPayload::Value(ParamValue::Int32(reason))`; `ReplyPayload` (`protocol/reply.rs`) has no field
+  for `DrvUserInfo.max_octet_len`. The command path threads `addr` both ways, but the **result** drops
+  the cap.
+- **C:** n/a — an asyn-rs proxy-transport limitation, not a C divergence. Sibling of R34: the `LEN=N`
+  cap R34 closed for in-process binding is lost if a modbus string record is bound over a **remote**
+  port (`RuntimeClient` / `PortReply`).
+- **Why latent (not a live defect):** in-process record binding uses
+  `PortHandle::drv_user_create_blocking` → `submit_blocking` → the `PortActor` returns the
+  `RequestResult` **directly over the actor channel**, never through `PortReply`/`result_to_reply`. No
+  record binds via the `RuntimeClient`/`PortReply` transport today, so no current bind loses the cap;
+  both opus rounds confirmed every in-process path correct.
+- **Disposition:** sign-off deferred. Closing it needs a `ReplyPayload` field for `max_octet_len` +
+  client-side `DrvUserInfo` reconstruction — added when a remote modbus string record actually exists
+  (adding it now is speculative configurability). Recorded in kodex (`d21cdbc5`). Do NOT add the field
+  speculatively.
+
 ---
 
 ## Intentional-divergence asides (C bugs correctly NOT copied — do not "fix" back)
@@ -687,3 +707,19 @@ pulled on demand), so the Rust-only stats post conflicts with no C ordering. The
 unreachable (the fixed addr-0 stats params cannot error) and over-fire-safe if reached; both panels
 ruled special-casing it out as the dual-owner shape that produced R58. mask==0 decline CONFIRMED
 against asynPortDriver.cpp:720. The new test proves the re-arm (fails under d78b01e0). R58 CLOSED.
+
+**R34 + R52 contract sign-off (rounds `01KWBDMW` + `01KWBEM1`, 2026-06-30) — BOTH CLEARED.** The
+breaking `drv_user_create` contract change (`(&self, drv_info) -> usize` → `(&mut self, drv_info,
+addr) -> DrvUserInfo { reason, max_octet_len }`) was signed off and landed across asyn-rs / modbus-rs
+/ mqtt-rs + the proxy protocol. **R52** (offset rejected at bind, gated on the data-type branch like C
+`drvUserCreate:378-384`) closed by `989505ff`. **R34** (per-record octet `LEN=N` cap) closed across
+all three C `getStringLen` sites — read `34714929`, write + I/O-Intr `e157e8a5`. Round 1 (2 opus
+panels) confirmed R52 OK and found R34 still read-only (write/poller halves open); the completion
+commit closed them and a second parity round (`01KWBEM1`) CONVERGED R34 (all 3 sites capped with the
+correct per-site value — write at the raw LEN, read/poller at `min(SIZV, LEN)` — no copied bug, no new
+wire-divergence). One latent gap surfaced → **R59** (the `max_octet_len` cap is dropped by the proxy
+`result_to_reply`; no record binds over that transport today, sign-off deferred). The dormant
+`connect_addr` override (e633e601) is now superseded by the bind-path fix (left in place, not reverted
+this round). Open after this round: **none on the data/contract path** — R34, R52, R54, R56, R57, R58
+all CLEARED; R59 is latent-deferred. Owed: full `--workspace` clippy/nextest/doctest before push (the
+contract change crosses crates).

@@ -454,14 +454,31 @@ impl ModbusPortDriver {
         if !self.engine.config().function.is_read() {
             return Ok(());
         }
-        if let Err(e) = self.engine.poll(self.transport.as_mut()) {
-            // C forces the next cycle's callbacks on an I/O-status transition
-            // (drvModbusAsyn.cpp:1654). The Rust poller aborts this cycle on a
-            // read error (it fires no stale data), so the faithful equivalent
-            // is to force the next successful cycle.
-            self.force_callback = true;
-            return Err(to_asyn(e));
+        // Single finalizer for the abort => recover invariant. Any error after
+        // the poll begins — the engine read, a mid-loop decode, or the stats
+        // publish — aborts the cycle WITHOUT advancing the on-change baseline, so
+        // the next cycle must be forced (C sets forceCallback_ on an I/O-status
+        // transition, drvModbusAsyn.cpp:1654). `run_poll_cycle` clears
+        // force_callback and advances prev_data only when the cycle fully
+        // completes (C :1928/1934); every Err path re-arms the force here, in one
+        // place, so no mid-loop `?` can leave the baseline frozen with the force
+        // cleared.
+        match self.run_poll_cycle() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.force_callback = true;
+                Err(e)
+            }
         }
+    }
+
+    /// The fallible body of one poll cycle: read the register block, fire every
+    /// bound interface (on-change gated per C `readPoller`), publish statistics,
+    /// and — only on full success — advance the on-change baseline (`prev_data`)
+    /// and clear the one-shot `force_callback`. Any `Err` leaves both untouched
+    /// so [`poll_cycle`](Self::poll_cycle) re-arms recovery.
+    fn run_poll_cycle(&mut self) -> AsynResult<()> {
+        self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
 
         // On-change gate, mirroring C `readPoller`. int32/int64/float64 and
         // float64Array fire every cycle (ADC averaging, drvModbusAsyn.cpp:
@@ -635,12 +652,6 @@ impl ModbusPortDriver {
                 }
             }
         }
-        // Snapshot this block as the baseline for the next on-change comparison
-        // and clear the one-shot force flag (C drvModbusAsyn.cpp:1928/1934).
-        let snapshot: Vec<u16> = self.engine.data().to_vec();
-        self.prev_data = snapshot;
-        self.force_callback = false;
-
         self.publish_stats()?;
         // The statistics/control params are set at asyn addr 0 (their
         // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
@@ -648,6 +659,16 @@ impl ModbusPortDriver {
         // control values, not per-interface data points. Flush addr 0 every
         // cycle so the statistics monitors post.
         self.base.call_param_callbacks(0)?;
+
+        // Cycle fully completed: advance the on-change baseline and clear the
+        // one-shot force flag (C drvModbusAsyn.cpp:1928/1934). This is the LAST
+        // statement, reached only on full success — any earlier `?` (engine
+        // poll, a per-offset decode, or the stats publish) leaves `prev_data`
+        // and `force_callback` untouched, so `poll_cycle` re-arms the force and
+        // the next clean cycle recovers instead of freezing the baseline.
+        let snapshot: Vec<u16> = self.engine.data().to_vec();
+        self.prev_data = snapshot;
+        self.force_callback = false;
         Ok(())
     }
 
@@ -3612,6 +3633,100 @@ mod tests {
             vec![(1, !0)],
             "post-I/O-error recovery forces a uInt32Digital re-fire (mask !0) even \
              though the word is unchanged"
+        );
+    }
+
+    /// R57 finalizer: ANY aborted poll cycle must re-arm `force_callback` so the
+    /// next clean cycle recovers — not only the engine-poll error, but a mid-loop
+    /// decode error too. A subscriber bound at a tail offset whose datatype
+    /// overruns the block (INT32_LE, rc=2, at the last register) aborts the
+    /// per-offset decode `?`; the single finalizer in `poll_cycle` re-arms the
+    /// force, so once the bad binding is gone the next cycle force-fires the
+    /// on-change-gated interfaces even though the data never changed. Without the
+    /// finalizer, `prev_data` would freeze and the gated fire would be lost.
+    #[test]
+    fn poll_cycle_mid_loop_decode_error_rearms_force_for_recovery() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_MIDLOOP_ABORT",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))),
+                Ok(tcp_response(2, &regs_pdu([1, 2, 3, 4]))), // unchanged
+                Ok(tcp_response(3, &regs_pdu([1, 2, 3, 4]))), // unchanged
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let u16_reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let i32_reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+
+        // Good uInt32Digital binding at addr 0 (word = regs[0], always decodable).
+        let (_good, _rg) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(u16_reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
+            fires
+                .iter()
+                .filter_map(|iv| match (iv.iface, &iv.value) {
+                    (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                        Some((*v, iv.uint32_changed_mask))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Poll 1: clean forced first cycle -> uInt32Digital@0 fires (1, !0);
+        // force cleared, prev_data advanced.
+        driver.poll_cycle().expect("poll 1 must succeed");
+        assert_eq!(u32d(&drain_addr0_fires(&mut rx, u16_reason)), vec![(1, !0)]);
+
+        // Bind an INT32_LE (rc=2) subscriber at addr 3: regs[3..] is one word, so
+        // the per-offset read_int32 decode errors and aborts the cycle mid-loop.
+        let (sub_bad, _rb) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(i32_reason),
+                    addr: Some(3),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
+
+        // Poll 2: the tail decode aborts the cycle (returns Err).
+        driver
+            .poll_cycle()
+            .expect_err("a tail-offset decode overrun must abort poll 2");
+        let _ = drain_addr0_fires(&mut rx, u16_reason);
+
+        // Drop the bad binding so poll 3 is clean again.
+        drop(sub_bad);
+
+        // Poll 3: data identical to poll 1, but the aborted poll 2 re-armed the
+        // force, so the on-change-gated uInt32Digital@0 fires anyway.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut rx, u16_reason)),
+            vec![(1, !0)],
+            "a mid-loop decode abort must re-arm force_callback so the next clean \
+             cycle recovers (else prev_data freezes and the gated fire is lost)"
         );
     }
 

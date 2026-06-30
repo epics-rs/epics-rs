@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
@@ -36,12 +36,31 @@ pub struct PublishRequest {
 /// Parameter index for the MQTT connection status.
 pub const PARAM_CONNECTED: &str = "_MQTT_CONNECTED";
 
+/// MQTT topic -> the records (param index + parsed address) bound to it.
+pub(crate) type TopicMap = HashMap<String, Vec<(usize, TopicAddress)>>;
+
+/// Shared, lock-guarded [`TopicMap`]: the driver (single-threaded port actor)
+/// writes it as records bind in `drv_user_create`; the event loop snapshots it
+/// once after iocInit.
+pub(crate) type SharedTopicMap = Arc<Mutex<TopicMap>>;
+
 pub struct MqttDriver {
     base: PortDriverBase,
-    /// drvInfo string -> (param index, address)
+    /// Canonical drvInfo (`TopicAddress::to_drv_info`) -> (param index, address).
+    /// Dedups on-demand `drv_user_create` so two records referencing the same
+    /// address share one parameter (C: `drvUserCreate` -> `createParam` dedups
+    /// by `DeviceAddress::operator==`).
     registry: HashMap<String, (usize, TopicAddress)>,
-    /// MQTT topic -> list of (param index, address)
-    topic_map: HashMap<String, Vec<(usize, TopicAddress)>>,
+    /// Per-topic config supplied before bind for fields the drvInfo grammar
+    /// cannot express (currently only `normalize_on_off`, set by the Z2M
+    /// builders for `/set` controls). Keyed by canonical drvInfo. On-demand
+    /// creation consults this overlay so a record link carrying a bare drvInfo
+    /// still picks up Z2M's write-side normalization. Empty for generic MQTT.
+    overlay: HashMap<String, TopicAddress>,
+    /// MQTT topic -> records bound to it. Shared with the event loop, which
+    /// snapshots it after iocInit. The driver (single-threaded port actor) is
+    /// the sole writer, in `drv_user_create`.
+    topic_map: SharedTopicMap,
     /// param index -> topic address (for O(1) lookup on writes)
     reason_to_addr: Vec<Option<TopicAddress>>,
     /// Channel to send publish requests to the event loop
@@ -61,14 +80,21 @@ pub struct MqttDriver {
 }
 
 impl MqttDriver {
-    /// Create a new MQTT driver with pre-declared topic addresses.
+    /// Create a new MQTT driver.
     ///
-    /// All topics must be declared upfront because `drv_user_create(&self)`
-    /// cannot mutate the driver to create new parameters at runtime.
+    /// C parity: `Autoparam::Driver` is born with no topic parameters; each is
+    /// created on demand as a record binds (`drvUserCreate` -> `createParam`).
+    /// This driver mirrors that — only the internal `_MQTT_CONNECTED` param
+    /// exists at construction; topic params are created in `drv_user_create`.
+    ///
+    /// `overlay_topics` carries pre-bind per-topic configuration the drvInfo
+    /// grammar cannot express (the Z2M builders' `normalize_on_off`). These are
+    /// **not** created here; they are stored as an overlay that on-demand
+    /// creation consults. Generic MQTT passes an empty vector.
     pub fn new(
         port_name: &str,
         config: &MqttConfig,
-        topics: Vec<TopicAddress>,
+        overlay_topics: Vec<TopicAddress>,
         publish_tx: mpsc::UnboundedSender<PublishRequest>,
         connected: Arc<AtomicBool>,
     ) -> Self {
@@ -82,9 +108,6 @@ impl MqttDriver {
             ..PortFlags::default()
         };
         let mut base = PortDriverBase::new(port_name, 1, flags);
-        let mut registry = HashMap::new();
-        let mut topic_map: HashMap<String, Vec<(usize, TopicAddress)>> = HashMap::new();
-        let mut reason_to_addr = Vec::new();
 
         // Create connection status param (0=disconnected, 1=connected)
         let connected_param = base
@@ -92,31 +115,17 @@ impl MqttDriver {
             .expect("failed to create connected param");
         base.set_int32_param(connected_param, 0, 0).unwrap();
 
-        for addr in topics {
-            let drv_info = addr.to_drv_info();
-            let param_type = addr.param_type();
-            let idx = base
-                .create_param(&drv_info, param_type)
-                .expect("failed to create param");
-
-            // Grow reason_to_addr to accommodate this index
-            if reason_to_addr.len() <= idx {
-                reason_to_addr.resize_with(idx + 1, || None);
-            }
-            reason_to_addr[idx] = Some(addr.clone());
-
-            topic_map
-                .entry(addr.topic.clone())
-                .or_default()
-                .push((idx, addr.clone()));
-            registry.insert(drv_info, (idx, addr));
-        }
+        let overlay = overlay_topics
+            .into_iter()
+            .map(|addr| (addr.to_drv_info(), addr))
+            .collect();
 
         Self {
             base,
-            registry,
-            topic_map,
-            reason_to_addr,
+            registry: HashMap::new(),
+            overlay,
+            topic_map: Arc::new(Mutex::new(HashMap::new())),
+            reason_to_addr: Vec::new(),
             publish_tx,
             default_qos: config.qos,
             connected_param,
@@ -124,14 +133,16 @@ impl MqttDriver {
         }
     }
 
-    /// Get the set of MQTT topics this driver subscribes to.
+    /// Get the set of MQTT topics created so far (those a record has bound).
     pub fn subscribed_topics(&self) -> Vec<String> {
-        self.topic_map.keys().cloned().collect()
+        self.topic_map.lock().unwrap().keys().cloned().collect()
     }
 
-    /// Get a clone of the topic map for the event loop.
-    pub fn topic_map(&self) -> &HashMap<String, Vec<(usize, TopicAddress)>> {
-        &self.topic_map
+    /// A handle to the shared topic map for the event loop, which snapshots it
+    /// after iocInit (every record has bound by then; records are never created
+    /// at runtime in EPICS, so the map is final).
+    pub fn topic_map(&self) -> SharedTopicMap {
+        Arc::clone(&self.topic_map)
     }
 
     /// Gate every write while the broker is down.
@@ -206,17 +217,50 @@ impl PortDriver for MqttDriver {
     }
 
     fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
-        // Check topic registry first, then fall back to param name lookup
-        // (for internal params like _MQTT_CONNECTED)
-        if let Some((idx, _)) = self.registry.get(drv_info) {
+        // C parity: `Autoparam::Driver::drvUserCreate` parses the reason into a
+        // device address and creates the parameter on demand, reusing the
+        // existing one for an equal address (`createParam` dedup by
+        // `DeviceAddress::operator==`). A reason that is not a topic address
+        // (e.g. the internal `_MQTT_CONNECTED` param) falls through to a plain
+        // parameter-name lookup.
+        let parsed = match TopicAddress::parse(drv_info) {
+            Ok(addr) => addr,
+            Err(_) => {
+                let reason = self
+                    .base()
+                    .params
+                    .find_param(drv_info)
+                    .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+                return Ok(DrvUserInfo::from_reason(reason));
+            }
+        };
+
+        // Canonical form is the parameter key and the dedup identity.
+        let canonical = parsed.to_drv_info();
+        if let Some((idx, _)) = self.registry.get(&canonical) {
             return Ok(DrvUserInfo::from_reason(*idx));
         }
-        let reason = self
-            .base()
-            .params
-            .find_param(drv_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
-        Ok(DrvUserInfo::from_reason(reason))
+
+        // An overlay entry (Z2M `normalize_on_off`) supersedes the parsed
+        // address; otherwise the parsed address is used verbatim.
+        let addr = self.overlay.get(&canonical).cloned().unwrap_or(parsed);
+        let param_type = addr.param_type();
+        let idx = self.base_mut().create_param(&canonical, param_type)?;
+
+        if self.reason_to_addr.len() <= idx {
+            self.reason_to_addr.resize_with(idx + 1, || None);
+        }
+        self.reason_to_addr[idx] = Some(addr.clone());
+
+        self.topic_map
+            .lock()
+            .unwrap()
+            .entry(addr.topic.clone())
+            .or_default()
+            .push((idx, addr.clone()));
+        self.registry.insert(canonical, (idx, addr));
+
+        Ok(DrvUserInfo::from_reason(idx))
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -357,15 +401,16 @@ mod tests {
     fn make_driver(topics: &[&str]) -> (MqttDriver, mpsc::UnboundedReceiver<PublishRequest>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let config = MqttConfig::default();
-        let addrs: Vec<TopicAddress> = topics
-            .iter()
-            .map(|s| TopicAddress::parse(s).unwrap())
-            .collect();
         // These tests exercise the publish path, so start connected; the event
         // loop owns this flag at runtime. The disconnected gate is covered by
         // `write_while_disconnected_fails_and_does_not_publish`.
         let connected = Arc::new(AtomicBool::new(true));
-        let driver = MqttDriver::new("TEST", &config, addrs, tx, connected);
+        // Born-empty (no overlay); bind each topic on demand exactly as a record
+        // would (`drv_user_create`).
+        let mut driver = MqttDriver::new("TEST", &config, Vec::new(), tx, connected);
+        for t in topics {
+            driver.drv_user_create(t, 0).expect("on-demand create");
+        }
         (driver, rx)
     }
 
@@ -378,8 +423,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let config = MqttConfig::default();
         let connected = Arc::new(AtomicBool::new(false));
-        let addrs = vec![TopicAddress::parse("FLAT:INT test/int_topic").unwrap()];
-        let mut driver = MqttDriver::new("TEST", &config, addrs, tx, connected.clone());
+        let mut driver = MqttDriver::new("TEST", &config, Vec::new(), tx, connected.clone());
         let reason = driver
             .drv_user_create("FLAT:INT test/int_topic", 0)
             .unwrap()
@@ -411,8 +455,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let config = MqttConfig::default();
         let connected = Arc::new(AtomicBool::new(false));
-        let addrs = vec![TopicAddress::parse("FLAT:DIGITAL test/digital_topic").unwrap()];
-        let mut driver = MqttDriver::new("TEST", &config, addrs, tx, connected.clone());
+        let mut driver = MqttDriver::new("TEST", &config, Vec::new(), tx, connected.clone());
         let reason = driver
             .drv_user_create("FLAT:DIGITAL test/digital_topic", 0)
             .unwrap()
@@ -455,30 +498,75 @@ mod tests {
     }
 
     #[test]
-    fn drv_user_create_finds_registered_topics() {
-        let (mut driver, _rx) = make_driver(&[
-            "FLAT:INT test/int_topic",
-            "FLAT:FLOAT test/float_topic",
-            "JSON:FLOAT sensors/data humidity",
-        ]);
+    fn drv_user_create_dedups_repeated_binds() {
+        // C parity: two records referencing the same address share one parameter
+        // (`createParam` dedup by `DeviceAddress::operator==`). Re-binding the
+        // same drvInfo returns the same reason; a different address gets its own.
+        let (mut driver, _rx) = make_driver(&[]);
+        let a1 = driver
+            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .unwrap()
+            .reason;
+        let a2 = driver
+            .drv_user_create("FLAT:INT test/int_topic", 0)
+            .unwrap()
+            .reason;
+        assert_eq!(a1, a2, "same address must reuse the same parameter");
 
-        assert!(driver.drv_user_create("FLAT:INT test/int_topic", 0).is_ok());
-        assert!(
-            driver
-                .drv_user_create("FLAT:FLOAT test/float_topic", 0)
-                .is_ok()
-        );
-        assert!(
-            driver
-                .drv_user_create("JSON:FLOAT sensors/data humidity", 0)
-                .is_ok()
-        );
+        let b = driver
+            .drv_user_create("FLAT:FLOAT test/float_topic", 0)
+            .unwrap()
+            .reason;
+        assert_ne!(a1, b, "a distinct address gets its own parameter");
     }
 
     #[test]
-    fn drv_user_create_rejects_unknown() {
-        let (mut driver, _rx) = make_driver(&["FLAT:INT test/topic"]);
-        assert!(driver.drv_user_create("FLAT:FLOAT other/topic", 0).is_err());
+    fn drv_user_create_creates_on_demand_and_rejects_invalid() {
+        // Born-empty driver: a valid topic never pre-registered is created on
+        // demand when a record binds (C: `Autoparam::Driver` lazy `createParam`).
+        let (mut driver, _rx) = make_driver(&[]);
+        assert!(driver.drv_user_create("FLAT:FLOAT other/topic", 0).is_ok());
+        // A drvInfo that is neither a valid topic address nor an internal param
+        // name is rejected.
+        assert!(driver.drv_user_create("not a topic address", 0).is_err());
+    }
+
+    #[test]
+    fn on_demand_create_applies_overlay_config() {
+        // A Z2M `/set` control pre-registers `normalize_on_off` through the
+        // overlay; the record link carries only the bare drvInfo (the grammar
+        // cannot express the flag), so on-demand creation must recover it from
+        // the overlay rather than from the parsed address.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = MqttConfig::default();
+        let connected = Arc::new(AtomicBool::new(true));
+        let mut overlaid = TopicAddress::parse("JSON:STRING zigbee/x state").unwrap();
+        overlaid.normalize_on_off = true;
+        let mut driver = MqttDriver::new("TEST", &config, vec![overlaid], tx, connected);
+
+        let on_demand = driver
+            .drv_user_create("JSON:STRING zigbee/x state", 0)
+            .unwrap()
+            .reason;
+        assert!(
+            driver.reason_to_addr[on_demand]
+                .as_ref()
+                .unwrap()
+                .normalize_on_off,
+            "on-demand create must apply the overlay's normalize_on_off flag"
+        );
+
+        // A topic with no overlay entry uses the parsed address verbatim.
+        let plain = driver
+            .drv_user_create("JSON:STRING zigbee/y state", 0)
+            .unwrap()
+            .reason;
+        assert!(
+            !driver.reason_to_addr[plain]
+                .as_ref()
+                .unwrap()
+                .normalize_on_off
+        );
     }
 
     #[test]
@@ -648,7 +736,9 @@ mod tests {
             "FLAT:STRING test/other",
         ]);
 
-        assert_eq!(driver.topic_map()["test/shared"].len(), 2);
-        assert_eq!(driver.topic_map()["test/other"].len(), 1);
+        let topic_map = driver.topic_map();
+        let topic_map = topic_map.lock().unwrap();
+        assert_eq!(topic_map["test/shared"].len(), 2);
+        assert_eq!(topic_map["test/other"].len(), 1);
     }
 }

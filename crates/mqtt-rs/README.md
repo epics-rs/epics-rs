@@ -70,15 +70,12 @@ record(ai, "$(P)Humidity") {
 ### Startup Script
 
 ```bash
-# Register topics
-mqttAddTopic("MQTT1", "FLAT:FLOAT sensors/temperature")
-mqttAddTopic("MQTT1", "FLAT:FLOAT actuators/setpoint")
-mqttAddTopic("MQTT1", "JSON:FLOAT sensors/environment humidity")
-
-# Create driver with optional connection status PV
+# Create driver with optional connection status PV.
+# No topics are pre-declared: each record creates its topic on demand when it
+# binds during iocInit (C parity with Autoparam::Driver).
 mqttDriverConfigure("MQTT1", "mqtt://localhost:1883", "epics-client", 1, "TEST:MQTT:Connected")
 
-# Load records
+# Load records — their INP/OUT links carry the topic addresses
 dbLoadRecords("db/mqtt.db", "P=TEST:,PORT=MQTT1")
 
 iocInit()
@@ -153,7 +150,6 @@ app = register_z2m_commands(app);  // adds mqttZ2m* commands
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `mqttAddTopic` | `portName drvInfo` | Register a topic before driver creation |
 | `mqttDriverConfigure` | `portName brokerUrl clientId [qos] [connPvName]` | Create driver, connect to broker |
 
 ### Z2M Builders

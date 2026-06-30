@@ -11,8 +11,15 @@ use crate::config::{MqttConfig, QoS};
 use crate::driver::MqttDriver;
 use crate::event_loop::mqtt_event_loop;
 
-/// Global pending topic registry.
-/// Topics are registered via `mqttAddTopic` before `mqttDriverConfigure` creates the driver.
+/// Per-port pre-bind config overlay.
+///
+/// The driver creates topic params on demand as records bind (C parity:
+/// `Autoparam::Driver` lazy `createParam`), so topics are NOT pre-declared.
+/// This registry only carries per-topic configuration the drvInfo grammar
+/// cannot express — currently the Z2M builders' `normalize_on_off` — which
+/// `mqttDriverConfigure` hands to the driver as an overlay consulted during
+/// on-demand creation. Populated by [`register_pending_topic`] (the Z2M
+/// builders), drained once by [`take_pending_topics`] at driver creation.
 static PENDING_TOPICS: Mutex<Option<HashMap<String, Vec<TopicAddress>>>> = Mutex::new(None);
 
 /// Global storage for port runtime handles.
@@ -39,51 +46,14 @@ fn take_pending_topics(port_name: &str) -> Vec<TopicAddress> {
         .unwrap_or_default()
 }
 
-/// Create the `mqttAddTopic` command definition.
-///
-/// Usage: `mqttAddTopic portName "FLAT:INT test/temperature"`
-pub fn mqtt_add_topic_command() -> CommandDef {
-    CommandDef::new(
-        "mqttAddTopic",
-        vec![
-            ArgDesc {
-                name: "portName",
-                arg_type: ArgType::String,
-                optional: false,
-            },
-            ArgDesc {
-                name: "drvInfo",
-                arg_type: ArgType::String,
-                optional: false,
-            },
-        ],
-        "mqttAddTopic portName drvInfo - Register an MQTT topic before driver creation",
-        |args: &[ArgValue], _ctx: &CommandContext| -> CommandResult {
-            let port_name = match &args[0] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("portName required".into()),
-            };
-            let drv_info = match &args[1] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("drvInfo required".into()),
-            };
-
-            let addr = TopicAddress::parse(&drv_info).map_err(|e| e.to_string())?;
-            println!(
-                "mqttAddTopic: port={port_name} topic={}",
-                addr.to_drv_info()
-            );
-            register_pending_topic(&port_name, addr);
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
 /// Create the `mqttDriverConfigure` command definition.
 ///
 /// Usage: `mqttDriverConfigure portName brokerUrl clientId qos`
 ///
-/// Topics must be registered first via `mqttAddTopic`.
+/// No topics are pre-declared: the driver creates topic params on demand as
+/// records bind (C parity with `Autoparam::Driver`). Records reference a topic
+/// directly through their `INP`/`OUT` `@asyn(port) FORMAT:TYPE topic[ field]`
+/// link.
 pub fn mqtt_driver_configure_command(
     handle: epics_base_rs::runtime::task::RuntimeHandle,
     trace: Arc<TraceManager>,
@@ -170,18 +140,13 @@ impl CommandHandler for MqttConfigHandler {
             ..MqttConfig::default()
         };
 
-        let topics = take_pending_topics(&port_name);
-        if topics.is_empty() {
-            println!("mqttDriverConfigure: WARNING — no topics registered for port '{port_name}'");
-            println!("  Use mqttAddTopic before mqttDriverConfigure");
-        } else {
-            println!(
-                "mqttDriverConfigure: port={port_name} broker={}:{} topics={}",
-                config.broker_host,
-                config.broker_port,
-                topics.len()
-            );
-        }
+        // Pre-bind config overlay (Z2M `normalize_on_off`); empty for generic
+        // MQTT. Topic params themselves are created on demand when records bind.
+        let overlay = take_pending_topics(&port_name);
+        println!(
+            "mqttDriverConfigure: port={port_name} broker={}:{}",
+            config.broker_host, config.broker_port,
+        );
 
         let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel();
         // Shared broker-connection flag: the event loop is the sole writer, the
@@ -189,8 +154,8 @@ impl CommandHandler for MqttConfigHandler {
         // disconnected, mqttClient.cpp:70-72). Starts down until the first
         // ConnAck.
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let driver = MqttDriver::new(&port_name, &config, topics, publish_tx, connected.clone());
-        let topic_map = driver.topic_map().clone();
+        let driver = MqttDriver::new(&port_name, &config, overlay, publish_tx, connected.clone());
+        let topic_map = driver.topic_map();
         let connected_param = driver.connected_param;
 
         let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
@@ -299,8 +264,7 @@ pub fn register_mqtt_commands(
     handle: epics_base_rs::runtime::task::RuntimeHandle,
     trace: Arc<TraceManager>,
 ) -> epics_ca_rs::server::ioc_app::IocApplication {
-    app.register_startup_command(mqtt_add_topic_command())
-        .register_startup_command(mqtt_driver_configure_command(handle, trace))
+    app.register_startup_command(mqtt_driver_configure_command(handle, trace))
 }
 
 #[cfg(test)]

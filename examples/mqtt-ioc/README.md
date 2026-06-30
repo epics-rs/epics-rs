@@ -86,17 +86,15 @@ camonitor TEST:MQTT:LR:Plug:Power TEST:MQTT:BR1:Plug:Power
 
 ## Generic MQTT Example
 
-For non-Z2M topics, use `mqttAddTopic` + `dbLoadRecords` with a `.db` file. See `db/mqtt.db` for examples.
+For non-Z2M topics, load a `.db` file whose record links carry the topic
+addresses. Topics are created on demand as records bind — there is no separate
+registration step. See `db/mqtt.db` for examples.
 
 ```bash
-# Register topics
-mqttAddTopic("MQTT1", "FLAT:FLOAT sensors/temperature")
-mqttAddTopic("MQTT1", "JSON:FLOAT sensors/environment humidity")
-
 # Create driver
 mqttDriverConfigure("MQTT1", "mqtt://localhost:1883", "epics-client", 1)
 
-# Load records from .db file
+# Load records — each INP/OUT link's `FORMAT:TYPE topic` creates its topic
 dbLoadRecords("db/mqtt.db", "P=TEST:,R=MQTT:,PORT=MQTT1")
 
 iocInit()

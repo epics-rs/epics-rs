@@ -174,11 +174,6 @@ impl TopicAddress {
         // C parity: `supportedTopicTypes.find(type)` (drvMqtt.cpp:362-364) is a
         // case-sensitive lookup over the uppercase-only set (drvMqtt.cpp:24-37),
         // so `flat:int` / `Json:Float` are rejected (record device-init fails).
-        // Matching exact case here also removes a Rust-internal inconsistency:
-        // `mqttAddTopic` canonicalises the key to uppercase via `to_drv_info()`,
-        // but `drv_user_create` looks up a record's verbatim drvInfo, so an
-        // accepted lowercase form would store under a key the record can never
-        // find (`ParamNotFound`) after a false "success".
         let format = match fmt_str {
             "FLAT" => PayloadFormat::Flat,
             "JSON" => PayloadFormat::Json,

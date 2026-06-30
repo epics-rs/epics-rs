@@ -8,9 +8,9 @@ use asyn_rs::request::ParamSetValue;
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
 use tokio::sync::{Notify, mpsc};
 
-use crate::address::{TopicAddress, ValueType};
+use crate::address::ValueType;
 use crate::config::MqttConfig;
-use crate::driver::PublishRequest;
+use crate::driver::{PublishRequest, SharedTopicMap, TopicMap};
 use crate::payload::{DecodedValue, decode_payload, octet_cstr};
 
 /// Run the MQTT event loop.
@@ -28,7 +28,7 @@ use crate::payload::{DecodedValue, decode_payload, octet_cstr};
 /// 4. Publishes outgoing messages from EPICS write operations.
 pub async fn mqtt_event_loop(
     config: MqttConfig,
-    topic_map: HashMap<String, Vec<(usize, TopicAddress)>>,
+    topic_map: SharedTopicMap,
     port_handle: PortHandle,
     publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
     connected_param: usize,
@@ -51,10 +51,6 @@ pub async fn mqtt_event_loop(
     // forwarded on a dedicated task, and the main loop only awaits `poll()`.
     tokio::spawn(publish_task(client.clone(), publish_rx));
 
-    // Reverse index reason -> MQTT topic, used on ConnAck to translate the live
-    // interrupt-variable set (asyn reasons) back into the topics to subscribe.
-    let reason_to_topic = reason_topic_index(&topic_map);
-
     // C parity: `drvMqtt` does not connect from its constructor; it registers
     // `setInitHook(initHook)` (drvMqtt.cpp:124) and only calls
     // `mqttClient.connect()` from that hook at `initHookAfterScanInit`
@@ -64,6 +60,15 @@ pub async fn mqtt_event_loop(
     // fires `start`. This guarantees the first ConnAck's subscribe sees the
     // fully-populated interrupt-variable set rather than racing iocInit.
     start.notified().await;
+
+    // Records create their topic params on demand during iocInit
+    // (`drv_user_create`), so the shared topic map is only final once
+    // `AfterScanInit` has fired. EPICS never creates records at runtime, so the
+    // map is now frozen: snapshot it once and read only the local copy below.
+    let topic_map = topic_map.lock().unwrap().clone();
+    // Reverse index reason -> MQTT topic, used on ConnAck to translate the live
+    // interrupt-variable set (asyn reasons) back into the topics to subscribe.
+    let reason_to_topic = reason_topic_index(&topic_map);
 
     // Subscriptions are driven exclusively on ConnAck (covers both the first
     // connect and every reconnect), so no pre-loop subscribe is needed.
@@ -197,9 +202,7 @@ async fn publish_task(
 /// Build the reverse index `reason -> topic` from the topic map. The ConnAck
 /// subscribe uses it to translate the interrupt-variable set (asyn reasons)
 /// back into the MQTT topics to subscribe.
-fn reason_topic_index(
-    topic_map: &HashMap<String, Vec<(usize, TopicAddress)>>,
-) -> HashMap<usize, String> {
+fn reason_topic_index(topic_map: &TopicMap) -> HashMap<usize, String> {
     let mut index = HashMap::new();
     for (topic, subs) in topic_map {
         for (reason, _addr) in subs {
@@ -244,7 +247,7 @@ async fn subscribe_all(client: &AsyncClient, topics: &[String], qos: crate::conf
 async fn handle_incoming_message(
     topic: &str,
     payload: &[u8],
-    topic_map: &HashMap<String, Vec<(usize, TopicAddress)>>,
+    topic_map: &TopicMap,
     port_handle: &PortHandle,
 ) {
     let payload_str = match std::str::from_utf8(payload) {
@@ -368,6 +371,7 @@ impl ValueType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::TopicAddress;
 
     fn addr(topic: &str) -> TopicAddress {
         TopicAddress::parse(&format!("FLAT:INT {topic}")).unwrap()
@@ -375,7 +379,7 @@ mod tests {
 
     #[test]
     fn subscribe_topics_selects_only_interrupt_bound_reasons() {
-        let mut topic_map: HashMap<String, Vec<(usize, TopicAddress)>> = HashMap::new();
+        let mut topic_map: TopicMap = HashMap::new();
         topic_map.insert("a/b".into(), vec![(1, addr("a/b")), (3, addr("a/b"))]);
         topic_map.insert("c/d".into(), vec![(2, addr("c/d"))]);
         let idx = reason_topic_index(&topic_map);
@@ -402,7 +406,7 @@ mod tests {
         // An interrupt binding on a reason that maps to no topic (e.g. the
         // internal _MQTT_CONNECTED param) contributes nothing to the subscribe
         // set rather than panicking or subscribing an empty topic.
-        let topic_map: HashMap<String, Vec<(usize, TopicAddress)>> = HashMap::new();
+        let topic_map: TopicMap = HashMap::new();
         let idx = reason_topic_index(&topic_map);
         assert!(subscribe_topics(&idx, &[(99, 0)]).is_empty());
     }

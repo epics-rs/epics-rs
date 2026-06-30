@@ -477,8 +477,19 @@ checked out 2026-06-30) — the earlier block is lifted:
   and confirmed asyn delivers the user-param with no leading whitespace, so Rust's
   `split_once`-based leading-whitespace rejection is unreachable in practice; logged as a
   latent parse-leniency aside, not a live divergence.
-- **MQ51** (write-side cache-update parity) — still owed a dedicated verification round
-  against the now-present autoparam source; not in scope of the MQ2/MQ47 round.
+- **MQ51 — CLEARED** `ad2d0c22` — write-side cache-update parity. The round-4
+  review read the Autoparam base directly and confirmed C's mqtt write is
+  publish-only: every `*Write` handler returns a default `WriteResult`
+  (`processInterrupts==DEFAULT`, `autoparamHandler.h:293,364`), `setAutoInterrupts(false)`
+  (`drvMqtt.cpp:123`) makes `shouldProcessInterrupts` false (`autoparamDriver.cpp:437-442`),
+  so `writeScalar`/`writeArray` skip `setParamDispatch`+`callParamCallbacks`
+  (`:1026-1038,1070-1082`), and every function has a type-matched handler so the
+  posting `asynPortDriver` fallback is unreachable. Fix made all six Rust
+  `write_*` handlers publish-only (removed the write-side `set_*` +
+  `call_param_callbacks`); the digital partial-mask merge now reads the cache
+  (`get_uint32_strict`) instead of committing through `set_uint32`. The broker
+  echo (`handle_incoming_message`, MQ2) is the sole cache writer + readback
+  source. Round-4 opus review: FAITHFUL, family-complete, no open item.
 
 ---
 
@@ -526,8 +537,29 @@ it only changes the pathological different-type-same-topic case (C aliases to on
 fails the second handler; Rust keeps two correct params), kept as intentional-better per the
 don't-copy-C-bugs steer. Two non-blocking notes: `_MQTT_CONNECTED` is a Rust-only additive PV
 (MQ49, correctly excluded from subscribe); MQ19 leading-whitespace rejection is unreachable
-(asyn delivers no leading whitespace). **MQ51 still owed** a dedicated round against the
-now-present autoparam source.
+(asyn delivers no leading whitespace). **MQ51 owed** a dedicated round against the
+now-present autoparam source (taken up in round 4).
 
 Per-crate `cargo nextest -p mqtt-rs --features ioc` (106 pass) + `clippy -D warnings` green;
+full-workspace pass owed before any push. Nothing pushed.
+
+### Round 4 (2026-06-30) — MQ51 publish-only fix + 1-panel opus convergence
+With the Autoparam base present, took the dedicated MQ51 ruling owed since round 1.
+Verified at source that C's mqtt write is **publish-only**: default `WriteResult`
+(`processInterrupts==DEFAULT`) + `setAutoInterrupts(false)` ⇒ `shouldProcessInterrupts`
+false on every successful write, so the base class never `setParamDispatch`+`callParamCallbacks`;
+all 12 functions have type-matched handlers, so the posting `asynPortDriver` fallback is
+unreachable. Fixed **MQ51** (`ad2d0c22`): all six Rust `write_*` handlers
+(int32/float64/octet/uint32_digital/int32_array/float64_array) made publish-only by removing
+the write-side `set_*` + `call_param_callbacks`; the digital partial-mask merge now reads the
+cache (`get_uint32_strict`, `ParamUndefined` if no prior broker echo) instead of committing
+via `set_uint32`, with the connection gate moved into `publish_value` to match C's
+read-then-publish order. The broker echo (`handle_incoming_message`, MQ2) is the sole cache
+writer + readback source. User signed off the publish-only direction (broker-echo-only readback,
+matching C's intentional pub/sub model). The round-4 opus reviewer, reading `autoparamDriver.cpp`
++ `autoparamHandler.h` directly, returned **CONVERGED**: MQ51 FAITHFUL and family-complete, zero
+open DEFECT/CONCERN; the digital merge is bit-exact; MQ52 (JSON writes) untouched and still
+intentional-better.
+
+Per-crate `cargo nextest -p mqtt-rs --features ioc` (108 pass) + `clippy -D warnings` green;
 full-workspace pass owed before any push. Nothing pushed.

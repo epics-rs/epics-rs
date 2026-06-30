@@ -422,12 +422,12 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   partial register past `modbusLength_`. Rust's floor is strictly safer (no OOB) and differs only on
   a non-`register_count`-aligned block (a malformed config). Per "do not copy C's bugs", the floor
   stays.
-- **Residual (folded into R57):** `int32Array` is fired UNCONDITIONALLY where C gates it on
-  `forceCallback_ || anyChanged` (`:1824`); `float64Array` matches C (unconditional, `:1857`). The
-  int32Array on-change cadence is the array sibling of R57 and closes with the same shared
-  `prevData`/`anyChanged` primitive — the fired value is correct either way.
+- **Residual (folded into R57, now CLEARED d78b01e0):** `int32Array` was fired UNCONDITIONALLY where C
+  gates it on `forceCallback_ || anyChanged` (`:1824`); `float64Array` matches C (unconditional,
+  `:1857`). The int32Array on-change cadence was the array sibling of R57 and closed with the same
+  shared `prev_data`/`any_changed` primitive — see R57.
 
-### R57 — on-change I/O-Intr fires (uInt32Digital + octet) sent unconditionally vs C's change gate — OPEN (CONCERN, documented)
+### R57 — on-change I/O-Intr fires (uInt32Digital + octet + int32Array) sent unconditionally vs C's change gate — CLEARED (d78b01e0)
 - **Severity:** CONCERN (extra record processing; no wrong value, identical wire-visible monitor
   output).
 - **Rust:** `poll_cycle` (`ioc.rs:489-501` uInt32Digital; `ioc.rs:441-447` octet) fires both
@@ -448,11 +448,18 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   processes every poll in Rust vs only-on-change in C. CA monitor posts are identical (the record's
   deadband suppresses unchanged VAL); the divergence is extra record processing each poll (forward
   links / .PROC side effects fire every poll). Never a wrong value.
-- **Fix (shared primitive):** a single `prevData`/`anyChanged` primitive in `poll_cycle` — track the
-  previous register block, compute port-wide `anyChanged` plus per-offset prev-value comparison —
-  gates uInt32Digital (`:1700` per-offset), octet (`:1893` port-wide), AND int32Array (`:1824`
-  port-wide, the on-change half of R56) in one place, mirroring C `readPoller`. Currently documented
-  in the `ioc.rs` poll_cycle comment only.
+- **Fix (shared primitive, d78b01e0):** `poll_cycle` now holds a `prev_data` register-block snapshot
+  and a one-shot `force_callback` flag (set for the first cycle per C `:331` and after an I/O error
+  per C `:1654`; cleared each cycle end per C `:1928`). `any_changed` is the port-wide block compare
+  (`:1658`); `port_gate = force || any_changed` gates octet (`:1893`) and int32Array (`:1824`).
+  int32/int64/float64 + float64Array stay unconditional (C ADC-averaging, `:1714/1858`). uInt32Digital
+  closes STRUCTURALLY, not with a coarse gate: the poller passes the actually-changed bits
+  `word ^ prev_word` as `uint32_changed_mask` instead of `!0`, so the interrupt filter's existing mask
+  gate (`uint32_changed_mask & @asynMask != 0`, asynPortDriver.cpp:720) reproduces C's exact
+  per-subscriber `(new ^ prev) & mask` test (`:1700`); `force` still passes `!0`. Boundary tests:
+  `poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change`,
+  `poll_cycle_int32_array_gated_on_change_scalars_unconditional`, `poll_cycle_octet_fires_only_on_change`,
+  `poll_cycle_io_error_forces_next_unchanged_cycle`.
 
 ---
 
@@ -574,5 +581,12 @@ mailbox-ONLY, missing averaging/time-series records (sync-callback bindings, no 
 `readPoller` fires — closed by `3ac7db5b` (enumerate both mailbox and sync-callback bindings). A
 fourth (fix-verification) round CONVERGED R56: both opus panels CONFIRMED-CORRECT with no new
 findings (three registration entry points only, fourth kind impossible by construction, deadlock-free,
-empirical Scenario C fires). int32Array on-change cadence folded into R57. R56 CLOSED. Open: R34, R52
-(asyn-rs contract); R57 (on-change gating, now incl. int32Array).
+empirical Scenario C fires). int32Array on-change cadence folded into R57. R56 CLOSED.
+
+**R57 CLEARED (d78b01e0).** A shared `prev_data`/`force_callback` primitive in `poll_cycle` now gates
+the on-change interfaces exactly as C `readPoller`: octet (`:1893`) and int32Array (`:1824`) port-wide
+on `force || any_changed`; uInt32Digital structurally via `word ^ prev_word` as the changed mask (the
+interrupt filter's mask gate reproduces C's per-subscriber `(new ^ prev) & mask`, `:1700`);
+int32/int64/float64 + float64Array stay unconditional (ADC averaging, `:1714/1858`). `force` covers the
+first cycle (`:331`) and post-I/O-error recovery (`:1654`), cleared each cycle end (`:1928`). Four
+boundary tests. Open: R34, R52 (asyn-rs contract).

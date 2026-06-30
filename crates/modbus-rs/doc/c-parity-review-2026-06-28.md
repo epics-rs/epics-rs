@@ -410,6 +410,13 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   `readPoller:1714/1750/1786`). `subscribed_bindings()` now enumerates BOTH mailbox subscriptions and
   sync callbacks; only the broadcast `subscribe_async` observer stays excluded. `has_subscriber`
   stays mailbox-only by design (it gates the array decode; averaging/time-series are scalar-only).
+  CONVERGED — a fix-verification round (2 fresh opus panels) confirmed: the registry has exactly
+  three registration entry points (`register_interrupt_user`/mailbox, `register_sync_callback`/sync,
+  `subscribe_async`/broadcast), the two private subscriber structs forbid a fourth kind by
+  construction, the snapshot-then-dedup is deadlock-free against `notify` (neither nests the two
+  locks), and the empirical Scenario C now fires (Ci `0→1`, Cf `1`, array path no regression). No new
+  findings; the invariant "`subscribed_bindings()` contains every concrete `(reason,addr)` any
+  record-binding interrupt user wants polled" holds by construction.
 - **Benign divergence (kept, NOT a C bug to copy):** the block decode tail uses `floor`
   (`while (n+1)*rc <= len`), dropping a trailing partial element; C uses `ceil` and may OOB-read a
   partial register past `modbusLength_`. Rust's floor is strictly safer (no OOB) and differs only on
@@ -562,5 +569,10 @@ fire mechanism (with a subscriber-presence gate), but a second R56-review round 
 scalar I/O-Intr fire, were dead. Structural fix `9c136c32` (user-signed-off): drive the fire set from
 the interrupt subscriber registry (`InterruptManager::subscribed_bindings()`), exactly C `readPoller`;
 the `active`/`touch` primitive is removed. This also closed a broader latent bug — scalar I/O-Intr
-modbus records were dead too. int32Array on-change cadence folded into R57. Open: R34, R52 (asyn-rs
-contract); R57 (on-change gating, now incl. int32Array).
+modbus records were dead too. A THIRD R56-review round then found `subscribed_bindings()` was
+mailbox-ONLY, missing averaging/time-series records (sync-callback bindings, no mailbox) that C
+`readPoller` fires — closed by `3ac7db5b` (enumerate both mailbox and sync-callback bindings). A
+fourth (fix-verification) round CONVERGED R56: both opus panels CONFIRMED-CORRECT with no new
+findings (three registration entry points only, fourth kind impossible by construction, deadlock-free,
+empirical Scenario C fires). int32Array on-change cadence folded into R57. R56 CLOSED. Open: R34, R52
+(asyn-rs contract); R57 (on-change gating, now incl. int32Array).

@@ -1255,6 +1255,39 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// Truncate an octet **write** payload to the per-record length cap, mirroring
+    /// C `writeOctet`'s `getStringLen(pasynUser, maxChars)` = `min(maxChars,
+    /// drvUser->len)` (drvModbusAsyn.cpp:1521/1524/1531). The cap is the raw
+    /// per-record LEN (`octet_len_cap`; `None` ⇒ C `len == -1` ⇒ uncapped). SIZV
+    /// does NOT bound writes — C's `maxChars` is the actual data length, not the
+    /// record buffer — so this uses `octet_len_cap`, not `octet_max_size`.
+    fn cap_octet_write(&self, mut data: Vec<u8>) -> Vec<u8> {
+        if let Some(cap) = self.octet_len_cap {
+            data.truncate(cap);
+        }
+        data
+    }
+
+    /// Truncate a delivered octet **read** value to the per-record buffer length,
+    /// mirroring C's I/O-Intr poller `getStringLen(pasynUser, sizeof(stringBuffer))`
+    /// = `min(buffer, drvUser->len)` (drvModbusAsyn.cpp:1914). The polled read caps
+    /// at the driver via `buf_size`, but the I/O-Intr ring fires the driver's full
+    /// block (the poller is per-reason, shared by records with different LEN), so the
+    /// cap is applied here, consumer-side, where the per-record `octet_max_size`
+    /// (= min(SIZV, LEN)) lives. asynOctet reads are delivered as `EpicsValue::String`
+    /// (result_to_value / param_value_to_epics_value); only that variant is capped,
+    /// leaving array-interface `CharArray` reads (bounded by `max_array_elements`)
+    /// untouched. Bytes are truncated verbatim — `PvString` is raw bytes, matching the
+    /// polled path's `&d[..n]` slice.
+    fn cap_octet_read_value(&self, val: EpicsValue) -> EpicsValue {
+        match val {
+            EpicsValue::String(s) if s.len() > self.octet_max_size => EpicsValue::String(
+                epics_base_rs::types::PvString::from_bytes(&s.as_bytes()[..self.octet_max_size]),
+            ),
+            other => other,
+        }
+    }
+
     /// Build a `RequestOp` for writing an `EpicsValue` for the current interface type.
     /// asynOctetWriteBinary: build the write op for exactly NORD bytes, INCLUDING
     /// any interior NUL. C `callbackWfWriteBinary` (devAsynOctet.c:1086-1091) does
@@ -1277,7 +1310,7 @@ impl AsynDeviceSupport {
             _ => data.len(),
         };
         Some(RequestOp::OctetWrite {
-            data: data[..nord].to_vec(),
+            data: self.cap_octet_write(data[..nord].to_vec()),
         })
     }
 
@@ -1310,20 +1343,20 @@ impl AsynDeviceSupport {
                 Some(RequestOp::Float64Write { value: *v as f64 })
             }
             ("asynOctet", EpicsValue::String(s)) => Some(RequestOp::OctetWrite {
-                data: s.as_bytes().to_vec(),
+                data: self.cap_octet_write(s.as_bytes().to_vec()),
             }),
             ("asynOctet", EpicsValue::CharArray(data)) => {
                 // Trim trailing nulls (waveform FTVL=CHAR pads to NELM)
                 let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 Some(RequestOp::OctetWrite {
-                    data: data[..len].to_vec(),
+                    data: self.cap_octet_write(data[..len].to_vec()),
                 })
             }
             // Coerce numeric types to octet (e.g. longout writing to NDArrayPort string param)
             ("asynOctet", v) => {
                 let s = format!("{v}");
                 Some(RequestOp::OctetWrite {
-                    data: s.as_bytes().to_vec(),
+                    data: self.cap_octet_write(s.as_bytes().to_vec()),
                 })
             }
             ("asynUInt32Digital", EpicsValue::Long(v)) => Some(RequestOp::UInt32DigitalWrite {
@@ -2159,7 +2192,8 @@ impl DeviceSupport for AsynDeviceSupport {
                     // all six array interfaces, NDPluginStdArrays.cpp:169-197).
                     // Scalar interfaces fall back to the verbatim mapping.
                     let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
-                        .or_else(|| param_value_to_epics_value(&ci.value));
+                        .or_else(|| param_value_to_epics_value(&ci.value))
+                        .map(|v| self.cap_octet_read_value(v));
                     if let Some(val) = val {
                         skip_convert = self.store_read_value(record, val);
                     }
@@ -6910,6 +6944,90 @@ mod tests {
                 assert!(!flush, "CmdResponse must not pre-flush the input buffer");
             }
             other => panic!("expected OctetWriteRead, got {other:?}"),
+        }
+    }
+
+    /// The per-record octet length cap (`octet_len_cap`, the asyn-rs home for C
+    /// `modbusDrvUser_t.len`) truncates the octet WRITE payload,
+    /// mirroring C `writeOctet`'s `getStringLen(maxChars) = min(data_len, len)`
+    /// (drvModbusAsyn.cpp:1521/1524/1531). SIZV / `octet_max_size` does NOT bound
+    /// writes; `None` (C `len == -1`) leaves the payload intact. Covers the text,
+    /// CharArray, and over-long-cap edges.
+    #[test]
+    fn octet_len_cap_truncates_write_payload() {
+        let (handle, _) = spawn_cmd_response_port("octetcap_write", b"");
+        let link = AsynLink {
+            port_name: "octetcap_write".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        // A large read buffer must NOT bound the write (C maxChars is data length).
+        ads.octet_max_size = 256;
+
+        // No cap (C len == -1): full payload written.
+        ads.octet_len_cap = None;
+        match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABCDEFG".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+
+        // LEN=3: write truncated to 3 bytes (C getStringLen min(7,3)=3).
+        ads.octet_len_cap = Some(3);
+        match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABC".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+
+        // CharArray write (waveform FTVL=CHAR) is capped on the same path.
+        match ads.write_op(&EpicsValue::CharArray(b"ABCDEFG".to_vec())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABC".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+
+        // A cap longer than the data is a no-op (min(7,99)=7).
+        ads.octet_len_cap = Some(99);
+        match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABCDEFG".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+    }
+
+    /// A poller-fired octet value (delivered as `EpicsValue::String`) is capped at
+    /// `octet_max_size` (= min(SIZV, LEN)),
+    /// mirroring C's poller `getStringLen(sizeof stringBuffer) = min(buffer, len)`
+    /// (drvModbusAsyn.cpp:1914). The polled read caps at the driver via `buf_size`;
+    /// the I/O-Intr ring fires the full block, so the cap is applied consumer-side.
+    /// Array-interface `CharArray` reads are left untouched.
+    #[test]
+    fn octet_max_size_caps_io_intr_read_value() {
+        let (handle, _) = spawn_cmd_response_port("octetcap_read", b"");
+        let link = AsynLink {
+            port_name: "octetcap_read".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_max_size = 5;
+
+        // Over the cap → truncated to 5 bytes.
+        match ads.cap_octet_read_value(EpicsValue::String("ABCDEFG".into())) {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), b"ABCDE"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        // Under the cap → untouched.
+        match ads.cap_octet_read_value(EpicsValue::String("AB".into())) {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), b"AB"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        // Array-interface CharArray reads are NOT octet-capped (bounded by
+        // max_array_elements elsewhere).
+        let long = vec![1u8; 10];
+        match ads.cap_octet_read_value(EpicsValue::CharArray(long.clone())) {
+            EpicsValue::CharArray(v) => assert_eq!(v, long),
+            other => panic!("expected CharArray, got {other:?}"),
         }
     }
 

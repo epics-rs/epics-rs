@@ -33,7 +33,7 @@
 //! of indexing the polled buffer; `poll_cycle` is a no-op and the periodic
 //! poller is not spawned.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -222,10 +222,6 @@ pub struct ModbusPortDriver {
     /// `reason` index → the data type it represents (`None` for non-data
     /// params such as the statistics counters).
     reason_to_datatype: Vec<Option<ModbusDataType>>,
-    /// `(reason, addr)` pairs touched by a record — discovered on first
-    /// access, then refreshed every poll. Replaces the C `interruptStart`
-    /// client enumeration.
-    active: HashSet<(usize, i32)>,
     /// reason of the `MODBUS_READ` trigger parameter.
     read_reason: usize,
     /// reasons of the statistics parameters.
@@ -334,7 +330,6 @@ impl ModbusPortDriver {
             engine,
             transport,
             reason_to_datatype,
-            active: HashSet::new(),
             read_reason,
             read_ok_reason,
             write_ok_reason,
@@ -362,11 +357,6 @@ impl ModbusPortDriver {
                 status: AsynStatus::Error,
                 message: format!("reason {reason} is not a Modbus data parameter"),
             })
-    }
-
-    /// Register bits of a record on first access so the poller refreshes it.
-    fn touch(&mut self, reason: usize, addr: i32) {
-        self.active.insert((reason, addr));
     }
 
     /// Modbus address for `offset`, relative to the configured start address.
@@ -454,15 +444,22 @@ impl ModbusPortDriver {
         }
         self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
 
-        let active: Vec<(usize, i32)> = self.active.iter().copied().collect();
-        for (reason, addr) in active {
+        // Fire every record on the interrupt list, exactly like C `readPoller`
+        // (drvModbusAsyn.cpp:1600-1928), which walks the per-interface interrupt
+        // lists populated at `registerInterruptUser` — independent of whether
+        // the record was ever read. The interrupt registry is the single owner
+        // of "which records want a fire"; the driver keeps no parallel set
+        // seeded by reads. A read-seeded `active` set left every `SCAN="I/O
+        // Intr"` record dead, since such a record never reads on its own — its
+        // first (and every) value must come from the poller's fire.
+        for (reason, addr) in self.base.interrupts.subscribed_bindings() {
             let Ok(dt) = self.datatype_of(reason) else {
                 continue;
             };
-            // Defense-in-depth: an out-of-range `addr` must never index the
-            // engine buffer. Accessors check the offset before `touch`, so
-            // `self.active` should hold only valid addrs — but a bad addr
-            // here is skipped, not allowed to panic.
+            // Defense-in-depth: a subscriber may bind an out-of-range `addr`
+            // (the registry does not range-check offsets); it must never index
+            // the engine buffer. A bad addr here is skipped, not allowed to
+            // panic.
             let data = self.engine.data();
             if addr < 0 || addr as usize >= data.len() {
                 continue;
@@ -816,7 +813,6 @@ impl PortDriver for ModbusPortDriver {
             let regs = self.read_absolute_words(user.addr, 2)?;
             return Ok(datatype::read_int32(dt, &regs).map_err(to_asyn)?.0);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int32(dt, regs).map_err(to_asyn)?.0)
     }
@@ -833,7 +829,6 @@ impl PortDriver for ModbusPortDriver {
             let regs = self.read_absolute_words(user.addr, 4)?;
             return Ok(datatype::read_int64(dt, &regs).map_err(to_asyn)?.0);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int64(dt, regs).map_err(to_asyn)?.0)
     }
@@ -850,7 +845,6 @@ impl PortDriver for ModbusPortDriver {
             let regs = self.read_absolute_words(user.addr, 4)?;
             return Ok(datatype::read_float(dt, &regs).map_err(to_asyn)?.0);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_float(dt, regs).map_err(to_asyn)?.0)
     }
@@ -875,7 +869,6 @@ impl PortDriver for ModbusPortDriver {
             let raw = regs.first().copied().unwrap_or(0) as u32;
             return Ok(if mask == 0 { raw } else { raw & mask });
         }
-        self.touch(user.reason, user.addr);
         let raw = self.engine.data()[user.addr as usize] as u32;
         Ok(if mask == 0 { raw } else { raw & mask })
     }
@@ -903,7 +896,6 @@ impl PortDriver for ModbusPortDriver {
             buf[..n].copy_from_slice(&bytes[..n]);
             return Ok(n);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         // String length comes from the record buffer (`NELM`).
         let (bytes, _) = datatype::read_string(dt, regs, buf.len()).map_err(to_asyn)?;
@@ -1857,12 +1849,6 @@ mod tests {
             .read_int32(&user)
             .expect("absolute read must succeed");
         assert_eq!(v, 0xBEEF);
-        // No periodic poller in absolute mode, so the read must not register
-        // the record in the `active` set.
-        assert!(
-            driver.active.is_empty(),
-            "absolute reads must not touch the poller `active` set"
-        );
     }
 
     /// R50: an absolute-addressing port has no poller, so the statistics
@@ -2906,22 +2892,14 @@ mod tests {
         assert!(driver.write_float64(&mut wuser, 1.0).is_err());
         assert!(driver.write_uint32_digital(&mut wuser, 1, 0).is_err());
         assert!(driver.write_octet(&mut wuser, b"hi").is_err());
-
-        // A failed out-of-range access must never register the bad addr —
-        // otherwise the next poll cycle would index the engine buffer out of
-        // bounds and panic.
-        assert!(
-            !driver.active.iter().any(|&(_, a)| a == 100),
-            "out-of-range addr must not be registered in `active`"
-        );
     }
 
-    /// After failed out-of-range reads and writes, `poll_cycle` must iterate
-    /// `self.active` without panicking on a stale out-of-range addr. Guards
-    /// against the touch-before-check regression where a bad addr was
-    /// inserted into `active` and later indexed the engine buffer unchecked.
+    /// A subscriber may bind an out-of-range offset (the interrupt registry
+    /// does not range-check). `poll_cycle` walks the subscriber bindings, so it
+    /// must skip such a binding via its bounds guard instead of indexing the
+    /// engine buffer out of bounds and panicking.
     #[test]
-    fn poll_cycle_after_failed_out_of_range_access_does_not_panic() {
+    fn poll_cycle_skips_out_of_range_subscriber_binding_without_panic() {
         // ReadHoldingRegisters response for the 4-word buffer: slave 1, fc 3,
         // byte_count 8, four zero registers. The engine's first poll expects
         // TCP transaction id 1.
@@ -2938,29 +2916,31 @@ mod tests {
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
 
-        // Out-of-range read on the 4-word buffer — must fail cleanly.
+        // Out-of-range read/write still fail cleanly at the accessor.
         let mut ruser = AsynUser::new(reason);
         ruser.addr = 100;
         assert!(driver.read_int32(&ruser).is_err());
-
-        // Out-of-range write — must fail cleanly.
         let mut wuser = AsynUser::new(reason);
         wuser.addr = 100;
         assert!(driver.write_int32(&mut wuser, 1).is_err());
 
-        // The bad addr must not have leaked into `active`.
-        assert!(
-            !driver.active.iter().any(|&(_, a)| a == 100),
-            "out-of-range addr must not be registered in `active`"
-        );
-
-        // Defense-in-depth: even with a bad addr present in `active`, a full
-        // `poll_cycle` (engine poll succeeds, then the active set is iterated)
-        // must skip it instead of panicking on an out-of-bounds buffer index.
-        driver.active.insert((reason, 100));
+        // Register an interrupt subscriber at the out-of-range offset, then run
+        // a full poll cycle (engine poll succeeds, bindings iterated). The
+        // 4-word buffer has no index 100, so poll_cycle's bounds guard must skip
+        // the binding rather than panic.
+        let (_sub, _rx) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(100),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
         driver
             .poll_cycle()
-            .expect("poll_cycle must skip the stale out-of-range addr, not error");
+            .expect("poll_cycle must skip the out-of-range subscriber binding, not error");
     }
 
     /// BUG 1 regression — a statistics/control reason has no
@@ -3022,17 +3002,11 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
         let read_ok_reason = driver.read_ok_reason;
 
-        // The only data record is at addr 2 — nothing at addr 0.
-        let mut ruser = AsynUser::new(reason);
-        ruser.addr = 2;
-        assert!(driver.read_int32(&ruser).is_ok());
-
+        // No data record is bound anywhere — the statistics params at addr 0
+        // must still post their monitors after a poll, because `publish_stats`
+        // is independent of the per-record interrupt fan-out.
         let mut rx = driver.base.interrupts.subscribe_async();
         driver.poll_cycle().expect("poll_cycle must succeed");
 
@@ -3078,9 +3052,21 @@ mod tests {
             .base
             .find_param(ModbusDataType::Int32Le.as_str())
             .expect("INT32_LE parameter must exist");
-        let mut ruser = AsynUser::new(reason);
-        ruser.addr = 0;
-        assert!(driver.read_int32(&ruser).is_ok());
+        // A record bound at addr 0 puts the offset on the interrupt list; the
+        // poller then fires every scalar interface for it. One mailbox
+        // subscription suffices to enumerate the binding — the per-interface
+        // fan-out below is unconditional, so the broadcast observer sees all
+        // four typed values regardless of this subscriber's own iface.
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
 
         let mut rx = driver.base.interrupts.subscribe_async();
         driver.poll_cycle().expect("poll_cycle must succeed");
@@ -3155,15 +3141,14 @@ mod tests {
         )
         .expect("non-absolute config must build");
 
-        // Activate the INT32_LE reason at addr 0 (rc=2, two registers per
-        // element), so the 4-register block decodes to two elements.
+        // INT32_LE reason at addr 0 (rc=2, two registers per element), so the
+        // 4-register block decodes to two elements. No prior read: the poller
+        // fires purely from the registered subscribers, exactly as a real
+        // SCAN="I/O Intr" waveform — which never reads on its own — relies on.
         let reason = driver
             .base
             .find_param(ModbusDataType::Int32Le.as_str())
             .expect("INT32_LE parameter must exist");
-        let mut ruser = AsynUser::new(reason);
-        ruser.addr = 0;
-        assert!(driver.read_int32(&ruser).is_ok());
 
         // --- Poll 1: array records ARE bound (mailbox subscribers present). ---
         let (_sub_i, _rx_i) =

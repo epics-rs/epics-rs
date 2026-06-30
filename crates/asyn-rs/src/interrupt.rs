@@ -474,6 +474,36 @@ impl InterruptManager {
             .any(|s| s.active.load(Ordering::Relaxed) && s.filter.accepts(reason, addr, iface))
     }
 
+    /// The distinct `(reason, addr)` pairs of every active mailbox subscription
+    /// that pins a concrete reason AND address.
+    ///
+    /// A polling driver (Modbus `readPoller`) drives its fire set directly from
+    /// this — exactly C's model, where `readPoller` fires every record on the
+    /// interrupt list (populated at `registerInterruptUser`), with no
+    /// dependence on whether the record was ever read. The interrupt registry
+    /// is the single owner of "which records want a fire"; the driver holds no
+    /// parallel set to keep in sync. A wildcard subscription (reason or addr
+    /// `None`) names no single offset to poll and is skipped — every record
+    /// binding sets both (the asyn device support fills `reason`/`addr` from
+    /// its link), so none are lost. Broadcast and sync-callback subscribers are
+    /// not record bindings and are excluded, matching [`has_subscriber`].
+    ///
+    /// [`has_subscriber`]: Self::has_subscriber
+    pub fn subscribed_bindings(&self) -> Vec<(usize, i32)> {
+        let mut out: Vec<(usize, i32)> = Vec::new();
+        for s in self.state.mailboxes.lock().iter() {
+            if !s.active.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let (Some(reason), Some(addr)) = (s.filter.reason, s.filter.addr) {
+                if !out.contains(&(reason, addr)) {
+                    out.push((reason, addr));
+                }
+            }
+        }
+        out
+    }
+
     // --- Metrics ---
 
     /// Total number of notify() calls since creation.
@@ -946,5 +976,59 @@ mod tests {
         assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
         drop(sub2);
         assert!(!im.has_subscriber(5, 99, InterfaceType::Float64Array));
+    }
+
+    #[tokio::test]
+    async fn subscribed_bindings_enumerates_distinct_concrete_pairs() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+        assert!(im.subscribed_bindings().is_empty());
+
+        // Two ifaces on the SAME (reason, addr) collapse to one binding.
+        let (s_a, _r0) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(2),
+            addr: Some(7),
+            iface: Some(InterfaceType::Int32Array),
+            ..Default::default()
+        });
+        let (s_b, _r1) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(2),
+            addr: Some(7),
+            iface: Some(InterfaceType::Float64Array),
+            ..Default::default()
+        });
+        // A distinct addr is its own binding.
+        let (s_other, _r2) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(2),
+            addr: Some(8),
+            iface: Some(InterfaceType::Int32Array),
+            ..Default::default()
+        });
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+
+        // A wildcard subscription (addr None) pins no offset and is skipped.
+        let (s_wild, _r3) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(9),
+            ..Default::default()
+        });
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+
+        // The pair stays alive while either iface subscription survives.
+        drop(s_a);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+        drop(s_b);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 8)]);
+
+        drop(s_other);
+        drop(s_wild);
+        assert!(im.subscribed_bindings().is_empty());
     }
 }

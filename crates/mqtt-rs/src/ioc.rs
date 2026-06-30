@@ -190,7 +190,6 @@ impl CommandHandler for MqttConfigHandler {
         // ConnAck.
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let driver = MqttDriver::new(&port_name, &config, topics, publish_tx, connected.clone());
-        let subscribed_topics = driver.subscribed_topics();
         let topic_map = driver.topic_map().clone();
         let connected_param = driver.connected_param;
 
@@ -253,17 +252,34 @@ impl CommandHandler for MqttConfigHandler {
             println!("mqttDriverConfigure: connected PV = {pv_name}");
         }
 
+        // C parity: defer the broker connect (and its first subscribe) until
+        // after iocInit, when records have bound and registered (or not) their
+        // `I/O Intr` interrupts. `drvMqtt` does this via `setInitHook(initHook)`
+        // → `mqttClient.connect()` at `initHookAfterScanInit`
+        // (drvMqtt.cpp:124,186-189). The event loop waits on `start`; the
+        // `AfterScanInit` hook below releases it.
+        let start = Arc::new(tokio::sync::Notify::new());
+        let start_hook = start.clone();
+        epics_base_rs::server::ioc_app::init_hook_register(Arc::new(move |state| {
+            if matches!(
+                state,
+                epics_base_rs::server::ioc_app::InitHookState::AfterScanInit
+            ) {
+                start_hook.notify_one();
+            }
+        }));
+
         // Spawn the MQTT event loop as a background task
         let event_config = config.clone();
         self.handle.spawn(async move {
             mqtt_event_loop(
                 event_config,
-                subscribed_topics,
                 topic_map,
                 port_handle,
                 publish_rx,
                 connected_param,
                 connected,
+                start,
             )
             .await;
         });

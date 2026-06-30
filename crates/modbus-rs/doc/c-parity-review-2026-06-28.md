@@ -388,21 +388,32 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   subscriber-presence gate avoids decoding a full array at every scalar addr. **Surface for sign-off
   before implementing.**
 
-### R57 — uInt32Digital I/O-Intr fired unconditionally vs C's on-change gate — OPEN (CONCERN, documented)
+### R57 — on-change I/O-Intr fires (uInt32Digital + octet) sent unconditionally vs C's change gate — OPEN (CONCERN, documented)
 - **Severity:** CONCERN (extra record processing; no wrong value, identical wire-visible monitor
   output).
-- **Rust:** `poll_cycle` (`ioc.rs:489-501`) fires the uInt32Digital interface UNCONDITIONALLY each
-  poll (`uint32_changed_mask = !0`) and relies on the record's monitor deadband to suppress
-  unchanged posts.
+- **Rust:** `poll_cycle` (`ioc.rs:489-501` uInt32Digital; `ioc.rs:441-447` octet) fires both
+  interfaces UNCONDITIONALLY each poll (`uint32_changed_mask = !0` for uInt32Digital) and relies on
+  the record's monitor deadband to suppress unchanged posts.
 - **C:** `readPoller:1700` fires uInt32Digital only on `forceCallback_ || (masked newValue != masked
-  prevValue)`. (int32/int64/float64 are fired unconditionally by BOTH C and Rust — C comment: "called
-  even if the data has not changed, because we could be doing ADC averaging"; only uInt32Digital is
-  on-change in C.)
-- **Impact:** a uInt32Digital I/O-Intr record (bi/mbbi/mbbiDirect) processes every poll in Rust vs
-  only-on-change in C. CA monitor posts are identical (the record's deadband suppresses unchanged
-  VAL); the divergence is extra record processing each poll (forward links / .PROC side effects fire
-  every poll). A faithful fix needs per-offset prev-value tracking in `poll_cycle` to gate the fire.
-  Documented in the `ioc.rs` poll_cycle comment.
+  prevValue)` (per-offset change check); `readPoller:1893` gates the asynOctet callback on
+  `forceCallback_ || anyChanged` (port-wide change flag). (int32/int64/float64 are fired
+  unconditionally by BOTH C and Rust — C comment at `:1858`: "called even if the data has not
+  changed, because we could be doing ADC averaging"; only uInt32Digital, octet — and int32Array,
+  see R56 — are on-change in C. float64Array `:1857-1889` is unconditional in C too.)
+- **Octet sibling (surfaced in the R54-fix review, parity panel):** the string branch of `poll_cycle`
+  fires `InterfaceType::Octet` every poll (`ioc.rs:441-447`); the existing comment there cites the C
+  octet list (`:1894-1921`) but not its `forceCallback_ || anyChanged` gate at `:1893`. Same
+  on-change-gating gap as the uInt32Digital case, same root cause: `poll_cycle` lacks a
+  prev-data/`anyChanged` primitive.
+- **Impact:** a uInt32Digital (bi/mbbi/mbbiDirect) or asynOctet (stringin/waveform) I/O-Intr record
+  processes every poll in Rust vs only-on-change in C. CA monitor posts are identical (the record's
+  deadband suppresses unchanged VAL); the divergence is extra record processing each poll (forward
+  links / .PROC side effects fire every poll). Never a wrong value.
+- **Fix (shared primitive):** a single `prevData`/`anyChanged` primitive in `poll_cycle` — track the
+  previous register block, compute port-wide `anyChanged` plus per-offset prev-value comparison —
+  gates uInt32Digital (`:1700` per-offset), octet (`:1893` port-wide), AND int32Array (`:1824`
+  port-wide, the on-change half of R56) in one place, mirroring C `readPoller`. Currently documented
+  in the `ioc.rs` poll_cycle comment only.
 
 ---
 
@@ -483,3 +494,31 @@ D-records) plus one adversarial cross-cut (A-protocol) tasked to *break* the bat
 Net: data path remains wire-clean. Open after Round 2: R34, R52, R54 — one asyn-rs framework
 work item (record-init per-addr connect + per-record/per-interface driver data), awaiting design
 sign-off. No further modbus-rs-local fixes outstanding.
+
+### Round 3 — 2026-06-30 (R54 fix landed + 2 opus reviewers, F1 convergence)
+
+R54 fixed as **F1** (`a3e2fee6`, branch `f1-asyn-per-interface-iointr`): per-interface I/O-Intr
+routing via an `iface: Option<InterfaceType>` tag on `InterruptValue`/`InterruptFilter`; modbus
+`poll_cycle` decodes the register block once and fires Int32/Int64/Float64/UInt32Digital separately
+through the new `PortDriverBase::notify_interface_value`. Two opus review panels (consumer-bridge +
+C-parity) converged:
+
+- **F1 — CONFIRMED CORRECT (both panels).** `matches()` rejects only when both sides are `Some` and
+  differ (untyped fires still reach everyone; typed fires reach only their interface); the consumer
+  bridge (Int32→Long, Int64→Double, UInt32Digital→Long) lands each value in the right
+  `store_read_value` branch (apply_raw_readback mask/shift, asynInt32 ESLO); int64 is consistently
+  `Double` on both the polled and I/O-Intr paths. **No regression:** no record/interface combination
+  loses a value the old coalesced path delivered.
+- **R56 (I/O-Intr array fan-out) — CONFIRMED defect, kept OPEN for its own sign-off (both panels).**
+  Same C `readPoller` fan-out family as R54 but a genuinely distinct, larger work item (whole-block
+  array decode, distinct on-change gating at `:1824`, subscriber-presence gate, an unexercised
+  end-to-end array consumer path). NOT to be folded into R54.
+- **R57 (on-change gating) — CONFIRMED CONCERN, broadened.** Real divergence, wire-observable only
+  via forward-link/.PROC processing every poll; output-equivalent on the direct value monitor, never
+  a wrong value. Parity panel surfaced the **asynOctet sibling** (`poll_cycle` fires octet
+  unconditionally vs C `:1893` `forceCallback_ || anyChanged`) — appended to R57; both close with one
+  shared `prevData`/`anyChanged` primitive in `poll_cycle` (also gates int32Array, the on-change half
+  of R56).
+
+Open after Round 3: R34, R52 (asyn-rs contract, sign-off); R56 (array fan-out, sign-off); R57
+(on-change gating incl. octet, CONCERN). R54 CLEARED.

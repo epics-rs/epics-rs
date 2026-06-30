@@ -461,6 +461,30 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   `poll_cycle_int32_array_gated_on_change_scalars_unconditional`, `poll_cycle_octet_fires_only_on_change`,
   `poll_cycle_io_error_forces_next_unchanged_cycle`.
 
+### R58 — R57's force re-arm covered only the engine-poll error, not a mid-loop decode abort — CLEARED (af8991bd)
+- **Severity:** CONCERN (recoverable stale fire on a misconfigured/late-subscribing record; no
+  wrong value). Introduced by R57's gating (d78b01e0); caught in the R57 review round
+  (`01KWB56E`, consumer panel).
+- **Rust (pre-fix):** `poll_cycle` cleared `force_callback` + advanced `prev_data` only at cycle
+  end, and only the **engine-poll** error path re-armed `force_callback=true` on abort. A mid-loop
+  per-offset decode `?` (e.g. an `INT32_LE` subscriber bound at the last register, where
+  `regs[addr..]` is shorter than `need_regs`, `datatype.rs:357`) returned `Err` WITHOUT re-arming
+  the force or advancing the baseline.
+- **Impact:** if such an abort lands **after** a clean cycle (a late-subscribing or misconfigured
+  record), `prev_data` freezes at the last-good snapshot and `force_callback` stays `false`, so the
+  on-change-gated interfaces (octet / int32Array / uInt32Digital) at **other** offsets can miss a
+  change or revert until a fully-clean cycle runs. The common case (error before any clean cycle)
+  leaves the force stuck `true` — a safe over-fire. Never a wrong value; self-heals on the next
+  clean cycle. The unconditional scalars (int32/int64/float64/float64Array) are unaffected.
+- **Fix (structural single finalizer, af8991bd):** the fallible body is split into `run_poll_cycle`,
+  which advances `prev_data` + clears `force_callback` only as its **last** statement (reached only
+  on full success); `poll_cycle`'s `match` wrapper re-arms `force_callback` on **any** `Err` — engine
+  poll, per-offset decode, or stats publish — through one owner, so no `?` can leave the baseline
+  frozen with the force cleared. Mirrors C, which updates `prevData` + clears `forceCallback_` at
+  cycle end on every completed cycle (`drvModbusAsyn.cpp:1928/1934`) and re-arms on an I/O-status
+  transition (`:1654`). Boundary test
+  `poll_cycle_mid_loop_decode_error_rearms_force_for_recovery`.
+
 ---
 
 ## Intentional-divergence asides (C bugs correctly NOT copied — do not "fix" back)
@@ -476,6 +500,18 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 - **Histogram div-by-zero guard** — `driver.rs:251` `histogram_ms_per_bin.max(1)`; C
   `bin = msec/histogramMsPerBin_` (`drvModbusAsyn.cpp:2220`) has no zero guard.
 - **drvModbusAsynConfigure `length < 0` guard** — `ioc.rs:1103` is stricter than C.
+- **uInt32Digital `@asynMask(port,addr,0)` (zero mask) never fires** — the R57 on-change
+  filter (`interrupt.rs matches`: `uint32_changed_mask & M != 0`) gates a `mask==0`
+  subscriber out forever (`x & 0 == 0`). C `readPoller:1695-1707` treats `mask==0` as
+  "no mask" and compares the **full word**, so it *fires* a zero-mask subscriber on any
+  change. Rust deliberately follows the **asyn framework** convention instead: the generic
+  `doCallbacksUInt32Digital` (asynPortDriver.cpp:720, `pInterrupt->mask & interruptMask`)
+  also never fires `mask==0`. C's modbus `readPoller` full-word path is the idiosyncratic
+  one, inconsistent with C's own framework. A zero-mask digital record is degenerate (it
+  selects no bits — value is always 0) and `@asynMask` requires an explicit mask argument
+  (the default is `0xFFFFFFFF`), so the case only arises from a meaningless explicit
+  `@asynMask(port,addr,0)`. Matching the framework, not the readPoller quirk, is the
+  correct decline. (R57 review, parity panel, round `01KWB56E`.)
 
 ---
 
@@ -590,3 +626,19 @@ interrupt filter's mask gate reproduces C's per-subscriber `(new ^ prev) & mask`
 int32/int64/float64 + float64Array stay unconditional (ADC averaging, `:1714/1858`). `force` covers the
 first cycle (`:331`) and post-I/O-error recovery (`:1654`), cleared each cycle end (`:1928`). Four
 boundary tests. Open: R34, R52 (asyn-rs contract).
+
+**R57-fix review round (`01KWB56E`, 2 opus panels, 2026-06-30).** Both panels CONFIRMED the d78b01e0
+gating C-faithful (parity: `any_changed` == C `anyChanged` memcmp `:1658`; `force_callback`
+init/error/clear lifecycle; gate split octet+int32Array on-change vs scalars+float64Array
+unconditional; uInt32Digital `(new^prev)&mask` exact for every sensible mask. consumer: `prev_data`
+read-during/rewrite-after-loop, no panic, no double-fire, no averaging/TS starvation). Two NEW
+low-severity findings, both dispositioned:
+- **mask==0 (parity).** C `readPoller:1695` fires a zero-mask subscriber on full-word change; the Rust
+  filter never fires it. DECLINED as an intentional divergence — Rust follows the asyn framework
+  convention (`doCallbacksUInt32Digital`, asynPortDriver.cpp:720, also never fires `mask==0`); C's
+  readPoller full-word path is the idiosyncrasy, inconsistent with C's own framework, and a zero-mask
+  digital record is degenerate. See Intentional-divergence asides.
+- **mid-loop decode abort (consumer) → R58.** A per-offset decode `?` aborted the cycle without
+  re-arming `force_callback` (only the engine-poll error did), so an abort after a clean cycle could
+  freeze the on-change baseline. FIXED structurally `af8991bd` (single finalizer: every Err re-arms
+  through one owner). See R58.

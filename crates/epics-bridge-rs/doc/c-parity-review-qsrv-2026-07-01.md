@@ -171,7 +171,16 @@ divergence on the wire, not just metadata. Fix spans `DbFieldType` +
 DBF_USHORT/DBF_ULONG work, commit 1cdd4319, which omitted UCHAR).
 
 ### Q15: `alarm.message` never reflects a record AMSG string
-Severity: Low — OPEN (latent; AMSG not modeled yet)
+Severity: Low — DEFERRED (latent; blocked on AMSG modeling in epics-base-rs)
+Disposition: no qsrv divergence exists for any state Rust can currently
+represent — `AlarmInfo` has no `amsg` carrier, so `build_alarm` can only emit the
+condition string, which is exactly C's fallback when `meta.amsg` is empty
+(`iocsource.cpp:230-237`). The finding is a forward-looking marker: when AMSG is
+modeled end-to-end in `epics-base-rs` (an `amsg` field on `AlarmInfo` fed by a
+`recGblSetSevrMsg` equivalent, EPICS ≥7.0.6), `build_alarm` must prefer it under
+`DBR_AMSG`. That is a base-rs record-layer feature, not a qsrv boundary fix —
+outside this gap's scope. Tracked here so the qsrv `build_alarm` prefer-AMSG
+branch is added at the same time. No action in the qsrv batch.
 Rust: `crates/epics-bridge-rs/src/qsrv/pvif.rs:674-681` (`build_alarm`
 unconditionally sets `message = alarm_condition_string(status)`); source
 `AlarmInfo` (`crates/epics-base-rs/src/server/snapshot.rs:5-14`) has only

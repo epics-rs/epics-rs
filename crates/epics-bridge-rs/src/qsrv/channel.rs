@@ -1597,4 +1597,65 @@ mod tests {
             "OUT must stay deferred until the delay completes, got {v:?}"
         );
     }
+
+    /// The barrier's RELEASE path: a Force+block put to an async record whose
+    /// delay DOES complete in-test must return `Ok` only AFTER the deferred
+    /// OUT link fired. `ODLY≈0.05 s` arms the async barrier; the real tokio
+    /// timer fires within the 5 s guard; the reprocess drives OUT → TGT2.VAL=42
+    /// and completes the put-notify wait-set → the put resolves. A barrier that
+    /// held forever (rx never fired even after the timer) would hang and trip
+    /// the timeout. The sync test and the async-hold test never observe this
+    /// successful completion — this is the third boundary the reviewer flagged.
+    #[tokio::test]
+    async fn put_force_block_async_releases_after_delay_completes() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TGT2", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // Short ODLY: the record goes PACT and arms the delay, then the timer
+        // fires and the reprocess drives the OUT — the async barrier both holds
+        // and then releases inside the test.
+        let mut sc = ScalcoutRecord::default();
+        sc.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
+        sc.oopt = 0;
+        sc.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
+        sc.put_field("OUT", EpicsValue::String("TGT2".into()))
+            .unwrap();
+        db.add_record("SC2", Box::new(sc)).await.unwrap();
+
+        let ch = BridgeChannel::new(db.clone(), "SC2")
+            .await
+            .expect("channel over scalcout VAL must create");
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ch.put_with_options(
+                &put,
+                PutOptions {
+                    process: ProcessMode::Force,
+                    block: true,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "Force+block put must release with Ok once the ODLY delay completes, got {outcome:?}"
+        );
+        // Released only after the deferred OUT actually fired.
+        let tgt = db.get_record("TGT2").await.unwrap();
+        let v = tgt.read().await.record.get_field("VAL");
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(42.0)),
+            "the barrier must release only after the deferred OUT drove TGT2.VAL=42, got {v:?}"
+        );
+    }
 }

@@ -589,6 +589,58 @@ impl PvDatabase {
             .map(|_| ())
     }
 
+    /// Process a record UNCONDITIONALLY with a put-notify wait-set, returning
+    /// the completion receiver — the QSRV `record[process=true,block=true]`
+    /// (Force + block) barrier.
+    ///
+    /// C `dbProcessNotify`: pvxs routes a blocking forced put through
+    /// `dbProcessNotify` (`singlesource.cpp:360-369`), whose completion fires
+    /// only after the record's whole processing chain — including async device
+    /// work (a motor move, an asyn-backed AO) — settles. The value is written
+    /// by the caller's preceding [`Self::put_pv`] (the `dbPut` analogue, no
+    /// process); this entry then mints the wait-set, registers it into the
+    /// record's `notify` slot so PACT records join it, and runs the full
+    /// unconditional [`Self::process_record_with_links`] cycle (C `dbProcess`,
+    /// the Force analogue). A fully synchronous chain returns `Ok(None)` (the
+    /// wait-set already drained); an async record returns `Ok(Some(rx))` for
+    /// the caller to await. A concurrent put-callback already in flight on the
+    /// record is rejected with `PutCallbackInProgress`, matching the PROC path.
+    pub async fn process_record_with_notify(
+        &self,
+        record_name: &str,
+    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+        let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+        let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
+        {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before taking the per-record write lock.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            let Some(rec_arc) = rec_arc else {
+                return Err(CaError::ChannelNotFound(record_name.to_string()));
+            };
+            let mut guard = rec_arc.write().await;
+            if guard.notify.is_some() {
+                return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+            }
+            guard.notify = Some(notify.clone());
+        }
+        let mut visited = HashSet::new();
+        self.process_record_with_links(record_name, &mut visited, 0)
+            .await?;
+        // The wait-set fires the oneshot only after the whole FLNK/OUT chain
+        // (sync + async) settles. Already-completed ⟹ fully synchronous ⟹
+        // report immediate success; otherwise hand the receiver back to await
+        // the deferred async completion.
+        if notify.completed() {
+            Ok(None)
+        } else {
+            Ok(Some(completion_rx))
+        }
+    }
+
     async fn put_record_field_from_ca_inner(
         &self,
         record_name: &str,

@@ -190,7 +190,24 @@ would serve. **Reverse-direction** (Rust stricter). Disposition: decide keep
 (security-positive) + document vs. relax to C. Surface for sign-off.
 
 ### Q27: `block=true` completion barrier skipped when combined with `process=true` (Force)
-Severity: Medium — OPEN
+Severity: Medium — CLEARED
+Resolution: the Force arm now honors `opts.block`. When `block` is set it routes
+the unconditional process through the new `PvDatabase::process_record_with_notify`
+— which mints a put-notify wait-set, registers it into the record's `notify`
+slot, runs the full `process_record_with_links` cycle (Force = unconditional
+`dbProcess`), and returns a completion receiver only when the chain went async;
+a synchronous chain drains the wait-set inside processing and returns `Ok(None)`.
+The Force arm awaits that receiver, withholding the put reply until processing —
+including async (PACT) device completion — finishes, matching pvxs routing a
+`doWait` forced put through `dbProcessNotify(putProcessRequest)`
+(`singlesource.cpp:360-369`). Non-blocking Force keeps the fire-and-forget
+`process_record_with_links` path. Group Force is DISTINCT and unchanged: pvxs
+`putGroupField` → `doPostProcessing` → `dbProcess` directly (no `dbProcessNotify`,
+no wait), so a group put never establishes a completion barrier — Rust's group
+Force (non-blocking) already matches. Regression:
+`epics-base-rs/tests/force_block_process_notify.rs` (sync → `Ok(None)` + OUT
+driven; async ODLY-PACT → `Ok(Some(_))` receiver withheld, DLYA armed, OUT
+deferred).
 Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:721` (Force arm ignores
 `opts.block`).
 C ref: `pvxs/ioc/singlesource.cpp:348-368` (`doWait` cleared only for

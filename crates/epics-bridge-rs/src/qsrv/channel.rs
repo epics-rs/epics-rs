@@ -765,11 +765,33 @@ impl BridgeChannel {
                         .put_pv(&format!("{}.{}", self.record_name, self.field), value)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    let mut visited = std::collections::HashSet::new();
-                    self.db
-                        .process_record_with_links(&self.record_name, &mut visited, 0)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    if opts.block {
+                        // pvxs honors `block` for Force exactly as for Passive:
+                        // a `record[process=true,block=true]` put routes through
+                        // `dbProcessNotify` and the reply is withheld until
+                        // processing — including async device completion (a
+                        // motor move, an asyn-backed AO) — finishes
+                        // (`singlesource.cpp:360-369`; `if forceProcessing==False
+                        // doWait=false` clears the wait for Inhibit only, never
+                        // for Force). The bare `process_record_with_links` below
+                        // returns success as soon as the record goes PACT, so a
+                        // blocking forced put to an async record must instead
+                        // await the put-notify completion.
+                        let notify_rx = self
+                            .db
+                            .process_record_with_notify(&self.record_name)
+                            .await
+                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                        if let Some(rx) = notify_rx {
+                            let _ = rx.await;
+                        }
+                    } else {
+                        let mut visited = std::collections::HashSet::new();
+                        self.db
+                            .process_record_with_links(&self.record_name, &mut visited, 0)
+                            .await
+                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    }
                 }
             }
             Ok(())

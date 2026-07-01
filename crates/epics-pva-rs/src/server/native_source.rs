@@ -140,7 +140,12 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::Float(v) => PvField::Scalar(ScalarValue::Float(*v)),
         EpicsValue::Long(v) => PvField::Scalar(ScalarValue::Int(*v)),
         EpicsValue::Short(v) => PvField::Scalar(ScalarValue::Short(*v)),
-        EpicsValue::Char(v) => PvField::Scalar(ScalarValue::UByte(*v)),
+        // C `DBF_CHAR` → PVA `byte` (Int8, signed), pvxs
+        // `ioc/typeutils.cpp:32-33` (`DBR_CHAR -> TypeCode::Int8`). The
+        // bit-preserving `as i8` keeps the wire byte identical; only the typed
+        // interpretation flips from unsigned to signed. Serving it as `ubyte`
+        // reads 200 as 200 where the client expects −56.
+        EpicsValue::Char(v) => PvField::Scalar(ScalarValue::Byte(*v as i8)),
         EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
         // Transient NTEnum carrier never reaches a record snapshot (coerced in
         // base at the link-write boundary); serve its index like a DBF_ENUM.
@@ -170,8 +175,10 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::ShortArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Short(*x)).collect())
         }
+        // C `DBF_CHAR[]` → PVA `byte[]` (Int8, signed), pvxs
+        // `ioc/typeutils.cpp:32-33` — the signed twin of `UCharArray → ubyte[]`.
         EpicsValue::CharArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UByte(*x)).collect())
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Byte(*x as i8)).collect())
         }
         EpicsValue::EnumArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
@@ -230,7 +237,8 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::Float(_) => (FieldDesc::Scalar(ScalarType::Float), false),
         EpicsValue::Long(_) => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::Short(_) => (FieldDesc::Scalar(ScalarType::Short), false),
-        EpicsValue::Char(_) => (FieldDesc::Scalar(ScalarType::UByte), false),
+        // C `DBF_CHAR` → PVA `byte` (Int8), pvxs `ioc/typeutils.cpp:32-33`.
+        EpicsValue::Char(_) => (FieldDesc::Scalar(ScalarType::Byte), false),
         EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::EnumWithChoices { .. } => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
@@ -246,7 +254,8 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
         EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
         EpicsValue::ShortArray(_) => (FieldDesc::ScalarArray(ScalarType::Short), true),
-        EpicsValue::CharArray(_) => (FieldDesc::ScalarArray(ScalarType::UByte), true),
+        // C `DBF_CHAR[]` → PVA `byte[]` (Int8), pvxs `ioc/typeutils.cpp:32-33`.
+        EpicsValue::CharArray(_) => (FieldDesc::ScalarArray(ScalarType::Byte), true),
         EpicsValue::EnumArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
         EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
         EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
@@ -1412,6 +1421,81 @@ mod tests {
             bv.get_field("choices"),
             Some(PvField::ScalarArray(c)) if c.is_empty()
         ));
+    }
+
+    /// `DBF_CHAR` is signed on the pvAccess wire: pvxs `fromDbrType` maps
+    /// `DBR_CHAR -> TypeCode::Int8` and `DBR_UCHAR -> TypeCode::UInt8`
+    /// (`ioc/typeutils.cpp:32-35`). A `Char` value of 200 (0xC8) must serve as
+    /// the signed byte −56 with a `byte` descriptor, not unsigned 200/`ubyte`
+    /// — while the unsigned `UChar` twin stays `ubyte`/200. Both the value and
+    /// the descriptor path are covered so they cannot drift apart.
+    #[test]
+    fn dbf_char_serves_as_signed_byte_uchar_stays_unsigned() {
+        let ts = std::time::UNIX_EPOCH;
+
+        // Scalar DBF_CHAR → signed byte (value + descriptor).
+        let snap = Snapshot::new(EpicsValue::Char(200), 0, 0, ts);
+        let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
+            panic!("NTScalar value must be a structure");
+        };
+        let Some(PvField::Scalar(ScalarValue::Byte(b))) = s.get_field("value") else {
+            panic!(
+                "DBF_CHAR value must be a signed byte scalar, got {:?}",
+                s.get_field("value")
+            );
+        };
+        assert_eq!(*b, -56, "DBF_CHAR 200 must serve as signed byte −56");
+        let FieldDesc::Structure { fields, .. } = snapshot_to_field_desc(&snap) else {
+            panic!("NTScalar descriptor must be a structure");
+        };
+        assert!(
+            matches!(
+                fields.iter().find(|(n, _)| n == "value").unwrap().1,
+                FieldDesc::Scalar(ScalarType::Byte)
+            ),
+            "DBF_CHAR descriptor must be signed `byte`"
+        );
+
+        // Scalar DBF_UCHAR → unsigned byte (the untouched twin).
+        let usnap = Snapshot::new(EpicsValue::UChar(200), 0, 0, ts);
+        let PvField::Structure(us) = snapshot_to_pv_field(&usnap) else {
+            panic!("structure");
+        };
+        let Some(PvField::Scalar(ScalarValue::UByte(u))) = us.get_field("value") else {
+            panic!("DBF_UCHAR value must be an unsigned byte scalar");
+        };
+        assert_eq!(*u, 200, "DBF_UCHAR must stay unsigned 200");
+
+        // Array DBF_CHAR[] → signed byte[], element-wise (value + descriptor).
+        let asnap = Snapshot::new(EpicsValue::CharArray(vec![200, 0, 127]), 0, 0, ts);
+        let PvField::Structure(a) = snapshot_to_pv_field(&asnap) else {
+            panic!("structure");
+        };
+        let Some(PvField::ScalarArray(arr)) = a.get_field("value") else {
+            panic!("DBF_CHAR[] value must be a scalar array");
+        };
+        assert_eq!(
+            arr,
+            &vec![
+                ScalarValue::Byte(-56),
+                ScalarValue::Byte(0),
+                ScalarValue::Byte(127),
+            ],
+            "DBF_CHAR[] must serve as signed byte[]"
+        );
+        let FieldDesc::Structure {
+            fields: afields, ..
+        } = snapshot_to_field_desc(&asnap)
+        else {
+            panic!("structure");
+        };
+        assert!(
+            matches!(
+                afields.iter().find(|(n, _)| n == "value").unwrap().1,
+                FieldDesc::ScalarArray(ScalarType::Byte)
+            ),
+            "DBF_CHAR[] descriptor must be signed `byte[]`"
+        );
     }
 
     #[test]

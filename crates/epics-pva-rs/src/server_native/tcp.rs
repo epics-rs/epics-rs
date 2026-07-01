@@ -296,7 +296,16 @@ fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValu
             ScalarValue::Long(l) => EpicsValue::Int64(*l),
             ScalarValue::ULong(u) => EpicsValue::UInt64(*u),
             ScalarValue::Short(s) => EpicsValue::Short(*s),
-            ScalarValue::UByte(b) => EpicsValue::Char(*b),
+            // DBF_CHAR is signed (`byte`, Int8) and DBF_UCHAR unsigned
+            // (`ubyte`, UInt8) on the wire (pvxs `typeutils.cpp:32-35`); the
+            // primary serving path emits them distinctly (de500251). Carry
+            // each into the filter engine with its own EpicsValue type so the
+            // backward bridge can re-emit the correct leaf — folding both into
+            // `Char` would make `Byte`(CHAR)↔`UByte`(UCHAR) indistinguishable
+            // on the way out. `Char` stores `u8`, so the signed leaf is
+            // reinterpreted with `as u8` (wire byte unchanged).
+            ScalarValue::Byte(b) => EpicsValue::Char(*b as u8),
+            ScalarValue::UByte(b) => EpicsValue::UChar(*b),
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
             _ => return None,
         })
@@ -375,7 +384,19 @@ fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValu
                     })
                     .collect(),
             ),
-            Some(ScalarValue::UByte(_)) => EpicsValue::CharArray(
+            // DBF_CHAR[] (signed byte[]) and DBF_UCHAR[] (unsigned ubyte[])
+            // carry distinctly (see the scalar helper): `Byte[] → CharArray`
+            // (`as u8`, wire byte unchanged) vs `UByte[] → UCharArray`.
+            Some(ScalarValue::Byte(_)) => EpicsValue::CharArray(
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Byte(v) => *v as u8,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            Some(ScalarValue::UByte(_)) => EpicsValue::UCharArray(
                 items
                     .iter()
                     .map(|s| match s {
@@ -494,7 +515,12 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         EpicsValue::Float(f) => PvField::Scalar(ScalarValue::Float(*f)),
         EpicsValue::Long(i) => PvField::Scalar(ScalarValue::Int(*i)),
         EpicsValue::Short(s) => PvField::Scalar(ScalarValue::Short(*s)),
-        EpicsValue::Char(c) => PvField::Scalar(ScalarValue::UByte(*c)),
+        // C `DBF_CHAR` → PVA `byte` (Int8, signed), pvxs
+        // `ioc/typeutils.cpp:32-33`; must match the `Byte`/`Byte[]` descriptor
+        // the primary path now advertises (de500251). `Char` stores `u8`, so
+        // reinterpret with `as i8` (wire byte unchanged). The unsigned
+        // `UChar → UByte` twin below stays correct.
+        EpicsValue::Char(c) => PvField::Scalar(ScalarValue::Byte(*c as i8)),
         EpicsValue::Enum(e) => PvField::Scalar(ScalarValue::Int(*e as i32)),
         // Transient NTEnum carrier never reaches a filter result (coerced in
         // base at the link-write boundary); serve its index like a DBF_ENUM.
@@ -522,8 +548,10 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         EpicsValue::ShortArray(a) => {
             PvField::ScalarArray(a.iter().map(|x| ScalarValue::Short(*x)).collect())
         }
+        // C `DBF_CHAR[]` → PVA `byte[]` (Int8), pvxs `ioc/typeutils.cpp:32-33`
+        // — the signed twin of `UCharArray → ubyte[]` below.
         EpicsValue::CharArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UByte(*x)).collect())
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Byte(*x as i8)).collect())
         }
         EpicsValue::EnumArray(a) => {
             PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
@@ -8429,9 +8457,11 @@ mod tests {
         /// with `Double(0.0)`.
         #[test]
         fn forward_unsupported_scalars_return_none() {
+            // `Byte` is NOT here: it is DBF_CHAR (signed), a faithful leaf
+            // carried as `EpicsValue::Char` — see
+            // `forward_char_and_uchar_bytes_carry_faithfully`.
             for sv in [
                 ScalarValue::Boolean(true),
-                ScalarValue::Byte(-3),
                 ScalarValue::UShort(7),
                 ScalarValue::UInt(9),
             ] {
@@ -8453,6 +8483,7 @@ mod tests {
                 ScalarValue::Long(4),
                 ScalarValue::ULong(5),
                 ScalarValue::Short(6),
+                ScalarValue::Byte(-56),
                 ScalarValue::UByte(7),
                 ScalarValue::String("x".into()),
             ] {
@@ -8467,11 +8498,13 @@ mod tests {
         /// fail closed at the forward bridge.
         #[test]
         fn forward_unsupported_arrays_return_none() {
+            // `byte[]` is NOT here: it is DBF_CHAR[] (signed), carried as
+            // `EpicsValue::CharArray` — see
+            // `forward_char_and_uchar_bytes_carry_faithfully`.
             let cases = [
                 vec![ScalarValue::UInt(1), ScalarValue::UInt(2)],
                 vec![ScalarValue::UShort(1)],
                 vec![ScalarValue::Boolean(true)],
-                vec![ScalarValue::Byte(-1)],
             ];
             for items in cases {
                 assert!(
@@ -8517,6 +8550,111 @@ mod tests {
                 is_mismatch(apply_monitor_filter_chain(&chain, &value, &desc)),
                 "filtered uint[] monitor must be a DescriptorMismatch, not an empty array",
             );
+        }
+
+        // --- DBF_CHAR (signed byte) round-trips both bridge directions. ---
+
+        /// DBF_CHAR is signed `byte`/`byte[]` on the wire (de500251); the
+        /// filter bridge must carry it faithfully in BOTH directions, or a
+        /// filtered DBF_CHAR monitor dies at the forward bridge. Forward maps
+        /// `Byte -> Char` / `Byte[] -> CharArray` (signed) and `UByte -> UChar`
+        /// / `UByte[] -> UCharArray` (unsigned); backward inverts. The type is
+        /// preserved through the filter engine so the backward bridge can
+        /// re-emit the correct signed-vs-unsigned leaf. Regression for the
+        /// sibling the native_source fix (de500251) missed — Q52 completion.
+        #[test]
+        fn forward_char_and_uchar_bytes_carry_faithfully() {
+            use epics_base_rs::types::EpicsValue;
+            // Forward: signed byte 200 (0xC8 == -56i8) -> Char(200); unsigned
+            // ubyte -> UChar; distinct so the backward leaf stays disambiguated.
+            assert_eq!(
+                pv_value_leaf_to_epics(&PvField::Scalar(ScalarValue::Byte(-56))),
+                Some(EpicsValue::Char(200)),
+            );
+            assert_eq!(
+                pv_value_leaf_to_epics(&PvField::Scalar(ScalarValue::UByte(200))),
+                Some(EpicsValue::UChar(200)),
+            );
+            assert_eq!(
+                pv_value_leaf_to_epics(&PvField::ScalarArray(vec![
+                    ScalarValue::Byte(-56),
+                    ScalarValue::Byte(0),
+                ])),
+                Some(EpicsValue::CharArray(vec![200, 0])),
+            );
+            assert_eq!(
+                pv_value_leaf_to_epics(&PvField::ScalarArray(vec![ScalarValue::UByte(200)])),
+                Some(EpicsValue::UCharArray(vec![200])),
+            );
+            // Backward: Char -> signed Byte, CharArray -> signed Byte[], UChar
+            // -> unsigned UByte (each must fit its own descriptor).
+            assert_eq!(
+                epics_value_to_pv_field(&EpicsValue::Char(200)),
+                Some(PvField::Scalar(ScalarValue::Byte(-56))),
+            );
+            assert_eq!(
+                epics_value_to_pv_field(&EpicsValue::CharArray(vec![200, 0])),
+                Some(PvField::ScalarArray(vec![
+                    ScalarValue::Byte(-56),
+                    ScalarValue::Byte(0),
+                ])),
+            );
+            assert_eq!(
+                epics_value_to_pv_field(&EpicsValue::UChar(200)),
+                Some(PvField::Scalar(ScalarValue::UByte(200))),
+            );
+        }
+
+        /// End-to-end: a filtered DBF_CHAR array monitor must survive the
+        /// bridge. Before the Q52 completion an `arr` filter on a `byte[]`
+        /// value hit the forward bridge's missing `Byte` arm -> None ->
+        /// DescriptorMismatch, terminating the monitor. It must now pass or
+        /// transform, re-emitting a signed `byte[]` leaf that fits the
+        /// `byte[]` descriptor — never DescriptorMismatch.
+        #[test]
+        fn owner_char_array_under_arr_filter_is_not_descriptor_mismatch() {
+            let chain = parse_filter_chain(r#"{"arr":{}}"#);
+            let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
+            s.fields.push((
+                "value".into(),
+                PvField::ScalarArray(vec![
+                    ScalarValue::Byte(10),
+                    ScalarValue::Byte(-56),
+                    ScalarValue::Byte(30),
+                ]),
+            ));
+            let value = PvField::Structure(s);
+            let desc = FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Byte))],
+            };
+            match apply_monitor_filter_chain(&chain, &value, &desc) {
+                MonitorFilterOutcome::DescriptorMismatch => {
+                    panic!("filtered DBF_CHAR[] must not regress to DescriptorMismatch");
+                }
+                MonitorFilterOutcome::Drop => {
+                    panic!("an arr filter must not drop the frame");
+                }
+                MonitorFilterOutcome::Transformed(PvField::Structure(out)) => {
+                    let leaf = out
+                        .fields
+                        .iter()
+                        .find_map(|(k, v)| (k == "value").then_some(v))
+                        .expect("transformed frame keeps a value leaf");
+                    assert!(
+                        matches!(leaf, PvField::ScalarArray(items)
+                            if items.iter().all(|x| matches!(x, ScalarValue::Byte(_)))),
+                        "sliced DBF_CHAR[] must re-emit a signed byte[] leaf, got {leaf:?}",
+                    );
+                }
+                MonitorFilterOutcome::Transformed(other) => {
+                    panic!("transformed frame must stay an NT structure, got {other:?}");
+                }
+                MonitorFilterOutcome::Pass => {
+                    // Acceptable: an identity arr passed the frame unchanged;
+                    // the original leaf is already a signed byte[] fitting desc.
+                }
+            }
         }
 
         // --- Backward fail-closed: filter changes the leaf type. ---

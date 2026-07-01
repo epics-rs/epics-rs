@@ -47,6 +47,61 @@ intentional Rust-only behavior unless it breaks a libca/rsrv wire contract.
 > R2-19, R2-21, R2-25, R2-26, R2-27, R2-28, R2-29, R2-30, R2-31, R2-32,
 > R2-37, R2-38, R2-39, R2-40, R2-41, R2-45, R2-57, R2-59, R2-62, R2-63.
 
+> **2026-07-01 client-backlog triage (Round 4).** The 22 client-side
+> (libca) findings deferred above were re-verified against current
+> `src/client/` + the libca reference (`modules/ca/src/client/`), opening
+> each cited C line directly. **20 of 22 are ALREADY-FIXED**; one real
+> bug was fixed this round; one is a deferred structural divergence
+> pending sign-off.
+>
+> **FIXED this round:** R2-26 (`f37a0be8`) — UDP SEARCH replies now
+> resolve unconditionally. C `searchRespAction` never gates resolution on
+> the datagram sequence number; the seq (`lastReceivedSeqNo`) feeds only
+> libca's RTT estimate and immediate-resend timer optimisation
+> (`searchTimer.cpp:336-340`), never whether the channel is found. The
+> finding's "accepts stale sequenced replies" half is C-correct (C
+> resolves those too). Removed the resolution gate + the received-seq
+> machinery whose sole purpose was that gate; `state.pending` membership
+> is the resolve-once guard. Regression tests added.
+>
+> **ALREADY-FIXED (current file:line):** R2-17 `transport.rs:1792`, R2-18
+> `mod.rs:1030`, R2-19 `mod.rs:2423`, R2-21 `channel.rs:16`, R2-25
+> `mod.rs:3805`, R2-27 `transport.rs:1653`, R2-28 `transport.rs:757`,
+> R2-29 `transport.rs:1873`, R2-30 `search.rs:1583`, R2-31 `mod.rs:1734`,
+> R2-32 `mod.rs:2373`, R2-37 `subscription.rs:536`, R2-38 `mod.rs:4051`,
+> R2-39 `mod.rs:4135`, R2-41 `transport.rs:1866`, R2-45 `transport.rs:1407`,
+> R2-57 `mod.rs:4537`, R2-59 `mod.rs:5061`, R2-62 `search.rs:173`, R2-63
+> `transport.rs:123`.
+>
+> **DEFERRED — structural, pending sign-off (do NOT patch):**
+> - **R2-40** — on a send/write timeout the Rust transport tears the
+>   circuit down (`TcpClosed`, `transport.rs:1067-1086`) and reconnects,
+>   where C `sendTimeoutNotify`→`unresponsiveCircuitNotify`
+>   (`tcpiiu.cpp:879-941`) marks the circuit unresponsive, sends an echo
+>   probe, and KEEPS the socket. This is not patchable: Tokio's
+>   `timeout(write_all)` cancels the write mid-frame, so the socket cannot
+>   be safely reused (a partial CA frame would desync the server parser);
+>   teardown+reconnect is the safe handling (and matches C's send-*error*
+>   path, `shutdown(SHUT_WR)`). Matching C's keep-and-probe on a
+>   slow-but-alive circuit needs a transport write-path redesign
+>   (non-cancelling spawned write + a separate read-side echo watchdog).
+>   Correctness is preserved — the channel reconnects; the divergence is a
+>   heavier recovery under transient send stalls. Flagged for user
+>   sign-off before any redesign; documented in `transport.rs:988-1014`.
+>
+> **Minor residuals (benign, not re-filed):**
+> - R2-17: EVENT_ADD-via-`CA_PROTO_ERROR` is a `_=>{}` no-op; subscription
+>   errors normally arrive as EVENT_ADD status frames handled at
+>   `transport.rs:1655`.
+> - R2-39: circuit-recovery resubscribe skips subs whose wire
+>   `data_type`/`count` are still `None`; benign — active monitors have
+>   both set.
+> - R2-63: core sub-second/truncation bugs are fixed; the residual
+>   `EPICS_CA_CONN_TMO=0` → 30 s default (Rust) vs C keeping literal `0.0`
+>   is a degenerate-config edge left as-is. The doc's original C citation
+>   `if (status || connTMO <= 0.0)` was a misread — C (`cac.cpp:188-194`)
+>   resets `connTMO` only on a parse-failure `status`, never on `<=0.0`.
+
 ### R2-1: Access-rights loss emits the wrong monitor error frame
 
 Severity: Medium
@@ -1290,3 +1345,19 @@ isolated subnet no longer leaks beacons onto unrelated networks.
   reject, and for conformant clients the upgrade-only write is already
   identical to C. No source fix was owed; the server backlog is
   converged. See the triage block at the head of `## Open Findings`.
+- 2026-07-01: Round 4 — client-backlog triage. Three opus panels
+  re-verified the 22 deferred client (libca) findings against current
+  `src/client/` + the libca reference (each cited C line opened
+  directly). Result: **20 of 22 ALREADY-FIXED** by interim churn; **1
+  real bug fixed** (R2-26, `f37a0be8` — UDP SEARCH replies resolve
+  unconditionally per C `searchRespAction`, whose seq number gates only
+  libca RTT/timer tuning, not resolution; removed the resolution gate +
+  the dead received-seq machinery, kept the wire-conformant sent
+  `dgram_seq`; two regression tests added); **1 deferred structural
+  divergence** (R2-40 — send-timeout tears the circuit down where C
+  keeps it + echo-probes; not patchable under Tokio's cancellable
+  `write_all`, needs a transport write-path redesign, flagged for user
+  sign-off). Three benign minor residuals (R2-17 EVENT_ADD-via-ERROR
+  no-op, R2-39 untyped-sub resend skip, R2-63 `EPICS_CA_CONN_TMO=0`
+  edge) recorded, not re-filed. See the Round-4 triage block at the head
+  of `## Open Findings`.

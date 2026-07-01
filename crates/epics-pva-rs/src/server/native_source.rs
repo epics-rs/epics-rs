@@ -155,6 +155,9 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         // (pvxs `ioc/typeutils.cpp:38-44`: DBR_USHORT→UInt16, DBR_ULONG→UInt32).
         EpicsValue::UShort(v) => PvField::Scalar(ScalarValue::UShort(*v)),
         EpicsValue::ULong(v) => PvField::Scalar(ScalarValue::UInt(*v)),
+        // C `DBF_UCHAR` → PVA `ubyte` (UInt8), pvxs `ioc/typeutils.cpp:34-35`
+        // (`DBR_UCHAR -> TypeCode::UInt8`).
+        EpicsValue::UChar(v) => PvField::Scalar(ScalarValue::UByte(*v)),
         EpicsValue::DoubleArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -187,6 +190,11 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         }
         EpicsValue::ULongArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::UInt(*x)).collect())
+        }
+        // C `DBF_UCHAR[]` → PVA `ubyte[]` (the common image/byte-buffer shape),
+        // pvxs `ioc/typeutils.cpp:34-35`. Element 200 stays 200, not −56.
+        EpicsValue::UCharArray(v) => {
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UByte(*x)).collect())
         }
     };
 
@@ -232,6 +240,8 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         // (pvxs `ioc/typeutils.cpp:38-44`).
         EpicsValue::UShort(_) => (FieldDesc::Scalar(ScalarType::UShort), false),
         EpicsValue::ULong(_) => (FieldDesc::Scalar(ScalarType::UInt), false),
+        // C `DBF_UCHAR` → PVA `ubyte` (pvxs `ioc/typeutils.cpp:34-35`).
+        EpicsValue::UChar(_) => (FieldDesc::Scalar(ScalarType::UByte), false),
         EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
         EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
         EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
@@ -243,6 +253,8 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::UInt64Array(_) => (FieldDesc::ScalarArray(ScalarType::ULong), true),
         EpicsValue::UShortArray(_) => (FieldDesc::ScalarArray(ScalarType::UShort), true),
         EpicsValue::ULongArray(_) => (FieldDesc::ScalarArray(ScalarType::UInt), true),
+        // C `DBF_UCHAR[]` → PVA `ubyte[]` (pvxs `ioc/typeutils.cpp:34-35`).
+        EpicsValue::UCharArray(_) => (FieldDesc::ScalarArray(ScalarType::UByte), true),
     };
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"

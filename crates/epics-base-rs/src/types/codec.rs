@@ -276,8 +276,9 @@ pub(crate) fn sts_pad(native: DbFieldType) -> &'static [u8] {
     match native {
         // status(2)+severity(2) = 4 → short/enum need 0 pad.
         // `dbr_sts_char` (db_access.h:218-223): `dbr_char_t RISC_pad`
-        // (epicsInt8, 1 byte) between severity and value.
-        DbFieldType::Char => &[0],
+        // (epicsInt8, 1 byte) between severity and value. DBF_UCHAR promotes
+        // to DBR_CHAR (db_convert.h dbDBRnewToDBRold) so it shares the pad.
+        DbFieldType::Char | DbFieldType::UChar => &[0],
         // `dbr_sts_double` (db_access.h:233-238): `dbr_long_t RISC_pad`
         // (epicsInt32, **4 bytes** — `db_access.h:45 typedef epicsInt32
         // dbr_long_t`) between severity and value. Layout is
@@ -296,9 +297,10 @@ pub(crate) fn sts_pad(native: DbFieldType) -> &'static [u8] {
 /// RISC alignment padding bytes for TIME structs (after 12-byte metadata header).
 pub(crate) fn time_pad(native: DbFieldType) -> &'static [u8] {
     match native {
-        // 12 bytes header → short/enum need 2-pad, char needs 2+1=3 pad
+        // 12 bytes header → short/enum need 2-pad, char needs 2+1=3 pad.
+        // DBF_UCHAR promotes to DBR_CHAR so it shares the char pad.
         DbFieldType::Short | DbFieldType::Enum => &[0, 0],
-        DbFieldType::Char => &[0, 0, 0],
+        DbFieldType::Char | DbFieldType::UChar => &[0, 0, 0],
         // double: 12 → pad 4 to reach 16-byte boundary for 8-byte double.
         // DBF_ULONG promotes to DBR_DOUBLE (db_convert.h dbDBRnewToDBRold) so
         // it shares the 4-byte pad; DBF_USHORT promotes to DBR_LONG (4-byte-
@@ -337,8 +339,9 @@ fn gr_ctrl_meta_size(native: DbFieldType, ctrl: bool) -> usize {
         // units[8] + n limits (i32). DBF_USHORT promotes to DBR_LONG, so it
         // reuses the Long GR/CTRL layout.
         DbFieldType::Long | DbFieldType::UShort => head + MAX_UNITS_SIZE + n_limits * 4,
-        // units[8] + n limits (u8) + RISC_pad(1).
-        DbFieldType::Char => head + MAX_UNITS_SIZE + n_limits + 1,
+        // units[8] + n limits (u8) + RISC_pad(1). DBF_UCHAR promotes to
+        // DBR_CHAR (db_convert.h dbDBRnewToDBRold), reusing the Char layout.
+        DbFieldType::Char | DbFieldType::UChar => head + MAX_UNITS_SIZE + n_limits + 1,
     }
 }
 
@@ -461,7 +464,9 @@ fn serialize_gr_ctrl(
             let n_limits = if ctrl { 8 } else { 6 };
             buf.extend_from_slice(&vec![0u8; n_limits * 4]);
         }
-        DbFieldType::Char => {
+        // DBF_UCHAR promotes to DBR_CHAR (db_convert.h dbDBRnewToDBRold), so
+        // it serializes with the Char GR/CTRL layout.
+        DbFieldType::Char | DbFieldType::UChar => {
             // units[8] + 6 or 8 limits (u8) + RISC_pad(1)
             buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
             let n_limits = if ctrl { 8 } else { 6 };
@@ -581,7 +586,8 @@ fn encode_gr(
         DbFieldType::Long | DbFieldType::UShort => {
             encode_units_limits_i32(&mut buf, snapshot, 6);
         }
-        DbFieldType::Char => {
+        // DBF_UCHAR promotes to DBR_CHAR; use the Char GR layout.
+        DbFieldType::Char | DbFieldType::UChar => {
             encode_units_limits_u8(&mut buf, snapshot, 6);
             buf.push(0); // RISC_pad
         }
@@ -628,7 +634,8 @@ fn encode_ctrl(
         DbFieldType::Long | DbFieldType::UShort => {
             encode_units_limits_i32(&mut buf, snapshot, 8);
         }
-        DbFieldType::Char => {
+        // DBF_UCHAR promotes to DBR_CHAR; use the Char CTRL layout.
+        DbFieldType::Char | DbFieldType::UChar => {
             encode_units_limits_u8(&mut buf, snapshot, 8);
             buf.push(0); // RISC_pad
         }
@@ -1120,7 +1127,9 @@ fn decode_gr_ctrl(
                 });
             }
         }
-        DbFieldType::Char => {
+        // DBF_UCHAR promotes to DBR_CHAR over CA (identical GR/CTRL wire
+        // form: 1-byte limits), so it decodes with the Char layout.
+        DbFieldType::Char | DbFieldType::UChar => {
             let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };

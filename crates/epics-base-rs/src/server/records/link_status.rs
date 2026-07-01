@@ -80,10 +80,9 @@ pub(crate) const DBF_UNKNOWN: i16 = -1;
 /// CA `DBR_DOUBLE` value 6. The two orderings diverge because `DBF_INT64` /
 /// `DBF_UINT64` occupy slots 7/8 ahead of `DBF_FLOAT` / `DBF_DOUBLE`.
 ///
-/// The Rust model has a single `Char` (no signed/unsigned split): it maps to
-/// `DBF_CHAR` (1), the dbStatic field type CA `DBR_CHAR` resolves to
-/// (dbFldTypes.h:77). A `DBF_UCHAR` (2) source is not separately
-/// representable, and a `DBF_MENU` (12) field is modelled as `Enum`
+/// The Rust model distinguishes signed `Char` (`DBF_CHAR` = 1, the dbStatic
+/// field type CA `DBR_CHAR` resolves to, dbFldTypes.h:77) from unsigned
+/// `UChar` (`DBF_UCHAR` = 2). A `DBF_MENU` (12) field is modelled as `Enum`
 /// (`DBF_ENUM` = 11) — the same kind of collapse [`DBF_UNKNOWN`] documents
 /// for `DBF_NOACCESS`. The match is exhaustive so a new `DbFieldType` variant
 /// forces a deliberate code assignment here rather than a silent default.
@@ -91,6 +90,7 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
     match ft {
         DbFieldType::String => 0,  // DBF_STRING
         DbFieldType::Char => 1,    // DBF_CHAR
+        DbFieldType::UChar => 2,   // DBF_UCHAR
         DbFieldType::Short => 3,   // DBF_SHORT
         DbFieldType::UShort => 4,  // DBF_USHORT
         DbFieldType::Long => 5,    // DBF_LONG

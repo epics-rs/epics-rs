@@ -90,7 +90,32 @@ in the same commit (6 sites). `timeStamp`/`alarm`/NTEnum-`value` keep their ids
 and qsrv introspection tests stay green.
 
 ### Q14: `FTVL=UCHAR` waveforms served as signed `byte[]` (Int8) instead of pvxs `ubyte[]` (UInt8)
-Severity: High — OPEN (cross-crate root cause; scope assessment needed)
+Severity: High — CLEARED (commit pending)
+
+Resolution: added first-class `DbFieldType::UChar` (=11, promotes to DBR_CHAR
+over CA per `db_convert.h`) and `EpicsValue::{UChar(u8), UCharArray(Vec<u8>)}`,
+mirroring the DBF_USHORT/DBF_ULONG precedent (1cdd4319) but with UChar's
+divergent semantics: Char-like over CA (DBR_CHAR, raw 1-byte wire), unsigned
+`ubyte` over PVA (pvxs `typeutils.cpp:34-35`), and unsigned-numeric in the
+value accessors (INCLUDED in `as_f64/as_int_i64/as_*_array`, unlike the signed
+CHAR carrier's string special-cases). Root cause closed at
+`waveform.rs` `new()`/`reallocate_val`/`resize_val_preserving`/`put_field`
+(FTVL=UCHAR index 2 → `UCharArray`, split from the `1 | 2 => CharArray`
+collapse); the qsrv boundary at `pvif.rs` `value_scalar_type`
+(`UChar/UCharArray → ScalarType::UByte`), `nt_type_for_field`, `is_empty_array`;
+`convert.rs` `epics_to_scalar`/`epics_to_pv_field`/`scalar_to_epics_typed`
+(UByte array explicit, no scalar-collapse), plus the context-free
+`scalar_to_epics` `UByte → UChar` (was widen-to-Short workaround, now the exact
+unsigned-8 carrier, restoring round-trip symmetry — see commit). Threaded
+through `codec.rs` (DBR_CHAR wire layout), `value.rs` (Display unsigned,
+`dbr_type→Char`, `db_field_type→UChar`), `link_status.rs`, `iocsh`, `autosave`,
+`menu_choices.rs`, and the CA/PVA/motor consumers. Tests: `q14_*` in
+`convert.rs` + `pvif.rs` (element 200 stays 200, not −56).
+
+Distinct siblings NOT in this fix (separate findings): (a) `waveform.rs`
+`reallocate_val` still collapses `3 | 4 => ShortArray` / `5 | 6 => LongArray`
+for USHORT/ULONG (a 1cdd4319 record-layer gap); (b) `native_source.rs`
+CHAR → UByte (should be Byte/Int8 per pvxs `typeutils.cpp:32-33`).
 Rust: `crates/epics-bridge-rs/src/qsrv/pvif.rs:159` (`value_scalar_type`:
 `CharArray => ScalarType::Byte`, no UInt8 arm); `crates/epics-bridge-rs/src/convert.rs:9-25`
 (`dbf_to_scalar_type` has no `UChar` arm — `DbFieldType` lacks the variant,

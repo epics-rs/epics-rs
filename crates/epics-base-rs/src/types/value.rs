@@ -46,6 +46,12 @@ pub enum EpicsValue {
     /// like `UInt64`; over PVA served natively as `uint`. See
     /// [`DbFieldType::ULong`].
     ULong(u32),
+    /// Unsigned 8-bit storage for C `DBF_UCHAR` fields (`waveform`
+    /// `FTVL=UCHAR` scalar element). Distinct from the signed `Char`
+    /// (epicsInt8): over CA promoted to `DBR_CHAR` (identical 1-byte wire
+    /// form as `Char`); over PVA served natively as `ubyte` (UInt8, not the
+    /// signed `byte`). See [`DbFieldType::UChar`].
+    UChar(u8),
     // Array variants
     ShortArray(Vec<i16>),
     FloatArray(Vec<f32>),
@@ -64,6 +70,12 @@ pub enum EpicsValue {
     /// `num=ts` two-element result). Over CA promoted to `DBR_DOUBLE[]`;
     /// over PVA `uint[]`.
     ULongArray(Vec<u32>),
+    /// Unsigned 8-bit array storage (`DBF_UCHAR` waveform / `aai` / `aao`,
+    /// the common image/byte-buffer shape). Distinct from the signed
+    /// `CharArray` (epicsInt8): over CA promoted to `DBR_CHAR[]` (identical
+    /// raw bytes); over PVA `ubyte[]` (UInt8), so element 200 stays 200 not
+    /// −56. See [`DbFieldType::UChar`].
+    UCharArray(Vec<u8>),
     /// DBR_STRING with `count > 1`. Each element is at most 40 bytes
     /// per the DBR_STRING spec; the wire layout is `count * 40` bytes
     /// of NUL-padded strings. Used by `mbbo`/`mbbi` choice arrays
@@ -93,6 +105,9 @@ impl fmt::Display for EpicsValue {
             Self::UInt64(v) => write!(f, "{v}"),
             Self::UShort(v) => write!(f, "{v}"),
             Self::ULong(v) => write!(f, "{v}"),
+            // DBF_UCHAR is epicsUInt8: render the storage byte unsigned
+            // (0xFF -> "255"), the counterpart of `Char`'s signed render.
+            Self::UChar(v) => write!(f, "{v}"),
             Self::ShortArray(arr) => {
                 let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
                 write!(f, "[{}]", parts.join(", "))
@@ -126,6 +141,13 @@ impl fmt::Display for EpicsValue {
                 write!(f, "[{}]", parts.join(", "))
             }
             Self::ULongArray(arr) => {
+                let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+                write!(f, "[{}]", parts.join(", "))
+            }
+            // DBF_UCHAR[] is a numeric unsigned-byte buffer (image/waveform
+            // data), not text — render as a numeric array, unlike the signed
+            // `CharArray` which decodes as a UTF-8 long string.
+            Self::UCharArray(arr) => {
                 let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
                 write!(f, "[{}]", parts.join(", "))
             }
@@ -193,6 +215,9 @@ impl EpicsValue {
             Self::UInt64Array(arr) => render(arr, max_elems),
             Self::UShortArray(arr) => render(arr, max_elems),
             Self::ULongArray(arr) => render(arr, max_elems),
+            // Numeric unsigned-byte preview (not the binary/text CharArray
+            // path below): DBF_UCHAR carries image/waveform numbers.
+            Self::UCharArray(arr) => render(arr, max_elems),
             Self::StringArray(arr) => {
                 if arr.len() <= max_elems {
                     let parts: Vec<String> = arr.iter().map(|s| format!("{s:?}")).collect();
@@ -310,6 +335,16 @@ impl EpicsValue {
                     data[0], data[1], data[2], data[3],
                 ])))
             }
+            // DBF_UCHAR promotes to DBR_CHAR over CA (identical 1-byte wire
+            // form), so on the network it decodes through the `Char` arm; this
+            // native decoder keeps the match total and preserves the unsigned
+            // interpretation for the internal round-trip.
+            DbFieldType::UChar => {
+                if data.is_empty() {
+                    return Err(CaError::Protocol("uchar data too small".into()));
+                }
+                Ok(Self::UChar(data[0]))
+            }
         }
     }
 
@@ -344,6 +379,10 @@ impl EpicsValue {
             // (db_convert.h `dbDBRnewToDBRold[DBR_ULONG] = DBR_DOUBLE`),
             // mirroring UInt64. Emit 8 promoted big-endian bytes.
             Self::ULong(v) => (*v as f64).to_be_bytes().to_vec(),
+            // DBF_UCHAR promotes to DBR_CHAR on the wire (db_convert.h
+            // `dbDBRnewToDBRold[DBR_UCHAR] = DBR_CHAR`); the raw byte is
+            // identical to `Char`, only the interpretation is unsigned.
+            Self::UChar(v) => vec![*v],
             Self::ShortArray(arr) => {
                 let mut buf = Vec::with_capacity(arr.len() * 2);
                 for v in arr {
@@ -410,6 +449,10 @@ impl EpicsValue {
                 buf
             }
             Self::CharArray(arr) => arr.clone(),
+            // DBF_UCHAR[] promotes to DBR_CHAR[] over CA (identical raw bytes,
+            // same as CharArray); the unsigned interpretation is carried by
+            // the type, not the wire bytes.
+            Self::UCharArray(arr) => arr.clone(),
             Self::StringArray(arr) => {
                 let mut buf = vec![0u8; arr.len() * 40];
                 for (i, s) in arr.iter().enumerate() {
@@ -455,6 +498,7 @@ impl EpicsValue {
                 DbFieldType::UInt64 => Self::UInt64Array(Vec::new()),
                 DbFieldType::UShort => Self::UShortArray(Vec::new()),
                 DbFieldType::ULong => Self::ULongArray(Vec::new()),
+                DbFieldType::UChar => Self::UCharArray(Vec::new()),
             });
         }
         if count == 1 {
@@ -610,6 +654,12 @@ impl EpicsValue {
                 let len = count.min(data.len());
                 Ok(Self::CharArray(data[..len].to_vec()))
             }
+            // DBF_UCHAR[] decodes 1 byte per element like Char (it promotes to
+            // DBR_CHAR[] over CA); the bytes are copied verbatim, unsigned.
+            DbFieldType::UChar => {
+                let len = count.min(data.len());
+                Ok(Self::UCharArray(data[..len].to_vec()))
+            }
             DbFieldType::String => {
                 // DBR_STRING is fixed-width 40 bytes per element. The
                 // wire delivers `count * 40` bytes; each slot is
@@ -653,6 +703,9 @@ impl EpicsValue {
             // DBF_ULONG promotes to DBR_DOUBLE like UInt64;
             // db_convert.h `dbDBRnewToDBRold[DBR_ULONG] = DBR_DOUBLE`.
             Self::ULong(_) | Self::ULongArray(_) => DbFieldType::Double,
+            // DBF_UCHAR promotes to DBR_CHAR (identical 1-byte wire form);
+            // db_convert.h `dbDBRnewToDBRold[DBR_UCHAR] = DBR_CHAR`.
+            Self::UChar(_) | Self::UCharArray(_) => DbFieldType::Char,
         }
     }
 
@@ -668,6 +721,7 @@ impl EpicsValue {
             Self::UInt64Array(arr) => arr.len() as u32,
             Self::UShortArray(arr) => arr.len() as u32,
             Self::ULongArray(arr) => arr.len() as u32,
+            Self::UCharArray(arr) => arr.len() as u32,
             Self::CharArray(arr) => arr.len() as u32,
             Self::StringArray(arr) => arr.len() as u32,
             _ => 1,
@@ -709,6 +763,9 @@ impl EpicsValue {
             Self::ULongArray(arr) if arr.is_empty()
         ) || matches!(
             self,
+            Self::UCharArray(arr) if arr.is_empty()
+        ) || matches!(
+            self,
             Self::CharArray(arr) if arr.is_empty()
         ) || matches!(
             self,
@@ -728,6 +785,7 @@ impl EpicsValue {
             Self::UInt64Array(arr) => arr.truncate(max),
             Self::UShortArray(arr) => arr.truncate(max),
             Self::ULongArray(arr) => arr.truncate(max),
+            Self::UCharArray(arr) => arr.truncate(max),
             Self::CharArray(arr) => arr.truncate(max),
             Self::StringArray(arr) => arr.truncate(max),
             _ => {}
@@ -749,6 +807,10 @@ impl EpicsValue {
             Self::UInt64Array(a) => Some(a.iter().map(|&v| v as f64).collect()),
             Self::UShortArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
             Self::ULongArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
+            // DBF_UCHAR[] is unsigned-numeric (0..=255), so it takes the plain
+            // numeric view here — unlike the signed `CharArray`, which needs
+            // the epicsInt8 sign-reinterpret arm in `convert_to`.
+            Self::UCharArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
             _ => None,
         }
     }
@@ -775,6 +837,9 @@ impl EpicsValue {
             // then truncates off the low bits (C/pvxs `static_cast`).
             Self::UShort(v) => *v as i64,
             Self::ULong(v) => *v as i64,
+            // epicsUInt8 widens unsigned (0xFF -> 255), unlike the signed
+            // `Char` which `to_f64` reinterprets as epicsInt8 and is excluded.
+            Self::UChar(v) => *v as i64,
             _ => return None,
         })
     }
@@ -793,6 +858,8 @@ impl EpicsValue {
             Self::UInt64Array(a) => a.iter().map(|&v| v as i64).collect(),
             Self::UShortArray(a) => a.iter().map(|&v| v as i64).collect(),
             Self::ULongArray(a) => a.iter().map(|&v| v as i64).collect(),
+            // Unsigned-byte view (0..=255); `CharArray` stays excluded (signed).
+            Self::UCharArray(a) => a.iter().map(|&v| v as i64).collect(),
             _ => return None,
         })
     }
@@ -879,6 +946,12 @@ impl EpicsValue {
                     Some(v) => v.iter().map(|&x| x as u8).collect(),
                     None => nums.iter().map(|&v| v as u8).collect(),
                 }),
+                // DBF_UCHAR[] narrows off the integer view (low 8 bits), the
+                // unsigned twin of the Char target.
+                DbFieldType::UChar => EpicsValue::UCharArray(match &ints {
+                    Some(v) => v.iter().map(|&x| x as u8).collect(),
+                    None => nums.iter().map(|&v| v as u8).collect(),
+                }),
                 DbFieldType::String => {
                     EpicsValue::StringArray(nums.iter().map(|v| v.to_string().into()).collect())
                 }
@@ -920,6 +993,10 @@ impl EpicsValue {
                 // (no UTF-8 validation), matching pvxs raw-byte storage.
                 DbFieldType::String => EpicsValue::String(PvString::from_bytes(bytes.clone())),
                 DbFieldType::Char => EpicsValue::CharArray(bytes.clone()),
+                // epicsInt8 -> epicsUInt8 is byte-identity (C `charToUchar`
+                // casts the signed source: -1/0xFF -> 255/0xFF), so the raw
+                // bytes carry over unchanged into the unsigned carrier.
+                DbFieldType::UChar => EpicsValue::UCharArray(bytes.clone()),
             };
         }
 
@@ -1006,6 +1083,18 @@ impl EpicsValue {
                 Some(i) => i as u32,
                 None => self.to_f64().unwrap_or(0.0) as u32,
             }),
+            DbFieldType::UChar => {
+                // String → UCharArray (for waveform FTVL=UCHAR), the unsigned
+                // twin of the Char target's String → CharArray path.
+                if let EpicsValue::String(s) = self {
+                    EpicsValue::UCharArray(s.as_bytes().to_vec())
+                } else {
+                    EpicsValue::UChar(match self.as_int_i64() {
+                        Some(i) => i as u8,
+                        None => self.to_f64().unwrap_or(0.0) as u8,
+                    })
+                }
+            }
         }
     }
 
@@ -1024,6 +1113,7 @@ impl EpicsValue {
             Self::UInt64(_) | Self::UInt64Array(_) => DbFieldType::UInt64,
             Self::UShort(_) | Self::UShortArray(_) => DbFieldType::UShort,
             Self::ULong(_) | Self::ULongArray(_) => DbFieldType::ULong,
+            Self::UChar(_) | Self::UCharArray(_) => DbFieldType::UChar,
             Self::CharArray(_) => DbFieldType::Char,
             Self::ShortArray(_) => DbFieldType::Short,
             Self::LongArray(_) => DbFieldType::Long,
@@ -1055,6 +1145,10 @@ impl EpicsValue {
             // not 255.0. The CharArray storage stays u8 because that matches the
             // CA wire byte pattern; the sign only matters when promoting to f64.
             Self::Char(v) => Some((*v as i8) as f64),
+            // DBF_UCHAR is epicsUInt8 (unsigned): widen the storage byte
+            // directly (0xFF → 255.0), the counterpart of `Char`'s signed
+            // reinterpret above.
+            Self::UChar(v) => Some(*v as f64),
             // C EPICS dbConvert (88bfd6f, 2025-11-05): string-to-integer
             // conversion auto-detects hex/octal prefixes by default
             // (`dbConvertBase = 0`). Plain `s.parse::<f64>()` handles
@@ -1158,6 +1252,7 @@ impl EpicsValue {
                 DbFieldType::UInt64 => Ok(Self::UInt64(0)),
                 DbFieldType::UShort => Ok(Self::UShort(0)),
                 DbFieldType::ULong => Ok(Self::ULong(0)),
+                DbFieldType::UChar => Ok(Self::UChar(0)),
             };
         }
         match dbr_type {
@@ -1200,6 +1295,11 @@ impl EpicsValue {
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
             DbFieldType::ULong => Self::parse_uint(s)
                 .map(|v| Self::ULong(v as u32))
+                .map_err(|e| CaError::InvalidValue(e.to_string())),
+            // DBF_UCHAR parses unsigned like its UShort/ULong siblings
+            // (epicsUInt8), narrowing off the low byte.
+            DbFieldType::UChar => Self::parse_uint(s)
+                .map(|v| Self::UChar(v as u8))
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
             DbFieldType::Double => parse_string_to_f64(s)
                 .map(Self::Double)

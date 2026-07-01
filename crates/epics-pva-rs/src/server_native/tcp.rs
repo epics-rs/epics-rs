@@ -508,6 +508,8 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         // (pvxs `ioc/typeutils.cpp:38-44`).
         EpicsValue::UShort(u) => PvField::Scalar(ScalarValue::UShort(*u)),
         EpicsValue::ULong(u) => PvField::Scalar(ScalarValue::UInt(*u)),
+        // C `DBF_UCHAR` → PVA `ubyte` (pvxs `ioc/typeutils.cpp:34-35`).
+        EpicsValue::UChar(c) => PvField::Scalar(ScalarValue::UByte(*c)),
         EpicsValue::DoubleArray(a) => {
             PvField::ScalarArray(a.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -540,6 +542,10 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         }
         EpicsValue::ULongArray(a) => {
             PvField::ScalarArray(a.iter().map(|x| ScalarValue::UInt(*x)).collect())
+        }
+        // C `DBF_UCHAR[]` → PVA `ubyte[]` (pvxs `ioc/typeutils.cpp:34-35`).
+        EpicsValue::UCharArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UByte(*x)).collect())
         }
     })
 }

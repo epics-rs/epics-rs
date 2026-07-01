@@ -184,6 +184,7 @@ fn menu_index_value(dbf_type: DbFieldType, index: i64) -> EpicsValue {
         DbFieldType::Short => EpicsValue::Short(index as i16),
         DbFieldType::UShort => EpicsValue::UShort(index as u16),
         DbFieldType::Char => EpicsValue::Char(index as u8),
+        DbFieldType::UChar => EpicsValue::UChar(index as u8),
         DbFieldType::Long => EpicsValue::Long(index as i32),
         DbFieldType::ULong => EpicsValue::ULong(index as u32),
         DbFieldType::Int64 => EpicsValue::Int64(index),

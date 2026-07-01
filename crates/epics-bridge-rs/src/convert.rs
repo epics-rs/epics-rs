@@ -22,6 +22,9 @@ pub fn dbf_to_scalar_type(dbf: DbFieldType) -> ScalarType {
         // (pvxs `ioc/typeutils.cpp:38-44`).
         DbFieldType::UShort => ScalarType::UShort,
         DbFieldType::ULong => ScalarType::UInt,
+        // C `DBF_UCHAR` → PVA `ubyte` (UInt8), the unsigned twin of the
+        // signed `Char → Byte` above (pvxs `ioc/typeutils.cpp:34-35`).
+        DbFieldType::UChar => ScalarType::UByte,
     }
 }
 
@@ -47,6 +50,8 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         // (pvxs `ioc/typeutils.cpp:38-44`).
         EpicsValue::UShort(v) => ScalarValue::UShort(*v),
         EpicsValue::ULong(v) => ScalarValue::UInt(*v),
+        // C `DBF_UCHAR` → PVA `ubyte`, the unsigned twin of `Char → Byte`.
+        EpicsValue::UChar(v) => ScalarValue::UByte(*v),
         // Arrays: take first element or default
         EpicsValue::ShortArray(a) => ScalarValue::Short(a.first().copied().unwrap_or(0)),
         EpicsValue::FloatArray(a) => ScalarValue::Float(a.first().copied().unwrap_or(0.0)),
@@ -59,6 +64,7 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::UInt64Array(a) => ScalarValue::ULong(a.first().copied().unwrap_or(0)),
         EpicsValue::UShortArray(a) => ScalarValue::UShort(a.first().copied().unwrap_or(0)),
         EpicsValue::ULongArray(a) => ScalarValue::UInt(a.first().copied().unwrap_or(0)),
+        EpicsValue::UCharArray(a) => ScalarValue::UByte(a.first().copied().unwrap_or(0)),
     }
 }
 
@@ -84,7 +90,13 @@ pub fn scalar_to_epics(val: &ScalarValue) -> EpicsValue {
         // the storage byte identical; legacy UByte input still accepted
         // — we widen to Short to avoid clipping the unsigned 128..255 range.
         ScalarValue::Byte(v) => EpicsValue::Char(*v as u8),
-        ScalarValue::UByte(v) => EpicsValue::Short(*v as i16),
+        // PVA `ubyte` ↔ C `DBF_UCHAR` — the exact unsigned-8 carrier
+        // `EpicsValue::UChar` now exists, so map it losslessly (0..255 fits)
+        // and restore round-trip symmetry with `epics_to_scalar`'s
+        // `UChar -> UByte`. The prior `Short` widening was a workaround for
+        // the missing unsigned-8 variant (mirrors the `UInt -> Int64` note),
+        // not a deliberate retype; it is now obsolete.
+        ScalarValue::UByte(v) => EpicsValue::UChar(*v),
         ScalarValue::UShort(v) => EpicsValue::Enum(*v),
         // PVA `uint` (unsigned-32) has no unsigned-32 `EpicsValue`
         // variant. Carry the full range losslessly through `Int64` (a
@@ -151,6 +163,7 @@ pub fn scalar_to_epics_typed(
         DbFieldType::UInt64 => EpicsValue::UInt64(scalar_to_u64(val)?),
         DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val)? as i16),
         DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val)? as u8),
+        DbFieldType::UChar => EpicsValue::UChar(scalar_to_i64(val)? as u8),
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val)? as u16),
         // DBF_USHORT/DBF_ULONG narrow off the integer view (C static_cast
         // truncation, low 16/32 bits), mirroring the Short/Enum targets.
@@ -329,6 +342,12 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
         EpicsValue::ULongArray(a) => {
             PvField::ScalarArray(a.iter().map(|v| ScalarValue::UInt(*v)).collect())
         }
+        // DBF_UCHAR[] serves as PVA ubyte[] (unsigned), unlike CHAR[]'s signed
+        // byte[] above (pvxs `ioc/typeutils.cpp:34-35` DBR_UCHAR→UInt8). MUST
+        // be explicit: the `other =>` scalar fallback would collapse it.
+        EpicsValue::UCharArray(a) => {
+            PvField::ScalarArray(a.iter().map(|v| ScalarValue::UByte(*v)).collect())
+        }
         other => PvField::Scalar(epics_to_scalar(other)),
     }
 }
@@ -350,7 +369,7 @@ fn empty_typed_array(ty: ScalarType) -> EpicsValue {
         ScalarType::Short => EpicsValue::ShortArray(vec![]),
         ScalarType::Int => EpicsValue::LongArray(vec![]),
         ScalarType::Byte => EpicsValue::CharArray(vec![]),
-        ScalarType::UByte => EpicsValue::ShortArray(vec![]),
+        ScalarType::UByte => EpicsValue::UCharArray(vec![]),
         ScalarType::UShort => EpicsValue::EnumArray(vec![]),
         ScalarType::String => EpicsValue::StringArray(vec![]),
         ScalarType::UInt => EpicsValue::Int64Array(vec![]),
@@ -427,12 +446,15 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                         .collect::<Result<_, _>>()
                         .ok()?,
                 )),
-                // Legacy: pvUByte arrays widen to Short to preserve the
-                // unsigned range; never silently fold into the new signed
-                // DBF_CHAR mapping.
-                ScalarValue::UByte(_) => Some(EpicsValue::ShortArray(
+                // pvUByte[] ↔ C `DBF_UCHAR[]` — the exact unsigned-8 carrier
+                // `EpicsValue::UCharArray` now exists, so map it losslessly
+                // and symmetric with `epics_to_pv_field`'s `UCharArray ->
+                // UByte`. The prior widen-to-Short was a workaround for the
+                // missing unsigned-8 variant; never fold into the signed
+                // DBF_CHAR (`CharArray`) mapping.
+                ScalarValue::UByte(_) => Some(EpicsValue::UCharArray(
                     arr.iter()
-                        .map(|v| scalar_to_i64(v).map(|n| n as i16))
+                        .map(|v| scalar_to_i64(v).map(|n| n as u8))
                         .collect::<Result<_, _>>()
                         .ok()?,
                 )),
@@ -774,12 +796,43 @@ mod tests {
     }
 
     #[test]
-    fn f9_legacy_ubyte_widens_to_short() {
-        // For backward compat: an incoming pvUByte (unsigned) widens to
-        // Short rather than collapsing into the new signed DBF_CHAR space.
+    fn q14_dbf_uchar_unsigned_roundtrip() {
+        // DBF_UCHAR maps to pvUByte (unsigned), the unsigned twin of
+        // DBF_CHAR->pvByte. The high value 0xFF must stay 255 (unsigned),
+        // NOT wrap to -1 as the signed Char path does.
+        let orig = EpicsValue::UChar(0xFFu8);
+        let sv = epics_to_scalar(&orig);
+        assert!(matches!(sv, ScalarValue::UByte(255)));
+        let back = scalar_to_epics(&sv);
+        assert_eq!(back, EpicsValue::UChar(0xFFu8));
+    }
+
+    #[test]
+    fn q14_dbf_uchar_array_unsigned_roundtrip() {
+        // FTVL=UCHAR waveform serves as PVA ubyte[] (unsigned). Element 200
+        // stays 200, and the full array round-trips back to UCharArray —
+        // never collapsing into the signed DBF_CHAR (Byte) space.
+        let orig = EpicsValue::UCharArray(vec![0u8, 1, 200, 0xFF]);
+        let pf = epics_to_pv_field(&orig);
+        if let PvField::ScalarArray(arr) = &pf {
+            assert!(matches!(arr[2], ScalarValue::UByte(200)));
+            assert!(matches!(arr[3], ScalarValue::UByte(255)));
+        } else {
+            panic!("expected ScalarArray of UByte, got {pf:?}");
+        }
+        let back = pv_field_to_epics(&pf).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn q14_legacy_ubyte_maps_to_exact_uchar() {
+        // Now that the exact unsigned-8 carrier EpicsValue::UChar exists,
+        // an incoming pvUByte maps to it losslessly (restoring round-trip
+        // symmetry with epics_to_scalar's UChar->UByte) instead of the
+        // prior widen-to-Short workaround.
         let sv = ScalarValue::UByte(200);
         let ev = scalar_to_epics(&sv);
-        assert_eq!(ev, EpicsValue::Short(200));
+        assert_eq!(ev, EpicsValue::UChar(200));
     }
 
     /// a scalar PVA `ulong` extracted through the context-free

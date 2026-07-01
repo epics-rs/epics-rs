@@ -704,6 +704,8 @@ fn map_dbf_type(t: DbFieldType) -> LinkDbfType {
         // for completeness.
         DbFieldType::UShort => LinkDbfType::UShort,
         DbFieldType::ULong => LinkDbfType::ULong,
+        // DBF_UCHAR presents as DBR_CHAR over CA but keeps its own link type.
+        DbFieldType::UChar => LinkDbfType::UChar,
     }
 }
 

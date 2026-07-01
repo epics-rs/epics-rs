@@ -173,6 +173,8 @@ pub fn format_value(
         EpicsValue::UShort(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::ULong(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
+        // epicsUInt8 formats unsigned (0xFF -> 255), unlike the signed `Char`.
+        EpicsValue::UChar(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         // Transient NTEnum carrier never reaches CA serialization (coerced in
         // base at the link-write boundary); format its index like a DBF_ENUM.
@@ -218,6 +220,15 @@ pub fn format_value(
         ),
         EpicsValue::ULongArray(arr) => render_array_int(
             arr.iter().map(|&n| n as i64),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        // DBF_UCHAR[] is numeric unsigned-byte image data: render each element
+        // unsigned (0xFF -> 255), not the signed-i8 / long-string CharArray path.
+        EpicsValue::UCharArray(arr) => render_array_int(
+            arr.iter().map(|&b| b as i64),
             arr.len(),
             fmt,
             sep,

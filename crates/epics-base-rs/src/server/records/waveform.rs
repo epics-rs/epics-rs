@@ -215,6 +215,7 @@ impl WaveformRecord {
         // DBR and menuFtype have different numbering.
         let (val, ftvl_idx) = match ftvl {
             DbFieldType::Char => (EpicsValue::CharArray(vec![0; nelm as usize]), 1), // CHAR
+            DbFieldType::UChar => (EpicsValue::UCharArray(vec![0; nelm as usize]), 2), // UCHAR
             DbFieldType::Short => (EpicsValue::ShortArray(vec![0; nelm as usize]), 3), // SHORT
             DbFieldType::Long => (EpicsValue::LongArray(vec![0; nelm as usize]), 5), // LONG
             DbFieldType::Int64 => (EpicsValue::Int64Array(vec![0; nelm as usize]), 7), // INT64
@@ -239,12 +240,13 @@ impl WaveformRecord {
     fn reallocate_val(&mut self) {
         let n = self.nelm.max(0) as usize;
         self.val = match self.ftvl {
-            1 | 2 => EpicsValue::CharArray(vec![0; n]), // CHAR, UCHAR
+            1 => EpicsValue::CharArray(vec![0; n]),  // CHAR (epicsInt8)
+            2 => EpicsValue::UCharArray(vec![0; n]), // UCHAR (epicsUInt8)
             3 | 4 => EpicsValue::ShortArray(vec![0; n]), // SHORT, USHORT
             5 | 6 => EpicsValue::LongArray(vec![0; n]), // LONG, ULONG
-            7 => EpicsValue::Int64Array(vec![0; n]),    // INT64
-            8 => EpicsValue::UInt64Array(vec![0; n]),   // UINT64
-            9 => EpicsValue::FloatArray(vec![0.0; n]),  // FLOAT
+            7 => EpicsValue::Int64Array(vec![0; n]), // INT64
+            8 => EpicsValue::UInt64Array(vec![0; n]), // UINT64
+            9 => EpicsValue::FloatArray(vec![0.0; n]), // FLOAT
             _ => EpicsValue::DoubleArray(vec![0.0; n]), // DOUBLE, etc.
         };
         self.nord = 0;
@@ -263,6 +265,7 @@ impl WaveformRecord {
         let n = self.nelm.max(0) as usize;
         match &mut self.val {
             EpicsValue::CharArray(v) => v.resize(n, 0),
+            EpicsValue::UCharArray(v) => v.resize(n, 0),
             EpicsValue::ShortArray(v) => v.resize(n, 0),
             EpicsValue::LongArray(v) => v.resize(n, 0),
             EpicsValue::Int64Array(v) => v.resize(n, 0),
@@ -1187,9 +1190,11 @@ impl Record for WaveformRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
-                // Coerce value to match FTVL (e.g. String → CharArray for FTVL=CHAR)
+                // Coerce value to match FTVL (e.g. String → CharArray for
+                // FTVL=CHAR, String → UCharArray for FTVL=UCHAR).
                 let value = match (&value, self.ftvl) {
-                    (EpicsValue::String(s), 1 | 2) => EpicsValue::CharArray(s.as_bytes().to_vec()),
+                    (EpicsValue::String(s), 1) => EpicsValue::CharArray(s.as_bytes().to_vec()),
+                    (EpicsValue::String(s), 2) => EpicsValue::UCharArray(s.as_bytes().to_vec()),
                     _ => value,
                 };
                 // Update NORD based on actual data length, capped at NELM
@@ -1203,6 +1208,11 @@ impl Record for WaveformRecord {
                         self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::CharArray(arr);
+                    }
+                    EpicsValue::UCharArray(mut arr) => {
+                        self.nord = arr.len().min(nelm) as i32;
+                        arr.resize(nelm, 0);
+                        self.val = EpicsValue::UCharArray(arr);
                     }
                     EpicsValue::ShortArray(mut arr) => {
                         self.nord = arr.len().min(nelm) as i32;
@@ -1567,6 +1577,7 @@ impl Record for WaveformRecord {
         }
         match value {
             EpicsValue::CharArray(arr) => slice!(value, arr, CharArray, 0u8),
+            EpicsValue::UCharArray(arr) => slice!(value, arr, UCharArray, 0u8),
             EpicsValue::ShortArray(arr) => slice!(value, arr, ShortArray, 0i16),
             EpicsValue::LongArray(arr) => slice!(value, arr, LongArray, 0i32),
             EpicsValue::FloatArray(arr) => slice!(value, arr, FloatArray, 0.0f32),

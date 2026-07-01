@@ -113,6 +113,13 @@ fn native_placeholder(native_type: DbFieldType, element_count: u32) -> EpicsValu
         DbFieldType::UShort => EpicsValue::UShortArray(vec![0; n]),
         DbFieldType::ULong if scalar => EpicsValue::ULong(0),
         DbFieldType::ULong => EpicsValue::ULongArray(vec![0; n]),
+        // DBF_UCHAR promotes to DBR_CHAR over CA (db_convert.h), so a CA
+        // upstream reports it as DBF_CHAR, not DBF_UCHAR — this branch is
+        // unreachable for a CA upstream but mapped for completeness. Its
+        // `dbr_type()` is `Char`, keeping the advertised create-channel type
+        // DBF_CHAR on this branch.
+        DbFieldType::UChar if scalar => EpicsValue::UChar(0),
+        DbFieldType::UChar => EpicsValue::UCharArray(vec![0; n]),
     }
 }
 

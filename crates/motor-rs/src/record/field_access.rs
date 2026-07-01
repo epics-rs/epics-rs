@@ -2571,6 +2571,7 @@ fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
             | DbFieldType::Long
             | DbFieldType::Int64
             | DbFieldType::Char
+            | DbFieldType::UChar
             | DbFieldType::Enum
             | DbFieldType::UShort
             | DbFieldType::ULong
@@ -2613,7 +2614,7 @@ fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
         }
         "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
         _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
-            DbFieldType::Char => Some((255.0, 0.0)),
+            DbFieldType::Char | DbFieldType::UChar => Some((255.0, 0.0)),
             DbFieldType::Short => Some((32767.0, -32768.0)),
             DbFieldType::Enum | DbFieldType::UShort => Some((65535.0, 0.0)),
             DbFieldType::Long => Some((2147483647.0, -2147483648.0)),

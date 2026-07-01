@@ -2020,7 +2020,13 @@ fn spawn_monitor_subscriber(
                 on_start: _,
             } = seed_raw;
             // Revalidate ACL before seeding (a reload between subscribe and here
-            // could flip to NoAccess).
+            // could flip to NoAccess). Unlike the source-close FINISH in the loop
+            // below, this ACL-deny FINISH is deliberately NOT Executing-gated: an
+            // access revocation is a security event that closes the monitor
+            // promptly even while Idle (approved INIT-surfacing shift + pvxs
+            // prompt-close-on-revocation), whereas a lifecycle source-close holds
+            // backlog+finish until START. Do NOT "align" this to hold — that would
+            // keep an ACL-revoked subscription alive.
             let live_v0 = src.access_gate().acl_version();
             if live_v0
                 != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
@@ -2202,6 +2208,10 @@ fn spawn_monitor_subscriber(
             }
         });
         {
+            // ACL-deny FINISH is prompt (not Executing-gated) — see the raw path's
+            // pre-loop revalidate: a security revocation closes the monitor even
+            // while Idle, unlike the lifecycle source-close FINISH which holds
+            // backlog+finish until START.
             let live_v0 = src.access_gate().acl_version();
             if live_v0
                 != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)

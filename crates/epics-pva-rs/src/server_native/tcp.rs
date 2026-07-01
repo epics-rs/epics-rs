@@ -2063,9 +2063,20 @@ fn spawn_monitor_subscriber(
                                 // The cooked seed occupies one FIFO slot until the
                                 // consumer emits it, so while it is pending the raw
                                 // backlog is bounded to queue_limit-1 — keeping the
-                                // total (seed + raw) at queueSize, uniform with the
-                                // decoded path where the seed IS pending[0]. Once the
-                                // seed is emitted the raw bound relaxes to queue_limit.
+                                // total (seed + raw) at queueSize, matching the decoded
+                                // path where the seed IS pending[0]. Once the seed is
+                                // emitted the raw bound relaxes to queue_limit.
+                                //
+                                // Exception at queue_limit == 1: the `.max(1)` floor
+                                // keeps one raw slot even while the seed is pending, so
+                                // the seed plus one raw event briefly coexist (a
+                                // transient +1 that relaxes the moment the seed emits).
+                                // The raw seed is a decoded snapshot and cannot coalesce
+                                // into a raw event, so unlike the decoded path it cannot
+                                // share pending[0]. This is not client-reachable — a
+                                // client queueSize < 2 is rejected at INIT, so
+                                // queue_limit == 1 requires a non-default
+                                // monitor_queue_depth == 1.
                                 let raw_cap = queue_limit
                                     .saturating_sub(seed_cooked.is_some() as usize)
                                     .max(1);

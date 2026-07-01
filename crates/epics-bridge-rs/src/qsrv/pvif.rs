@@ -798,7 +798,14 @@ fn build_form(form: i16) -> PvStructure {
 /// scalar type and `form` as an `enum_t`; for non-numeric (string) values
 /// only `{description, units}` is emitted (pvxs `src/nt.cpp:58-85`).
 fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> PvStructure {
-    let mut d = PvStructure::new("display_t");
+    // pvxs builds `display`/`control`/`valueAlarm` with the 2-arg
+    // `members::Struct(name, children)` form (`src/nt.cpp:60`/`:89`/`:99`),
+    // which leaves `id = std::string()` (empty) — only `alarm`/`timeStamp`
+    // (and NTEnum's `value`) use the 3-arg form with an explicit id. An
+    // `id`-carrying struct serializes the id as a length-prefixed string
+    // (`encode_structure_body`), so a non-empty `display_t` diverged from
+    // pvxs byte-for-byte on every NTScalar/NTScalarArray introspection.
+    let mut d = PvStructure::new("");
     if numeric {
         d.fields.push((
             "limitLow".into(),
@@ -829,7 +836,9 @@ fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> 
 }
 
 fn build_control(ctrl: &ControlInfo, scalar_type: ScalarType) -> PvStructure {
-    let mut c = PvStructure::new("control_t");
+    // Anonymous id — pvxs `Struct("control", {…})` (`src/nt.cpp:89`), see
+    // `build_display`.
+    let mut c = PvStructure::new("");
     c.fields.push((
         "limitLow".into(),
         PvField::Scalar(limit_scalar(scalar_type, ctrl.lower_ctrl_limit)),
@@ -895,14 +904,15 @@ fn display_desc(scalar_type: ScalarType, numeric: bool) -> FieldDesc {
         fields.push(("form".into(), form_desc()));
     }
     FieldDesc::Structure {
-        struct_id: "display_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_display`).
+        struct_id: String::new(),
         fields,
     }
 }
 
 fn control_desc(scalar_type: ScalarType) -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "control_t".into(),
+        struct_id: String::new(),
         fields: vec![
             ("limitLow".into(), FieldDesc::Scalar(scalar_type)),
             ("limitHigh".into(), FieldDesc::Scalar(scalar_type)),
@@ -921,7 +931,9 @@ fn control_desc(scalar_type: ScalarType) -> FieldDesc {
 /// same values pvxs emits when QSRV does not populate them
 /// (`test/testqsingle.cpp:116-127`). Mirrors pvxs `src/nt.cpp:97-112`.
 fn build_value_alarm(disp: &DisplayInfo, scalar_type: ScalarType) -> PvStructure {
-    let mut va = PvStructure::new("valueAlarm_t");
+    // Anonymous id — pvxs `Struct("valueAlarm", {…})` (`src/nt.cpp:99`), see
+    // `build_display`.
+    let mut va = PvStructure::new("");
     va.fields.push((
         "active".into(),
         PvField::Scalar(ScalarValue::Boolean(false)),
@@ -967,7 +979,7 @@ fn build_value_alarm(disp: &DisplayInfo, scalar_type: ScalarType) -> PvStructure
 
 fn value_alarm_desc(scalar_type: ScalarType) -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "valueAlarm_t".into(),
+        struct_id: String::new(),
         fields: vec![
             ("active".into(), FieldDesc::Scalar(ScalarType::Boolean)),
             ("lowAlarmLimit".into(), FieldDesc::Scalar(scalar_type)),

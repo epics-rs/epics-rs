@@ -62,7 +62,7 @@ the whole group. Low real-world hit rate (non-canonical inputs), but a genuine
 missed sibling of the group-level coercion fix.
 
 ### Q13: NTScalar/NTScalarArray metadata sub-structs carry non-empty type-IDs pvxs leaves anonymous
-Severity: Medium — OPEN
+Severity: Medium — CLEARED (commit pending)
 Rust: `crates/epics-bridge-rs/src/qsrv/pvif.rs:801` (`build_display` →
 `PvStructure::new("display_t")`), `:832` (`build_control` → `"control_t"`),
 `:924` (`build_value_alarm` → `"valueAlarm_t"`); mirrored in descriptor
@@ -80,6 +80,14 @@ extra bytes and a different type-id than pvxs. Values still decode, but
 byte-exact introspection parity breaks and any client/gateway keying a type
 cache on the sub-struct id sees a mismatch. NTEnum `display` already correct
 (empty id at `pvif.rs:330`/`615`) — defect confined to the NTScalar family.
+Resolution: all 6 qsrv sites (`build_display`/`build_control`/`build_value_alarm`
++ the `display_desc`/`control_desc`/`value_alarm_desc` descriptors) set an empty
+id. Defect-family search found the identical bug in the PVA native source
+(`crates/epics-pva-rs/src/server/native_source.rs`), whose NTScalar builders and
+descriptors carried the same `display_t`/`control_t`/`valueAlarm_t` ids — fixed
+in the same commit (6 sites). `timeStamp`/`alarm`/NTEnum-`value` keep their ids
+(3-arg form, correct). No test asserted the old ids; typed_nt descriptor tests
+and qsrv introspection tests stay green.
 
 ### Q14: `FTVL=UCHAR` waveforms served as signed `byte[]` (Int8) instead of pvxs `ubyte[]` (UInt8)
 Severity: High — OPEN (cross-crate root cause; scope assessment needed)

@@ -322,7 +322,7 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
         .push(("choices".into(), PvField::ScalarArray(choices)));
 
     // pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
-    // (no `display_t` id, no limits/units) — distinct from the NTScalar display.
+    // (description only, no limits/units/precision — narrower than the NTScalar display).
     let mut display = PvStructure::new("");
     let description = snap
         .display
@@ -370,7 +370,8 @@ fn timestamp_desc() -> FieldDesc {
 
 fn display_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "display_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_display`).
+        struct_id: String::new(),
         fields: vec![
             ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
@@ -383,7 +384,8 @@ fn display_desc() -> FieldDesc {
 
 fn control_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "control_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_control`).
+        struct_id: String::new(),
         fields: vec![
             ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
@@ -394,7 +396,8 @@ fn control_desc() -> FieldDesc {
 
 fn value_alarm_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "valueAlarm_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_value_alarm`).
+        struct_id: String::new(),
         fields: vec![
             ("active".into(), FieldDesc::Scalar(ScalarType::Boolean)),
             (
@@ -524,7 +527,12 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
 }
 
 fn build_display(snap: &Snapshot) -> PvField {
-    let mut d = PvStructure::new("display_t");
+    // Anonymous id: pvxs builds `display`/`control`/`valueAlarm` with the
+    // 2-arg `members::Struct(name, children)` form (`src/nt.cpp:60`/`:89`/
+    // `:99`), which leaves `id = ""` — only `alarm`/`timeStamp` use the
+    // 3-arg id form. A non-empty `display_t` serialized an extra
+    // length-prefixed id and diverged from pvxs byte-for-byte.
+    let mut d = PvStructure::new("");
     // pvxs `iocsource.cpp:306-308` sets `display.description` from the
     // record's DESC field; in Rust it is `DisplayInfo.description`,
     // one field over from the limits/units this already reads. It was
@@ -556,7 +564,9 @@ fn build_display(snap: &Snapshot) -> PvField {
 }
 
 fn build_control(snap: &Snapshot) -> PvField {
-    let mut c = PvStructure::new("control_t");
+    // Anonymous id — pvxs `Struct("control", {…})` (`src/nt.cpp:89`), see
+    // `build_display`.
+    let mut c = PvStructure::new("");
     let (lo, hi) = if let Some(ctrl) = &snap.control {
         (ctrl.lower_ctrl_limit, ctrl.upper_ctrl_limit)
     } else {
@@ -579,7 +589,9 @@ fn build_value_alarm(snap: &Snapshot) -> PvField {
     // per-limit severities / `active` / `hysteresis` are not part of
     // DBR_AL_DOUBLE (pvxs leaves them untouched in this path), so they
     // remain 0/false until a record exposes LSV/HSV etc.
-    let mut v = PvStructure::new("valueAlarm_t");
+    // Anonymous id — pvxs `Struct("valueAlarm", {…})` (`src/nt.cpp:99`), see
+    // `build_display`.
+    let mut v = PvStructure::new("");
     v.fields.push((
         "active".into(),
         PvField::Scalar(ScalarValue::Boolean(false)),
@@ -1164,7 +1176,7 @@ mod tests {
         PvField::Scalar(ScalarValue::Double(v))
     }
 
-    /// Look up a scalar sub-field of a `time_t`/`display_t`/`valueAlarm_t`
+    /// Look up a scalar sub-field of a timeStamp/display/valueAlarm meta
     /// structure by name, for the NT-meta synthesizer regression tests.
     fn scalar(s: &PvStructure, name: &str) -> ScalarValue {
         match &s

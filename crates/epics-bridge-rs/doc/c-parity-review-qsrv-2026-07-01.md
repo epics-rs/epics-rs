@@ -742,7 +742,21 @@ It must **not** absorb the PUT-decode path (`scalar_to_epics`/
 `typed_array_to_epics`), whose `UByte→Char` single-carrier collapse is a
 deliberately different rule (re-coerced by `put_pv`, never round-tripped);
 merging it would break PUT re-coercion or wrongly force distinct carriers where
-the fold is correct. Deferred to its own commit pending user sign-off.
+the fold is correct.
+
+**DONE (79888ef5, signed off).** Implemented as `crate::leaf_convert` in
+`epics-pva-rs`: `epics_value_to_pv_leaf` (EpicsValue→PvField value leaf, shared
+by `snapshot_to_pv_field` + the monitor backward bridge),
+`epics_value_to_field_desc_leaf` (its type-only projection, for
+`snapshot_to_field_desc`), and `pv_leaf_to_epics_value` (the partial inverse for
+the monitor forward bridge, fail-closed `None` for the uncarried `ushort`/`uint`
+gap preserved). The two serve converters and the two filter-bridge converters
+now delegate; the DBF_CHAR signedness lives once per direction. Module doc
+states the scope boundary; the PUT-decode path is untouched. Round-trip and
+gap-pinning unit tests own the correspondence; the redundant tcp.rs
+direct-mapping test was dropped and the end-to-end filtered-monitor wiring test
+kept. No behavior change — 1196 `epics-pva-rs` tests pass, clippy `-D warnings`
+clean.
 
 **Backlog (out-of-family, not blocking):** inbound PUT-decode maps `UByte→Char`
 (`native_source.rs:1089`) / `UByte[]→CharArray` (`:999`) into the *signed* CHAR

@@ -520,34 +520,68 @@ member's backing record triggers processing and gets a normal `reply()` in
 pvxs, while Rust rejects — an observable PUT-error-vs-success divergence for
 facilities using per-record ASG.
 
-### Q52: PVA-native single-record source serves `DBF_CHAR` as `ubyte` (UInt8) instead of pvxs `byte` (Int8)
-Severity: Medium — CLEARED (de500251)
+### Q52: PVA-native server serves `DBF_CHAR` as `ubyte` (UInt8) instead of pvxs `byte` (Int8)
+Severity: Medium — CLEARED (de500251 + f9812674)
 Origin: first surfaced as the deferred distinct sibling (b) of Q14; promoted to
 its own finding when fixed.
-Resolution: `native_source.rs` mapped `EpicsValue::Char`/`CharArray` to the
-unsigned `ScalarValue`/`ScalarType::UByte` on all four sites — scalar value
-(`:143`), array value (`:173`), scalar descriptor (`:233`), array descriptor
-(`:249`) — where pvxs `fromDbrType` maps `DBR_CHAR -> TypeCode::Int8` (signed)
-and `DBR_UCHAR -> TypeCode::UInt8` (unsigned) (`ioc/typeutils.cpp:32-35`). Now
-mapped to `ScalarValue::Byte(*v as i8)` / `ScalarType::Byte` (bit-preserving
-cast: the wire byte is identical, only the typed interpretation flips from
-unsigned to signed); the genuinely-unsigned `UChar`/`UCharArray` twins stay
-`ubyte`. The qsrv bridge already mapped `DBF_CHAR -> pvByte (signed)` correctly
-(`convert.rs:44,61`; `pvif.rs:160`, both with typeutils citations) — only the
-native path diverged, and its `Char` lines carried no citation while the
-`UChar` twins did, the tell of the oversight. `EpicsValue::Char` is stored as
-`u8` in `epics-base-rs` (`types/value.rs:30`), so the signed mapping needs the
-`as i8` cast. Regression:
+Resolution: the PVA-native server has **two** hand-written `EpicsValue`↔`PvField`
+converters, and both mapped `DBF_CHAR` through the unsigned `UByte`, where pvxs
+`fromDbrType` maps `DBR_CHAR -> TypeCode::Int8` (signed) and `DBR_UCHAR ->
+TypeCode::UInt8` (unsigned) (`ioc/typeutils.cpp:32-35`). The finding spans **8
+sites across 2 files**:
+
+- **Serving path** (`native_source.rs`, de500251) — 4 sites: scalar value
+  (`:143`), array value (`:173`), scalar descriptor (`:233`), array descriptor
+  (`:249`). Now `ScalarValue::Byte(*v as i8)` / `ScalarType::Byte` (bit-preserving
+  cast: the wire byte is identical, only the typed interpretation flips from
+  unsigned to signed); the genuinely-unsigned `UChar`/`UCharArray` twins stay
+  `ubyte`.
+- **Monitor-filter bridge** (`server_native/tcp.rs`, f9812674) — 4 sites: the
+  forward `pv_value_leaf_to_epics` scalar + array helpers, the backward
+  `epics_value_to_pv_field` scalar + array arms. This is a *separate* converter
+  pair the de500251 sweep missed: after de500251 flipped the descriptor to
+  `byte`/`byte[]`, the forward bridge had no `Byte` arm — a `Byte` leaf returned
+  `None` → `DescriptorMismatch`, terminating **every** filtered `DBF_CHAR`
+  monitor — and the backward bridge still emitted `UByte`, which no longer fit
+  the `byte` descriptor. de500251 alone thus turned "filtered `DBF_CHAR` monitor
+  delivers a frame" into "monitor errors and dies", a client-reachable
+  regression the fix itself introduced; the Round-2 convergence review caught it
+  (defect citation = sample not population). f9812674 maps forward `Byte -> Char`
+  / `UByte -> UChar` (distinct carriers so the backward bridge stays
+  unambiguous; the filter engine reads `UChar` via the Q14 accessors) and
+  backward `Char -> Byte` / `UChar -> UByte`.
+
+**Structural cause (triplication):** `native_source.rs`, `server_native/tcp.rs`,
+and the qsrv `convert.rs`/`pvif.rs` each hand-map every `EpicsValue` variant to a
+`PvField`. The qsrv bridge already mapped `DBF_CHAR -> pvByte (signed)` correctly
+(`convert.rs:44,61`; `pvif.rs:160`, both with typeutils citations) — only the two
+native converters diverged, and their `Char` lines carried no citation while the
+`UChar` twins did, the tell of the oversight. A single shared value-leaf
+converter to close the triplication structurally is proposed as a follow-up (its
+own change; see Round 2 note).
+
+Distinct / not in family (verified): `native_source.rs` PUT-decode
+`scalar_to_epics:1085` already has `Byte -> Char`; `pvalink/integration.rs:1842`
+is a *consumer* that deliberately widens `Byte -> ShortArray(i16)` "so the
+negative range survives the DBF_CHAR-as-signed gap" (documented, pre-existing);
+the CA-protocol paths (`ca_gateway`, `ca` cli) are a different type system.
+`EpicsValue::Char` is stored as `u8` in `epics-base-rs` (`types/value.rs:30`), so
+the signed mapping needs the `as i8` cast. Regressions:
 `native_source.rs::tests::dbf_char_serves_as_signed_byte_uchar_stays_unsigned`
-(value + descriptor, scalar + array; `Char(200) → Byte(-56)`, `UChar(200)`
-stays `UByte(200)`). All 1192 `epics-pva-rs` tests green.
-Rust: `crates/epics-pva-rs/src/server/native_source.rs:143,173,233,249`.
+(value + descriptor, scalar + array; `Char(200) → Byte(-56)`, `UChar(200)` stays
+`UByte(200)`), plus `server_native/tcp.rs` fail-closed suite updates
+(`forward_char_and_uchar_bytes_carry_faithfully`,
+`owner_char_array_under_arr_filter_is_not_descriptor_mismatch`).
+Rust: `crates/epics-pva-rs/src/server/native_source.rs:143,173,233,249`;
+`crates/epics-pva-rs/src/server_native/tcp.rs` (forward+backward bridges).
 C ref: `pvxs/ioc/typeutils.cpp:32-33` (`case DBR_CHAR: return TypeCode::Int8;`).
 Impact: a scalar/array `DBF_CHAR` record served over the PVA-native server (not
 the qsrv bridge) advertised `ubyte`/`ubyte[]` with a value where every element
 ≥128 is reinterpreted — a `DBF_CHAR` of 200 reaches the client as 200 where it
-should read −56. Introspection typecode and data fidelity both diverge on the
-wire, matching the Q14 UCHAR waveform bug in the opposite signedness direction.
+should read −56 — and, with any client filter chain applied, the monitor
+terminated with `DescriptorMismatch`. Introspection typecode and data fidelity
+both diverge on the wire, matching the Q14 UCHAR waveform bug in the opposite
+signedness direction.
 
 ## Review Log
 
@@ -614,15 +648,40 @@ pvxs/epics-base source before acting — all four held:
    `yajl_parser.c:175-181`), and the group is served with the annotation
    defaulted. Rust's per-group skip is intentionally stricter; documented, not
    changed (d5a63519 / doc corrections).
-3. **Q27 (single-record) — genuine test-coverage gap closed.** The Force+block
-   fix had only a primitive test on `process_record_with_notify`; nothing
-   exercised the `BridgeChannel::put_with_options` Force arm that wires into it.
-   Added the bridge end-to-end twin (136e7d72).
-4. **Q52 (type/wire) — genuine distinct bug fixed.** `native_source.rs` served
-   `DBF_CHAR` as unsigned `ubyte` on all four value/descriptor sites where pvxs
-   maps `DBR_CHAR -> Int8` (the Q14 sibling (b) deferred earlier). Fixed
-   (de500251); the qsrv bridge already had it right, only the native path
-   diverged.
+3. **Q27 (single-record) — genuine test-coverage gap closed, then the barrier
+   *release* path completed.** The Force+block fix had only a primitive test on
+   `process_record_with_notify`; nothing exercised the
+   `BridgeChannel::put_with_options` Force arm that wires into it. Added the
+   bridge end-to-end twin (136e7d72), then a single-record panel noted the twin
+   proved the barrier *holds* (async pending) but not that it *releases* — so a
+   third test (`put_force_block_async_releases_after_delay_completes`,
+   ODLY=0.05 s) asserts the awaited `put` returns `Ok(Ok(()))` after the delayed
+   processing completes and the OUT-link target is driven (03633c3f).
+4. **Q52 (type/wire) — genuine distinct bug fixed, then completed across the
+   second native converter.** de500251 fixed `native_source.rs`'s serving path
+   (4 sites) where pvxs maps `DBR_CHAR -> Int8` (the Q14 sibling (b) deferred
+   earlier); the qsrv bridge already had it right, only the native path diverged.
+   The type/wire panel then caught that de500251 was **incomplete**: the
+   monitor-filter bridge in `server_native/tcp.rs` is a *separate* converter pair
+   the sweep missed, and de500251's descriptor flip turned it into a
+   client-reachable regression (`Byte` leaf → `None` → `DescriptorMismatch` kills
+   every filtered `DBF_CHAR` monitor). Completed in f9812674 (4 more sites; 8
+   total across 2 files). This is the round's defect-family lesson: the original
+   `Char.*=> .*UByte` search shape missed `tcp.rs` because its converters use
+   different function names (`pv_value_leaf_to_epics` /
+   `epics_value_to_pv_field`) — a type-mapping bug lives in *every* hand-written
+   `EpicsValue`↔`PvField` converter, enumerated by locating every fn that
+   pattern-matches the variants, not by one regex shape. See the Q52 entry's
+   structural-triplication note.
+
+**Structural follow-up surfaced for sign-off (not yet done):** the three
+hand-written `EpicsValue`↔`PvField` converters in `epics-pva-rs`
+(`native_source.rs` serve, `server_native/tcp.rs` filter-bridge) plus the qsrv
+`convert.rs` are the structural cause of this defect family — the same type
+mapping is transcribed three times, so a signedness fix must be applied (and can
+be forgotten) in each. A single shared value-leaf converter would close the
+family by construction. It is large enough to be its own change and is deferred
+pending user sign-off.
 
 Also recorded as a tracked residual (not fixed, symmetric with accepted
 BR-R15): the Q50 atomic-GET advisory gate does not cover DB-internal

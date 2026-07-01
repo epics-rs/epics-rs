@@ -59,6 +59,16 @@ pub struct BridgeMonitor {
     /// the pvxs-compatible `PV.VAL{...}` JSON suffix on the
     /// channel name (parsed once by `BridgeChannel::new`).
     filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// filter chain to install on the PROPERTY subscription — an
+    /// INDEPENDENT re-parse of the same `PV.VAL{...}` suffix (pvxs builds
+    /// the property `dbChannel` from the same filtered name,
+    /// singlesource.cpp:161 + singlesrcsubscriptionctx.cpp:24). Held apart
+    /// from `filters` so a stateful `dbnd`/`dec` on the value stream never
+    /// shares state with a DBE_PROPERTY event on the property stream.
+    /// Without it, a filtered array (`arr`-sliced) monitor rebuilt the NT
+    /// from an UNFILTERED property snapshot and shipped the whole un-sliced
+    /// array on every metadata change, corrupting the client's cached slice.
+    property_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     running: bool,
     /// Initial complete snapshot sent on first poll() after start().
     initial_snapshot: Option<PvStructure>,
@@ -81,6 +91,9 @@ impl BridgeMonitor {
             filters: std::sync::Arc::new(
                 epics_base_rs::server::database::filters::FilterChain::new(),
             ),
+            property_filters: std::sync::Arc::new(
+                epics_base_rs::server::database::filters::FilterChain::new(),
+            ),
             running: false,
             initial_snapshot: None,
             overflow_count: Arc::new(AtomicU64::new(0)),
@@ -97,6 +110,19 @@ impl BridgeMonitor {
         filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     ) -> Self {
         self.filters = filters;
+        self
+    }
+
+    /// attach the INDEPENDENT filter chain for the PROPERTY subscription.
+    /// pvxs's property `dbChannel` re-parses the same `PV.VAL{...}` suffix
+    /// (`dbChannel.c:471`), so metadata-change events carry the client's
+    /// value reshaping (`arr` slice) with per-channel filter state. Called
+    /// by `BridgeChannel::create_monitor` alongside [`Self::with_filters`].
+    pub fn with_property_filters(
+        mut self,
+        filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
+    ) -> Self {
+        self.property_filters = filters;
         self
     }
 
@@ -175,9 +201,7 @@ impl PvaMonitor for BridgeMonitor {
         let value_mask = self
             .value_mask_override
             .unwrap_or_else(|| (EventMask::VALUE | EventMask::ALARM).bits());
-        // attach the channel-filter chain to the value
-        // subscription. Property subscription stays unfiltered;
-        // pvxs-style filters only gate value-class events.
+        // attach the channel-filter chain to the value subscription.
         let filters_opt = if self.filters.is_empty() {
             None
         } else {
@@ -199,10 +223,30 @@ impl PvaMonitor for BridgeMonitor {
         // not just when VAL changes. The full snapshot is rebuilt
         // on every wake so the property-channel firing alone is
         // enough to push fresh metadata down the wire.
-        let property_sub =
-            DbSubscription::subscribe_with_mask(&self.db, &pv_name, 0, EventMask::PROPERTY.bits())
-                .await
-                .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
+        //
+        // The property `dbChannel` carries the SAME channel filter as the
+        // value channel (pvxs builds `pPropertiesChannel` from
+        // `dbChannelName(sInfo->chan)`, singlesrcsubscriptionctx.cpp:24),
+        // so a DBE_PROPERTY event's snapshot is reshaped (e.g. `arr`
+        // sliced) before `poll()` rebuilds the NT. Use the INDEPENDENT
+        // `property_filters` re-parse — a stateful `dbnd`/`dec` here must
+        // not perturb the value stream's baseline/counter. Without this the
+        // metadata event carried the whole un-sliced array and corrupted
+        // the client's cached slice.
+        let property_filters_opt = if self.property_filters.is_empty() {
+            None
+        } else {
+            Some(self.property_filters.as_ref())
+        };
+        let property_sub = DbSubscription::subscribe_with_mask_and_filters(
+            &self.db,
+            &pv_name,
+            0,
+            EventMask::PROPERTY.bits(),
+            property_filters_opt,
+        )
+        .await
+        .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // The native PVA server emits the initial snapshot via
         // ChannelSource::get_value() at MONITOR INIT time (server_native/
@@ -377,6 +421,83 @@ mod tests {
             !snap.value.fields.is_empty(),
             "PROPERTY-event snapshot must carry the full NT structure"
         );
+
+        mon.stop().await;
+    }
+
+    /// Regression (Q37): a DBE_PROPERTY event on an `arr`-sliced array
+    /// monitor must deliver the SLICED value, not the whole array. pvxs
+    /// builds the property `dbChannel` from the same filtered channel name
+    /// (`singlesrcsubscriptionctx.cpp:24`), so both streams carry the
+    /// client's `arr` filter. Pre-fix the property subscription was
+    /// unfiltered, so `poll()` rebuilt the NT from the full un-sliced array
+    /// on every metadata change and shipped a wrong-length value that
+    /// corrupted the client's cached slice.
+    #[tokio::test]
+    async fn property_event_delivers_filtered_slice() {
+        use epics_base_rs::server::database::filters::try_parse_filter_chain;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::{DbFieldType, EpicsValue};
+        use epics_pva_rs::pvdata::PvField;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "WF_ARR",
+            Box::new(WaveformRecord::new(4, DbFieldType::Double)),
+        )
+        .await
+        .unwrap();
+        db.put_pv(
+            "WF_ARR.VAL",
+            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]),
+        )
+        .await
+        .unwrap();
+
+        // `[1:2]` slice → elements 1 and 2 → length 2. Parse the value and
+        // property chains independently, mirroring `BridgeChannel::new`.
+        let value_chain =
+            Arc::new(try_parse_filter_chain(r#"{"arr":{"s":1,"e":2}}"#).expect("parse value arr"));
+        let property_chain =
+            Arc::new(try_parse_filter_chain(r#"{"arr":{"s":1,"e":2}}"#).expect("parse prop arr"));
+
+        let mut mon = BridgeMonitor::new(
+            db.clone(),
+            "WF_ARR".into(),
+            "VAL".into(),
+            NtType::ScalarArray,
+        )
+        .with_filters(value_chain)
+        .with_property_filters(property_chain);
+        mon.start().await.expect("start ok");
+
+        // A PROPERTY-only post (metadata change) carries the current VAL.
+        {
+            let rec = db.get_record("WF_ARR").await.expect("rec exists");
+            let instance = rec.read().await;
+            instance.notify_field("VAL", EventMask::PROPERTY);
+        }
+
+        let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+            .await
+            .expect("PROPERTY event must wake poll within 500ms")
+            .expect("snapshot delivered");
+
+        let value = snap
+            .value
+            .fields
+            .iter()
+            .find(|(n, _)| n == "value")
+            .map(|(_, v)| v)
+            .expect("NTScalarArray has a value field");
+        match value {
+            PvField::ScalarArray(v) => assert_eq!(
+                v.len(),
+                2,
+                "PROPERTY event must ship the arr-sliced value (len 2), not the full array (len 4)"
+            ),
+            other => panic!("value must be a ScalarArray, got {other:?}"),
+        }
 
         mon.stop().await;
     }

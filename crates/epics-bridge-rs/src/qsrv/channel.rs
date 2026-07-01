@@ -378,6 +378,16 @@ pub struct BridgeChannel {
     /// [`FilterChain::apply_to_read_value`]. PUT writes the raw value
     /// (filters are read-side only).
     channel_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// An INDEPENDENT re-parse of the same channel-filter suffix, for the
+    /// monitor's PROPERTY subscription. pvxs builds `pPropertiesChannel`
+    /// from `dbChannelName(sInfo->chan)` — the same filtered channel name
+    /// (`singlesrcsubscriptionctx.cpp:24`) — so both the value and property
+    /// dbChannels carry the client's filter, each with its own state
+    /// (`dbChannelCreate` re-parses the suffix per channel,
+    /// `dbChannel.c:471`). Held separately from `channel_filters` so a
+    /// stateful filter (`dbnd` last-sent, `dec` counter) on the value
+    /// subscription never shares state with the property subscription.
+    property_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// Access control context — checked on every get/put.
     access: super::provider::AccessContext,
 }
@@ -400,6 +410,9 @@ impl BridgeChannel {
             nt_type,
             value_dbf,
             channel_filters: std::sync::Arc::new(
+                epics_base_rs::server::database::filters::FilterChain::new(),
+            ),
+            property_filters: std::sync::Arc::new(
                 epics_base_rs::server::database::filters::FilterChain::new(),
             ),
             access: super::provider::AccessContext::allow_all(),
@@ -431,14 +444,28 @@ impl BridgeChannel {
         // EPICS `dbChannelCreate()` (`dbChannel.c:512-529`). Fail-open
         // to an unfiltered monitor would silently drop the requested
         // throttling/slicing semantics.
-        let channel_filters = match parsed.json_suffix.as_deref() {
-            Some(json) => std::sync::Arc::new(
-                epics_base_rs::server::database::filters::try_parse_filter_chain(json)
-                    .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?,
-            ),
-            None => {
-                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
+        // Parse the suffix into TWO independent chains: one for the value
+        // subscription / GET read path (`channel_filters`) and one for the
+        // monitor's PROPERTY subscription (`property_filters`). pvxs builds
+        // the property dbChannel from the same filtered channel name
+        // (`singlesrcsubscriptionctx.cpp:24`), and `dbChannelCreate`
+        // re-parses the suffix per channel (`dbChannel.c:471`), so each
+        // channel owns independent filter state — a stateful `dbnd`/`dec`
+        // on the value stream must not have its baseline/counter perturbed
+        // by a DBE_PROPERTY event on the property stream.
+        let (channel_filters, property_filters) = match parsed.json_suffix.as_deref() {
+            Some(json) => {
+                let value = epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                    .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?;
+                let property =
+                    epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                        .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?;
+                (std::sync::Arc::new(value), std::sync::Arc::new(property))
             }
+            None => (
+                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+            ),
         };
         // EPICS `$` long-string field modifier (C `dbChannel.c:486-505`):
         // a trailing `$` re-views a `DBF_STRING` or link field as a
@@ -547,6 +574,7 @@ impl BridgeChannel {
             nt_type,
             value_dbf,
             channel_filters,
+            property_filters,
             access: super::provider::AccessContext::allow_all(),
         })
     }
@@ -854,8 +882,12 @@ impl BridgeChannel {
         .with_access(self.access.clone())
         // thread the channel's parsed filter chain (from the
         // pvxs `PV.VAL{...}` JSON suffix) into the monitor so its
-        // subscription installs the filters at the dbChannel level.
-        .with_filters(self.channel_filters.clone());
+        // subscription installs the filters at the dbChannel level. The
+        // value stream and the PROPERTY stream each get an independent
+        // re-parse of the same suffix (pvxs builds both dbChannels from
+        // the same filtered name, with per-channel filter state).
+        .with_filters(self.channel_filters.clone())
+        .with_property_filters(self.property_filters.clone());
         if let Some(mask) = value_mask {
             monitor = monitor.with_value_mask(mask);
         }

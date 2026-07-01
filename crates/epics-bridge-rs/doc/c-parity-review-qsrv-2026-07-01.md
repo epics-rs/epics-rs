@@ -173,7 +173,19 @@ block/put-completion contract is broken for that combination. Passive+block is
 handled correctly.
 
 ### Q37: Single-record monitor PROPERTY subscription is unfiltered — filtered array/value monitors emit unfiltered values on metadata events
-Severity: High — OPEN
+Severity: High — CLEARED
+Resolution: the PROPERTY subscription now carries an INDEPENDENT re-parse
+of the same `PV.VAL{...}` suffix (`BridgeChannel::new` parses `channel_filters`
+and `property_filters` separately; `BridgeMonitor::with_property_filters`
+attaches the second chain via `subscribe_with_mask_and_filters`). Mirrors
+pvxs building `pPropertiesChannel(dbChannelName(sInfo->chan))` from the same
+filtered name (`singlesrcsubscriptionctx.cpp:24`), with `dbChannelCreate`
+re-parsing the suffix per channel (`dbChannel.c:471`) for independent filter
+state — so a stateful `dbnd`/`dec` on the value stream is never perturbed by
+a DBE_PROPERTY event (which would else move the deadband baseline and drop
+value events). `arr` slices unconditionally, so a metadata event now ships
+the correctly-sliced value. Regression:
+`monitor.rs::tests::property_event_delivers_filtered_slice`.
 Rust: `crates/epics-bridge-rs/src/qsrv/monitor.rs:202-205` (`property_sub` via
 `subscribe_with_mask`, no filter chain; deliberate per comment `monitor.rs:180-185`
 "Property subscription stays unfiltered").

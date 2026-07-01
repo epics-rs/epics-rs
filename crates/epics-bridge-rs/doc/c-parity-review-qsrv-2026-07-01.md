@@ -175,7 +175,8 @@ through `codec.rs` (DBR_CHAR wire layout), `value.rs` (Display unsigned,
 Distinct siblings NOT in this fix (separate findings): (a) `waveform.rs`
 `reallocate_val` still collapses `3 | 4 => ShortArray` / `5 | 6 => LongArray`
 for USHORT/ULONG (a 1cdd4319 record-layer gap); (b) `native_source.rs`
-CHAR → UByte (should be Byte/Int8 per pvxs `typeutils.cpp:32-33`).
+CHAR → UByte (should be Byte/Int8 per pvxs `typeutils.cpp:32-33`) — now
+tracked and CLEARED as Q52 (de500251).
 Rust: `crates/epics-bridge-rs/src/qsrv/pvif.rs:159` (`value_scalar_type`:
 `CharArray => ScalarType::Byte`, no UInt8 arm); `crates/epics-bridge-rs/src/convert.rs:9-25`
 (`dbf_to_scalar_type` has no `UChar` arm — `DbFieldType` lacks the variant,
@@ -291,7 +292,15 @@ no wait), so a group put never establishes a completion barrier — Rust's group
 Force (non-blocking) already matches. Regression:
 `epics-base-rs/tests/force_block_process_notify.rs` (sync → `Ok(None)` + OUT
 driven; async ODLY-PACT → `Ok(Some(_))` receiver withheld, DLYA armed, OUT
-deferred).
+deferred). Bridge-level end-to-end twin added (136e7d72,
+`channel.rs::tests::put_force_block_{sync_drives_out_link_before_returning,
+async_holds_barrier_until_processing_done}`): drives the real
+`BridgeChannel::put_with_options(Force, block=true)` PUT path — the sync case
+returns only after the OUT link drove `TGT0.VAL=42`; the async case asserts a
+200 ms `tokio::time::timeout` fires (the put future must not resolve while the
+record is PACT), the discriminator a bare-`process_record_with_links`
+regression would fail. The primitive test proves the DB method; this proves the
+bridge Force arm actually calls it.
 Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:721` (Force arm ignores
 `opts.block`).
 C ref: `pvxs/ioc/singlesource.cpp:348-368` (`doWait` cleared only for
@@ -455,6 +464,30 @@ read(B) — a snapshot with B updated and A stale. Defeats the atomicity the
 `atomic` flag exists to provide; BR-R15's gate only closed PUT-vs-plain-write,
 not GET-vs-PUT.
 
+Pre-existing residual (TRACKED, not fixed this round — symmetric with accepted
+BR-R15): the advisory `lock_records`/`lock_record` gate serializes the atomic
+GET/PUT against other qsrv group PUTs, qsrv single PUTs, and plain CA/PVA
+single-record writes (all take the gate via `lock_record`,
+`field_io.rs:682-683`). It does NOT serialize against a DB-internal
+output-link write to a group member: `write_db_link_value` writes the OUT-link
+target through `put_pv_already_locked` (`links.rs:742-750`), which by design
+does not acquire the target's advisory gate (a self-referencing `SELF PP` link
+would else deadlock on the entry record's non-reentrant gate). So a record
+whose processing drives an OUT/`dbPutLink` into a group member takes only that
+member's `RwLock` write guard, not the group advisory gate, and can still land
+between the atomic GET's incremental per-member reads → the same torn snapshot,
+via a different writer class. In pvxs this is closed because the DB-link
+lockset merges the source and target records, and the group's `DBManyLock`
+holds every member's per-record scan lock simultaneously, subsuming the link
+writer's `dbScanLock`. Closing it in Rust requires either the group GET/PUT to
+hold all member `RwLock` guards simultaneously (a true `DBManyLock`, replacing
+the incremental read guards) or every DB-link writer to acquire the group
+advisory gate. This is exactly the class BR-R15 accepted on the PUT side (its
+fix direction — "route direct member writes through the same lock" — was
+deferred; `pvxs-functional-security-review-2026-05-18.md:445-469`); the Q50
+GET-side gate inherits the identical limitation. Recorded here so the residual
+divergence is not lost behind the CLEARED label.
+
 ### Q51: Group PUT enforces per-member write ACF on proc members; pvxs never checks canWrite for proc
 Severity: Medium — CLEARED
 Resolution: the group PUT's per-member write-ACF loop now skips `proc` members.
@@ -486,6 +519,35 @@ so a client with read/process rights but no write permission on the proc
 member's backing record triggers processing and gets a normal `reply()` in
 pvxs, while Rust rejects — an observable PUT-error-vs-success divergence for
 facilities using per-record ASG.
+
+### Q52: PVA-native single-record source serves `DBF_CHAR` as `ubyte` (UInt8) instead of pvxs `byte` (Int8)
+Severity: Medium — CLEARED (de500251)
+Origin: first surfaced as the deferred distinct sibling (b) of Q14; promoted to
+its own finding when fixed.
+Resolution: `native_source.rs` mapped `EpicsValue::Char`/`CharArray` to the
+unsigned `ScalarValue`/`ScalarType::UByte` on all four sites — scalar value
+(`:143`), array value (`:173`), scalar descriptor (`:233`), array descriptor
+(`:249`) — where pvxs `fromDbrType` maps `DBR_CHAR -> TypeCode::Int8` (signed)
+and `DBR_UCHAR -> TypeCode::UInt8` (unsigned) (`ioc/typeutils.cpp:32-35`). Now
+mapped to `ScalarValue::Byte(*v as i8)` / `ScalarType::Byte` (bit-preserving
+cast: the wire byte is identical, only the typed interpretation flips from
+unsigned to signed); the genuinely-unsigned `UChar`/`UCharArray` twins stay
+`ubyte`. The qsrv bridge already mapped `DBF_CHAR -> pvByte (signed)` correctly
+(`convert.rs:44,61`; `pvif.rs:160`, both with typeutils citations) — only the
+native path diverged, and its `Char` lines carried no citation while the
+`UChar` twins did, the tell of the oversight. `EpicsValue::Char` is stored as
+`u8` in `epics-base-rs` (`types/value.rs:30`), so the signed mapping needs the
+`as i8` cast. Regression:
+`native_source.rs::tests::dbf_char_serves_as_signed_byte_uchar_stays_unsigned`
+(value + descriptor, scalar + array; `Char(200) → Byte(-56)`, `UChar(200)`
+stays `UByte(200)`). All 1192 `epics-pva-rs` tests green.
+Rust: `crates/epics-pva-rs/src/server/native_source.rs:143,173,233,249`.
+C ref: `pvxs/ioc/typeutils.cpp:32-33` (`case DBR_CHAR: return TypeCode::Int8;`).
+Impact: a scalar/array `DBF_CHAR` record served over the PVA-native server (not
+the qsrv bridge) advertised `ubyte`/`ubyte[]` with a value where every element
+≥128 is reinterpreted — a `DBF_CHAR` of 200 reaches the client as 200 where it
+should read −56. Introspection typecode and data fidelity both diverge on the
+wire, matching the Q14 UCHAR waveform bug in the opposite signedness direction.
 
 ## Review Log
 
@@ -530,3 +592,41 @@ Dispositions requiring judgment (not blind parity fixes):
 - Q14 — cross-crate structural (`DbFieldType` UChar). Assess scope; may be its
   own change.
 - Q15 — latent (AMSG unmodeled). Deferred until AMSG is modeled end-to-end.
+
+### Round 2 (2026-07-01) — fix-verification pass (four opus panels)
+Four parallel opus reviewers verified the Round-1 fix commits against pvxs
+(categories: config-parse, group-runtime, single-record, type/wire). Every
+load-bearing reviewer claim was ground-verified against the actual
+pvxs/epics-base source before acting — all four held:
+
+1. **Q1 (config-parse) — false-parity artifacts corrected, divergence
+   documented.** The Rust field-path parser rejects `value[]`, `value[ 5]`,
+   negative, and overflow subscripts that pvxs's `strtol`-based
+   `fieldName.cpp:29-67` accepts (`[]` → element 0; `[ 5]` → 5; negative/
+   overflow accepted then failing at navigation). These are intentionally
+   stricter — the "don't copy C's bugs" steer applies, behavior kept — so the
+   fix was documentation-only: removed the false "matches strtol" claim, added
+   an authoritative divergence note (d62d063a / doc corrections).
+2. **Q2 (config-parse) — false NoConvert-throw claim corrected.** The
+   annotation-coercion divergence: pvxs's yajl `_CC_CHK` cancels only on a
+   falsy 0, so the `yajlProcess` `-1` return on an `as<T>()` NoConvert
+   exception is SWALLOWED (a pvxs bug — `groupconfigprocessor.cpp:1048-1059` +
+   `yajl_parser.c:175-181`), and the group is served with the annotation
+   defaulted. Rust's per-group skip is intentionally stricter; documented, not
+   changed (d5a63519 / doc corrections).
+3. **Q27 (single-record) — genuine test-coverage gap closed.** The Force+block
+   fix had only a primitive test on `process_record_with_notify`; nothing
+   exercised the `BridgeChannel::put_with_options` Force arm that wires into it.
+   Added the bridge end-to-end twin (136e7d72).
+4. **Q52 (type/wire) — genuine distinct bug fixed.** `native_source.rs` served
+   `DBF_CHAR` as unsigned `ubyte` on all four value/descriptor sites where pvxs
+   maps `DBR_CHAR -> Int8` (the Q14 sibling (b) deferred earlier). Fixed
+   (de500251); the qsrv bridge already had it right, only the native path
+   diverged.
+
+Also recorded as a tracked residual (not fixed, symmetric with accepted
+BR-R15): the Q50 atomic-GET advisory gate does not cover DB-internal
+output-link writes to a group member (`write_db_link_value` uses
+`put_pv_already_locked`, no gate), so that writer class can still tear the
+snapshot — closed in pvxs by the DB-link lockset + `DBManyLock`, deferred here
+exactly as BR-R15 deferred the PUT-side twin.

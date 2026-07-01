@@ -409,7 +409,21 @@ read(B) — a snapshot with B updated and A stale. Defeats the atomicity the
 not GET-vs-PUT.
 
 ### Q51: Group PUT enforces per-member write ACF on proc members; pvxs never checks canWrite for proc
-Severity: Medium — OPEN
+Severity: Medium — CLEARED
+Resolution: the group PUT's per-member write-ACF loop now skips `proc` members.
+That loop mirrors pvxs `doFieldPreProcessing` (`canWrite`, iocsource.cpp:382),
+which pvxs runs only for a `changing` field — `marked && putable` with a
+`field.value` (groupsource.cpp:557,564). A proc member has no value field, so it
+is never `changing` and `canWrite` is never checked for it, while its record is
+still processed unconditionally (`doPostProcessing`, :568). Gating a processing
+trigger on write access is a category error (`dbProcess` is not a `dbPutField`),
+so a client with group-PUT rights but no write permission on the proc member's
+backing record now triggers processing and gets a normal reply, matching pvxs
+(and correcting a reverse divergence where Rust wrongly rejected). The DISP/
+read-only prep gate (`doPreProcessing`, groupsource.cpp:599-602) still runs for
+every channeled member including proc — unchanged. Regression:
+`q51_group_put_does_not_write_acf_check_proc_member` (a write-denied proc member
+does not block the PUT and its record is still processed, INIT 0→1).
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:1376-1397` (per-member
 `write_grant` check runs for every active channeled member, including
 `FieldMapping::Proc`, always active per `:1327`).

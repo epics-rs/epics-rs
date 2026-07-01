@@ -1494,6 +1494,21 @@ impl GroupChannel {
             if !member_is_active(m) {
                 continue;
             }
+            // A `proc` member is a processing TRIGGER, not a value write:
+            // pvxs runs the write-ACF gate `doFieldPreProcessing`
+            // (`canWrite`, iocsource.cpp:382) only for a `changing` field —
+            // `marked && putable` with a `field.value`
+            // (groupsource.cpp:557,564) — and a proc member has no value
+            // field, so it is never `changing` and `canWrite` is never
+            // checked for it, while its record is still processed
+            // unconditionally (`doPostProcessing`, :568). Gating a proc
+            // trigger on write access is a category error (`dbProcess` is not
+            // a `dbPutField`); skip the per-member write-ACF check for proc,
+            // matching pvxs. Its DISP/read-only prep gate (`doPreProcessing`)
+            // still ran in the precondition pass above.
+            if m.mapping == FieldMapping::Proc {
+                continue;
+            }
             if m.channel.is_empty() {
                 // Structure / Const members have no backing channel
                 // to security-check; pvxs skips these in the
@@ -4776,6 +4791,86 @@ mod tests {
         assert!(
             matches!(res, Err(BridgeError::PutRejected(_))),
             "full PUT including denied member b must be rejected, got {res:?}"
+        );
+    }
+
+    /// Regression (Q51): a group PUT must NOT enforce per-member write ACF on a
+    /// `proc` member. pvxs runs the write-ACF gate `doFieldPreProcessing`
+    /// (`canWrite`) only for a `changing` value field (groupsource.cpp:564); a
+    /// proc member is never `changing` (no `field.value`), so a client with
+    /// group-PUT rights but NO write permission on the proc member's backing
+    /// record still triggers processing and gets a normal reply
+    /// (`doPostProcessing`, :568). Pre-fix Rust resolved a `write_grant` for
+    /// the always-active proc member and a single denial failed the whole PUT.
+    #[tokio::test]
+    async fn q51_group_put_does_not_write_acf_check_proc_member() {
+        use super::super::provider::{AccessContext, AccessControl};
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        // Deny writes to the proc member's backing channel only.
+        struct DenyChannel(&'static str);
+        impl AccessControl for DenyChannel {
+            fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+                channel != self.0
+            }
+        }
+
+        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
+            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("VAL:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("HOOK:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "PROC:ACF:GRP": {
+                "+atomic": false,
+                "v":  {"+type":"plain","+channel":"VAL:rec.VAL","+putorder":0},
+                "go": {"+type":"proc","+channel":"HOOK:rec"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+
+        // The proc member's channel is write-denied; the value member is writable.
+        let access =
+            AccessContext::with_identity(Arc::new(DenyChannel("HOOK:rec")), "u".into(), "h".into());
+        let channel = GroupChannel::new(db.clone(), def).with_access(access);
+
+        assert_eq!(
+            init_flag(&db, "HOOK:rec").await,
+            0,
+            "proc target unprocessed at start"
+        );
+
+        // PUT marking the writable value member; the write-denied proc member
+        // must NOT block the PUT and must still be processed.
+        let mut put = PvStructure::new("structure");
+        put.fields
+            .push(("v".into(), PvField::Scalar(ScalarValue::Double(5.0))));
+        channel
+            .put_with_options(
+                &put,
+                super::super::channel::PutOptions::default(),
+                Some(false),
+            )
+            .await
+            .expect("group PUT must succeed: a write-denied proc member is not write-ACF checked");
+
+        assert_eq!(
+            init_flag(&db, "HOOK:rec").await,
+            1,
+            "the proc member's record was processed despite the write deny"
         );
     }
 }

@@ -1469,4 +1469,132 @@ mod tests {
             .expect("unfiltered channel must create");
         assert!(ch.channel_filters.is_empty());
     }
+
+    // ---- Force + block (record[process=true,block=true]) end-to-end wiring ----
+
+    /// End-to-end proof that `put_with_options(Force, block)` routes a
+    /// *synchronous* forced put through the put-notify barrier
+    /// (`process_record_with_notify`) and returns only after the full
+    /// processing cycle — including the OUT link write — has run. This is the
+    /// `BridgeChannel` PUT-path twin of the `epics-base-rs`
+    /// `force_block_sync_record_returns_none_and_processes` primitive test:
+    /// the primitive proves the database method drives the OUT link; this
+    /// proves the bridge Force+block branch actually calls it.
+    #[tokio::test]
+    async fn put_force_block_sync_drives_out_link_before_returning() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TGT0", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // scalcout ODLY=0: CALC="42" ⇒ VAL=OVAL=42, OOPT=Every ⇒ OUT fires
+        // with no delay, so the whole cycle (incl. the OUT write) is synchronous.
+        let mut sc = ScalcoutRecord::default();
+        sc.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
+        sc.oopt = 0;
+        sc.put_field("ODLY", EpicsValue::Double(0.0)).unwrap();
+        sc.put_field("OUT", EpicsValue::String("TGT0".into()))
+            .unwrap();
+        db.add_record("SC0", Box::new(sc)).await.unwrap();
+
+        let ch = BridgeChannel::new(db.clone(), "SC0")
+            .await
+            .expect("channel over scalcout VAL must create");
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        ch.put_with_options(
+            &put,
+            PutOptions {
+                process: ProcessMode::Force,
+                block: true,
+            },
+        )
+        .await
+        .expect("forced blocking put must succeed");
+
+        // The barrier held until processing finished: the OUT link drove
+        // TGT0.VAL = 42 before the PUT returned.
+        let tgt = db.get_record("TGT0").await.unwrap();
+        let v = tgt.read().await.record.get_field("VAL");
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(42.0)),
+            "Force+block must have driven the OUT write before returning, got {v:?}"
+        );
+    }
+
+    /// End-to-end proof that `put_with_options(Force, block)` HOLDS the reply
+    /// barrier for an *async* record: with ODLY=100 s the record stays PACT
+    /// across the (un-fireable-in-test) delay, so the put-notify completion
+    /// never arrives and the PUT future must not resolve. A regression that
+    /// reverted the Force+block branch to the bare `process_record_with_links`
+    /// (which returns as soon as the record goes PACT) would let the PUT
+    /// return immediately — the timeout below would NOT fire and this test
+    /// would fail. The timeout firing is the barrier proof.
+    #[tokio::test]
+    async fn put_force_block_async_holds_barrier_until_processing_done() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TGT1", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // ODLY=100 s: the OUT write is deferred and the record stays PACT
+        // across the (un-fireable-in-test) delay — the async shape a blocking
+        // forced put must wait on.
+        let mut sc = ScalcoutRecord::default();
+        sc.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
+        sc.oopt = 0;
+        sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
+        sc.put_field("OUT", EpicsValue::String("TGT1".into()))
+            .unwrap();
+        db.add_record("SC1", Box::new(sc)).await.unwrap();
+
+        let ch = BridgeChannel::new(db.clone(), "SC1")
+            .await
+            .expect("channel over scalcout VAL must create");
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        let putting = ch.put_with_options(
+            &put,
+            PutOptions {
+                process: ProcessMode::Force,
+                block: true,
+            },
+        );
+        // The barrier must hold: the put future cannot resolve while the
+        // record is PACT on the 100 s delay. If it resolves, the Force+block
+        // wiring regressed to a non-blocking process call.
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), putting).await;
+        assert!(
+            outcome.is_err(),
+            "Force+block put must NOT return while the async record is PACT; \
+             it returned {outcome:?} — the reply barrier regressed"
+        );
+
+        // The barrier is genuinely async-pending: DLYA armed, OUT still deferred.
+        let sc_rec = db.get_record("SC1").await.unwrap();
+        let dlya = sc_rec.read().await.record.get_field("DLYA");
+        assert_eq!(
+            dlya,
+            Some(EpicsValue::Short(1)),
+            "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
+        );
+        let tgt = db.get_record("TGT1").await.unwrap();
+        let v = tgt.read().await.record.get_field("VAL");
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(0.0)),
+            "OUT must stay deferred until the delay completes, got {v:?}"
+        );
+    }
 }

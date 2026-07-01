@@ -213,7 +213,22 @@ prior review confirmed three-way routing "faithful"
 precondition applies to all three routes.
 
 ### Q26: Read access-security enforced on GET/MONITOR, which pvxs QSRV2 single-source never applies
-Severity: Medium — OPEN (reverse divergence; disposition needed)
+Severity: Medium — CLEARED (disposition: KEEP the stricter Rust behavior)
+Disposition: KEEP Rust's `can_read` gate on group/single GET and monitor-create;
+no code change. Read access-security is a legitimate, long-standing EPICS control
+— classic RSRV (the CA server) enforces it via `asCheckGet`
+(`epics-base/modules/database/src/ioc/rsrv/camessage.c`), and an `.acf` author
+writing a READ rule reasonably expects it to be honored on the pvAccess side
+too. pvxs QSRV2 omitting the read check (verified: `SecurityClient` exposes only
+`canWrite`/`asCheckPut`; no `canRead`/`asCheckGet` anywhere in `pvxs/ioc/`) is a
+security gap, not a behavior to copy — the campaign's rule is "find divergences
+from C but do not copy C's bugs." Distinguished from Q51 (also reverse-direction,
+but FIXED toward pvxs): Q51's per-member write-ACF on a `proc` member was a
+category error (`dbProcess` is not a value write, so write-ACF simply does not
+apply); Q26's read-ACF is a genuine security control whose enforcement loses
+nothing and matches classic CA. Relaxing to pvxs would remove a real control and
+diverge from RSRV, so the stricter, security-positive behavior stands. Reversible
+by the user if exact pvxs read-open parity is later required.
 Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:748` (`get` `can_read`) and
 `:828` (`create_monitor_with_value_mask` `can_read`).
 C ref: `pvxs/ioc/securityclient.cpp:42` (`SecurityClient` exposes only
@@ -223,8 +238,8 @@ Impact: pvxs QSRV2 single source never enforces read access-security — GET and
 MONITOR are served regardless of ASG READ rules. Rust adds `can_read` gates in
 both `get` and monitor-create. With an `.acf` whose ASG grants only WRITE (a
 shape relying on QSRV's read-open behavior), Rust denies reads/monitors pvxs
-would serve. **Reverse-direction** (Rust stricter). Disposition: decide keep
-(security-positive) + document vs. relax to C. Surface for sign-off.
+would serve. **Reverse-direction** (Rust stricter), kept as security-positive
+(matches classic RSRV `asCheckGet`).
 
 ### Q27: `block=true` completion barrier skipped when combined with `process=true` (Force)
 Severity: Medium — CLEARED

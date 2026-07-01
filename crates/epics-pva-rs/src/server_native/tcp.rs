@@ -2047,7 +2047,12 @@ fn spawn_monitor_subscriber(
             loop {
                 let executing = *exec_rx.borrow_and_update();
                 let has_work = seed_cooked.is_some() || !pending.is_empty();
-                if !source_open && (!has_work || !executing) {
+                // Executing-gated terminal FINISH (see the decoded path): an
+                // Idle/never-STARTed monitor holds the backlog and the finish
+                // until a later START rather than emitting FINISH on source-close,
+                // matching pvxs servermon.cpp:82,142-154. Teardown still aborts
+                // the waiting task.
+                if !source_open && executing && !has_work {
                     break;
                 }
                 tokio::select! {
@@ -2210,7 +2215,16 @@ fn spawn_monitor_subscriber(
         let mut source_open = true;
         loop {
             let executing = *exec_rx.borrow_and_update();
-            if !source_open && (pending.is_empty() || !executing) {
+            // The terminal FINISH is Executing-gated, exactly like every DATA
+            // frame: pvxs holds both the backlog and the finish until the client
+            // is Executing (servermon.cpp:82,142-154). Break — and so send the
+            // post-loop FINISH — only once the source is closed AND we are
+            // Executing AND the backlog has drained. An Idle or never-STARTed
+            // monitor whose PV closes therefore accrues the finish instead of
+            // emitting FINISH and abandoning `pending`; a later START flushes the
+            // backlog then finishes. Teardown (DESTROY / disconnect) still aborts
+            // the task via `monitor_abort` while it waits for that START.
+            if !source_open && executing && pending.is_empty() {
                 break;
             }
             tokio::select! {
@@ -10225,6 +10239,22 @@ mod tests {
         out
     }
 
+    /// True if `resp` is a MONITOR FINISH frame (subcmd `0x10`).
+    #[cfg(test)]
+    fn pvx61_is_finish(resp: &[u8], order: ByteOrder) -> bool {
+        let Ok(Some((frame, _))) = try_parse_frame(resp) else {
+            return false;
+        };
+        if frame.header.command != Command::Monitor.code() {
+            return false;
+        }
+        let mut cur = frame.cursor();
+        if cur.get_u32(order).is_err() {
+            return false;
+        }
+        matches!(cur.get_u8(), Ok(0x10))
+    }
+
     /// INIT->START accrual + ordering. Posts B, C, D arriving in the
     /// INIT->START window are delivered in order (A(seed), B, C, D) at the
     /// first START. Pre-fix the subscriber spawned only at START, so the
@@ -10684,6 +10714,110 @@ mod tests {
             .expect("teardown fires within 2s")
             .expect("MonitorFinished");
         assert_eq!(fin.ioid, ioid, "the never-started op is torn down on drop");
+    }
+
+    /// Source-close while Idle holds the backlog AND the finish. An
+    /// Idle/never-STARTed monitor whose PV closes must NOT emit MONITOR
+    /// FINISH — pvxs gates emission on `state==Executing` and holds both the
+    /// backlog and the finish until a later START (servermon.cpp:82,142-154).
+    /// Pre-fix the terminal FINISH was ungated on Executing, so an Idle-close
+    /// emitted FINISH immediately and abandoned the accrued backlog. Newly
+    /// reachable because the subscriber now runs from INIT.
+    #[tokio::test]
+    async fn pvx61_source_close_while_idle_holds_backlog_until_start() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (11u32, 710u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Posts arrive while the monitor is Idle (INIT->START window).
+        for i in 1..=3 {
+            pusher.try_post(three_field_value(i, 0, 0));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The PV closes while the monitor is STILL Idle (never STARTed): the
+        // subscriber's source channel ends but no START has arrived.
+        pusher.close();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Invariant: an Idle monitor emits NOTHING on source-close — no
+        // FINISH, no DATA. The backlog and the finish are held for a START.
+        assert!(
+            rx.try_recv().is_err(),
+            "an Idle (pre-START) monitor must not emit FINISH when the source \
+             closes — the backlog and finish are held until a START"
+        );
+
+        // START flips Executing: the held backlog flushes in order, THEN the
+        // terminal FINISH follows.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Classify every drained frame in order: DATA field-`a` values, and
+        // whether the terminal FINISH followed the whole backlog.
+        let mut data = Vec::new();
+        let mut saw_finish = false;
+        let mut finish_after_all_data = true;
+        while let Ok(buf) = rx.try_recv() {
+            if let Some(a) = pvx61_decode_data_a(&buf, &intro, order) {
+                if saw_finish {
+                    finish_after_all_data = false; // DATA after FINISH — wrong order
+                }
+                data.push(a);
+            } else if pvx61_is_finish(&buf, order) {
+                saw_finish = true;
+            }
+        }
+        assert_eq!(
+            data,
+            vec![0, 1, 2, 3],
+            "the backlog held across the Idle source-close must flush in order \
+             at START (pre-fix it was dropped); got {data:?}"
+        );
+        assert!(
+            saw_finish,
+            "MONITOR FINISH must follow the flushed backlog once the source is \
+             closed and the monitor reaches Executing"
+        );
+        assert!(
+            finish_after_all_data,
+            "FINISH must arrive AFTER the whole backlog, not interleaved"
+        );
     }
 
     /// Build a raw MONITOR DATA event (`changed | value | overrun`) for

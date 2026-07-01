@@ -602,19 +602,21 @@ impl UpstreamManager {
                 }
             };
 
-        // read initial upstream write-access and create a flag
+        // read initial upstream read+write access and create the flags
         // the access hook AND write-hook closures share. `channel.info()`
         // reads a cached snapshot — no round-trip — and succeeds here
         // because `channel.get()` above already waited for connection.
         // Defaults to true (permissive) on the rare timeout/error path so
-        // we match the C gateway's connect-time behaviour (activate() calls
-        // ca_write_access only after the channel is operational).
-        let upstream_write_init = channel
-            .info()
-            .await
-            .map(|i| i.access_rights.write)
-            .unwrap_or(true);
+        // we match the C gateway's connect-time behaviour (activate() reads
+        // ca_read_access/ca_write_access only after the channel is
+        // operational). One `info()` snapshot feeds both flags so read and
+        // write can't come from inconsistent reads.
+        let (upstream_read_init, upstream_write_init) = match channel.info().await {
+            Ok(i) => (i.access_rights.read, i.access_rights.write),
+            Err(_) => (true, true),
+        };
         let upstream_write = Arc::new(AtomicBool::new(upstream_write_init));
+        let upstream_read = Arc::new(AtomicBool::new(upstream_read_init));
 
         // Atomically register the shadow PV WITH its WriteHook
         // attached. `add_pv_with_hook` constructs the PV with the
@@ -644,6 +646,7 @@ impl UpstreamManager {
             acl.clone(),
             self.write_env.access.clone(),
             upstream_write.clone(),
+            upstream_read.clone(),
         );
         // If a prior subscribe attempt left a stale shadow entry (it
         // would have been cleaned up by the failure path, but a hot
@@ -796,11 +799,18 @@ impl UpstreamManager {
         // callback does not wake every client; the downstream side applies
         // the further `oldaccess != access` filter.
         let access_rights_watcher = channel.on_access_rights_change({
-            let flag = upstream_write.clone();
+            let write_flag = upstream_write.clone();
+            let read_flag = upstream_read.clone();
             let notifier = self.access_notifier.clone();
             move |rights| {
-                let prev = flag.swap(rights.write, Ordering::Relaxed);
-                if prev != rights.write {
+                // C accessCB (gatePv.cc:1851-1852) updates BOTH read and
+                // write from ca_read_access/ca_write_access; postAccessRights
+                // re-pushes when the computed level changed on either bit.
+                // Track both flags and wake downstream clients if either
+                // flipped.
+                let prev_w = write_flag.swap(rights.write, Ordering::Relaxed);
+                let prev_r = read_flag.swap(rights.read, Ordering::Relaxed);
+                if prev_w != rights.write || prev_r != rights.read {
                     if let Some(n) = notifier.load_full() {
                         n.notify();
                     }
@@ -1428,14 +1438,18 @@ impl UpstreamManager {
 /// the access-rights report matches what the write hook will actually
 /// enforce.
 ///
-/// `upstream_write` mirrors the upstream IOC's `ca_write_access(chID)`,
-/// set at connect time and kept live by `on_access_rights_change`. The write
-/// decision is now `local_acf_write && upstream_write`, matching C
-/// `gateVcChan::writeAccess` (gateVc.cc:341): `asclient->writeAccess() && vc->writeAccess()`.
+/// `upstream_write`/`upstream_read` mirror the upstream IOC's
+/// `ca_write_access(chID)`/`ca_read_access(chID)`, set at connect time and
+/// kept live by `on_access_rights_change`. The decisions are
+/// `local_acf_write && upstream_write` and `local_acf_read && upstream_read`,
+/// matching C `gateVcChan::writeAccess`/`readAccess` (gateVc.cc:341/326):
+/// `asclient->writeAccess() && vc->writeAccess()` /
+/// `asclient->readAccess() && vc->readAccess()`.
 fn build_access_hook(
     acl: PvAclCell,
     access: Arc<ArcSwap<AccessConfig>>,
     upstream_write: Arc<AtomicBool>,
+    upstream_read: Arc<AtomicBool>,
 ) -> epics_base_rs::server::pv::AccessHook {
     Arc::new(move |user: &str, host: &str| {
         let cfg = access.load();
@@ -1444,7 +1458,8 @@ fn build_access_hook(
         let pv_acl = acl.load();
         let asg_ref = pv_acl.asg.as_deref().unwrap_or("DEFAULT");
         let asl = pv_acl.asl;
-        let read = cfg.can_read(asg_ref, asl, user, host);
+        let local_read = cfg.can_read(asg_ref, asl, user, host);
+        let read = local_read && upstream_read.load(Ordering::Relaxed);
         let local_write = if user.is_empty() && cfg.has_rules() {
             false
         } else {
@@ -2120,11 +2135,12 @@ ASG(DEFAULT) {
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
         let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl {
             asg: Some("DEFAULT".to_string()),
             asl: 0,
         }));
-        let hook = build_access_hook(acl, access, upstream_write);
+        let hook = build_access_hook(acl, access, upstream_write, upstream_read);
 
         // Privileged user: read granted, write denied (no WRITE rule).
         let alice = hook("alice", "host1");
@@ -2151,8 +2167,9 @@ ASG(DEFAULT) {
     fn br_fr1_access_hook_allow_all_grants_both() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
-        let hook = build_access_hook(acl, access, upstream_write);
+        let hook = build_access_hook(acl, access, upstream_write, upstream_read);
         let d = hook("anyone", "anywhere");
         assert!(d.read && d.write, "allow-all must grant read and write");
     }
@@ -2165,8 +2182,9 @@ ASG(DEFAULT) {
     fn br_r51_upstream_write_denied_overrides_local_acf_allow() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let upstream_write = Arc::new(AtomicBool::new(false));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
-        let hook = build_access_hook(acl, access, upstream_write.clone());
+        let hook = build_access_hook(acl, access, upstream_write.clone(), upstream_read);
 
         let d = hook("alice", "host1");
         assert!(d.read, "read must still be granted by allow-all");
@@ -2179,6 +2197,33 @@ ASG(DEFAULT) {
         upstream_write.store(true, Ordering::Relaxed);
         let d2 = hook("alice", "host1");
         assert!(d2.write, "write must be granted once upstream restores it");
+    }
+
+    /// GW-40: read-access must bridge the upstream IOC's `ca_read_access`
+    /// symmetrically with write — `local_acf_read && upstream_read` — so an
+    /// upstream that revokes read to the gateway's client reports read=false
+    /// downstream even under a local allow-all ACF. Mirrors C
+    /// `gateVcChan::readAccess` (gateVc.cc:326):
+    /// `asclient->readAccess() && vc->readAccess()`.
+    #[test]
+    fn br_gw40_upstream_read_denied_overrides_local_acf_allow() {
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(false));
+        let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
+        let hook = build_access_hook(acl, access, upstream_write, upstream_read.clone());
+
+        let d = hook("alice", "host1");
+        assert!(
+            !d.read,
+            "upstream read-denied must override local allow-all"
+        );
+        assert!(d.write, "write must still be granted by allow-all");
+
+        // Restoring upstream read-access restores read permission.
+        upstream_read.store(true, Ordering::Relaxed);
+        let d2 = hook("alice", "host1");
+        assert!(d2.read, "read must be granted once upstream restores it");
     }
 
     /// the access hook must enforce the LIVE per-PV ASG/ASL, not the one
@@ -2203,11 +2248,12 @@ ASG(NewGroup) {
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
         let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl {
             asg: Some("OldGroup".to_string()),
             asl: 1,
         }));
-        let hook = build_access_hook(acl.clone(), access, upstream_write);
+        let hook = build_access_hook(acl.clone(), access, upstream_write, upstream_read);
 
         // Under OldGroup, alice has READ; bob does not.
         assert!(hook("alice", "h").read, "OldGroup grants alice READ");

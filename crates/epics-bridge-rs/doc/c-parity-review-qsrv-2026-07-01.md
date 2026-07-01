@@ -116,7 +116,14 @@ message — but when AMSG is modeled, `build_alarm` must prefer it. Deferred:
 closing requires modeling AMSG end-to-end.
 
 ### Q25: DISP `S_db_putDisabled` (and SPC_NOMOD read-only) gate bypassed for `process=true`/`process=false` single-record puts
-Severity: Blocker — OPEN
+Severity: Blocker — CLEARED (56cc44e4)
+Resolution: a shared `PvDatabase::check_external_put_preconditions` gate
+(DISP≠DISP-field → PutDisabled; read-only field → ReadOnlyField; silent on
+missing record so the downstream put reports not-found inside its own
+`asTrapWrite` bracket) now runs at the top of `channel.rs::put_with_options`
+before the ACF grant — mirroring C's `doPreProcessing` order — so all three
+process modes enforce it. Regression:
+`testqsingle.rs::disp_disabled_record_rejects_put_in_every_process_mode`.
 Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:688` (Inhibit `put_pv`) and
 `:722` (Force `put_pv`).
 C ref: `pvxs/ioc/iocsource.cpp:367` (`doPreProcessing`: `precord->disp &&

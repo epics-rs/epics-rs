@@ -848,6 +848,20 @@ async fn connect_server(
 
     let (write_tx, write_rx) = mpsc::unbounded_channel();
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // C `tcpiiu::unresponsiveCircuit` (`tcpiiu.cpp:899-940`): a single
+    // circuit-level flag shared by BOTH the send and receive watchdogs.
+    // `sendTimeoutNotify` (send stall) and `receiveTimeoutNotify` /
+    // echo-timeout (recv stall) both funnel through
+    // `unresponsiveCircuitNotify`, which sets it exactly once and marks
+    // the channels unresponsive; `responsiveCircuitNotify` clears it on
+    // the echo reply. Mirroring that single owner lets the write loop's
+    // send-stall detection and the read loop's echo watchdog cooperate:
+    // whichever observes the stall first performs the one-shot
+    // `CircuitUnresponsive` transition, and the read loop's data-arrival
+    // path performs the sole `CircuitResponsive` recovery — so a stall
+    // first seen on the send side still recovers when replies resume on
+    // the read side.
+    let unresponsive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
 
     // Build initial CA handshake.
@@ -909,6 +923,7 @@ async fn connect_server(
             priority,
             event_tx.clone(),
             pending_frames.clone(),
+            unresponsive.clone(),
         ));
         let read_task = epics_base_rs::runtime::task::spawn(read_loop(
             reader,
@@ -919,6 +934,7 @@ async fn connect_server(
             beacon_arrival_rx,
             in_flight.clone(),
             last_rx_at.clone(),
+            unresponsive.clone(),
         ));
         (read_task, write_task)
     } else {
@@ -930,6 +946,7 @@ async fn connect_server(
             priority,
             event_tx.clone(),
             pending_frames.clone(),
+            unresponsive.clone(),
         ));
         let read_task = epics_base_rs::runtime::task::spawn(read_loop(
             reader,
@@ -940,6 +957,7 @@ async fn connect_server(
             beacon_arrival_rx,
             in_flight.clone(),
             last_rx_at.clone(),
+            unresponsive.clone(),
         ));
         (read_task, write_task)
     };
@@ -954,6 +972,7 @@ async fn connect_server(
             priority,
             event_tx.clone(),
             pending_frames.clone(),
+            unresponsive.clone(),
         ));
         let read_task = epics_base_rs::runtime::task::spawn(read_loop(
             reader,
@@ -964,6 +983,7 @@ async fn connect_server(
             beacon_arrival_rx,
             in_flight.clone(),
             last_rx_at.clone(),
+            unresponsive.clone(),
         ));
         (read_task, write_task)
     };
@@ -984,106 +1004,101 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    unresponsive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Send watchdog deadline. C `tcpSendWatchdog`
-    // (`libca/tcpSendWatchdog.cpp:43-64`) fires after `connTMO`
-    // (`EPICS_CA_CONN_TMO`, default 30 s) and calls
-    // `iiu.sendTimeoutNotify` → `unresponsiveCircuitNotify`. The
-    // critical detail is that C's send is a *blocking* `::send`
-    // (`tcpiiu.cpp:232`, `flushToWire`): the watchdog runs as a
-    // separate liveness probe alongside a send that is never
-    // abandoned mid-frame — `flushToWire` either completes a whole
-    // `comBuf` or fails. C therefore never leaves a truncated CA
-    // frame on the wire and then keeps writing.
+    // Send watchdog. C `tcpSendWatchdog` (`libca/tcpSendWatchdog.cpp:43-64`)
+    // fires after `connTMO` (`EPICS_CA_CONN_TMO`, default 30 s) and calls
+    // `iiu.sendTimeoutNotify` → `unresponsiveCircuitNotify`
+    // (`tcpiiu.cpp:879-940`): it marks the circuit unresponsive, arms an
+    // echo probe, and KEEPS the socket. The send side never tears the
+    // circuit down — a permanently dead circuit is closed by the RECEIVE
+    // watchdog (echo-timeout in `read_loop`), never the send watchdog.
     //
-    // Tokio's `timeout(send_timeout, write_all(&batch))` is NOT
-    // equivalent: when the timeout fires the `write_all` future is
-    // *cancelled*, possibly after a prefix of a CA frame has already
-    // reached the socket. Continuing to write later batches on the
-    // same stream would append after that truncated frame and
-    // desynchronize the server's parser. This arm was changed to
-    // emit `CircuitUnresponsive` and keep the socket — that is only
-    // safe for the read-side echo watchdog, where no bytes were
-    // corrupted, not for a cancelled write. So on write timeout we
-    // close the circuit (`TcpClosed`), exactly as `origin/main` did:
-    // `handle_disconnect` then drains the pending read/write waiters
-    // (no silently-dropped frames) and the reconnect path rebuilds a
-    // clean stream. This mirrors C's send-error path, where a
-    // `flushToWire` failure makes `sendThreadFlush` return false →
-    // the send thread breaks and `shutdown(sock, SHUT_WR)` tears the
-    // circuit down (`tcpiiu.cpp:168-176`, `:1684-1690`).
+    // Matching that requires not abandoning a partial CA frame on a stall.
+    // `write_all` cannot: `timeout(.., write_all(&batch))` cancels the
+    // future mid-frame and loses the bytes-written count, so the stream
+    // could only be discarded (the previous behaviour). Instead we drive
+    // the flush ourselves with `writer.write(&batch[written..])` and carry
+    // `written` across stalls. `timeout` reports `Err` only when the inner
+    // `write` was genuinely `Pending`, and a `Pending` `poll_write` wrote
+    // 0 bytes per the `AsyncWrite` contract — so on a send-watchdog expiry
+    // `written` is exact and we resume the SAME batch from that offset. No
+    // byte is ever re-sent, so the server parser never desyncs. A real
+    // socket error (`Err`) or a 0-byte accept still closes (`TcpClosed`):
+    // those are a dead socket, not a slow one, mirroring C's `flushToWire`
+    // failure → `shutdown(SHUT_WR)` teardown (`tcpiiu.cpp:168-176`).
     let send_timeout = echo_idle();
     let mut batch = Vec::with_capacity(4096);
     while let Some(frame) = rx.recv().await {
         let mut drained: usize = 1;
+        batch.clear();
         batch.extend_from_slice(&frame);
-        // Drain all pending frames into a single write
+        // Coalesce all queued frames into a single flush.
         while let Ok(frame) = rx.try_recv() {
             batch.extend_from_slice(&frame);
             drained += 1;
         }
-        match tokio::time::timeout(send_timeout, writer.write_all(&batch)).await {
-            Ok(Ok(())) => {
-                batch.clear();
-                // `pending_frames` is the local backpressure
-                // counter that decides when `send_frame` should treat
-                // a stalled circuit as disconnected. Pre-fix the
-                // decrement used `load` + `store(prev - drained)`,
-                // which silently overwrites any concurrent
-                // `send_frame::fetch_add` landing between the two
-                // operations — under sustained producer activity the
-                // counter drifted below the real queued-frame count
-                // and the SEND_BACKPRESSURE_FRAMES threshold stopped
-                // firing reliably. `fetch_sub` is the atomic
-                // equivalent and never loses a concurrent increment.
-                // `saturating_sub` semantics: a `read_loop` frame
-                // (echo / flow control) bypasses `send_frame`'s
-                // increment, so the counter occasionally undershoots
-                // `drained`; `fetch_sub` would wrap on underflow, so
-                // pre-clamp with a CAS loop.
-                let mut current = pending_frames.load(std::sync::atomic::Ordering::Relaxed);
-                loop {
-                    let next = current.saturating_sub(drained);
-                    match pending_frames.compare_exchange_weak(
-                        current,
-                        next,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(observed) => current = observed,
+        // Flush the whole batch, resuming across send-watchdog stalls
+        // without abandoning a partial frame.
+        let mut written = 0usize;
+        while written < batch.len() {
+            match tokio::time::timeout(send_timeout, writer.write(&batch[written..])).await {
+                Ok(Ok(0)) => {
+                    // Peer will accept no more bytes — dead socket.
+                    let _ = event_tx.send(TransportEvent::TcpClosed {
+                        server_addr,
+                        priority,
+                    });
+                    return;
+                }
+                Ok(Ok(n)) => {
+                    written += n;
+                }
+                Ok(Err(_)) => {
+                    // True socket error — circuit is dead.
+                    let _ = event_tx.send(TransportEvent::TcpClosed {
+                        server_addr,
+                        priority,
+                    });
+                    return;
+                }
+                Err(_) => {
+                    // Send watchdog: no write progress within `connTMO`.
+                    // C `sendTimeoutNotify` → `unresponsiveCircuitNotify`:
+                    // mark the circuit unresponsive (once, via the flag
+                    // shared with the read loop's echo watchdog) and KEEP
+                    // the socket. The cancelled `write` was `Pending`, so
+                    // `written` is exact — loop and resume the batch from
+                    // `written`. Recovery (`CircuitResponsive`) and the
+                    // dead-circuit close are both owned by `read_loop`; on
+                    // teardown `ServerConnection::drop` aborts this task,
+                    // so a forever-stalled write cannot leak.
+                    if !unresponsive.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let _ = event_tx.send(TransportEvent::CircuitUnresponsive {
+                            server_addr,
+                            priority,
+                        });
                     }
                 }
             }
-            Ok(Err(_)) => {
-                // True socket error (write_all returned Err) — circuit
-                // is dead, signal close.
-                let _ = event_tx.send(TransportEvent::TcpClosed {
-                    server_addr,
-                    priority,
-                });
-                return;
-            }
-            Err(_) => {
-                // write-side timeout. `write_all` was
-                // cancelled by `timeout`, so a prefix of a CA frame
-                // may already be on the wire. The TCP stream is no
-                // longer a clean message boundary — keeping it and
-                // writing later batches would concatenate after a
-                // truncated frame and desync the server parser.
-                // Close the circuit: `handle_disconnect` (mod.rs)
-                // drains the pending read/write waiters so callers
-                // get a deterministic failure instead of hanging,
-                // and the reconnect path rebuilds a clean stream.
-                // The per-connection `pending_frames` backpressure
-                // counter is discarded with the dropped
-                // `ServerConnection`, so the stale count cannot
-                // leak into a future circuit.
-                let _ = event_tx.send(TransportEvent::TcpClosed {
-                    server_addr,
-                    priority,
-                });
-                return;
+        }
+        // Whole batch is on the wire — decrement the backpressure counter.
+        // `pending_frames` decides when `send_frame` should treat a stalled
+        // circuit as disconnected. `fetch_sub` via a saturating CAS loop
+        // never loses a concurrent `send_frame::fetch_add` (a plain
+        // `load`+`store` would) and never wraps on the occasional
+        // `read_loop` echo frame that bypassed `send_frame`'s increment.
+        let mut current = pending_frames.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(drained);
+            match pending_frames.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
             }
         }
     }
@@ -1099,6 +1114,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
+    unresponsive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used
     // both on idle expiry and on the first leg of an echo timeout.
@@ -1143,7 +1159,13 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // healthy-beacon watchdog refreshes so the deadline expires on
     // its own schedule. Cleared on any data arrival from the server.
     let mut beacon_anomaly = false;
-    let mut unresponsive_notified = false;
+    // Escalation counter for the echo probe: `false` on the first echo
+    // timeout (mark unresponsive + send a second probe), `true` on the
+    // second (declare the circuit dead). Distinct from the shared
+    // `unresponsive` flag, which is the circuit-level state — also set by
+    // the send watchdog in `write_loop` — and guards the one-shot
+    // `CircuitUnresponsive`/`CircuitResponsive` events.
+    let mut probe_escalated = false;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
     // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
@@ -1255,10 +1277,16 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     .unwrap_or(Duration::ZERO);
                 let suspend_wake = wall_skip >= suspend_threshold;
                 if echo_pending {
-                    if !unresponsive_notified {
-                        let _ = event_tx
-                            .send(TransportEvent::CircuitUnresponsive { server_addr, priority });
-                        unresponsive_notified = true;
+                    if !probe_escalated {
+                        // First echo timeout: perform the one-shot
+                        // unresponsive transition (shared with the send
+                        // watchdog — emit only if we win the swap), then
+                        // send a second probe before declaring death.
+                        if !unresponsive.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let _ = event_tx
+                                .send(TransportEvent::CircuitUnresponsive { server_addr, priority });
+                        }
+                        probe_escalated = true;
                         if send_echo(&write_tx, server_minor_version).is_err() {
                             let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                             return;
@@ -1319,6 +1347,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // Data received — circuit is alive. Mirrors libca
         // `messageArrivalNotify`: clear flags and refresh deadline.
         echo_pending = false;
+        probe_escalated = false;
         beacon_anomaly = false;
         deadline = tokio::time::Instant::now() + idle_timeout;
         sleep.as_mut().reset(deadline);
@@ -1327,8 +1356,12 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // parser later rejects still count as proof of liveness.
         // Read by `ca_receive_watchdog_delay` via the coordinator.
         last_rx_at.insert((server_addr, priority), std::time::Instant::now());
-        if unresponsive_notified {
-            unresponsive_notified = false;
+        // Recovery: clear the shared unresponsive state and emit the sole
+        // `CircuitResponsive`, whether the stall was first seen on the send
+        // watchdog (`write_loop`) or on this read loop's echo watchdog.
+        // Mirrors C `responsiveCircuitNotify`'s `if (unresponsiveCircuit)`
+        // guard (`tcpiiu.cpp:867`).
+        if unresponsive.swap(false, std::sync::atomic::Ordering::AcqRel) {
             let _ = event_tx.send(TransportEvent::CircuitResponsive {
                 server_addr,
                 priority,
@@ -1953,6 +1986,7 @@ mod read_loop_tests {
             beacon_rx,
             crate::client::types::InFlightOps::new(),
             std::sync::Arc::new(dashmap::DashMap::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -2276,6 +2310,7 @@ mod malformed_header_close_tests {
             ba_rx,
             in_flight,
             last_rx_at,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
 
         // 24-byte extended header: postsize=0xFFFF (extended marker),
@@ -2329,6 +2364,7 @@ mod malformed_header_close_tests {
             ba_rx,
             in_flight,
             last_rx_at,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -2359,29 +2395,29 @@ mod malformed_header_close_tests {
 
 #[cfg(test)]
 mod write_loop_timeout_tests {
-    //! a write-side timeout in `write_loop` must close the
-    //! circuit (`TcpClosed`) rather than emit `CircuitUnresponsive`
-    //! and keep writing on the same TCP stream. `tokio`'s
-    //! `timeout(.., write_all(&batch))` cancels the `write_all`
-    //! future on expiry, possibly after a prefix of a CA frame has
-    //! already reached the socket; reusing that stream would
-    //! concatenate later batches after a truncated frame and desync
-    //! the server parser. Closing forces the reconnect path to
-    //! rebuild a clean stream and lets `handle_disconnect` drain
-    //! the pending waiters with a deterministic failure.
+    //! R2-40: a send-side stall in `write_loop` must mark the circuit
+    //! unresponsive (`CircuitUnresponsive`) and KEEP the socket, resuming
+    //! the same batch when the peer drains — matching C `sendTimeoutNotify`
+    //! → `unresponsiveCircuitNotify` (`tcpiiu.cpp:879-940`), which keeps
+    //! the socket and echo-probes rather than tearing the circuit down.
+    //! The stall-safety that previously forced a close (a cancelled
+    //! `write_all` leaving a truncated frame with an unknown byte count)
+    //! is gone: the loop drives the flush with `writer.write(&batch[n..])`
+    //! and carries `written` across stalls, so a `Pending`-cancelled
+    //! `write` (0 bytes per the `AsyncWrite` contract) resumes from the
+    //! exact offset with no byte re-sent. A permanently dead circuit is
+    //! closed by the read-side echo watchdog, not here.
     use super::*;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::AsyncWrite;
 
-    /// Mock writer that accepts a partial first write (simulating a
-    /// CA-frame prefix landing on the socket) and then stalls
-    /// forever — every later `poll_write` returns `Pending`. This is
-    /// exactly the condition `write_all` cannot complete, so the
-    /// `timeout` in `write_loop` fires.
+    /// Mock writer that accepts a 4-byte prefix on the first
+    /// `poll_write` (a CA-frame prefix landing on the socket) and then
+    /// stalls forever — every later `poll_write` returns `Pending`.
     struct PartialThenStallWriter {
         first_write: Arc<AtomicUsize>,
     }
@@ -2392,8 +2428,6 @@ mod write_loop_timeout_tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            // First poll_write accepts a 4-byte prefix of the frame;
-            // all subsequent ones stall (Pending) forever.
             if self.first_write.swap(1, Ordering::SeqCst) == 0 {
                 let n = buf.len().min(4);
                 Poll::Ready(Ok(n))
@@ -2411,24 +2445,60 @@ mod write_loop_timeout_tests {
         }
     }
 
+    /// Mock writer that accepts a 4-byte prefix (poll 0), then stalls the
+    /// remainder for one full send-watchdog window before accepting it.
+    /// `tokio::time::timeout` re-polls its inner future at the deadline, so
+    /// the SAME `write` future must be `Pending` on both its initial poll
+    /// (poll 1) and its deadline re-poll (poll 2) for the `Elapsed` arm to
+    /// fire; only the NEW `write` future created after that (poll 3+)
+    /// resumes. It records every byte it accepts so the test can prove each
+    /// byte is sent exactly once across the stall.
+    struct ResumeAfterStallWriter {
+        polls: Arc<AtomicUsize>,
+        recorded: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for ResumeAfterStallWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let p = self.polls.fetch_add(1, Ordering::SeqCst);
+            if p == 1 || p == 2 {
+                // Initial poll and deadline re-poll of the second `write`
+                // future both stall, so `timeout` takes its `Elapsed` arm.
+                return Poll::Pending;
+            }
+            let n = if p == 0 { buf.len().min(4) } else { buf.len() };
+            self.recorded.lock().unwrap().extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn test_addr() -> SocketAddr {
         "127.0.0.1:5064".parse().unwrap()
     }
 
-    /// Regression: a stalled write that has already accepted a
-    /// partial frame must make `write_loop` emit `TcpClosed` and
-    /// exit — NOT `CircuitUnresponsive` while keeping the socket.
-    ///
-    /// Pre-fix the timeout arm sent `CircuitUnresponsive`, cleared
-    /// `batch`, and looped to drain the next frame on the same
-    /// (now desynchronized) stream, silently dropping the timed-out
-    /// frame and leaving the `pending_frames` counter inflated.
+    /// A send stall (partial frame accepted, then no progress within
+    /// `connTMO`) must emit `CircuitUnresponsive`, set the shared
+    /// unresponsive flag, and KEEP the socket — never `TcpClosed`, and
+    /// the loop must stay alive resuming the batch.
     #[tokio::test(start_paused = true)]
-    async fn mr_r17_write_timeout_closes_circuit() {
+    async fn r2_40_send_stall_marks_unresponsive_and_keeps_socket() {
         let server_addr = test_addr();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let pending_frames = Arc::new(AtomicUsize::new(0));
+        let unresponsive = Arc::new(AtomicBool::new(false));
         let writer = PartialThenStallWriter {
             first_write: Arc::new(AtomicUsize::new(0)),
         };
@@ -2440,42 +2510,113 @@ mod write_loop_timeout_tests {
             0,
             event_tx,
             pending_frames.clone(),
+            unresponsive.clone(),
         ));
 
-        // Queue a CA frame. `send_frame` would have incremented
-        // pending_frames; mirror that so we can assert the counter
-        // is not stranded after the timeout.
         pending_frames.fetch_add(1, Ordering::SeqCst);
         write_tx
             .send(vec![0xAAu8; 32])
             .expect("frame enqueue must succeed");
 
-        // The writer accepts 4 bytes then stalls; `echo_idle()`
-        // (default CONN_TMO 30 s) elapses on the paused clock and
-        // the timeout arm fires.
+        // First event on the stall must be CircuitUnresponsive (keep the
+        // socket), never TcpClosed. `echo_idle()` (default CONN_TMO 30 s)
+        // elapses on the paused clock and the send watchdog fires.
         let evt = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
             .await
             .expect("write_loop must emit an event before 60 s")
             .expect("event channel must not be closed");
-
         match evt {
-            TransportEvent::TcpClosed { server_addr: a, .. } => assert_eq!(a, server_addr),
-            TransportEvent::CircuitUnresponsive { .. } => panic!(
-                "write timeout must CLOSE the circuit (TcpClosed): the \
-                 cancelled write_all may have left a partial CA frame on \
-                 the wire — keeping the socket desyncs the server parser"
+            TransportEvent::CircuitUnresponsive { server_addr: a, .. } => {
+                assert_eq!(a, server_addr)
+            }
+            TransportEvent::TcpClosed { .. } => panic!(
+                "R2-40: a send stall must mark the circuit unresponsive and \
+                 KEEP the socket (C sendTimeoutNotify), not tear it down"
             ),
-            _ => panic!("write timeout must emit TcpClosed, got a different event"),
+            _ => panic!("a send stall must emit CircuitUnresponsive"),
         }
-
-        // The write loop must have returned (not looped to drain the
-        // next frame on the dead stream).
-        let joined = tokio::time::timeout(Duration::from_secs(2), task).await;
         assert!(
-            joined.is_ok(),
-            "write_loop must exit after a write-timeout close, not \
-             continue writing on the desynchronized circuit"
+            unresponsive.load(Ordering::SeqCst),
+            "the shared unresponsive flag must be set on a send stall"
         );
+
+        // No follow-up TcpClosed: the loop keeps the socket and retries
+        // the same batch. The task must still be running.
+        let none = tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await;
+        assert!(
+            none.is_err(),
+            "a send stall must not follow up with TcpClosed; the socket is kept"
+        );
+        assert!(
+            !task.is_finished(),
+            "write_loop must keep running (resuming the batch), not exit on a stall"
+        );
+        task.abort();
+    }
+
+    /// After a mid-batch stall, the resume must send each byte exactly
+    /// once from the tracked offset — a re-send from offset 0 would
+    /// duplicate the accepted prefix and desync the server parser.
+    #[tokio::test(start_paused = true)]
+    async fn r2_40_resume_sends_each_byte_once_across_stall() {
+        let server_addr = test_addr();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let pending_frames = Arc::new(AtomicUsize::new(1));
+        let unresponsive = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = ResumeAfterStallWriter {
+            polls: Arc::new(AtomicUsize::new(0)),
+            recorded: recorded.clone(),
+        };
+
+        let task = tokio::spawn(write_loop(
+            writer,
+            write_rx,
+            server_addr,
+            0,
+            event_tx,
+            pending_frames.clone(),
+            unresponsive.clone(),
+        ));
+
+        let frame = vec![0xAAu8; 32];
+        write_tx
+            .send(frame.clone())
+            .expect("frame enqueue must succeed");
+
+        // The stall between the partial accept and the resume emits
+        // exactly one CircuitUnresponsive.
+        let evt = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
+            .await
+            .expect("write_loop must emit an event before 60 s")
+            .expect("event channel must not be closed");
+        assert!(
+            matches!(evt, TransportEvent::CircuitUnresponsive { .. }),
+            "the mid-batch stall must mark the circuit unresponsive"
+        );
+
+        // Let the loop resume and finish the batch on the paused clock.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let got = recorded.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            32,
+            "resume must send each byte exactly once: expected 32 bytes, got \
+             {} (a re-send from offset 0 would double the 4-byte prefix)",
+            got.len()
+        );
+        assert_eq!(
+            got, frame,
+            "resumed bytes must equal the original frame in order"
+        );
+        assert_eq!(
+            pending_frames.load(Ordering::SeqCst),
+            0,
+            "the backpressure counter must be decremented once the batch flushed"
+        );
+        task.abort();
     }
 }
 

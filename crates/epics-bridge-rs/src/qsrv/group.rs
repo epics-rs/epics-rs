@@ -741,12 +741,28 @@ impl GroupChannel {
 
     /// Read all member values and compose into a single PvStructure.
     ///
-    /// Internal method. Both `Channel::get()` and `GroupMonitor::poll()`
-    /// (via the cached `group_channel`) call this. Performs an access
-    /// read check on entry — defensive: callers also check, but if a
-    /// new caller is added later this guarantees the policy still holds.
+    /// The MONITOR snapshot entry point. `GroupMonitor::seed()` (the INIT
+    /// frame) and `GroupMonitor::poll()` (each value event) call this via the
+    /// cached monitor `group_channel`; `Channel::get()` bypasses it and calls
+    /// `read_group_atomic` directly with the operation atomicity. The access
+    /// read check is performed by `read_group_atomic` on entry.
+    ///
+    /// A monitor ALWAYS composes its snapshot atomically, independent of the
+    /// group's `+atomic` setting. pvxs locks the fired field's entire
+    /// trigger-target record set (`DBManyLocker G(field.lock)`,
+    /// `groupsource.cpp:326`) for every value callback and stamps the value
+    /// `atomic=true` unconditionally (`:401-405`). So a monitor read forces the
+    /// atomic path even for a `+atomic:false` group: otherwise a multi-target
+    /// trigger (`*` or a named set) whose targets update concurrently would
+    /// sample its marked leaves at different instants (the sequential
+    /// per-member `read_group_atomic(false)` path) and ship a torn snapshot the
+    /// wire still advertises as atomic (`monitor_stamp` forces
+    /// `stamp_atomic=true`). Forcing the atomic read here keeps that stamp
+    /// truthful by construction. A `+atomic:false` group's non-atomic reads
+    /// remain reachable only through GET's `read_group_atomic(false)`.
     pub(crate) async fn read_group(&self) -> BridgeResult<PvStructure> {
-        self.read_group_atomic(self.def.atomic).await
+        self.read_group_atomic(self.monitor_stamp || self.def.atomic)
+            .await
     }
 
     /// Root structure ID advertised for this group's value and descriptor.
@@ -4606,6 +4622,82 @@ mod tests {
                 assert_eq!(*v, 0.0)
             }
             other => panic!("member b: expected Double(0.0), got {other:?}"),
+        }
+    }
+
+    /// Regression (Q38): a MONITOR over a `+atomic:false` group must still
+    /// compose its snapshot atomically — pvxs locks the fired field's whole
+    /// trigger-target set (`DBManyLocker G(field.lock)`, `groupsource.cpp:326`)
+    /// for every value callback and stamps `atomic=true` unconditionally
+    /// (`:401-405`), regardless of the group's `+atomic` setting. The monitor
+    /// `read_group()` therefore forces the atomic many-lock path even though
+    /// the group is non-atomic. Holding one member's gate externally must block
+    /// the monitor read from entering its loop; pre-fix the monitor took the
+    /// sequential `read_group_atomic(false)` path (no `lock_records`) and would
+    /// finish while a member gate was held, shipping a torn snapshot the wire
+    /// still stamps atomic. A plain non-atomic GET (no monitor stamp) still
+    /// takes the sequential path — asserted here as the contrast.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q38_nonatomic_group_monitor_read_composes_atomically() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("A:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("B:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // A NON-atomic group.
+        let cfg = r#"{
+            "NONATOMIC:GRP": {
+                "+atomic": false,
+                "a": {"+type": "plain", "+channel": "A:rec.VAL", "+putorder": 0},
+                "b": {"+type": "plain", "+channel": "B:rec.VAL", "+putorder": 1}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        assert!(!def.atomic, "fixture group must be +atomic:false");
+
+        // Hold one member record's gate. A monitor-stamped read must block on
+        // `lock_records` despite the group being non-atomic.
+        let held = db.lock_record("B:rec").await;
+
+        let mon_channel = GroupChannel::new(db.clone(), def.clone()).with_monitor_stamp();
+        let mon = tokio::spawn(async move { mon_channel.read_group().await.unwrap() });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !mon.is_finished(),
+            "a +atomic:false MONITOR read must block while a member gate is held \
+             (it forces the atomic many-lock so its atomic=true stamp is truthful)"
+        );
+
+        // Contrast: a plain non-atomic GET (no monitor stamp) does NOT take the
+        // many-lock — it reads sequentially and completes with the gate held.
+        let get_channel = GroupChannel::new(db.clone(), def.clone());
+        let get = tokio::spawn(async move { get_channel.read_group().await.unwrap() });
+        let get_done = tokio::time::timeout(Duration::from_secs(5), get)
+            .await
+            .expect("non-atomic GET must finish without the many-lock")
+            .expect("non-atomic GET task panicked");
+        assert!(
+            get_nested_field(&get_done, "a").is_some(),
+            "non-atomic GET returns a snapshot without blocking"
+        );
+
+        // Release the gate; the monitor read now completes atomically.
+        drop(held);
+        let mon_snapshot = tokio::time::timeout(Duration::from_secs(5), mon)
+            .await
+            .expect("monitor read must complete once the member gate is free")
+            .expect("monitor read task panicked");
+        match get_nested_field(&mon_snapshot, "a").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 0.0)
+            }
+            other => panic!("member a: expected Double(0.0), got {other:?}"),
         }
     }
 

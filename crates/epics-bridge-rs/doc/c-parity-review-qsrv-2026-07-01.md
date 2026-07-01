@@ -289,7 +289,25 @@ marks `value` and ships the entire un-sliced array. The client applies it,
 silently corrupting its cached slice with a wrong-length value.
 
 ### Q38: Non-atomic group monitor composes the snapshot with non-atomic per-member reads while stamping `atomic=true`
-Severity: Medium — OPEN
+Severity: Medium — CLEARED
+Resolution: the monitor entry point `read_group()` now forces the atomic read
+path — `read_group_atomic(self.monitor_stamp || self.def.atomic)` — so a
+`+atomic:false` group's MONITOR composes its snapshot under the `lock_records`
+`DBManyLock`-equivalent gate over the member set, exactly the lock its atomic
+GET/PUT holds. This makes the unconditional `atomic=true` monitor stamp
+(`monitor_stamp` → `stamp_atomic=true`, `:880`) truthful by construction rather
+than a runtime claim about a sequentially-sampled snapshot. It mirrors pvxs
+locking the fired field's whole trigger-target set (`DBManyLocker G(field.lock)`,
+`groupsource.cpp:326`) for every value callback and stamping `atomic=true`
+unconditionally (`:401-405`) regardless of the group's `+atomic` setting. Only
+the two monitor callers (`seed()` INIT frame at `:2030`, `poll()` at `:2503`)
+route through `read_group()`; a plain GET keeps `read_group_atomic(operation
+atomic)` and a `+atomic:false` group's non-atomic reads remain reachable only
+there. Rust locks all members (superset of pvxs's per-field trigger targets) —
+consistent with the existing atomic GET/PUT and still atomic over the trigger
+set. Regression: `q38_nonatomic_group_monitor_read_composes_atomically` (a
+monitor-stamped read blocks on a held member gate while a plain non-atomic GET
+does not).
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:697` (`read_group` →
 `read_group_atomic(self.def.atomic)`), `poll()` at `group.rs:2403`; monitor
 `atomic` forced true at `group.rs:808` (`stamp_atomic = if self.monitor_stamp { true }`).

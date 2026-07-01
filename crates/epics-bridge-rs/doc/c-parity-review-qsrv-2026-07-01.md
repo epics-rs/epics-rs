@@ -521,7 +521,7 @@ pvxs, while Rust rejects — an observable PUT-error-vs-success divergence for
 facilities using per-record ASG.
 
 ### Q52: PVA-native server serves `DBF_CHAR` as `ubyte` (UInt8) instead of pvxs `byte` (Int8)
-Severity: Medium — CLEARED (de500251 + f9812674)
+Severity: Medium — CLEARED (de500251 + f9812674), CONVERGED Round 3
 Origin: first surfaced as the deferred distinct sibling (b) of Q14; promoted to
 its own finding when fixed.
 Resolution: the PVA-native server has **two** hand-written `EpicsValue`↔`PvField`
@@ -560,11 +560,16 @@ native converters diverged, and their `Char` lines carried no citation while the
 converter to close the triplication structurally is proposed as a follow-up (its
 own change; see Round 2 note).
 
-Distinct / not in family (verified): `native_source.rs` PUT-decode
-`scalar_to_epics:1085` already has `Byte -> Char`; `pvalink/integration.rs:1842`
-is a *consumer* that deliberately widens `Byte -> ShortArray(i16)` "so the
-negative range survives the DBF_CHAR-as-signed gap" (documented, pre-existing);
-the CA-protocol paths (`ca_gateway`, `ca` cli) are a different type system.
+Distinct / not in family (verified, both Round-3 panels): the PUT-decode path
+(`native_source.rs::scalar_to_epics:1085 Byte=>Char`, `:1089 UByte=>Char`;
+`typed_array_to_epics:998/:999 Byte`/`UByte=>CharArray`) folds *both*
+signednesses into the signed `Char` carrier — DISTINCT because that `EpicsValue`
+is a bit-preserving intermediate `put_pv` (`:748`) re-coerces to the record's
+declared DBF type and which never reaches a served descriptor (terminal write,
+not a round-trip). `pvalink/integration.rs:1842` is a *consumer* that
+deliberately widens `Byte -> ShortArray(i16)` "so the negative range survives the
+DBF_CHAR-as-signed gap" (documented, pre-existing, and in a different crate); the
+CA-protocol paths (`ca_gateway`, `ca` cli) are a different type system.
 `EpicsValue::Char` is stored as `u8` in `epics-base-rs` (`types/value.rs:30`), so
 the signed mapping needs the `as i8` cast. Regressions:
 `native_source.rs::tests::dbf_char_serves_as_signed_byte_uchar_stays_unsigned`
@@ -689,3 +694,58 @@ output-link writes to a group member (`write_db_link_value` uses
 `put_pv_already_locked`, no gate), so that writer class can still tear the
 snapshot — closed in pvxs by the DB-link lockset + `DBManyLock`, deferred here
 exactly as BR-R15 deferred the PUT-side twin.
+
+### Round 3 (2026-07-01) — convergence pass (two opus panels), CONVERGED
+Two opus reviewers (type/wire, single-record) verified the two follow-up
+commits from Round 2 — Q52 completion (f9812674) and Q27c release-path
+(03633c3f). Both ground-verified against source + pvxs and both returned
+**PASS**; the round converged with zero DEFECT/CONCERN.
+
+1. **Q52 tcp.rs filter-bridge (f9812674) — PASS, family closed.** The
+   bidirectional mapping is bijective and bit-preserving (`Byte↔Char`,
+   `UByte↔UChar` as distinct carriers; wire byte `0xC8` round-trips
+   `Byte(-56)→Char(200)→Byte(-56)`), matches pvxs `typeutils.cpp:32-35`, and a
+   filtered `DBF_CHAR[]` monitor no longer `DescriptorMismatch`es. Both panels
+   independently enumerated every `EpicsValue`/`ScalarValue` byte-family
+   converter in the crate and **confirmed only two serve/monitor converters
+   exist** (`native_source.rs` serve + `server_native/tcp.rs` filter-bridge) —
+   no third. Family closed at 8 sites / 2 files.
+   - **Refinement to the completeness note:** the Round-2 write-up cited only
+     PUT-decode `scalar_to_epics:1085` (`Byte=>Char`); its siblings `:1089`
+     (`UByte=>Char`) and `typed_array_to_epics:998/:999` (`Byte`/`UByte=>
+     CharArray`) fold *both* signednesses into the signed `Char` carrier. Both
+     panels ruled this **DISTINCT, not a missed defect**: the PUT-decode
+     `EpicsValue` is a bit-preserving intermediate that `put_pv` (`:748`)
+     re-coerces to the record's declared DBF field type and which never reaches
+     a served descriptor — so the `UByte→Char` fold is benign there. It is
+     logged below as a backlog cleanliness item (inbound decode), orthogonal to
+     the DBF_CHAR-signedness serve family closed here.
+2. **Q27c release-path (03633c3f) — PASS.** `scalcout.rs:634` guarantees the
+   async arm for `odly > 0.0` (keys on presence, not magnitude), so ODLY=0.05 s
+   reliably takes the `Ok(Some(rx))→rx.await` release path the hold-only test
+   (ODLY=100 s, drops the future at 200 ms) never observes. The real ~50 ms
+   tokio timer fires well within the 5 s guard; `matches!(outcome, Ok(Ok(())))`
+   + `TGT2.VAL==42` pin release-after-OUT-completion ordering. Not flaky (100×
+   margin; a hung barrier trips the 5 s timeout). The three tests cleanly
+   partition the sync-drain (`Ok(None)`), hold (pending), and release
+   (`Some(rx)`) arms.
+
+**Structural follow-up — both panels AGREE, with a scope boundary.** The shared
+value-leaf converter is the right (and minimal) structural close for the
+triplication; a smaller const-table fix is strictly worse (leaves ≥2
+hand-maintained copies that drift — the type/wire panel noted the `UInt→Int64` /
+`ULong→UInt64` arms were each already patched piecemeal, the same recurring
+divergence family). **Scope boundary (must be stated in that change):** the
+shared converter owns only the **serve/monitor `EpicsValue`↔`PvField` leaf
+direction** (both ways, the 8 sites, type-preserving `byte↔Char`/`ubyte↔UChar`).
+It must **not** absorb the PUT-decode path (`scalar_to_epics`/
+`typed_array_to_epics`), whose `UByte→Char` single-carrier collapse is a
+deliberately different rule (re-coerced by `put_pv`, never round-tripped);
+merging it would break PUT re-coercion or wrongly force distinct carriers where
+the fold is correct. Deferred to its own commit pending user sign-off.
+
+**Backlog (out-of-family, not blocking):** inbound PUT-decode maps `UByte→Char`
+(`native_source.rs:1089`) / `UByte[]→CharArray` (`:999`) into the *signed* CHAR
+carrier rather than `UChar`/`UCharArray`. Benign today (the record re-coerces to
+its FTVL regardless), but a UCHAR inbound-decode cleanliness item for a later
+Q14/UCHAR pass.

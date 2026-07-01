@@ -271,158 +271,12 @@ fn pv_field_to_filter_event(
     use epics_base_rs::server::snapshot::Snapshot;
     use std::time::SystemTime;
 
-    let val = pv_value_leaf_to_epics(value)?;
+    let val = crate::leaf_convert::pv_leaf_to_epics_value(value)?;
     Some(FilteredMonitorEvent::new(MonitorEvent {
         snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
         origin: 0,
         mask: EventMask::VALUE,
     }))
-}
-
-/// Extract the value leaf of a PVA monitor `PvField` as an
-/// `EpicsValue`, looking through an NT-style structure's `value`
-/// member. Scalars and scalar arrays are both carried; returns
-/// `None` for shapes with no representable value leaf (the
-/// `arr` filter needs the real array, not a scalar fallback).
-fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValue> {
-    use crate::pvdata::ScalarValue;
-    use epics_base_rs::types::{EpicsValue, PvString};
-
-    fn scalar(sv: &ScalarValue) -> Option<EpicsValue> {
-        Some(match sv {
-            ScalarValue::Double(d) => EpicsValue::Double(*d),
-            ScalarValue::Float(v) => EpicsValue::Float(*v),
-            ScalarValue::Int(i) => EpicsValue::Long(*i),
-            ScalarValue::Long(l) => EpicsValue::Int64(*l),
-            ScalarValue::ULong(u) => EpicsValue::UInt64(*u),
-            ScalarValue::Short(s) => EpicsValue::Short(*s),
-            // DBF_CHAR is signed (`byte`, Int8) and DBF_UCHAR unsigned
-            // (`ubyte`, UInt8) on the wire (pvxs `typeutils.cpp:32-35`); the
-            // primary serving path emits them distinctly (de500251). Carry
-            // each into the filter engine with its own EpicsValue type so the
-            // backward bridge can re-emit the correct leaf — folding both into
-            // `Char` would make `Byte`(CHAR)↔`UByte`(UCHAR) indistinguishable
-            // on the way out. `Char` stores `u8`, so the signed leaf is
-            // reinterpreted with `as u8` (wire byte unchanged).
-            ScalarValue::Byte(b) => EpicsValue::Char(*b as u8),
-            ScalarValue::UByte(b) => EpicsValue::UChar(*b),
-            ScalarValue::String(s) => EpicsValue::String(s.clone()),
-            _ => return None,
-        })
-    }
-    fn array(items: &[ScalarValue]) -> Option<EpicsValue> {
-        // Empty array — default to a Double array (the filter slice
-        // of an empty array is still empty, so the element type is
-        // irrelevant for correctness here).
-        let first = items.first();
-        Some(match first {
-            Some(ScalarValue::Double(_)) | None => EpicsValue::DoubleArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::Double(d) => *d,
-                        _ => 0.0,
-                    })
-                    .collect(),
-            ),
-            Some(ScalarValue::Float(_)) => EpicsValue::FloatArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::Float(v) => *v,
-                        _ => 0.0,
-                    })
-                    .collect(),
-            ),
-            Some(ScalarValue::Int(_)) => EpicsValue::LongArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::Int(v) => *v,
-                        _ => 0,
-                    })
-                    .collect(),
-            ),
-            Some(ScalarValue::Long(_)) => EpicsValue::Int64Array(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::Long(v) => *v,
-                        _ => 0,
-                    })
-                    .collect(),
-            ),
-            Some(ScalarValue::Short(_)) => EpicsValue::ShortArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::Short(v) => *v,
-                        _ => 0,
-                    })
-                    .collect(),
-            ),
-            Some(ScalarValue::String(_)) => EpicsValue::StringArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::String(v) => v.clone(),
-                        _ => PvString::new(),
-                    })
-                    .collect(),
-            ),
-            // a PVA `ulong[]` monitor value must reach the
-            // `arr` filter as `UInt64Array` (mirrors the `scalar`
-            // helper's `ULong -> UInt64`); without this arm a filtered
-            // `DBF_UINT64` waveform fell through to a scalar `Double`
-            // and was emitted as an empty `ulong[]` payload.
-            Some(ScalarValue::ULong(_)) => EpicsValue::UInt64Array(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::ULong(v) => *v,
-                        _ => 0,
-                    })
-                    .collect(),
-            ),
-            // DBF_CHAR[] (signed byte[]) and DBF_UCHAR[] (unsigned ubyte[])
-            // carry distinctly (see the scalar helper): `Byte[] → CharArray`
-            // (`as u8`, wire byte unchanged) vs `UByte[] → UCharArray`.
-            Some(ScalarValue::Byte(_)) => EpicsValue::CharArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::Byte(v) => *v as u8,
-                        _ => 0,
-                    })
-                    .collect(),
-            ),
-            Some(ScalarValue::UByte(_)) => EpicsValue::UCharArray(
-                items
-                    .iter()
-                    .map(|s| match s {
-                        ScalarValue::UByte(v) => *v,
-                        _ => 0,
-                    })
-                    .collect(),
-            ),
-            _ => return None,
-        })
-    }
-    match f {
-        PvField::Scalar(sv) => scalar(sv),
-        PvField::ScalarArray(items) => array(items),
-        // Wire-decoded arrays arrive as the refcount-shared typed
-        // form; convert to the generic scalar vector so the `arr`
-        // filter sees the real array regardless of which variant the
-        // source produced.
-        PvField::ScalarArrayTyped(t) => array(&t.to_scalar_values()),
-        PvField::Structure(s) => s
-            .fields
-            .iter()
-            .find_map(|(k, v)| (k == "value").then_some(v))
-            .and_then(pv_value_leaf_to_epics),
-        _ => None,
-    }
 }
 
 /// bridge a filter-chain-transformed `FilteredMonitorEvent`
@@ -438,7 +292,7 @@ fn apply_filter_transform(
     original: &PvField,
     transformed: &epics_base_rs::types::EpicsValue,
 ) -> Option<PvField> {
-    let new_leaf = epics_value_to_pv_field(transformed)?;
+    let new_leaf = crate::leaf_convert::epics_value_to_pv_leaf(transformed);
     substitute_value_leaf(original, new_leaf)
 }
 
@@ -503,79 +357,6 @@ fn apply_monitor_filter_chain(
             }
         }
     }
-}
-
-/// Convert an `EpicsValue` produced by a filter back into a PVA
-/// value-leaf `PvField` (scalar or scalar array).
-fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvField> {
-    use crate::pvdata::ScalarValue;
-    use epics_base_rs::types::EpicsValue;
-    Some(match v {
-        EpicsValue::Double(d) => PvField::Scalar(ScalarValue::Double(*d)),
-        EpicsValue::Float(f) => PvField::Scalar(ScalarValue::Float(*f)),
-        EpicsValue::Long(i) => PvField::Scalar(ScalarValue::Int(*i)),
-        EpicsValue::Short(s) => PvField::Scalar(ScalarValue::Short(*s)),
-        // C `DBF_CHAR` → PVA `byte` (Int8, signed), pvxs
-        // `ioc/typeutils.cpp:32-33`; must match the `Byte`/`Byte[]` descriptor
-        // the primary path now advertises (de500251). `Char` stores `u8`, so
-        // reinterpret with `as i8` (wire byte unchanged). The unsigned
-        // `UChar → UByte` twin below stays correct.
-        EpicsValue::Char(c) => PvField::Scalar(ScalarValue::Byte(*c as i8)),
-        EpicsValue::Enum(e) => PvField::Scalar(ScalarValue::Int(*e as i32)),
-        // Transient NTEnum carrier never reaches a filter result (coerced in
-        // base at the link-write boundary); serve its index like a DBF_ENUM.
-        EpicsValue::EnumWithChoices { index, .. } => {
-            PvField::Scalar(ScalarValue::Int(*index as i32))
-        }
-        EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
-        EpicsValue::Int64(l) => PvField::Scalar(ScalarValue::Long(*l)),
-        EpicsValue::UInt64(u) => PvField::Scalar(ScalarValue::ULong(*u)),
-        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
-        // (pvxs `ioc/typeutils.cpp:38-44`).
-        EpicsValue::UShort(u) => PvField::Scalar(ScalarValue::UShort(*u)),
-        EpicsValue::ULong(u) => PvField::Scalar(ScalarValue::UInt(*u)),
-        // C `DBF_UCHAR` → PVA `ubyte` (pvxs `ioc/typeutils.cpp:34-35`).
-        EpicsValue::UChar(c) => PvField::Scalar(ScalarValue::UByte(*c)),
-        EpicsValue::DoubleArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Double(*x)).collect())
-        }
-        EpicsValue::FloatArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Float(*x)).collect())
-        }
-        EpicsValue::LongArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x)).collect())
-        }
-        EpicsValue::ShortArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Short(*x)).collect())
-        }
-        // C `DBF_CHAR[]` → PVA `byte[]` (Int8), pvxs `ioc/typeutils.cpp:32-33`
-        // — the signed twin of `UCharArray → ubyte[]` below.
-        EpicsValue::CharArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Byte(*x as i8)).collect())
-        }
-        EpicsValue::EnumArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
-        }
-        EpicsValue::StringArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::String(x.clone())).collect())
-        }
-        EpicsValue::Int64Array(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::Long(*x)).collect())
-        }
-        EpicsValue::UInt64Array(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::ULong(*x)).collect())
-        }
-        EpicsValue::UShortArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UShort(*x)).collect())
-        }
-        EpicsValue::ULongArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UInt(*x)).collect())
-        }
-        // C `DBF_UCHAR[]` → PVA `ubyte[]` (pvxs `ioc/typeutils.cpp:34-35`).
-        EpicsValue::UCharArray(a) => {
-            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UByte(*x)).collect())
-        }
-    })
 }
 
 /// Replace the value leaf of `original` with `new_leaf`. For an
@@ -8401,10 +8182,11 @@ mod tests {
 
     /// a PVA `ulong[]` monitor value must reach the `arr`
     /// server-side filter as `EpicsValue::UInt64Array`. Before the
-    /// fix `pv_value_leaf_to_epics`'s `array` helper had no `ULong`
-    /// arm, so a wire-decoded `ScalarArrayTyped::ULong` fell through
-    /// to `None`; `pv_field_to_filter_event` then substituted a
-    /// scalar `Double(0.0)`, and a filtered `DBF_UINT64` waveform was
+    /// fix `crate::leaf_convert::pv_leaf_to_epics_value`'s `array`
+    /// helper had no `ULong` arm, so a wire-decoded
+    /// `ScalarArrayTyped::ULong` fell through to `None`;
+    /// `pv_field_to_filter_event` then substituted a scalar
+    /// `Double(0.0)`, and a filtered `DBF_UINT64` waveform was
     /// emitted as an empty `ulong[]` payload.
     #[test]
     fn pf_r1_ulong_array_monitor_value_reaches_filter_as_uint64array() {
@@ -8416,7 +8198,7 @@ mod tests {
             vec![big, 2u64].as_slice(),
         )));
         assert_eq!(
-            pv_value_leaf_to_epics(&typed),
+            crate::leaf_convert::pv_leaf_to_epics_value(&typed),
             Some(EpicsValue::UInt64Array(vec![big, 2])),
             "ulong[] monitor value must convert to UInt64Array, not fall through to None",
         );
@@ -8553,57 +8335,12 @@ mod tests {
         }
 
         // --- DBF_CHAR (signed byte) round-trips both bridge directions. ---
-
-        /// DBF_CHAR is signed `byte`/`byte[]` on the wire (de500251); the
-        /// filter bridge must carry it faithfully in BOTH directions, or a
-        /// filtered DBF_CHAR monitor dies at the forward bridge. Forward maps
-        /// `Byte -> Char` / `Byte[] -> CharArray` (signed) and `UByte -> UChar`
-        /// / `UByte[] -> UCharArray` (unsigned); backward inverts. The type is
-        /// preserved through the filter engine so the backward bridge can
-        /// re-emit the correct signed-vs-unsigned leaf. Regression for the
-        /// sibling the native_source fix (de500251) missed — Q52 completion.
-        #[test]
-        fn forward_char_and_uchar_bytes_carry_faithfully() {
-            use epics_base_rs::types::EpicsValue;
-            // Forward: signed byte 200 (0xC8 == -56i8) -> Char(200); unsigned
-            // ubyte -> UChar; distinct so the backward leaf stays disambiguated.
-            assert_eq!(
-                pv_value_leaf_to_epics(&PvField::Scalar(ScalarValue::Byte(-56))),
-                Some(EpicsValue::Char(200)),
-            );
-            assert_eq!(
-                pv_value_leaf_to_epics(&PvField::Scalar(ScalarValue::UByte(200))),
-                Some(EpicsValue::UChar(200)),
-            );
-            assert_eq!(
-                pv_value_leaf_to_epics(&PvField::ScalarArray(vec![
-                    ScalarValue::Byte(-56),
-                    ScalarValue::Byte(0),
-                ])),
-                Some(EpicsValue::CharArray(vec![200, 0])),
-            );
-            assert_eq!(
-                pv_value_leaf_to_epics(&PvField::ScalarArray(vec![ScalarValue::UByte(200)])),
-                Some(EpicsValue::UCharArray(vec![200])),
-            );
-            // Backward: Char -> signed Byte, CharArray -> signed Byte[], UChar
-            // -> unsigned UByte (each must fit its own descriptor).
-            assert_eq!(
-                epics_value_to_pv_field(&EpicsValue::Char(200)),
-                Some(PvField::Scalar(ScalarValue::Byte(-56))),
-            );
-            assert_eq!(
-                epics_value_to_pv_field(&EpicsValue::CharArray(vec![200, 0])),
-                Some(PvField::ScalarArray(vec![
-                    ScalarValue::Byte(-56),
-                    ScalarValue::Byte(0),
-                ])),
-            );
-            assert_eq!(
-                epics_value_to_pv_field(&EpicsValue::UChar(200)),
-                Some(PvField::Scalar(ScalarValue::UByte(200))),
-            );
-        }
+        //
+        // The forward/backward leaf mapping (Byte<->Char signed,
+        // UByte<->UChar unsigned) is owned and unit-tested in
+        // `crate::leaf_convert` (`dbf_char_is_signed_dbf_uchar_is_unsigned_all_directions`,
+        // `forward_is_the_inverse_of_the_serve_backward_mapping`). The
+        // end-to-end test below covers the bridge wiring that consumes it.
 
         /// End-to-end: a filtered DBF_CHAR array monitor must survive the
         /// bridge. Before the Q52 completion an `arr` filter on a `byte[]`

@@ -135,75 +135,10 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
     if let EpicsValue::Enum(v) = &snap.value {
         return build_nt_enum(i32::from(*v), snap);
     }
-    let value_field = match &snap.value {
-        EpicsValue::Double(v) => PvField::Scalar(ScalarValue::Double(*v)),
-        EpicsValue::Float(v) => PvField::Scalar(ScalarValue::Float(*v)),
-        EpicsValue::Long(v) => PvField::Scalar(ScalarValue::Int(*v)),
-        EpicsValue::Short(v) => PvField::Scalar(ScalarValue::Short(*v)),
-        // C `DBF_CHAR` → PVA `byte` (Int8, signed), pvxs
-        // `ioc/typeutils.cpp:32-33` (`DBR_CHAR -> TypeCode::Int8`). The
-        // bit-preserving `as i8` keeps the wire byte identical; only the typed
-        // interpretation flips from unsigned to signed. Serving it as `ubyte`
-        // reads 200 as 200 where the client expects −56.
-        EpicsValue::Char(v) => PvField::Scalar(ScalarValue::Byte(*v as i8)),
-        EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
-        // Transient NTEnum carrier never reaches a record snapshot (coerced in
-        // base at the link-write boundary); serve its index like a DBF_ENUM.
-        EpicsValue::EnumWithChoices { index, .. } => {
-            PvField::Scalar(ScalarValue::Int(*index as i32))
-        }
-        EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
-        EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
-        // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
-        EpicsValue::UInt64(v) => PvField::Scalar(ScalarValue::ULong(*v)),
-        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
-        // (pvxs `ioc/typeutils.cpp:38-44`: DBR_USHORT→UInt16, DBR_ULONG→UInt32).
-        EpicsValue::UShort(v) => PvField::Scalar(ScalarValue::UShort(*v)),
-        EpicsValue::ULong(v) => PvField::Scalar(ScalarValue::UInt(*v)),
-        // C `DBF_UCHAR` → PVA `ubyte` (UInt8), pvxs `ioc/typeutils.cpp:34-35`
-        // (`DBR_UCHAR -> TypeCode::UInt8`).
-        EpicsValue::UChar(v) => PvField::Scalar(ScalarValue::UByte(*v)),
-        EpicsValue::DoubleArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
-        }
-        EpicsValue::FloatArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Float(*x)).collect())
-        }
-        EpicsValue::LongArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Int(*x)).collect())
-        }
-        EpicsValue::ShortArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Short(*x)).collect())
-        }
-        // C `DBF_CHAR[]` → PVA `byte[]` (Int8, signed), pvxs
-        // `ioc/typeutils.cpp:32-33` — the signed twin of `UCharArray → ubyte[]`.
-        EpicsValue::CharArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Byte(*x as i8)).collect())
-        }
-        EpicsValue::EnumArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
-        }
-        EpicsValue::StringArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::String(x.clone())).collect())
-        }
-        EpicsValue::Int64Array(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Long(*x)).collect())
-        }
-        EpicsValue::UInt64Array(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::ULong(*x)).collect())
-        }
-        EpicsValue::UShortArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UShort(*x)).collect())
-        }
-        EpicsValue::ULongArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UInt(*x)).collect())
-        }
-        // C `DBF_UCHAR[]` → PVA `ubyte[]` (the common image/byte-buffer shape),
-        // pvxs `ioc/typeutils.cpp:34-35`. Element 200 stays 200, not −56.
-        EpicsValue::UCharArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UByte(*x)).collect())
-        }
-    };
+    // The `EpicsValue → PVA value leaf` correspondence (incl. the `DBF_CHAR`
+    // signedness) is owned once in `crate::leaf_convert`, shared with the
+    // monitor-filter backward bridge so the two cannot drift apart.
+    let value_field = crate::leaf_convert::epics_value_to_pv_leaf(&snap.value);
 
     let is_array = matches!(value_field, PvField::ScalarArray(_));
     let struct_id = if is_array {
@@ -232,39 +167,11 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
     if matches!(&snap.value, EpicsValue::Enum(_)) {
         return nt_enum_desc();
     }
-    let (value_desc, is_array) = match &snap.value {
-        EpicsValue::Double(_) => (FieldDesc::Scalar(ScalarType::Double), false),
-        EpicsValue::Float(_) => (FieldDesc::Scalar(ScalarType::Float), false),
-        EpicsValue::Long(_) => (FieldDesc::Scalar(ScalarType::Int), false),
-        EpicsValue::Short(_) => (FieldDesc::Scalar(ScalarType::Short), false),
-        // C `DBF_CHAR` → PVA `byte` (Int8), pvxs `ioc/typeutils.cpp:32-33`.
-        EpicsValue::Char(_) => (FieldDesc::Scalar(ScalarType::Byte), false),
-        EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
-        EpicsValue::EnumWithChoices { .. } => (FieldDesc::Scalar(ScalarType::Int), false),
-        EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
-        EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
-        EpicsValue::UInt64(_) => (FieldDesc::Scalar(ScalarType::ULong), false),
-        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
-        // (pvxs `ioc/typeutils.cpp:38-44`).
-        EpicsValue::UShort(_) => (FieldDesc::Scalar(ScalarType::UShort), false),
-        EpicsValue::ULong(_) => (FieldDesc::Scalar(ScalarType::UInt), false),
-        // C `DBF_UCHAR` → PVA `ubyte` (pvxs `ioc/typeutils.cpp:34-35`).
-        EpicsValue::UChar(_) => (FieldDesc::Scalar(ScalarType::UByte), false),
-        EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
-        EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
-        EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
-        EpicsValue::ShortArray(_) => (FieldDesc::ScalarArray(ScalarType::Short), true),
-        // C `DBF_CHAR[]` → PVA `byte[]` (Int8), pvxs `ioc/typeutils.cpp:32-33`.
-        EpicsValue::CharArray(_) => (FieldDesc::ScalarArray(ScalarType::Byte), true),
-        EpicsValue::EnumArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
-        EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
-        EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
-        EpicsValue::UInt64Array(_) => (FieldDesc::ScalarArray(ScalarType::ULong), true),
-        EpicsValue::UShortArray(_) => (FieldDesc::ScalarArray(ScalarType::UShort), true),
-        EpicsValue::ULongArray(_) => (FieldDesc::ScalarArray(ScalarType::UInt), true),
-        // C `DBF_UCHAR[]` → PVA `ubyte[]` (pvxs `ioc/typeutils.cpp:34-35`).
-        EpicsValue::UCharArray(_) => (FieldDesc::ScalarArray(ScalarType::UByte), true),
-    };
+    // Same single owner as the value leaf (`crate::leaf_convert`): the
+    // descriptor is the type-only projection of `epics_value_to_pv_leaf`, so
+    // the served value and its advertised type cannot diverge.
+    let value_desc = crate::leaf_convert::epics_value_to_field_desc_leaf(&snap.value);
+    let is_array = matches!(value_desc, FieldDesc::ScalarArray(_));
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"
     } else {

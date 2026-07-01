@@ -1019,13 +1019,38 @@ async fn connect_server(
 /// out of order.
 struct UnresponsiveGate {
     state: std::sync::Mutex<bool>,
+    /// C `tcpiiu::_receiveThreadIsBusy` (`tcpiiu.cpp:494/526`): true while
+    /// `read_loop` is processing a just-arrived message batch. C's
+    /// `tcpSendWatchdog::expire` reads it under the mutex and RESTARTS the
+    /// send watchdog instead of calling `sendTimeoutNotify` when the recv
+    /// thread is busy (`tcpSendWatchdog.cpp:48-50`) — a circuit that is
+    /// actively receiving is demonstrably alive, so a send stall must not
+    /// mark it unresponsive (which would fail in-flight IO with
+    /// ECA_UNRESPTMO). Lives on the gate because the gate is already the
+    /// shared owner of the circuit's liveness state seen by both loops.
+    recv_busy: std::sync::atomic::AtomicBool,
 }
 
 impl UnresponsiveGate {
     fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(false),
+            recv_busy: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// `read_loop` marks itself busy across message processing and idle
+    /// while blocked in the socket read. Best-effort liveness hint (a plain
+    /// relaxed flag, exactly like C's mutex-guarded bool), so `Relaxed`.
+    fn set_recv_busy(&self, busy: bool) {
+        self.recv_busy
+            .store(busy, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `write_loop`'s send-stall arm consults this to skip the unresponsive
+    /// transition when the recv thread is actively receiving.
+    fn recv_busy(&self) -> bool {
+        self.recv_busy.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Mark the circuit unresponsive and emit `CircuitUnresponsive` exactly
@@ -1152,7 +1177,17 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                     // dead-circuit close are both owned by `read_loop`; on
                     // teardown `ServerConnection::drop` aborts this task,
                     // so a forever-stalled write cannot leak.
-                    unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
+                    //
+                    // But first mirror C `tcpSendWatchdog::expire`: if the
+                    // recv thread is mid-processing a message the circuit is
+                    // demonstrably alive, so RESTART the watchdog (re-poll
+                    // the same write below) instead of marking unresponsive
+                    // (`tcpSendWatchdog.cpp:48-50`). The read echo watchdog
+                    // remains the sole owner of declaring a truly dead
+                    // circuit, so nothing is lost by deferring here.
+                    if !unresponsive.recv_busy() {
+                        unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
+                    }
                 }
             }
         }
@@ -1297,6 +1332,12 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // system stays bounded by `idle_timeout`/`echo_timeout`, so a
         // skip far beyond that is a strong suspend signal.
         last_loop_at = std::time::SystemTime::now();
+        // Not processing a message while parked in `select!` (blocked in
+        // the socket read / watchdog / beacon wait). C `_receiveThreadIsBusy`
+        // is false here; the send watchdog may mark the circuit unresponsive
+        // if a send also stalls. Set true only across message processing
+        // below (after data arrives).
+        unresponsive.set_recv_busy(false);
         let n = tokio::select! {
             // No `biased;` — let tokio randomize. With three
             // branches (beacon arrival, sleep expiry, data read)
@@ -1418,6 +1459,12 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
 
         // Data received — circuit is alive. Mirrors libca
         // `messageArrivalNotify`: clear flags and refresh deadline.
+        // Mark the recv thread busy across the message processing that
+        // follows (C `_receiveThreadIsBusy = true`, `tcpiiu.cpp:494`);
+        // the next loop-top store clears it (C sets false at :526). While
+        // set, a concurrent send stall in `write_loop` restarts its
+        // watchdog rather than marking this live circuit unresponsive.
+        unresponsive.set_recv_busy(true);
         echo_pending = false;
         probe_escalated = false;
         beacon_anomaly = false;
@@ -2682,6 +2729,70 @@ mod write_loop_timeout_tests {
             pending_frames.load(Ordering::SeqCst),
             0,
             "the backpressure counter must be decremented once the batch flushed"
+        );
+        task.abort();
+    }
+
+    /// C `tcpSendWatchdog::expire` restarts (does NOT `sendTimeoutNotify`)
+    /// while `receiveThreadIsBusy` (`tcpSendWatchdog.cpp:48-50`). Boundary
+    /// test on that flag: a send stall while the recv thread is busy must
+    /// NOT mark the circuit unresponsive; once the recv thread goes idle
+    /// the same stall DOES. Fails in-flight IO with a spurious
+    /// ECA_UNRESPTMO on a demonstrably-alive circuit if the guard is
+    /// missing.
+    #[tokio::test(start_paused = true)]
+    async fn r2_40_send_stall_defers_while_recv_busy() {
+        let server_addr = test_addr();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let pending_frames = Arc::new(AtomicUsize::new(1));
+        let unresponsive = Arc::new(UnresponsiveGate::new());
+        // Recv thread mid-processing when the send stalls.
+        unresponsive.set_recv_busy(true);
+        let writer = PartialThenStallWriter {
+            first_write: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let task = tokio::spawn(write_loop(
+            writer,
+            write_rx,
+            server_addr,
+            0,
+            event_tx,
+            pending_frames.clone(),
+            unresponsive.clone(),
+        ));
+
+        write_tx
+            .send(vec![0xAAu8; 32])
+            .expect("frame enqueue must succeed");
+
+        // While recv is busy the stall must restart, not mark unresponsive:
+        // no event, gate stays responsive, across more than one stall cycle.
+        let none = tokio::time::timeout(Duration::from_secs(70), event_rx.recv()).await;
+        assert!(
+            none.is_err(),
+            "a send stall while the recv thread is busy must NOT emit an event \
+             (C restarts the send watchdog)"
+        );
+        assert!(
+            !unresponsive.is_unresponsive(),
+            "recv-busy send stall must leave the circuit responsive"
+        );
+
+        // Recv thread goes idle — the next stall now marks unresponsive.
+        unresponsive.set_recv_busy(false);
+        let evt = tokio::time::timeout(Duration::from_secs(70), event_rx.recv())
+            .await
+            .expect("once recv is idle the send stall must emit within one cycle")
+            .expect("event channel must not be closed");
+        assert!(
+            matches!(evt, TransportEvent::CircuitUnresponsive { .. }),
+            "an idle-recv send stall marks the circuit unresponsive"
+        );
+        assert!(
+            unresponsive.is_unresponsive(),
+            "the gate must be set once the idle-recv stall fires"
         );
         task.abort();
     }

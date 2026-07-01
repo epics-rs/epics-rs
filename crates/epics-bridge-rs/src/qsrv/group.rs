@@ -1345,6 +1345,34 @@ impl GroupChannel {
         // that spells a link field outside the list and false-rejects
         // non-link fields whose names collide with the heuristic.
         for m in &self.def.members {
+            // A Structure/Const member has no backing dbChannel — pvxs's
+            // prep pass gates each check on `field.value` being non-null
+            // (groupsource.cpp:597), so skip those members here.
+            if m.channel.is_empty() {
+                continue;
+            }
+            let (record_name, field_name) =
+                epics_base_rs::server::database::parse_pv_name(&m.channel);
+            // pvxs runs `IOCSource::doPreProcessing` (iocsource.cpp:365-369)
+            // on every channeled member in this prep pass
+            // (groupsource.cpp:599-602) — before any marked/putable
+            // filtering and in every process mode — rejecting the whole
+            // group PUT if a member's backing record is DISP-disabled or the
+            // bound field is read-only. An UNMARKED DISP=1 member still fails
+            // the operation, matching C. This runs before the link-class
+            // check to mirror C's per-field ordering (doPreProcessing, then
+            // the link throw). Same gate the single-record path enforces —
+            // the `Force`/`Inhibit` group routes go through `put_pv`, which
+            // does not itself gate DISP.
+            self.db
+                .check_external_put_preconditions(record_name, field_name)
+                .await
+                .map_err(|e| {
+                    BridgeError::PutRejected(format!(
+                        "group {} PUT: member '{}' field '{}': {}",
+                        self.def.name, m.field_name, m.channel, e
+                    ))
+                })?;
             if self.member_targets_link_field(m).await {
                 return Err(BridgeError::PutRejected(format!(
                     "group {} PUT: member '{}' targets link field '{}' \

@@ -215,7 +215,15 @@ and tears the whole group monitor down with a MONITOR FINISH. One member-level
 read error kills the entire subscription rather than dropping a single update.
 
 ### Q49: Group PUT force/inhibit modes bypass the DISP (S_db_putDisabled) and SPC_NOMOD put gates
-Severity: High — OPEN (family with Q25)
+Severity: High — CLEARED (family with Q25)
+Resolution: the group PUT preparation pass (`group.rs`
+`put_with_options`) now runs the shared
+`PvDatabase::check_external_put_preconditions` gate over every channeled
+member before marked/putable filtering — mirroring pvxs's
+`groupsource.cpp:596-609` prep loop that calls `doPreProcessing` on every
+`field.value` unconditionally. An unmarked DISP=1 member now rejects the
+whole group PUT in Passive/Force/Inhibit alike. Regression:
+`testqgroup.rs::group_put_rejected_when_unmarked_member_is_disp_disabled`.
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:1191-1229` (`apply_member_value`
 `Inhibit`/`Force` arms → `put_pv`/`put_pv_already_locked`); gate absent in
 `crates/epics-base-rs/src/server/database/field_io.rs:96-220` (`put_pv_inner`).

@@ -10,8 +10,11 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
+use epics_base_rs::types::EpicsValue;
 
-use epics_bridge_rs::qsrv::{BridgeProvider, Channel, group::GroupChannel};
+use epics_bridge_rs::qsrv::{
+    BridgeProvider, Channel, ProcessMode, PutOptions, group::GroupChannel,
+};
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
 // members need `+putorder` to be writable. pvxs's
@@ -227,6 +230,70 @@ async fn br_r60_put_with_no_writable_field_errors() {
     // Empty PUT (no member field supplied) → silent no-op.
     let empty = PvStructure::new("structure");
     ch.put(&empty).await.expect("empty PUT is a silent no-op");
+}
+
+/// C-parity for the group PUT preparation pass: pvxs runs
+/// `IOCSource::doPreProcessing` over every channeled member
+/// (`groupsource.cpp:596-609`) BEFORE any marked/putable filtering and
+/// in every process mode, throwing `S_db_putDisabled` when a member's
+/// backing record is DISP-disabled. A DISP=1 member therefore rejects
+/// the whole group PUT even when the client did not mark it — the prep
+/// pass iterates `group.fields`, not just the changed ones.
+///
+/// Regression: the `Force`/`Inhibit` group routes call `put_pv`, which
+/// (as the internal `dbPut` analogue) does not itself gate DISP, so a
+/// forced group PUT to a DISP=1 member wrote through the interlock.
+#[tokio::test]
+async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
+    for mode in [
+        ProcessMode::Passive,
+        ProcessMode::Force,
+        ProcessMode::Inhibit,
+    ] {
+        let db = make_db().await;
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load");
+        let def = provider
+            .groups()
+            .get("TEST:grp")
+            .cloned()
+            .expect("grp registered");
+
+        // DISP=1 on the `count` member's backing record. The PUT below
+        // marks only `level`, leaving `count` unmarked — the prep pass
+        // must still reject the whole operation.
+        db.put_pv("TEST:count.DISP", EpicsValue::Char(1))
+            .await
+            .expect("set DISP");
+
+        let ch = GroupChannel::new(db.clone(), def);
+
+        let mut put = PvStructure::new("epics:nt/NTGroup:1.0");
+        put.fields
+            .push(("level".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+        let opts = PutOptions {
+            process: mode,
+            block: false,
+        };
+        let err = ch
+            .put_with_options(&put, opts, None)
+            .await
+            .expect_err("DISP=1 member must reject the whole group PUT");
+        let msg = format!("{err}").to_ascii_lowercase();
+        assert!(
+            msg.contains("disp") || msg.contains("disabled"),
+            "{mode:?}: expected a DISP rejection, got: {err}"
+        );
+
+        // The whole PUT is rejected in the prep pass, before any member
+        // write — the marked `level` member must be untouched.
+        let result = ch.get(&empty_request()).await.expect("get");
+        assert_eq!(
+            extract_double(&result, "level"),
+            Some(1.5),
+            "{mode:?}: level must be untouched after a rejected PUT"
+        );
+    }
 }
 
 /// a `DBE_LOG`-only post against a backing record (archive

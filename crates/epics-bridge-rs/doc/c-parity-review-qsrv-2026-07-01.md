@@ -99,7 +99,7 @@ the whole group. Low real-world hit rate (non-canonical inputs), but a genuine
 missed sibling of the group-level coercion fix.
 
 ### Q13: NTScalar/NTScalarArray metadata sub-structs carry non-empty type-IDs pvxs leaves anonymous
-Severity: Medium — CLEARED (commit pending)
+Severity: Medium — CLEARED (39e7f9e3)
 Rust: `crates/epics-bridge-rs/src/qsrv/pvif.rs:801` (`build_display` →
 `PvStructure::new("display_t")`), `:832` (`build_control` → `"control_t"`),
 `:924` (`build_value_alarm` → `"valueAlarm_t"`); mirrored in descriptor
@@ -127,7 +127,7 @@ in the same commit (6 sites). `timeStamp`/`alarm`/NTEnum-`value` keep their ids
 and qsrv introspection tests stay green.
 
 ### Q14: `FTVL=UCHAR` waveforms served as signed `byte[]` (Int8) instead of pvxs `ubyte[]` (UInt8)
-Severity: High — CLEARED (commit pending)
+Severity: High — CLEARED (11c8798e)
 
 Resolution: added first-class `DbFieldType::UChar` (=11, promotes to DBR_CHAR
 over CA per `db_convert.h`) and `EpicsValue::{UChar(u8), UCharArray(Vec<u8>)}`,
@@ -348,7 +348,7 @@ concurrently between the per-member reads produces marked leaves sampled at
 different instants: a torn snapshot the wire advertises as atomic.
 
 ### Q39: Group monitor `poll()` turns a per-event read failure into MONITOR FINISH instead of skipping the event
-Severity: Medium — CLEARED (commit pending)
+Severity: Medium — CLEARED (4cdfd20a)
 
 Resolution: `GroupMonitor::poll()` now matches on `read_group()` and, on
 `Err`, logs via `tracing::warn!` (the `log_exc_printf` analogue) and

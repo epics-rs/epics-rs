@@ -44,22 +44,31 @@ pub(crate) struct FieldNameComponent {
 ///     (`getline` fails on a zero-length extraction at end-of-stream) and is
 ///     NOT an error;
 ///   - a component is array-indexed only when it ENDS with `]`, in which case
-///     it must contain a `[` and an integer subscript immediately followed by
-///     `]` (`a[x]`, `a[]`, `a[1x]` are errors, matching `strtol` requiring at
-///     least one digit whose next char is `]`). A component with no trailing
-///     `]` (`a[`) is a plain literal name, bracket included.
+///     it must contain a `[` and a non-negative decimal subscript (`a[x]`,
+///     `a[1x]` are errors: the subscript is not a clean integer). A component
+///     with no trailing `]` (`a[`) is a plain literal name, bracket included.
 ///
 /// The infallible [`parse_field_path`] wraps this for navigating names already
 /// validated at group-build time; `group_config::validate_field_name` calls it
 /// to reject a malformed member (a per-group skip, matching pvxs's per-group
 /// `try` at `groupconfigprocessor.cpp:431-446`).
 ///
-/// Divergence note: a negative or `u32`-overflowing subscript (`a[-1]`,
-/// `a[99999999999]`) is rejected here, whereas pvxs's `strtol` accepts it and
-/// only fails later at navigation. Group array indices are non-negative and
-/// bounded, so these degenerate names could never navigate to a real element;
-/// rejecting them at build is stricter-but-safe and never touches a real
-/// config.
+/// Divergence note: this subscript grammar is intentionally STRICTER than pvxs
+/// and rejects three degenerate forms that pvxs's `strtol`
+/// (`fieldname.cpp:48-53`) accepts — we deliberately do NOT replicate the
+/// `strtol` accidents:
+///   - an empty subscript `a[]` — `strtol("]")` performs no conversion, returns
+///     0, and leaves `endScan` on the `]`, so pvxs silently reads it as element
+///     0; `"".parse::<u32>()` errors here;
+///   - a whitespace/sign-padded subscript `a[ 5]` — `strtol` skips leading
+///     whitespace and an optional sign and reads 5; `" 5".parse::<u32>()`
+///     errors here;
+///   - a negative or `u32`-overflowing subscript (`a[-1]`, `a[99999999999]`) —
+///     `strtol` accepts it and only fails later at navigation.
+///
+/// Group array indices are non-negative and bounded, so none of these could
+/// navigate to a real element; rejecting them at build is stricter-but-safe and
+/// never touches a real config. All three are build-time-only divergences.
 pub(crate) fn parse_field_path_checked(path: &str) -> Result<Vec<FieldNameComponent>, String> {
     if path.is_empty() {
         return Ok(Vec::new());
@@ -3539,9 +3548,14 @@ mod tests {
         assert_eq!(comps[0].name, "a");
     }
 
-    /// A component ending in ']' must carry a '[' and an integer subscript
-    /// (pvxs `strtol` requires ≥1 digit whose next char is ']',
-    /// fieldname.cpp:41-53). A non-']'-terminated component is a literal name.
+    /// A component ending in ']' must carry a '[' and a non-negative decimal
+    /// subscript. NOTE: `value[]` and `value[-1]` are rejected here
+    /// INTENTIONALLY stricter than pvxs — its `strtol` (fieldname.cpp:48-53)
+    /// reads `value[]` as element 0 and accepts a negative/overflow index,
+    /// failing only later at navigation. We reject at build (see the divergence
+    /// note on `parse_field_path_checked`); this test pins the stricter Rust
+    /// behavior, it is NOT asserting a pvxs match. A non-']'-terminated
+    /// component is a literal name.
     #[test]
     fn parse_field_path_checked_bad_subscript() {
         assert!(
@@ -3550,7 +3564,7 @@ mod tests {
         );
         assert!(
             parse_field_path_checked("value[]").is_err(),
-            "empty subscript"
+            "empty subscript — stricter than pvxs, which reads it as element 0"
         );
         assert!(
             parse_field_path_checked("value[1x]").is_err(),
@@ -3558,7 +3572,7 @@ mod tests {
         );
         assert!(
             parse_field_path_checked("value[-1]").is_err(),
-            "negative subscript rejected"
+            "negative subscript — stricter than pvxs, which strtol-accepts then fails at nav"
         );
 
         // `value[` does not end with ']' → pvxs keeps it as a literal field

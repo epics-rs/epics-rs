@@ -782,7 +782,9 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
 /// Validate a group member field-name path against the pvxs `FieldName`
 /// constructor grammar (`ioc/fieldname.cpp:29-67`), which **throws** on a
 /// malformed path — an empty leading/interior component (`.a`, `a..b`) or a
-/// bad array subscript (`a[x]`, `a[]`). pvxs runs this via `fieldName(def.name)`
+/// bad array subscript (`a[x]`; plus the stricter-than-pvxs `a[]`/`a[-1]` forms
+/// documented in the `parse_field_path_checked` divergence note). pvxs runs
+/// this via `fieldName(def.name)`
 /// (`field.cpp:21`) inside the `createGroups` per-group `try`
 /// (`groupconfigprocessor.cpp:431-446`), so a throw aborts just that group's
 /// build (logged, group not served) while siblings still load. Here the error

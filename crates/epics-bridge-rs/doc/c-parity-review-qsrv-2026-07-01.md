@@ -28,10 +28,11 @@ unused slots are gaps, not omissions.
 Severity: Medium — CLEARED
 Resolution: the pvxs `FieldName` grammar is now enforced at group-build time
 from a single canonical parser. `group.rs::parse_field_path_checked` is the one
-source of truth for the grammar and returns `Err` on exactly pvxs's throw set
+source of truth for the grammar and returns `Err` on pvxs's throw set
 (empty leading/interior component; a `]`-terminated component with no `[` or a
-non-integer subscript), while dropping a single trailing `.` at EOF like
-`getline`. The infallible `parse_field_path` (navigation) is now a thin
+non-integer subscript) PLUS three intentionally-stricter subscript rejections
+(see the divergence note below), while dropping a single trailing `.` at EOF
+like `getline`. The infallible `parse_field_path` (navigation) is now a thin
 `parse_field_path_checked(..).unwrap_or_default()` wrapper, so build-time
 validation and runtime navigation can never diverge (this also fixes the
 navigation-side normalization: `value[x]`→`value`, `value[`→`value`). The
@@ -41,10 +42,16 @@ config layer calls it via `group_config::validate_field_name` at the top of
 (`tracing::warn!("ignoring invalid QSRV group")`) and preserves siblings —
 matching pvxs's per-group `try` (`groupconfigprocessor.cpp:431-446`). The false
 `group.rs` comment claiming the old `.filter(!is_empty)` "matches pvxs
-validation (fieldname.cpp:35-36)" is removed. Degenerate divergence documented:
-a negative/`u32`-overflowing subscript is rejected at build (pvxs `strtol`
-accepts then fails navigation) — non-negative bounded indices only, never a
-real config. Regression: `group.rs::parse_field_path_checked_{empty_component,
+validation (fieldname.cpp:35-36)" is removed. Degenerate divergences documented
+(intentional, stricter-than-pvxs; we do NOT replicate the `strtol` accidents):
+the empty subscript `a[]` (pvxs `strtol("]")` reads element 0), a
+whitespace/sign-padded subscript `a[ 5]` (pvxs `strtol` skips leading ws → 5),
+and a negative/`u32`-overflowing subscript (pvxs `strtol` accepts then fails at
+navigation) are all rejected at build. Group indices are non-negative and
+bounded, so none could navigate to a real element and none touches a real
+config. Round-2 verify (config panel) confirmed the earlier
+"exactly pvxs's throw set" claim was false — `a[]`/`a[ N]` were undocumented
+stricter rejections; they are now documented, not silent. Regression: `group.rs::parse_field_path_checked_{empty_component,
 bad_subscript,empty_ok}`, `group_config.rs::{malformed_member_field_name_skips_
 only_that_group,trailing_dot_member_name_is_accepted}`.
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:44-50` (`parse_field_path`);

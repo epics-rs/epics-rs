@@ -73,30 +73,26 @@ intentional Rust-only behavior unless it breaks a libca/rsrv wire contract.
 > R2-57 `mod.rs:4537`, R2-59 `mod.rs:5061`, R2-62 `search.rs:173`, R2-63
 > `transport.rs:123`.
 >
-> **DEFERRED — structural, pending sign-off (do NOT patch):**
-> - **R2-40** — on a send/write timeout the Rust transport tears the
->   circuit down (`TcpClosed`, `transport.rs:1067-1086`) and reconnects,
->   where C `sendTimeoutNotify`→`unresponsiveCircuitNotify`
->   (`tcpiiu.cpp:879-941`) marks the circuit unresponsive, sends an echo
->   probe, and KEEPS the socket. This is not patchable: Tokio's
->   `timeout(write_all)` cancels the write mid-frame, so the socket cannot
->   be safely reused (a partial CA frame would desync the server parser);
->   teardown+reconnect is the safe handling (and matches C's send-*error*
->   path, `shutdown(SHUT_WR)`). Matching C's keep-and-probe on a
->   slow-but-alive circuit needs a transport write-path redesign
->   (non-cancelling spawned write + a separate read-side echo watchdog).
->   Correctness is preserved — the channel reconnects; the divergence is a
->   heavier recovery under transient send stalls. Flagged for user
->   sign-off before any redesign; documented in `transport.rs:988-1014`.
->   Scope (Round-4 review, bounds the sign-off): the redesign is
->   *write-loop-confined* — the `CircuitUnresponsive`→echo-probe→
->   `CircuitRecovered` plumbing already exists on the read side
->   (`transport.rs:1259-1260`, `types.rs` events), so only the send loop
->   changes (a non-cancelling write that tracks bytes-written across the
->   unresponsive window, or a spawned write task + last-progress
->   watchdog). The current comment additionally conflates send-*stall*
->   (C keeps the socket + echo-probes) with send-*error* (C
->   `shutdown(SHUT_WR)` teardown); only the stall case is the divergence.
+> **FIXED (2026-07-01, `2c6b1537`) — R2-40 send-stall keep-socket:**
+> - **R2-40** — on a send/write stall the Rust transport used to tear the
+>   circuit down (`TcpClosed`) and reconnect, where C `sendTimeoutNotify`→
+>   `unresponsiveCircuitNotify` (`tcpiiu.cpp:879-940`) marks the circuit
+>   unresponsive, arms an echo probe, and KEEPS the socket. The write loop
+>   now drives the flush with `writer.write(&batch[written..])` and carries
+>   `written` across stalls, so a `Pending`-cancelled `write` (0 bytes per
+>   the `AsyncWrite` contract) resumes from the exact offset with no byte
+>   re-sent — the reason the old code had to discard the stream is gone.
+>   On a send stall it emits `CircuitUnresponsive` and keeps the socket; a
+>   real socket error or 0-byte accept still closes. Recovery was unified
+>   to a single `Arc<AtomicBool>` shared by the send and receive watchdogs
+>   (mirroring C's one `tcpiiu::unresponsiveCircuit`): the read loop's
+>   data-arrival path emits the sole `CircuitResponsive` regardless of
+>   which watchdog first saw the stall (previously the recovery was gated
+>   on a read-loop-only flag, so a send-side stall could never clear). A
+>   forever-stalled write cannot leak — `ServerConnection::drop` aborts the
+>   write task when the receive echo watchdog closes a truly-dead circuit.
+>   Tests pin: send stall → `CircuitUnresponsive` + socket kept (not
+>   `TcpClosed`); resume sends each byte exactly once from the offset.
 >
 > **Minor residuals (benign, not re-filed):**
 > - R2-17: EVENT_ADD-via-`CA_PROTO_ERROR` is a `_=>{}` no-op; subscription

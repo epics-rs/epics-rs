@@ -14,16 +14,20 @@ nothing here. Findings are numbered `GW-N`.
 | `crates/epics-bridge-rs/src/pva_gateway/*` | `~/codes/epics-base/modules/pva2pva/p2pApp/` (`server.cpp`, `channel.cpp`, `chancache.cpp`, `moncache.cpp`, `gwmain.cpp`) |
 | `crates/epics-bridge-rs/src/pvalink/*` | see caveat below |
 
-### ⚠ pvalink reference caveat (blocks GW-80..GW-84 disposition)
+### ⚠ pvalink reference caveat — RESOLVED (re-validated vs pvxs 2026-07-01)
 
-The pvalink category was audited against **pva2pva** `pdbApp/pvalink*.cpp`
-(the reference path handed to the auditor), but the Rust port's own
-comments cite **pvxs** `ioc/pvalink*.cpp`. pva2pva and pvxs pvalink differ
-in several semantics, and the port appears to track pvxs where they
-diverge. **GW-80..GW-84 must be re-validated against pvxs
-(`~/codes/epics-modules/pvxs`, or the canonical pvxs checkout) before any
-are treated as real divergences or fixed.** Treating them as pva2pva
-divergences risks "fixing" the port toward the wrong reference.
+The pvalink category was first audited against **pva2pva** `pdbApp/pvalink*.cpp`
+(the reference path handed to the auditor), but the Rust port's own comments
+cite **pvxs** `ioc/pvalink*.cpp` — its true upstream. pva2pva and pvxs
+pvalink diverge in exactly the change-mask, PP-scan, and `atomic`-option
+areas that generated GW-80/81/82. Re-validation round
+`01KWEB9B0MF4D257X3C8V9RWZP` opened pvxs directly and **overturned most of
+the grading**: GW-80/81/82 are **false positives** (the port faithfully
+tracks pvxs), GW-83 collapses to a narrow NOTE, and only GW-84 is a
+confirmed (NOTE-severity) divergence vs pvxs. Verdicts are recorded inline
+in Category 5 below. **Net: zero pvalink defects; nothing to fix except two
+low-priority NOTEs.** (Lesson: audit against the reference the port actually
+tracks — pva2pva was the wrong upstream here.)
 
 ## Methodology
 
@@ -121,10 +125,11 @@ divergence, often a documented-intentional redesign needing sign-off),
 `gateAs.cc`, `gateAsCa.cc`, `gateResources.cc`. (All divergences fail in the
 **safe / over-deny / over-report** direction — no over-grant found.)
 
-**GW-40** Upstream READ-access not bridged into the downstream read decision — **CONCERN**
+**GW-40** Upstream READ-access not bridged into the downstream read decision — **FIXED `1ed22d29`**
 - Rust: `upstream.rs:1447` (`read = cfg.can_read(...)`, no AND with upstream) and `:798-808` (access-rights watcher swaps only `rights.write`; `rights.read` ignored)
 - C ref: `gateVc.cc:326` `readAccess() = asclient->readAccess() && vc->readAccess()`; `gatePv.cc:395,1851` set `vc` read-access from `ca_read_access` on connect + every AR callback
 - Impact: Write path correctly ANDs local+upstream (`:1453`); read path uses local ACF only. When the upstream revokes read to the gateway's client, C reports read=false downstream; Rust keeps read=true and (cached) serves the last value. Asymmetric with write bridging — over-reports read rights (no fresh data flows, so CONCERN not DEFECT).
+- Fix: seed `upstream_read` from the same connect-time `channel.info()` snapshot, keep it live in the AR watcher (now tracks both bits, wakes downstream clients if either flips), and AND it into the read decision — symmetric with the write path. Test `br_gw40_upstream_read_denied_overrides_local_acf_allow`. Single read-decision owner, no sibling sites.
 
 **GW-41** Conditional ASG rules (CALC/INP) entirely non-functional — the whole `gateAsCa` subsystem is unported — **CONCERN**
 - Rust: `access.rs:103-109` (`Mode::Rules` with no INP resolver); `access.rs:117,147` call sync `check_access_*`, which in `epics-base-rs/src/server/access_security.rs:741-743` pass `calc_ok = |_| false` (fail-closed)
@@ -193,36 +198,42 @@ CONCERNs are deliberate redesign departures.
 
 *Clean (verified):* pvRequest passthrough + monitor dedup, `p2pReadOnly` gating (stricter than C), op forwarding (GET/PUT/PUT_GET/RPC/PROCESS/ChannelArray/GET_FIELD), type-change handling (superset), cleaner two-tick reaping + counters, `list_pvs` empty (matches C no `channelList`), operator `:drop`/`:flush`/status (superset).
 
-### Category 5 — pvalink (⚠ audited vs pva2pva; port tracks pvxs — RE-VALIDATE)
+### Category 5 — pvalink (⚠ first graded vs pva2pva; RE-VALIDATED vs pvxs 2026-07-01)
 
-`pvalink/{link,config,integration,registry,iocsh}.rs` vs pva2pva
-`pdbApp/pvalink*.cpp`. **See the pvalink reference caveat above — none of
-GW-80..GW-84 is dispositioned until re-checked against pvxs.**
+`pvalink/{link,config,integration,registry,iocsh}.rs`. The port's true
+upstream is **pvxs** `ioc/pvalink*.cpp`, not pva2pva. Round
+`01KWEB9B0MF4D257X3C8V9RWZP` re-checked GW-80..GW-84 against pvxs directly
+(citations verified by hand): **GW-80/81/82 are FALSE POSITIVES** (the port
+matches pvxs, which — unlike pva2pva — has no change-mask suppression, no
+PP-scan target, and does parse `atomic`); **GW-83 downgrades** (its alarm-on-
+disconnect claim is wrong vs pvxs; only a `retry`-forward-link residual
+remains, NOTE); **GW-84 is CONFIRMED vs pvxs** (NOTE). Net: **zero pvalink
+defects.** Each verdict is inlined below.
 
-**GW-80** CP/CPP scan has no per-field change suppression (processes on every event) — **DEFECT (pending pvxs re-validation)**
-- Rust: `integration.rs:973-985` (`run_notify_forwarder` scans on every `ScanEvent`, payload unused) + `link.rs:354-367` (monitor callback caches whole value, no changed-bitset)
-- C ref (pva2pva): `pvalink_channel.cpp:304` (`if(connected_latched && !op_mon.changed.logical_and(scan_changed[idx])) return;`), mask built `pvalink_link.cpp:132-153`
-- Impact: pva2pva reprocesses a CP/CPP record only when the monitor's changed-bitset intersects the link's selected-field mask; the Rust forwarder has no changed-bitset and processes on every update. A `CP` link on `field=alarm.severity` fires the record (and FLNK/output cascade) on every value change. **Must confirm pvxs pvalink does field-mask suppression before treating as a defect.**
+**GW-80** ~~CP/CPP scan has no per-field change suppression~~ — **FALSE POSITIVE (RE-VALIDATED vs pvxs)**
+- Rust: `integration.rs:973-985` (`run_notify_forwarder` scans on every `ScanEvent`) + `link.rs:354-367` (monitor callback caches whole value, no changed-bitset)
+- pvxs evidence: `pvalink_channel.cpp:312-325` (`ScanTrack::scan()` has only the passive + PACT gates, then `dbProcess(prec)` — NO changed-bitset test), `:422-432` (scan loop runs `trac.scan()` for every record on every `run()`/monitor pop), `pvalink_link.cpp:83-120` (`onTypeChange` builds no `proc_changed` mask). The entire pva2pva change-mask machinery does not exist in pvxs.
+- Verdict: The change-mask suppression is a **pva2pva-only** behavior. pvxs processes on every monitor pop, exactly like the Rust forwarder. **Rust matches pvxs — drop.** (Hand-verified: pvalink_channel.cpp:312-325.)
 
-**GW-81** `PP` input link does not register a passive-gated monitor scan target — **CONCERN (pending pvxs re-validation)**
+**GW-81** ~~`PP` input link does not register a passive-gated monitor scan target~~ — **FALSE POSITIVE (RE-VALIDATED vs pvxs)**
 - Rust: `config.rs:129-135` (`ProcMode::inp_scan()` returns `(false,false)` for `Pp`); `:283-305` derives scan flags from it, so `PP` never sets `scan_on_update`
-- C ref (pva2pva): `pvalink_channel.cpp:394-399` (scan-list build includes `pp==PP`, `scan_check_passive = (pp != CP)`)
-- Impact: In pva2pva `INP=@pva://SRC PP` on a Passive record reprocesses on SRC updates; in Rust `PP` registers no scan target (PUT-only), so the record never processes on updates. The `config.rs:286-292` comment asserts PP "must register a passive-only scan target" but the code does not.
+- pvxs evidence: `pvalink_link.cpp:122-133` (`scanOnUpdate()`: `CP → Yes`, `CPP → Passive`, **everything else incl. `PP` → No`). PP INP links register no scan target in pvxs.
+- Verdict: Rust `Pp → (false,false)` matches pvxs `PP → scanOnUpdateNo`. The `config.rs:286-292` comment citing pva2pva is stale/misleading, but the **code is correct vs pvxs — drop.** (Hand-verified: pvalink_link.cpp:122-133.)
 
-**GW-82** `atomic` accepted as a per-link option, driving scan-group locking pva2pva never performs — **NOTE (pending pvxs re-validation)**
+**GW-82** ~~`atomic` accepted as a per-link option pva2pva never performs~~ — **FALSE POSITIVE (RE-VALIDATED vs pvxs)**
 - Rust: `config.rs:400,532` (parse `atomic`) + `integration.rs:1075-1092` (atomic targets scanned under one `lock_records` epoch)
-- C ref (pva2pva): `pvalink.h:98` has no `atomic` member (`pva_parse_bool` ignores unknown keys); `isatomic` init false and never assigned true (dead `DBManyLocker` branch)
-- Impact: pva2pva silently ignores `{pva:{atomic:...}}` and always scans per-record; Rust honors `atomic:true` (a pvxs behavior). Default matches pva2pva; the parser accepting an option pva2pva drops is a surface divergence.
+- pvxs evidence: `pvalink_jlif.cpp:112-113` (`else if(pvt->jkey=="atomic") pvt->atomic = !!val;`) parses it, `:256` reports it, `pvalink_channel.cpp:398-404` builds `atomicrecs` from `pvaLink::atomic` and `:422-427` holds `DBManyLocker` across the atomic group.
+- Verdict: pvxs **does** parse `atomic` and drive atomic-group scanning; the "pva2pva drops it" grading was against the wrong reference. Rust matches pvxs — **drop.**
 
-**GW-83** `scanForward` errors on disconnect + ignores `retry`; pva2pva silent + honors `retry` — **NOTE (pending pvxs re-validation)**
-- Rust: `link.rs:990-998` (`scan_forward` returns `Err(Disconnected)` when `!is_connected()`, no `retry`) via `integration.rs:1285-1314`
-- C ref (pva2pva): `pvalink_lset.cpp:479-493` (gate `if(!self->retry && !self->valid()) return;` — void, no alarm; a `retry` FWD link proceeds to `put(true)` while disconnected)
-- Impact: A disconnected non-retry pva FWD link is a silent no-op in pva2pva; Rust returns an error. A `retry` FWD link is queued in pva2pva but rejected in Rust. Obscure config.
+**GW-83** `scanForward` on a disconnected `retry` forward link errors instead of queuing — **NOTE (RE-VALIDATED vs pvxs, downgraded)**
+- Rust: `link.rs:990-998` (`scan_forward` returns `Err(Disconnected)` when `!is_connected()`, gates on connection alone regardless of `retry`) via `integration.rs:1285-1314`
+- pvxs evidence: `pvalink_lset.cpp:677-680` (`pvaScanForward` raises `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` on a disconnected non-retry forward link — so Rust's `Err(Disconnected)→alarm` **matches pvxs** for the common case); pvxs gates on `!retry && !valid()`, so a `retry` forward link proceeds to `put(true)` (queues) even while disconnected.
+- Verdict: The graded "C is silent on disconnect" claim was against pva2pva and is **wrong vs pvxs** (pvxs alarms too). Residual real divergence: a `retry=true` pva `FLNK` proceeds/queues in pvxs but Rust rejects it. Obscure config → **NOTE.**
 
-**GW-84** Connected read of an NT value lacking a `value` child fails (→INVALID) instead of leaving buffer untouched — **NOTE (pending pvxs re-validation)**
-- Rust: `link.rs:1788-1801` (`select_link_value` → `PvField::Null` when no `value` child) → base raises LINK/INVALID
-- C ref (pva2pva): `pvalink_lset.cpp:218-224` (`if(self->fld_value){...}` — null fld_value copies nothing, still `return 0`, keeps prior VAL, no alarm)
-- Impact: For a connected structure with no `value` field, pva2pva reads succeed (value untouched); Rust drives the record to INVALID. Rare NT shape.
+**GW-84** Connected read of a value lacking a selected child fails (→INVALID) instead of keeping prior VAL — **NOTE (CONFIRMED vs pvxs)**
+- Rust: `link.rs:1788-1801` (`select_link_value` → `PvField::Null` when the child is absent) → resolver returns `None` → base raises LINK/INVALID
+- pvxs evidence: `pvalink_lset.cpp:281-286`,`:439` (connected but `!value`: copies nothing, memsets 0 only when `pnRequest==NULL`, falls through to `return 0` — success, record keeps prior value, no LINK_ALARM)
+- Verdict: Real divergence vs pvxs, reachable with a metadata-substruct selector (`field=timeStamp`, `field=alarm`). Confidence hinges on `pvfield_to_epics_value(Null)→None`. Rare NT shape → **NOTE, keep.**
 
 *Clean (verified vs pva2pva):* jlif option parsing (proc/sevr enums, bool shorthands, clamps, KIND dispatch), `makeRequest` monitor pvRequest, OUT `put()` combine-process resolution, disconnect value-serving gate, `dbpvar` levels + glob match, sub-field selection.
 
@@ -230,9 +241,16 @@ GW-80..GW-84 is dispositioned until re-checked against pvxs.**
 
 ## Review Log — round `01KWE96SQY6TJGFRDACXAZ130S` (2026-07-01)
 
-Findings: **1 DEFECT** (GW-80, pending pvxs re-validation), **12 CONCERN**,
-**11 NOTE** across 5 categories (GW-1..5, GW-20..26, GW-40..43, GW-60..67,
-GW-80..84).
+Findings as first graded: 1 DEFECT / 12 CONCERN / 11 NOTE across 5
+categories (GW-1..5, GW-20..26, GW-40..43, GW-60..67, GW-80..84).
+
+**After the pvxs re-validation round `01KWEB9B0MF4D257X3C8V9RWZP`: 0 DEFECT.**
+GW-80 (the only DEFECT) plus GW-81/GW-82 are false positives — the pvalink
+category was first graded against pva2pva but the port tracks pvxs, and pvxs
+lacks the change-mask suppression / PP-scan / `atomic`-drop behaviors that
+generated them. GW-40 is now **FIXED** (`1ed22d29`). Remaining actionable:
+GW-23 + GW-60 (wrong-data), GW-41 (subsystem scope). The rest are redesign
+sign-off decisions or NOTEs.
 
 Thematic clusters:
 
@@ -263,17 +281,19 @@ Thematic clusters:
    client can observe *wrong data*, not just different connection dynamics.
    GW-23 in particular has no C analogue (self-heals in C).
 
-5. **pvalink reference mismatch (BLOCKER for GW-80..84).** The port tracks
-   pvxs; the audit used pva2pva. GW-80 (CP/CPP over-processing) would be a
-   real DEFECT *if* pvxs also does field-mask suppression — must be
-   re-validated against pvxs before any fix.
+5. **pvalink reference mismatch — RESOLVED.** The port tracks pvxs; the
+   audit first used pva2pva. Re-validation vs pvxs cleared GW-80/81/82 as
+   false positives (the three areas where pva2pva and pvxs diverge),
+   downgraded GW-83, and confirmed only GW-84 (NOTE). Zero pvalink defects.
+   Lesson: grade against the reference the port actually tracks.
 
 ### Next steps (fix phase — separate commits, after this doc lands)
 
-- **Re-validate GW-80..GW-84 against pvxs** before touching pvalink.
+- **GW-40** (bridge upstream read-access) — **DONE `1ed22d29`.**
+- **GW-80..GW-84 re-validated vs pvxs** — no fix owed (GW-80/81/82 false
+  positive; GW-83/GW-84 are low-priority NOTEs, left as documented).
 - **GW-23** (metadata zeroed forever) and **GW-60** (stale overflow value)
-  are the strongest wrong-data candidates for fixes.
-- **GW-40** (bridge upstream read-access) is a small, safe correctness fix.
+  are the strongest remaining wrong-data candidates for fixes.
 - **GW-41** (`gateAsCa`) is a subsystem-sized port — confirm scope with the
   user before starting.
 - **GW-1/GW-20/GW-22/GW-61/GW-62/GW-63** are redesign sign-off decisions,

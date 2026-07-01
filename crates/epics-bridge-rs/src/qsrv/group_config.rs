@@ -731,7 +731,29 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     Ok(def)
 }
 
+/// Validate a group member field-name path against the pvxs `FieldName`
+/// constructor grammar (`ioc/fieldname.cpp:29-67`), which **throws** on a
+/// malformed path — an empty leading/interior component (`.a`, `a..b`) or a
+/// bad array subscript (`a[x]`, `a[]`). pvxs runs this via `fieldName(def.name)`
+/// (`field.cpp:21`) inside the `createGroups` per-group `try`
+/// (`groupconfigprocessor.cpp:431-446`), so a throw aborts just that group's
+/// build (logged, group not served) while siblings still load. Here the error
+/// propagates out of `parse_member` → `raw_to_group_def`, whose caller already
+/// implements the same per-group recovery (`tracing::warn!("ignoring invalid
+/// QSRV group")`). The grammar itself lives in one place — the canonical
+/// `super::group::parse_field_path_checked`, which the navigation parser also
+/// uses — so build-time validation and runtime navigation can never diverge.
+fn validate_field_name(field_name: &str) -> BridgeResult<()> {
+    super::group::parse_field_path_checked(field_name)
+        .map(|_| ())
+        .map_err(BridgeError::GroupConfigError)
+}
+
 fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<GroupMember> {
+    // pvxs constructs `FieldName(def.name)` before anything else in the field
+    // definition; a malformed path throws and aborts this group's build.
+    validate_field_name(field_name)?;
+
     let obj = value.as_object().ok_or_else(|| {
         BridgeError::GroupConfigError(format!("field '{field_name}' must be an object"))
     })?;
@@ -2510,5 +2532,47 @@ mod tests {
 
         let groups = parse_group_config(json).unwrap();
         assert!(groups[0].members[0].channel.is_empty());
+    }
+
+    /// Q1: a group with a malformed member field-name path is refused (pvxs's
+    /// `FieldName` ctor throws), skipping just that group via the per-group
+    /// recovery boundary — a valid sibling group in the same config still
+    /// loads. The old parser silently normalized the bad name and served a
+    /// well-formed-but-different structure.
+    #[test]
+    fn malformed_member_field_name_skips_only_that_group() {
+        // `bad..path` has an empty interior component; `arr[x]` a non-integer
+        // subscript. Each pvxs `FieldName` ctor throws → group not served.
+        let json = r#"{
+            "GRP:emptycomp": { "bad..path": { "+channel": "R:a" } },
+            "GRP:badsub":    { "arr[x]":    { "+channel": "R:b" } },
+            "GRP:ok":        { "val":       { "+channel": "R:c" } }
+        }"#;
+
+        let groups = parse_group_config(json).unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["GRP:ok"],
+            "only the valid sibling loads; the two malformed groups are skipped, got {names:?}"
+        );
+    }
+
+    /// Q1: a single trailing dot is dropped (pvxs `getline` fails the terminal
+    /// empty extraction at EOF), so a member named `a.` builds field `a` and
+    /// the group loads — it must NOT be rejected as a malformed component.
+    #[test]
+    fn trailing_dot_member_name_is_accepted() {
+        let json = r#"{
+            "GRP:trail": { "a.": { "+channel": "R:a" } }
+        }"#;
+
+        let groups = parse_group_config(json).unwrap();
+        assert_eq!(groups.len(), 1, "trailing dot is not a malformed component");
+        assert_eq!(
+            groups[0].members.len(),
+            1,
+            "the member builds and the group loads"
+        );
     }
 }

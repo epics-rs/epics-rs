@@ -25,7 +25,28 @@ unused slots are gaps, not omissions.
 ## Open Findings
 
 ### Q1: Malformed group field-name path silently normalized, not rejected
-Severity: Medium — OPEN
+Severity: Medium — CLEARED
+Resolution: the pvxs `FieldName` grammar is now enforced at group-build time
+from a single canonical parser. `group.rs::parse_field_path_checked` is the one
+source of truth for the grammar and returns `Err` on exactly pvxs's throw set
+(empty leading/interior component; a `]`-terminated component with no `[` or a
+non-integer subscript), while dropping a single trailing `.` at EOF like
+`getline`. The infallible `parse_field_path` (navigation) is now a thin
+`parse_field_path_checked(..).unwrap_or_default()` wrapper, so build-time
+validation and runtime navigation can never diverge (this also fixes the
+navigation-side normalization: `value[x]`→`value`, `value[`→`value`). The
+config layer calls it via `group_config::validate_field_name` at the top of
+`parse_member`, so a malformed member fails `parse_member` →
+`raw_to_group_def`, whose caller already skips just that group
+(`tracing::warn!("ignoring invalid QSRV group")`) and preserves siblings —
+matching pvxs's per-group `try` (`groupconfigprocessor.cpp:431-446`). The false
+`group.rs` comment claiming the old `.filter(!is_empty)` "matches pvxs
+validation (fieldname.cpp:35-36)" is removed. Degenerate divergence documented:
+a negative/`u32`-overflowing subscript is rejected at build (pvxs `strtol`
+accepts then fails navigation) — non-negative bounded indices only, never a
+real config. Regression: `group.rs::parse_field_path_checked_{empty_component,
+bad_subscript,empty_ok}`, `group_config.rs::{malformed_member_field_name_skips_
+only_that_group,trailing_dot_member_name_is_accepted}`.
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:44-50` (`parse_field_path`);
 `group_config.rs:882-890` (`parse_member` stores the field name verbatim, no
 grammar check).

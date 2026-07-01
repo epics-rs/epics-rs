@@ -157,11 +157,12 @@ vs `server.cpp`, `channel.cpp`, `chancache.cpp`, `moncache.cpp`,
 (broadcast fan-out + per-credential identity forwarding), so several
 CONCERNs are deliberate redesign departures.
 
-**GW-60** Monitor overflow delivers a lagging trailing window, not C's latest-value-coalesced element — **CONCERN (⚠ pva2pva-referenced — RE-VALIDATE vs pvxs before fixing)**
-- Rust: `channel_cache.rs:48` (`BROADCAST_CAPACITY=16` FIFO ring) + `source.rs:1068,965` (on `broadcast::Lagged` resume at oldest retained frame, mark `overrun`)
-- C ref: `moncache.cpp:157-197,354-368` — on overflow each `MonitorUser` coalesces into a single `overflowElement` (latest value), `release()` returns that with the overrun bitset OR'd
-- Impact: A slow downstream client receives delayed/stale values (oldest-first) where pva2pva coalesces to newest. Observable semantic difference for latest-value control monitors; overrun flag set but delivered value not current until upstream rate falls.
-- ⚠ REFERENCE CAVEAT: this is graded against **pva2pva** `moncache.cpp`, but the Rust PVA path tracks **pvxs** (same mismatch that made GW-80/81/82 false positives). pvxs `server::Monitor` queue-overflow / `MonitorControlOp` maybe-drop / coalescing semantics differ from pva2pva's `overflowElement`. Do NOT fix toward pva2pva coalescing until pvxs's actual overflow behavior is confirmed — fixing toward the wrong reference is the trap this campaign already hit once.
+**GW-60** Monitor overflow drops the oldest of a fixed-16 window and does not coalesce, where C squashes overflow into the tail (latest) — **CONFIRMED REAL vs pvxs** (re-validation round `01KWEDDFX0PW559DGSFRPBQVVH`)
+- Rust: `pva_gateway/channel_cache.rs:48` (`BROADCAST_CAPACITY=16` FIFO ring) + `source.rs:965-968,1068-1071` (on `broadcast::Lagged` resume at oldest retained frame, mark `pending_overrun`)
+- C ref (PRIMARY, pvxs — the reference the port tracks): `pvxs/src/servermon.cpp:273-297` `ServerMonitorControl::doPost` — on a full queue the default `post()` (`maybe=false`, source.h:98-99) takes the SQUASH branch `queue.back().assign(val)` (`:285`), overwriting the tail with the newest value and bumping `nSquash`; the newest is NEVER dropped. Only `tryPost()` (`maybe=true`) drops-newest; `forcePost` grows past `limit`. Queue depth honors the client-negotiated `record._options.queueSize` (`:533-544`, min 2). Secondary ref (pva2pva): `moncache.cpp:157-197` `overflowElement` — same coalesce-to-latest discipline.
+- Impact: A slow downstream client on the Rust gateway gets the oldest-first trailing window of a fixed 16-frame ring and, under sustained overflow, may never converge to the true latest value; pvxs always lands the latest in the queue tail. REAL wrong-data divergence for latest-value control monitors.
+- ⚠ RE-VALIDATED (was flagged as a possible pva2pva-reference false positive like GW-80/81/82). Verdict is REAL: pvxs `doPost` squash confirms the SAME coalesce-to-latest behavior as the cited pva2pva, so the reference did not mislead. Two wording refinements a fix must absorb: (1) pvxs emits NO wire overrun mask — `servermon.cpp:174-176` is a TODO that always serializes an empty BitSet, `nSquash` is server-side stats only; so the Rust gateway's overrun-marking is an *addition* over pvxs (safe over-signaling), a mirror only of pva2pva — do not call it pvxs parity. (2) pvxs keeps a FIFO front backlog and coalesces ONLY the overflow tail, so it too delivers older values first; the guarantee is "newest never dropped, staleness bounded by `queueSize`," not "pure latest."
+- Related: GW-64 (fixed-16 ring vs client-negotiated `queueSize`) is now also confirmed vs pvxs (`servermon.cpp:533-544`), not just pva2pva.
 
 **GW-61** Per-credential cache split breaks chancache's single-shared-upstream-monitor model — **CONCERN**
 - Rust: `source.rs:584-622` (`upstream_cache_for` — every distinct `(account,method,host,authority)` gets its own `ChannelCache` → own upstream channel+monitor per PV; only anonymous share `self.cache`)
@@ -251,9 +252,11 @@ GW-80 (the only DEFECT) plus GW-81/GW-82 are false positives — the pvalink
 category was first graded against pva2pva but the port tracks pvxs, and pvxs
 lacks the change-mask suppression / PP-scan / `atomic`-drop behaviors that
 generated them. GW-40 (`1ed22d29`) and GW-23 (`70ebcfae`) are now **FIXED**.
-Remaining actionable: GW-60 (wrong-data, but pva2pva-referenced — needs
-pvxs re-validation), GW-41 (subsystem scope). The rest are redesign
-sign-off decisions or NOTEs.
+Remaining actionable: GW-60 (wrong-data, CONFIRMED REAL vs pvxs
+`servermon.cpp:273-297` — structural PVA-gateway fan-out change, subsumes
+GW-64), GW-41 (subsystem scope). The rest are redesign sign-off decisions
+or NOTEs. GW-40 review round `01KWEDDFX...` PASSED all four questions (no
+defect); GW-23 review re-run pending.
 
 Thematic clusters:
 
@@ -296,9 +299,11 @@ Thematic clusters:
 - **GW-80..GW-84 re-validated vs pvxs** — no fix owed (GW-80/81/82 false
   positive; GW-83/GW-84 are low-priority NOTEs, left as documented).
 - **GW-23** (metadata zeroed forever) — **DONE `70ebcfae`.**
-- **GW-60** (stale overflow value) — the graded C ref is pva2pva; RE-VALIDATE
-  against pvxs before fixing (see its reference caveat). Not fixed toward
-  pva2pva coalescing until pvxs's overflow behavior is confirmed.
+- **GW-60** (stale overflow value) — **CONFIRMED REAL vs pvxs** (`servermon.cpp:273-297`
+  squash-to-tail). Fix = replace the fixed-16 drop-oldest broadcast ring with a
+  coalesce-to-latest per-subscriber queue sized to the client-negotiated
+  `queueSize` (subsumes GW-64). This is a structural change to the PVA gateway
+  monitor fan-out — scope/sign-off before starting.
 - **GW-41** (`gateAsCa`) is a subsystem-sized port — confirm scope with the
   user before starting.
 - **GW-1/GW-20/GW-22/GW-61/GW-62/GW-63** are redesign sign-off decisions,

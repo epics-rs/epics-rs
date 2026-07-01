@@ -252,7 +252,22 @@ concurrently between the per-member reads produces marked leaves sampled at
 different instants: a torn snapshot the wire advertises as atomic.
 
 ### Q39: Group monitor `poll()` turns a per-event read failure into MONITOR FINISH instead of skipping the event
-Severity: Medium — OPEN
+Severity: Medium — CLEARED (commit pending)
+
+Resolution: `GroupMonitor::poll()` now matches on `read_group()` and, on
+`Err`, logs via `tracing::warn!` (the `log_exc_printf` analogue) and
+`continue`s the event loop instead of `.ok()?` → `None`. A per-event member
+read/conversion failure drops a single update and keeps the subscription alive,
+mirroring pvxs's per-callback try/catch (`groupsource.cpp:350-352`). Defect-family
+audit (anchor: per-event read failure mapped to a stream-ending `None` in a
+monitor poll): the single-record `BridgeMonitor::poll` `snap?`/`recv_snapshot()?`
+are legitimate channel-close (the snapshot is pre-materialised in the
+subscription; `snapshot_to_pv_structure` is infallible) — DISTINCT; `seed()`
+`.ok()` is the MONITOR-INIT frame whose `None` falls back to `get_value_checked`
+(no teardown) — DISTINCT; `event_rx`/`recv()`/`group_channel.as_ref()?` are
+teardown detection (stop() cleared the field) — DISTINCT. Regression:
+`q39_group_monitor_member_read_error_skips_event_keeps_open` (remove the member
+record mid-stream, inject an event, assert poll parks not FINISH).
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:2402-2403` (`read_group().await.ok()?`)
 → `pva_adapter.rs:324-325` (`let Some(poll) = poll else { break }` →
 `monitor.stop()` → stream end → wire FINISH).

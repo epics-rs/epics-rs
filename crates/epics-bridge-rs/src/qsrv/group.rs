@@ -2448,7 +2448,27 @@ impl super::provider::PvaMonitor for GroupMonitor {
             };
 
             let group_channel = self.group_channel.as_ref()?;
-            let value = group_channel.read_group().await.ok()?;
+            let value = match group_channel.read_group().await {
+                Ok(v) => v,
+                Err(e) => {
+                    // pvxs wraps each group value/property refresh in a
+                    // try/catch that logs and returns from the callback
+                    // *without posting*, leaving the subscription alive
+                    // (`groupsource.cpp:350-352`). A per-event read or
+                    // conversion failure (a member record gone, a value
+                    // conversion error, a mid-stream ACL revocation on one
+                    // member) must therefore drop a single update — not map
+                    // to `None`, which the forward task reads as source-close
+                    // and turns into a spurious MONITOR FINISH that tears the
+                    // whole group subscription down.
+                    tracing::warn!(
+                        group = %self.def.name,
+                        error = %e,
+                        "qsrv group monitor: member read failed; skipping event, subscription kept open"
+                    );
+                    continue;
+                }
+            };
             // Resolve value-shape-dependent leaves against the concrete
             // composed value: an NTEnum member's value/alarm event marks
             // only `value.index`, never the property-only `value.choices`
@@ -3912,6 +3932,60 @@ mod tests {
         assert!(
             polled.is_err(),
             "all-const group monitor must park (no snapshot, no FINISH), got {polled:?}"
+        );
+    }
+
+    /// Regression (Q39): a per-event `read_group()` failure — a member
+    /// record removed mid-stream, a value-conversion error, or an ACL
+    /// revocation on one member — must drop that single update and leave
+    /// the subscription open. pvxs wraps each group value/property refresh
+    /// in a try/catch that logs and returns from the callback WITHOUT
+    /// posting (`groupsource.cpp:350-352`). Mapping the error to `None`
+    /// instead reads as source-close in the forward task and tears the
+    /// whole group monitor down with a spurious MONITOR FINISH.
+    #[tokio::test]
+    async fn q39_group_monitor_member_read_error_skips_event_keeps_open() {
+        use crate::qsrv::provider::PvaMonitor;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("Q39:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "Q39:GRP": {
+                "v": {"+type": "plain", "+channel": "Q39:rec.VAL"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let mut mon = GroupMonitor::new(db.clone(), def);
+        mon.start().await.expect("group monitor starts");
+
+        // Retain a keepalive sender so the fan-in channel stays open, then
+        // make the member unreadable: `read_group()` now fails with
+        // `RecordNotFound`.
+        let tx = mon.event_tx.clone().expect("keepalive sender present");
+        assert!(db.remove_record("Q39:rec").await, "member record removed");
+
+        // Inject a value event for the now-unreadable member.
+        tx.send(MemberEvent {
+            member_index: 0,
+            kind: MemberEventKind::Value,
+            mask: DbeMask::VALUE | DbeMask::ALARM,
+        })
+        .await
+        .expect("event queued on keepalive channel");
+
+        // poll() must consume the event, hit the read failure, log+skip,
+        // and PARK on the still-open channel — never return `None` (FINISH).
+        // A bounded poll therefore TIMES OUT; pre-fix it returned `None`
+        // (Some(None)) immediately.
+        let polled = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
+        assert!(
+            polled.is_err(),
+            "a member read error must skip the event and keep the \
+             subscription open (park), not FINISH — got {polled:?}"
         );
     }
 

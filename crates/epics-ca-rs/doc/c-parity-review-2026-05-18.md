@@ -94,6 +94,32 @@ intentional Rust-only behavior unless it breaks a libca/rsrv wire contract.
 >   Tests pin: send stall → `CircuitUnresponsive` + socket kept (not
 >   `TcpClosed`); resume sends each byte exactly once from the offset.
 >
+> **Review round (2026-07-01) — two follow-up fixes to convergence:**
+> - `a45e9391` — the adversarial review caught a regression the redesign
+>   itself introduced. The shared `AtomicBool`'s `swap` and its
+>   `event_tx.send` were two non-atomic statements, and the send watchdog
+>   (`write_loop`) and receive echo watchdog (`read_loop`) run on separate
+>   tasks sharing one event channel, so a `CircuitResponsive` could be
+>   enqueued ahead of a still-pending `CircuitUnresponsive` — wedging the
+>   channels Unresponsive with revoked access on a live circuit (the next
+>   data arrival can't re-clear a flag that is already false). Replaced the
+>   bare `AtomicBool` with `UnresponsiveGate` (`Mutex<bool>`) whose
+>   `mark_unresponsive`/`mark_responsive` guard the (test + emit) pair under
+>   one lock — exactly as C guards `unresponsiveCircuit` under the cac lock
+>   (`tcpiiu.cpp:861-940`) — so the two transition events can no longer be
+>   delivered out of order. (Before the redesign only `read_loop` emitted
+>   both, same-task-ordered, so the reorder is new to this fix.)
+> - `2e053adf` — the send watchdog was missing C's `receiveThreadIsBusy`
+>   guard: C `tcpSendWatchdog::expire` RESTARTS (does not `sendTimeoutNotify`)
+>   while the recv thread is mid-processing (`tcpSendWatchdog.cpp:48-50`,
+>   `_receiveThreadIsBusy` set/cleared at `tcpiiu.cpp:494/526`). Without it a
+>   send stall raised a spurious `ECA_UNRESPTMO` on in-flight IO of a
+>   live-inbound circuit. `UnresponsiveGate` gained a `recv_busy` flag
+>   (`read_loop` sets it across message processing, clears it while parked in
+>   `select!`); `write_loop`'s stall arm re-polls the same write (restart)
+>   instead of marking unresponsive while it is set. Boundary test pins both
+>   sides of the flag.
+>
 > **Minor residuals (benign, not re-filed):**
 > - R2-17: EVENT_ADD-via-`CA_PROTO_ERROR` is a `_=>{}` no-op; subscription
 >   errors normally arrive as EVENT_ADD status frames handled at

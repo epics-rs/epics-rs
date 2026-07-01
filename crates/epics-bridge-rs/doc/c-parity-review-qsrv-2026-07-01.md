@@ -65,7 +65,23 @@ this "matches pvxs validation (fieldname.cpp:35-36)" is false — that C line
 throws, it does not filter.
 
 ### Q2: Member-level `+id`/`+putorder`/`+channel` accept only their canonical JSON type
-Severity: Low — OPEN
+Severity: Low — CLEARED
+Resolution: every member-level scalar annotation now coerces through the same
+`as<T>()`-equivalent helpers the group-level fix uses. `parse_member` routes
+`+type`/`+channel`/`+trigger`/`+id` through `json_value_as_string` (bool/number
+→ string) and `+putorder` through the new `json_value_as_i64` (bool/real/string
+→ int, whose string branch is `parse_stoll_base0` mirroring pvxs
+`parseTo<int64_t>` = `std::stoll(s,_,0)`: base auto-detect, sign,
+leading/trailing whitespace). A present-but-non-coercible value (array/object)
+now returns `Err` → per-group skip, matching pvxs's `NoConvert` throw and the
+group-level `+atomic`/`+id` idiom. So `+id:5`→`"5"`, `+putorder:"2"`→`2`,
+numeric `+channel`→`"5"` all coerce (pvxs behavior) instead of being silently
+dropped; a `bool`/`number` `+type` coerces then warns-and-defaults to Scalar.
+Defect-family: the finding cited `+id`/`+putorder`/`+channel`; `+type` and
+`+trigger` were the same-anchor member-level `.as_str()` reads and are fixed in
+the same pass. Regression: `parse_stoll_base0_matches_pvxs`,
+`member_putorder_coerces_numeric_string`, `member_id_and_channel_coerce_numeric`,
+`member_noncoercible_annotation_skips_only_that_group`.
 Rust: `crates/epics-bridge-rs/src/qsrv/group_config.rs:877-880` (member `+id`
 via `.as_str()`), `:872-875` (`+putorder` via `.as_i64()`).
 C ref: `pvxs/ioc/groupprocessorcontext.cpp:66-82` (`assign` depth==3:

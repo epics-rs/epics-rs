@@ -740,6 +740,26 @@ impl GroupChannel {
         // recursive-read deadlock. So the atomic path resolves every
         // member against the pre-acquired guards and never re-locks.
         if atomic {
+            // C-parity: pvxs's `onGet` takes `DBManyLocker G(group.value.lock)`
+            // — the SAME `DBManyLock` the atomic PUT holds
+            // (`groupsource.cpp:492` onGet vs `:621` onPutGroup). Take the
+            // `lock_records` advisory gate over every member record BEFORE the
+            // per-record read guards below, so this atomic GET is mutually
+            // exclusive with a concurrent atomic group PUT (which also takes
+            // `lock_records`, `group.rs:1460`) and with a plain single-record
+            // write (which takes the same per-record gate via `lock_record`,
+            // `field_io.rs:630`). Every writer takes the advisory gate before
+            // its `RwLock` write guard, so while this GET owns the gate set no
+            // writer can hold any member's write guard — the incremental
+            // read-guard acquisition in `lock_group_records_read` becomes
+            // uncontended and consistent. Without this gate that incremental
+            // acquisition left a window: a write-preferring writer could update
+            // a later-sorted member between this GET's read of an earlier one,
+            // yielding a torn snapshot (B updated, A stale) that defeats the
+            // `atomic` flag — the GET-side twin of the PUT-side BR-R15 gap.
+            let member_records = group_member_record_names(&self.db, &self.def.members).await;
+            let _many_guard = self.db.lock_records(&member_records).await;
+
             let guards = lock_group_records_read(&self.db, &self.def.members).await;
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
@@ -4342,6 +4362,60 @@ mod tests {
                 assert_eq!(vb, 6.0);
             }
             other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    /// Regression (Q50): the atomic group GET must hold the same
+    /// `DBManyLock`-equivalent gate set the atomic PUT holds — pvxs's
+    /// `onGet` takes `DBManyLocker G(group.value.lock)`
+    /// (`groupsource.cpp:492`), the identical lock its `onPutGroup` takes
+    /// (`:621`). Holding one member's gate externally must block the atomic
+    /// GET from entering its read loop, and the GET must complete once the
+    /// gate is released. Pre-fix the atomic GET took only per-record `RwLock`
+    /// read guards incrementally via `lock_group_records_read` and never
+    /// `lock_records`, so a concurrent writer could slip a later-sorted
+    /// member write between this GET's read of an earlier one — the torn
+    /// snapshot the `atomic` flag exists to prevent (GET-side twin of
+    /// `br_r15_atomic_put_blocks_on_member_record_gates`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q50_atomic_get_blocks_on_member_record_gates() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Hold one member record's gate. The atomic group GET must block
+        // trying to acquire the gate set via `lock_records`.
+        let held = db.lock_record("B:rec").await;
+
+        let get = tokio::spawn(async move { channel.read_group().await.unwrap() });
+
+        // Give the spawned GET real time to run: if it did not take
+        // `lock_records`, it would read both members and finish inside this
+        // window. Blocked on the held gate, it stays unfinished.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !get.is_finished(),
+            "atomic group GET must block while a member-record gate is held"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(Duration::from_secs(5), get)
+            .await
+            .expect("atomic GET must complete once the member gate is free")
+            .expect("atomic GET task panicked");
+
+        // Both members read back their fixture values under one consistent
+        // snapshot.
+        match get_nested_field(&result, "a").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 0.0)
+            }
+            other => panic!("member a: expected Double(0.0), got {other:?}"),
+        }
+        match get_nested_field(&result, "b").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 0.0)
+            }
+            other => panic!("member b: expected Double(0.0), got {other:?}"),
         }
     }
 

@@ -248,7 +248,17 @@ member never rejects the PUT in any mode, whereas pvxs rejects the whole
 operation.
 
 ### Q50: Atomic group GET does not share the DBManyLock gate the atomic PUT holds — torn snapshot
-Severity: High — OPEN (GET-side twin of BR-R15)
+Severity: High — CLEARED (GET-side twin of BR-R15)
+Resolution: `read_group_atomic`'s atomic branch now takes
+`PvDatabase::lock_records` over the member records — the same
+`DBManyLock`-equivalent gate the atomic PUT holds — before the per-record
+read guards, so an atomic GET is mutually exclusive with a concurrent
+atomic PUT and with any plain single-record write (both take the same gate
+via `lock_record`). Mirrors pvxs `onGet`'s `DBManyLocker G(group.value.lock)`
+(`groupsource.cpp:492`). Every writer takes the advisory gate before its
+`RwLock` write guard, so ordering stays advisory→RwLock everywhere (no
+inversion, no deadlock). Regression:
+`group.rs::tests::q50_atomic_get_blocks_on_member_record_gates`.
 Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:742-763` (`read_group_atomic`
 uses `lock_group_records_read`, `group.rs:565-591` — incremental
 `RwLock::read_owned`, never `lock_records`).

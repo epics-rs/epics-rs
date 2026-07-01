@@ -1805,6 +1805,16 @@ impl MonitorStartControl {
             let _ = self.exec_tx.send(desired);
         }
     }
+
+    /// True iff the most recent edge set this monitor Executing — a real
+    /// MONITOR START not yet followed by STOP/PAUSE/CANCEL. The subscriber's
+    /// emit gate follows this same state via the `monitor_exec` watch; this
+    /// accessor exists only so tests can observe the edge (the watch receiver
+    /// is internal to the subscriber task), hence `#[cfg(test)]`.
+    #[cfg(test)]
+    fn is_executing(&self) -> bool {
+        self.executing.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Drop for MonitorStartControl {
@@ -1817,6 +1827,496 @@ impl Drop for MonitorStartControl {
                 .notify_monitor_start(&self.pv_name, &self.ctx, false);
         }
     }
+}
+
+/// Push one monitor event into the bounded FIFO, squashing the newest into the
+/// tail once the queue is full — the single producer rule covering both the
+/// INIT->START and STOP->START "Idle, accruing" windows AND the Executing
+/// burst. Models pvxs `servermon.cpp:271-287`: a post is appended as a DISTINCT
+/// queue entry while the queue holds fewer than `limit` entries; once full, the
+/// newest update is coalesced into the queue tail (unioning marked-leaf sets via
+/// [`coalesce_monitor_update`] on the decoded path). `limit` must be >= 1 so a
+/// tail always exists to squash into. Returns whether an overflow squash
+/// happened (diagnostic only).
+fn push_squash_monitor<T>(
+    pending: &mut std::collections::VecDeque<T>,
+    ev: T,
+    limit: usize,
+    coalesce: impl Fn(T, T) -> T,
+) -> bool {
+    if pending.len() < limit {
+        pending.push_back(ev);
+        false
+    } else {
+        let tail = pending
+            .pop_back()
+            .expect("len >= limit >= 1 guarantees a tail to squash into");
+        pending.push_back(coalesce(tail, ev));
+        true
+    }
+}
+
+/// Inputs to [`spawn_monitor_subscriber`]. A cohesive bundle of the per-op
+/// monitor state captured at INIT (read out of the just-inserted `OpState`)
+/// plus the connection-scope handles the subscriber task needs — one struct
+/// keeps the INIT call site and the helper signature readable.
+struct MonitorSubscriberArgs {
+    sid: u32,
+    ioid: u32,
+    pv_name: String,
+    intro: FieldDesc,
+    mask: BitSet,
+    /// Per-channel writer (clone of the connection `ChannelTx`).
+    tx: ChannelTx,
+    src: DynSource,
+    /// Per-op squash threshold (client `record._options.queueSize` or the
+    /// server default), computed at INIT.
+    queue_depth: usize,
+    high_watermark: usize,
+    /// Credential + INIT-pvRequest context for subscribe / get / ACL.
+    mon_ctx: crate::server_native::source::ChannelContext,
+    window: Option<Arc<std::sync::atomic::AtomicU32>>,
+    window_notify: Option<Arc<tokio::sync::Notify>>,
+    filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
+    monitor_options: crate::server_native::source::MonitorOptions,
+    wm_seq: Arc<std::sync::atomic::AtomicU64>,
+    monitor_op_id: u64,
+    wm_levels: Option<(usize, usize)>,
+    mon_fin_tx: mpsc::UnboundedSender<MonitorFinished>,
+    /// Connection's live outbound byte-order cell.
+    out_order: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Spawn the per-op MONITOR subscriber task at INIT (pvxs `onSubscribe`
+/// registers the upstream at INIT — `servermon.cpp:591`), returning the task
+/// abort handle + the Executing<->Idle edge owner so the INIT branch can
+/// install them into the op's `OpState`.
+///
+/// Invariant — one bounded FIFO per monitor. The PRODUCER drains the
+/// source `updates` channel into `pending` (squash-to-`queue_limit`) from the
+/// moment of subscribe, i.e. from INIT, so posts arriving in the INIT->START
+/// window are accrued, not lost. The CONSUMER emits `pending` to the wire one
+/// frame per pipeline credit, but ONLY while Executing (after a MONITOR START,
+/// not STOPped). INIT->START and STOP->START are the same "Idle, accruing"
+/// state. This retires the old `held` single-cell pause buffer: a STOP->START
+/// now delivers up to `queueSize` (was: latest only).
+///
+/// Executing state is read from the op's `monitor_exec` watch (set by
+/// [`MonitorStartControl`] on every START/STOP edge). Teardown: the returned
+/// `JoinHandle` is wrapped in the op's `monitor_abort` `AbortOnDrop`; dropping
+/// the `OpState` (DESTROY / channel destroy / disconnect — including
+/// DESTROY-before-START and never-START) aborts the task, dropping `rx` and the
+/// source subscription handle, releasing the upstream. The `MonitorFinishGuard`
+/// installed as the first task statement reports terminal removal on every exit.
+fn spawn_monitor_subscriber(
+    args: MonitorSubscriberArgs,
+) -> (tokio::task::JoinHandle<()>, Arc<MonitorStartControl>) {
+    let MonitorSubscriberArgs {
+        sid,
+        ioid,
+        pv_name,
+        intro: intro_clone,
+        mask: mask_clone,
+        tx: tx_clone,
+        src,
+        queue_depth,
+        high_watermark,
+        mon_ctx,
+        window,
+        window_notify,
+        filters,
+        monitor_options,
+        wm_seq,
+        monitor_op_id,
+        wm_levels: wm_levels_init,
+        mon_fin_tx,
+        out_order: out_order_mon,
+    } = args;
+
+    // Credential-scoped context (no pv_request) for the start-control /
+    // watermark paths — a fanout gateway scopes the upstream suspend/resume to
+    // the firing credential's cache layer.
+    let credential_ctx = crate::server_native::source::ChannelContext {
+        pv_request: None,
+        ..mon_ctx.clone()
+    };
+
+    // Per-op executing-state watch. `MonitorStartControl` publishes each
+    // Executing<->Idle edge here; the subscriber loop reads it as its emit gate
+    // and (when the source supplies one) the `MonitorGate` driver reads it too.
+    // Starts `false` (Idle) — the first MONITOR START flips it to `true`.
+    let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
+    let start_ctl = Arc::new(MonitorStartControl::new(
+        src.clone(),
+        pv_name.clone(),
+        credential_ctx,
+        monitor_exec_tx,
+    ));
+
+    let total_bits = intro_clone.total_bits();
+    // Raw fast path eligibility (same predicate as the legacy spawn): 1:1 mask,
+    // no pipeline window, no server filter chain.
+    let raw_path_eligible = mask_clone.count() == total_bits
+        && mask_clone.size() >= total_bits
+        && window.is_none()
+        && filters.is_empty();
+
+    let mon_fin = MonitorFinished {
+        sid,
+        ioid,
+        op_id: monitor_op_id,
+    };
+    // One receiver clone drives the emit-gate loop; the original drives the
+    // optional `MonitorGate` (QSRV suspend/enable) driver on the decoded path.
+    let loop_exec_rx = monitor_exec_rx.clone();
+
+    let join = tokio::spawn(async move {
+        let _fin_guard = MonitorFinishGuard {
+            tx: mon_fin_tx,
+            fin: mon_fin,
+        };
+        let order_now = || {
+            if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
+                ByteOrder::Big
+            } else {
+                ByteOrder::Little
+            }
+        };
+        let mut exec_rx = loop_exec_rx;
+        let queue_limit = queue_depth.max(1);
+
+        // Version capture must precede the check (an older-or-equal captured
+        // version => loop re-checks on the next event after a reload).
+        let mon_acl_version_at_subscribe_cell = Arc::new(std::sync::atomic::AtomicU64::new(
+            src.access_gate().acl_version(),
+        ));
+        let mon_checked = src
+            .access_gate()
+            .check_with_roles(
+                &pv_name,
+                &mon_ctx.host,
+                &mon_ctx.account,
+                &mon_ctx.roles,
+                &mon_ctx.method,
+                &mon_ctx.authority,
+            )
+            .await;
+
+        // ---------------- RAW FAST PATH ----------------
+        if raw_path_eligible
+            && let Some(seed_raw) = src
+                .subscribe_raw_seeded(
+                    mon_checked.clone(),
+                    mon_ctx.clone(),
+                    monitor_options.clone(),
+                )
+                .await
+        {
+            let crate::server_native::source::SubscriptionSeed {
+                initial: seed_raw_initial,
+                updates: mut rx_raw,
+                // raw fast path is the fanout gateway, gated per (name, ctx) via
+                // `notify_monitor_start`, not per op — no per-op gate.
+                on_start: _,
+            } = seed_raw;
+            // Revalidate ACL before seeding (a reload between subscribe and here
+            // could flip to NoAccess).
+            let live_v0 = src.access_gate().acl_version();
+            if live_v0
+                != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
+            {
+                if src
+                    .revalidate_read(&pv_name, mon_ctx.clone())
+                    .await
+                    .is_none()
+                {
+                    let finish = build_monitor_finish(ioid, order_now());
+                    let _ = tx_clone.send(finish).await;
+                    return;
+                }
+                mon_acl_version_at_subscribe_cell
+                    .store(live_v0, std::sync::atomic::Ordering::Release);
+            }
+            // The connect-time seed (a decoded snapshot, emitted cooked)
+            // and the accrued raw window are both Executing-gated; the seed is
+            // emitted first, ahead of the backlog.
+            let mut seed_cooked: Option<PvField> = seed_raw_initial;
+            let mut pending: std::collections::VecDeque<crate::server_native::RawMonitorEvent> =
+                std::collections::VecDeque::new();
+            let mut source_open = true;
+            loop {
+                let executing = *exec_rx.borrow_and_update();
+                let has_work = seed_cooked.is_some() || !pending.is_empty();
+                if !source_open && (!has_work || !executing) {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    r = rx_raw.recv(), if source_open => {
+                        match r {
+                            Some(ev) => {
+                                // The cooked seed occupies one FIFO slot until the
+                                // consumer emits it, so while it is pending the raw
+                                // backlog is bounded to queue_limit-1 — keeping the
+                                // total (seed + raw) at queueSize, uniform with the
+                                // decoded path where the seed IS pending[0]. Once the
+                                // seed is emitted the raw bound relaxes to queue_limit.
+                                let raw_cap = queue_limit
+                                    .saturating_sub(seed_cooked.is_some() as usize)
+                                    .max(1);
+                                push_squash_monitor(&mut pending, ev, raw_cap, |_old, new| new);
+                                while let Ok(e) = rx_raw.try_recv() {
+                                    push_squash_monitor(&mut pending, e, raw_cap, |_old, new| new);
+                                }
+                            }
+                            None => source_open = false,
+                        }
+                    }
+                    _ = exec_rx.changed() => {}
+                    _ = std::future::ready(()), if executing && has_work => {
+                        if let Some(initial) = seed_cooked.take() {
+                            let payload = build_monitor_payload(
+                                ioid, &intro_clone, &initial, &mask_clone, order_now(),
+                            );
+                            if tx_clone.send(payload).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let ev = pending.pop_front().expect("has_work && no seed => pending non-empty");
+                        if ev.type_changed {
+                            let finish = build_monitor_finish(ioid, order_now());
+                            let _ = tx_clone.send(finish).await;
+                            return;
+                        }
+                        let live_v = src.access_gate().acl_version();
+                        if live_v
+                            != mon_acl_version_at_subscribe_cell
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
+                                let finish = build_monitor_finish(ioid, order_now());
+                                let _ = tx_clone.send(finish).await;
+                                return;
+                            }
+                            mon_acl_version_at_subscribe_cell
+                                .store(live_v, std::sync::atomic::Ordering::Release);
+                        }
+                        let payload = match raw_monitor_frame(ioid, &intro_clone, &ev, order_now()) {
+                            RawMonitorFrame::Forward(p) => p,
+                            RawMonitorFrame::Terminate { frame, reason } => {
+                                debug!(
+                                    pv = %pv_name,
+                                    error = %reason,
+                                    "Raw monitor reencode failed — terminating monitor with error"
+                                );
+                                let _ = tx_clone.send(frame).await;
+                                return;
+                            }
+                        };
+                        if tx_clone.send(payload).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let finish = build_monitor_finish(ioid, order_now());
+            let _ = tx_clone.send(finish).await;
+            return;
+        }
+
+        // ---------------- DECODED PATH ----------------
+        let Some(seed) = src
+            .subscribe_seeded(
+                mon_checked.clone(),
+                mon_ctx.clone(),
+                monitor_options.clone(),
+            )
+            .await
+        else {
+            return;
+        };
+        let crate::server_native::source::SubscriptionSeed {
+            initial: seed_initial,
+            updates: mut rx,
+            on_start: seed_on_start,
+        } = seed;
+        if let Some(gate) = seed_on_start {
+            spawn_monitor_gate_driver(gate, monitor_exec_rx);
+        }
+        let mut queue_over_high = false;
+        let wm_levels = wm_levels_init;
+        let credit = MonitorPipelineCredit {
+            window: window.as_ref(),
+            window_notify: window_notify.as_ref(),
+            wm_levels,
+            wm_seq: &wm_seq,
+            monitor_op_id,
+            src: &src,
+            pv_name: &pv_name,
+            mon_ctx: &mon_ctx,
+        };
+        let _wm_withdraw_guard = wm_levels.is_some().then(|| {
+            let mut ctx = mon_ctx.clone();
+            ctx.pv_request = None;
+            WatermarkWithdrawOnDrop {
+                src: src.clone(),
+                pv_name: pv_name.clone(),
+                ctx,
+                op_id: monitor_op_id,
+            }
+        });
+        {
+            let live_v0 = src.access_gate().acl_version();
+            if live_v0
+                != mon_acl_version_at_subscribe_cell.load(std::sync::atomic::Ordering::Acquire)
+            {
+                if src
+                    .revalidate_read(&pv_name, mon_ctx.clone())
+                    .await
+                    .is_none()
+                {
+                    let finish = build_monitor_finish(ioid, order_now());
+                    let _ = tx_clone.send(finish).await;
+                    return;
+                }
+                mon_acl_version_at_subscribe_cell
+                    .store(live_v0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let emits_partial = src.monitor_emits_partial(&pv_name).await;
+        let mut prev_value: Option<PvField> = None;
+
+        // Bounded FIFO: the connect-time seed is `pending[0]` (the
+        // consumer emits it first at START, ahead of the accrued backlog) rather
+        // than an unconditional pre-loop send. The seed is pushed RAW — the
+        // consumer runs the `_filter` chain on every pending item (so the seed
+        // is filtered exactly once, like epics-base `dbChannelRunPreChain`; a
+        // gating filter that drops it suppresses the initial frame, a transform
+        // mismatch tears the monitor down with an error). `prev_value` is NOT
+        // set here — the seed must emit FULL (the consumer sets `prev_value`
+        // after emitting, so event #2 onward is partial).
+        let mut pending: std::collections::VecDeque<crate::server_native::MonitorUpdate> =
+            std::collections::VecDeque::new();
+        if let Some(initial) = seed_initial {
+            pending.push_back(crate::server_native::MonitorUpdate {
+                value: initial,
+                marked: None,
+                type_changed: false,
+                overrun: Vec::new(),
+            });
+        }
+
+        let mut source_open = true;
+        loop {
+            let executing = *exec_rx.borrow_and_update();
+            if !source_open && (pending.is_empty() || !executing) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                r = rx.recv(), if source_open => {
+                    match r {
+                        Some(ev) => {
+                            push_squash_monitor(&mut pending, ev, queue_limit, coalesce_monitor_update);
+                            while let Ok(e) = rx.try_recv() {
+                                push_squash_monitor(&mut pending, e, queue_limit, coalesce_monitor_update);
+                            }
+                        }
+                        None => source_open = false,
+                    }
+                }
+                _ = exec_rx.changed() => {}
+                _ = std::future::ready(()), if executing && !pending.is_empty() => {
+                    let mut value = pending.pop_front().expect("guarded non-empty");
+                    // Subscription boundary (upstream descriptor change): emit
+                    // MONITOR FINISH and end — the decoded counterpart of the raw
+                    // path's `type_changed` branch.
+                    if value.type_changed {
+                        let finish = build_monitor_finish(ioid, order_now());
+                        let _ = tx_clone.send(finish).await;
+                        return;
+                    }
+                    // Per-event ACL recheck on policy reload, routed through
+                    // `revalidate_read` for composite-source correctness.
+                    let live_v = src.access_gate().acl_version();
+                    if live_v
+                        != mon_acl_version_at_subscribe_cell
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
+                            let finish = build_monitor_finish(ioid, order_now());
+                            let _ = tx_clone.send(finish).await;
+                            return;
+                        }
+                        mon_acl_version_at_subscribe_cell
+                            .store(live_v, std::sync::atomic::Ordering::Release);
+                    }
+                    // Outbound-queue depth: server diagnostic only.
+                    let outbound_pending = tx_clone.max_capacity() - tx_clone.capacity();
+                    if outbound_pending >= high_watermark && !queue_over_high {
+                        queue_over_high = true;
+                        warn!(
+                            pv = %pv_name,
+                            pending = outbound_pending,
+                            high_watermark,
+                            "monitor outbound queue crossed high watermark"
+                        );
+                    } else if outbound_pending == 0 && queue_over_high {
+                        queue_over_high = false;
+                        debug!(pv = %pv_name, "monitor outbound queue drained");
+                    }
+                    let marked = value.marked.take();
+                    let value = value.value;
+                    // Server-side channel filters: skip when the chain drops this
+                    // event (no wire frame => no credit consumed).
+                    let value = match apply_monitor_filter_chain(&filters, &value, &intro_clone) {
+                        MonitorFilterOutcome::Pass => value,
+                        MonitorFilterOutcome::Drop => continue,
+                        MonitorFilterOutcome::Transformed(tv) => tv,
+                        MonitorFilterOutcome::DescriptorMismatch => {
+                            let err = build_monitor_error(
+                                ioid,
+                                "server-side filter transform does not fit the monitor descriptor",
+                                order_now(),
+                            );
+                            let _ = tx_clone.send(err).await;
+                            return;
+                        }
+                    };
+                    // Pipeline window: consume one credit AFTER the pause/filter
+                    // gates (pvxs `servermon.cpp:192`). No-op for a non-pipeline
+                    // monitor. For a pipeline monitor with no credit this awaits;
+                    // the source then backpressures at the `updates` channel
+                    // (sized >= queue_limit) instead of squashing — a documented
+                    // pipeline-starvation residual orthogonal to the accrual FIFO.
+                    credit.acquire().await;
+                    let payload = if let Some(paths) = marked.as_ref() {
+                        build_monitor_payload_marked(
+                            ioid, &intro_clone, &value, paths, &mask_clone, order_now(),
+                        )
+                    } else if let Some(prev) = prev_value.as_ref() {
+                        build_monitor_payload_partial(
+                            ioid, &intro_clone, &value, prev, &mask_clone, order_now(),
+                        )
+                    } else {
+                        build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order_now())
+                    };
+                    if emits_partial {
+                        prev_value = Some(value.clone());
+                    }
+                    if tx_clone.send(payload).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        // Source closed — emit MONITOR FINISH (pvxs servermon.cpp:148-178).
+        let finish = build_monitor_finish(ioid, order_now());
+        let _ = tx_clone.send(finish).await;
+    });
+
+    (join, start_ctl)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6058,6 +6558,77 @@ async fn handle_op(
             },
         );
 
+        // Subscribe + spawn the MONITOR subscriber at INIT (pvxs
+        // `onSubscribe` registers the upstream at INIT, servermon.cpp:591), so
+        // posts arriving in the INIT->START window are accrued into the op's
+        // bounded FIFO rather than lost. The task stays Idle (emits nothing)
+        // until the first MONITOR START flips its `monitor_exec` watch. Install
+        // the abort guard + start-control in the SAME synchronous step as the
+        // spawn (teardown invariant: task-spawned <=> abort-installed), so a
+        // DESTROY-before-START always tears the upstream down.
+        if kind == OpKind::Monitor {
+            let pv_name = ch.name.clone();
+            // Per-op squash threshold: the client-requested
+            // `record._options.queueSize` (captured at INIT into
+            // `monitor_options.queue_size`) overrides the server-wide default,
+            // matching pvxs `op->limit = qSize` for both pipeline and plain
+            // monitors (servermon.cpp:533-543).
+            let queue_depth = ch
+                .ops
+                .get(&ioid)
+                .and_then(|s| s.monitor_options.queue_size)
+                .map(|n| n as usize)
+                .unwrap_or(config.monitor_queue_depth);
+            let high_watermark = config.monitor_high_watermark;
+            // Read the per-op state back out of the just-inserted `OpState`
+            // (its construction consumed the `mask`/window/filter locals) into
+            // a self-contained args bundle, so the spawn holds no `ch` borrow.
+            let args = ch.ops.get(&ioid).map(|s| {
+                // ACF-aware MONITOR: forward the INIT pvRequest so the source
+                // can honor `record._options.DBE` (per-op event-mask selection,
+                // pvxs singlesource.cpp:115); data-phase START/ACK frames are
+                // pure stream control and carry no per-op options.
+                let mon_ctx = crate::server_native::source::ChannelContext {
+                    peer,
+                    account: cred.account.clone(),
+                    method: cred.method.clone(),
+                    host: cred.host.clone(),
+                    authority: cred.authority.clone(),
+                    roles: cred.roles.clone(),
+                    pv_request: s.pv_request.clone(),
+                };
+                MonitorSubscriberArgs {
+                    sid,
+                    ioid,
+                    pv_name: pv_name.clone(),
+                    intro: intro.clone(),
+                    mask: s.mask.clone(),
+                    tx: chan_tx.clone(),
+                    src: source.clone(),
+                    queue_depth,
+                    high_watermark,
+                    mon_ctx,
+                    window: s.monitor_window.clone(),
+                    window_notify: s.monitor_window_notify.clone(),
+                    filters: s.monitor_filters.clone(),
+                    monitor_options: s.monitor_options.clone(),
+                    wm_seq: s.monitor_wm_seq.clone(),
+                    monitor_op_id: s.monitor_op_id,
+                    wm_levels: s.monitor_wm,
+                    mon_fin_tx: mon_fin_tx.clone(),
+                    out_order: out_order.clone(),
+                }
+            });
+            if let Some(args) = args {
+                let (join, start_ctl) = spawn_monitor_subscriber(args);
+                if let Some(s) = ch.ops.get_mut(&ioid) {
+                    s.monitor_started = true;
+                    s.monitor_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
+                    s.monitor_start_ctl = Some(start_ctl);
+                }
+            }
+        }
+
         // Build INIT response: ioid + subcmd + status + introspection
         let cmd = kind.command();
 
@@ -6718,974 +7289,39 @@ async fn handle_op(
 
             // START / STOP — applied AFTER ACK refill (pvxs
             // servermon.cpp:671-689 sets Executing/Idle and fires `onStart`
-            // after the ACK block). The ACK count for a combined frame was
-            // already validated at the top of this arm, so reaching here means
-            // the frame decoded cleanly and these side effects are safe.
+            // after the ACK block). The subscriber task is spawned at
+            // INIT (the upstream is subscribed at INIT so INIT->START posts are
+            // accrued into the op's bounded FIFO), so START/STOP here only flip
+            // the Executing edge on the op's single start-control owner; the
+            // subscriber's emit gate (its `monitor_exec` watch) follows that
+            // edge. `monitor_paused` mirrors the Idle/paused state for the
+            // cancel-parity tests.
             if let Some(op) = ch.ops.get(&ioid) {
                 if is_stop {
                     op.monitor_paused
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    // Executing->Idle. The op's single
-                    // start-control owner fires notify_monitor_start(false)
+                    // Executing->Idle: the consumer suspends emission, holding
+                    // the FIFO (up to queueSize) for the next START. The op's
+                    // single start-control owner fires notify_monitor_start(false)
                     // on the edge so a gateway can suspend its upstream.
                     if let Some(ctl) = &op.monitor_start_ctl {
                         ctl.set(false);
                     }
                 } else if is_start {
-                    let prev = op
-                        .monitor_paused
-                        .swap(false, std::sync::atomic::Ordering::Relaxed);
-                    if prev {
-                        if let Some(n) = op.monitor_window_notify.as_ref() {
-                            n.notify_waiters();
-                        }
-                        // wake the subscriber loop so it flushes
-                        // the value squashed during the pause (works for
-                        // non-pipelined ops too, which have no window
-                        // notify). `notify_one` stores a permit when the
-                        // loop isn't waiting yet, so a resume that races
-                        // ahead of the loop's `notified()` is not lost.
-                        op.monitor_resume.notify_one();
-                        // Idle->Executing. `prev` gates this to a
-                        // genuine resume — a START on a monitor that was not
-                        // actually paused does not re-fire on_start(true).
-                        if let Some(ctl) = &op.monitor_start_ctl {
-                            ctl.set(true);
-                        }
+                    op.monitor_paused
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Idle->Executing on EVERY start. `MonitorStartControl::set`
+                    // is edge-triggered (only fires the source edge + watch
+                    // publish on a real transition), so a redundant START on an
+                    // already-executing monitor is a no-op. The FIRST start (task
+                    // already spawned at INIT) is what flips the watch to
+                    // Executing and releases the accrued INIT->START backlog.
+                    if let Some(ctl) = &op.monitor_start_ctl {
+                        ctl.set(true);
                     }
                 }
             }
 
-            // Only spawn the subscriber task once per ioid.
-            let already_running = ch
-                .ops
-                .get(&ioid)
-                .map(|s| s.monitor_started)
-                .unwrap_or(false);
-            if is_start && !already_running {
-                let pv_name = ch.name.clone();
-                let intro_clone = intro.clone();
-                let mask_clone = mask.clone();
-                let tx_clone = chan_tx.clone();
-                let src = source.clone();
-                // Per-operation monitor queue depth: the client-requested
-                // `record._options.queueSize` (captured at INIT into
-                // `monitor_options.queue_size`) overrides the server-wide
-                // default, matching pvxs `op->limit = qSize` for both
-                // pipeline and plain monitors (servermon.cpp:533-543). The
-                // squash threshold below keys on this, not the config
-                // default, so `record[queueSize=2]` squashes at 2.
-                let queue_depth = ch
-                    .ops
-                    .get(&ioid)
-                    .and_then(|s| s.monitor_options.queue_size)
-                    .map(|n| n as usize)
-                    .unwrap_or(config.monitor_queue_depth);
-                let high_watermark = config.monitor_high_watermark;
-                // ACF-aware MONITOR: capture the peer's credentials
-                // so the spawned task can consult ctx-aware
-                // subscribe/get_value paths. Sources without ACF
-                // delegate to the legacy methods.
-                // forward the INIT pvRequest so the source can
-                // honor `record._options.DBE` (per-op database event-
-                // mask selection — pvxs singlesource.cpp:115). As
-                // with PUT, the data-phase START/ACK frames are
-                // pure stream control; per-operation options live in
-                // the INIT pvRequest only.
-                let mon_ctx = crate::server_native::source::ChannelContext {
-                    peer,
-                    account: cred.account.clone(),
-                    method: cred.method.clone(),
-                    host: cred.host.clone(),
-                    authority: cred.authority.clone(),
-                    roles: cred.roles.clone(),
-                    pv_request: init_pv_request.clone(),
-                };
-                // Type-state MONITOR gate.
-                //
-                // Capture the ACL generation BEFORE the check.
-                // This guarantees the captured version is `≤` the
-                // version under which the resulting `AccessChecked`
-                // was minted: if a reload bumps the version between
-                // the capture and the check, the check runs under
-                // the new policy and the captured (older) version
-                // is below the live version, so the forwarding loop
-                // detects the mismatch on its next event and
-                // re-checks. The reverse order (check then capture)
-                // could combine an "old allow" token with a "new
-                // version", causing the loop to think it was
-                // already synced under the new policy and never
-                // re-check.
-                //
-                // Wrapped in `Arc<AtomicU64>` so a successful
-                // re-check inside the spawned loop can advance the
-                // surviving peer's "current" generation without
-                // re-checking on every subsequent event.
-                // Snapshot the window + notify so the spawned task can
-                // share state with this dispatch path's ACK handler.
-                // also lift the event-affecting monitor
-                // options so they reach the source's
-                // `subscribe_*_checked_opts`.
-                let (
-                    window,
-                    window_notify,
-                    paused_flag,
-                    resume_notify,
-                    filters,
-                    monitor_options,
-                    wm_seq,
-                    monitor_op_id,
-                    wm_levels_init,
-                ) = ch
-                    .ops
-                    .get(&ioid)
-                    .map(|s| {
-                        (
-                            s.monitor_window.clone(),
-                            s.monitor_window_notify.clone(),
-                            s.monitor_paused.clone(),
-                            s.monitor_resume.clone(),
-                            s.monitor_filters.clone(),
-                            s.monitor_options.clone(),
-                            // the LOW callback in the loop
-                            // below crosses this shared counter back to
-                            // "below"; the HIGH callback in the ACK dispatch
-                            // crosses it to "above". Sharing it keeps the
-                            // pause/resume hysteresis AND the monotonic
-                            // ordering token coherent across the two paths.
-                            s.monitor_wm_seq.clone(),
-                            // same op identity the ACK
-                            // HIGH uses, so both votes (and the teardown
-                            // Withdraw) reference-count under one key.
-                            s.monitor_op_id,
-                            // pvxs ackAt parity: the INIT-clamped watermark
-                            // levels (see [`clamp_watermarks`]). The LOW
-                            // crossing below reads THIS, not a fresh source
-                            // read, so it shares the HIGH path's clamped
-                            // levels and honors `ackAny` identically.
-                            s.monitor_wm,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            None,
-                            None,
-                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                            Arc::new(tokio::sync::Notify::new()),
-                            Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
-                            crate::server_native::source::MonitorOptions::default(),
-                            Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                            next_op_id(),
-                            None,
-                        )
-                    });
-                let total_bits = intro_clone.total_bits();
-                // Raw fast path is correct only when the downstream's
-                // pvRequest matches the upstream's bytes 1:1 — i.e. no
-                // per-field projection, no negotiated pipeline credit
-                // window (the raw branch has no per-event
-                // window-decrement / wait-for-ACK gating), AND no
-                // server-side filter chain (the raw branch forwards
-                // pre-encoded wire bytes; the filter chain operates
-                // on the decoded PvField). Fall back to the decoded
-                // subscribe path in any of those cases.
-                let raw_path_eligible = mask_clone.count() == total_bits
-                    && mask_clone.size() >= total_bits
-                    && window.is_none()
-                    && filters.is_empty();
-                // capture this op instance's terminal-signal payload
-                // (sid + ioid + the process-unique `monitor_op_id`) before
-                // the move. The guard installed as the first statement of the
-                // task body reports it on EVERY exit so the read-loop owner
-                // removes the op — the task itself owns no `ch.ops` handle.
-                let mon_fin = MonitorFinished {
-                    sid,
-                    ioid,
-                    op_id: monitor_op_id,
-                };
-                let mon_fin_tx_task = mon_fin_tx.clone();
-                // Per-op executing-state channel for the monitor START/STOP
-                // gate. `MonitorStartControl` (read-loop side) publishes each
-                // Executing<->Idle edge here; the spawned task drives the
-                // source-supplied `SubscriptionSeed::on_start` gate from it.
-                // Starts `false` (Idle) — the first MONITOR START fires the
-                // edge to `true`. Created before the spawn so the receiver is
-                // captured by the task and the sender reaches the op's
-                // `MonitorStartControl` below.
-                let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
-                // Outbound byte order for this long-lived monitor task is read
-                // LIVE from the connection's shared `out_order` cell, not
-                // captured by value at spawn. pvxs `conn.cpp:169-188` re-latches
-                // `sendBE` on every mid-stream SET_BYTE_ORDER and
-                // `servermon.cpp:159,174` reads `conn->sendBE` at monitor send
-                // time, so an already-open monitor follows the renegotiated
-                // order. Capturing `order` here would freeze each subscription
-                // at its INIT-time order and diverge from the connection's
-                // synchronous replies and heartbeat after a renegotiation.
-                let out_order_mon = out_order.clone();
-                let join = tokio::spawn(async move {
-                    // terminal finalizer — see `MonitorFinishGuard`.
-                    // A single local at the top of the body so no exit (source
-                    // close FINISH, ACL/descriptor/filter/raw terminal return,
-                    // panic, abort) can skip notifying the owner.
-                    let _fin_guard = MonitorFinishGuard {
-                        tx: mon_fin_tx_task,
-                        fin: mon_fin,
-                    };
-                    // Single live read of the connection's current outbound
-                    // byte order, consulted at every frame build below — the
-                    // monitor stream follows a mid-stream SET_BYTE_ORDER instead
-                    // of staying latched to its INIT-time order (pvxs
-                    // `servermon.cpp:159,174` reads `conn->sendBE` at send time).
-                    let order_now = || {
-                        if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
-                            ByteOrder::Big
-                        } else {
-                            ByteOrder::Little
-                        }
-                    };
-                    // access gate check moved inside the spawn
-                    // so the read loop is not blocked while the ACF
-                    // policy resolves. The version capture must precede
-                    // the check (see audit note above).
-                    let mon_acl_version_at_subscribe_cell = Arc::new(
-                        std::sync::atomic::AtomicU64::new(src.access_gate().acl_version()),
-                    );
-                    let mon_checked = src
-                        .access_gate()
-                        .check_with_roles(
-                            &pv_name,
-                            &mon_ctx.host,
-                            &mon_ctx.account,
-                            &mon_ctx.roles,
-                            &mon_ctx.method,
-                            &mon_ctx.authority,
-                        )
-                        .await;
-                    // raw-frame fast path. When the source can
-                    // hand us pre-encoded MONITOR DATA bytes (e.g.
-                    // pva_gateway upstream-monitor task already
-                    // received them on the wire), emit them with only
-                    // an IOID-rewrite — pvxs / pva2pva style raw
-                    // forward. Falls back to the decoded path on
-                    // byte-order mismatch or when the source returns
-                    // None.
-                    // Raw fast path must consult
-                    // the ACF too. The earlier ACL gate covered
-                    // `subscribe_ctx` only; ACF-aware sources can now
-                    // override `subscribe_raw_ctx` to deny when the
-                    // peer lacks READ. When the gateway denies (returns
-                    // None), we fall through to the decoded
-                    // `subscribe_ctx` below — which is also ACF-gated
-                    // and will likewise return None.
-                    if raw_path_eligible
-                        && let Some(seed_raw) = src
-                            .subscribe_raw_seeded(
-                                mon_checked.clone(),
-                                mon_ctx.clone(),
-                                monitor_options.clone(),
-                            )
-                            .await
-                    {
-                        // Single MONITOR seed owner (raw path): the seed
-                        // is the source's cached snapshot, captured with
-                        // the subscription; the server no longer issues
-                        // its own `get_value` seed (which, for the
-                        // gateway, was a fresh upstream GET that diverged
-                        // from the pvxs cached-`lastelem` seed).
-                        let crate::server_native::source::SubscriptionSeed {
-                            initial: seed_raw_initial,
-                            updates: mut rx_raw,
-                            // raw fast path is the fanout gateway, which gates
-                            // its shared upstream per `(name, ctx)` via
-                            // `notify_monitor_start`, not per op — no per-op gate.
-                            on_start: _,
-                        } = seed_raw;
-                        // Revalidate ACL BEFORE sending the
-                        // initial snapshot. Between the spawn's
-                        // initial `check()` and reaching this point
-                        // a reload could have flipped the peer to
-                        // NoAccess; without this gate the initial
-                        // would be emitted under stale policy. The
-                        // recv loop below performs the same check
-                        // on every subsequent event.
-                        let live_v0 = src.access_gate().acl_version();
-                        if live_v0
-                            != mon_acl_version_at_subscribe_cell
-                                .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            // Route the re-check
-                            // through the source's
-                            // `revalidate_read` owner so composite
-                            // sources resolve to the MATCHED inner
-                            // source's gate (the one that served
-                            // the original subscription), not the
-                            // composite's permissive aggregator
-                            // gate.
-                            if src
-                                .revalidate_read(&pv_name, mon_ctx.clone())
-                                .await
-                                .is_none()
-                            {
-                                let finish = build_monitor_finish(ioid, order_now());
-                                let _ = tx_clone.send(finish).await;
-                                return;
-                            }
-                            mon_acl_version_at_subscribe_cell
-                                .store(live_v0, std::sync::atomic::Ordering::Release);
-                        }
-                        // Emit the single connect-time seed via the
-                        // regular encode path (no raw bytes for the
-                        // first-event seed; the cache may not have them
-                        // yet). `seed_raw_initial` is the source's cached
-                        // snapshot; `None` means no value yet or NoAccess
-                        // on this PV's ASG — no initial frame either way.
-                        if let Some(initial) = seed_raw_initial {
-                            let payload = build_monitor_payload(
-                                ioid,
-                                &intro_clone,
-                                &initial,
-                                &mask_clone,
-                                order_now(),
-                            );
-                            if tx_clone.send(payload).await.is_err() {
-                                return;
-                            }
-                        }
-                        // raw fast path honors the pause gate
-                        // through the same owner as the decoded path.
-                        // `held_raw` carries the latest squashed event
-                        // across a pause; `type_changed` is a boundary
-                        // that the owner yields immediately even while
-                        // paused (it tears the stream down — it must not
-                        // be held behind a later descriptor-incompatible
-                        // event).
-                        let mut held_raw: Option<crate::server_native::RawMonitorEvent> = None;
-                        while let Some(ev) = next_monitor_event(
-                            &mut rx_raw,
-                            &mut held_raw,
-                            &paused_flag,
-                            &resume_notify,
-                            |ev| ev.type_changed,
-                            // Raw events carry no marked set; a pause-time
-                            // collapse keeps the newer pre-encoded body.
-                            |_, new| new,
-                        )
-                        .await
-                        {
-                            // an upstream descriptor change
-                            // arrives as a `type_changed=true` marker
-                            // event. The body bytes are encoded for
-                            // the NEW upstream descriptor but this
-                            // monitor was negotiated against the OLD
-                            // (now-stale) `intro_clone` at INIT.
-                            // Forwarding the body would deliver
-                            // garbage / cause a client-side protocol
-                            // error (pvxs treats this as a
-                            // subscription boundary —
-                            // pvalink_channel.cpp:342-351). Emit
-                            // MONITOR FINISH so the client knows to
-                            // reopen against the new descriptor, and
-                            // tear down this monitor task.
-                            if ev.type_changed {
-                                let finish = build_monitor_finish(ioid, order_now());
-                                let _ = tx_clone.send(finish).await;
-                                return;
-                            }
-                            // ACL re-check on
-                            // policy reload. The version compare uses
-                            // the source's aggregate (composite =
-                            // wrapping-sum of inner versions); the
-                            // re-check is routed through
-                            // `revalidate_read` so composite sources
-                            // resolve to the matched inner gate
-                            // instead of the permissive aggregator
-                            // gate.
-                            let live_v = src.access_gate().acl_version();
-                            if live_v
-                                != mon_acl_version_at_subscribe_cell
-                                    .load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                if src
-                                    .revalidate_read(&pv_name, mon_ctx.clone())
-                                    .await
-                                    .is_none()
-                                {
-                                    let finish = build_monitor_finish(ioid, order_now());
-                                    let _ = tx_clone.send(finish).await;
-                                    return;
-                                }
-                                // Survive — resync the version so we
-                                // don't re-check on every event under
-                                // the new policy.
-                                mon_acl_version_at_subscribe_cell
-                                    .store(live_v, std::sync::atomic::Ordering::Release);
-                            }
-                            // a pause that began after the
-                            // owner handed back this event (during the
-                            // ACL revalidation await above) must HOLD it
-                            // — squash to latest and resume-flush —
-                            // exactly as the decoded path does once a
-                            // value is already in hand. Producing no
-                            // wire frame consumes no pipeline credit.
-                            if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                held_raw = Some(ev);
-                                continue;
-                            }
-                            // on byte-order mismatch we decode the
-                            // raw event under the upstream order and
-                            // re-encode under the downstream order. Earlier
-                            // code dropped the event with `continue`, so any
-                            // cross-host gateway between peers with different
-                            // negotiated byte orders silently lost every
-                            // monitor update after the initial snapshot (the
-                            // decoded-fallback path never sees those events
-                            // under raw subscription). a re-encode
-                            // failure (malformed upstream body) is now a
-                            // terminal protocol boundary, not a silent drop —
-                            // `raw_monitor_frame` owns that single policy so
-                            // the same-endian forward and the cross-endian
-                            // re-encode cannot diverge on malformed input.
-                            let payload = match raw_monitor_frame(
-                                ioid,
-                                &intro_clone,
-                                &ev,
-                                order_now(),
-                            ) {
-                                RawMonitorFrame::Forward(p) => p,
-                                RawMonitorFrame::Terminate { frame, reason } => {
-                                    debug!(
-                                        pv = %pv_name,
-                                        error = %reason,
-                                        "Raw monitor reencode failed — terminating monitor with error"
-                                    );
-                                    let _ = tx_clone.send(frame).await;
-                                    return;
-                                }
-                            };
-                            if tx_clone.send(payload).await.is_err() {
-                                return;
-                            }
-                        }
-                        let finish = build_monitor_finish(ioid, order_now());
-                        let _ = tx_clone.send(finish).await;
-                        return;
-                    }
-
-                    // Single MONITOR seed owner: the source returns the
-                    // connect-time seed AND the post-seed update stream
-                    // as one `SubscriptionSeed`, so the server emits the
-                    // seed below from `seed_initial` and never issues its
-                    // own `get_value` seed — closing the double-seed
-                    // (server get_value + a self-seeding source stream).
-                    let Some(seed) = src
-                        .subscribe_seeded(
-                            mon_checked.clone(),
-                            mon_ctx.clone(),
-                            monitor_options.clone(),
-                        )
-                        .await
-                    else {
-                        return;
-                    };
-                    let crate::server_native::source::SubscriptionSeed {
-                        initial: seed_initial,
-                        updates: mut rx,
-                        on_start: seed_on_start,
-                    } = seed;
-                    // Per-op MONITOR START/STOP gate. When the source backs
-                    // this op with suspendable upstream subscriptions (QSRV
-                    // DbSubscriptions), drive its enable/disable from this op's
-                    // Executing<->Idle edge — published on `monitor_exec_rx` by
-                    // `MonitorStartControl` (read-loop side). The driver lives
-                    // in its own task so the hot update loop below is untouched;
-                    // it ends when the op tears down and drops `monitor_exec_tx`
-                    // (the backing subscriptions are then removed with the
-                    // aborted monitor, so STOP=disable / teardown=remove).
-                    if let Some(gate) = seed_on_start {
-                        spawn_monitor_gate_driver(gate, monitor_exec_rx);
-                    }
-                    // Diagnostic-only outbound-queue-depth crossing flag.
-                    let mut queue_over_high = false;
-                    // per-PV pipeline-window watermark levels
-                    // `(low, high)` in credit units. `None` when the source
-                    // exposes no per-PV levels. the hysteresis
-                    // state + ordering token is the SHARED `wm_seq` counter
-                    // (crossed to "above" by the ACK dispatch, back to
-                    // "below" here) so a gateway upstream paused on LOW can
-                    // be resumed by the credit-refill HIGH callback. These
-                    // are the INIT-clamped levels threaded out of `OpState`
-                    // (pvxs ackAt parity, [`clamp_watermarks`]) — the same
-                    // value the HIGH path reads via `op.monitor_wm`, NOT a
-                    // fresh `monitor_watermarks` call, so `ackAny` clamps
-                    // both crossings through one owner.
-                    let wm_levels = wm_levels_init;
-                    // Single owner of this monitor's pipeline-credit
-                    // accounting, shared by the initial-snapshot send and
-                    // the update loop so the initial frame consumes a
-                    // window slot exactly like every subsequent DATA
-                    // frame (pvxs `servermon.cpp:192`). Holds shared
-                    // borrows for the rest of the task body.
-                    let credit = MonitorPipelineCredit {
-                        window: window.as_ref(),
-                        window_notify: window_notify.as_ref(),
-                        wm_levels,
-                        wm_seq: &wm_seq,
-                        monitor_op_id,
-                        src: &src,
-                        pv_name: &pv_name,
-                        mon_ctx: &mon_ctx,
-                    };
-                    // arm the withdraw-on-teardown
-                    // finalizer for flow-controlled (gateway) ops only.
-                    // Held live for the rest of the task so every exit
-                    // path — normal end, early `return`, or AbortOnDrop
-                    // cancelling this task on DESTROY/disconnect — drops
-                    // it and withdraws this op's upstream pause vote (see
-                    // [`WatermarkWithdrawOnDrop`]). `pv_request` is
-                    // irrelevant to upstream-cache selection, so the ctx
-                    // mirrors the HIGH path and omits it.
-                    let _wm_withdraw_guard = wm_levels.is_some().then(|| {
-                        let mut ctx = mon_ctx.clone();
-                        ctx.pv_request = None;
-                        WatermarkWithdrawOnDrop {
-                            src: src.clone(),
-                            pv_name: pv_name.clone(),
-                            ctx,
-                            op_id: monitor_op_id,
-                        }
-                    });
-                    // Revalidate ACL BEFORE
-                    // sending the initial snapshot on the decoded
-                    // path. The re-check is routed through
-                    // `revalidate_read` so composite sources resolve
-                    // to the matched inner gate.
-                    {
-                        let live_v0 = src.access_gate().acl_version();
-                        if live_v0
-                            != mon_acl_version_at_subscribe_cell
-                                .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            if src
-                                .revalidate_read(&pv_name, mon_ctx.clone())
-                                .await
-                                .is_none()
-                            {
-                                let finish = build_monitor_finish(ioid, order_now());
-                                let _ = tx_clone.send(finish).await;
-                                return;
-                            }
-                            mon_acl_version_at_subscribe_cell
-                                .store(live_v0, std::sync::atomic::Ordering::Release);
-                        }
-                    }
-                    // does this source emit *partial* monitor
-                    // updates (QSRV group monitor with a self-trigger)?
-                    // When it does, every event after the first carries
-                    // a wire changed-bitset narrowed to the leaves that
-                    // actually changed — derived by structurally
-                    // diffing consecutive snapshots, matching pvxs's
-                    // marked-leaf semantics (`servermon.cpp:174`
-                    // `to_wire_valid(R, ent, &pvMask)`). `prev_value`
-                    // holds the last emitted snapshot for that diff.
-                    let emits_partial = src.monitor_emits_partial(&pv_name).await;
-                    let mut prev_value: Option<PvField> = None;
-                    // Emit the single connect-time seed carried back by
-                    // `subscribe_seeded`. `None` means the source has no
-                    // current value yet (unopened SharedPV / gateway entry
-                    // awaiting its first upstream event) or a peer with
-                    // NoAccess on the record's ASG — emit nothing and let
-                    // the update loop deliver the first real event.
-                    if let Some(initial) = seed_initial {
-                        // Finding #2: run the server `_filter` chain on the
-                        // FIRST frame too, through the same owner the update
-                        // loop uses — epics-base `dbChannelRunPreChain`
-                        // filters every monitor event, so `arr` must slice
-                        // the initial snapshot, not just updates. A gating
-                        // filter (`dbnd`/`dec`/`sync`) that drops the first
-                        // event suppresses the initial frame; the update
-                        // loop then delivers the first passing one.
-                        let initial =
-                            match apply_monitor_filter_chain(&filters, &initial, &intro_clone) {
-                                MonitorFilterOutcome::Pass => Some(initial),
-                                MonitorFilterOutcome::Transformed(tv) => Some(tv),
-                                MonitorFilterOutcome::Drop => None,
-                                MonitorFilterOutcome::DescriptorMismatch => {
-                                    let err = build_monitor_error(
-                                        ioid,
-                                        "server-side filter transform does not \
-                                     fit the monitor descriptor",
-                                        order_now(),
-                                    );
-                                    let _ = tx_clone.send(err).await;
-                                    return;
-                                }
-                            };
-                        if let Some(initial) = initial {
-                            // pvxs `servermon.cpp:261` always lets
-                            // the first update enter the queue (it bypasses
-                            // the change-or-mask gate), but `:174` still
-                            // encodes the wire BitSet with
-                            // `self->pvMask` — the field mask derived
-                            // from the client's pvRequest. The earlier
-                            // Rust path bypassed both checks, sending the
-                            // initial event with `BitSet::all_set(...)`
-                            // and leaking unrequested leaves. Match pvxs
-                            // by always queueing the first event (no
-                            // change-filter here) but honouring
-                            // `mask_clone` on the wire. The first event is
-                            // always full (pvxs builds a fresh fully-marked
-                            // Value); partial narrowing starts at event #2.
-                            let payload = build_monitor_payload(
-                                ioid,
-                                &intro_clone,
-                                &initial,
-                                &mask_clone,
-                                order_now(),
-                            );
-                            if emits_partial {
-                                prev_value = Some(initial);
-                            }
-                            // pvxs `servermon.cpp:192` decrements `window`
-                            // for the initial snapshot too — consume one
-                            // credit through the single owner before
-                            // sending, or the client's window drifts to
-                            // queueSize + 1.
-                            credit.acquire().await;
-                            if tx_clone.send(payload).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    // Server-side monitor queue (pvxs servermon.cpp:271-287,
-                    // drained one-per-reply at :171-183). A short burst below
-                    // the negotiated depth is delivered as distinct DATA
-                    // frames; coalescing happens only as the overflow action
-                    // once the queue is full. See `drain_monitor_queue`.
-                    let queue_limit = queue_depth.max(1);
-                    let mut pending: std::collections::VecDeque<
-                        crate::server_native::MonitorUpdate,
-                    > = std::collections::VecDeque::new();
-                    // value squashed while paused, flushed on
-                    // resume. `None` between batches.
-                    let mut held: Option<crate::server_native::MonitorUpdate> = None;
-                    loop {
-                        // Acquire the next value to consider emitting
-                        // through the shared pause owner: a value held
-                        // from a pause takes priority once resumed; while
-                        // paused we keep receiving and squash to the
-                        // latest without emitting, waking on resume to
-                        // flush it (pvxs queues posts while Idle and
-                        // drains on START). A `type_changed` boundary is
-                        // the one exception: `|u| u.type_changed` yields
-                        // it immediately even while paused, so an upstream
-                        // descriptor change is never squashed behind a
-                        // later value. Events coalesced during a pause
-                        // union their marked-leaf sets via
-                        // `coalesce_monitor_update`.
-                        // Emit a queued entry first — one per reply (pvxs
-                        // servermon.cpp:171-183) — and only block for a fresh
-                        // event when the queue is empty. While paused we must
-                        // NOT drain the queue: fall through to the pause-aware
-                        // `next_monitor_event`, which holds the latest, and
-                        // the pause branch below folds the queue into `held`.
-                        let mut value = if !paused_flag.load(std::sync::atomic::Ordering::Relaxed)
-                            && let Some(front) = pending.pop_front()
-                        {
-                            front
-                        } else {
-                            match next_monitor_event(
-                                &mut rx,
-                                &mut held,
-                                &paused_flag,
-                                &resume_notify,
-                                // An upstream descriptor change arrives as a
-                                // `type_changed` boundary on the decoded stream
-                                // too (the PVA gateway fanout). Yield it
-                                // immediately — even while paused — so it is
-                                // never squashed behind a later,
-                                // descriptor-incompatible value.
-                                |u| u.type_changed,
-                                coalesce_monitor_update,
-                            )
-                            .await
-                            {
-                                Some(v) => v,
-                                None => break,
-                            }
-                        };
-                        // Drain immediately-available extras, folding the
-                        // in-hand `value` into the SAME bounded queue so a
-                        // single owner counts EVERY unsent post against
-                        // `queue_limit` — including the front being prepared
-                        // for this reply. pvxs counts `queue.front()` against
-                        // queueSize (servermon.cpp:271-287) and pops it only in
-                        // `doReply()` when a frame is produced
-                        // (servermon.cpp:171-183); holding `value` OUTSIDE the
-                        // queue (as before) let `queue_limit + 1` distinct
-                        // posts go unsent under backpressure. The drain returns
-                        // the (possibly squashed) front as the next `value`.
-                        let (next_value, overflow) =
-                            drain_monitor_queue(&mut rx, value, &mut pending, queue_limit);
-                        value = next_value;
-                        if overflow {
-                            debug!(
-                                pv = %pv_name,
-                                queue_limit,
-                                "monitor queue full — squashed newest into tail"
-                            );
-                        }
-                        // Subscription boundary: the upstream descriptor
-                        // changed. The decoded values that follow are shaped
-                        // for the NEW descriptor and would be mis-encoded
-                        // against the `intro_clone` negotiated at this
-                        // monitor's INIT. Emit MONITOR FINISH so the client
-                        // reopens with a fresh INIT — the decoded-path
-                        // counterpart of the raw fast path's `type_changed`
-                        // branch. This check runs AFTER the drain: at
-                        // `queueSize == 1` the front IS the tail, so the drain
-                        // can coalesce a boundary post directly into `value`,
-                        // and a coalesced boundary MUST be detected on the
-                        // finalized `value`, not the pre-drain one. It still
-                        // covers both acquisition paths — a boundary popped
-                        // from `pending` and one yielded live by
-                        // `next_monitor_event` (incl. one surfaced through a
-                        // pause-hold coalesce) — because `coalesce_monitor_update`
-                        // keeps a boundary sticky and it always reaches the
-                        // front before any value it shadowed.
-                        if value.type_changed {
-                            let finish = build_monitor_finish(ioid, order_now());
-                            let _ = tx_clone.send(finish).await;
-                            return;
-                        }
-                        // ACL re-check on policy reload (same
-                        // shape as the raw-fast-path branch above).
-                        // The gate's `acl_version` bumps on every
-                        // PvaServer ACF swap; on mismatch we
-                        // re-mint AccessChecked and tear down with
-                        // a MONITOR FINISH if the new policy denies.
-                        // Decoded recv-loop
-                        // re-check, routed through `revalidate_read`
-                        // for composite-source correctness.
-                        let live_v = src.access_gate().acl_version();
-                        if live_v
-                            != mon_acl_version_at_subscribe_cell
-                                .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            if src
-                                .revalidate_read(&pv_name, mon_ctx.clone())
-                                .await
-                                .is_none()
-                            {
-                                let finish = build_monitor_finish(ioid, order_now());
-                                let _ = tx_clone.send(finish).await;
-                                return;
-                            }
-                            mon_acl_version_at_subscribe_cell
-                                .store(live_v, std::sync::atomic::Ordering::Release);
-                        }
-                        // outbound-queue depth is a SERVER
-                        // diagnostic only — it is no longer used to fire
-                        // the SharedPV watermark callbacks. pvxs ties
-                        // `onHighMark`/`onLowMark` to the pipeline flow-
-                        // control window, which we now do at the credit
-                        // gate below. Counter is max_capacity - capacity
-                        // since mpsc doesn't expose len directly.
-                        let outbound_pending = tx_clone.max_capacity() - tx_clone.capacity();
-                        if outbound_pending >= high_watermark && !queue_over_high {
-                            queue_over_high = true;
-                            warn!(
-                                pv = %pv_name,
-                                pending = outbound_pending,
-                                high_watermark,
-                                "monitor outbound queue crossed high watermark"
-                            );
-                        } else if outbound_pending == 0 && queue_over_high {
-                            queue_over_high = false;
-                            debug!(pv = %pv_name, "monitor outbound queue drained");
-                        }
-                        // pause and filter suppression MUST run
-                        // before pipeline credit is consumed. Pipeline
-                        // credit accounts for monitor DATA frames sent
-                        // to the client (pvxs `servermon.cpp:192`
-                        // decrements `window` only after the frame is
-                        // enqueued). An event dropped by pause or by
-                        // the filter chain produces no wire frame, so
-                        // it must not consume a window slot — otherwise
-                        // a client with a finite pipeline window stalls
-                        // waiting to ACK frames it never received.
-                        //
-                        // a pause that began while this value was
-                        // already in hand must HOLD it (squash to latest),
-                        // not drop it — resume flushes the held value. This
-                        // mirrors pvxs keeping posts in the monitor queue
-                        // while Idle and draining on START. Like the drop
-                        // it once was, holding consumes no pipeline credit
-                        // (no wire frame is produced).
-                        if paused_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            // Paused: emit nothing. Squash the in-hand value
-                            // and any queued backlog (front→back, oldest→
-                            // newest) into the single held latest — resume
-                            // flushes it. The queue models the non-paused
-                            // burst; pause keeps the existing hold-latest
-                            // semantics and must not leave entries behind.
-                            while let Some(q) = pending.pop_front() {
-                                value = coalesce_monitor_update(value, q);
-                            }
-                            held = Some(value);
-                            continue;
-                        }
-                        // past the pause gate the wire frame is
-                        // built from the PvField snapshot; the explicit
-                        // marked-leaf set (when the source carries one) drives
-                        // the changed-bitset below. `take()` leaves the moved
-                        // MonitorUpdate inert before we shadow `value`.
-                        //
-                        // `value.overrun` — lost-intermediate leaves the
-                        // server's queue-overflow squash (or a fanout gateway's
-                        // lag) accumulated — is intentionally NOT carried to the
-                        // wire: pvxs `servermon.cpp:174-176` always writes an
-                        // empty overrun bitset (`// TODO: placeholder`), so the
-                        // cooked builders below emit 0x00 unconditionally. The
-                        // field stays for the coalescing accountant; it simply
-                        // never reaches the DATA body.
-                        let marked = value.marked.take();
-                        let value = value.value;
-                        // Server-side channel filters: skip when the
-                        // chain drops this event. Empty chain (the
-                        // default) is a no-op pass-through.
-                        //
-                        // a filter chain may TRANSFORM the
-                        // event (e.g. `arr` slices the array, `ts`
-                        // rewrites the value). The transformed value
-                        // from `FilterChain::apply` is bridged back
-                        // into the wire `PvField` via
-                        // `apply_filter_transform`; the monitor frame
-                        // is then built from the transformed value,
-                        // not the original. A pass/drop-only filter
-                        // (`dec`, `sync`, scalar `dbnd`) leaves the
-                        // value unchanged, so the bridge is a no-op
-                        // for it. When the transformed value cannot be
-                        // represented in the negotiated monitor
-                        // descriptor (a transformation filter whose
-                        // output type/shape does not fit this PV's
-                        // fixed wire descriptor — e.g. a `ts` mode
-                        // that changes the scalar type), the
-                        // subscription cannot honor the filter: emit a
-                        // monitor error frame and end the stream
-                        // rather than silently sending a wrong value.
-                        let value = match apply_monitor_filter_chain(&filters, &value, &intro_clone)
-                        {
-                            MonitorFilterOutcome::Pass => value,
-                            MonitorFilterOutcome::Drop => continue,
-                            MonitorFilterOutcome::Transformed(tv) => tv,
-                            MonitorFilterOutcome::DescriptorMismatch => {
-                                let err = build_monitor_error(
-                                    ioid,
-                                    "server-side filter transform does not \
-                                     fit the monitor descriptor",
-                                    order_now(),
-                                );
-                                let _ = tx_clone.send(err).await;
-                                return;
-                            }
-                        };
-                        // pipeline window check, through the same
-                        // single owner the initial snapshot uses. When
-                        // pipeline is active this waits for a free window
-                        // slot, consumes one credit, and fires LOW on the
-                        // above→below crossing; for a non-pipeline monitor
-                        // it is a no-op (mpsc backpressure stays the only
-                        // gate). It runs after the pause/filter gates above
-                        // so credit is consumed only for events that will
-                        // produce a DATA frame.
-                        credit.acquire().await;
-                        // an explicit marked-leaf set from the
-                        // source (a QSRV group `+trigger` target graph) takes
-                        // precedence over both server-derived bitsets — pvxs
-                        // `groupsource.cpp:288` marks each trigger target
-                        // assigned-not-changed, so a value-diff would wrongly
-                        // drop targets whose value did not move. The encoder
-                        // turns the declared paths into the wire bitset
-                        // intersected with the request mask.
-                        //
-                        // otherwise, for a partial-emitting source,
-                        // narrow the wire changed-bitset to exactly the leaves
-                        // that differ from the previously emitted snapshot,
-                        // intersected with the request mask — pvxs
-                        // `to_wire_valid(R, ent, &pvMask)`. The first event
-                        // already went out above with the full mask; from here
-                        // on `prev_value` is set.
-                        let payload = if let Some(paths) = marked.as_ref() {
-                            build_monitor_payload_marked(
-                                ioid,
-                                &intro_clone,
-                                &value,
-                                paths,
-                                &mask_clone,
-                                order_now(),
-                            )
-                        } else if let Some(prev) = prev_value.as_ref() {
-                            build_monitor_payload_partial(
-                                ioid,
-                                &intro_clone,
-                                &value,
-                                prev,
-                                &mask_clone,
-                                order_now(),
-                            )
-                        } else {
-                            build_monitor_payload(
-                                ioid,
-                                &intro_clone,
-                                &value,
-                                &mask_clone,
-                                order_now(),
-                            )
-                        };
-                        if emits_partial {
-                            prev_value = Some(value.clone());
-                        }
-                        if tx_clone.send(payload).await.is_err() {
-                            return;
-                        }
-                    }
-                    // Source closed — emit MONITOR FINISH (subcmd 0x10 + Status).
-                    // pvxs servermon.cpp:148-178 sends a final frame with
-                    // subcmd=0x10 to signal end-of-stream so the client can
-                    // tear down cleanly.
-                    let finish = build_monitor_finish(ioid, order_now());
-                    let _ = tx_clone.send(finish).await;
-                });
-                // install the single-owner Executing<->Idle edge
-                // tracker for this op (see `MonitorStartControl`). The ctx is
-                // credential-scoped (no pv_request), matching the watermark
-                // path, so a fanout gateway can scope the upstream
-                // suspend/resume to the firing credential's cache layer.
-                let start_ctl = Arc::new(MonitorStartControl::new(
-                    source.clone(),
-                    ch.name.clone(),
-                    crate::server_native::source::ChannelContext {
-                        peer,
-                        account: cred.account.clone(),
-                        method: cred.method.clone(),
-                        host: cred.host.clone(),
-                        authority: cred.authority.clone(),
-                        roles: cred.roles.clone(),
-                        pv_request: None,
-                    },
-                    monitor_exec_tx,
-                ));
-                if let Some(s) = ch.ops.get_mut(&ioid) {
-                    s.monitor_started = true;
-                    s.monitor_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
-                    s.monitor_start_ctl = Some(start_ctl.clone());
-                    // Fire the initial Idle->Executing edge (pvxs
-                    // onStart(true) at MONITOR START) now that the op owns
-                    // the control.
-                    start_ctl.set(true);
-                }
-            }
             // pvxs `servermon.cpp:691-708`: the destroy bit (`0x10`) on any
             // non-INIT MONITOR frame frees the op exactly like the dedicated
             // DESTROY_REQUEST command — pvAccessCPP "will accept destroy in
@@ -8086,60 +7722,6 @@ fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrde
 use crate::proto::ReadExt;
 const _: u8 = PVA_VERSION;
 
-/// single owner of the monitor pause/hold/squash transition.
-///
-/// Both the decoded and the raw-frame monitor forward loops acquire
-/// their next event through this helper so the pause gate is enforced
-/// in exactly one place. Semantics (mirroring pvxs keeping posts in the
-/// monitor queue while Idle and draining on START):
-///
-/// - **Not paused**: a value held from a prior pause is returned first
-///   (drain-on-resume), otherwise the next `rx.recv()` is awaited.
-/// - **Paused**: keep receiving and squash to the latest into `*held`
-///   without returning (no wire frame is produced), waking on
-///   `resume.notified()` to flush the held value on the next iteration.
-/// - **Boundary**: an event for which `is_boundary` is true is returned
-///   immediately even while paused — a subscription boundary (raw
-///   `type_changed` descriptor change) must tear the stream down rather
-///   than be squashed behind a later, descriptor-incompatible event.
-///
-/// Returns `None` when the source channel closes (caller breaks/ends).
-async fn next_monitor_event<T>(
-    rx: &mut mpsc::Receiver<T>,
-    held: &mut Option<T>,
-    paused: &std::sync::atomic::AtomicBool,
-    resume: &tokio::sync::Notify,
-    is_boundary: impl Fn(&T) -> bool,
-    // combine an already-held event with a newer one when
-    // multiple events squash into `held` during a pause. The raw path
-    // keeps the latest frame (`|_old, new| new`); the cooked path
-    // unions the per-event marked-leaf sets so a coalesced burst still
-    // marks every field that changed across it.
-    coalesce: impl Fn(T, T) -> T,
-) -> Option<T> {
-    loop {
-        if paused.load(Ordering::Relaxed) {
-            tokio::select! {
-                ev = rx.recv() => match ev {
-                    Some(v) if is_boundary(&v) => return Some(v),
-                    Some(v) => {
-                        *held = Some(match held.take() {
-                            Some(old) => coalesce(old, v),
-                            None => v,
-                        });
-                    }
-                    None => return None,
-                },
-                _ = resume.notified() => {}
-            }
-        } else if let Some(v) = held.take() {
-            return Some(v);
-        } else {
-            return rx.recv().await;
-        }
-    }
-}
-
 /// Build a complete MONITOR data frame (header + payload) for a single value
 /// emission. Pulled out so the back-pressure squashing loop can call it.
 fn build_monitor_payload(
@@ -8323,7 +7905,7 @@ fn build_monitor_payload_marked(
 /// boundary the result is the boundary — the dispatch loop then emits
 /// MONITOR FINISH instead of encoding a stale-descriptor value. This is
 /// what keeps the decoded type-change marker from being lost when the
-/// pause-hold or the `drain_monitor_queue` overflow coalesces a burst.
+/// bounded FIFO overflow ([`push_squash_monitor`]) coalesces a burst.
 fn coalesce_monitor_update(
     older: crate::server_native::MonitorUpdate,
     newer: crate::server_native::MonitorUpdate,
@@ -8372,63 +7954,6 @@ fn coalesce_monitor_update(
         type_changed: false,
         overrun,
     }
-}
-
-/// Fold the in-hand monitor update and every immediately-available update
-/// from `rx` into the bounded server-side queue, returning the
-/// (possibly squashed) front as the next event to consider plus a flag
-/// set when any overflow squash occurred.
-///
-/// This is the server monitor queue, modelled after pvxs
-/// `servermon.cpp:271-287`: a post is appended as a DISTINCT queue entry
-/// while the queue holds fewer than `limit` entries, and only once the
-/// queue is full is the newest update squashed into the queue tail
-/// (unioning marked-leaf sets via [`coalesce_monitor_update`]). The send
-/// loop pops exactly one entry per reply (`servermon.cpp:171-183`), so a
-/// burst below the negotiated depth is delivered as distinct DATA frames
-/// rather than collapsed into one. Coalescing is the OVERFLOW action, not
-/// the normal drain.
-///
-/// `in_hand` is the front of the conceptual queue — pvxs counts
-/// `queue.front()` (the post being prepared for the next reply) against
-/// `queueSize` and pops it only in `doReply()` when a frame is actually
-/// produced. So this helper is the SINGLE owner of the unsent count:
-/// `[in_hand] ++ pending` is bounded to `limit` total, never `limit + 1`.
-/// `in_hand` is pushed to the front, the queue is bounded, then the front
-/// is restored as the returned value — at `limit == 1` the front IS the
-/// tail, so an overflow squashes into `in_hand` itself.
-///
-/// `limit` must be >= 1, so the queue always has a tail to squash into.
-fn drain_monitor_queue(
-    rx: &mut mpsc::Receiver<crate::server_native::MonitorUpdate>,
-    in_hand: crate::server_native::MonitorUpdate,
-    pending: &mut std::collections::VecDeque<crate::server_native::MonitorUpdate>,
-    limit: usize,
-) -> (crate::server_native::MonitorUpdate, bool) {
-    // Fold the in-hand front into the SAME queue so one uniform rule
-    // covers every unsent post: it extends the queue while there is room,
-    // else squashes into the tail.
-    pending.push_front(in_hand);
-    let mut overflow = false;
-    // `try_recv` Empty (no more buffered) or Disconnected (source ended)
-    // both stop the drain; disconnect is observed by the outer loop's
-    // `next_monitor_event` returning None once the queue empties.
-    while let Ok(next) = rx.try_recv() {
-        if pending.len() < limit {
-            pending.push_back(next);
-        } else {
-            let tail = pending
-                .pop_back()
-                .expect("push_front above guarantees a non-empty queue to squash into");
-            pending.push_back(coalesce_monitor_update(tail, next));
-            overflow = true;
-        }
-    }
-    // Restore the (possibly squashed) front as the next in-hand event.
-    let front = pending
-        .pop_front()
-        .expect("push_front above guarantees a non-empty queue");
-    (front, overflow)
 }
 
 /// outcome of turning one [`crate::server_native::RawMonitorEvent`]
@@ -9158,24 +8683,18 @@ mod tests {
         assert!(m.overrun.is_empty(), "boundary carries no overrun");
     }
 
-    /// Boundary test for the server-side monitor queue
-    /// ([`drain_monitor_queue`], pvxs servermon.cpp:271-287). The drain is
-    /// the SINGLE owner of the unsent count: it folds the in-hand front
-    /// event into the same bounded queue, so `[in_hand] ++ pending` never
-    /// exceeds `limit`. Tested by invariant boundary — below limit, at
-    /// limit, the `limit == 1` squash-into-front, and a boundary post — not
-    /// by a narrative burst.
-    ///
-    /// Before the fix the
-    /// in-hand `value` was held OUTSIDE the queue and only `pending.len()`
-    /// was bounded, so under backpressure `queue_limit + 1` distinct posts
-    /// went unsent. This reproduces the real loop state the old isolated
-    /// helper test missed (one event already removed from the queue before
-    /// the drain): with `record[queueSize=2]`, in-hand `first` plus posts
-    /// `[second, third]` must leave exactly two unsent events `[first,
-    /// third]`, not three.
-    #[tokio::test]
-    async fn pva_44_monitor_queue_counts_in_hand_event_against_limit() {
+    /// Boundary test for the bounded server-side monitor FIFO
+    /// ([`push_squash_monitor`], pvxs servermon.cpp:271-287). The producer
+    /// appends each post as a DISTINCT entry while the FIFO holds fewer than
+    /// `limit`; once full, the newest post coalesces into the tail (unioning
+    /// marked-leaf sets via [`coalesce_monitor_update`]). This single
+    /// rule governs both the Idle-accrual windows (INIT->START, STOP->START)
+    /// and the Executing burst, so a `record[queueSize=N]` monitor never holds
+    /// more than `N` unsent posts. Tested by invariant boundary — below limit,
+    /// at limit, the `limit == 1` collapse, and a sticky descriptor boundary —
+    /// not by a narrative burst.
+    #[test]
+    fn push_squash_monitor_bounds_fifo_to_queue_size() {
         use std::collections::VecDeque;
         let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
         let upd = |tag: i32| crate::server_native::MonitorUpdate {
@@ -9184,213 +8703,66 @@ mod tests {
             type_changed: false,
             overrun: Vec::new(),
         };
-        // The whole unsent set the loop will deliver, in send order: the
-        // returned front followed by the rest of the bounded queue.
-        let unsent =
-            |front: &crate::server_native::MonitorUpdate,
-             pending: &VecDeque<crate::server_native::MonitorUpdate>| {
-                let mut v = vec![front.value.clone()];
-                v.extend(pending.iter().map(|u| u.value.clone()));
-                v
-            };
+        let values = |pending: &VecDeque<crate::server_native::MonitorUpdate>| {
+            pending.iter().map(|u| u.value.clone()).collect::<Vec<_>>()
+        };
 
-        // The finding's exact loop state: record[queueSize=2], pipeline
-        // credit at zero so nothing is sent, in-hand `first` already popped
-        // for this iteration, posts `second` and `third` buffered on the
-        // channel. The whole unsent set is bounded to 2 — [first, third],
-        // the newest squashed into the tail — NOT three distinct frames.
-        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
-        for tag in [2, 3] {
-            tx.send(upd(tag)).await.unwrap();
-        }
+        // Below the limit: three posts into limit 4 stay distinct, in order.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let (front, overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 2);
-        assert!(
-            overflow,
-            "in-hand + 2 posts into limit 2 must squash the tail"
-        );
-        assert_eq!(
-            unsent(&front, &pending),
-            vec![val(1), val(3)],
-            "queueSize=2 holds the in-hand front plus one queued tail, \
-             squashing the newest into it — never queue_limit + 1 distinct posts"
-        );
-
-        // Below the limit: the in-hand front plus the queued posts all stay
-        // distinct (in-hand counts against the limit, but there is room).
-        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
-        for tag in [2, 3] {
-            tx.send(upd(tag)).await.unwrap();
+        let mut any_overflow = false;
+        for tag in [1, 2, 3] {
+            any_overflow |= push_squash_monitor(&mut pending, upd(tag), 4, coalesce_monitor_update);
         }
-        let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let (front, overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 4);
-        assert!(!overflow, "in-hand + 2 posts below limit 4 must not squash");
+        assert!(!any_overflow, "three posts below limit 4 must not squash");
         assert_eq!(
-            unsent(&front, &pending),
+            values(&pending),
             vec![val(1), val(2), val(3)],
-            "in-hand front and queued posts stay distinct below the limit"
+            "posts stay distinct and ordered below the limit"
         );
 
-        // queueSize == 1: the front IS the tail, so every later post
-        // squashes into the in-hand event itself (latest value wins).
-        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
-        for tag in [2, 3] {
-            tx.send(upd(tag)).await.unwrap();
-        }
+        // At the limit: three posts into limit 2 leave [1, 3] — the newest
+        // coalesced into the tail, never queue_limit + 1 distinct posts.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let (front, overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 1);
-        assert!(overflow, "limit 1 squashes every later post into the front");
-        assert!(
-            pending.is_empty(),
-            "limit 1 leaves no distinct queue entries"
-        );
+        let mut overflow = false;
+        for tag in [1, 2, 3] {
+            overflow |= push_squash_monitor(&mut pending, upd(tag), 2, coalesce_monitor_update);
+        }
+        assert!(overflow, "the 3rd post into limit 2 must squash the tail");
         assert_eq!(
-            unsent(&front, &pending),
-            vec![val(3)],
-            "limit 1 collapses in-hand + posts to the single newest value"
+            values(&pending),
+            vec![val(1), val(3)],
+            "queueSize=2 holds the head plus one tail, squashing the newest into it"
         );
 
-        // A descriptor-change boundary among the posts is sticky through the
-        // squash: at limit 1 it coalesces into the front, which the loop
-        // then detects (MONITOR FINISH) rather than encoding a stale value.
-        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
-        tx.send(upd(2)).await.unwrap();
-        tx.send(crate::server_native::MonitorUpdate::type_change())
-            .await
-            .unwrap();
+        // limit == 1: every later post collapses into the single entry
+        // (latest value wins).
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let (front, _overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 1);
-        assert!(
-            front.type_changed,
-            "a boundary post must survive the limit-1 squash into the front"
+        for tag in [1, 2, 3] {
+            push_squash_monitor(&mut pending, upd(tag), 1, coalesce_monitor_update);
+        }
+        assert_eq!(
+            values(&pending),
+            vec![val(3)],
+            "limit 1 collapses the burst to the single newest value"
         );
-    }
 
-    /// Owner: invariant boundaries of [`next_monitor_event`],
-    /// the single owner of the monitor pause/hold/squash transition that
-    /// both the decoded and the raw-frame forward loops acquire through.
-    /// Tested by boundary (paused vs not, held empty vs set, boundary vs
-    /// not, channel open vs closed), not by narrative scenario.
-    mod next_monitor_event_owner {
-        use super::*;
-        use std::sync::atomic::AtomicBool;
-        use tokio::sync::Notify;
-
-        /// Not paused, nothing held → the next received value is yielded.
-        #[tokio::test]
-        async fn not_paused_yields_next_recv() {
-            let (tx, mut rx) = mpsc::channel::<u32>(8);
-            let paused = AtomicBool::new(false);
-            let resume = Notify::new();
-            let mut held: Option<u32> = None;
-            tx.send(7).await.unwrap();
-            let got =
-                next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false, |_, n| n).await;
-            assert_eq!(got, Some(7));
-        }
-
-        /// Not paused, a value held from a prior pause → the held value
-        /// drains first (resume flush) before any new recv.
-        #[tokio::test]
-        async fn not_paused_drains_held_first() {
-            let (tx, mut rx) = mpsc::channel::<u32>(8);
-            let paused = AtomicBool::new(false);
-            let resume = Notify::new();
-            let mut held: Option<u32> = Some(42);
-            // A fresher value is queued, but the held one must win.
-            tx.send(99).await.unwrap();
-            let got =
-                next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false, |_, n| n).await;
-            assert_eq!(got, Some(42), "held value drains before fresh recv");
-            assert!(held.is_none(), "held is consumed once drained");
-        }
-
-        /// Paused → events squash to the latest into `held` without
-        /// returning; resume flushes only the latest (no per-event frame).
-        #[tokio::test]
-        async fn paused_squashes_to_latest_then_resume_flushes() {
-            let (tx, mut rx) = mpsc::channel::<u32>(8);
-            let paused = Arc::new(AtomicBool::new(true));
-            let resume = Arc::new(Notify::new());
-            let p2 = paused.clone();
-            let r2 = resume.clone();
-            let task = tokio::spawn(async move {
-                let mut held: Option<u32> = None;
-                next_monitor_event(&mut rx, &mut held, &p2, &r2, |_| false, |_, n| n).await
-            });
-            // Feed while paused; each yield lets the owner squash the
-            // sent value into `held` and park again in the select.
-            for v in [1u32, 2, 3] {
-                tx.send(v).await.unwrap();
-                tokio::task::yield_now().await;
-            }
-            paused.store(false, Ordering::Relaxed);
-            resume.notify_one();
-            assert_eq!(
-                task.await.unwrap(),
-                Some(3),
-                "paused squash yields only the latest value on resume"
-            );
-        }
-
-        /// Paused + a boundary event → the boundary is yielded
-        /// immediately (not squashed behind a later, descriptor-
-        /// incompatible event). A non-boundary that arrived first is
-        /// squashed into `held`.
-        #[tokio::test]
-        async fn paused_yields_boundary_immediately() {
-            use crate::proto::ByteOrder;
-            use crate::server_native::RawMonitorEvent;
-
-            let (tx, mut rx) = mpsc::channel::<RawMonitorEvent>(8);
-            let paused = AtomicBool::new(true);
-            let resume = Notify::new();
-            let mut held: Option<RawMonitorEvent> = None;
-            tx.send(RawMonitorEvent {
-                body_bytes: bytes::Bytes::from_static(b"stale"),
-                byte_order: ByteOrder::Little,
-                type_changed: false,
-            })
-            .await
-            .unwrap();
-            tx.send(RawMonitorEvent {
-                body_bytes: bytes::Bytes::new(),
-                byte_order: ByteOrder::Little,
-                type_changed: true,
-            })
-            .await
-            .unwrap();
-            let got = next_monitor_event(
-                &mut rx,
-                &mut held,
-                &paused,
-                &resume,
-                |ev| ev.type_changed,
-                |_, n| n,
-            )
-            .await;
-            assert!(
-                got.is_some_and(|e| e.type_changed),
-                "boundary event must be yielded immediately even while paused"
-            );
-            assert!(
-                held.is_some_and(|e| !e.type_changed),
-                "the pre-boundary non-boundary event was squashed into held"
-            );
-        }
-
-        /// Source channel closed → `None` (caller ends the stream).
-        #[tokio::test]
-        async fn closed_channel_yields_none() {
-            let (tx, mut rx) = mpsc::channel::<u32>(1);
-            let paused = AtomicBool::new(false);
-            let resume = Notify::new();
-            let mut held: Option<u32> = None;
-            drop(tx);
-            let got =
-                next_monitor_event(&mut rx, &mut held, &paused, &resume, |_| false, |_, n| n).await;
-            assert_eq!(got, None);
-        }
+        // A descriptor-change boundary is sticky through the squash: pushed
+        // into a full limit-1 FIFO it coalesces into the tail and stays
+        // type_changed, so the consumer detects it (MONITOR FINISH) rather
+        // than encoding a stale value.
+        let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
+        push_squash_monitor(&mut pending, upd(2), 1, coalesce_monitor_update);
+        push_squash_monitor(
+            &mut pending,
+            crate::server_native::MonitorUpdate::type_change(),
+            1,
+            coalesce_monitor_update,
+        );
+        assert_eq!(pending.len(), 1, "limit 1 keeps a single entry");
+        assert!(
+            pending[0].type_changed,
+            "a boundary post survives the limit-1 squash into the tail"
+        );
     }
 
     /// server pipeline parser accepts the typed-bool /
@@ -10699,6 +10071,1007 @@ mod tests {
         );
     }
 
+    // ================================================================
+    // Monitor accrual: the MONITOR subscriber is spawned at INIT (pvxs
+    // `onSubscribe`, servermon.cpp:591), so posts arriving in the
+    // INIT->START window accrue into the op's bounded FIFO instead of
+    // being lost; the consumer emits `pending -> wire` ONLY while
+    // Executing (after a START, before a STOP). INIT->START and
+    // STOP->START are the same "Idle, accruing" state. These tests
+    // drive the real `handle_op` INIT-spawn + START/STOP/DESTROY
+    // state-flip and decode the wire frames, one case per invariant
+    // boundary.
+    // ================================================================
+
+    /// Build a MONITOR INIT frame for a NON-pipeline monitor with the
+    /// given `queueSize` (the per-op squash bound). Non-pipeline so no
+    /// credit window gates emission — the accrued backlog flushes freely
+    /// at START, isolating the FIFO bound from pipeline crediting.
+    #[cfg(test)]
+    fn pvx61_init_frame(sid: u32, ioid: u32, queue_size: i32, order: ByteOrder) -> Frame {
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(queue_size)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x08); // INIT (no 0x80 pipeline bit)
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut payload);
+        synth_frame(Command::Monitor, order, payload)
+    }
+
+    /// Build a data-phase MONITOR control frame: START `0x44`
+    /// (`0x04` start/stop | `0x40` start), STOP `0x04`, DESTROY `0x10`.
+    #[cfg(test)]
+    fn pvx61_ctrl_frame(sid: u32, ioid: u32, subcmd: u8, order: ByteOrder) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(subcmd);
+        synth_frame(Command::Monitor, order, payload)
+    }
+
+    /// Single-PV `SharedSource` channel map for the monitor-accrual tests, seeded
+    /// with `three_field_value(0, 0, 0)`. Returns the channels map, the
+    /// source (kept alive by the caller), and a clonable pusher for
+    /// post-INIT posts.
+    #[cfg(test)]
+    fn pvx61_channels(
+        sid: u32,
+        intro: &FieldDesc,
+    ) -> (
+        HashMap<u32, ChannelState>,
+        DynSource,
+        crate::server_native::shared_pv::SharedPV,
+    ) {
+        let pv = crate::server_native::shared_pv::SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+        let pusher = pv.clone();
+        let shared = crate::server_native::SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+        (channels, source, pusher)
+    }
+
+    /// Drive one MONITOR frame through `handle_op` with the monitor-accrual
+    /// test defaults (fixed byte order, throwaway decode cache + exec-fin).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn pvx61_drive(
+        frame: &Frame,
+        tx: &SrvTx,
+        channels: &mut HashMap<u32, ChannelState>,
+        order: ByteOrder,
+        config: &PvaServerConfig,
+        encode_cache: &mut crate::pvdata::encode::EncodeTypeCache,
+        peer: SocketAddr,
+        cred: &ClientCredentials,
+        mon_fin: &mpsc::UnboundedSender<MonitorFinished>,
+    ) -> PvaResult<()> {
+        handle_op(
+            frame,
+            tx,
+            channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Monitor,
+            config,
+            encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            cred,
+            mon_fin,
+            &discard_exec_fin(),
+        )
+        .await
+    }
+
+    /// Decode the field-`a` value of a MONITOR DATA frame (subcmd
+    /// `0x00`), or `None` for any non-DATA frame (INIT reply `0x08`,
+    /// FINISH `0x10`). `SharedSource` emits FULL frames
+    /// (`monitor_emits_partial == false`), so every DATA frame carries
+    /// all three fields and `three_field_extract` applies.
+    #[cfg(test)]
+    fn pvx61_decode_data_a(resp: &[u8], intro: &FieldDesc, order: ByteOrder) -> Option<i32> {
+        let (frame, _) = try_parse_frame(resp).ok()??;
+        if frame.header.command != Command::Monitor.code() {
+            return None;
+        }
+        let mut cur = frame.cursor();
+        let _ioid = cur.get_u32(order).ok()?;
+        let subcmd = cur.get_u8().ok()?;
+        if subcmd != 0x00 {
+            return None; // INIT reply / FINISH — not a DATA frame
+        }
+        let changed = BitSet::decode(&mut cur, order).ok()?;
+        let value =
+            crate::pvdata::encode::decode_pv_field_with_bitset(intro, &changed, 0, &mut cur, order)
+                .ok()?;
+        Some(three_field_extract(&value).0)
+    }
+
+    /// Drain every currently-queued frame from `rx` and return the
+    /// field-`a` sequence of the DATA frames (INIT reply + FINISH are
+    /// filtered out).
+    #[cfg(test)]
+    fn pvx61_drain_data_a(
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        intro: &FieldDesc,
+        order: ByteOrder,
+    ) -> Vec<i32> {
+        let mut out = Vec::new();
+        while let Ok(buf) = rx.try_recv() {
+            if let Some(a) = pvx61_decode_data_a(&buf, intro, order) {
+                out.push(a);
+            }
+        }
+        out
+    }
+
+    /// INIT->START accrual + ordering. Posts B, C, D arriving in the
+    /// INIT->START window are delivered in order (A(seed), B, C, D) at the
+    /// first START. Pre-fix the subscriber spawned only at START, so the
+    /// window posts were lost and only the latest seed survived.
+    #[tokio::test]
+    async fn pvx61_init_window_posts_accrue_in_order() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 700u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // INIT with queueSize 8 — large enough to hold the seed + 3 posts
+        // with no squash.
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+
+        // Let the subscriber task subscribe and capture the seed (0,0,0)
+        // BEFORE any post arrives.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Posts arrive while the monitor is Idle (INIT->START window).
+        for i in 1..=3 {
+            pusher.try_post(three_field_value(i, 0, 0));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Invariant: an Idle monitor emits nothing before START.
+        assert!(
+            rx.try_recv().is_err(),
+            "an Idle (pre-START) monitor must not emit any DATA frame"
+        );
+
+        // START flips Executing; the accrued backlog flushes in order.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq,
+            vec![0, 1, 2, 3],
+            "INIT->START posts must be delivered in order at START (pre-fix \
+             only the latest seed survived); got {seq:?}"
+        );
+    }
+
+    /// Backlog > queueSize bounds to queueSize. With queueSize 2,
+    /// five posts in the INIT->START window squash to the seed + the
+    /// latest, so START delivers exactly 2 frames (bounded FIFO, newest
+    /// tail wins).
+    #[tokio::test]
+    async fn pvx61_backlog_bounds_to_queue_size() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (2u32, 701u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 2, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Five posts while Idle — the FIFO (seed + queueSize-1 tail) must
+        // bound them to 2 total.
+        for i in 1..=5 {
+            pusher.try_post(three_field_value(i, 0, 0));
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq.len(),
+            2,
+            "queueSize=2 must bound the INIT->START backlog to exactly 2 \
+             frames; got {seq:?}"
+        );
+        assert_eq!(seq[0], 0, "first frame is the connect-time seed");
+        assert_eq!(
+            *seq.last().unwrap(),
+            5,
+            "the squashed tail must carry the latest post"
+        );
+    }
+
+    /// Backlog == 0: a START with no window posts delivers the seed
+    /// only.
+    #[tokio::test]
+    async fn pvx61_seed_only_no_backlog() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (3u32, 702u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq,
+            vec![0],
+            "with no window posts the START delivers only the seed; got {seq:?}"
+        );
+    }
+
+    /// Backlog == 1: a single window post delivers the seed + that
+    /// one post.
+    #[tokio::test]
+    async fn pvx61_single_backlog() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (4u32, 703u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        pusher.try_post(three_field_value(1, 0, 0));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq,
+            vec![0, 1],
+            "one window post delivers the seed then that post; got {seq:?}"
+        );
+    }
+
+    /// STOP->START depth (the accrual sibling). STOP->START is the
+    /// same Idle-accruing state as INIT->START: posts during the pause
+    /// accrue up to queueSize and flush at the next START. Pre-fix the
+    /// single `held` cell delivered only the latest pause-window value.
+    #[tokio::test]
+    async fn pvx61_stop_start_delivers_backlog_depth() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (5u32, 704u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // First START drains the seed.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("first MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let seed = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(seed, vec![0], "first START delivers the seed; got {seed:?}");
+
+        // STOP → Idle. Posts during the pause accrue.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x04, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR STOP ok");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for i in 1..=3 {
+            pusher.try_post(three_field_value(i, 0, 0));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Still Idle — nothing emitted during the pause.
+        assert!(
+            rx.try_recv().is_err(),
+            "a STOPped monitor must not emit during the pause window"
+        );
+
+        // Second START flushes the pause backlog up to queueSize.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("second MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq,
+            vec![1, 2, 3],
+            "STOP->START must deliver the full pause backlog up to queueSize \
+             (pre-fix the single `held` cell delivered only the latest); got {seq:?}"
+        );
+    }
+
+    /// DESTROY before START tears the upstream down. The subscriber
+    /// task is spawned at INIT with its abort guard installed in the same
+    /// synchronous step, so a DESTROY arriving before any START removes
+    /// the op, drops the abort, and fires the terminal `MonitorFinished`.
+    #[tokio::test]
+    async fn pvx61_destroy_before_start_tears_down() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (6u32, 705u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        // Let the task subscribe and install its `MonitorFinishGuard`.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            mon_fin_rx.try_recv().is_err(),
+            "the subscriber is alive (Idle) before DESTROY — no finish yet"
+        );
+
+        // DESTROY (0x10) before any START.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x10, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR DESTROY ok");
+
+        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+            .await
+            .expect("teardown fires within 2s")
+            .expect("MonitorFinished");
+        assert_eq!(fin.ioid, ioid, "the torn-down op is the DESTROYed one");
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "DESTROY removed the op from ch.ops"
+        );
+    }
+
+    /// Never-START tears down on connection drop. INIT spawns the
+    /// subscriber; dropping the channels map (connection teardown) before
+    /// any START drops the op's abort guard, aborting the task and firing
+    /// the terminal `MonitorFinished`.
+    #[tokio::test]
+    async fn pvx61_never_start_tears_down_on_drop() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (7u32, 706u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        // Let the task subscribe and install its guard before teardown.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Connection torn down before any START.
+        drop(channels);
+
+        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+            .await
+            .expect("teardown fires within 2s")
+            .expect("MonitorFinished");
+        assert_eq!(fin.ioid, ioid, "the never-started op is torn down on drop");
+    }
+
+    /// Build a raw MONITOR DATA event (`changed | value | overrun`) for
+    /// the three-Int structure with field `a = a`: full changed mask,
+    /// empty overrun trailer — the shape a same-endian raw forward
+    /// carries to the wire verbatim.
+    #[cfg(test)]
+    fn pvx61_raw_event(a: i32, order: ByteOrder) -> crate::server_native::RawMonitorEvent {
+        let intro = three_field_intro();
+        let changed = BitSet::all_set(intro.total_bits());
+        let value = three_field_value(a, 0, 0);
+        let mut body = Vec::new();
+        changed.write_into(order, &mut body);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &value, &intro, &changed, 0, order, &mut body,
+        );
+        BitSet::new().write_into(order, &mut body); // required empty overrun trailer
+        crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::from(body),
+            byte_order: order,
+            type_changed: false,
+        }
+    }
+
+    /// A source exposing the RAW monitor fast path: `subscribe_raw` hands
+    /// out a pre-built receiver the test pushes `RawMonitorEvent`s into,
+    /// and `get_value` supplies the cooked seed. Full mask + no pipeline
+    /// window + no filters ⇒ the subscriber takes the raw path.
+    #[cfg(test)]
+    struct RawSeedSource {
+        intro: FieldDesc,
+        seed: PvField,
+        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+    }
+
+    #[cfg(test)]
+    impl crate::server_native::source::ChannelSource for RawSeedSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, name: &str) -> bool {
+            name == "dut"
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(self.seed.clone())
+        }
+        async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        async fn subscribe_raw(
+            &self,
+            _name: &str,
+        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+            self.raw_rx.lock().unwrap().take()
+        }
+    }
+
+    /// Single-PV `RawSeedSource` channel map, seeded with
+    /// `three_field_value(0, 0, 0)`. Returns the channels map, the source,
+    /// and the raw-event pusher.
+    #[cfg(test)]
+    fn pvx61_raw_channels(
+        sid: u32,
+        intro: &FieldDesc,
+    ) -> (
+        HashMap<u32, ChannelState>,
+        DynSource,
+        mpsc::Sender<crate::server_native::RawMonitorEvent>,
+    ) {
+        let (raw_tx, raw_rx) = mpsc::channel::<crate::server_native::RawMonitorEvent>(64);
+        let source: DynSource = Arc::new(RawSeedSource {
+            intro: intro.clone(),
+            seed: three_field_value(0, 0, 0),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+        });
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+        (channels, source, raw_tx)
+    }
+
+    /// Raw fast path: INIT->START posts accrue in order (the raw
+    /// counterpart of T1). The raw subscriber accrues events from INIT and
+    /// flushes them after START in order, ahead of the cooked seed's
+    /// backlog.
+    #[tokio::test]
+    async fn pvx61_raw_path_accrues_in_order() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (8u32, 707u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, raw_tx) = pvx61_raw_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        for i in 1..=3 {
+            raw_tx
+                .send(pvx61_raw_event(i, order))
+                .await
+                .expect("raw event queued");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an Idle (pre-START) raw monitor must not emit any DATA frame"
+        );
+
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq,
+            vec![0, 1, 2, 3],
+            "raw INIT->START events must be delivered seed-first, then in order; got {seq:?}"
+        );
+    }
+
+    /// Raw fast path: backlog > queueSize bounds to queueSize (the
+    /// raw counterpart of T2). Five events with queueSize 2 flush to
+    /// exactly 2 frames (seed + latest), the same total the decoded path
+    /// yields — the cooked seed counts against queueSize on both paths.
+    #[tokio::test]
+    async fn pvx61_raw_path_bounds_to_queue_size() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (9u32, 708u32);
+        let intro = three_field_intro();
+        let (mut channels, _source, raw_tx) = pvx61_raw_channels(sid, &intro);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 2, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        for i in 1..=5 {
+            raw_tx
+                .send(pvx61_raw_event(i, order))
+                .await
+                .expect("raw event queued");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert_eq!(
+            seq.len(),
+            2,
+            "queueSize=2 must bound the raw INIT->START backlog to exactly 2 \
+             frames (seed counts against the bound); got {seq:?}"
+        );
+        assert_eq!(seq[0], 0, "first frame is the cooked seed");
+        assert_eq!(
+            *seq.last().unwrap(),
+            5,
+            "the squashed raw tail must carry the latest event"
+        );
+    }
+
+    /// A source whose `Required` ACL denies READ to the connecting
+    /// (anonymous) peer. `subscribe` returns a live receiver, so the only
+    /// thing blocking the subscription is the gate — proving the deny is
+    /// ACL-driven, not an absent stream.
+    #[cfg(test)]
+    struct DenyReadSource {
+        gate: epics_base_rs::server::access_security::AccessGate,
+    }
+
+    #[cfg(test)]
+    impl DenyReadSource {
+        fn new() -> Self {
+            use epics_base_rs::server::access_security::{AsgAslResolver, parse_acf};
+            // READ is granted only to UAG(ops)={alice}; the anonymous peer
+            // matches no rule ⇒ NoAccess (default deny).
+            let acf = parse_acf(
+                "UAG(ops) { alice }\n\
+                 ASG(DEFAULT) {\n\
+                 \x20   RULE(0, READ) { UAG(ops) }\n\
+                 }\n",
+            )
+            .expect("acf parse");
+            let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(acf)));
+            let resolver: AsgAslResolver =
+                std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+            Self {
+                gate: epics_base_rs::server::access_security::AccessGate::required(cell, resolver),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    impl crate::server_native::source::ChannelSource for DenyReadSource {
+        fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+            &self.gate
+        }
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+            Some(three_field_intro())
+        }
+        async fn get_value(&self, _: &str) -> Option<PvField> {
+            Some(three_field_value(0, 0, 0))
+        }
+        async fn put_value(&self, _: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+            let (_tx, rx) = mpsc::channel(4);
+            Some(rx)
+        }
+    }
+
+    /// ACL denial surfaces at INIT (an approved semantic shift, documented
+    /// in the commit).
+    /// pvxs registers the upstream at INIT (`onSubscribe`), so an ACL
+    /// deny now fails the subscribe at INIT: the subscriber task ends
+    /// immediately (its terminal `MonitorFinished` fires) and no DATA
+    /// frame ever flows — not even after a later START. Pre-fix the
+    /// subscribe (and therefore the deny) was deferred to START.
+    ///
+    /// The complementary case — an ACL that flips to DENY *mid-window*,
+    /// forcing the per-event `revalidate_read` recheck to emit MONITOR
+    /// FINISH — is exercised end-to-end (over the wire, through
+    /// `run_pva_server`) by
+    /// `tests/parity/test_monitor_reload_deny_composite.rs`; this change
+    /// preserved that per-event recheck arm unchanged, so that test
+    /// remains its coverage.
+    #[tokio::test]
+    async fn pvx61_acl_deny_surfaces_at_init() {
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (10u32, 709u32);
+        let intro = three_field_intro();
+        let source: DynSource = Arc::new(DenyReadSource::new());
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+
+        // The subscribe is denied AT INIT: the subscriber task returns
+        // immediately, firing its terminal MonitorFinished.
+        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+            .await
+            .expect("ACL deny tears the subscriber down at INIT within 2s")
+            .expect("MonitorFinished");
+        assert_eq!(fin.ioid, ioid, "the denied op tore down at INIT");
+
+        // Even a subsequent START yields no DATA frame — the subscriber
+        // is already gone.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &mon_fin_tx,
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seq = pvx61_drain_data_a(&mut rx, &intro, order);
+        assert!(
+            seq.is_empty(),
+            "an ACL-denied monitor emits no DATA frame; got {seq:?}"
+        );
+    }
+
     /// A pipelined MONITOR INIT that omits the 0x80 initial-nack
     /// rider must seed the credit window to 0, NOT to the negotiated
     /// `queueSize`. pvxs initialises `nack = 0` and assigns
@@ -11008,13 +11381,22 @@ mod tests {
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT reply");
 
+        // The subscriber task is spawned at INIT (so `monitor_started`
+        // is now set from INIT), so "is the monitor delivering?" is the
+        // Executing edge owned by `MonitorStartControl`, not `monitor_started`.
+        // A real START (0x44) flips it; a plain 0x00 or an ACK-only frame must
+        // not.
         let started = |chs: &HashMap<u32, ChannelState>| -> bool {
             chs.get(&sid)
                 .and_then(|c| c.ops.get(&ioid))
-                .map(|o| o.monitor_started)
-                .expect("op present")
+                .and_then(|o| o.monitor_start_ctl.as_ref())
+                .map(|ctl| ctl.is_executing())
+                .expect("op + start-control present after INIT")
         };
-        assert!(!started(&channels), "monitor must be idle right after INIT");
+        assert!(
+            !started(&channels),
+            "monitor must be idle (not executing) right after INIT"
+        );
 
         // Sync builder for a data-phase control frame with a given subcmd
         // (and optional trailing pipeline ack-count).

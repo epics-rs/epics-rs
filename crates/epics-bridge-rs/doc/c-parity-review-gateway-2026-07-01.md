@@ -98,10 +98,11 @@ divergence, often a documented-intentional redesign needing sign-off),
 - C ref: `gatePv.cc:597-610` `death()` deletes the VC (clients see ECA_DISCONN, must re-search); reconnect `life()` → Inactive not Active
 - Impact: Client-visible connection-state differs. Marked intentional (`upstream.rs:996-1001`); flag for sign-off.
 
-**GW-23** CTRL-metadata seed bounded to 500 ms; on timeout, zeroed metadata is served indefinitely (repairing prop event unconditionally skipped) — **CONCERN**
+**GW-23** CTRL-metadata seed bounded to 500 ms; on timeout, zeroed metadata is served indefinitely (repairing prop event unconditionally skipped) — **FIXED `70ebcfae`**
 - Rust: `upstream.rs:713-744` (500 ms timeout on `get_with_metadata(Ctrl)`; empty on timeout) + `upstream.rs:1081,1112-1115` (prop task skips its first event unconditionally)
-- C ref: `gatePv.cc:915-1011` `get(ctrlType)` → `getCB:1689-1696` async + unbounded (always seeds); `propEventCB:1564-1568` ignores first event *because* the seed is reliable
+- C ref: `gatePv.cc:915-1011` `get(ctrlType)` → `getCB:1689-1696` async + unbounded (always seeds); `propEventCB:1564-1568` ignores first event *because* the seed is reliable (getCB enables propMonitor() only AFTER setPvData, gatePv.cc:1702-1705)
 - Impact: For a slow upstream where the initial control get exceeds 500 ms, the shadow PV serves zeroed units/precision/limits/enum-labels to DBR_CTRL/DBR_GR reads and does not self-heal — the repairing first DBE_PROPERTY event is skipped, so metadata stays zeroed until a genuine future property change. C has no such failure mode.
+- Fix: capture a real `seed_succeeded` bool from the seed outcome, thread it into `spawn_prop_forward_task` (both the cached and no-cache lazy spawn paths, the latter via a stored `UpstreamSubscription.seed_succeeded`), and start `first_event_seen = !seed_succeeded` so a missed seed consumes the first property event to seed (via `post_pv_property`, which persists metadata) instead of skipping it. Also closes C's own get-hard-failure gap. Regression test `br_gw23_seed_miss_first_prop_event_seeds_metadata`.
 
 **GW-24** `put`/`get` look up `subs` by `upstream_name` but `subs` is keyed by `served_name` (latent; API uncalled) — **NOTE**
 - Rust: `upstream.rs:1300`, `:1321` (`get(upstream_name)`) vs insert key `served_name` at `:835`
@@ -156,10 +157,11 @@ vs `server.cpp`, `channel.cpp`, `chancache.cpp`, `moncache.cpp`,
 (broadcast fan-out + per-credential identity forwarding), so several
 CONCERNs are deliberate redesign departures.
 
-**GW-60** Monitor overflow delivers a lagging trailing window, not C's latest-value-coalesced element — **CONCERN**
+**GW-60** Monitor overflow delivers a lagging trailing window, not C's latest-value-coalesced element — **CONCERN (⚠ pva2pva-referenced — RE-VALIDATE vs pvxs before fixing)**
 - Rust: `channel_cache.rs:48` (`BROADCAST_CAPACITY=16` FIFO ring) + `source.rs:1068,965` (on `broadcast::Lagged` resume at oldest retained frame, mark `overrun`)
 - C ref: `moncache.cpp:157-197,354-368` — on overflow each `MonitorUser` coalesces into a single `overflowElement` (latest value), `release()` returns that with the overrun bitset OR'd
 - Impact: A slow downstream client receives delayed/stale values (oldest-first) where pva2pva coalesces to newest. Observable semantic difference for latest-value control monitors; overrun flag set but delivered value not current until upstream rate falls.
+- ⚠ REFERENCE CAVEAT: this is graded against **pva2pva** `moncache.cpp`, but the Rust PVA path tracks **pvxs** (same mismatch that made GW-80/81/82 false positives). pvxs `server::Monitor` queue-overflow / `MonitorControlOp` maybe-drop / coalescing semantics differ from pva2pva's `overflowElement`. Do NOT fix toward pva2pva coalescing until pvxs's actual overflow behavior is confirmed — fixing toward the wrong reference is the trap this campaign already hit once.
 
 **GW-61** Per-credential cache split breaks chancache's single-shared-upstream-monitor model — **CONCERN**
 - Rust: `source.rs:584-622` (`upstream_cache_for` — every distinct `(account,method,host,authority)` gets its own `ChannelCache` → own upstream channel+monitor per PV; only anonymous share `self.cache`)
@@ -248,8 +250,9 @@ categories (GW-1..5, GW-20..26, GW-40..43, GW-60..67, GW-80..84).
 GW-80 (the only DEFECT) plus GW-81/GW-82 are false positives — the pvalink
 category was first graded against pva2pva but the port tracks pvxs, and pvxs
 lacks the change-mask suppression / PP-scan / `atomic`-drop behaviors that
-generated them. GW-40 is now **FIXED** (`1ed22d29`). Remaining actionable:
-GW-23 + GW-60 (wrong-data), GW-41 (subsystem scope). The rest are redesign
+generated them. GW-40 (`1ed22d29`) and GW-23 (`70ebcfae`) are now **FIXED**.
+Remaining actionable: GW-60 (wrong-data, but pva2pva-referenced — needs
+pvxs re-validation), GW-41 (subsystem scope). The rest are redesign
 sign-off decisions or NOTEs.
 
 Thematic clusters:
@@ -292,8 +295,10 @@ Thematic clusters:
 - **GW-40** (bridge upstream read-access) — **DONE `1ed22d29`.**
 - **GW-80..GW-84 re-validated vs pvxs** — no fix owed (GW-80/81/82 false
   positive; GW-83/GW-84 are low-priority NOTEs, left as documented).
-- **GW-23** (metadata zeroed forever) and **GW-60** (stale overflow value)
-  are the strongest remaining wrong-data candidates for fixes.
+- **GW-23** (metadata zeroed forever) — **DONE `70ebcfae`.**
+- **GW-60** (stale overflow value) — the graded C ref is pva2pva; RE-VALIDATE
+  against pvxs before fixing (see its reference caveat). Not fixed toward
+  pva2pva coalescing until pvxs's overflow behavior is confirmed.
 - **GW-41** (`gateAsCa`) is a subsystem-sized port — confirm scope with the
   user before starting.
 - **GW-1/GW-20/GW-22/GW-61/GW-62/GW-63** are redesign sign-off decisions,

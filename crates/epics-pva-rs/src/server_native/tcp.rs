@@ -2080,6 +2080,25 @@ fn spawn_monitor_subscriber(
                     _ = exec_rx.changed() => {}
                     _ = std::future::ready(()), if executing && has_work => {
                         if let Some(initial) = seed_cooked.take() {
+                            // Per-event ACL recheck on policy reload — the seed is
+                            // emitted through the same gate as every backlog event
+                            // (below), so an ACL reload during the idle window that
+                            // revokes read suppresses the raw seed too, symmetric
+                            // with the decoded path where the seed is pending[0] and
+                            // is rechecked when popped.
+                            let live_v = src.access_gate().acl_version();
+                            if live_v
+                                != mon_acl_version_at_subscribe_cell
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
+                                    let finish = build_monitor_finish(ioid, order_now());
+                                    let _ = tx_clone.send(finish).await;
+                                    return;
+                                }
+                                mon_acl_version_at_subscribe_cell
+                                    .store(live_v, std::sync::atomic::Ordering::Release);
+                            }
                             let payload = build_monitor_payload(
                                 ioid, &intro_clone, &initial, &mask_clone, order_now(),
                             );
@@ -11055,6 +11074,165 @@ mod tests {
             *seq.last().unwrap(),
             5,
             "the squashed raw tail must carry the latest event"
+        );
+    }
+
+    /// Raw-seeded source whose ACL gate can be flipped from permissive to
+    /// deny mid-window (the test holds the ACF cell + version counter), to
+    /// exercise the raw seed's per-event ACL recheck.
+    #[cfg(test)]
+    struct FlipRawSeedSource {
+        intro: FieldDesc,
+        seed: PvField,
+        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        gate: epics_base_rs::server::access_security::AccessGate,
+    }
+
+    #[cfg(test)]
+    impl crate::server_native::source::ChannelSource for FlipRawSeedSource {
+        fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
+            &self.gate
+        }
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, name: &str) -> bool {
+            name == "dut"
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(self.seed.clone())
+        }
+        async fn put_value(&self, _name: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        async fn subscribe_raw(
+            &self,
+            _name: &str,
+        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+            self.raw_rx.lock().unwrap().take()
+        }
+    }
+
+    /// The raw seed honors the per-event ACL recheck. An ACL reload that
+    /// revokes READ during the idle window must suppress the raw seed
+    /// (MONITOR FINISH, no seed DATA), symmetric with the decoded path where
+    /// the seed is pending[0] and is rechecked on pop. Pre-fix the raw seed
+    /// was emitted via `seed_cooked.take()` without the recheck, so a client
+    /// that lost read access still received it.
+    #[tokio::test]
+    async fn pvx61_raw_seed_rechecks_acl_on_reload() {
+        use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, parse_acf};
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (12u32, 711u32);
+        let intro = three_field_intro();
+
+        // Permissive at subscribe: the anonymous peer may READ.
+        let permissive = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").expect("acf");
+        let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(permissive)));
+        let version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let resolver: AsgAslResolver =
+            std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let gate = AccessGate::required_with_version(cell.clone(), resolver, version.clone());
+
+        let (_raw_tx, raw_rx) = mpsc::channel::<crate::server_native::RawMonitorEvent>(64);
+        let source: DynSource = Arc::new(FlipRawSeedSource {
+            intro: intro.clone(),
+            seed: three_field_value(0, 0, 0),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            gate,
+        });
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        pvx61_drive(
+            &pvx61_init_frame(sid, ioid, 8, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT introspection reply");
+        // Let the raw subscriber capture the seed under the permissive gate.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // ACL reload during the idle window: READ is revoked, version bumped.
+        let deny = parse_acf(
+            "UAG(ops) { alice }\n\
+             ASG(DEFAULT) {\n\
+             \x20   RULE(0, READ) { UAG(ops) }\n\
+             }\n",
+        )
+        .expect("acf");
+        *cell.write().await = Some(deny);
+        version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // START: the raw seed emit rechecks ACL, sees the deny, and emits
+        // FINISH instead of the seed DATA frame.
+        pvx61_drive(
+            &pvx61_ctrl_frame(sid, ioid, 0x44, order),
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            peer,
+            &cred,
+            &discard_mon_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut data = Vec::new();
+        let mut saw_finish = false;
+        while let Ok(buf) = rx.try_recv() {
+            if let Some(a) = pvx61_decode_data_a(&buf, &intro, order) {
+                data.push(a);
+            } else if pvx61_is_finish(&buf, order) {
+                saw_finish = true;
+            }
+        }
+        assert!(
+            data.is_empty(),
+            "the raw seed must be suppressed once READ is revoked mid-window; \
+             got seed DATA {data:?}"
+        );
+        assert!(
+            saw_finish,
+            "a revoked raw seed must emit MONITOR FINISH, not the seed frame"
         );
     }
 

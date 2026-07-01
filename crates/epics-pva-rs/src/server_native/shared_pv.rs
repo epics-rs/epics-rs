@@ -189,7 +189,13 @@ fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
     let limit = limit.max(1);
     let shared = Arc::new(MonitorQueueShared {
         inner: Mutex::new(MonitorQueueInner {
-            items: VecDeque::with_capacity(limit),
+            // Grow lazily. `limit` is the client-supplied queueSize (unbounded
+            // u32) and must never be pre-allocated — a single MONITOR INIT with
+            // an enormous queueSize would otherwise force a multi-GB reservation
+            // and abort the process. `post` bounds live length to `limit` via
+            // tail-squash, so lazy growth preserves the same semantics; pvxs
+            // likewise never pre-sizes its monitor deque.
+            items: VecDeque::new(),
             limit,
             producer_done: false,
         }),
@@ -1609,6 +1615,30 @@ mod tests {
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Int(v))));
         PvField::Structure(s)
+    }
+
+    /// A client-supplied `queueSize` must never be eagerly pre-allocated: an INIT
+    /// with a hostile queueSize would otherwise force a multi-GB reservation and
+    /// abort the process. `make_monitor_queue` grows lazily and `post` bounds live
+    /// length to `limit`, so the huge limit is honored logically without the
+    /// allocation.
+    #[test]
+    fn make_monitor_queue_does_not_preallocate_client_limit() {
+        let huge = 1_000_000_000usize;
+        let (outbox, inbox) = make_monitor_queue(huge);
+        // Construction reserves nothing.
+        assert_eq!(inbox.shared.inner.lock().items.capacity(), 0);
+        // Posting eight values grows the deque only to serve those live items.
+        for i in 0..8 {
+            outbox.post(nt_scalar_int_value(i), false);
+        }
+        let inner = inbox.shared.inner.lock();
+        assert!(inner.items.len() <= inner.limit);
+        assert!(
+            inner.items.capacity() < huge,
+            "capacity {} must stay lazy, not track the client limit {huge}",
+            inner.items.capacity(),
+        );
     }
 
     /// NTScalar<Int> with a `time_t` `timeStamp` member. Bit numbering:

@@ -100,7 +100,7 @@ op-handlers, and beacon/search layout are byte-faithful.
 | PVX-2  | **CLEARED (`a71e168b`)** — Fix (structural): added `proto::size::decode_size_nonnull(cur, order, what)`, the non-null primitive (pvxs `from_wire(Size, allow_null=false)`) that holds the invariant by construction; routed the count-must-not-be-null family (encode.rs ×11, bitset, the `pvxvct-rs.rs:367` `.unwrap_or(0)` CLI bug) through it. Strings/union-selectors stay on `decode_size`. |
 | PVX-82 | **CLEARED (`03caa4d1` INTF + `da4b0be8` IGNORE)** — Fix (behavior change vs prior Rust, matches pvxs): `server_intf_addr_list_checked` / `server_ignore_addr_list_checked` error when every token in a non-blank server addr-list is unresolvable, recorded as `intf_addr_error` / `ignore_addr_error` and surfaced as a hard `PvaServer::start` failure — closes the silent over-broad wildcard bind (INTF) and the silently-empty blocklist (IGNORE). The finding named both lists; the IGNORE half was closed in the convergence round (`da4b0be8`). Client-path `expand()` wildcard left as-is (DISTINCT — diagnostic, pvxs client parse is `required=false`). **Residual (documented, accepted):** the gate is `all`-bad (fails only when every token is unresolvable), whereas pvxs `required=true` throws on `any` bad token — but the Rust gate is fail-closed (binds/blocks a subset, never a superset/wildcard), so no over-broad exposure. |
 | PVX-42 | **CLEARED (`1941d5e2`)** — Fixed by matching pvxs: default `pipeline_size = 0` so the default monitor is non-pipelined (plain `0x08` INIT, no credit trailer/options/ACKs). Pipelining stays opt-in via `pipeline_size(n)` or a pvRequest `record._options.pipeline`. Regression test pins the non-pipelined default. |
-| PVX-61 | **OPEN (round-2 candidate)** — establish monitor subscription at INIT (pvxs `connectSub`) so INIT→START transitions queue instead of collapse. More involved server change. |
+| PVX-61 | **CLEARED (`72283cf3` + 4 follow-ups)** — establish the monitor subscription at INIT (pvxs `connectSub`/`onSubscribe`) so INIT→START transitions accrue into one bounded FIFO instead of collapsing to the START seed. Structural: PRODUCER drains source→`pending` (squash-to-queueSize) from INIT; CONSUMER emits `pending`→wire only while Executing; INIT→START and STOP→START are the same "Idle, accruing" state. Two approved semantic shifts (documented, not bugs): ACL denial surfaces at INIT (subscribe fails there); STOP→START delivers up-to-queueSize not latest-only. See Round 4. |
 | PVX-41 | **CLEARED (`345e57bf`)** — Fix: route the get-first put snapshot through the PUT op's own GetOPut phase (`CMD_PUT` subcmd `0x40`, empty body, same ioid) via new `codec.build_put_get`, replacing the separate all-fields `CMD_GET` op. Server `0x40` handler (`tcp.rs`) + client PUT_GET decode (`decode.rs`) already existed. Semantic note (signed off in-line): a snapshot transport failure (send/timeout/malformed) now fails the op rather than falling back, because the snapshot shares the op's frame stream and a late reply would desync the exec await; an error *status* reply stays best-effort. End-to-end interop test added. **Sibling found+fixed (`5429ff78`):** the end-to-end test surfaced a pre-existing latent bug — `enum_choices_from_previous` read `value.choices` only as untyped `ScalarArray`, but the wire decode emits the canonical `ScalarArrayTyped` for `string[]`, so every get-first enum-by-label put (old *and* new path) silently rejected the label. Now accepts both representations. |
 | PVX-1  | **DOCUMENTED (kept) — intentional divergence** — Rust's `Status::decode` rejecting out-of-range status type bytes is a deliberate strictness choice, NOT softened to pvxs's silent `type_t` coercion. Conforming pvxs peers emit only 0–3/`0xFF`, so no interop impact; the strictness rejects malformed peers rather than limping on a coerced failure code. Softening would adopt pvxs's lenient cast — declined per "don't copy C's looser behavior". |
 
@@ -193,6 +193,53 @@ Three residuals surfaced, dispositioned:
 
 Remaining open: **PVX-61** (monitor-sub-at-INIT) — the last open PVA
 finding.
+
+### Round 4 (2026-07-01) — PVX-61 (monitor-sub-at-INIT) + 2 verification rounds
+
+- **PVX-61** `72283cf3` — the monitor subscriber is now spawned at INIT
+  (extracted `spawn_monitor_subscriber(MonitorSubscriberArgs)`, called from
+  the INIT branch with `monitor_abort`/`monitor_start_ctl` installed in the
+  same synchronous step = teardown invariant). One bounded FIFO per monitor:
+  a cancel-safe `select!` loop with a PRODUCER arm (`rx.recv()`→squash-to-
+  queueSize), an Executing-edge arm (`exec_rx.changed()`), and a CONSUMER arm
+  (`std::future::ready(())` gated on `executing && !pending.is_empty()`,
+  `credit.acquire()` awaited inside after the filter/ACL gates). Retired the
+  `held`/`held_raw` single cell, `next_monitor_event`, `drain_monitor_queue`.
+  Closes both the lost-INIT→START-posts bug and its STOP→START sibling.
+  8 per-invariant-boundary tests.
+- First caucus opus verification round (`01KWDHNM`, pvxs-parity +
+  concurrency/teardown lenses) surfaced 1 blocker + 1 medium + 3 low:
+  - **F1 (blocker)** `ae939ce0` — plumbing queueSize into `subscribe_seeded`
+    made `make_monitor_queue` pre-allocate `VecDeque::with_capacity(client
+    queueSize)`, a remote OOM/abort DoS. Fixed: `VecDeque::new()` (lazy);
+    `post` already bounds live length via tail-squash, so identical semantics,
+    pvxs-faithful, SR-19-consistent.
+  - **F3 (medium)** `4e2a1a21` — the INIT-subscribe made "PV closes while
+    Idle" reachable; the loop emitted the terminal FINISH while `!executing`,
+    dropping the backlog. Fixed: break (→ FINISH) only when `!source_open &&
+    executing && <drained>`, matching pvxs `maybeReply` state==Executing gate
+    (servermon.cpp:82,142-154). Idle-close now holds backlog+finish until a
+    later START; teardown still aborts the parked task.
+  - **F4 (low)** `4d607d5d` — the raw seed emit bypassed the per-event ACL
+    recheck every backlog event + the decoded seed get, leaking the seed to a
+    reader revoked mid-window. Fixed: uniform recheck before the raw seed
+    emit. Only coverage of the raw ACL-deny branch.
+  - **F2 (low)** `37b52090` — `raw_cap` comment overclaimed uniformity;
+    `queue_limit==1` seed+raw=+1 is client-unreachable (client `queueSize<2`
+    rejected; `monitor_queue_depth` default 64). Doc corrected.
+  - **F5 (low)** — async INIT-subscribe vs pvxs synchronous `onSubscribe`:
+    accepted architectural residual (both reviewers confirmed not
+    wire-observable; a sub-ms-window post folds into the seed, no loss).
+- Second verification round (`01KWDKMQ`, same two lenses) **both panels
+  `approve`** — all four fixes wire-faithful and concurrency/teardown-clean,
+  no new defects. One open question (source-close FINISH held vs ACL-deny
+  FINISH prompt) confirmed intentional and documented at both pre-loop
+  revalidate sites (`1d3e3b6d`): a security revocation closes promptly, a
+  lifecycle close holds until START.
+
+**PVA C-parity campaign CONVERGED.** Round 1 found 0 DEFECT across all 5
+categories; all 8 CONCERNs (PVX-1/2/21/41/42/61/81/82) are now cleared or
+documented-as-intentional. No open PVA findings remain.
 
 **Pre-existing, out of scope (UNFIXED):** three interop suite tests fail
 on this machine because they require an installed pvxs C++ binary

@@ -860,8 +860,11 @@ async fn connect_server(
     // `CircuitUnresponsive` transition, and the read loop's data-arrival
     // path performs the sole `CircuitResponsive` recovery — so a stall
     // first seen on the send side still recovers when replies resume on
-    // the read side.
-    let unresponsive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // the read side. `UnresponsiveGate` guards the (test + emit) pair
+    // under one mutex, exactly as C guards it under the cac lock, so a
+    // `CircuitResponsive` from the read loop can never be enqueued ahead
+    // of a `CircuitUnresponsive` still in flight from the write loop.
+    let unresponsive = std::sync::Arc::new(UnresponsiveGate::new());
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
 
     // Build initial CA handshake.
@@ -997,6 +1000,82 @@ async fn connect_server(
     })
 }
 
+/// Single owner of a virtual circuit's unresponsive state.
+///
+/// C funnels both watchdogs through one `tcpiiu::unresponsiveCircuit`
+/// bool guarded by the cac mutex, so the flag flip and its
+/// `genLocalExcep(ECA_UNRESPTMO)` / `responsiveCircuitNotify` are atomic
+/// with respect to each other (`tcpiiu.cpp:861-940`). The send watchdog
+/// (`write_loop`) and the receive echo watchdog (`read_loop`) run on
+/// separate tasks that share one `event_tx`, so a bare `AtomicBool` swap
+/// followed by a *separate* `event_tx.send` is NOT atomic: the write loop
+/// could win `swap(true)`, be preempted before its send, and the read
+/// loop could then win `swap(false)` and enqueue `CircuitResponsive`
+/// ahead of the still-pending `CircuitUnresponsive`. The coordinator would
+/// apply Responsive (a no-op on not-yet-unresponsive channels) before
+/// Unresponsive, wedging the channels Unresponsive with revoked access on
+/// a live circuit. Guarding the (test + emit) pair with one mutex makes
+/// each transition indivisible, so the two events can never be delivered
+/// out of order.
+struct UnresponsiveGate {
+    state: std::sync::Mutex<bool>,
+}
+
+impl UnresponsiveGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(false),
+        }
+    }
+
+    /// Mark the circuit unresponsive and emit `CircuitUnresponsive` exactly
+    /// once per episode — only the `false → true` transition emits, so the
+    /// send watchdog and the read echo watchdog cannot double-post. Mirrors
+    /// C's `if (!unresponsiveCircuit)` guard (`tcpiiu.cpp:906`).
+    fn mark_unresponsive(
+        &self,
+        event_tx: &mpsc::UnboundedSender<TransportEvent>,
+        server_addr: SocketAddr,
+        priority: u8,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if !*state {
+            *state = true;
+            let _ = event_tx.send(TransportEvent::CircuitUnresponsive {
+                server_addr,
+                priority,
+            });
+        }
+    }
+
+    /// Clear the unresponsive state on data arrival and emit the sole
+    /// `CircuitResponsive` — only the `true → false` transition emits, so a
+    /// circuit that was never marked stays quiet. Mirrors C's
+    /// `if (this->unresponsiveCircuit)` guard in `responsiveCircuitNotify`
+    /// (`tcpiiu.cpp:867`).
+    fn mark_responsive(
+        &self,
+        event_tx: &mpsc::UnboundedSender<TransportEvent>,
+        server_addr: SocketAddr,
+        priority: u8,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if *state {
+            *state = false;
+            let _ = event_tx.send(TransportEvent::CircuitResponsive {
+                server_addr,
+                priority,
+            });
+        }
+    }
+
+    /// Test-only read of the current unresponsive state.
+    #[cfg(test)]
+    fn is_unresponsive(&self) -> bool {
+        *self.state.lock().unwrap()
+    }
+}
+
 async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     mut writer: W,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -1004,7 +1083,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    unresponsive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    unresponsive: std::sync::Arc<UnresponsiveGate>,
 ) {
     // Send watchdog. C `tcpSendWatchdog` (`libca/tcpSendWatchdog.cpp:43-64`)
     // fires after `connTMO` (`EPICS_CA_CONN_TMO`, default 30 s) and calls
@@ -1065,7 +1144,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                 Err(_) => {
                     // Send watchdog: no write progress within `connTMO`.
                     // C `sendTimeoutNotify` → `unresponsiveCircuitNotify`:
-                    // mark the circuit unresponsive (once, via the flag
+                    // mark the circuit unresponsive (once, via the gate
                     // shared with the read loop's echo watchdog) and KEEP
                     // the socket. The cancelled `write` was `Pending`, so
                     // `written` is exact — loop and resume the batch from
@@ -1073,12 +1152,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
                     // dead-circuit close are both owned by `read_loop`; on
                     // teardown `ServerConnection::drop` aborts this task,
                     // so a forever-stalled write cannot leak.
-                    if !unresponsive.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        let _ = event_tx.send(TransportEvent::CircuitUnresponsive {
-                            server_addr,
-                            priority,
-                        });
-                    }
+                    unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
                 }
             }
         }
@@ -1114,7 +1188,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
-    unresponsive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    unresponsive: std::sync::Arc<UnresponsiveGate>,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used
     // both on idle expiry and on the first leg of an echo timeout.
@@ -1280,12 +1354,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     if !probe_escalated {
                         // First echo timeout: perform the one-shot
                         // unresponsive transition (shared with the send
-                        // watchdog — emit only if we win the swap), then
-                        // send a second probe before declaring death.
-                        if !unresponsive.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                            let _ = event_tx
-                                .send(TransportEvent::CircuitUnresponsive { server_addr, priority });
-                        }
+                        // watchdog via the gate — emit only on the winning
+                        // transition), then send a second probe before
+                        // declaring death.
+                        unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
                         probe_escalated = true;
                         if send_echo(&write_tx, server_minor_version).is_err() {
                             let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
@@ -1361,12 +1433,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // watchdog (`write_loop`) or on this read loop's echo watchdog.
         // Mirrors C `responsiveCircuitNotify`'s `if (unresponsiveCircuit)`
         // guard (`tcpiiu.cpp:867`).
-        if unresponsive.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            let _ = event_tx.send(TransportEvent::CircuitResponsive {
-                server_addr,
-                priority,
-            });
-        }
+        unresponsive.mark_responsive(&event_tx, server_addr, priority);
 
         // Automatic CA flow control is intentionally disabled here. The
         // previous implementation counted TCP reads, which can overshoot badly
@@ -1986,7 +2053,7 @@ mod read_loop_tests {
             beacon_rx,
             crate::client::types::InFlightOps::new(),
             std::sync::Arc::new(dashmap::DashMap::new()),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(UnresponsiveGate::new()),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -2310,7 +2377,7 @@ mod malformed_header_close_tests {
             ba_rx,
             in_flight,
             last_rx_at,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(UnresponsiveGate::new()),
         ));
 
         // 24-byte extended header: postsize=0xFFFF (extended marker),
@@ -2364,7 +2431,7 @@ mod malformed_header_close_tests {
             ba_rx,
             in_flight,
             last_rx_at,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(UnresponsiveGate::new()),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -2410,7 +2477,7 @@ mod write_loop_timeout_tests {
     use super::*;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::AsyncWrite;
@@ -2498,7 +2565,7 @@ mod write_loop_timeout_tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let pending_frames = Arc::new(AtomicUsize::new(0));
-        let unresponsive = Arc::new(AtomicBool::new(false));
+        let unresponsive = Arc::new(UnresponsiveGate::new());
         let writer = PartialThenStallWriter {
             first_write: Arc::new(AtomicUsize::new(0)),
         };
@@ -2536,8 +2603,8 @@ mod write_loop_timeout_tests {
             _ => panic!("a send stall must emit CircuitUnresponsive"),
         }
         assert!(
-            unresponsive.load(Ordering::SeqCst),
-            "the shared unresponsive flag must be set on a send stall"
+            unresponsive.is_unresponsive(),
+            "the shared unresponsive gate must be set on a send stall"
         );
 
         // No follow-up TcpClosed: the loop keeps the socket and retries
@@ -2563,7 +2630,7 @@ mod write_loop_timeout_tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let pending_frames = Arc::new(AtomicUsize::new(1));
-        let unresponsive = Arc::new(AtomicBool::new(false));
+        let unresponsive = Arc::new(UnresponsiveGate::new());
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = ResumeAfterStallWriter {
             polls: Arc::new(AtomicUsize::new(0)),

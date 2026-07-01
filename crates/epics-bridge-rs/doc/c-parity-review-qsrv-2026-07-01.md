@@ -79,11 +79,27 @@ Resolution: every member-level scalar annotation now coerces through the same
 → string) and `+putorder` through the new `json_value_as_i64` (bool/real/string
 → int, whose string branch is `parse_stoll_base0` mirroring pvxs
 `parseTo<int64_t>` = `std::stoll(s,_,0)`: base auto-detect, sign,
-leading/trailing whitespace). A present-but-non-coercible value (array/object)
-now returns `Err` → per-group skip, matching pvxs's `NoConvert` throw and the
-group-level `+atomic`/`+id` idiom. So `+id:5`→`"5"`, `+putorder:"2"`→`2`,
+leading/trailing whitespace). So `+id:5`→`"5"`, `+putorder:"2"`→`2`,
 numeric `+channel`→`"5"` all coerce (pvxs behavior) instead of being silently
 dropped; a `bool`/`number` `+type` coerces then warns-and-defaults to Scalar.
+A present-but-non-coercible value (array/object/unparsable string) returns
+`Err` → this group is dropped.
+Divergence correction (round-2 verify, config panel): the earlier claim that
+this per-group drop "matches pvxs's `NoConvert` throw" is FALSE — pvxs's
+`as<T>()` NoConvert is raised inside a yajl SAX callback, and its wrapper
+`yajlProcess` (groupconfigprocessor.cpp:1048-1059) returns -1, which yajl's
+`_CC_CHK` (`libcom/yajl/yajl_parser.c:175-181`, cancels only on a FALSY 0) does
+NOT treat as a cancel. pvxs therefore SWALLOWS the coercion error and serves
+the group with the annotation defaulted (and for an array `+id:[1,2]`,
+decomposed into scalar callbacks with no array boundary, keeps the FIRST
+element `structureId="1"`). Rust's hard per-group skip is INTENTIONALLY
+stricter — we surface the malformed annotation as a dropped group rather than
+copy pvxs's swallow-and-serve (a `_CC_CHK` return-value bug), per the campaign
+rule to match pvxs without copying its bugs. Degenerate-config-only. All the
+in-source "NoConvert → per-group skip matching pvxs" comments and the
+`config_bad_*`/`member_noncoercible_*` test comments are corrected to describe
+this stricter divergence; the coercion values themselves (the actual Q2
+finding) are unchanged and correct.
 Defect-family: the finding cited `+id`/`+putorder`/`+channel`; `+type` and
 `+trigger` were the same-anchor member-level `.as_str()` reads and are fixed in
 the same pass. Regression: `parse_stoll_base0_matches_pvxs`,

@@ -88,6 +88,15 @@ intentional Rust-only behavior unless it breaks a libca/rsrv wire contract.
 >   Correctness is preserved — the channel reconnects; the divergence is a
 >   heavier recovery under transient send stalls. Flagged for user
 >   sign-off before any redesign; documented in `transport.rs:988-1014`.
+>   Scope (Round-4 review, bounds the sign-off): the redesign is
+>   *write-loop-confined* — the `CircuitUnresponsive`→echo-probe→
+>   `CircuitRecovered` plumbing already exists on the read side
+>   (`transport.rs:1259-1260`, `types.rs` events), so only the send loop
+>   changes (a non-cancelling write that tracks bytes-written across the
+>   unresponsive window, or a spawned write task + last-progress
+>   watchdog). The current comment additionally conflates send-*stall*
+>   (C keeps the socket + echo-probes) with send-*error* (C
+>   `shutdown(SHUT_WR)` teardown); only the stall case is the divergence.
 >
 > **Minor residuals (benign, not re-filed):**
 > - R2-17: EVENT_ADD-via-`CA_PROTO_ERROR` is a `_=>{}` no-op; subscription

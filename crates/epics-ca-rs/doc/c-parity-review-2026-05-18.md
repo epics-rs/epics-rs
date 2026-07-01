@@ -9,6 +9,44 @@ intentional Rust-only behavior unless it breaks a libca/rsrv wire contract.
 
 ## Open Findings
 
+> **2026-07-01 server-backlog triage.** Every server-side (rsrv) finding
+> below was re-verified against *current* source and the C rsrv reference
+> (`modules/database/src/ioc/rsrv/`), opening each cited C line directly.
+> **All 17 server findings are ALREADY-FIXED**; the two that carry a
+> deliberate, benign divergence from C are dispositioned as intentional
+> keeps (not "still open"). The 22 client-side (libca) findings are
+> **deferred** — out of scope for this CA-server pass. The entries are left
+> in place for provenance; use this block for status.
+>
+> **Server — ALREADY-FIXED (current file:line):** R2-1 `tcp.rs:4893/4962`,
+> R2-8 `tcp.rs:5001`, R2-9 `tcp.rs:3192`+`PutNotifySlot`, R2-12
+> `tcp.rs:5108`, R2-20 `repeater.rs:180`, R2-23 `tcp.rs:4309`, R2-33
+> `tcp.rs:2128`/`udp.rs:499`/`tcp.rs:4460`, R2-34 `tcp.rs:2452/2491/2512`,
+> R2-35 `repeater.rs:233`, R2-36 `tcp.rs:3532/3688/3880`, R2-46
+> `tcp.rs:3114`, R2-47 `tcp.rs:1353`, R2-49 `udp.rs:714`, R2-51
+> `tcp.rs:4801`, R2-52 `tcp.rs:2006`.
+>
+> **Server — intentional divergence from C (do NOT re-flag):**
+> - **R2-50** — Rust refuses a duplicate `sub_id` on one connection with
+>   `CA_PROTO_ERROR`/`ECA_BADMONID` (`tcp.rs:3651-3662`). C `event_add_action`
+>   (`camessage.c:1762-1866`) installs *both* subscriptions with no dedup,
+>   emitting duplicate wire frames per event for the same client `sub_id` —
+>   a latent client-confusion bug we decline to copy. Not observable for a
+>   conformant client (never sends a duplicate `sub_id`).
+> - **R2-55** — CREATE_CHAN minor-version write is upgrade-only
+>   (`tcp.rs:2042-2055`). C `claim_ciu_action` (`camessage.c:1196`) writes it
+>   unconditionally then rejects the channel if the result is `< 4.4`. A
+>   conformant libca client carries its true version in CREATE_CHAN
+>   `m_available` (== the VERSION `m_count` it handshook), so upgrade-only is
+>   *identical* to C's write for real clients; the two differ only for a
+>   non-conformant peer sending a lower `m_available` than its handshake,
+>   where C downgrades-then-rejects and we keep the negotiated version. We
+>   deliberately do not copy C's downgrade+reject (commit `9e79bb15`).
+>
+> **Client — deferred (out of CA-server scope this pass):** R2-17, R2-18,
+> R2-19, R2-21, R2-25, R2-26, R2-27, R2-28, R2-29, R2-30, R2-31, R2-32,
+> R2-37, R2-38, R2-39, R2-40, R2-41, R2-45, R2-57, R2-59, R2-62, R2-63.
+
 ### R2-1: Access-rights loss emits the wrong monitor error frame
 
 Severity: Medium
@@ -1235,3 +1273,20 @@ isolated subnet no longer leaks beacons onto unrelated networks.
   flush-time strip/fill, send_to failure logging,
   UDP_FLUSH_THRESHOLD=1024). Full-workspace regression: 4584/4584
   pass, clippy clean, doctests pass.
+- 2026-07-01: Round 3 — server-backlog triage. Three opus panels
+  re-verified all 39 open findings against current source + the C rsrv
+  reference (each cited C line opened directly, not trusting doc
+  citations). Result: **0 still-real** on the server side — all 17
+  server (rsrv) findings ALREADY-FIXED by interim churn (the 2026-05-18
+  present-tense text was stale); the 22 client (libca) findings deferred
+  as out of scope for the CA-server pass. Two server findings carry a
+  deliberate benign divergence from C and were dispositioned as
+  intentional keeps: R2-50 (duplicate-`sub_id` refusal vs C's no-dedup
+  double-install) and R2-55 (CREATE_CHAN minor-version upgrade-only vs
+  C's unconditional-write-then-reject; comment clarified in `9e79bb15`).
+  An initial attempt to "match C" on R2-55 by making the write
+  unconditional was reverted after it regressed four deprecated-read
+  server tests: it copied C's downgrade without C's paired `CA_V44`
+  reject, and for conformant clients the upgrade-only write is already
+  identical to C. No source fix was owed; the server backlog is
+  converged. See the triage block at the head of `## Open Findings`.

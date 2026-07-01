@@ -586,6 +586,20 @@ impl BridgeChannel {
         value: &PvStructure,
         opts: PutOptions,
     ) -> BridgeResult<()> {
+        // C `IOCSource::doPreProcessing` (iocsource.cpp:363-375), which
+        // pvxs runs on every QSRV put in every process mode
+        // (singlesource.cpp:354-356) BEFORE the write-ACF check: reject a
+        // put to a DISP-disabled record (except the DISP field) or a
+        // read-only field. The `Passive` route enforces this inside
+        // `put_record_field_from_ca`, but the `Force`/`Inhibit` routes go
+        // through `put_pv` (the internal `dbPut` analogue, which by design
+        // does not gate DISP), so the gate must run at this boundary for
+        // all three process modes.
+        self.db
+            .check_external_put_preconditions(&self.record_name, &self.field)
+            .await
+            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+
         // One access evaluation yields both the allow/deny decision and
         // the matched rule's TRAPWRITE flag (`WriteGrant`). The grant is
         // the single source of "is this a trapped write" — the PUT below

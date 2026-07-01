@@ -93,6 +93,56 @@ impl PvDatabase {
         self.put_pv_inner(name, value, false).await
     }
 
+    /// C `IOCSource::doPreProcessing` gate (pvxs `iocsource.cpp:363-375`).
+    ///
+    /// Reject an *external* put (a PVA/CA client put routed through QSRV)
+    /// that C refuses before any write: a put to a `DISP=1` record's
+    /// non-DISP field (`S_db_putDisabled`) or to a read-only / `SPC_NOMOD`
+    /// field (`S_db_noMod`). No value is written — this is a precondition
+    /// check only. It mirrors the two gates inside
+    /// [`Self::put_record_field_from_ca`] (the Passive route) so the QSRV
+    /// `Force`/`Inhibit` routes — which go through [`Self::put_pv`] — enforce
+    /// the same preconditions. `put_pv` itself is the internal `dbPut`
+    /// analogue and deliberately does not gate DISP (internal
+    /// link/processing puts must bypass it), so the gate lives at the
+    /// external put boundary, exactly as C places `doPreProcessing` in the
+    /// source layer rather than in `dbPut`.
+    pub async fn check_external_put_preconditions(
+        &self,
+        record_name: &str,
+        field: &str,
+    ) -> CaResult<()> {
+        let field_upper = field.to_ascii_uppercase();
+        // A missing record is not a DISP/read-only precondition violation:
+        // stay silent and let the downstream put report the not-found (for
+        // QSRV, inside its own `asTrapWrite` bracket). C's `doPreProcessing`
+        // only runs against an established channel — the record is
+        // guaranteed present there — and a `BridgeChannel` likewise always
+        // binds a real record in production.
+        let Some(rec) = self.get_record(record_name).await else {
+            return Ok(());
+        };
+        let instance = rec.read().await;
+        // DISP=1 blocks a put to any field except DISP itself
+        // (C: `precord->disp && pfield != &precord->disp` → S_db_putDisabled).
+        if instance.common.disp && field_upper != "DISP" {
+            return Err(CaError::PutDisabled(field_upper));
+        }
+        // Read-only / SPC_NOMOD field
+        // (C: `special == SPC_ATTRIBUTE` → S_db_noMod) — same `read_only`
+        // flag the Passive route checks, so all three modes gate uniformly.
+        let is_read_only = instance
+            .record
+            .field_list()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(&field_upper))
+            .is_some_and(|f| f.read_only);
+        if is_read_only {
+            return Err(CaError::ReadOnlyField(field_upper));
+        }
+        Ok(())
+    }
+
     async fn put_pv_inner(
         &self,
         name: &str,

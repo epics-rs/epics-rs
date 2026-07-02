@@ -455,6 +455,7 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
         // numeric scalar with no string target, so it takes the index form.
         E::EnumWithChoices { index, .. } => NDAttrValue::UInt16(*index),
         E::Char(v) => NDAttrValue::UInt8(*v),
+        E::UChar(v) => NDAttrValue::UInt8(*v),
         E::Long(v) => NDAttrValue::Int32(*v),
         E::Double(v) => NDAttrValue::Float64(*v),
         E::Int64(v) => NDAttrValue::Int64(*v),
@@ -477,6 +478,9 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int32(*v)),
         E::CharArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt8(*v)),
+        E::UCharArray(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt8(*v)),
         E::Int64Array(a) => a

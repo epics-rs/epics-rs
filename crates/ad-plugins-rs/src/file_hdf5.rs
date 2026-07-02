@@ -4813,10 +4813,30 @@ mod tests {
         writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
 
-        let file_size = std::fs::metadata(&path).unwrap().len();
+        // Assert compression by COMPARING against an uncompressed baseline of
+        // the same frame, not against a fixed byte threshold. Since rust-hdf5
+        // 0.2.25 the NeXus group string attributes (NX_class, …) are stored as
+        // variable-length UTF-8 in the global heap, so the file's constant
+        // metadata overhead now dwarfs this 8 KiB frame — an absolute
+        // "< 8192" check no longer reflects whether the data chunk was
+        // compressed (h5dump confirms the chunk itself is ~412 B, ~20:1).
+        // Writing the identical array uncompressed cancels that shared
+        // overhead, isolating the deflate saving on the data chunk.
+        let raw_path = temp_path("hdf5_deflate_raw");
+        {
+            let mut raw_writer = Hdf5Writer::new();
+            raw_writer.set_compression_type(COMPRESS_NONE);
+            raw_writer
+                .open_file(&raw_path, NDFileMode::Single, &arr)
+                .unwrap();
+            raw_writer.write_file(&arr).unwrap();
+            raw_writer.close_file().unwrap();
+        }
+        let compressed_size = std::fs::metadata(&path).unwrap().len();
+        let raw_size = std::fs::metadata(&raw_path).unwrap().len();
         assert!(
-            file_size < 8192,
-            "compressed file should be smaller than raw data"
+            compressed_size + 4096 < raw_size,
+            "deflate must shrink the data chunk: compressed={compressed_size} raw={raw_size}"
         );
 
         let h5file = H5File::open(&path).unwrap();

@@ -246,7 +246,7 @@ prior review confirmed three-way routing "faithful"
 precondition applies to all three routes.
 
 ### Q26: Read access-security enforced on GET/MONITOR, which pvxs QSRV2 single-source never applies
-Severity: Medium — CLEARED (disposition: KEEP the stricter Rust behavior)
+Severity: Medium — CLEARED (disposition: KEEP the stricter Rust behavior; user sign-off 2026-07-02)
 Disposition: KEEP Rust's `can_read` gate on group/single GET and monitor-create;
 no code change. Read access-security is a legitimate, long-standing EPICS control
 — classic RSRV (the CA server) enforces it via `asCheckGet`
@@ -625,11 +625,17 @@ Thematic clusters:
    pvxs throws (Q1); member annotations aren't type-coerced like the group-level
    ones (Q2).
 
-Dispositions requiring judgment (not blind parity fixes):
-- Q26 — reverse divergence (Rust read-gates QSRV where pvxs never does). Likely
-  keep (security-positive) + document; surface for sign-off.
-- Q14 — cross-crate structural (`DbFieldType` UChar). Assess scope; may be its
-  own change.
+Dispositions requiring judgment (not blind parity fixes) — RESOLVED
+(this list was written at Round 1; updated 2026-07-02):
+- Q26 — reverse divergence (Rust read-gates QSRV where pvxs never does).
+  **KEEP the stricter, security-positive behavior — user sign-off 2026-07-02.**
+  No code change; documented at the Q26 entry; reversible if exact pvxs
+  read-open parity is later required.
+- Q14 — cross-crate structural (`DbFieldType` UChar). **FIXED `11c8798e`**
+  (first-class `DbFieldType::UChar` served as unsigned `ubyte[]`); distinct
+  sibling (b) cleared as Q52. Sibling (a) USHORT/ULONG `reallocate_val`
+  collapse remains a separate tracked record-layer gap (1cdd4319), out of
+  Q14 scope.
 - Q15 — latent (AMSG unmodeled). Deferred until AMSG is modeled end-to-end.
 
 ### Round 2 (2026-07-01) — fix-verification pass (four opus panels)
@@ -763,3 +769,28 @@ clean.
 carrier rather than `UChar`/`UCharArray`. Benign today (the record re-coerces to
 its FTVL regardless), but a UCHAR inbound-decode cleanliness item for a later
 Q14/UCHAR pass.
+
+### Review closed — 2026-07-02
+
+QSRV parity review (Q1..Q52) closed. Rounds 1–3 converged with zero
+DEFECT/CONCERN (see the Round 3 section); every defect was FIXED and verified
+there. Workspace locked at close: `cargo clippy --workspace --all-targets
+-D warnings` clean and `cargo nextest run --workspace` 7420 passed / 0 failed.
+
+The two items left in the Round-1 "Dispositions requiring judgment" list are
+resolved by user sign-off (2026-07-02):
+
+- **Q26** (read-ACF gate stricter than pvxs QSRV2) — **KEEP** as
+  security-positive; no code change, reversible on explicit request.
+- **Q14** (UCHAR waveform served as signed `byte[]`) — already **FIXED
+  `11c8798e`**; no action owed.
+
+Deferred / tracked, documented and not blocking (reopen on demand):
+
+- **Q15** — `alarm.message` / AMSG latent, blocked on AMSG modeling in
+  epics-base-rs.
+- **Q50** — atomic-GET advisory gate does not cover DB-internal output-link
+  writes (symmetric with the deferred BR-R15 PUT-side twin).
+- Q14 sibling (a): USHORT/ULONG `reallocate_val` collapse (record-layer,
+  `1cdd4319`); and the inbound PUT-decode `UByte→Char` cleanliness backlog
+  item above.

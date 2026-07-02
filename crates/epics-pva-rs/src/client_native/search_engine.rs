@@ -4992,7 +4992,6 @@ mod tests {
             .await
             .expect("tx bind");
         let dest = SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
-        tx.send_to(&frame, dest).await.expect("send beacon");
 
         // Poll the tracker for up to ~2s — the engine processes the
         // beacon asynchronously. The tracker keys on the resolved
@@ -5005,8 +5004,18 @@ mod tests {
             0,
             0,
         ));
+        // Re-transmit the beacon on every poll iteration instead of once up
+        // front. A single UDP datagram over the v6 loopback is not
+        // guaranteed to arrive: CI runners drop occasional v6 loopback
+        // packets even when bind + multicast-group-join succeed (the sibling
+        // v6_beacon_socket_binds_and_joins_default_group test passes on the
+        // same runner where a one-shot send here timed out). Periodic re-send
+        // mirrors the real PVA beacon cadence and makes the recv-decode-track
+        // chain this test guards deterministic without masking a recv bug —
+        // if the v6 arm were broken, no number of re-sends would be observed.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let found_guid = loop {
+            tx.send_to(&frame, dest).await.expect("send beacon");
             if let Some(g) = engine.beacon_guid_for(resolved_server) {
                 break Some(g);
             }

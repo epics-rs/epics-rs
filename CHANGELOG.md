@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.20.4 — 2026-07-02
+
+Patch release: 511 commits on top of `v0.20.3`, one commit per finding
+(the `fix(...)` / `feat(...)` git log is the ledger) — 261 fixes and 58
+additive parity features, plus refactors and tests. No breaking public
+API changes (the new trait/method surface is additive). The sweep is
+dominated by an asyn device-support port (`asyn-rs`), a `base` record and
+device-support parity pass (`epics-base-rs`), and a full `procServ` port
+in `epics-tools-rs`, with further module-driver, gateway, and protocol
+fixes.
+
+### asyn (asyn-rs)
+
+Large asyn device-support and driver port:
+
+- **Octet family**: `asynOctetCmdResponse` (stringin/waveform/lsi write a
+  command then read the reply), `asynOctetWriteBinary` (waveform,
+  full-NORD bytes), `write_octet` returns bytes transferred, and a
+  per-record octet length cap threaded through `drv_user_create`.
+- **EOS interposition**: auto-install the EOS interpose on
+  `drvAsynIPPortConfigure` and the FTDI configure path, and route runtime
+  EOS through the `OctetInterpose` stack (DRV-2 family).
+- **Averaging / TimeSeries**: `asynInt32Average` / `asynFloat64Average`
+  device support, Average Mode 1 (I/O Intr SVAL-decimation), and
+  `devAsynXXXTimeSeries` waveform device support.
+- **Conversions**: `asynFloat64` ao ASLO/AOFF readback + write conversion.
+- **Serial / GPIB**: a Win32 serial backend, `drvAsynSerialPortConfigure`
+  and serial configure with default EOS, Prologix GPIB
+  (`prologixGPIBConfigure`, `AsynGpib`), and serial fd / byte counters in
+  `report()`.
+
+### base/db (epics-base-rs)
+
+Record and device-support parity:
+
+- **New records**: `permissive`, `state`, and the array `aCalcout` (with
+  ODLY delayed output); `scalcout` ODLY/DLYA output delay.
+- **Device support**: "Db State" (`devBiDbState` / `devBoDbState`), "Soft
+  Timestamp" (`devTimestamp.c`), and "stdio" (`devStdio.c`).
+- **Record fields / behaviour**: aSub EFLG / LFLG / SUBL / PREC / INAM,
+  ai SVAL, waveform RARM / BUSY TimeSeries control, aao OMSL=closed_loop
+  DOL array pull, LINR>=3 breakpoint-table linearisation for ai/ao, ao
+  raw→eng readback back-convert, swait OUT-write / OEVT deferral by ODLY,
+  OEVT output events for the calc-output family, and the `Q:form` info tag
+  wired into the display form index.
+
+### epics-tools (procServ)
+
+A full `procServ` port: command-key flags with caret notation, the
+control-endpoint surface (`-P` specs, interface bind, UNIX-socket
+permissions, abstract sockets), C-exact child-lifecycle and
+welcome-banner messages, `--coresize` / RLIMIT_CORE, `--killsig` / `-K`,
+`--noautorestart` / `--oneshot`, `-e` / `--exec`, `--logfile -` to stdout,
+the `PROCSERV_PID` default pidfile, `-d` / `-q` / `PROCSERV_DEBUG`, the
+C-faithful `-c` / `-I` / `-n` aliases, and the `-p` / `-P` swap to match C.
+
+### modules (modbus / mqtt / motor / optics / std)
+
+Driver and record parity fixes across `modbus-rs`, `mqtt-rs`, `motor-rs`,
+and `optics-rs`; `std-rs` throttle SYNC valueSync with OV/SIV
+classification (no spurious process on non-VAL puts).
+
+### bridge / qsrv
+
+QSRV and dual-gateway fixes (CA and PVA gateways, pvalink), including
+config-key precedence (CLI vs TOML on `clap` value source) and the
+GW-series shadow-metadata / reconnect convergence work.
+
+### pva / ca
+
+The `pvxsr` iocsh server-report command, `$SSLKEYLOGFILE` TLS secret
+logging, single-owner `ServerReport` assembly and `EpicsValue`↔PVA
+value-leaf mapping, and a v6-beacon loopback test deflake.
+
+### ad-plugins / ad-core
+
+`rust-hdf5` bumped `0.2.23` → `0.2.28`.
+
 ## v0.20.3 — 2026-06-22
 
 Patch release: 118 C-parity regression fixes plus 5 additive parity

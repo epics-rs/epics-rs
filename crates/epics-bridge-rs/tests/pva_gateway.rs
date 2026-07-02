@@ -1267,6 +1267,123 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
     h_pipe.abort();
 }
 
+/// GW-60 lock (system-level false-positive regression).
+///
+/// The gateway's per-PV upstream fan-out uses a bounded broadcast ring
+/// (`channel_cache.rs` `BROADCAST_CAPACITY`) that, read in isolation, drops
+/// the OLDEST frame when a downstream forwarder lags — which a parity review
+/// graded a wrong-data divergence from pvxs's coalesce-to-latest server queue.
+/// But every wire-facing gateway monitor flows through the `epics-pva-rs`
+/// server monitor queue (`tcp.rs` `push_squash_monitor`), which is sized to the
+/// client's `queueSize` and SQUASHES to the tail (newest) on overflow while
+/// eagerly draining the gateway source. End-to-end the client therefore
+/// converges to the latest value, matching pvxs.
+///
+/// This drives the FULL pipeline into the exact GW-60 condition: a slow,
+/// pipelined downstream consumer against a fast upstream burst. The slow
+/// consumer stops ACKing, the credit window closes, the server's `queueSize`
+/// `pending` fills and squashes, and the gateway source's broadcast ring laps
+/// behind it. The client must still converge to the FINAL posted value, and
+/// coalescing must actually have happened (fewer deliveries than posts). If the
+/// server squash regressed to drop-oldest, or a stale trailing frame leaked as
+/// the final delivery, `seen.last()` would not be the final post and this
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+    use epics_pva_rs::pv_request::PvRequestExpr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn extract_double(v: &PvField) -> Option<f64> {
+        if let PvField::Structure(s) = v {
+            for (name, f) in &s.fields {
+                if name == "value"
+                    && let PvField::Scalar(ScalarValue::Double(d)) = f
+                {
+                    return Some(*d);
+                }
+            }
+        }
+        None
+    }
+
+    let (_us, us_addr, us_pv) = spawn_upstream("GW:GW60:PV", 0.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let c = gw.client_config();
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let seen_cb = seen.clone();
+    let slow = Arc::new(AtomicBool::new(true));
+    let slow_cb = slow.clone();
+    let mask = MonitorEventMask::default();
+    // pipeline=true → DECODED path with a credit window; queueSize=4 is a small
+    // squash bound. A slow consumer starves the ACKs, closing the window so the
+    // server's `pending` overflows into its squash path and the gateway source
+    // broadcast ring laps behind it — the GW-60 condition end-to-end.
+    let req = PvRequestExpr::parse("record[pipeline=true,queueSize=4]").expect("parse pvRequest");
+    let h = tokio::spawn(async move {
+        let _ = c
+            .pvmonitor_events("GW:GW60:PV", Some(&req), mask, move |ev| {
+                if let MonitorEvent::Data { value, .. } = ev {
+                    if let Some(d) = extract_double(&value) {
+                        seen_cb.lock().unwrap().push(d);
+                    }
+                    // Slow consumer: delay each delivery so ACKs lag and the
+                    // server monitor queue overflows into its squash path.
+                    if slow_cb.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            })
+            .await;
+    });
+
+    // Subscription establishes; the seed (0.0) is delivered.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Fast burst, far faster than the 50 ms/event slow consumer ⟹ overflow.
+    const N: i64 = 80;
+    for i in 1..=N {
+        us_pv.try_post(nt_double_value(i as f64));
+    }
+
+    // Let the overflow build and the slow consumer chew the coalesced backlog,
+    // then stop slowing so it drains the squash queue down to the latest.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    slow.store(false, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let seen_final = seen.lock().unwrap().clone();
+    h.abort();
+
+    assert!(
+        !seen_final.is_empty(),
+        "the monitor must deliver at least the seed plus some updates"
+    );
+    // Convergence: the LAST value delivered is the final posted value. A
+    // drop-oldest ring that leaked a stale trailing frame as the final delivery
+    // would fail here.
+    assert_eq!(
+        seen_final.last().copied(),
+        Some(N as f64),
+        "slow pipelined downstream must converge to the latest posted value \
+         (GW-60): saw {seen_final:?}"
+    );
+    // Coalescing actually happened — the server squashed under overflow rather
+    // than delivering every post (seed 0.0 + coalesced updates ⟹ < N + 1).
+    assert!(
+        seen_final.len() < (N as usize),
+        "server must coalesce under overflow, not deliver every post: {} deliveries for {N} posts",
+        seen_final.len()
+    );
+}
+
 // ---------------------------------------------------------------------
 // PUT_GET leg: the gateway must forward a
 // downstream PUT_GET as ONE upstream PUT_GET — preserving the downstream

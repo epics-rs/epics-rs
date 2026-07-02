@@ -111,15 +111,17 @@ impl SyncIOHandle {
         })
     }
 
-    pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<()> {
+    /// Returns the number of bytes transferred (C `asynOctet::write`'s
+    /// `*nbytesTransfered`).
+    pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<usize> {
         let user = self.user(reason);
-        self.handle.submit_blocking(
+        let result = self.handle.submit_blocking(
             RequestOp::OctetWrite {
                 data: data.to_vec(),
             },
             user,
         )?;
-        Ok(())
+        Ok(result.nbytes)
     }
 
     pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {
@@ -186,7 +188,11 @@ impl SyncIOHandle {
     }
 
     pub fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
-        self.handle.drv_user_create_blocking(drv_info)
+        // Synchronous I/O binds at the port level (no per-record asyn addr); use
+        // addr 0 (C `getAddr` default) and surface only the shared reason.
+        self.handle
+            .drv_user_create_blocking(drv_info, 0)
+            .map(|info| info.reason)
     }
 }
 

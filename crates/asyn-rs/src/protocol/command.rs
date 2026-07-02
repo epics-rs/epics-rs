@@ -24,6 +24,10 @@ pub enum PortCommand {
     OctetWriteRead {
         data: Vec<u8>,
         buf_size: usize,
+        /// Flush the input buffer before the write (asynOctetSyncIO::writeRead)
+        /// vs raw write-then-read (devAsynOctet command-response). See
+        /// [`crate::request::RequestOp::OctetWriteRead`].
+        flush: bool,
     },
     /// Binary octet write with the driver's output EOS suppressed
     /// (asynRecord binary output, asynRecord.c:1528-1541).
@@ -111,6 +115,8 @@ pub enum PortCommand {
     UnblockProcess,
     DrvUserCreate {
         drv_info: String,
+        /// The record's asyn `addr` (C `drvUserCreate` `checkOffset` input).
+        addr: i32,
     },
     CallParamCallbacks {
         addr: i32,
@@ -158,6 +164,7 @@ mod tests {
             PortCommand::OctetWriteRead {
                 data: vec![4, 5],
                 buf_size: 128,
+                flush: true,
             },
             PortCommand::UInt32DigitalRead { mask: 0xFF },
             PortCommand::UInt32DigitalWrite {
@@ -191,6 +198,7 @@ mod tests {
             PortCommand::UnblockProcess,
             PortCommand::DrvUserCreate {
                 drv_info: "MOTOR_STATUS".into(),
+                addr: 0,
             },
             PortCommand::CallParamCallbacks { addr: 0 },
             PortCommand::GetOption { key: "baud".into() },

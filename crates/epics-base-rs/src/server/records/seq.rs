@@ -167,7 +167,10 @@ impl Default for SeqRecord {
         Self {
             val: 0,
             selm: 0,
-            seln: 0,
+            // C `seqRecord.dbd.pod` `field(SELN,DBF_USHORT){ initial("1") }`:
+            // an unset SELN defaults to 1, not 0. Only observable when the
+            // .db omits SELN and SELM is Specified/Mask (All ignores SELN).
+            seln: 1,
             sell: String::new(),
             offs: 0,
             // C `seqRecord.dbd.pod:287` `field(SHFT,DBF_SHORT){ initial("-1") }`:

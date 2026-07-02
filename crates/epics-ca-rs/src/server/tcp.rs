@@ -2039,17 +2039,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if hdr.actual_postsize() <= 1 {
                 return Ok(());
             }
-            // C `rsrv/camessage.c:1190-1199` `claim_ciu_action`
-            // unconditionally executes `client->minor_version_number
-            // = mp->m_available;` — the protocol comment is explicit:
-            // "The available field is used (abused) here to
-            // communicate the minor version number starting with
-            // CA 4.1". A client that handshakes v4.4 then upgrades on
-            // CREATE_CHAN to v4.13 gets the upgrade applied through
-            // this branch, which downstream `CA_V49` checks (extended-
-            // form headers for nElem >= 0xffff) then honour. Pre-fix
-            // Rust ignored `hdr.available` here, so a peer using the
-            // upgrade pattern saw truncated counts on large arrays.
+            // C `rsrv/camessage.c:1196` `claim_ciu_action` writes
+            // `client->minor_version_number = mp->m_available;`
+            // UNCONDITIONALLY, then rejects the channel outright if the
+            // result is below 4.4 (`if (!CA_V44(...)) return RSRV_ERROR;`).
+            // The protocol comment there is explicit: "The available field
+            // is used (abused) here to communicate the minor version number
+            // starting with CA 4.1. The field was set to zero prior to 4.1."
+            // So a conformant libca client always carries its true version
+            // in CREATE_CHAN `m_available` (== the VERSION `m_count` it
+            // already handshook), and for such a client this upgrade-only
+            // write is IDENTICAL to C's unconditional one — both leave the
+            // negotiated version in place. The two differ only for a
+            // non-conformant peer whose `m_available` is *lower* than the
+            // version it handshook, where C downgrades-then-rejects and we
+            // instead keep the handshook version; we deliberately do NOT
+            // copy C's downgrade+reject for that malformed case (see the
+            // 2026-07-01 R2-55 disposition). The upgrade path itself
+            // (v4.4 handshake → v4.13 CREATE_CHAN) is applied here, which
+            // downstream `CA_V49` extended-form framing (nElem >= 0xffff)
+            // then honours; pre-fix Rust ignored `hdr.available` entirely,
+            // so a peer using the upgrade pattern saw truncated large arrays.
             if (hdr.available as u16) > state.client_minor_version {
                 state.client_minor_version = hdr.available as u16;
             }

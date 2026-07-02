@@ -354,8 +354,8 @@ impl PortActor {
 
         let result = match op {
             RequestOp::OctetWrite { data } => {
-                self.driver.io_write_octet(user, data)?;
-                Ok(RequestResult::write_ok())
+                let n = self.driver.io_write_octet(user, data)?;
+                Ok(RequestResult::write_n(n))
             }
             RequestOp::OctetRead { buf_size } => {
                 let mut buf = vec![0u8; *buf_size];
@@ -373,8 +373,8 @@ impl PortActor {
                 self.driver.set_output_eos(&[])?;
                 let res = self.driver.io_write_octet(user, data);
                 let _ = self.driver.set_output_eos(&saved);
-                res?;
-                Ok(RequestResult::write_ok())
+                let n = res?;
+                Ok(RequestResult::write_n(n))
             }
             RequestOp::OctetReadBinary { buf_size } => {
                 // C parity: asynRecord binary input (asynRecord.c:1564-1577).
@@ -391,18 +391,28 @@ impl PortActor {
                 buf.truncate(n);
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
-            RequestOp::OctetWriteRead { data, buf_size } => {
-                // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
-                // does flush() → write() → read() under a single
-                // queueLockPort. The flush drains any stale bytes
-                // left in the driver's input buffer from a prior
-                // read so that the post-write read returns only the
-                // response to *this* command (e.g. echoes from a
-                // serial line, leftover prompts from a TCP device).
-                // Skipping the flush leaks pre-existing input into
-                // the response and breaks every command-response
-                // protocol when the line was warm.
-                self.driver.io_flush(user)?;
+            RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            } => {
+                // Two C patterns share this op, distinguished by `flush`:
+                //   flush=true  — asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
+                //     does flush() → write() → read() under a single
+                //     queueLockPort. The flush drains stale bytes left in the
+                //     driver's input buffer so the post-write read returns only
+                //     the response to *this* command (the StreamDevice /
+                //     asynRecord writeRead pattern).
+                //   flush=false — devAsynOctet command-response
+                //     (callbackSiCmdResponse, devAsynOctet.c:853-855) does plain
+                //     writeIt → readIt on the raw asynOctet interface with NO
+                //     flush, so the read returns whatever the device sends,
+                //     including bytes already on the warm line.
+                // Both run atomically here: the actor owns the port for the whole
+                // op, the queueLockPort equivalent.
+                if *flush {
+                    self.driver.io_flush(user)?;
+                }
                 self.driver.io_write_octet(user, data)?;
                 let mut buf = vec![0u8; *buf_size];
                 let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
@@ -584,9 +594,12 @@ impl PortActor {
                 }
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::DrvUserCreate { drv_info } => {
-                let reason = self.driver.drv_user_create(drv_info)?;
-                Ok(RequestResult::drv_user_create(reason))
+            RequestOp::DrvUserCreate { drv_info, addr } => {
+                let info = self.driver.drv_user_create(drv_info, *addr)?;
+                Ok(RequestResult::drv_user_create(
+                    info.reason,
+                    info.max_octet_len,
+                ))
             }
             RequestOp::EnumRead => {
                 // Carry the driver's enum table (strings/values/severities)
@@ -777,7 +790,15 @@ impl PortActor {
                 // /timeout) read returned clean (no INVALID, UDF-clearing).
                 let (alarm_status, alarm_severity) =
                     combine_read_alarm(status, alarm_status, alarm_severity);
-                return Ok(r.with_alarm(alarm_status, alarm_severity, ts));
+                // Carry the device read status (C pasynUser->auxStatus) to the
+                // device-support consumer so it can gate the value store the way
+                // C processAi does (store iff result.status == asynSuccess,
+                // devAsynInt32.c:848-855). Kept distinct from `status` (the
+                // op/request outcome) so the network reply path — which keys on
+                // `status` to emit an Error reply — is unaffected.
+                let mut out = r.with_alarm(alarm_status, alarm_severity, ts);
+                out.aux_status = status;
+                return Ok(out);
             }
         }
 
@@ -944,6 +965,15 @@ mod tests {
         assert_eq!(result.int_val, Some(5));
         assert_eq!(result.alarm_status, al::READ_ALARM);
         assert_eq!(result.alarm_severity, AlarmSeverity::Invalid as u16);
+        // The transport status is also carried as aux_status (distinct from the
+        // op-level `status`, which stays Success) so device support can gate the
+        // value store on it — C processAi (devAsynInt32.c:848-855).
+        assert_eq!(result.aux_status, AsynStatus::Error);
+        assert_eq!(
+            result.status,
+            AsynStatus::Success,
+            "op-level status stays Success so the network reply path is unaffected"
+        );
     }
 
     #[test]
@@ -1004,9 +1034,9 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 *self.write_eos.lock() = self.base().output_eos.clone();
-                Ok(())
+                Ok(data.len())
             }
             fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
                 *self.read_eos.lock() = self.base().input_eos.clone();
@@ -1111,10 +1141,10 @@ mod tests {
                 self.sequence.lock().push("flush");
                 Ok(())
             }
-            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 self.write_calls.fetch_add(1, Ordering::Relaxed);
                 self.sequence.lock().push("write");
-                Ok(())
+                Ok(data.len())
             }
             fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
                 self.sequence.lock().push("read");
@@ -1141,6 +1171,7 @@ mod tests {
             RequestOp::OctetWriteRead {
                 data: b"CMD".to_vec(),
                 buf_size: 16,
+                flush: true,
             },
             user,
         )

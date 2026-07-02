@@ -151,6 +151,29 @@ pub enum RecordProcessResult {
     /// Async pending, but notify these intermediate field changes immediately.
     /// Used by motor records to flush DMOV=0 before the move completes.
     AsyncPendingNotify(Vec<(String, EpicsValue)>),
+    /// Completed synchronously (PACT cleared, unlike `AsyncPending`), but the
+    /// record produced no new value to publish this cycle — the framework must
+    /// skip the value-publication epilogue (UDF clear / timestamp / monitor /
+    /// FLNK). C parity `compressRecord.c:365` `if (status != 1)`: a compress
+    /// record still accumulating toward its next compressed sample runs none of
+    /// `recGblGetTimeStamp` / `monitor` / `recGblFwdLink` on that cycle.
+    CompleteNoEmit,
+    /// Ran the value-publication epilogue NOW (UDF clear / timestamp / monitor —
+    /// VAL and the alarm fields are posted this cycle), but the OUTPUT side (OUT
+    /// link write / OEVT / forward link) is deferred to a scheduled
+    /// reprocess, with PACT held across the wait. C parity `swaitRecord.c::process`
+    /// (lines 425-481): when `schedOutput` arms the ODLY watchdog it sets
+    /// `async=TRUE`, so `process` still runs `monitor()` (line 475) — posting the
+    /// value side at the START of the delay — but skips the `if(!async)
+    /// {recGblFwdLink; pact=FALSE;}` tail; the deferred `execOutput` (watchdog,
+    /// at delay-END) does the OUT write + OEVT + forward link and posts no
+    /// monitors. Unlike the calcout/scalcout/acalcout family, whose C `process`
+    /// `return`s BEFORE `monitor()` (calcoutRecord.c:282, only `dlya` posted), so
+    /// they defer the value side too and use `AsyncPendingNotify`. The deferral
+    /// must carry a [`ProcessAction::ReprocessAfter`] — that scheduled reprocess
+    /// is the continuation that releases the held PACT (same by-construction
+    /// invariant as the `AsyncPendingNotify` ODLY defer).
+    CompleteDeferOutput,
 }
 
 /// Complete outcome of a record's process() call.
@@ -183,6 +206,17 @@ impl ProcessOutcome {
         Self {
             result: RecordProcessResult::Complete,
             actions,
+            device_did_compute: false,
+        }
+    }
+
+    /// Completed synchronously, but no new value was emitted this cycle, so
+    /// the framework skips the value-publication epilogue (UDF clear /
+    /// timestamp / monitor / FLNK). See `RecordProcessResult::CompleteNoEmit`.
+    pub fn complete_no_emit() -> Self {
+        Self {
+            result: RecordProcessResult::CompleteNoEmit,
+            actions: Vec::new(),
             device_did_compute: false,
         }
     }
@@ -399,18 +433,34 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
-    /// Field names declared `pp(TRUE)` in this record type's DBD, or
-    /// `None` if the type's pp-flags have not been modeled.
+    /// Field names declared `pp(TRUE)` in this record type's DBD (empty if
+    /// none, e.g. `event`/`histogram`, or if the type is unmodeled).
     ///
-    /// Drives the `dbPutField` processing gate: C
-    /// `dbAccess.c:1263` re-processes a record on a put only when the put
-    /// field is `PROC` or it is `pp(TRUE)` **and** `SCAN == Passive`. A
-    /// `None` return tells the put path to fall back to the legacy
-    /// "process on every put" behavior, so un-modeled record types keep
-    /// working unchanged. The default consults the central DBD-sourced
-    /// table keyed by [`Record::record_type`]; record types can override.
-    fn process_passive_fields(&self) -> Option<&'static [&'static str]> {
+    /// Drives the `dbPutField` processing gate: C `dbAccess.c:1263`
+    /// re-processes a record on a put only when the put field is `PROC` or it
+    /// is `pp(TRUE)` **and** `SCAN == Passive`. The table is total and
+    /// fail-safe — an unmodeled type returns `&[]` (and warns once), so its
+    /// field puts never auto-process (only `PROC` does). The default consults
+    /// the central DBD-sourced table keyed by [`Record::record_type`]; record
+    /// types can override.
+    fn process_passive_fields(&self) -> &'static [&'static str] {
         super::process_passive::pp_fields_for(self.record_type())
+    }
+
+    /// Whether a put to `field` should reprocess this Passive record.
+    ///
+    /// The default is pure `pp(TRUE)` membership — the put gate's
+    /// `field in process_passive_fields()` test. A record type overrides this
+    /// when its C `special()` conditionally returns ERROR to suppress the
+    /// reprocess for a `pp(TRUE)` field on certain values (e.g. motor STUP:
+    /// only a `STUP == ON` put runs the status-update process; any other value
+    /// is clamped to OFF and C returns ERROR so no process runs). Modeling that
+    /// here keeps the suppression at the same gate as the pp test, with no
+    /// per-put one-shot state — the post-clamp field value is deterministic.
+    fn processes_after_put(&self, field: &str) -> bool {
+        self.process_passive_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
     }
 
     /// Validate a put before it is applied. Return Err to reject.
@@ -480,6 +530,56 @@ pub trait Record: Send + Sync + 'static {
         self.set_val(value)
     }
 
+    /// Apply a raw device value read *back* from an output record's device
+    /// support (the asyn init seed and driver readback callback), the output
+    /// analogue of [`Record::apply_raw_input`]. An output record whose
+    /// `convert()` is forward (engineering → raw) must invert it here — store
+    /// the raw value into `RVAL` and compute the engineering `VAL` — because
+    /// the framework's forward convert would otherwise recompute `RVAL` from
+    /// the stale `VAL` and discard the readback (C `processAo`/`initAo` set
+    /// `rval`/`val` directly, devAsynInt32.c:955-957/:973-994).
+    ///
+    /// Returns `true` when the record fully produced `VAL` from the raw value
+    /// (the asyn store path then reports `computed` so the forward convert is
+    /// skipped). The default returns `false`: records whose own `convert()` is
+    /// already `raw → eng` (`ai`) or that need no conversion (`longout`,
+    /// `mbbo`, whose `set_val` re-derives from the raw value) keep the legacy
+    /// raw → `RVAL` / direct-`VAL` path.
+    fn apply_raw_readback(&mut self, _raw: i32) -> bool {
+        false
+    }
+
+    /// Apply a float64 device value read *back* from an output record's asyn
+    /// device support — the `asynFloat64` analogue of
+    /// [`Record::apply_raw_readback`]. A float64 output (`ao`) whose device
+    /// value carries an `ASLO`/`AOFF` linear scaling must seed the engineering
+    /// `VAL` here (`VAL = value * ASLO + AOFF`), because the asyn store path
+    /// would otherwise write the raw device value straight into `VAL` and drop
+    /// the scaling. Sets `VAL` only (a float64 `ao` carries no `RVAL`); the
+    /// reverse scaling `(OVAL - AOFF) / ASLO` is applied on the device-write
+    /// side. Mirrors C `initAo`/`processAo` (devAsynFloat64.c:627-629/:646-649).
+    ///
+    /// Returns `true` when the record produced `VAL` from the raw value (the
+    /// asyn store path then reports `computed`, skipping the forward convert).
+    /// The default returns `false`: records with no float64 readback scaling
+    /// keep the raw `set_val` path.
+    fn apply_float64_readback(&mut self, _raw: f64) -> bool {
+        false
+    }
+
+    /// Hand the record the database's breakpoint-table registry so an `ai`/`ao`
+    /// with `LINR >= 3` can resolve and cache the table its `LINR` selects.
+    /// Called once at iocInit, before the first `process`/`convert`. The record
+    /// resolves the table lazily on the first conversion (and re-resolves when
+    /// `LINR` changes at runtime), mirroring C `cvtRawToEngBpt`'s
+    /// `init || *ppbrk == NULL` cache. The default is a no-op: only `ai`/`ao`
+    /// carry `LINR`.
+    fn install_breaktable_registry(
+        &mut self,
+        _registry: std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>,
+    ) {
+    }
+
     /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
     /// IVOV value into whatever output staging field the OUT
     /// writeback consumes for this record type. Mirrors the
@@ -513,6 +613,7 @@ pub trait Record: Send + Sync + 'static {
                 | "mbboDirect"
                 | "stringout"
                 | "lso"
+                | "printf"
                 | "aao"
         )
     }
@@ -970,6 +1071,25 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Return the name of the output event (`OEVT`) to post this cycle, or
+    /// `None`. The event-subsystem twin of the OUT write: a downstream
+    /// `SCAN="Event"` / `EVNT="<name>"` record is woken each time the record
+    /// drives output. Mirrors C `calcout`/`sCalcout`/`aCalcout` `execOutput`,
+    /// which calls `postEvent(epvt)` / `post_event(oevt)` immediately after
+    /// `writeValue` in every OUT-driving branch.
+    ///
+    /// The override MUST fold in the record's own output-fire decision
+    /// (`should_output()` for `calcout`; the cached OOPT/calc-fail/ODLY
+    /// decision for `sCalcout`/`aCalcout`) and return `None` when output did
+    /// not fire or when `OEVT` is unset. The framework adds the only gate the
+    /// record cannot see — the IVOA `Don't_drive` veto on an INVALID cycle —
+    /// so the post fires on exactly the cycles the OUT write does. Numeric
+    /// `OEVT` (DBF_USHORT) stringifies to match the `EVNT` ingest; a string
+    /// `OEVT` (DBF_STRING) is the event name verbatim.
+    fn output_event(&self) -> Option<String> {
+        None
+    }
+
     /// Internal field write that bypasses read-only checks.
     /// Used by the framework to write values from ReadDbLink actions
     /// into fields that are normally read-only (e.g., epid.CVAL).
@@ -1146,5 +1266,13 @@ pub trait Record: Send + Sync + 'static {
     }
 }
 
-/// Subroutine function type for sub records.
-pub type SubroutineFn = Box<dyn Fn(&mut dyn Record) -> CaResult<()> + Send + Sync>;
+/// Subroutine function type for `sub`/`aSub` records.
+///
+/// The return value is the subroutine's C `long` status
+/// (`subRecord.c::do_sub` / `aSubRecord.c::do_sub`): `< 0` raises
+/// `SOFT_ALARM` at the record's `BRSV` severity, and for `aSub` the status
+/// is published as `VAL` (`aSubRecord.c:223`). Return `Ok(0)` for the
+/// normal no-alarm path. `Err(..)` is reserved for an infrastructure
+/// failure inside the closure (e.g. a field write error), which aborts
+/// processing — it is distinct from a negative status.
+pub type SubroutineFn = Box<dyn Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync>;

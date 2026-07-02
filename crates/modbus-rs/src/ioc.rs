@@ -12,10 +12,14 @@
 //! - `modbusInterposeConfig` records a link type for an octet port;
 //!   `drvModbusAsynConfigure` creates the driver and its poller.
 //!
-//! Per the confirmed `drvUser` model, the C `pasynUser->drvUser` per-record
-//! `{dataType, len}` struct has no asyn-rs equivalent: the data type is
-//! encoded in the reason and the optional `=N` string length is dropped — a
-//! string record's length comes from its own record buffer (`NELM`).
+//! The C `pasynUser->drvUser` per-record `{dataType, len}` struct maps onto two
+//! asyn-rs channels: the data type is encoded in the reason, and the optional
+//! `=N` string length is returned from `drv_user_create` as the per-record
+//! octet cap (`DrvUserInfo::max_octet_len`), which the binding applies to its
+//! octet buffer length — the asyn-rs analogue of C `getStringLen` capping the
+//! asyn octet `maxLen`. The `=N` suffix is validated as C does: it is legal
+//! only for the eight string types and must be a non-negative integer, so an
+//! invalid `drvInfo` fails record init rather than being silently accepted.
 //!
 //! # Absolute addressing
 //!
@@ -29,13 +33,18 @@
 //! of indexing the polled buffer; `poll_cycle` is a no-op and the periodic
 //! poller is not spawned.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::param::ParamType;
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::interfaces::InterfaceType;
+use asyn_rs::interpose::EomReason;
+use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::sync_io::SyncIOHandle;
@@ -80,6 +89,43 @@ fn to_asyn(e: ModbusError) -> AsynError {
     }
 }
 
+/// Decode a poller register block (from a record's offset to the block end)
+/// into an int32 array — the relative-mode decode of [`Ioc::read_int32_array`],
+/// one element per `register_count` registers. Mirrors C `readPoller`'s
+/// `for (i=0; offset<modbusLength_; i++) readPlcInt32(...)` array fan-out
+/// (drvModbusAsyn.cpp:1840-1843). A malformed element decode aborts the poll.
+fn decode_block_int32(dt: ModbusDataType, regs: &[u16]) -> AsynResult<Vec<i32>> {
+    let rc = dt.register_count().max(1);
+    let mut out = Vec::with_capacity(regs.len() / rc);
+    let mut n = 0;
+    while (n + 1) * rc <= regs.len() {
+        out.push(
+            datatype::read_int32(dt, &regs[n * rc..])
+                .map_err(to_asyn)?
+                .0,
+        );
+        n += 1;
+    }
+    Ok(out)
+}
+
+/// Float64 twin of [`decode_block_int32`] (C `readPlcFloat` fan-out,
+/// drvModbusAsyn.cpp:1875-1878).
+fn decode_block_float64(dt: ModbusDataType, regs: &[u16]) -> AsynResult<Vec<f64>> {
+    let rc = dt.register_count().max(1);
+    let mut out = Vec::with_capacity(regs.len() / rc);
+    let mut n = 0;
+    while (n + 1) * rc <= regs.len() {
+        out.push(
+            datatype::read_float(dt, &regs[n * rc..])
+                .map_err(to_asyn)?
+                .0,
+        );
+        n += 1;
+    }
+    Ok(out)
+}
+
 /// Whether a Modbus function may carry a record *array* write. C
 /// `writeInt32Array`/`writeFloat64Array` (drvModbusAsyn.cpp:1398-1428 /
 /// 1230-...) switch only on `MODBUS_WRITE_MULTIPLE_COILS` and
@@ -104,19 +150,51 @@ fn is_array_write_function(function: ModbusFunctionCode) -> bool {
 /// interpose required).
 pub struct SyncIoTransport {
     handle: SyncIOHandle,
+    /// Slept before each frame write, mirroring C's pre-write
+    /// `epicsThreadSleep(writeDelay)` (`modbusInterpose.c:246`); zero disables
+    /// it. Needed by slow serial PLCs that require an inter-frame gap.
+    write_delay: Duration,
 }
 
 impl SyncIoTransport {
-    /// Wrap a sync-I/O handle to the underlying octet port.
+    /// Wrap a sync-I/O handle to the underlying octet port, with no pre-write
+    /// delay (the `modbusInterposeConfig writeDelayMsec` default).
     pub fn new(handle: SyncIOHandle) -> Self {
-        Self { handle }
+        Self::with_write_delay(handle, Duration::ZERO)
+    }
+
+    /// Wrap a sync-I/O handle with an explicit pre-write delay
+    /// (C `modbusInterposeConfig writeDelayMsec`).
+    pub fn with_write_delay(handle: SyncIOHandle, write_delay: Duration) -> Self {
+        Self {
+            handle,
+            write_delay,
+        }
     }
 }
 
 impl OctetTransport for SyncIoTransport {
     fn write_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
+        // C sleeps before every write (modbusInterpose.c:246); the modbus
+        // driver runs on a blocking sync-I/O thread (the same one that blocks
+        // in `write_octet`/`read_octet`), so a blocking sleep here matches
+        // `epicsThreadSleep` without stalling the async executor.
+        if !self.write_delay.is_zero() {
+            std::thread::sleep(self.write_delay);
+        }
         self.handle
             .write_octet(0, data)
+            .map(|_| ())
+            .map_err(|e| ModbusError::Io(e.to_string()))
+    }
+
+    fn resend_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
+        // UDP retransmit after a read failure: C resends via the raw octet
+        // write (modbusInterpose.c:358), bypassing writeIt's pre-write
+        // epicsThreadSleep(writeDelay) (:246). No pacing delay on a retransmit.
+        self.handle
+            .write_octet(0, data)
+            .map(|_| ())
             .map_err(|e| ModbusError::Io(e.to_string()))
     }
 
@@ -144,10 +222,6 @@ pub struct ModbusPortDriver {
     /// `reason` index → the data type it represents (`None` for non-data
     /// params such as the statistics counters).
     reason_to_datatype: Vec<Option<ModbusDataType>>,
-    /// `(reason, addr)` pairs touched by a record — discovered on first
-    /// access, then refreshed every poll. Replaces the C `interruptStart`
-    /// client enumeration.
-    active: HashSet<(usize, i32)>,
     /// reason of the `MODBUS_READ` trigger parameter.
     read_reason: usize,
     /// reasons of the statistics parameters.
@@ -161,6 +235,21 @@ pub struct ModbusPortDriver {
     read_histogram_reason: usize,
     histogram_bin_reason: usize,
     histogram_axis_reason: usize,
+    /// reason of the POLL_DELAY control parameter.
+    poll_delay_reason: usize,
+    /// Live poll period in milliseconds, shared with the poller task so a
+    /// runtime POLL_DELAY write retunes it (C `pollDelay_`).
+    poll_delay: Arc<AtomicU64>,
+    /// Wakes the poller when POLL_DELAY changes so the new period takes effect
+    /// immediately, not after the current sleep (C `readPollerEventId_`).
+    poll_wake: Arc<Notify>,
+    /// Previous poll's register block — the baseline for the on-change gate
+    /// (C `prevData`, drvModbusAsyn.cpp:1612/1934). Empty until the first poll.
+    prev_data: Vec<u16>,
+    /// Force the next successful poll's on-change callbacks regardless of
+    /// whether the data changed (C `forceCallback_`, :331/1654). Set for the
+    /// first cycle and after an I/O error; cleared at each cycle end (:1928).
+    force_callback: bool,
 }
 
 impl ModbusPortDriver {
@@ -219,7 +308,7 @@ impl ModbusPortDriver {
         let io_errors_reason = base.create_param(PARAM_IO_ERRORS, ParamType::Int32)?;
         let last_io_reason = base.create_param(PARAM_LAST_IO_TIME, ParamType::Int32)?;
         let max_io_reason = base.create_param(PARAM_MAX_IO_TIME, ParamType::Int32)?;
-        base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
+        let poll_delay_reason = base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
         let enable_histogram_reason =
             base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
         let read_histogram_reason =
@@ -241,12 +330,13 @@ impl ModbusPortDriver {
             base.set_int32_param(r, 0, 0)?;
         }
 
+        let poll_delay_ms = engine.config().poll_delay.as_millis() as u64;
+
         Ok(Self {
             base,
             engine,
             transport,
             reason_to_datatype,
-            active: HashSet::new(),
             read_reason,
             read_ok_reason,
             write_ok_reason,
@@ -257,6 +347,14 @@ impl ModbusPortDriver {
             read_histogram_reason,
             histogram_bin_reason,
             histogram_axis_reason,
+            poll_delay_reason,
+            poll_delay: Arc::new(AtomicU64::new(poll_delay_ms)),
+            poll_wake: Arc::new(Notify::new()),
+            prev_data: Vec::new(),
+            // C sets forceCallback_ = true when the read-poller thread is
+            // created (drvModbusAsyn.cpp:331), so the first cycle fires every
+            // interface unconditionally.
+            force_callback: true,
         })
     }
 
@@ -271,11 +369,6 @@ impl ModbusPortDriver {
                 status: AsynStatus::Error,
                 message: format!("reason {reason} is not a Modbus data parameter"),
             })
-    }
-
-    /// Register bits of a record on first access so the poller refreshes it.
-    fn touch(&mut self, reason: usize, addr: i32) {
-        self.active.insert((reason, addr));
     }
 
     /// Modbus address for `offset`, relative to the configured start address.
@@ -320,18 +413,33 @@ impl ModbusPortDriver {
     /// `absoluteAddressing_` read branch shared by every read accessor.
     fn read_absolute_words(&mut self, addr: i32, count: usize) -> AsynResult<Vec<u16>> {
         let function = self.absolute_read_function()?;
-        self.engine
-            .read_absolute(self.transport.as_mut(), function, addr, count)
-            .map_err(to_asyn)
+        let result = self
+            .engine
+            .read_absolute(self.transport.as_mut(), function, addr, count);
+        // C `doModbusIO` setIntegerParams the statistics counters inline on
+        // every I/O — success OR failure — before it returns
+        // (drvModbusAsyn.cpp:2206/2214/2255/2279/2301). The relative-mode
+        // poller publishes them via `poll_cycle`, but an absolute-addressing
+        // port has no poller (`poll_cycle` early-returns), so the per-record
+        // read is the only place an I/O happens. Publish here too, or the
+        // statistics records read 0 forever (R50).
+        self.publish_stats()?;
+        result.map_err(to_asyn)
     }
 
     /// Absolute-mode per-record write: issue one Modbus request carrying
     /// `regs` at the wire address `addr` with the configured write function.
     fn write_absolute_regs(&mut self, addr: i32, regs: &[u16]) -> AsynResult<()> {
         let function = self.engine.config().function;
-        self.engine
-            .write_absolute(self.transport.as_mut(), function, addr, regs)
-            .map_err(to_asyn)
+        let result = self
+            .engine
+            .write_absolute(self.transport.as_mut(), function, addr, regs);
+        // Publish the statistics counters after the I/O, same as the read
+        // path — C `doModbusIO` setIntegerParams them inline on every write
+        // too (drvModbusAsyn.cpp:2326/2334/2341), and the absolute-mode write
+        // has no poller to publish them otherwise (R50).
+        self.publish_stats()?;
+        result.map_err(to_asyn)
     }
 
     /// One acquisition cycle: read all registers, refresh every touched
@@ -346,47 +454,221 @@ impl ModbusPortDriver {
         if !self.engine.config().function.is_read() {
             return Ok(());
         }
+        // Single finalizer for the abort => recover invariant. Any error after
+        // the poll begins — the engine read, a mid-loop decode, or the stats
+        // publish — aborts the cycle WITHOUT advancing the on-change baseline, so
+        // the next cycle must be forced (C sets forceCallback_ on an I/O-status
+        // transition, drvModbusAsyn.cpp:1654). `run_poll_cycle` clears
+        // force_callback and advances prev_data only when the cycle fully
+        // completes (C :1928/1934); every Err path re-arms the force here, in one
+        // place, so no mid-loop `?` can leave the baseline frozen with the force
+        // cleared.
+        match self.run_poll_cycle() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.force_callback = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// The fallible body of one poll cycle: read the register block, fire every
+    /// bound interface (on-change gated per C `readPoller`), publish statistics,
+    /// and — only on full success — advance the on-change baseline (`prev_data`)
+    /// and clear the one-shot `force_callback`. Any `Err` leaves both untouched
+    /// so [`poll_cycle`](Self::poll_cycle) re-arms recovery.
+    fn run_poll_cycle(&mut self) -> AsynResult<()> {
         self.engine.poll(self.transport.as_mut()).map_err(to_asyn)?;
 
-        let active: Vec<(usize, i32)> = self.active.iter().copied().collect();
-        let mut addrs: HashSet<i32> = HashSet::new();
-        for (reason, addr) in active {
+        // On-change gate, mirroring C `readPoller`. int32/int64/float64 and
+        // float64Array fire every cycle (ADC averaging, drvModbusAsyn.cpp:
+        // 1714/1858); uInt32Digital (:1700, per-offset masked change),
+        // int32Array (:1824) and octet (:1893) fire only on `forceCallback_ ||
+        // anyChanged`. `anyChanged` is the port-wide block compare (memcmp
+        // data_ vs prevData, :1658); `force` covers the first cycle and
+        // post-I/O-error recovery (:331/1654).
+        let force = self.force_callback;
+        let any_changed = self.prev_data.as_slice() != self.engine.data();
+        let port_gate = force || any_changed;
+
+        // Fire every record on the interrupt list, exactly like C `readPoller`
+        // (drvModbusAsyn.cpp:1600-1928), which walks the per-interface interrupt
+        // lists populated at `registerInterruptUser` — independent of whether
+        // the record was ever read. The interrupt registry is the single owner
+        // of "which records want a fire"; the driver keeps no parallel set
+        // seeded by reads. A read-seeded `active` set left every `SCAN="I/O
+        // Intr"` record dead, since such a record never reads on its own — its
+        // first (and every) value must come from the poller's fire.
+        for (reason, addr) in self.base.interrupts.subscribed_bindings() {
             let Ok(dt) = self.datatype_of(reason) else {
                 continue;
             };
-            // Defense-in-depth: an out-of-range `addr` must never index the
-            // engine buffer. Accessors check the offset before `touch`, so
-            // `self.active` should hold only valid addrs — but a bad addr
-            // here is skipped, not allowed to panic.
+            // Defense-in-depth: a subscriber may bind an out-of-range `addr`
+            // (the registry does not range-check offsets); it must never index
+            // the engine buffer. A bad addr here is skipped, not allowed to
+            // panic.
             let data = self.engine.data();
             if addr < 0 || addr as usize >= data.len() {
                 continue;
             }
             let regs = &data[addr as usize..];
             if dt.is_string() {
-                let (bytes, _) =
-                    datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
-                let s = String::from_utf8_lossy(&bytes).into_owned();
-                self.base.set_string_param(reason, addr, s)?;
+                // C gates the octet interrupt list on `forceCallback_ ||
+                // anyChanged` (port-wide change, drvModbusAsyn.cpp:1893) and
+                // skips even the `readPlcString` when nothing changed. asynOctet
+                // records are the sole subscribers for a string offset
+                // (:1894-1921), so a single typed fire suffices.
+                if port_gate {
+                    let (bytes, _) =
+                        datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
+                    let s = String::from_utf8_lossy(&bytes).into_owned();
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::Octet,
+                        ParamValue::Octet(s),
+                        0,
+                    );
+                }
             } else {
-                let (v, _) = datatype::read_float(dt, regs).map_err(to_asyn)?;
-                self.base.set_float64_param(reason, addr, v)?;
+                // C `readPoller` decodes the SAME register block separately per
+                // scalar interface and fires each interface's own interrupt list
+                // (drvModbusAsyn.cpp:1736 int32 / 1772 int64 / 1808 float64 / 1706
+                // uInt32Digital). One Modbus offset can be bound at once by an
+                // asynInt32 ai (ESLO convert), an asynInt64 int64in, an
+                // asynFloat64 ai (ASLO/SMOO), and an asynUInt32Digital bi (mask),
+                // each needing the value in its own type — collapsing to one
+                // Float64 (the old path) delivered a wrong-typed value to all but
+                // the asynFloat64 record. Decode all up front so a mid-decode
+                // error aborts the poll before any partial fire; the interrupt
+                // iface filter routes each tagged value to only its interface's
+                // records.
+                let i32v = datatype::read_int32(dt, regs).map_err(to_asyn)?.0;
+                let i64v = datatype::read_int64(dt, regs).map_err(to_asyn)?.0;
+                let f64v = datatype::read_float(dt, regs).map_err(to_asyn)?.0;
+                // Raw register word for UInt32Digital; the record applies its own
+                // @asynMask via `apply_raw_readback`, matching the polled
+                // `read_uint32_digital` which delivers the unmasked word.
+                let word = regs.first().copied().unwrap_or(0) as u32;
+                // Array interfaces: C `readPoller` decodes the SAME register
+                // block from the record's offset to `modbusLength_` and fires the
+                // array interrupt lists — int32Array (drvModbusAsyn.cpp:1840-1851)
+                // and float64Array (:1875-1886) — so an asynInt32ArrayIn /
+                // asynFloat64ArrayIn waveform on `SCAN="I/O Intr"` updates every
+                // frame. Decode the whole block once per array interface a record
+                // is bound to; the subscriber-presence gate skips the decode when
+                // no array record exists, mirroring C iterating an empty interrupt
+                // list (the per-element `readPlcInt32`/`readPlcFloat` loop never
+                // runs). The waveform consumer caps the array at its NELM. Decode
+                // up front with the scalars so a mid-decode error aborts the poll
+                // before any partial fire.
+                //
+                // int32Array fires on `forceCallback_ || anyChanged` (port-wide
+                // change, drvModbusAsyn.cpp:1824); float64Array fires every cycle
+                // (ADC averaging, :1857). The `has_subscriber` gate skips the
+                // whole-block decode when no array record is bound, mirroring C
+                // iterating an empty interrupt list (the per-element
+                // `readPlcInt32`/`readPlcFloat` loop never runs).
+                let int32_array = if port_gate
+                    && self
+                        .base
+                        .interrupts
+                        .has_subscriber(reason, addr, InterfaceType::Int32Array)
+                {
+                    Some(decode_block_int32(dt, regs)?)
+                } else {
+                    None
+                };
+                let float64_array = if self.base.interrupts.has_subscriber(
+                    reason,
+                    addr,
+                    InterfaceType::Float64Array,
+                ) {
+                    Some(decode_block_float64(dt, regs)?)
+                } else {
+                    None
+                };
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Int32,
+                    ParamValue::Int32(i32v),
+                    0,
+                );
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Int64,
+                    ParamValue::Int64(i64v),
+                    0,
+                );
+                self.base.notify_interface_value(
+                    reason,
+                    addr,
+                    InterfaceType::Float64,
+                    ParamValue::Float64(f64v),
+                    0,
+                );
+                // C fires uInt32Digital only on a per-offset masked change
+                // (`forceCallback_ || (newValue & mask != prevValue & mask)`,
+                // drvModbusAsyn.cpp:1695-1707). The asyn interrupt filter applies
+                // the same gate: a subscriber with `@asynMask` M passes iff
+                // `uint32_changed_mask & M != 0` (interrupt.rs `matches`;
+                // asynPortDriver.cpp:720). So pass the actually-changed bits
+                // `word ^ prev_word` as the changed mask — equivalent to C's
+                // per-subscriber `(new ^ prev) & mask` test — and skip the fire
+                // entirely when the offset's word is unchanged. `force` (first
+                // cycle / post-I/O-error) passes `!0` so every subscriber fires
+                // regardless, matching C `forceCallback_`.
+                let prev_word = self.prev_data.get(addr as usize).copied().unwrap_or(0) as u32;
+                let changed_bits = word ^ prev_word;
+                if force || changed_bits != 0 {
+                    let changed_mask = if force { !0 } else { changed_bits };
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::UInt32Digital,
+                        ParamValue::UInt32Digital(word),
+                        changed_mask,
+                    );
+                }
+                if let Some(arr) = int32_array {
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::Int32Array,
+                        ParamValue::Int32Array(arr.into()),
+                        0,
+                    );
+                }
+                if let Some(arr) = float64_array {
+                    self.base.notify_interface_value(
+                        reason,
+                        addr,
+                        InterfaceType::Float64Array,
+                        ParamValue::Float64Array(arr.into()),
+                        0,
+                    );
+                }
             }
-            self.base.mark_param_changed(reason, addr)?;
-            addrs.insert(addr);
         }
         self.publish_stats()?;
-        // The statistics/control params are all set at asyn addr 0 (their
-        // `statistics.template` records bind `@asyn($(PORT) 0)`). Their
-        // changed-param list lives in addr 0's bucket, so flush addr 0 every
-        // cycle regardless of whether a data record happens to sit there —
-        // otherwise the statistics monitors never post.
+        // The statistics/control params are set at asyn addr 0 (their
+        // `statistics.template` records bind `@asyn($(PORT) 0)`) and still flow
+        // through the param-cache callback path — they are single-interface
+        // control values, not per-interface data points. Flush addr 0 every
+        // cycle so the statistics monitors post.
         self.base.call_param_callbacks(0)?;
-        for addr in addrs {
-            if addr != 0 {
-                self.base.call_param_callbacks(addr)?;
-            }
-        }
+
+        // Cycle fully completed: advance the on-change baseline and clear the
+        // one-shot force flag (C drvModbusAsyn.cpp:1928/1934). This is the LAST
+        // statement, reached only on full success — any earlier `?` (engine
+        // poll, a per-offset decode, or the stats publish) leaves `prev_data`
+        // and `force_callback` untouched, so `poll_cycle` re-arms the force and
+        // the next clean cycle recovers instead of freezing the baseline.
+        let snapshot: Vec<u16> = self.engine.data().to_vec();
+        self.prev_data = snapshot;
+        self.force_callback = false;
         Ok(())
     }
 
@@ -484,6 +766,39 @@ impl ModbusPortDriver {
     }
 }
 
+/// Parse a drvUser `=N` string-length suffix the way C does
+/// (drvModbusAsyn.cpp:398-404): `strtol(suffix, &endptr, 0)` then reject if
+/// `endptr[0] != '\0'` (trailing junk) or the value is negative. Base 0 means
+/// `0x`/`0X` → hex, a leading `0` → octal, otherwise decimal. An empty suffix
+/// (`TYPE=`) parses as 0, which C accepts. Returns the parsed non-negative
+/// length, or `None` if C would reject the suffix. The caller stashes the
+/// length as the per-record octet cap (C `drvUser->len`).
+fn parse_drvuser_string_len(suffix: &str) -> Option<i64> {
+    // C `strtol` skips leading whitespace and honours a leading sign; a real
+    // drvInfo carries neither, but mirror the accept set so parity holds.
+    let s = suffix.trim_start_matches([' ', '\t']);
+    if s.is_empty() {
+        // `strtol("")` returns 0 with `endptr` at the terminator → C accepts.
+        return Some(0);
+    }
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let value = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        i64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse::<i64>().ok()?
+    };
+    let value = if negative { -value } else { value };
+    (value >= 0).then_some(value)
+}
+
 impl PortDriver for ModbusPortDriver {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -493,13 +808,74 @@ impl PortDriver for ModbusPortDriver {
         &mut self.base
     }
 
-    fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
-        // Everything after a '=' is the optional string length — parsed and
-        // dropped (see the module docs).
-        let base_info = drv_info.split('=').next().unwrap_or(drv_info).trim();
-        self.base
+    fn drv_user_create(&mut self, drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
+        // C `drvUserCreate` (drvModbusAsyn.cpp:368-433) strips everything after
+        // the first '=' to resolve the data-type name, then validates the
+        // optional `=N` string-length suffix: it is legal ONLY for the eight
+        // string types (`strtol` base 0, non-negative); a non-string type with
+        // a suffix, or a garbage/negative length, is rejected with `asynError`
+        // (:399-412). A valid length is stashed as the per-record octet cap
+        // (C `modbusDrvUser_t.len`); `getStringLen` later caps the asyn octet
+        // `maxLen` to it (:2367-2377), which the binding applies to its octet
+        // buffer length at init.
+        let mut parts = drv_info.splitn(2, '=');
+        let base_info = parts.next().unwrap_or(drv_info).trim();
+        let suffix = parts.next();
+        let reason = self
+            .base
             .find_param(base_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))
+            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+        let datatype = self.reason_to_datatype.get(reason).copied().flatten();
+        if datatype.is_some() {
+            // C runs `getAddr` + `checkOffset` ONLY inside the data-type-match
+            // branch (:378-384), before the suffix switch; a non-data drvInfo
+            // (statistics/control) falls through to the base class with no offset
+            // check. Reject an out-of-range offset here at bind so the record
+            // fails init instead of binding and alarming on every I/O.
+            self.engine.check_offset(addr).map_err(to_asyn)?;
+        }
+        let mut max_octet_len = None;
+        if let Some(suffix) = suffix {
+            let is_string = datatype.is_some_and(|dt| dt.is_string());
+            if !is_string {
+                // C: the `=` length suffix is invalid for a non-string type.
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("invalid drvUser (length suffix on non-string): {drv_info}"),
+                });
+            }
+            match parse_drvuser_string_len(suffix) {
+                // C stores the parsed length in `drvUser->len`; it is `>= 0`
+                // here (the parser rejects negatives), so the cap is exact.
+                Some(len) => max_octet_len = Some(len as usize),
+                None => {
+                    // C: `strtol` base 0 with the `endptr[0] != '\0' || len < 0`
+                    // guard rejects garbage or a negative length.
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("invalid string length: {suffix}"),
+                    });
+                }
+            }
+        }
+        Ok(DrvUserInfo {
+            reason,
+            max_octet_len,
+        })
+    }
+
+    fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+        // C `connect` (drvModbusAsyn.cpp:455-467) validates the register offset
+        // (the asyn `addr`) against the addressing-mode bounds and returns
+        // `asynError` for an out-of-range offset, so a misconfigured record
+        // fails to connect instead of connecting and alarming on every I/O
+        // (R52). modbus is a multi-device port, so `connect_addr` is the
+        // per-`addr` connect the framework drives; reject before marking the
+        // address connected. The bounds are the same `check_offset` enforces
+        // per I/O (absolute `0..=0xFFFF`, relative `0..length`).
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.base.connect_addr(user.addr);
+        Ok(())
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
@@ -520,7 +896,6 @@ impl PortDriver for ModbusPortDriver {
             let regs = self.read_absolute_words(user.addr, 2)?;
             return Ok(datatype::read_int32(dt, &regs).map_err(to_asyn)?.0);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int32(dt, regs).map_err(to_asyn)?.0)
     }
@@ -537,7 +912,6 @@ impl PortDriver for ModbusPortDriver {
             let regs = self.read_absolute_words(user.addr, 4)?;
             return Ok(datatype::read_int64(dt, &regs).map_err(to_asyn)?.0);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_int64(dt, regs).map_err(to_asyn)?.0)
     }
@@ -554,7 +928,6 @@ impl PortDriver for ModbusPortDriver {
             let regs = self.read_absolute_words(user.addr, 4)?;
             return Ok(datatype::read_float(dt, &regs).map_err(to_asyn)?.0);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         Ok(datatype::read_float(dt, regs).map_err(to_asyn)?.0)
     }
@@ -579,7 +952,6 @@ impl PortDriver for ModbusPortDriver {
             let raw = regs.first().copied().unwrap_or(0) as u32;
             return Ok(if mask == 0 { raw } else { raw & mask });
         }
-        self.touch(user.reason, user.addr);
         let raw = self.engine.data()[user.addr as usize] as u32;
         Ok(if mask == 0 { raw } else { raw & mask })
     }
@@ -607,13 +979,28 @@ impl PortDriver for ModbusPortDriver {
             buf[..n].copy_from_slice(&bytes[..n]);
             return Ok(n);
         }
-        self.touch(user.reason, user.addr);
         let regs = &self.engine.data()[user.addr as usize..];
         // String length comes from the record buffer (`NELM`).
         let (bytes, _) = datatype::read_string(dt, regs, buf.len()).map_err(to_asyn)?;
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
+    }
+
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        // C `readOctet` sets `*eomReason = ASYN_EOM_CNT` on every successful
+        // P_Data read (drvModbusAsyn.cpp:1480), and the poller octet callback
+        // passes `ASYN_EOM_CNT` too (:1921): a register-snapshot read is always
+        // a complete logical message, never a stream fragment. The generic
+        // `PortDriver::io_read_octet_eom` only synthesises `CNT` when the buffer
+        // fills, so a modbus string shorter than the record buffer would lose
+        // the flag. Override to flag every successful read complete.
+        let n = self.read_octet(user, buf)?;
+        Ok((n, EomReason::CNT))
     }
 
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
@@ -668,6 +1055,26 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
+        // C `readFloat64Array` serves the diagnostic histogram arrays too
+        // (drvModbusAsyn.cpp:1181-1191), exactly like `readInt32Array`
+        // (:1350-1360) — an aai/waveform with FTVL=DOUBLE binding to
+        // READ_HISTOGRAM / HISTOGRAM_TIME_AXIS must work, not just the LONG one.
+        if user.reason == self.read_histogram_reason {
+            let h = &self.engine.stats.histogram;
+            let n = h.len().min(buf.len());
+            for (slot, &v) in buf[..n].iter_mut().zip(h) {
+                *slot = v as f64;
+            }
+            return Ok(n);
+        }
+        if user.reason == self.histogram_axis_reason {
+            let bin = self.engine.stats.histogram_ms_per_bin.max(1) as f64;
+            let n = crate::driver::HISTOGRAM_LENGTH.min(buf.len());
+            for (i, slot) in buf[..n].iter_mut().enumerate() {
+                *slot = i as f64 * bin;
+            }
+            return Ok(n);
+        }
         let dt = self.datatype_of(user.reason)?;
         let rc = dt.register_count().max(1);
         // Absolute mode: per-record read at the wire address (see
@@ -783,7 +1190,13 @@ impl PortDriver for ModbusPortDriver {
         }
         // HISTOGRAM_BIN_TIME sets the histogram bin width.
         if user.reason == self.histogram_bin_reason {
+            // C `writeInt32` (drvModbusAsyn.cpp:794-803): set the bin width
+            // (clamp <1 to 1), then erase the existing counts — the old counts
+            // no longer map to the rebinned widths. (C also rebuilds the time
+            // axis; here the axis is recomputed on demand in read_int32_array /
+            // read_float64_array, so only the count erase is needed.)
             self.engine.stats.histogram_ms_per_bin = value.max(1) as u32;
+            self.engine.stats.clear_histogram();
             return Ok(());
         }
         let dt = self.datatype_of(user.reason)?;
@@ -802,6 +1215,18 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        // POLL_DELAY retunes the read poller's period at runtime. C
+        // `writeFloat64` (drvModbusAsyn.cpp:1094-1099) sets `pollDelay_` and
+        // signals the poller event. The `ao` writes seconds; store the period
+        // in milliseconds and wake the poller so the new period takes effect
+        // immediately rather than after the current sleep. Checked before
+        // `datatype_of`, which would otherwise reject this non-data reason.
+        if user.reason == self.poll_delay_reason {
+            let ms = (value * 1000.0).max(0.0) as u64;
+            self.poll_delay.store(ms, Ordering::Relaxed);
+            self.poll_wake.notify_one();
+            return Ok(());
+        }
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_float(dt, value).map_err(to_asyn)?;
@@ -817,7 +1242,15 @@ impl PortDriver for ModbusPortDriver {
     ) -> AsynResult<()> {
         // ENABLE_HISTOGRAM toggles read-time histogram accumulation.
         if user.reason == self.enable_histogram_reason {
-            self.engine.stats.histogram_enabled = value != 0;
+            // C `writeUInt32Digital` (drvModbusAsyn.cpp:633-641): on an OFF→ON
+            // transition, erase the existing counts before enabling so a
+            // re-enable starts clean. A no-op when already enabled or on
+            // disable.
+            let enabling = value != 0;
+            if enabling && !self.engine.stats.histogram_enabled {
+                self.engine.stats.clear_histogram();
+            }
+            self.engine.stats.histogram_enabled = enabling;
             return Ok(());
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -876,7 +1309,7 @@ impl PortDriver for ModbusPortDriver {
         Ok(())
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let dt = self.datatype_of(user.reason)?;
         // C `writeOctet` (drvModbusAsyn.cpp:1545-1562) accepts only the
         // write-multiple-registers functions; any other function returns
@@ -924,7 +1357,7 @@ impl PortDriver for ModbusPortDriver {
         } else {
             data
         };
-        let (regs, _) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
+        let (regs, consumed) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
         // Relative mode caches the value and fans out its monitor (see
         // `cache_write_numeric`); absolute mode has no parameter-table slot
@@ -934,7 +1367,11 @@ impl PortDriver for ModbusPortDriver {
             self.base.set_string_param(user.reason, user.addr, s)?;
             self.base.call_param_callbacks(user.addr)?;
         }
-        Ok(())
+        // Bytes transferred = caller chars written, capped by the register
+        // budget and excluding the appended NUL terminator for Z-strings
+        // (C `writeOctet` reports the character count, not the NUL,
+        // drvModbusAsyn.cpp:1519-1529).
+        Ok(consumed.min(data.len()))
     }
 }
 
@@ -942,26 +1379,50 @@ impl PortDriver for ModbusPortDriver {
 // iocsh commands
 // ---------------------------------------------------------------------------
 
-/// Link types declared by `modbusInterposeConfig`, keyed by octet port name,
-/// consumed by `drvModbusAsynConfigure`.
-static PENDING_LINKS: Mutex<Option<HashMap<String, LinkType>>> = Mutex::new(None);
+/// The settings declared by `modbusInterposeConfig` for one octet port: the
+/// Modbus link type, the I/O timeout, and the pre-write delay. C stores these
+/// on the interpose `modbusPvt` (`modbusInterpose.c:83-85`).
+#[derive(Clone, Copy)]
+struct InterposeSettings {
+    link: LinkType,
+    /// Applied to each transport read/write (C `pasynUser->timeout`,
+    /// `modbusInterpose.c:248/337`); `READ_TIMEOUT` when unset (C `DEFAULT_TIMEOUT`).
+    timeout: Duration,
+    /// Slept before each frame write (C `epicsThreadSleep(writeDelay)`,
+    /// `modbusInterpose.c:246`); zero disables it.
+    write_delay: Duration,
+}
+
+impl Default for InterposeSettings {
+    fn default() -> Self {
+        Self {
+            link: LinkType::Tcp,
+            timeout: crate::driver::READ_TIMEOUT,
+            write_delay: Duration::ZERO,
+        }
+    }
+}
+
+/// Interpose settings declared by `modbusInterposeConfig`, keyed by octet port
+/// name, consumed by `drvModbusAsynConfigure`.
+static PENDING_LINKS: Mutex<Option<HashMap<String, InterposeSettings>>> = Mutex::new(None);
 
 /// Port runtime handles — dropping one shuts the actor down, so they are kept.
 static PORT_RUNTIMES: Mutex<Option<Vec<PortRuntimeHandle>>> = Mutex::new(None);
 
-fn record_link(octet_port: &str, link: LinkType) {
+fn record_interpose(octet_port: &str, settings: InterposeSettings) {
     let mut g = PENDING_LINKS.lock().unwrap();
     g.get_or_insert_with(HashMap::new)
-        .insert(octet_port.to_string(), link);
+        .insert(octet_port.to_string(), settings);
 }
 
-fn take_link(octet_port: &str) -> LinkType {
+fn take_interpose(octet_port: &str) -> InterposeSettings {
     PENDING_LINKS
         .lock()
         .unwrap()
         .as_ref()
         .and_then(|m| m.get(octet_port).copied())
-        .unwrap_or(LinkType::Tcp)
+        .unwrap_or_default()
 }
 
 fn keep_runtime(handle: PortRuntimeHandle) {
@@ -999,21 +1460,51 @@ pub fn modbus_interpose_config_command() -> CommandDef {
         ],
         "modbusInterposeConfig portName linkType timeoutMsec writeDelayMsec",
         |args: &[ArgValue], _ctx: &CommandContext| -> CommandResult {
-            let port = match &args[0] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("portName required".into()),
-            };
-            let link = match &args[1] {
-                ArgValue::Int(v) => {
-                    LinkType::from_i32(*v as i32).ok_or_else(|| format!("invalid link type {v}"))?
-                }
-                _ => return Err("linkType required".into()),
-            };
-            record_link(&port, link);
-            println!("modbusInterposeConfig: octet port '{port}' link={link:?}");
+            let (port, settings) = parse_interpose_args(args)?;
+            record_interpose(&port, settings);
+            println!(
+                "modbusInterposeConfig: octet port '{port}' link={:?} \
+                 timeout={:?} write_delay={:?}",
+                settings.link, settings.timeout, settings.write_delay
+            );
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// Parse the `modbusInterposeConfig portName linkType timeoutMsec
+/// writeDelayMsec` arguments into the octet port name and its
+/// [`InterposeSettings`]. Mirrors C `modbusInterposeConfig`
+/// (modbusInterpose.c:134-136): the timeout is `timeoutMsec/1000`, falling
+/// back to `DEFAULT_TIMEOUT` (2 s = `READ_TIMEOUT`) when 0/unset; the write
+/// delay is `writeDelayMsec/1000`, zero when 0/unset.
+fn parse_interpose_args(args: &[ArgValue]) -> Result<(String, InterposeSettings), String> {
+    let port = match args.first() {
+        Some(ArgValue::String(s)) => s.clone(),
+        _ => return Err("portName required".into()),
+    };
+    let link = match args.get(1) {
+        Some(ArgValue::Int(v)) => {
+            LinkType::from_i32(*v as i32).ok_or_else(|| format!("invalid link type {v}"))?
+        }
+        _ => return Err("linkType required".into()),
+    };
+    let timeout = match args.get(2) {
+        Some(ArgValue::Int(v)) if *v > 0 => Duration::from_millis(*v as u64),
+        _ => crate::driver::READ_TIMEOUT,
+    };
+    let write_delay = match args.get(3) {
+        Some(ArgValue::Int(v)) if *v > 0 => Duration::from_millis(*v as u64),
+        _ => Duration::ZERO,
+    };
+    Ok((
+        port,
+        InterposeSettings {
+            link,
+            timeout,
+            write_delay,
+        },
+    ))
 }
 
 /// `drvModbusAsynConfigure portName octetPortName slave function startAddr
@@ -1137,8 +1628,9 @@ impl CommandHandler for ModbusConfigHandler {
     fn call(&self, args: &[ArgValue], _ctx: &CommandContext) -> CommandResult {
         let (port_name, octet_port, config) =
             parse_configure_args(args).map_err(|e| e.to_string())?;
-        let link = take_link(&octet_port);
-        let poll_delay = config.poll_delay;
+        let interpose = take_interpose(&octet_port);
+        let link = interpose.link;
+        let initial_poll_delay = config.poll_delay;
         // The read poller is started only for a relative-addressing read port.
         // An absolute-addressing port has no poller (drvModbusAsyn.cpp:1121,
         // `if (absoluteAddressing_) needReadThread = 0;`) — each record reads
@@ -1148,12 +1640,23 @@ impl CommandHandler for ModbusConfigHandler {
         // Find the underlying octet port and build the framed transport.
         let entry = asyn_rs::asyn_record::get_port(&octet_port)
             .ok_or_else(|| format!("octet port '{octet_port}' not found"))?;
-        let sync = SyncIOHandle::from_handle(entry.handle.clone(), 0, crate::driver::READ_TIMEOUT);
-        let transport = Box::new(SyncIoTransport::new(sync));
+        // The configured timeout (C `modbusInterposeConfig timeoutMsec`) drives
+        // both the underlying read and write; the write delay is applied by the
+        // transport before each frame write (R53).
+        let sync = SyncIOHandle::from_handle(entry.handle.clone(), 0, interpose.timeout);
+        let transport = Box::new(SyncIoTransport::with_write_delay(
+            sync,
+            interpose.write_delay,
+        ));
 
         let driver = ModbusPortDriver::new(&port_name, config, link, transport)
             .map_err(|e| e.to_string())?;
         let read_reason = driver.read_reason;
+        // Cloned before the driver moves into the runtime: the poller reads the
+        // live period from the shared atomic each cycle and the wake lets a
+        // POLL_DELAY write interrupt the current sleep (R46).
+        let poll_delay = driver.poll_delay.clone();
+        let poll_wake = driver.poll_wake.clone();
 
         let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime.port_handle().clone();
@@ -1164,11 +1667,17 @@ impl CommandHandler for ModbusConfigHandler {
 
         // Spawn the read poller — periodically triggers a poll cycle by
         // writing the MODBUS_READ parameter. Port of the `readPoller` thread.
-        if needs_poller && !poll_delay.is_zero() {
+        if needs_poller && !initial_poll_delay.is_zero() {
             let poller_handle = port_handle.clone();
             self.handle.spawn(async move {
                 loop {
-                    tokio::time::sleep(poll_delay).await;
+                    // Read the live period each cycle so a runtime POLL_DELAY
+                    // write retunes it. A wake (POLL_DELAY changed) ends the
+                    // wait early — C signals readPollerEventId_ and re-waits
+                    // with the new pollDelay_ — then we re-read the period.
+                    let ms = poll_delay.load(Ordering::Relaxed);
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(ms), poll_wake.notified()).await;
                     if poller_handle.write_int32(read_reason, 0, 1).await.is_err() {
                         break;
                     }
@@ -1288,6 +1797,196 @@ mod tests {
         assert!(driver.is_absolute());
     }
 
+    /// R51: the drvUser `=N` suffix is validated as C does — legal only for
+    /// the eight string types, where it must be a non-negative integer
+    /// (`strtol` base 0). A bare type, a valid string length, hex, and an empty
+    /// suffix resolve; garbage, a negative length, and any suffix on a
+    /// non-string type are rejected so record init fails (drvModbusAsyn.cpp
+    /// :387-412).
+    #[test]
+    fn drv_user_create_validates_string_length_suffix() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_DRVUSER",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        // Accepted.
+        assert!(driver.drv_user_create("STRING_HIGH", 0).is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=5", 0).is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=0x10", 0).is_ok());
+        assert!(driver.drv_user_create("STRING_HIGH=010", 0).is_ok());
+        assert!(
+            driver.drv_user_create("STRING_HIGH=", 0).is_ok(),
+            "empty length parses as 0, which C accepts"
+        );
+        assert!(driver.drv_user_create("INT16", 0).is_ok());
+        // Rejected: garbage / negative length on a string type.
+        assert!(driver.drv_user_create("STRING_HIGH=abc", 0).is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=5x", 0).is_err());
+        assert!(driver.drv_user_create("STRING_HIGH=-3", 0).is_err());
+        // Rejected: a length suffix on a non-string type.
+        assert!(driver.drv_user_create("INT16=5", 0).is_err());
+        assert!(driver.drv_user_create("UINT16=0", 0).is_err());
+        // Still rejected: an unknown type name.
+        assert!(driver.drv_user_create("NOPE", 0).is_err());
+    }
+
+    /// R52: `connect_addr` rejects an out-of-range register offset (the asyn
+    /// `addr`), mirroring C `connect` (drvModbusAsyn.cpp:455-467) which returns
+    /// `asynError` so a misconfigured record fails to connect rather than
+    /// connecting and alarming on every I/O.
+    #[test]
+    fn connect_addr_rejects_out_of_range_offset() {
+        // Relative mode: valid offsets are 0..length (here 16).
+        let mut relative = ModbusPortDriver::new(
+            "MB_CONN_REL",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        assert!(
+            relative
+                .connect_addr(&AsynUser::new(0).with_addr(5))
+                .is_ok()
+        );
+        assert!(
+            relative
+                .connect_addr(&AsynUser::new(0).with_addr(16))
+                .is_err(),
+            "offset == length is out of range in relative mode"
+        );
+        assert!(
+            relative
+                .connect_addr(&AsynUser::new(0).with_addr(99))
+                .is_err()
+        );
+
+        // Absolute mode: the full 16-bit wire range 0..=0xFFFF is valid.
+        let mut absolute = ModbusPortDriver::new(
+            "MB_CONN_ABS",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("absolute config must build");
+        assert!(absolute.is_absolute());
+        assert!(
+            absolute
+                .connect_addr(&AsynUser::new(0).with_addr(0xFFFF))
+                .is_ok(),
+            "0xFFFF is the top of the absolute wire range"
+        );
+        assert!(
+            absolute
+                .connect_addr(&AsynUser::new(0).with_addr(0x1_0000))
+                .is_err(),
+            "0x10000 is one past the 16-bit wire range"
+        );
+    }
+
+    /// A data-type drvInfo with an out-of-range register offset (the asyn
+    /// `addr`) fails at `drv_user_create` (record bind), mirroring C
+    /// `drvUserCreate` (drvModbusAsyn.cpp:378-384) which runs `getAddr` +
+    /// `checkOffset` inside the data-type branch and returns `asynError`, so a
+    /// misconfigured record fails init rather than alarming on every I/O. A
+    /// non-data (statistics) drvInfo skips the check, as C falls through to the
+    /// base class with no offset validation (:433).
+    #[test]
+    fn drv_user_create_rejects_out_of_range_offset_for_data_reason() {
+        // Relative mode: valid offsets are 0..length (here 16).
+        let mut driver = ModbusPortDriver::new(
+            "MB_DU_OFF",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        // In-range data offset binds.
+        assert!(driver.drv_user_create("INT16", 5).is_ok());
+        // Out-of-range data offset fails at bind, not per-I/O.
+        assert!(
+            driver.drv_user_create("INT16", 16).is_err(),
+            "offset == length is out of range in relative mode"
+        );
+        assert!(driver.drv_user_create("INT16", 99).is_err());
+        // A non-data (statistics) reason carries no offset → C skips
+        // `checkOffset`, so an out-of-range addr must NOT reject it.
+        assert!(
+            driver.drv_user_create("READ_OK", 99).is_ok(),
+            "statistics params fall through to the base class with no offset check"
+        );
+    }
+
+    /// A valid `TYPE=N` suffix on a string type yields the per-record octet cap
+    /// (C `drvUser->len`, consumed by `getStringLen`); no suffix yields no cap;
+    /// `TYPE=` yields 0 (C accepts `strtol("")` == 0). A non-string type never
+    /// carries a cap.
+    #[test]
+    fn drv_user_create_returns_octet_len_cap() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_DU_CAP",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH=5", 0)
+                .unwrap()
+                .max_octet_len,
+            Some(5)
+        );
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH=0x10", 0)
+                .unwrap()
+                .max_octet_len,
+            Some(16)
+        );
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH", 0)
+                .unwrap()
+                .max_octet_len,
+            None,
+            "no suffix → no cap (C leaves drvUser->len at -1)"
+        );
+        assert_eq!(
+            driver
+                .drv_user_create("STRING_HIGH=", 0)
+                .unwrap()
+                .max_octet_len,
+            Some(0),
+            "TYPE= caps to 0 (C strtol(\"\") == 0)"
+        );
+        assert_eq!(
+            driver.drv_user_create("INT16", 0).unwrap().max_octet_len,
+            None,
+            "a non-string type never carries an octet cap"
+        );
+    }
+
+    /// Unit-level coverage of the `strtol` base-0 accept/reject set the
+    /// drvUser validator depends on (drvModbusAsyn.cpp:398-404).
+    #[test]
+    fn parse_drvuser_string_len_matches_strtol_base0() {
+        assert_eq!(parse_drvuser_string_len("5"), Some(5));
+        assert_eq!(parse_drvuser_string_len("0"), Some(0));
+        assert_eq!(parse_drvuser_string_len(""), Some(0));
+        assert_eq!(parse_drvuser_string_len("0x10"), Some(16));
+        assert_eq!(parse_drvuser_string_len("0X1f"), Some(31));
+        assert_eq!(parse_drvuser_string_len("010"), Some(8)); // octal
+        assert_eq!(parse_drvuser_string_len("+7"), Some(7));
+        assert_eq!(parse_drvuser_string_len("abc"), None);
+        assert_eq!(parse_drvuser_string_len("5x"), None);
+        assert_eq!(parse_drvuser_string_len("-3"), None);
+        assert_eq!(parse_drvuser_string_len("-"), None);
+    }
+
     /// Absolute-mode `read_int32`: the record's asyn `addr` is the absolute
     /// wire address; the accessor issues an individual Modbus request there
     /// and decodes the response — no shared polled buffer is consulted.
@@ -1316,12 +2015,201 @@ mod tests {
             .read_int32(&user)
             .expect("absolute read must succeed");
         assert_eq!(v, 0xBEEF);
-        // No periodic poller in absolute mode, so the read must not register
-        // the record in the `active` set.
-        assert!(
-            driver.active.is_empty(),
-            "absolute reads must not touch the poller `active` set"
+    }
+
+    /// R50: an absolute-addressing port has no poller, so the statistics
+    /// counters were only ever published from `poll_cycle` and read 0 forever.
+    /// C `doModbusIO` setIntegerParams them inline on every I/O
+    /// (drvModbusAsyn.cpp:2255/2279/2301), so the per-record absolute read must
+    /// publish them too. After one successful absolute read, READ_OK must be 1
+    /// and IO_ERRORS 0.
+    #[test]
+    fn absolute_read_publishes_statistics() {
+        let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_STATS",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("absolute config must build");
+        let data_reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(data_reason);
+        user.addr = 0x2710;
+        driver
+            .read_int32(&user)
+            .expect("absolute read must succeed");
+
+        // The statistics longins read their params (asyn addr 0) on scan.
+        let read_ok_reason = driver.base.find_param(PARAM_READ_OK).unwrap();
+        let io_errors_reason = driver.base.find_param(PARAM_IO_ERRORS).unwrap();
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(read_ok_reason)).unwrap(),
+            1,
+            "READ_OK must be published after an absolute read (R50)"
         );
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(io_errors_reason)).unwrap(),
+            0,
+        );
+    }
+
+    /// R50 error path: C setIntegerParams P_IOErrors inside `doModbusIO` on a
+    /// transport failure *before* it returns the error (drvModbusAsyn.cpp:
+    /// 2206), so a failed absolute read must still publish IO_ERRORS = 1.
+    #[test]
+    fn absolute_read_failure_publishes_io_errors() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_STATS_ERR",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Err(ModbusError::Timeout)])),
+        )
+        .expect("absolute config must build");
+        let data_reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(data_reason);
+        user.addr = 0x2710;
+        driver
+            .read_int32(&user)
+            .expect_err("a timed-out absolute read must fail");
+
+        let io_errors_reason = driver.base.find_param(PARAM_IO_ERRORS).unwrap();
+        let read_ok_reason = driver.base.find_param(PARAM_READ_OK).unwrap();
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(io_errors_reason)).unwrap(),
+            1,
+            "IO_ERRORS must be published even on a failed absolute read (R50)"
+        );
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(read_ok_reason)).unwrap(),
+            0,
+        );
+    }
+
+    /// R47: re-enabling the histogram (OFF→ON) must erase stale counts first
+    /// (C drvModbusAsyn.cpp:633-641). Disabling, or re-asserting ENABLE while
+    /// already on, must NOT clear.
+    #[test]
+    fn enable_histogram_rising_edge_clears_counts() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_HIST_EN",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        let reason = driver.base.find_param(PARAM_ENABLE_HISTOGRAM).unwrap();
+        let mut user = AsynUser::new(reason);
+
+        // Enable, then stash a count as if an I/O had been timed.
+        driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
+        driver.engine.stats.histogram[3] = 5;
+        // Re-asserting ENABLE while already on must NOT clear (no rising edge).
+        driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
+        assert_eq!(driver.engine.stats.histogram[3], 5);
+        // Disabling must NOT clear (C clears only on the OFF→ON edge).
+        driver.write_uint32_digital(&mut user, 0, 0xFFFF).unwrap();
+        assert_eq!(driver.engine.stats.histogram[3], 5);
+        // OFF→ON re-enable must erase the stale count.
+        driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
+        assert_eq!(driver.engine.stats.histogram[3], 0);
+        assert!(driver.engine.stats.histogram_enabled);
+    }
+
+    /// R48: changing HISTOGRAM_BIN_TIME must set the (clamped) bin width and
+    /// erase the existing counts, which no longer map to the new bins
+    /// (C drvModbusAsyn.cpp:794-803).
+    #[test]
+    fn histogram_bin_time_change_clears_counts() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_HIST_BIN",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        let reason = driver.base.find_param(PARAM_HISTOGRAM_BIN_TIME).unwrap();
+        let mut user = AsynUser::new(reason);
+        driver.engine.stats.histogram[7] = 9;
+
+        driver.write_int32(&mut user, 5).unwrap();
+        assert_eq!(driver.engine.stats.histogram_ms_per_bin, 5);
+        assert_eq!(driver.engine.stats.histogram[7], 0, "counts must be erased");
+
+        // A value below 1 clamps to 1 (C `if (histogramMsPerBin_ < 1) = 1`).
+        driver.engine.stats.histogram[7] = 4;
+        driver.write_int32(&mut user, 0).unwrap();
+        assert_eq!(driver.engine.stats.histogram_ms_per_bin, 1);
+        assert_eq!(driver.engine.stats.histogram[7], 0);
+    }
+
+    /// R49: READ_HISTOGRAM and HISTOGRAM_TIME_AXIS must serve a Float64 array
+    /// binding (aai/waveform FTVL=DOUBLE), not only the LONG path — C
+    /// `readFloat64Array` serves both (drvModbusAsyn.cpp:1181-1191).
+    #[test]
+    fn read_float64_array_serves_histogram() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_HIST_F64",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        driver.engine.stats.histogram_ms_per_bin = 4;
+        driver.engine.stats.histogram[0] = 11;
+        driver.engine.stats.histogram[2] = 22;
+
+        let hist_reason = driver.base.find_param(PARAM_READ_HISTOGRAM).unwrap();
+        let axis_reason = driver.base.find_param(PARAM_HISTOGRAM_TIME_AXIS).unwrap();
+
+        let mut hbuf = [0.0f64; 5];
+        let n = driver
+            .read_float64_array(&AsynUser::new(hist_reason), &mut hbuf)
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(hbuf[0], 11.0);
+        assert_eq!(hbuf[2], 22.0);
+
+        let mut abuf = [0.0f64; 5];
+        let n = driver
+            .read_float64_array(&AsynUser::new(axis_reason), &mut abuf)
+            .unwrap();
+        assert_eq!(n, 5);
+        // axis[i] = i * bin, bin = 4.
+        assert_eq!(abuf, [0.0, 4.0, 8.0, 12.0, 16.0]);
+    }
+
+    /// R46: a POLL_DELAY write (the poll_delay.template `ao`, in seconds) must
+    /// succeed and retune the live poll period, not error out through
+    /// `datatype_of`. C `writeFloat64` sets `pollDelay_` and signals the poller
+    /// (drvModbusAsyn.cpp:1094-1099).
+    #[test]
+    fn poll_delay_write_retunes_period() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_POLL_DELAY",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        // Initial period seeded from test_config = 100 ms.
+        assert_eq!(driver.poll_delay.load(Ordering::Relaxed), 100);
+        let reason = driver.base.find_param(PARAM_POLL_DELAY).unwrap();
+        let mut user = AsynUser::new(reason);
+        // 2.5 s -> 2500 ms; the write must succeed (not a WRITE/INVALID alarm).
+        driver
+            .write_float64(&mut user, 2.5)
+            .expect("POLL_DELAY write must succeed");
+        assert_eq!(driver.poll_delay.load(Ordering::Relaxed), 2500);
+        // A negative value clamps to 0.
+        driver.write_float64(&mut user, -1.0).unwrap();
+        assert_eq!(driver.poll_delay.load(Ordering::Relaxed), 0);
     }
 
     /// Absolute-mode `read_octet` for a single-byte string encoding
@@ -1372,6 +2260,47 @@ mod tests {
             &[0x01, 0x03, 0x30, 0x00, 0x00, 0x0A],
             "request must target wire addr 0x3000 with a 10-register count"
         );
+    }
+
+    /// `io_read_octet_eom` must report `ASYN_EOM_CNT` even when the decoded
+    /// string is SHORTER than the record buffer — mirroring C `readOctet`
+    /// (drvModbusAsyn.cpp:1480) which sets `*eomReason = ASYN_EOM_CNT`
+    /// unconditionally. The generic `PortDriver` synthesis would return `empty`
+    /// here because the buffer did not fill (R55).
+    #[test]
+    fn read_octet_eom_always_flags_cnt_for_short_string() {
+        // High bytes spell "ABCD\0FGHIJ": the embedded NUL truncates the
+        // decoded string to 4 chars, well under the 10-char buffer.
+        let chars = b"ABCD\0FGHIJ";
+        let mut pdu = vec![0x01u8, 0x03, (chars.len() * 2) as u8];
+        for &c in chars {
+            pdu.push(c); // high byte = char (StringHigh)
+            pdu.push(0x00); // low byte unused
+        }
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let mut cfg = test_config(-1, 64);
+        cfg.data_type = ModbusDataType::StringHigh;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_STR_EOM", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x3000;
+        let mut buf = [0u8; 10];
+        let (n, eom) = driver
+            .io_read_octet_eom(&user, &mut buf)
+            .expect("absolute octet read must succeed");
+        assert_eq!(n, 4, "string truncates at the embedded NUL to 4 chars");
+        assert!(n < buf.len(), "test must exercise the not-full-buffer case");
+        assert_eq!(
+            eom,
+            EomReason::CNT,
+            "modbus octet read must always flag ASYN_EOM_CNT (R55)"
+        );
+        assert_eq!(&buf[..4], b"ABCD");
     }
 
     /// Absolute-mode `read_int32` issues a fixed-length request of
@@ -2129,22 +3058,14 @@ mod tests {
         assert!(driver.write_float64(&mut wuser, 1.0).is_err());
         assert!(driver.write_uint32_digital(&mut wuser, 1, 0).is_err());
         assert!(driver.write_octet(&mut wuser, b"hi").is_err());
-
-        // A failed out-of-range access must never register the bad addr —
-        // otherwise the next poll cycle would index the engine buffer out of
-        // bounds and panic.
-        assert!(
-            !driver.active.iter().any(|&(_, a)| a == 100),
-            "out-of-range addr must not be registered in `active`"
-        );
     }
 
-    /// After failed out-of-range reads and writes, `poll_cycle` must iterate
-    /// `self.active` without panicking on a stale out-of-range addr. Guards
-    /// against the touch-before-check regression where a bad addr was
-    /// inserted into `active` and later indexed the engine buffer unchecked.
+    /// A subscriber may bind an out-of-range offset (the interrupt registry
+    /// does not range-check). `poll_cycle` walks the subscriber bindings, so it
+    /// must skip such a binding via its bounds guard instead of indexing the
+    /// engine buffer out of bounds and panicking.
     #[test]
-    fn poll_cycle_after_failed_out_of_range_access_does_not_panic() {
+    fn poll_cycle_skips_out_of_range_subscriber_binding_without_panic() {
         // ReadHoldingRegisters response for the 4-word buffer: slave 1, fc 3,
         // byte_count 8, four zero registers. The engine's first poll expects
         // TCP transaction id 1.
@@ -2161,29 +3082,31 @@ mod tests {
             .find_param(ModbusDataType::UInt16.as_str())
             .expect("UINT16 parameter must exist");
 
-        // Out-of-range read on the 4-word buffer — must fail cleanly.
+        // Out-of-range read/write still fail cleanly at the accessor.
         let mut ruser = AsynUser::new(reason);
         ruser.addr = 100;
         assert!(driver.read_int32(&ruser).is_err());
-
-        // Out-of-range write — must fail cleanly.
         let mut wuser = AsynUser::new(reason);
         wuser.addr = 100;
         assert!(driver.write_int32(&mut wuser, 1).is_err());
 
-        // The bad addr must not have leaked into `active`.
-        assert!(
-            !driver.active.iter().any(|&(_, a)| a == 100),
-            "out-of-range addr must not be registered in `active`"
-        );
-
-        // Defense-in-depth: even with a bad addr present in `active`, a full
-        // `poll_cycle` (engine poll succeeds, then the active set is iterated)
-        // must skip it instead of panicking on an out-of-bounds buffer index.
-        driver.active.insert((reason, 100));
+        // Register an interrupt subscriber at the out-of-range offset, then run
+        // a full poll cycle (engine poll succeeds, bindings iterated). The
+        // 4-word buffer has no index 100, so poll_cycle's bounds guard must skip
+        // the binding rather than panic.
+        let (_sub, _rx) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(100),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
         driver
             .poll_cycle()
-            .expect("poll_cycle must skip the stale out-of-range addr, not error");
+            .expect("poll_cycle must skip the out-of-range subscriber binding, not error");
     }
 
     /// BUG 1 regression — a statistics/control reason has no
@@ -2245,17 +3168,11 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
         let read_ok_reason = driver.read_ok_reason;
 
-        // The only data record is at addr 2 — nothing at addr 0.
-        let mut ruser = AsynUser::new(reason);
-        ruser.addr = 2;
-        assert!(driver.read_int32(&ruser).is_ok());
-
+        // No data record is bound anywhere — the statistics params at addr 0
+        // must still post their monitors after a poll, because `publish_stats`
+        // is independent of the per-record interrupt fan-out.
         let mut rx = driver.base.interrupts.subscribe_async();
         driver.poll_cycle().expect("poll_cycle must succeed");
 
@@ -2270,6 +3187,641 @@ mod tests {
         assert!(
             saw_read_ok,
             "READ_OK statistics monitor must post at addr 0 after a poll cycle"
+        );
+    }
+
+    /// R54: one Modbus offset feeds several asyn interfaces, each needing the
+    /// value in its own type. A poll cycle must fire a separately-decoded value
+    /// per interface — int32 / int64 / float64 / the raw uInt32Digital word —
+    /// not one collapsed Float64. Port of `readPoller`'s per-interface fan-out
+    /// (drvModbusAsyn.cpp:1700-1815): an asynUInt32Digital `bi` sees the raw
+    /// register word while an asynInt32 `ai` sees the multi-register integer.
+    #[test]
+    fn poll_cycle_fires_per_interface_typed_values() {
+        // 4 holding registers: 0x0001, 0x0002, 0x0003, 0x0004.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = ModbusPortDriver::new(
+            "MB_PER_IFACE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+
+        // Activate the INT32_LE reason at addr 0. As a 32-bit little-endian
+        // value the two-register decode (0x0002_0001 = 131073) differs from the
+        // raw word (regs[0] = 1) the uInt32Digital interface delivers — so the
+        // per-interface decode is observable, not the same number typed four
+        // ways. `datatype_of` is per-reason, so the value is decoded as
+        // Int32Le even though the port's config datatype is UInt16.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+        // A record bound at addr 0 puts the offset on the interrupt list; the
+        // poller then fires every scalar interface for it. One mailbox
+        // subscription suffices to enumerate the binding — the per-interface
+        // fan-out below is unconditional, so the broadcast observer sees all
+        // four typed values regardless of this subscriber's own iface.
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
+
+        let mut rx = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+
+        let mut int32 = None;
+        let mut int64 = None;
+        let mut float64 = None;
+        let mut uint32 = None;
+        while let Ok(iv) = rx.try_recv() {
+            if iv.reason != reason || iv.addr != 0 {
+                continue;
+            }
+            match (iv.iface, &iv.value) {
+                (Some(InterfaceType::Int32), ParamValue::Int32(v)) => int32 = Some(*v),
+                (Some(InterfaceType::Int64), ParamValue::Int64(v)) => int64 = Some(*v),
+                (Some(InterfaceType::Float64), ParamValue::Float64(v)) => float64 = Some(*v),
+                (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                    // This is the first (forced) cycle, so every bit is marked
+                    // changed (`!0`) and no `@asynMask` gates it out. The
+                    // per-offset masked-change cadence on later cycles is covered
+                    // by `poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change`.
+                    assert_eq!(
+                        iv.uint32_changed_mask, !0,
+                        "the forced first cycle marks all bits changed"
+                    );
+                    uint32 = Some(*v);
+                }
+                other => panic!("unexpected per-interface fire: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            int32,
+            Some(0x0002_0001),
+            "asynInt32 must see the 32-bit Int32Le decode"
+        );
+        assert_eq!(
+            int64,
+            Some(0x0002_0001),
+            "asynInt64 must see the widened integer"
+        );
+        assert_eq!(
+            float64,
+            Some(131073.0),
+            "asynFloat64 must see the float decode"
+        );
+        assert_eq!(
+            uint32,
+            Some(1),
+            "asynUInt32Digital must see the raw register word, not the collapsed value"
+        );
+    }
+
+    /// R56: a `SCAN="I/O Intr"` asynInt32ArrayIn / asynFloat64ArrayIn waveform
+    /// must update every poll. C `readPoller` fires the int32Array / float64Array
+    /// interrupt lists with the whole register block decoded from the record's
+    /// offset (drvModbusAsyn.cpp:1840-1886); the Rust poll fires the array
+    /// interfaces too — but only when a record is bound (the subscriber-presence
+    /// gate mirrors C iterating an empty interrupt list). This pins both the fire
+    /// (with correct whole-block contents) and the gate (silent when unbound).
+    #[test]
+    fn poll_cycle_fires_array_interfaces_only_when_a_record_is_bound() {
+        // 4 holding registers 0x0001..0x0004, replayed for two polls.
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = ModbusPortDriver::new(
+            "MB_ARRAY_IOINTR",
+            test_config(0, 4),
+            LinkType::Tcp,
+            // Two polls: the framer increments the transaction ID per request
+            // (1 then 2), so the replies must carry the matching txid or the
+            // poll skips them as stale and times out.
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &pdu)),
+                Ok(tcp_response(2, &pdu)),
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        // INT32_LE reason at addr 0 (rc=2, two registers per element), so the
+        // 4-register block decodes to two elements. No prior read: the poller
+        // fires purely from the registered subscribers, exactly as a real
+        // SCAN="I/O Intr" waveform — which never reads on its own — relies on.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+
+        // --- Poll 1: array records ARE bound (mailbox subscribers present). ---
+        let (_sub_i, _rx_i) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                });
+        let (_sub_f, _rx_f) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+
+        let mut int32_arr = None;
+        let mut float64_arr = None;
+        while let Ok(iv) = rx.try_recv() {
+            match (iv.iface, iv.value) {
+                (Some(InterfaceType::Int32Array), ParamValue::Int32Array(a)) => {
+                    int32_arr = Some(a.to_vec());
+                }
+                (Some(InterfaceType::Float64Array), ParamValue::Float64Array(a)) => {
+                    float64_arr = Some(a.to_vec());
+                }
+                _ => {}
+            }
+        }
+        // INT32_LE: regs[0..2]=[1,2]=0x0002_0001=131073, regs[2..4]=[3,4]=
+        // 0x0004_0003=262147 — the whole block, one element per two registers.
+        assert_eq!(
+            int32_arr.as_deref(),
+            Some(&[131073i32, 262147][..]),
+            "asynInt32Array must get the whole-block per-element Int32Le decode"
+        );
+        assert_eq!(
+            float64_arr.as_deref(),
+            Some(&[131073.0f64, 262147.0][..]),
+            "asynFloat64Array must get the float decode of the same block"
+        );
+
+        // --- Poll 2: no array record bound (subscribers dropped) → gate skips. ---
+        drop(_sub_i);
+        drop(_sub_f);
+        drop(_rx_i);
+        drop(_rx_f);
+        let mut rx2 = driver.base.interrupts.subscribe_async();
+        driver.poll_cycle().expect("second poll_cycle must succeed");
+        while let Ok(iv) = rx2.try_recv() {
+            assert!(
+                !matches!(
+                    iv.iface,
+                    Some(InterfaceType::Int32Array) | Some(InterfaceType::Float64Array)
+                ),
+                "no array interface may fire when no array record is bound \
+                 (subscriber-presence gate)"
+            );
+        }
+    }
+
+    /// Drain every buffered interrupt fire for `(reason, addr 0)`, in order.
+    /// The R57 on-change tests inspect which interfaces fired each poll.
+    fn drain_addr0_fires(
+        rx: &mut tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        reason: usize,
+    ) -> Vec<asyn_rs::interrupt::InterruptValue> {
+        let mut out = Vec::new();
+        while let Ok(iv) = rx.try_recv() {
+            if iv.reason == reason && iv.addr == 0 {
+                out.push(iv);
+            }
+        }
+        out
+    }
+
+    fn count_iface(fires: &[asyn_rs::interrupt::InterruptValue], iface: InterfaceType) -> usize {
+        fires.iter().filter(|iv| iv.iface == Some(iface)).count()
+    }
+
+    /// A 4-register ReadHoldingRegisters response PDU for the given words.
+    fn regs_pdu(words: [u16; 4]) -> Vec<u8> {
+        let mut p = vec![0x01u8, 0x03, 0x08];
+        for w in words {
+            p.push((w >> 8) as u8);
+            p.push((w & 0xff) as u8);
+        }
+        p
+    }
+
+    /// R57: a `uInt32Digital` I/O-Intr record fires only on a per-offset masked
+    /// change, mirroring C `readPoller` (drvModbusAsyn.cpp:1695-1707) — not every
+    /// poll. The first cycle forces (changed mask `!0`); an unchanged word is
+    /// suppressed even when a different offset changed (per-offset, not
+    /// port-wide); a changed word fires carrying only the changed bits, so a
+    /// record `@asynMask` that does not overlap them is gated out by the
+    /// interrupt filter.
+    #[test]
+    fn poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_U32D_ONCHANGE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))), // word@0 = 1
+                Ok(tcp_response(2, &regs_pdu([1, 9, 3, 4]))), // word@0 unchanged (only @1 changed)
+                Ok(tcp_response(3, &regs_pdu([5, 9, 3, 4]))), // word@0 1 -> 5 (changed bits 0x0004)
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        // UInt16 reason (rc=1) at addr 0 — the fired word is regs[0]. A mailbox
+        // subscriber enumerates the binding; the broadcast observer sees fires.
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
+            fires
+                .iter()
+                .filter_map(|iv| match (iv.iface, &iv.value) {
+                    (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                        Some((*v, iv.uint32_changed_mask))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Poll 1: force -> fires word=1 with all bits marked changed.
+        driver.poll_cycle().expect("poll 1 must succeed");
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut rx, reason)),
+            vec![(1, !0)],
+            "first poll forces the uInt32Digital fire with all bits marked changed"
+        );
+
+        // Poll 2: word@0 unchanged though the block changed (regs[1]) -> no fire.
+        driver.poll_cycle().expect("poll 2 must succeed");
+        assert!(
+            u32d(&drain_addr0_fires(&mut rx, reason)).is_empty(),
+            "an unchanged word must not fire uInt32Digital even when another \
+             offset changed (per-offset gate, not port-wide)"
+        );
+
+        // Poll 3: word@0 1 -> 5, changed bits = 1 ^ 5 = 0x0004 -> fires that mask.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut rx, reason)),
+            vec![(5, 0x0004)],
+            "a changed word fires carrying only the changed bits as the mask"
+        );
+    }
+
+    /// R57: `int32Array` fires only on a port-wide change (C `forceCallback_ ||
+    /// anyChanged`, drvModbusAsyn.cpp:1824), while the int32/int64/float64
+    /// scalars AND `float64Array` fire every poll (ADC-averaging, :1714/1858).
+    /// An unchanged second poll must therefore drop int32Array but keep the
+    /// unconditional fires; a changed third poll fires int32Array again.
+    #[test]
+    fn poll_cycle_int32_array_gated_on_change_scalars_unconditional() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_ARR_ONCHANGE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))),
+                Ok(tcp_response(2, &regs_pdu([1, 2, 3, 4]))), // unchanged
+                Ok(tcp_response(3, &regs_pdu([7, 2, 3, 4]))), // regs[0] changed
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+        let (_si, _ri) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Int32Array),
+                    ..Default::default()
+                });
+        let (_sf, _rf) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Float64Array),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        // Poll 1 (force): int32Array + float64Array + scalars all fire.
+        driver.poll_cycle().expect("poll 1 must succeed");
+        let f1 = drain_addr0_fires(&mut rx, reason);
+        assert_eq!(
+            count_iface(&f1, InterfaceType::Int32Array),
+            1,
+            "poll 1 int32Array"
+        );
+        assert_eq!(
+            count_iface(&f1, InterfaceType::Float64Array),
+            1,
+            "poll 1 float64Array"
+        );
+        assert_eq!(
+            count_iface(&f1, InterfaceType::Int32),
+            1,
+            "poll 1 int32 scalar"
+        );
+
+        // Poll 2 (unchanged): int32Array gated OFF; float64Array + scalars stay
+        // on; uInt32Digital gated off (word unchanged).
+        driver.poll_cycle().expect("poll 2 must succeed");
+        let f2 = drain_addr0_fires(&mut rx, reason);
+        assert_eq!(
+            count_iface(&f2, InterfaceType::Int32Array),
+            0,
+            "int32Array must NOT fire on an unchanged poll (port-wide change gate)"
+        );
+        assert_eq!(
+            count_iface(&f2, InterfaceType::Float64Array),
+            1,
+            "float64Array fires every poll (unconditional, ADC averaging)"
+        );
+        assert_eq!(
+            count_iface(&f2, InterfaceType::Int32),
+            1,
+            "int32 scalar fires every poll (unconditional)"
+        );
+        assert_eq!(
+            count_iface(&f2, InterfaceType::UInt32Digital),
+            0,
+            "uInt32Digital must NOT fire on an unchanged word"
+        );
+
+        // Poll 3 (regs[0] changed): int32Array fires again.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        let f3 = drain_addr0_fires(&mut rx, reason);
+        assert_eq!(
+            count_iface(&f3, InterfaceType::Int32Array),
+            1,
+            "int32Array fires again once the block changes"
+        );
+    }
+
+    /// R57: an `asynOctet` I/O-Intr record fires only when the port data changes
+    /// (C `forceCallback_ || anyChanged`, drvModbusAsyn.cpp:1893) — not every
+    /// poll. First poll forces; an identical second poll is silent; a changed
+    /// third poll fires.
+    #[test]
+    fn poll_cycle_octet_fires_only_on_change() {
+        // StringHigh: each register's high byte is one ASCII char.
+        let str_pdu = |s: &[u8; 4]| -> Vec<u8> {
+            let mut p = vec![0x01u8, 0x03, 0x08];
+            for &c in s {
+                p.push(c);
+                p.push(0x00);
+            }
+            p
+        };
+        let mut cfg = test_config(0, 4);
+        cfg.data_type = ModbusDataType::StringHigh;
+        let mut driver = ModbusPortDriver::new(
+            "MB_OCTET_ONCHANGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &str_pdu(b"ABCD"))),
+                Ok(tcp_response(2, &str_pdu(b"ABCD"))), // unchanged
+                Ok(tcp_response(3, &str_pdu(b"ABCE"))), // last char changed
+            ])),
+        )
+        .expect("non-absolute string config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::Octet),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        driver.poll_cycle().expect("poll 1 must succeed");
+        assert_eq!(
+            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            1,
+            "first poll forces the octet fire"
+        );
+
+        driver.poll_cycle().expect("poll 2 must succeed");
+        assert_eq!(
+            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            0,
+            "an unchanged poll must not fire octet (port-wide change gate)"
+        );
+
+        driver.poll_cycle().expect("poll 3 must succeed");
+        assert_eq!(
+            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            1,
+            "octet fires again once the string changes"
+        );
+    }
+
+    /// R57: an I/O error forces the next successful cycle's on-change callbacks
+    /// even if the data is unchanged, mirroring C's `forceCallback_` on an
+    /// I/O-status transition (drvModbusAsyn.cpp:1654). The Rust poller aborts the
+    /// failed cycle (returns Err, fires nothing), so the recovered cycle must
+    /// re-fire uInt32Digital with `!0` despite the word being identical.
+    #[test]
+    fn poll_cycle_io_error_forces_next_unchanged_cycle() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_FORCE_RECOVER",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))), // poll 1 ok
+                Err(ModbusError::Timeout),                    // poll 2 I/O error
+                Ok(tcp_response(3, &regs_pdu([1, 2, 3, 4]))), // poll 3 ok, UNCHANGED
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        driver.poll_cycle().expect("poll 1 must succeed");
+        let _ = drain_addr0_fires(&mut rx, reason); // discard the forced first fire
+
+        // Poll 2 errors: poll_cycle returns Err and fires nothing.
+        driver
+            .poll_cycle()
+            .expect_err("poll 2 must surface the I/O error");
+        assert_eq!(
+            count_iface(
+                &drain_addr0_fires(&mut rx, reason),
+                InterfaceType::UInt32Digital
+            ),
+            0,
+            "a failed poll fires nothing"
+        );
+
+        // Poll 3: data identical to poll 1, but the error forced a re-fire.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        let f3 = drain_addr0_fires(&mut rx, reason);
+        let u32d: Vec<(u32, u32)> = f3
+            .iter()
+            .filter_map(|iv| match (iv.iface, &iv.value) {
+                (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                    Some((*v, iv.uint32_changed_mask))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            u32d,
+            vec![(1, !0)],
+            "post-I/O-error recovery forces a uInt32Digital re-fire (mask !0) even \
+             though the word is unchanged"
+        );
+    }
+
+    /// R57 finalizer: ANY aborted poll cycle must re-arm `force_callback` so the
+    /// next clean cycle recovers — not only the engine-poll error, but a mid-loop
+    /// decode error too. A subscriber bound at a tail offset whose datatype
+    /// overruns the block (INT32_LE, rc=2, at the last register) aborts the
+    /// per-offset decode `?`; the single finalizer in `poll_cycle` re-arms the
+    /// force, so once the bad binding is gone the next cycle force-fires the
+    /// on-change-gated interfaces even though the data never changed. Without the
+    /// finalizer, `prev_data` would freeze and the gated fire would be lost.
+    #[test]
+    fn poll_cycle_mid_loop_decode_error_rearms_force_for_recovery() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_MIDLOOP_ABORT",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))),
+                Ok(tcp_response(2, &regs_pdu([1, 2, 3, 4]))), // unchanged
+                Ok(tcp_response(3, &regs_pdu([1, 2, 3, 4]))), // unchanged
+            ])),
+        )
+        .expect("non-absolute config must build");
+
+        let u16_reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let i32_reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+
+        // Good uInt32Digital binding at addr 0 (word = regs[0], always decodable).
+        let (_good, _rg) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(u16_reason),
+                    addr: Some(0),
+                    iface: Some(InterfaceType::UInt32Digital),
+                    ..Default::default()
+                });
+        let mut rx = driver.base.interrupts.subscribe_async();
+
+        let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
+            fires
+                .iter()
+                .filter_map(|iv| match (iv.iface, &iv.value) {
+                    (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
+                        Some((*v, iv.uint32_changed_mask))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Poll 1: clean forced first cycle -> uInt32Digital@0 fires (1, !0);
+        // force cleared, prev_data advanced.
+        driver.poll_cycle().expect("poll 1 must succeed");
+        assert_eq!(u32d(&drain_addr0_fires(&mut rx, u16_reason)), vec![(1, !0)]);
+
+        // Bind an INT32_LE (rc=2) subscriber at addr 3: regs[3..] is one word, so
+        // the per-offset read_int32 decode errors and aborts the cycle mid-loop.
+        let (sub_bad, _rb) =
+            driver
+                .base
+                .interrupts
+                .register_interrupt_user(asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(i32_reason),
+                    addr: Some(3),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                });
+
+        // Poll 2: the tail decode aborts the cycle (returns Err).
+        driver
+            .poll_cycle()
+            .expect_err("a tail-offset decode overrun must abort poll 2");
+        let _ = drain_addr0_fires(&mut rx, u16_reason);
+
+        // Drop the bad binding so poll 3 is clean again.
+        drop(sub_bad);
+
+        // Poll 3: data identical to poll 1, but the aborted poll 2 re-armed the
+        // force, so the on-change-gated uInt32Digital@0 fires anyway.
+        driver.poll_cycle().expect("poll 3 must succeed");
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut rx, u16_reason)),
+            vec![(1, !0)],
+            "a mid-loop decode abort must re-arm force_callback so the next clean \
+             cycle recovers (else prev_data freezes and the gated fire is lost)"
         );
     }
 
@@ -2294,6 +3846,65 @@ mod tests {
         assert_eq!(cfg.length, 10);
         assert_eq!(cfg.poll_delay, Duration::from_millis(100));
         assert_eq!(cfg.readback_offset(), 0);
+    }
+
+    /// R53: `modbusInterposeConfig` reads the optional `timeoutMsec` and
+    /// `writeDelayMsec` args (C modbusInterpose.c:134-136) instead of dropping
+    /// them — a configured read timeout and inter-frame write delay must reach
+    /// the transport.
+    #[test]
+    fn parse_interpose_args_reads_timeout_and_write_delay() {
+        // All four args: timeout 500 ms, write delay 50 ms.
+        let (port, s) = parse_interpose_args(&args(vec![
+            ArgValue::String("OCTET1".into()),
+            ArgValue::Int(0), // TCP
+            ArgValue::Int(500),
+            ArgValue::Int(50),
+        ]))
+        .unwrap();
+        assert_eq!(port, "OCTET1");
+        assert_eq!(s.link, LinkType::Tcp);
+        assert_eq!(s.timeout, Duration::from_millis(500));
+        assert_eq!(s.write_delay, Duration::from_millis(50));
+
+        // Omitted/zero timeout falls back to DEFAULT_TIMEOUT (READ_TIMEOUT);
+        // omitted/zero write delay is zero.
+        let (_, s) = parse_interpose_args(&args(vec![
+            ArgValue::String("OCTET2".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ]))
+        .unwrap();
+        assert_eq!(s.timeout, crate::driver::READ_TIMEOUT);
+        assert_eq!(s.write_delay, Duration::ZERO);
+
+        // Bare two-arg form: defaults for both.
+        let (_, s) = parse_interpose_args(&args(vec![
+            ArgValue::String("OCTET3".into()),
+            ArgValue::Int(1), // RTU
+        ]))
+        .unwrap();
+        assert_eq!(s.link, LinkType::Rtu);
+        assert_eq!(s.timeout, crate::driver::READ_TIMEOUT);
+        assert_eq!(s.write_delay, Duration::ZERO);
+
+        // record/take round-trip preserves the settings.
+        record_interpose(
+            "OCTET_RT",
+            InterposeSettings {
+                link: LinkType::Rtu,
+                timeout: Duration::from_millis(750),
+                write_delay: Duration::from_millis(20),
+            },
+        );
+        let got = take_interpose("OCTET_RT");
+        assert_eq!(got.timeout, Duration::from_millis(750));
+        assert_eq!(got.write_delay, Duration::from_millis(20));
+        // An unconfigured port yields the defaults.
+        let def = take_interpose("OCTET_NEVER_SET");
+        assert_eq!(def.link, LinkType::Tcp);
+        assert_eq!(def.timeout, crate::driver::READ_TIMEOUT);
+        assert_eq!(def.write_delay, Duration::ZERO);
     }
 
     #[test]

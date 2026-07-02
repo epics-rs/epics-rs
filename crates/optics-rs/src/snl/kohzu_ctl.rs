@@ -204,10 +204,15 @@ pub fn calc_z_position(geom: Geometry, theta_deg: f64, y_offset: f64) -> f64 {
 }
 
 /// Clamp theta to [lo, hi], returning (clamped_value, was_clamped).
+///
+/// The limit test is inclusive (`<=`/`>=`): theta landing exactly on a soft
+/// limit counts as constrained, matching C `(theta <= thetaLo) ||
+/// (theta >= thetaHi)` (kohzuCtl_soft.st:771, ml_monoCtl.st:852). A strict test
+/// let a move to the exact limit through without raising the constraint/alert.
 pub fn clamp_theta(theta: f64, lo: f64, hi: f64) -> (f64, bool) {
-    if theta < lo {
+    if theta <= lo {
         (lo, true)
-    } else if theta > hi {
+    } else if theta >= hi {
         (hi, true)
     } else {
         (theta, false)
@@ -1428,6 +1433,9 @@ mod tests {
         assert_eq!(clamp_theta(45.0, 1.0, 89.0), (45.0, false));
         assert_eq!(clamp_theta(0.5, 1.0, 89.0), (1.0, true));
         assert_eq!(clamp_theta(90.0, 1.0, 89.0), (89.0, true));
+        // Exactly on a limit is constrained (inclusive, matching C).
+        assert_eq!(clamp_theta(1.0, 1.0, 89.0), (1.0, true));
+        assert_eq!(clamp_theta(89.0, 1.0, 89.0), (89.0, true));
     }
 
     #[test]

@@ -1158,21 +1158,33 @@ impl PvDatabase {
         };
 
         // Resolve the SELL link into SELN before SELN is read below.
-        // C `fanoutRecord.c:103`, `dfanoutRecord.c:126`,
-        // `seqRecord.c:152` all call
-        // `dbGetLink(&prec->sell, DBR_USHORT, &prec->seln, 0, 0)` at
-        // the top of `process()`, every cycle. Only the `sel` record's
-        // NVL->SELN binding was previously wired; fanout/dfanout/seq
-        // never read the SELL link, so a SELL pointing at another
-        // record's value field never updated SELN — the selection was
-        // frozen at whatever SELN was initialised to. `sseq` reads its
-        // own SELL→SELN in `SseqRecord::pre_input_link_actions` (the
-        // async machine owns the whole cycle), so it is not handled here.
+        // C `fanoutRecord.c:103` and `dfanoutRecord.c:126` call
+        // `dbGetLink(&prec->sell, DBR_USHORT, &prec->seln, 0, 0)` at the
+        // top of `process()`, *before* the SELM switch, so SELN is
+        // refreshed from SELL every cycle regardless of SELM.
+        // `seqRecord.c:148` places the identical `dbGetLink` *inside* the
+        // `else` of `if (prec->selm == seqSELM_All)`, so an All-mode seq
+        // never reads SELL — SELN stays frozen at its last value and posts
+        // no spurious change (the post-process `if (seln != oldn)` monitor
+        // is then a no-op). Match that per-record placement: fanout/dfanout
+        // always, seq only when SELM != All. Only the `sel` record's
+        // NVL->SELN binding was previously wired; fanout/dfanout/seq never
+        // read the SELL link, so a SELL pointing at another record's value
+        // field never updated SELN — the selection was frozen at whatever
+        // SELN was initialised to. `sseq` reads its own SELL→SELN in
+        // `SseqRecord::pre_input_link_actions` (the async machine owns the
+        // whole cycle), so it is not handled here.
         {
             let sell = {
                 let instance = rec.read().await;
                 match instance.record.record_type() {
-                    "fanout" | "dfanout" | "seq" => Some(Self::field_str(&instance, "SELL")),
+                    "fanout" | "dfanout" => Some(Self::field_str(&instance, "SELL")),
+                    // seqSELM_All == 0 (seqRecord.dbd menu(seqSELM) order
+                    // All/Specified/Mask). C skips the SELL→SELN read in
+                    // All mode, so the port must too.
+                    "seq" if Self::field_i16(&instance, "SELM") != 0 => {
+                        Some(Self::field_str(&instance, "SELL"))
+                    }
                     _ => None,
                 }
             };

@@ -8,9 +8,12 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 ///   0 = N to 1 Low Value
 ///   1 = N to 1 High Value
 ///   2 = N to 1 Average
-///   3 = Average (rolling) — not yet implemented; falls through to 0.0
+///   3 = Average (rolling element-wise mean of N waveforms — `array_average`,
+///       C `array_average` compressRecord.c:223)
 ///   4 = Circular Buffer
-///   5 = N to 1 Median — not yet implemented; falls through to 0.0
+///   5 = N to 1 Median (sort each N-element chunk, take the middle
+///       `psource[n/2]` — `compress_array`, C compressRecord.c:209-211; a
+///       scalar input degrades to Average, matching C `compress_scalar`)
 ///
 /// The numeric values are CA-wire-visible (DBR_SHORT) and must match
 /// `menuCompressALG` so a C client setting `ALG=4` reaches the
@@ -62,15 +65,46 @@ pub struct CompressRecord {
     // their running state in `cvb`/`inx` (`compress_scalar`) or work
     // a whole waveform in one call (`compress_array`).
     accum: Vec<f64>,
+    // Per-cycle completion gate mirroring C `compressRecord.c::process`
+    // `status`. The ingestion (`push_value`/`push_array`, run during the
+    // pre-process INP read) sets `cycle_ingested`; `put_one` (the single emit
+    // point) sets `cycle_emitted`. `process()` suppresses the publication
+    // epilogue iff `cycle_ingested && !cycle_emitted` — C `status == 1`, the
+    // record accumulated this cycle without emitting. No ingestion at all
+    // (link error / empty read / no INP) leaves `cycle_ingested` false, so the
+    // epilogue runs — C forces `status = 0` on those paths. Both are reset
+    // each cycle in `pre_process_actions`.
+    cycle_ingested: bool,
+    cycle_emitted: bool,
+    // C `prec->inpn`: the INP source's element count from the previous
+    // INP-driven ingest. When the count changes between cycles the
+    // accumulation buffer is reset and restarted at the new length
+    // (compressRecord.c:334-340).
+    inpn: usize,
+    // True only while applying this cycle's INP read (set in
+    // `pre_process_actions`, consumed in `push_array`, cleared in `process`).
+    // C's element-count reset lives in `process` and keys on `prec->wptr` (the
+    // INP read buffer) — a CA put to VAL goes through `put_array_info`, never
+    // `process`, so it must NOT reset. In Rust both the INP read and a direct
+    // VAL put reach `push_array` via `put_field("VAL")`; this flag is how
+    // `push_array` tells them apart so only the INP-driven ingest can reset.
+    inp_read_pending: bool,
 }
 
 impl Default for CompressRecord {
     fn default() -> Self {
         Self {
-            val: vec![0.0; 10],
-            nsam: 10,
+            // C `compressRecord.dbd.pod` `field(NSAM,DBF_ULONG){ initial("1") }`:
+            // an unset NSAM defaults to a 1-sample buffer, not 10. VAL is the
+            // NSAM-length buffer; a NSAM put resizes it (put_field below), so
+            // there is no load-order dependency.
+            val: vec![0.0; 1],
+            nsam: 1,
             inp: String::new(),
-            alg: 4, // Circular Buffer by default (menuCompressALG_Circular_Buffer)
+            // C `compressRecord.dbd.pod` `field(ALG,DBF_MENU){ menu(compressALG) }`
+            // has no `initial(...)`, so an unset ALG defaults to menu index 0 =
+            // `compressALG_N_to_1_Low_Value`, not Circular Buffer.
+            alg: 0,
             n: 1,
             nuse: 0,
             off: 0,
@@ -86,6 +120,10 @@ impl Default for CompressRecord {
             lopr: 0.0,
             prec: 0,
             accum: Vec::new(),
+            cycle_ingested: false,
+            cycle_emitted: false,
+            inpn: 0,
+            inp_read_pending: false,
         }
     }
 }
@@ -106,9 +144,32 @@ impl CompressRecord {
         }
     }
 
+    /// Clear the running accumulator and output buffer — the body of C
+    /// `reset()` (compressRecord.c:85-99). Single owner shared by the
+    /// SPC_RESET path (`RES` write) and the INP element-count-change path in
+    /// `push_array`. Does NOT touch the C-1 completion gate
+    /// (`cycle_ingested`/`cycle_emitted`): a reset emits nothing, so the gate
+    /// stays whatever the surrounding cycle set it to.
+    fn reset_accumulators(&mut self) {
+        self.off = 0;
+        self.nuse = 0;
+        self.inx = 0;
+        self.cvb = 0.0;
+        self.accum.clear();
+        for v in &mut self.val {
+            *v = 0.0;
+        }
+    }
+
     /// Write one value into the circular buffer, advancing `off`
     /// and `nuse` per BALG. Mirrors C `put_value` (compressRecord.c).
+    ///
+    /// This is the single point at which a compressed sample is emitted, so it
+    /// owns the per-cycle `cycle_emitted` flag that drives the completion gate
+    /// (C `compressRecord.c::process` `status == 0`). Every algorithm path —
+    /// circular, N-to-1 array/scalar, rolling average — emits through here.
     fn put_one(&mut self, value: f64) {
+        self.cycle_emitted = true;
         let nsam = self.nsam.max(1) as usize;
         if self.balg == 1 {
             // LIFO: pre-decrement modulo nsam, then write.
@@ -133,6 +194,10 @@ impl CompressRecord {
     /// **not** applied on the scalar path — C's skip loop lives only
     /// in `compress_array` (the `nelements > 1` branch).
     pub fn push_value(&mut self, input: f64) {
+        // A scalar push ingests one sample this cycle; emission is recorded by
+        // `put_one`. This covers the C `nelements == 1` → `compress_scalar`
+        // path, which accumulates across cycles and emits only every Nth.
+        self.cycle_ingested = true;
         match self.alg {
             // menuCompressALG_Circular_Buffer
             4 => self.put_one(input),
@@ -219,6 +284,8 @@ impl CompressRecord {
         self.inx += 1;
         let n = self.n.max(1);
         if self.inx < n {
+            // C `array_average` `return 1`: still accumulating, no emit
+            // (no `put_one`, so the completion gate stays unset this cycle).
             return;
         }
         // N waveforms accumulated — divide and emit.
@@ -247,6 +314,34 @@ impl CompressRecord {
     /// samples available" behaviour — partial accumulation persists
     /// for the next array.
     pub fn push_array(&mut self, input: &[f64]) {
+        if input.is_empty() {
+            // C treats a zero-element read as a link error (status forced 0 →
+            // completion epilogue runs). Mark no ingestion so `process()`
+            // publishes rather than suppressing.
+            return;
+        }
+        // A non-empty ingestion happened this cycle; whether it emitted is
+        // recorded by `put_one`. See `cycle_ingested`/`cycle_emitted`.
+        self.cycle_ingested = true;
+        // C compressRecord.c:334-340: when the INP source's element count
+        // changes between INP-driven cycles, C frees the buffer and `reset()`s,
+        // restarting accumulation clean at the new length. Without this the
+        // rolling Average (ALG=3) keeps stale per-element partial sums from the
+        // old length and blends them with the new waveform → a corrupt average.
+        // C gates the reset on `prec->wptr` already being allocated (a prior
+        // INP read), so the FIRST INP read does not reset; and the reset lives
+        // in `process` (the INP path), NOT in a CA put to VAL (`put_array_info`).
+        // `inp_read_pending` confines the reset to the INP-driven ingest: a
+        // direct VAL put / unit-test `push_array` is a raw buffer op and never
+        // resets. The reset clears no completion-gate state, so C-1's emit gate
+        // holds (a reset cycle still ingests, then the algorithm decides emit).
+        if self.inp_read_pending {
+            self.inp_read_pending = false;
+            if self.inpn != 0 && input.len() != self.inpn {
+                self.reset_accumulators();
+            }
+            self.inpn = input.len();
+        }
         match self.alg {
             // Circular Buffer (alg=4): every sample independent.
             4 => {
@@ -461,19 +556,28 @@ impl Record for CompressRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // Safety net: clear the INP-read marker for any cycle whose read never
+        // reached `push_array` (no INP, empty/error read, scalar via
+        // `push_value`), so a later direct VAL put cannot inherit a stale mark.
+        self.inp_read_pending = false;
         if self.res != 0 {
             // C `reset` (compressRecord.c:85-99) clears the running
             // accumulator state too — `inx`, `cvb` and the summing
             // buffer — not just `off`/`nuse`.
-            self.off = 0;
-            self.nuse = 0;
-            self.inx = 0;
-            self.cvb = 0.0;
-            self.accum.clear();
-            for v in &mut self.val {
-                *v = 0.0;
-            }
+            self.reset_accumulators();
             self.res = 0;
+            // A reset publishes the cleared buffer (C `reset` is followed by
+            // `monitor`); never suppress on a reset cycle.
+            return Ok(ProcessOutcome::complete());
+        }
+        // C `compressRecord.c:365` `if (status != 1)`: when this cycle's
+        // ingestion (run during the pre-process INP read) accumulated without
+        // emitting a compressed sample (C `status == 1`), the framework must
+        // skip the value-publication epilogue (UDF clear / timestamp / monitor
+        // / FLNK). An emit, or no ingestion at all (link error / no INP — C
+        // forces `status = 0`), publishes.
+        if self.cycle_ingested && !self.cycle_emitted {
+            return Ok(ProcessOutcome::complete_no_emit());
         }
         Ok(ProcessOutcome::complete())
     }
@@ -605,9 +709,26 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("IHIL".into())),
             },
-            "NSAM" | "OFF" | "NUSE" | "INX" | "CVB" => {
-                Err(CaError::ReadOnlyField(name.to_string()))
-            }
+            // C `field(NSAM,DBF_ULONG){ promptgroup special(SPC_NOMOD) }`:
+            // settable at `.db` load, runtime-immutable (the field_io
+            // `read_only` gate; the FieldDesc carries `read_only: true`). This
+            // arm serves only the load path, sizing the sample buffer like
+            // `new()`.
+            "NSAM" => match value {
+                EpicsValue::Long(n) => {
+                    let n = n.max(1);
+                    self.nsam = n as i32;
+                    self.val = vec![0.0; n as usize];
+                    // Resizing the ring invalidates the cursor and used count.
+                    self.nuse = 0;
+                    self.off = 0;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("NSAM".into())),
+            },
+            // OFF/NUSE/INX/CVB are runtime buffer state (no promptgroup) —
+            // never client-writable.
+            "OFF" | "NUSE" | "INX" | "CVB" => Err(CaError::ReadOnlyField(name.to_string())),
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu = s;
@@ -662,9 +783,19 @@ impl Record for CompressRecord {
     /// through `push_array`, so the data is ingested by the configured
     /// compression algorithm (NOT a raw buffer overwrite).
     fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        // Reset the per-cycle completion gate before the INP read below feeds
+        // `push_value`/`push_array`. If the read never happens (no INP, or a
+        // link error that skips the put), both stay false and `process()`
+        // publishes — mirroring C, which forces `status = 0` on those paths.
+        self.cycle_ingested = false;
+        self.cycle_emitted = false;
         if self.inp.is_empty() {
             return Vec::new();
         }
+        // Mark the upcoming INP read so `push_array` knows this ingest is the
+        // INP-driven one that may trigger the element-count reset (vs a direct
+        // VAL put). Cleared in `process` if the read never reaches `push_array`.
+        self.inp_read_pending = true;
         vec![crate::server::record::ProcessAction::ReadDbLink {
             link_field: "INP",
             target_field: "VAL",
@@ -675,6 +806,94 @@ impl Record for CompressRecord {
 #[cfg(test)]
 mod pbuf_tests {
     use super::*;
+
+    // C `compressRecord.dbd.pod` `field(NSAM,DBF_ULONG){ initial("1") }` — a
+    // compress built without an explicit NSAM defaults to a 1-sample buffer,
+    // not the old hand-coded 10. VAL is the NSAM-length buffer.
+    #[test]
+    fn nsam_defaults_to_one_per_dbd_initial() {
+        let rec = CompressRecord::default();
+        assert_eq!(rec.nsam, 1);
+        assert_eq!(rec.val.len(), 1, "VAL is the NSAM-length buffer");
+        assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::Long(1)));
+    }
+
+    #[test]
+    fn alg_defaults_to_zero_per_absent_dbd_initial() {
+        // C `field(ALG,DBF_MENU){ menu(compressALG) }` has no `initial(...)`,
+        // so an unset ALG is menu index 0 = N-to-1 Low Value, not Circular
+        // Buffer (4).
+        let rec = CompressRecord::default();
+        assert_eq!(rec.alg, 0, "ALG has no C initial -> menu index 0");
+    }
+
+    /// `process_local` (the test-only record-body dispatch path) must honor the
+    /// same emit-gate as the production engine path: a compress that ingested
+    /// but did not emit (`CompleteNoEmit`, C `compressRecord.c:365` the
+    /// `if (status != 1)` epilogue gate) publishes nothing. Construct the
+    /// non-emit state by ingesting one sample of a 4-wide rolling Average, then
+    /// dispatch via `process_local`. Without the `CompleteNoEmit` early-return
+    /// in `process_local` this falls through to the publication epilogue and
+    /// posts the buffer — the regression this pins.
+    #[test]
+    fn process_local_suppresses_publication_on_non_emit_cycle() {
+        use crate::server::record::RecordInstance;
+
+        // Rolling Average (ALG 3), N=4: one sample ingested, no emit yet.
+        let mut cmp = CompressRecord::new(1, 3);
+        cmp.n = 4;
+        cmp.push_value(1.0);
+        assert!(
+            cmp.cycle_ingested && !cmp.cycle_emitted,
+            "1/4 samples → accumulating (CompleteNoEmit), not emitting"
+        );
+
+        let mut inst = RecordInstance::new("CMP".into(), cmp);
+        let (snap, actions) = inst.process_local().unwrap();
+
+        assert!(
+            snap.changed_fields.is_empty(),
+            "a non-emit (CompleteNoEmit) cycle must publish no field changes via \
+             process_local — got {:?}",
+            snap.changed_fields
+        );
+        assert!(actions.is_empty(), "compress is soft → no process actions");
+    }
+
+    /// C compressRecord.c:334-340: a change in the INP source's element count
+    /// between cycles must reset the accumulation buffer and restart clean.
+    /// The rolling Average (ALG=3) is the victim — without the reset it keeps
+    /// stale per-element partial sums from the old length and blends them with
+    /// the new waveform. Feed a 4-element waveform mid-window, switch to 2
+    /// elements; the emitted average must reflect only the post-resize data.
+    #[test]
+    fn average_resets_on_inp_element_count_change() {
+        let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=3 (Average)
+        rec.n = 2; // average over 2 cycles
+
+        // `inp_read_pending` marks each push as the INP-driven ingest (what
+        // `pre_process_actions` sets in the real process path); only those may
+        // trigger the element-count reset.
+        // Cycle 1: length 4, mid-window (inx 0 -> 1, no emit).
+        rec.inp_read_pending = true;
+        rec.push_array(&[10.0, 20.0, 30.0, 40.0]);
+        // Cycle 2: length CHANGES to 2 -> reset + restart (inx 0 -> 1, no emit).
+        rec.inp_read_pending = true;
+        rec.push_array(&[2.0, 2.0]);
+        // Cycle 3: length 2 again -> inx 1 -> 2 -> emit mean([2,2],[4,4])=[3,3].
+        rec.inp_read_pending = true;
+        rec.push_array(&[4.0, 4.0]);
+
+        // Clean restart: the average is the mean of the two post-resize
+        // 2-element waveforms, NOT a blend with the stale length-4 cycle-1 data
+        // (which would yield [6, 11] emitted a cycle early).
+        assert_eq!(
+            rec.val[0], 3.0,
+            "element 0 must be mean(2,4)=3 from the clean post-resize window, \
+             not a blend with the stale length-4 partial sum"
+        );
+        assert_eq!(rec.val[1], 3.0, "element 1 must be mean(2,4)=3");
+    }
 
     /// C `get_array_info` (compressRecord.c:409-431) returns
     /// `*no_elements = nuse` regardless of PBUF — only the valid
@@ -922,6 +1141,41 @@ mod pbuf_tests {
             assert!((v[1] - 74.0).abs() < 1e-9);
             assert!((v[2] - 111.0).abs() < 1e-9);
             assert!((v[3] - 148.0).abs() < 1e-9);
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    /// N-to-1 Median (alg=5) array path — C `compress_array`
+    /// (compressRecord.c:209-211): sort each N-element chunk and emit the
+    /// middle element `psource[n/2]`. This pins the algorithm the struct
+    /// doc once wrongly described as "not implemented; falls through to
+    /// 0.0" — it has always been the `_ =>` arm of `compress_array`.
+    #[test]
+    fn n_to_1_median_array_takes_sorted_middle_of_each_chunk() {
+        // ALG=5, N=3 (odd): unambiguous middle of each chunk.
+        let mut rec = CompressRecord::new(8, 5);
+        rec.n = 3;
+        // [3,1,2] -> sorted [1,2,3] -> middle 2; [6,5,4] -> [4,5,6] -> 5.
+        rec.push_array(&[3.0, 1.0, 2.0, 6.0, 5.0, 4.0]);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(v, vec![2.0, 5.0]);
+        } else {
+            panic!("expected DoubleArray");
+        }
+
+        // Even N: C takes `psource[n/2]` = the UPPER of the two middles
+        // (index 2 of 4), NOT their average. [10,40,30,20] -> sorted
+        // [10,20,30,40] -> index 2 -> 30 (not the interpolated 25).
+        let mut rec = CompressRecord::new(8, 5);
+        rec.n = 4;
+        rec.push_array(&[10.0, 40.0, 30.0, 20.0]);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(
+                v,
+                vec![30.0],
+                "even-N median is the upper-middle (C psource[n/2]), not a mean"
+            );
         } else {
             panic!("expected DoubleArray");
         }

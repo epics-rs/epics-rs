@@ -71,6 +71,16 @@ pub trait OctetInterpose: Send + Sync {
     ) -> AsynResult<usize>;
 
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()>;
+
+    /// Notify the layer of an input end-of-string change. Default no-op;
+    /// only EOS-aware layers (`eos::EosInterpose`) act on it. C asyn routes
+    /// `setInputEos` through every interpose via `pasynOctet->setInputEos`;
+    /// this is the Rust equivalent so a runtime IEOS change reaches the
+    /// installed EOS interpose.
+    fn set_input_eos(&mut self, _eos: &[u8]) {}
+
+    /// Notify the layer of an output end-of-string change. Default no-op.
+    fn set_output_eos(&mut self, _eos: &[u8]) {}
 }
 
 /// A stack of octet interpose layers.
@@ -95,6 +105,22 @@ impl OctetInterposeStack {
 
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+
+    /// Forward an input EOS change to every layer. EOS-aware layers update
+    /// their terminator; others ignore it (trait default). Mirrors C asyn
+    /// propagating `setInputEos` down the interpose chain.
+    pub fn set_input_eos(&mut self, eos: &[u8]) {
+        for layer in &mut self.layers {
+            layer.set_input_eos(eos);
+        }
+    }
+
+    /// Forward an output EOS change to every layer.
+    pub fn set_output_eos(&mut self, eos: &[u8]) {
+        for layer in &mut self.layers {
+            layer.set_output_eos(eos);
+        }
     }
 
     /// Dispatch a read through the interpose chain, ending at `base`.

@@ -121,11 +121,9 @@ impl DrvAsynFtdiPort {
     ///   `noAutoConnect`).
     /// * `no_process_eos` suppresses the automatic EOS interpose
     ///   install (C `noProcessEos`). Mirror of
-    ///   `drvAsynFTDIPort.cpp:622-623` — when zero the caller can
-    ///   manually `push_interpose(EosInterpose::default())` after
-    ///   construction; we do not auto-install because the inner
-    ///   `pasynOctetBase->initialize(..., 0, 0, 1)` call has no
-    ///   direct counterpart in the Rust octet stack yet.
+    ///   `drvAsynFTDIPort.cpp:622-623`: when zero, `configure` installs an
+    ///   `EosInterpose` (empty terminator until `setInputEos`/`OEOS`), the
+    ///   Rust octet-stack equivalent of C's `asynInterposeEosConfig`.
     #[allow(clippy::too_many_arguments)] // intentional 1:1 mirror of C iocshArg list
     pub fn configure(
         port_name: &str,
@@ -150,6 +148,12 @@ impl DrvAsynFtdiPort {
         );
         base.connected = false;
         base.auto_connect = !no_auto_connect;
+        // C drvAsynFTDIPort.cpp:622-623: install asynInterposeEos by default
+        // (empty terminator until setInputEos/OEOS), suppressed by
+        // noProcessEos.
+        if !no_process_eos {
+            base.push_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        }
         Ok(Self {
             base,
             config,
@@ -261,6 +265,22 @@ mod tests {
         assert!(!drv.no_process_eos());
         // no_auto_connect=true → base.auto_connect should be false
         assert!(!drv.base().auto_connect);
+        // no_process_eos=false → EOS interpose auto-installed (DRV-2 family,
+        // C drvAsynFTDIPort.cpp:622-623).
+        assert_eq!(drv.base().interpose_octet.len(), 1);
+    }
+
+    #[test]
+    fn configure_no_process_eos_suppresses_eos_interpose() {
+        let drv =
+            DrvAsynFtdiPort::configure("ftdi0", 0x0403, 0x6014, 115_200, 16, 0, false, true, 0)
+                .unwrap();
+        assert!(drv.no_process_eos());
+        assert_eq!(
+            drv.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@ async fn main() -> CaResult<()> {
     // Register universal asyn device support
     app = asyn_rs::adapter::register_asyn_device_support(app);
 
-    // Register MQTT iocsh commands (mqttAddTopic, mqttDriverConfigure)
+    // Register MQTT iocsh commands (mqttDriverConfigure)
     app = mqtt_rs::ioc::register_mqtt_commands(app, handle, trace);
 
     // Register Z2M device type builders

@@ -11,6 +11,46 @@ upstream: `epics-modules/asyn` HEAD `e2a281e2` (2025-08-04)
 
 ---
 
+## STATUS — VERIFIED 2026-06-29: ALL 17 FINDINGS CLOSED (doc SUPERSEDED)
+
+This 2026-06-12 inventory predates ~25 caucus review rounds of asyn-rs fix
+work. A 3-panel opus verification round (manager/port+interpose, param+convert
+device-support, devsup+record) re-checked every confirmed gap against current
+`main` and the upstream C. **Every one is CLOSED** — each by a post-review fix
+commit (most dated within two days of this review), with current-code file:line
+evidence and C-reference confirmation. No STILL-OPEN finding remains on the
+reviewed surface; this doc is retained only as a historical record. For NEW
+work, re-audit from the C surface rather than trusting the gap list below.
+
+| § | Finding id | Fixing commit(s) |
+|---|---|---|
+| 1 | deadline-reorders-within-priority | `cbd8a372` |
+| 1 | lifecycle-ops-gated-by-block-holder | `ac0787f5` |
+| 1 | no-2s-autoconnect-backoff | `115b0153` |
+| 1 | deadline-aborts-dequeued-request | `3e9a6514` |
+| 1 | enable-does-not-refuse-defunct-port | `c6045740` |
+| 6 | delay-trailing-and-single-char-delay-omitted | `abbfde36` |
+| 3 | read-discards-stored-param-status | `9d8f1512` |
+| 3 | flush-missing-isdefined-gate | `fe4d7fa0` |
+| 4 | io-intr-drops-driver-alarm-status-severity | `0b9e8d54` / `a50d3f73` |
+| 4 | asynfloat64-ai-skips-smoo-aslo-aoff | `14b535ad` |
+| 4 | asynint32-ai-linear-eslo-eoff-never-applied | `614e7ebb` / `c850c287` |
+| 4 | init-seed convert routing (ao/ai readback) | `6812c0c0` / `d4e8f66e` |
+| 4 | driver-enum-string-tables-not-propagated | `1b63540e` |
+| 4 | asynmask-nbits-bipolar-not-supported-for-int32 | `5913972c` |
+| 4 | parselink-addr-base0-hex-not-accepted | `28e75f65` |
+| 5 | octet-read-error-leaves-status-fields-stale | `09852c48` |
+| 5 | dbit-readback-wrong-option-key-csize | `678e272c` |
+| 5 | read-error-no-read-alarm-or-overflow-minor | `170c327b` |
+
+Residual STATE_ALARM on AQR-cancel / queue-timeout = the separately-classified
+§7 non-gap (`queue-timeout-and-not-connected-no-error-alarm`), not a new
+finding. Out-of-scope surface untouched by this review and not yet audited:
+hardware drivers (ftdi / ip_port / ip_server_port / prologix / serial_port /
+usbtmc / vxi11).
+
+---
+
 ## 0. TL;DR
 
 asyn-rs의 핵심 비동기 재설계(actor-per-port, coalescing mailbox, RequestOp 디스패치)는 구조적으로 견고하며, manager/port 큐, param library, octet I/O, interpose 스택의 골격은 C와 매핑된다. 그러나 **C의 software-side 변환(device support)·상태 전파(param status→alarm)·정책(throttle/FIFO)·readback 키** 레벨에서 17개의 확정 동작 갭이 남아 있다.

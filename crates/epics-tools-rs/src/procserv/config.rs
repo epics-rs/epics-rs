@@ -4,38 +4,33 @@
 //! deployments can switch to `procserv-rs` with the same wrapper
 //! scripts. Defaults match C procServ's defaults.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::procserv::endpoint::Endpoint;
 use crate::procserv::restart::{RestartMode, RestartPolicy};
 
-/// Listen-side configuration. procServ historically accepts both TCP
-/// (`--port` / `--allow`) and Unix-socket (`--unixpath`) consoles
-/// concurrently. The Rust port keeps both, gated by which fields the
-/// caller supplies.
+/// Listen-side configuration. C procServ collects control endpoints into
+/// a `ctlSpecs` vector built from repeatable `-P` plus the legacy
+/// positional port (`procServ.cc:211,386,453`), and a single optional log
+/// endpoint from `-l`; each spec is parsed by `acceptFactory`. The Rust
+/// port mirrors that shape: a vector of control endpoints (read/write) and
+/// one optional log endpoint (read-only).
 #[derive(Debug, Clone, Default)]
 pub struct ListenConfig {
-    /// TCP listen port (`--port`). `None` disables TCP.
-    pub tcp_port: Option<u16>,
-    /// Bind address for the TCP listener. C procServ `--allow`
-    /// flips between localhost-only and any-interface; the Rust port
-    /// takes the explicit `SocketAddr` so both forms collapse onto
-    /// one field. Defaults to `127.0.0.1` if `tcp_port` is set.
-    pub tcp_bind: Option<SocketAddr>,
-    /// Read-only viewer/log TCP port (`-l` / `--logport`). Clients on
-    /// this port receive all output but their input is discarded —
-    /// C procServ's log listener, created with `readonly=true`
-    /// (`procServ.cc:533`, `acceptFactory.cc:395`). `None` disables it.
-    pub log_port: Option<u16>,
-    /// Bind address for the log/viewer port. C's `logPortLocal` defaults
-    /// to *false* — the log port binds all interfaces (`INADDR_ANY`)
-    /// unless `--restrict` restricts it to localhost
-    /// (`procServ.cc:51,377`, `acceptFactory.cc:116`), the inverse of the
-    /// control port's localhost-by-default + `--allow`.
-    pub log_bind: Option<SocketAddr>,
-    /// Unix-domain socket path (`--unixpath`). `None` disables UNIX.
-    pub unix_path: Option<PathBuf>,
+    /// Control endpoints (read/write). Each is a fully-resolved
+    /// [`Endpoint`] — TCP (bare port or `A.B.C.D:port` interface bind) or
+    /// UNIX (filesystem, access-controlled, or abstract). At least one is
+    /// required (C's arg-count check, `procServ.cc:420`). C `ctlSpecs`.
+    pub control: Vec<Endpoint>,
+    /// Read-only viewer/log endpoint (`-l` / `--logport`). Clients here
+    /// receive all output but their input is discarded — C procServ's log
+    /// listener, created with `readonly=true` (`procServ.cc:533`,
+    /// `acceptFactory.cc:395`). Its localhost-vs-any decision is C's
+    /// `logPortLocal`: all interfaces by default, localhost under
+    /// `--restrict` (the inverse of the control port's localhost default +
+    /// `--allow`). `None` disables it.
+    pub log: Option<Endpoint>,
 }
 
 /// Per-input-key bindings. Matches C procServ's `restartChar`
@@ -54,9 +49,13 @@ pub struct KeyBindings {
     pub toggle_restart: Option<u8>,
     /// Restart child once after manual kill (default `Ctrl-R` = `0x12`).
     pub restart: Option<u8>,
-    /// Shut down procserv entirely (default disabled in C).
+    /// Shut down procserv entirely. C `quitChar` = `^Q` (`0x11`),
+    /// always enabled and never exposed on the CLI (procServ.cc:69);
+    /// it fires only while the child is shut down.
     pub quit: Option<u8>,
-    /// Disconnect this client only (default `Ctrl-]` = `0x1d`).
+    /// Disconnect this client only. C `logoutChar` starts at `0x00`
+    /// (disabled) and is enabled only by `--logoutcmd` (procServ.cc:70);
+    /// `^]` (`0x1d`) is merely the value the docs suggest, not a default.
     pub logout: Option<u8>,
 }
 
@@ -65,10 +64,19 @@ pub struct KeyBindings {
 pub struct ChildConfig {
     /// Executable name (display only; goes into welcome banner).
     pub name: String,
-    /// Argv[0] — actual program to exec.
+    /// The positional command. Used as argv[0] presented to the child,
+    /// and as the exec target unless [`Self::child_exec`] overrides it.
     pub program: PathBuf,
     /// Remaining argv.
     pub args: Vec<String>,
+    /// Override executable to `exec` instead of [`Self::program`]
+    /// (`--exec`). `None` ⇒ exec `program` itself (the default). When
+    /// set, the child still sees argv[0] = `program`, so it runs a
+    /// different binary while presenting the original command line —
+    /// C `childExec` (`procServ.cc:62,295-296,459-462`). C's argv[0]
+    /// quirk (the token before the command) is not reproduced; argv[0]
+    /// is the command's arg0, matching the documented intent.
+    pub child_exec: Option<PathBuf>,
     /// Working directory for the child (optional `--chdir`).
     pub cwd: Option<PathBuf>,
     /// Signal sent on `kill` keybinding. C procServ defaults to
@@ -78,6 +86,12 @@ pub struct ChildConfig {
     /// Characters to discard from PTY-master writes (`--ignore`).
     /// Empty = no filtering.
     pub ignore_chars: Vec<u8>,
+    /// Core-dump size limit (`RLIMIT_CORE` soft limit) applied to the
+    /// child before `exec` (`--coresize`). `None` leaves the inherited
+    /// limit untouched, matching C's `setCoreSize` flag which is only
+    /// honored for `coresize >= 0` (`procServ.cc:279-285`,
+    /// `processFactory.cc:206-210`).
+    pub core_size: Option<u64>,
 }
 
 /// Sidecar/log configuration.
@@ -133,8 +147,8 @@ impl ProcServConfig {
     /// Validate the config — bail at construction time rather than
     /// surfacing an error mid-run.
     pub fn validate(&self) -> Result<(), String> {
-        if self.listen.tcp_port.is_none() && self.listen.unix_path.is_none() {
-            return Err("at least one of tcp_port / unix_path must be set".into());
+        if self.listen.control.is_empty() {
+            return Err("at least one control endpoint is required".into());
         }
         if self.child.program.as_os_str().is_empty() {
             return Err("child.program is required".into());

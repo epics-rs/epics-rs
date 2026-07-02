@@ -3,7 +3,7 @@
 //! Uses `libc` termios directly for serial I/O. Unix-only (`#[cfg(unix)]`).
 
 use std::os::unix::io::RawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
@@ -13,96 +13,22 @@ use crate::trace::TraceMask;
 use crate::user::AsynUser;
 use crate::{asyn_trace, asyn_trace_io};
 
-// --- Configuration types ---
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataBits {
-    Five,
-    Six,
-    Seven,
-    Eight,
-}
-
-impl Default for DataBits {
-    fn default() -> Self {
-        DataBits::Eight
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Parity {
-    None,
-    Odd,
-    Even,
-}
-
-impl Default for Parity {
-    fn default() -> Self {
-        Parity::None
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopBits {
-    One,
-    Two,
-}
-
-impl Default for StopBits {
-    fn default() -> Self {
-        StopBits::One
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlowControl {
-    None,
-    Hardware,
-    Software,
-}
-
-impl Default for FlowControl {
-    fn default() -> Self {
-        FlowControl::None
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SerialConfig {
-    pub device: String,
-    pub baud: u32,
-    pub data_bits: DataBits,
-    pub parity: Parity,
-    pub stop_bits: StopBits,
-    pub flow_control: FlowControl,
-}
+use super::serial_config::{
+    DataBits, FlowControl, Parity, SerialConfig, StopBits, parse_bool_option,
+};
 
 impl SerialConfig {
-    /// Parse a serial port specification string.
-    ///
-    /// Format: `"/dev/ttyUSB0"` — just the device path.
-    /// Baud and other settings default to 9600 8N1 no flow control.
-    pub fn parse(spec: &str) -> AsynResult<Self> {
-        let device = spec.trim().to_string();
-        if device.is_empty() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "empty serial device path".into(),
-            });
-        }
-        Ok(Self {
-            device,
-            baud: 9600,
-            data_bits: DataBits::default(),
-            parity: Parity::default(),
-            stop_bits: StopBits::default(),
-            flow_control: FlowControl::default(),
-        })
-    }
-
     /// Apply this configuration to a raw termios struct.
-    pub fn apply_to_termios(&self, t: &mut libc::termios) {
-        let baud = baud_to_speed(self.baud);
+    ///
+    /// Errors if `self.baud` is not settable on this platform. `baud_to_speed`
+    /// is the single validation owner; surfacing the error here (rather than a
+    /// silent `B9600` fallback) means an unmappable rate cannot be applied even
+    /// through a directly-built `SerialConfig`, not just via `set_option`.
+    pub fn apply_to_termios(&self, t: &mut libc::termios) -> AsynResult<()> {
+        let baud = baud_to_speed(self.baud).ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("unsupported baud rate: {}", self.baud),
+        })?;
         unsafe {
             libc::cfsetispeed(t, baud);
             libc::cfsetospeed(t, baud);
@@ -153,57 +79,98 @@ impl SerialConfig {
                 t.c_iflag |= libc::IXON | libc::IXOFF;
             }
         }
+        Ok(())
     }
 }
 
-fn baud_to_speed(baud: u32) -> libc::speed_t {
-    match baud {
-        0 => libc::B0,
-        50 => libc::B50,
-        75 => libc::B75,
-        110 => libc::B110,
-        134 => libc::B134,
-        150 => libc::B150,
-        200 => libc::B200,
-        300 => libc::B300,
-        600 => libc::B600,
-        1200 => libc::B1200,
-        1800 => libc::B1800,
-        2400 => libc::B2400,
-        4800 => libc::B4800,
-        9600 => libc::B9600,
-        19200 => libc::B19200,
-        38400 => libc::B38400,
-        57600 => libc::B57600,
-        115200 => libc::B115200,
-        230400 => libc::B230400,
-        // High baud rates: available on Linux/FreeBSD/NetBSD, not macOS.
-        // C parity: conditional on #ifdef B460800 etc.
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        460800 => libc::B460800,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        500000 => libc::B500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        576000 => libc::B576000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        921600 => libc::B921600,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        1000000 => libc::B1000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        1152000 => libc::B1152000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        1500000 => libc::B1500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        2000000 => libc::B2000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        2500000 => libc::B2500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        3000000 => libc::B3000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        3500000 => libc::B3500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        4000000 => libc::B4000000,
-        _ => libc::B9600, // fallback
+/// Map a baud rate to its termios speed code, or `None` if the rate is not
+/// settable on this platform.
+///
+/// C parity (drvAsynSerialPort.c:271-345): on systems where the termios `Bxxx`
+/// constants equal the literal baud rate — macOS and the BSDs, where
+/// `B9600 == 9600` — C uses the baud value itself as the speed code
+/// (`baudCode = baud`, line 274), so *any* rate is accepted including
+/// non-standard ones. Elsewhere (Linux, where the codes are small encoded
+/// integers) C maps the known standard rates with a `switch` and returns
+/// asynError ("Unsupported data rate", lines 340-343) for anything outside it.
+fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        // Bxxx == literal rate: the baud value is itself a valid speed code.
+        // `from` (not `as`) so this stays clean whether speed_t is u32 or u64.
+        Some(libc::speed_t::from(baud))
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        Some(match baud {
+            // C parity (drvAsynSerialPort.c:276-344): the Linux switch starts at
+            // `case 50` with no `case 0`, so baud 0 (which would program B0 — a
+            // line hangup) falls to the `default` asynError. macOS/BSD differ:
+            // there `baudCode = baud`, so 0 is accepted by the passthrough branch
+            // above (C-macOS does the same). No `0 => B0` arm here.
+            50 => libc::B50,
+            75 => libc::B75,
+            110 => libc::B110,
+            134 => libc::B134,
+            150 => libc::B150,
+            200 => libc::B200,
+            300 => libc::B300,
+            600 => libc::B600,
+            1200 => libc::B1200,
+            1800 => libc::B1800,
+            2400 => libc::B2400,
+            4800 => libc::B4800,
+            9600 => libc::B9600,
+            19200 => libc::B19200,
+            38400 => libc::B38400,
+            57600 => libc::B57600,
+            115200 => libc::B115200,
+            230400 => libc::B230400,
+            // High baud rates: C gates each with `#ifdef Bxxx`; on Linux the
+            // codes exist, while the arbitrary-rate branch above covers
+            // macOS/BSD. Linux defines no B28800, matching C's `#ifdef B28800`.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            460800 => libc::B460800,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            500000 => libc::B500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            576000 => libc::B576000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            921600 => libc::B921600,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            1000000 => libc::B1000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            1152000 => libc::B1152000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            1500000 => libc::B1500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            2000000 => libc::B2000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            2500000 => libc::B2500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            3000000 => libc::B3000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            3500000 => libc::B3500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            4000000 => libc::B4000000,
+            // C parity (drvAsynSerialPort.c:340-343): unknown rate -> asynError.
+            _ => return None,
+        })
     }
 }
 
@@ -257,45 +224,23 @@ fn speed_to_baud(speed: libc::speed_t) -> u32 {
     }
 }
 
-/// Supported baud rates. `baud_to_speed` returns the matching `libc::speed_t`,
-/// or falls back to B9600 for unsupported values. Use `is_supported_baud()` to
-/// check before setting.
-const SUPPORTED_BAUDS: &[u32] = &[
-    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
-    115200, 230400,
-];
-
-fn is_supported_baud(baud: u32) -> bool {
-    SUPPORTED_BAUDS.contains(&baud)
-}
-
-/// Parse a boolean option value.
-///
-/// Accepted truthy values (case-insensitive): `y`, `yes`, `1`, `true`.
-/// Accepted falsy values (case-insensitive): `n`, `no`, `0`, `false`.
-/// Returns `Err` for unrecognized values.
-fn parse_bool_option(value: &str) -> AsynResult<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" | "1" | "true" => Ok(true),
-        "n" | "no" | "0" | "false" => Ok(false),
-        _ => Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!(
-                "invalid boolean value: '{value}' (expected y/yes/1/true or n/no/0/false)"
-            ),
-        }),
-    }
-}
-
 // --- I/O state ---
 
 struct SerialIoState {
     fd: Option<RawFd>,
+    /// Cumulative bytes successfully read / written, for `report()` diagnostics
+    /// (C tracks `tty->nRead` / `tty->nWritten`, drvAsynSerialPort.c).
+    n_read: u64,
+    n_written: u64,
 }
 
 impl SerialIoState {
     fn new() -> Self {
-        Self { fd: None }
+        Self {
+            fd: None,
+            n_read: 0,
+            n_written: 0,
+        }
     }
 
     fn fd_or_err(&self) -> AsynResult<RawFd> {
@@ -313,84 +258,173 @@ fn duration_to_poll_ms(d: Duration) -> i32 {
 impl OctetNext for SerialIoState {
     fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let fd = self.fd_or_err()?;
-        let timeout_ms = duration_to_poll_ms(user.timeout);
-
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if ret < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
-        if ret == 0 {
+        // C readIt (drvAsynSerialPort.c:871-875): reject maxchars == 0 with
+        // asynError right after the fd check and before touching the device.
+        // An empty buffer would otherwise reach libc::read(fd, ptr, 0), which
+        // returns 0 and is misclassified below (n == 0) as a disconnect (EOF)
+        // — tearing down a live serial port. (Message matches the serial
+        // driver's own wording, which omits the period the IP driver carries.)
+        if buf.is_empty() {
             return Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "serial read timeout".into(),
+                status: AsynStatus::Error,
+                message: "maxchars 0 Why <=0?".into(),
             });
         }
-
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
-        if n == 0 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disconnected,
-                message: "serial port EOF".into(),
-            });
-        }
-
-        Ok(OctetReadResult {
-            nbytes_transferred: n as usize,
-            // C parity: CNT only when the requested count was reached.
-            eom_reason: if n as usize >= buf.len() {
-                EomReason::CNT
-            } else {
-                EomReason::empty()
-            },
-        })
-    }
-
-    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let fd = self.fd_or_err()?;
         let timeout_ms = duration_to_poll_ms(user.timeout);
 
-        let mut total = 0usize;
-        while total < data.len() {
+        // C parity (drvAsynSerialPort.c): retry poll/read on EINTR (a signal
+        // interrupted the call) and EAGAIN/EWOULDBLOCK (spurious wakeup);
+        // only a real error is fatal. Without this, a benign signal would be
+        // surfaced as a fatal Io error and tear the connection down.
+        loop {
             let mut pfd = libc::pollfd {
                 fd,
-                events: libc::POLLOUT,
+                events: libc::POLLIN,
                 revents: 0,
             };
 
             let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
             if ret < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(AsynError::Io(err));
             }
             if ret == 0 {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
-                    message: "serial write timeout".into(),
+                    message: "serial read timeout".into(),
                 });
             }
 
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    data[total..].as_ptr() as *const libc::c_void,
-                    data.len() - total,
-                )
-            };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    continue;
+                }
+                return Err(AsynError::Io(err));
             }
-            total += n as usize;
+            if n == 0 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: "serial port EOF".into(),
+                });
+            }
+
+            self.n_read += n as u64; // C parity: tty->nRead += thisRead
+            return Ok(OctetReadResult {
+                nbytes_transferred: n as usize,
+                // C parity: CNT only when the requested count was reached.
+                eom_reason: if n as usize >= buf.len() {
+                    EomReason::CNT
+                } else {
+                    EomReason::empty()
+                },
+            });
+        }
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let fd = self.fd_or_err()?;
+
+        // The driver fd is blocking (connect restores O_NONBLOCK off so reads
+        // can block on poll). A blocking `write(fd, all_remaining)` would not
+        // return until the *entire* buffer is accepted by the kernel, so a
+        // stalled or slow peer blocks the write past the timeout regardless of
+        // the poll below — C instead unblocks a stuck write from its timeout
+        // timer via tcflush(TCOFLUSH) (drvAsynSerialPort.c:649). This driver has
+        // no such timer, so make the fd non-blocking for the duration of the
+        // write: each `write` then returns immediately with what fit (or EAGAIN)
+        // and the poll/deadline loop bounds the whole write. Blocking mode is
+        // restored on every exit path.
+        let prev_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if prev_flags < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(AsynError::Io(std::io::Error::last_os_error()));
         }
 
-        Ok(total)
+        // C parity (drvAsynSerialPort.c:815-842): writeIt arms a single timer
+        // for the whole writeTimeout *before* the loop and breaks when it fires,
+        // so the timeout bounds the TOTAL write, not each chunk. Bound total
+        // time with one deadline and poll with the remaining budget each
+        // iteration (the IP driver's write_with_retry total-deadline model).
+        // The previous code reused the full per-call timeout on every poll, so
+        // a slowly-draining peer could keep a multi-chunk write alive for up to
+        // timeout x iterations.
+        let deadline = Instant::now() + user.timeout;
+        let result = (|| -> AsynResult<usize> {
+            let mut total = 0usize;
+            while total < data.len() {
+                let poll_ms =
+                    duration_to_poll_ms(deadline.saturating_duration_since(Instant::now()));
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+
+                let ret = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(AsynError::Io(err));
+                }
+                if ret == 0 {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "serial write timeout".into(),
+                    });
+                }
+
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        data[total..].as_ptr() as *const libc::c_void,
+                        data.len() - total,
+                    )
+                };
+                if n < 0 {
+                    // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted
+                        || err.kind() == std::io::ErrorKind::WouldBlock
+                    {
+                        continue;
+                    }
+                    return Err(AsynError::Io(err));
+                }
+                total += n as usize;
+                self.n_written += n as u64; // C parity: tty->nWritten += thisWrite
+
+                // C parity (drvAsynSerialPort.c:827): after each write, if the
+                // total deadline has passed stop with asynTimeout even though
+                // some bytes went out. A non-blocking poll that finds free space
+                // (e.g. a slow peer that drains a little each gap) would
+                // otherwise let the write keep going past the deadline, since
+                // `poll(0)` returns POLLOUT instead of timing out. (timeout==0
+                // collapses to a single write attempt then bail, matching
+                // writeIt's `writeTimeout==0`.)
+                if total < data.len() && Instant::now() >= deadline {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "serial write timeout".into(),
+                    });
+                }
+            }
+            Ok(total)
+        })();
+
+        // Restore blocking mode on every exit path (success, timeout, error).
+        unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags) };
+        result
     }
 
     fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
@@ -416,7 +450,37 @@ pub struct DrvAsynSerialPort {
     saved_termios: Option<libc::termios>,
 }
 
+/// A transport error meaning the serial line is broken and the connection
+/// must be torn down (vs a timeout, which leaves it open). C parity:
+/// `drvAsynSerialPort.c` calls `closeConnection` on a real read/write error
+/// or EOF but returns `asynTimeout` with the fd intact on a poll timeout.
+/// Mirrors the same predicate in `ip_port.rs` (both transports share the
+/// `closeConnection`-on-fatal-error contract).
+fn is_fatal_transport_error(e: &AsynError) -> bool {
+    matches!(
+        e,
+        AsynError::Status {
+            status: AsynStatus::Disconnected,
+            ..
+        } | AsynError::Io(_)
+    )
+}
+
 impl DrvAsynSerialPort {
+    /// Close the fd and mark the port disconnected so the actor's
+    /// auto-reconnect re-opens it on the next request. C parity:
+    /// `drvAsynSerialPort.c::closeConnection` (close, fd=-1,
+    /// `exceptionDisconnect`). Unlike the graceful `disconnect`, a
+    /// fatal-error teardown does not restore termios — the device is gone
+    /// and the fd is being closed.
+    fn drop_connection(&mut self) {
+        if let Some(fd) = self.io.fd.take() {
+            unsafe { libc::close(fd) };
+        }
+        self.saved_termios = None;
+        self.base.set_connected(false);
+    }
+
     /// Create a new serial port driver.
     ///
     /// The driver starts disconnected with `auto_connect = true` and `can_block = true`.
@@ -440,6 +504,32 @@ impl DrvAsynSerialPort {
             io: SerialIoState::new(),
             saved_termios: None,
         })
+    }
+
+    /// Configure a serial port the way C `drvAsynSerialPortConfigure`
+    /// does (`drvAsynSerialPort.c:1031-1126`): parse the device, honor
+    /// `noAutoConnect`, and enable EOS processing by default unless
+    /// `noProcessEos`. C does this by passing `(noProcessEos ? 0 : 1)` to
+    /// `pasynOctetBase->initialize`; the Rust octet stack expresses EOS
+    /// through the interpose layer, so the equivalent is to auto-install
+    /// an `EosInterpose` (empty terminator until `setInputEos`/`OEOS`).
+    ///
+    /// `new` stays the parse-only constructor (no EOS), matching the
+    /// lower-level C octet init without the `Configure` wrapper.
+    pub fn configure(
+        port_name: &str,
+        config_str: &str,
+        no_auto_connect: bool,
+        no_process_eos: bool,
+    ) -> AsynResult<Self> {
+        let mut driver = Self::new(port_name, config_str)?;
+        if no_auto_connect {
+            driver.base.auto_connect = false;
+        }
+        if !no_process_eos {
+            driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        }
+        Ok(driver)
     }
 
     /// Push an interpose layer onto the octet I/O stack.
@@ -500,6 +590,52 @@ impl DrvAsynSerialPort {
         }
         Ok(())
     }
+
+    /// Build the fully-configured termios this driver pushes to the device:
+    /// `cfmakeraw` plus the fixed seeds (CREAD|CLOCAL, IGNBRK|IGNPAR,
+    /// VMIN/VTIME, VSTART/VSTOP) and the user config (baud/bits/parity/stop/
+    /// flow). It is rebuilt from `self.config` rather than read back from the
+    /// device, so the result is the canonical configured line state regardless
+    /// of what the kernel currently holds.
+    ///
+    /// This is the single source of that configured state, shared by `connect`
+    /// (initial setup) and the empty-key `set_option` re-apply (C
+    /// drvAsynSerialPort.c `applyOptions`, :105-130, which likewise re-pushes
+    /// its own cached termios, not the device's current one).
+    fn build_configured_termios(&self) -> AsynResult<libc::termios> {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe { libc::cfmakeraw(&mut t) };
+        // Enable receiver, local mode
+        t.c_cflag |= libc::CREAD | libc::CLOCAL;
+        // C parity (drvAsynSerialPort.c:1080): the default input flags are
+        // IGNBRK | IGNPAR. cfmakeraw clears IGNBRK (and never sets IGNPAR),
+        // so without this a line BREAK or a framing/parity error reaches
+        // the reader as a spurious 0x00 byte where C silently ignores it.
+        // apply_to_termios only touches c_iflag for XON/XOFF flow, so these
+        // survive the config layer.
+        t.c_iflag |= libc::IGNBRK | libc::IGNPAR;
+        // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte.
+        // Deliberate divergence from C (drvAsynSerialPort.c:1083 seeds
+        // VMIN=0 and reprograms VMIN/VTIME per read from the requested
+        // timeout, :899-908): C drives the read timeout through VTIME plus
+        // an epicsTimer, whereas this driver gates every read with
+        // poll(POLLIN, timeout) and only reads when data is ready. With that
+        // architecture VMIN=1 keeps `n == 0` meaning exactly EOF/hangup;
+        // VMIN=0 would make a spurious poll-wake return 0 and be misread as a
+        // disconnect. Every representable (non-negative) timeout is already
+        // bounded by the poll.
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        // C parity (drvAsynSerialPort.c:1085-1086): the XON/XOFF flow
+        // characters default to ^Q (0x11, VSTART) and ^S (0x13, VSTOP).
+        // `t` was zeroed before cfmakeraw and cfmakeraw leaves c_cc
+        // untouched, so without this FlowControl::Software (IXON|IXOFF)
+        // would drive flow with NUL bytes instead of ^Q/^S.
+        t.c_cc[libc::VSTART] = 0x11; // ^Q
+        t.c_cc[libc::VSTOP] = 0x13; // ^S
+        self.config.apply_to_termios(&mut t)?;
+        Ok(t)
+    }
 }
 
 impl PortDriver for DrvAsynSerialPort {
@@ -512,6 +648,15 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        // C drvAsynSerialPort.c::connectIt (694-698): reject a connect on
+        // an already-open link ("Link already open!") rather than opening a
+        // second fd and leaking the first (along with its saved termios).
+        if self.io.fd.is_some() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{}: Link already open!", self.base.port_name),
+            });
+        }
         // 1. Open device
         let c_path =
             std::ffi::CString::new(self.config.device.as_str()).map_err(|_| AsynError::Status {
@@ -534,20 +679,29 @@ impl PortDriver for DrvAsynSerialPort {
         // close the fd: `base.connected` is still false, so the `Drop`
         // impl would skip `disconnect()` and leak the descriptor.
         let setup = (|| -> AsynResult<()> {
+            // C parity (drvAsynSerialPort.c:713-722): set close-on-exec right
+            // after open so the serial fd is not inherited by child processes
+            // (e.g. an iocsh `system` call), which would otherwise hold the
+            // device open after this driver closes it.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(AsynError::Io(std::io::Error::last_os_error()));
+            }
+
             // 2. Save original termios
             let saved = self.get_current_termios()?;
             self.saved_termios = Some(saved);
 
-            // 3. Configure: cfmakeraw + apply config
-            let mut t: libc::termios = unsafe { std::mem::zeroed() };
-            unsafe { libc::cfmakeraw(&mut t) };
-            // Enable receiver, local mode
-            t.c_cflag |= libc::CREAD | libc::CLOCAL;
-            // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte
-            t.c_cc[libc::VMIN] = 1;
-            t.c_cc[libc::VTIME] = 0;
-            self.config.apply_to_termios(&mut t);
+            // 3. Configure: cfmakeraw + fixed seeds + user config. The full
+            // configured line state is owned by build_configured_termios so
+            // the empty-key set_option re-apply pushes exactly the same state.
+            let t = self.build_configured_termios()?;
             self.apply_termios(&t)?;
+
+            // C parity (drvAsynSerialPort.c:729): discard any bytes that
+            // accumulated in the kernel input/output buffers before the port
+            // was configured, so the first read/write starts from a clean
+            // device state. C does this right before turning blocking back on.
+            unsafe { libc::tcflush(fd, libc::TCIOFLUSH) };
 
             // 4. Restore blocking mode
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -602,12 +756,51 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
+    fn report(&self, level: i32) {
+        // C parity (drvAsynSerialPort.c:666-680): report the connection state,
+        // and at details>=1 the fd plus cumulative bytes written/read.
+        eprintln!(
+            "Serial line {}: {}",
+            self.config.device,
+            if self.base.connected {
+                "Connected"
+            } else {
+                "Disconnected"
+            }
+        );
+        if level >= 1 {
+            eprintln!("                    fd: {}", self.io.fd.unwrap_or(-1));
+            eprintln!("    Characters written: {}", self.io.n_written);
+            eprintln!("       Characters read: {}", self.io.n_read);
+            self.base.report_params(level.saturating_sub(1));
+        }
+    }
+
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
-        let result = self
+        let result = match self
             .base
             .interpose_octet
-            .dispatch_read(user, buf, &mut self.io)?;
+            .dispatch_read(user, buf, &mut self.io)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // C parity: drvAsynSerialPort.c::closeConnection on a fatal
+                // read error / EOF so the actor's auto-reconnect re-opens the
+                // device. EINTR/EAGAIN are already retried inside
+                // SerialIoState::read, so an error reaching here is fatal.
+                if is_fatal_transport_error(&e) && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "read error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                return Err(e);
+            }
+        };
         asyn_trace_io!(
             Some(self.base.trace),
             &self.base.port_name,
@@ -618,7 +811,7 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(result.nbytes_transferred)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
         asyn_trace_io!(
             Some(self.base.trace),
@@ -627,10 +820,28 @@ impl PortDriver for DrvAsynSerialPort {
             data,
             "write"
         );
-        self.base
+        match self
+            .base
             .interpose_octet
-            .dispatch_write(user, data, &mut self.io)?;
-        Ok(())
+            .dispatch_write(user, data, &mut self.io)
+        {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // C parity: closeConnection on a fatal write error so the
+                // next request reconnects (symmetric with read; matches
+                // ip_port DRV-5).
+                if is_fatal_transport_error(&e) && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "write error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
@@ -647,25 +858,28 @@ impl PortDriver for DrvAsynSerialPort {
                     status: AsynStatus::Error,
                     message: format!("invalid baud rate: '{value}'"),
                 })?;
-                if !is_supported_baud(baud) {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!(
-                            "unsupported baud rate: {baud} (supported: {:?})",
-                            SUPPORTED_BAUDS
-                        ),
-                    });
-                }
-                self.config.baud = baud;
+                // C parity (drvAsynSerialPort.c:340-343): reject an unsupported
+                // rate with asynError. baud_to_speed is the single source of
+                // truth for what is settable on this platform, so the
+                // validation and the speed lookup cannot disagree.
+                let speed = baud_to_speed(baud).ok_or_else(|| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("unsupported baud rate: {baud}"),
+                })?;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
-                    let speed = baud_to_speed(baud);
                     unsafe {
                         libc::cfsetispeed(&mut t, speed);
                         libc::cfsetospeed(&mut t, speed);
                     }
                     self.apply_termios(&t)?;
                 }
+                // C parity (drvAsynSerialPort.c:601-604): setOption restores the
+                // previous baud/termios if applyOptions fails. Commit the cached
+                // value only after a successful apply (or when the port is not
+                // open yet, where it is applied at the next connect), so
+                // getOption never reports a value the device rejected.
+                self.config.baud = baud;
             }
             "bits" => {
                 let bits = match value {
@@ -680,7 +894,6 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.config.data_bits = bits;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     t.c_cflag &= !libc::CSIZE;
@@ -692,13 +905,19 @@ impl PortDriver for DrvAsynSerialPort {
                     };
                     self.apply_termios(&t)?;
                 }
+                // Commit cached config only after a successful apply (see baud).
+                self.config.data_bits = bits;
             }
             "parity" => {
+                // C drvAsynSerialPort.c::setOption (379-395) accepts only
+                // "none"/"even"/"odd" (case-insensitive); anything else is
+                // asynError "Invalid parity." The single-char aliases n/e/o
+                // were a Rust-only superset and are dropped to match C.
                 let val_lower = value.to_ascii_lowercase();
                 let parity = match val_lower.as_str() {
-                    "none" | "n" => Parity::None,
-                    "even" | "e" => Parity::Even,
-                    "odd" | "o" => Parity::Odd,
+                    "none" => Parity::None,
+                    "even" => Parity::Even,
+                    "odd" => Parity::Odd,
                     _ => {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
@@ -708,7 +927,6 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.config.parity = parity;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     match parity {
@@ -724,6 +942,8 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     self.apply_termios(&t)?;
                 }
+                // Commit cached config only after a successful apply (see baud).
+                self.config.parity = parity;
             }
             "stop" => {
                 let stop = match value {
@@ -736,7 +956,6 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.config.stop_bits = stop;
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     match stop {
@@ -745,6 +964,8 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     self.apply_termios(&t)?;
                 }
+                // Commit cached config only after a successful apply (see baud).
+                self.config.stop_bits = stop;
             }
             "clocal" => {
                 let enabled = parse_bool_option(value)?;
@@ -760,11 +981,6 @@ impl PortDriver for DrvAsynSerialPort {
             }
             "crtscts" => {
                 let enabled = parse_bool_option(value)?;
-                if enabled {
-                    self.config.flow_control = FlowControl::Hardware;
-                } else if self.config.flow_control == FlowControl::Hardware {
-                    self.config.flow_control = FlowControl::None;
-                }
                 if self.io.fd.is_some() {
                     let mut t = self.get_current_termios()?;
                     if enabled {
@@ -773,6 +989,12 @@ impl PortDriver for DrvAsynSerialPort {
                         t.c_cflag &= !libc::CRTSCTS;
                     }
                     self.apply_termios(&t)?;
+                }
+                // Commit cached config only after a successful apply (see baud).
+                if enabled {
+                    self.config.flow_control = FlowControl::Hardware;
+                } else if self.config.flow_control == FlowControl::Hardware {
+                    self.config.flow_control = FlowControl::None;
                 }
             }
             "ixon" => {
@@ -812,15 +1034,14 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             "break" => {
-                // C parity: "off" = no-op, "" or "on" = standard break,
-                // numeric = break duration in ms
-                if value == "off" {
-                    // no-op
-                } else if let Some(fd) = self.io.fd {
-                    // Drain output first (C parity: tcdrain before tcsendbreak)
-                    if unsafe { libc::tcdrain(fd) } < 0 {
-                        return Err(AsynError::Io(std::io::Error::last_os_error()));
-                    }
+                // C parity (drvAsynSerialPort.c:507-528): "off" = no-op (early
+                // asynSuccess), "" or "on" = standard break (len 0), a number =
+                // break duration; anything else is "Bad number" (asynError).
+                // C validates the value and acts on the fd WITHOUT guarding on
+                // it being open, so a break on a closed port fails (tcsendbreak
+                // EBADF -> asynError) rather than silently succeeding. Mirror
+                // that order: validate first, then require the fd.
+                if value != "off" {
                     let duration = if value.is_empty() || value == "on" {
                         0 // standard break duration
                     } else {
@@ -829,6 +1050,13 @@ impl PortDriver for DrvAsynSerialPort {
                             message: format!("invalid break duration: '{value}'"),
                         })?
                     };
+                    // Disconnected -> error (not a silent no-op); C reaches
+                    // tcdrain/tcsendbreak on the dead fd and returns asynError.
+                    let fd = self.io.fd_or_err()?;
+                    // Drain output first (C parity: tcdrain before tcsendbreak).
+                    if unsafe { libc::tcdrain(fd) } < 0 {
+                        return Err(AsynError::Io(std::io::Error::last_os_error()));
+                    }
                     let ret = unsafe { libc::tcsendbreak(fd, duration) };
                     if ret < 0 {
                         return Err(AsynError::Io(std::io::Error::last_os_error()));
@@ -843,8 +1071,26 @@ impl PortDriver for DrvAsynSerialPort {
             | "rs485_delay_rts_after_send" => {
                 self.set_rs485_option(&key, value)?;
             }
-            _ => {
-                self.base.options.insert(key.to_string(), value.to_string());
+            other => {
+                // C drvAsynSerialPort.c::setOption (lines 594-616): any
+                // unsupported non-empty key returns asynError "Unsupported
+                // key" (the `epicsStrCaseCmp(key,"") != 0` guard at :594).
+                // The real handlers above own every supported key, so there
+                // is no generic option store.
+                if !other.is_empty() {
+                    return Err(AsynError::OptionNotFound(other.to_string()));
+                }
+                // The empty key is not an error: when the port is open C still
+                // runs applyOptions (:609-615), which forces CREAD and
+                // re-pushes the cached termios via tcsetattr (applyOptions,
+                // :119-126). That re-applies the configured line state to the
+                // device — restoring it if another process changed the port
+                // out from under the driver. Mirror it by re-pushing the
+                // canonical configured termios when connected.
+                if self.io.fd.is_some() {
+                    let t = self.build_configured_termios()?;
+                    self.apply_termios(&t)?;
+                }
             }
         }
         Ok(())
@@ -940,6 +1186,9 @@ impl PortDriver for DrvAsynSerialPort {
                     Ok("N".to_string())
                 }
             }
+            // C getOption (drvAsynSerialPort.c:204-207): "break" is a momentary
+            // line action, so a read always reports "off" rather than erroring.
+            "break" => Ok("off".to_string()),
             #[cfg(target_os = "linux")]
             "rs485_enable"
             | "rs485_rts_on_send"
@@ -1158,6 +1407,31 @@ mod tests {
         assert!(!drv.base().connected);
         assert!(drv.base().auto_connect);
         assert!(drv.base().flags.can_block);
+        // `new` is parse-only: no EOS interpose (DRV-45).
+        assert_eq!(drv.base().interpose_octet.len(), 0);
+    }
+
+    /// C drvAsynSerialPort.c:1126 enables EOS by default in Configure
+    /// unless noProcessEos; `configure` is the Rust analogue (DRV-45).
+    #[test]
+    fn test_configure_installs_eos_unless_suppressed_and_honors_no_auto_connect() {
+        let default_port =
+            DrvAsynSerialPort::configure("s_eos_default", "/dev/ttyS0", false, false).unwrap();
+        assert_eq!(
+            default_port.base().interpose_octet.len(),
+            1,
+            "default serial port must auto-install the EOS interpose"
+        );
+        assert!(default_port.base().auto_connect);
+
+        let suppressed =
+            DrvAsynSerialPort::configure("s_eos_off", "/dev/ttyS0", true, true).unwrap();
+        assert_eq!(
+            suppressed.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
+        );
+        assert!(!suppressed.base().auto_connect);
     }
 
     #[test]
@@ -1182,7 +1456,7 @@ mod tests {
         drv.set_option("parity", "even").unwrap();
         assert_eq!(drv.config.parity, Parity::Even);
         assert_eq!(drv.get_option("parity").unwrap(), "even");
-        drv.set_option("parity", "O").unwrap();
+        drv.set_option("parity", "odd").unwrap();
         assert_eq!(drv.config.parity, Parity::Odd);
     }
 
@@ -1202,12 +1476,110 @@ mod tests {
 
     #[test]
     fn test_set_option_unsupported_baud() {
+        // DRV-34: a non-standard rate (12345) is rejected only where the
+        // platform uses encoded Bxxx codes (Linux), matching C's switch default
+        // (drvAsynSerialPort.c:340-343). On macOS/BSD, where B9600 == 9600, C
+        // accepts any rate via `baudCode = baud` (:273-274), so the same value
+        // is settable there — see baud_arbitrary_on_bsd_mapped_set_on_linux.
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
-        let err = drv.set_option("baud", "12345").unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => assert!(message.contains("unsupported")),
-            _ => panic!("expected unsupported baud error"),
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        )))]
+        {
+            let err = drv.set_option("baud", "12345").unwrap_err();
+            match err {
+                AsynError::Status { message, .. } => assert!(message.contains("unsupported")),
+                _ => panic!("expected unsupported baud error"),
+            }
         }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            drv.set_option("baud", "12345").unwrap();
+            assert_eq!(drv.config.baud, 12345);
+            assert_eq!(drv.get_option("baud").unwrap(), "12345");
+        }
+    }
+
+    #[test]
+    fn baud_arbitrary_on_bsd_mapped_set_on_linux() {
+        // DRV-34: baud_to_speed is the single source of truth for which rates
+        // are settable. C (drvAsynSerialPort.c:271-345) accepts arbitrary rates
+        // where Bxxx == literal rate (macOS/BSD) and a fixed mapped set
+        // elsewhere (Linux), erroring on the rest.
+        assert!(baud_to_speed(9600).is_some(), "9600 is standard everywhere");
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            // Arbitrary rates accepted where the code is the literal rate; the
+            // speed code returned is the baud value itself (C: baudCode = baud).
+            assert_eq!(baud_to_speed(28800), Some(28800 as libc::speed_t));
+            assert_eq!(baud_to_speed(250000), Some(250000 as libc::speed_t));
+            assert_eq!(baud_to_speed(115200), Some(115200 as libc::speed_t));
+            // 0 (B0, line hangup) is accepted here too, matching C-macOS
+            // (baudCode = baud = 0), unlike the Linux switch.
+            assert_eq!(baud_to_speed(0), Some(0 as libc::speed_t));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Linux maps the high standard rates that the old fixed list (which
+            // capped at 230400) wrongly rejected, and still has no B28800.
+            assert!(baud_to_speed(460800).is_some(), "Linux maps 460800");
+            assert!(baud_to_speed(4000000).is_some(), "Linux maps 4000000");
+            assert!(baud_to_speed(28800).is_none(), "Linux has no B28800");
+            assert!(
+                baud_to_speed(250000).is_none(),
+                "Linux rejects non-standard"
+            );
+            // C's Linux switch starts at case 50 — no case 0, so baud 0 falls
+            // to the default asynError (drvAsynSerialPort.c:276-344).
+            assert!(
+                baud_to_speed(0).is_none(),
+                "Linux rejects baud 0 (C switch has no case 0)"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_to_termios_errors_on_unmappable_baud() {
+        // Round drv-s5 CONCERN fix: apply_to_termios surfaces an unmappable rate
+        // as an error rather than a silent B9600 fallback, even for a directly
+        // built SerialConfig that bypassed set_option validation.
+        let valid = SerialConfig::parse("/dev/ttyS0").unwrap();
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // A normal (9600) config applies cleanly on every platform.
+        assert!(valid.apply_to_termios(&mut t).is_ok());
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // 28800 is absent from C's Linux switch -> baud_to_speed None -> err.
+            let bad = SerialConfig {
+                baud: 28800,
+                ..SerialConfig::parse("/dev/ttyS0").unwrap()
+            };
+            assert!(bad.apply_to_termios(&mut t).is_err());
+        }
+        // macOS/BSD accept any rate via literal passthrough, so there is no
+        // unmappable baud to drive the error path there.
     }
 
     #[test]
@@ -1237,8 +1609,10 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
         drv.set_option("parity", "EVEN").unwrap();
         assert_eq!(drv.config.parity, Parity::Even);
-        drv.set_option("parity", "n").unwrap();
+        drv.set_option("parity", "None").unwrap();
         assert_eq!(drv.config.parity, Parity::None);
+        // Single-char aliases (n/e/o) are no longer accepted (C parity).
+        assert!(drv.set_option("parity", "n").is_err());
     }
 
     #[test]
@@ -1255,24 +1629,76 @@ mod tests {
 
     #[test]
     fn test_parse_bool_option() {
-        // Truthy
-        for v in &["y", "Y", "yes", "YES", "Yes", "1", "true", "TRUE", "True"] {
-            assert!(parse_bool_option(v).unwrap(), "expected true for '{v}'");
+        // C drvAsynSerialPort.c validates these options strictly Y/N
+        // (case-insensitive); the looser y/yes/1/true coercion is gone.
+        assert!(parse_bool_option("Y").unwrap());
+        assert!(parse_bool_option("y").unwrap());
+        assert!(!parse_bool_option("N").unwrap());
+        assert!(!parse_bool_option("n").unwrap());
+        // Tokens C rejects now error instead of silently coercing.
+        for v in &["yes", "1", "true", "no", "0", "false", "maybe", ""] {
+            assert!(parse_bool_option(v).is_err(), "expected err for '{v}'");
         }
-        // Falsy
-        for v in &["n", "N", "no", "NO", "No", "0", "false", "FALSE", "False"] {
-            assert!(!parse_bool_option(v).unwrap(), "expected false for '{v}'");
+    }
+
+    #[test]
+    fn get_option_break_returns_off() {
+        // DRV-39: C getOption (drvAsynSerialPort.c:204-207) reports "break" as
+        // "off" (a momentary line action), not an error.
+        let drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
+        assert_eq!(drv.get_option("break").unwrap(), "off");
+    }
+
+    #[test]
+    fn set_option_break_on_disconnected_errors_but_off_is_noop() {
+        // DRV-43: C setOption "break" (drvAsynSerialPort.c:507-528) does not
+        // guard on the fd, so a real break on a closed port fails
+        // (tcsendbreak EBADF -> asynError). The Rust arm previously skipped
+        // silently when disconnected. "off" stays a no-op (C asynSuccess), a
+        // bad duration is rejected before the fd is touched (C order).
+        let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
+
+        // "off" is a no-op even on a disconnected port.
+        drv.set_option("break", "off").unwrap();
+
+        // A real break on a disconnected port must error, not silently succeed.
+        let err = drv.set_option("break", "on").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    ..
+                }
+            ),
+            "break on a disconnected port must error, got {err:?}"
+        );
+
+        // A bad duration is rejected (validated before the fd, matching C).
+        let err = drv.set_option("break", "notanumber").unwrap_err();
+        match err {
+            AsynError::Status { message, .. } => {
+                assert!(message.contains("invalid break duration"))
+            }
+            other => panic!("expected invalid break duration error, got {other:?}"),
         }
-        // Invalid
-        assert!(parse_bool_option("maybe").is_err());
-        assert!(parse_bool_option("").is_err());
     }
 
     #[test]
     fn test_set_option_unknown() {
+        // C drvAsynSerialPort.c::setOption (594-598) rejects any non-empty
+        // unsupported key (asynError "Unsupported key") and never stores it,
+        // so a later getOption cannot echo it back.
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
-        drv.set_option("custom", "value").unwrap();
-        assert_eq!(drv.get_option("custom").unwrap(), "value");
+
+        let err = drv.set_option("custom", "value").unwrap_err();
+        assert!(matches!(err, AsynError::OptionNotFound(_)));
+        assert!(drv.get_option("custom").is_err());
+
+        // The empty key is not an error. With no open fd there is nothing to
+        // re-apply, so it is a no-op here; the connected re-apply path is
+        // covered by pty_empty_key_reapplies_configured_termios.
+        drv.set_option("", "ignored").unwrap();
     }
 
     #[test]
@@ -1293,11 +1719,13 @@ mod tests {
 
     #[test]
     fn test_baud_speed_roundtrip() {
+        // 0 is intentionally excluded: it maps only on macOS/BSD (passthrough),
+        // not on Linux, where C rejects it — see baud_arbitrary_on_bsd_mapped_set_on_linux.
         for baud in [
-            0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
+            50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
             57600, 115200, 230400,
         ] {
-            let speed = baud_to_speed(baud);
+            let speed = baud_to_speed(baud).expect("standard rate must map");
             assert_eq!(
                 speed_to_baud(speed),
                 baud,
@@ -1373,6 +1801,111 @@ mod tests {
         assert!(!drv.base().connected);
     }
 
+    /// DRV-57: a zero-length serial read request must be rejected with
+    /// asynError (C drvAsynSerialPort.c:871-875), NOT fall through to
+    /// libc::read(fd, ptr, 0) -> 0 -> EOF -> disconnect, which would tear
+    /// down a live serial port. The connection must stay up.
+    #[test]
+    fn pty_zero_length_read_rejected_not_eof_teardown() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_maxchars", &slave_name).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut empty: [u8; 0] = [];
+        let res = drv.read_octet(&ruser, &mut empty);
+        assert!(
+            matches!(
+                res,
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    ..
+                })
+            ),
+            "zero-length serial read must be rejected with asynError, got {res:?}"
+        );
+        assert!(
+            drv.base().connected,
+            "zero-length serial read must not tear down the connection"
+        );
+    }
+
+    /// DRV-36: the empty `set_option` key is not an error and, when the port is
+    /// open, re-applies the configured line state to the device (C
+    /// drvAsynSerialPort.c setOption :609-615 → applyOptions :119-126, which
+    /// re-pushes the cached termios). Simulate another process clobbering the
+    /// port's line settings and confirm the empty key restores the driver's
+    /// configured state. CSTOPB is used as the observable: a single c_cflag bit
+    /// that pty termios stores faithfully (unlike baud, which hardware may
+    /// reject).
+    #[test]
+    fn pty_empty_key_reapplies_configured_termios() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_reapply", &slave_name).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        let fd = drv.io.fd.expect("connected fd");
+
+        let read_cstopb = |fd: RawFd| -> bool {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+            (t.c_cflag & libc::CSTOPB) != 0
+        };
+
+        // The stop-bit state the driver pushed at connect (per config).
+        let configured = read_cstopb(fd);
+
+        // Externally flip the stop-bit width, as another process sharing the
+        // port would, and confirm the clobber actually took effect.
+        {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+            if configured {
+                t.c_cflag &= !libc::CSTOPB;
+            } else {
+                t.c_cflag |= libc::CSTOPB;
+            }
+            assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) }, 0);
+        }
+        assert_eq!(
+            read_cstopb(fd),
+            !configured,
+            "external clobber must take effect before the re-apply"
+        );
+
+        // The empty key re-applies the configured termios, overwriting the
+        // clobber — C applyOptions re-pushes the cached config, not the
+        // device's current state.
+        drv.set_option("", "").unwrap();
+        assert_eq!(
+            read_cstopb(fd),
+            configured,
+            "empty-key set_option must restore the configured line state"
+        );
+
+        drv.disconnect(&user).unwrap();
+    }
+
     #[test]
     fn test_pty_write_read_roundtrip() {
         let (master, slave, slave_name) = match create_pty_pair() {
@@ -1438,6 +1971,76 @@ mod tests {
     }
 
     #[test]
+    fn test_pty_read_error_disconnects() {
+        // DRV-31: a fatal read error / EOF must tear the connection down so
+        // the actor's auto-reconnect re-opens the device. Without it the port
+        // stays `connected` with a dead fd and never self-heals.
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+
+        // Break the link: closing the master makes the driver's slave fd
+        // return EOF (macOS) or EIO (Linux) on the next read — both fatal.
+        unsafe { libc::close(master) };
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let mut buf = [0u8; 32];
+        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        assert!(
+            is_fatal_transport_error(&err),
+            "expected a fatal transport error, got {err:?}"
+        );
+        assert!(
+            !drv.base().connected,
+            "DRV-31: fatal read error must set connected=false"
+        );
+    }
+
+    #[test]
+    fn test_pty_write_error_disconnects() {
+        // DRV-31 (write side, symmetric with read): a fatal write error must
+        // tear the connection down so the actor's auto-reconnect re-opens the
+        // device — same closeConnection contract C applies in writeIt
+        // (drvAsynSerialPort.c:837).
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+
+        // Break the link: closing the master makes the driver's slave fd return
+        // a fatal error (EIO) on the next write.
+        unsafe { libc::close(master) };
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = drv.write_octet(&mut user, b"hello world").unwrap_err();
+        assert!(
+            is_fatal_transport_error(&err),
+            "expected a fatal transport error, got {err:?}"
+        );
+        assert!(
+            !drv.base().connected,
+            "DRV-31: fatal write error must set connected=false"
+        );
+    }
+
+    #[test]
     fn test_pty_eos_interpose() {
         use crate::interpose::eos::{EosConfig, EosInterpose};
 
@@ -1495,6 +2098,34 @@ mod tests {
         let t = drv.get_current_termios().unwrap();
         let actual_speed = unsafe { libc::cfgetospeed(&t) };
         assert_eq!(actual_speed, libc::B115200);
+    }
+
+    #[test]
+    fn test_pty_connect_rejects_double_open() {
+        // C drvAsynSerialPort.c::connectIt (694-698) returns asynError
+        // "Link already open!" on a connect to an already-open link,
+        // rather than opening a second fd and leaking the first.
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        let first_fd = drv.io.fd;
+        assert!(first_fd.is_some());
+
+        let err = drv.connect(&user).unwrap_err();
+        assert!(matches!(err, AsynError::Status { .. }));
+        // The original fd (and its saved termios) is left intact.
+        assert_eq!(drv.io.fd, first_fd);
+        assert!(drv.saved_termios.is_some());
     }
 
     #[test]
@@ -1612,5 +2243,221 @@ mod tests {
             }
             unsafe { libc::close(fd2) };
         }
+    }
+
+    /// DRV-32: C (drvAsynSerialPort.c:1080) sets the default input flags to
+    /// IGNBRK | IGNPAR so a line BREAK / framing-parity error is ignored
+    /// rather than delivered as a spurious 0x00 byte. cfmakeraw clears IGNBRK
+    /// and never sets IGNPAR, so the driver must restore them after cfmakeraw.
+    #[test]
+    fn pty_termios_sets_ignbrk_ignpar() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_ignbrk", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let t = drv.get_current_termios().unwrap();
+        assert_ne!(
+            t.c_iflag & libc::IGNBRK,
+            0,
+            "IGNBRK must be set (C default, drvAsynSerialPort.c:1080)"
+        );
+        assert_ne!(
+            t.c_iflag & libc::IGNPAR,
+            0,
+            "IGNPAR must be set (C default, drvAsynSerialPort.c:1080)"
+        );
+    }
+
+    /// DRV-33: C (drvAsynSerialPort.c:1085-1086) seeds the XON/XOFF flow
+    /// characters to ^Q (0x11, VSTART) and ^S (0x13, VSTOP). cfmakeraw leaves
+    /// c_cc untouched and `t` is zeroed first, so the driver must set them or
+    /// software flow control would use NUL instead of ^Q/^S.
+    #[test]
+    fn pty_termios_sets_xon_xoff_chars() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_xonxoff", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let t = drv.get_current_termios().unwrap();
+        assert_eq!(t.c_cc[libc::VSTART], 0x11, "VSTART must be ^Q (C default)");
+        assert_eq!(t.c_cc[libc::VSTOP], 0x13, "VSTOP must be ^S (C default)");
+    }
+
+    /// DRV-35: C setOption (drvAsynSerialPort.c:601-604) restores the previous
+    /// baud/termios if applyOptions fails. The Rust driver must not leave the
+    /// cached config reporting a value the device rejected. Point the driver at
+    /// a non-tty fd so the apply path (tcgetattr/tcsetattr) fails, then assert
+    /// the cached baud is unchanged.
+    #[test]
+    fn set_option_does_not_commit_cached_config_on_apply_failure() {
+        let mut drv = DrvAsynSerialPort::new("rollback", "/dev/null").unwrap();
+        // A /dev/null fd is open but not a terminal: tcgetattr -> ENOTTY.
+        let badfd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        assert!(badfd >= 0, "could not open /dev/null");
+        drv.io.fd = Some(badfd);
+
+        // Default cached baud is 9600.
+        assert_eq!(drv.get_option("baud").unwrap(), "9600");
+
+        // The apply path fails (tcgetattr ENOTTY on /dev/null) ...
+        let r = drv.set_option("baud", "115200");
+        assert!(r.is_err(), "set_option must fail when apply fails");
+
+        // ... and the cached config must not have been mutated.
+        assert_eq!(
+            drv.get_option("baud").unwrap(),
+            "9600",
+            "cached baud must stay 9600 when apply fails (C restores baudPrev)"
+        );
+
+        // Clean up the fd ourselves (the driver never owned a real connection).
+        drv.io.fd = None;
+        unsafe { libc::close(badfd) };
+    }
+
+    /// DRV-37: C writeIt (drvAsynSerialPort.c:815-842) arms one timer for the
+    /// whole write, so the timeout bounds TOTAL write time. The old Rust write
+    /// reused the full timeout on every poll, so a peer that drains a little at
+    /// a time (each gap under the timeout) would never trip a per-poll timeout
+    /// and the write would run to completion well past the deadline. A slow
+    /// drain (4 KiB / 10 ms ~= 400 KiB/s) keeps each POLLOUT gap far under the
+    /// 300 ms timeout while a 512 KiB payload needs ~1.3 s to drain: the
+    /// total-deadline fix times out at ~300 ms; the per-poll bug would complete.
+    #[test]
+    fn pty_write_timeout_bounds_total_not_per_poll() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_write_total", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop2.load(Ordering::Relaxed) {
+                let n =
+                    unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n <= 0 {
+                    break; // slave closed (EOF) or error
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let payload = vec![0x5Au8; 512 * 1024];
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_millis(300));
+        let start = Instant::now();
+        let res = drv.write_octet(&mut user, &payload);
+        let elapsed = start.elapsed();
+
+        // Close the slave fd so the reader's blocking read returns EOF and the
+        // thread exits, then join before the PtyGuard closes the master fd.
+        stop.store(true, Ordering::Relaxed);
+        drv.disconnect(&AsynUser::default()).ok();
+        let _ = reader.join();
+
+        match res {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            }) => {}
+            other => panic!("expected total-deadline Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "total write time must be bounded by ~the timeout, took {elapsed:?}"
+        );
+    }
+
+    /// DRV-41: C connectIt (drvAsynSerialPort.c:713-722) sets FD_CLOEXEC on the
+    /// serial fd right after open so it is not inherited across exec.
+    #[test]
+    fn pty_connect_sets_cloexec() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_cloexec", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let fd = drv.io.fd.expect("connected fd");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "FD_CLOEXEC must be set after connect (C parity)"
+        );
+    }
+
+    /// DRV-44: C report (drvAsynSerialPort.c:666-680) shows cumulative
+    /// nWritten/nRead. Verify the counters track real I/O and report() runs at
+    /// every level without panicking.
+    #[test]
+    fn pty_report_tracks_byte_counters() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_report", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert_eq!(drv.io.n_written, 0);
+        assert_eq!(drv.io.n_read, 0);
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"hello").unwrap();
+        assert_eq!(drv.io.n_written, 5, "n_written must track bytes written");
+
+        let msg = b"world";
+        unsafe { libc::write(master, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut rbuf = [0u8; 32];
+        let n = drv.read_octet(&user, &mut rbuf).unwrap();
+        assert!(n > 0);
+        assert_eq!(drv.io.n_read, n as u64, "n_read must track bytes read");
+
+        // report() must not panic at any level.
+        drv.report(0);
+        drv.report(2);
     }
 }

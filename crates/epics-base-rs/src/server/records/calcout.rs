@@ -21,6 +21,12 @@ pub struct CalcoutRecord {
     pub calc: String,
     pub oopt: i16, // Output Option: 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
     cached_should_output: bool, // Cached result from process() for framework
+    // C `calcoutRecord.c::execOutput:620-625`: on a DOPT=Use_OVAL output cycle,
+    // a successful OCAL `calcPerform` sets `udf = isnan(oval)` (NOT VAL-based),
+    // which raises UDF_ALARM and lets IVOA gate the OUT write. `Some(_)` carries
+    // that per-cycle decision to `value_is_undefined()`; `None` (Use_VAL, an OCAL
+    // calc error, or a non-output cycle) leaves udf VAL-based, matching C.
+    ocal_udf_override: Option<bool>,
     pub dopt: i16, // Data Option: 0=Use CALC, 1=Use OCAL
     pub ocal: String,
     pub oval: f64,
@@ -113,6 +119,11 @@ pub struct CalcoutRecord {
     // delay is pending, cleared on the delayed re-process. Externally
     // readable (DBF_SHORT) so clients can observe the pending state.
     pub dlya: i16,
+    // OEVT ("Event To Issue") — C `calcoutRecord.c` `prec->oevt` (DBF_STRING).
+    // When output fires and OEVT names a non-empty event, `execOutput` posts
+    // it (`postEvent(eventNameToHandle(oevt))`) right after `writeValue`; see
+    // [`Record::output_event`].
+    pub oevt: String,
     // Internal: captured output decision while an ODLY delay is pending.
     // The delayed re-process must write the output that the *original*
     // cycle decided on, not re-evaluate should_output() against the
@@ -153,6 +164,7 @@ impl Default for CalcoutRecord {
             calc: String::new(),
             oopt: 0,
             cached_should_output: false,
+            ocal_udf_override: None,
             dopt: 0,
             ocal: String::new(),
             oval: 0.0,
@@ -233,6 +245,7 @@ impl Default for CalcoutRecord {
             pval: 0.0,
             odly: 0.0,
             dlya: 0,
+            oevt: String::new(),
             pending_output: false,
             calc_alarm: false,
             rpcl: None,
@@ -450,6 +463,11 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
         name: "DLYA",
         dbf_type: DbFieldType::Short,
         read_only: true,
+    },
+    FieldDesc {
+        name: "OEVT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
     },
     FieldDesc {
         name: "DOPT",
@@ -926,10 +944,46 @@ impl Record for CalcoutRecord {
         "calcout"
     }
 
+    // C raises UDF_ALARM from BOTH `checkAlarms` and `execOutput`, and
+    // `recGblSetSevr` only raises (never lowers), so the effective UDF
+    // condition is the OR of the two:
+    //   * `checkAlarms` (`calcoutRecord.c:244`, BEFORE the output switch) sees
+    //     `udf = isnan(VAL)` (set at line 241) and raises UDF_ALARM if VAL is
+    //     NaN — independent of OVAL.
+    //   * `execOutput` (`calcoutRecord.c:620-630`, Use_OVAL output cycle) then
+    //     sets `udf = isnan(OVAL)` and raises UDF_ALARM if OVAL is NaN.
+    // So a NaN VAL keeps the record INVALID even when OCAL yields a finite OVAL
+    // (the `checkAlarms` raise stands). `ocal_udf_override` carries the
+    // execOutput half — `Some(true)` when a Use_OVAL output cycle produced a
+    // NaN OVAL — and is OR'd with the VAL-NaN half. `None` (Use_VAL / OCAL calc
+    // error / non-output cycle) leaves udf purely VAL-based, matching the trait
+    // default. (Residual: C's udf *field* ends at `isnan(OVAL)` on a Use_OVAL
+    // output cycle, so for NaN VAL + finite OVAL C reports UDF field 0 with
+    // SEVR INVALID; Rust's single value_is_undefined() reports the field as 1.
+    // The SEVR/STAT — the parity-critical observables — match.)
+    fn value_is_undefined(&self) -> bool {
+        self.val.is_nan() || matches!(self.ocal_udf_override, Some(true))
+    }
+
     // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback
     // then sends OVAL. VAL is the calc *result* and remains intact.
+    //
+    // The `oval = ivov` substitution lives inside `execOutput`
+    // (calcoutRecord.c:646), which `process` calls ONLY under the
+    // `if (doOutput)` gate (calcoutRecord.c:276). So a non-output INVALID
+    // cycle (OOPT condition not met) must NOT clobber OVAL to IVOV — the
+    // retained OVAL stands and no spurious OVAL monitor is posted.
+    // `cached_should_output` is this cycle's doOutput decision. This is NOT
+    // additionally gated on a calc-failure (unlike acalcout): calcout's hook
+    // runs after the framework's `evaluate_alarms`, so the INVALID severity it
+    // sees already covers calc/limit/MS — exactly as C `execOutput` applies
+    // IVOA on any `nsev >= INVALID_ALARM`.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        self.put_field("OVAL", ivov)
+        if self.cached_should_output {
+            self.put_field("OVAL", ivov)
+        } else {
+            Ok(())
+        }
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -984,7 +1038,11 @@ impl Record for CalcoutRecord {
             }
         }
 
-        // Determine output and evaluate OCAL if needed
+        // Determine output and evaluate OCAL if needed. C runs this in
+        // `execOutput`, called only when the OOPT predicate (`should_output`)
+        // fired — so the OCAL-derived udf below is reset every cycle and set
+        // only on an actual Use_OVAL output cycle.
+        self.ocal_udf_override = None;
         if self.should_output() {
             if self.dopt == 1 {
                 // Use OCAL
@@ -995,7 +1053,17 @@ impl Record for CalcoutRecord {
                     // OCAL `VAL` token reads the *previous* OVAL, not VAL.
                     inputs.prev_val = self.oval;
                     match crate::calc::eval(compiled, &mut inputs) {
-                        Ok(v) => self.oval = v,
+                        Ok(v) => {
+                            self.oval = v;
+                            // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
+                            // on the successful-OCAL branch. A NaN OVAL then
+                            // raises UDF_ALARM (execOutput:628) so IVOA gates the
+                            // OUT write — without this a finite VAL but NaN OVAL
+                            // drives NaN to OUT with NO_ALARM (silent-wrong-value).
+                            self.ocal_udf_override = Some(self.oval.is_nan());
+                        }
+                        // C `execOutput:622`: OCAL calcPerform failure raises
+                        // CALC_ALARM and leaves udf VAL-based (no override).
                         Err(_) => self.calc_alarm = true,
                     }
                 }
@@ -1091,6 +1159,7 @@ impl Record for CalcoutRecord {
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::Short(self.dlya)),
+            "OEVT" => Some(EpicsValue::String(self.oevt.clone().into())),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
@@ -1269,6 +1338,13 @@ impl Record for CalcoutRecord {
                 _ => Err(CaError::TypeMismatch("ODLY".into())),
             },
             "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
+            "OEVT" => match value {
+                EpicsValue::String(s) => {
+                    self.oevt = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("OEVT".into())),
+            },
             "DOPT" => match value {
                 EpicsValue::Short(v) => {
                     self.dopt = v;
@@ -1550,6 +1626,22 @@ impl Record for CalcoutRecord {
 
     fn should_output(&self) -> bool {
         self.cached_should_output
+    }
+
+    /// `OEVT` ("Event To Issue"): post the named output event when output
+    /// fires. C `calcoutRecord.c` `execOutput` does `if (prec->epvt)
+    /// postEvent(prec->epvt);` right after `writeValue`, gated to the same
+    /// OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`,
+    /// the framework's `should_output()` gate) — the framework adds the IVOA
+    /// `Don't_drive` veto. The event name is posted verbatim (a numeric name
+    /// is canonicalised by the event router to match a `SCAN="Event"` record's
+    /// `EVNT`). An empty `OEVT` is C's `epvt == NULL` (no event).
+    fn output_event(&self) -> Option<String> {
+        if self.cached_should_output && !self.oevt.trim().is_empty() {
+            Some(self.oevt.clone())
+        } else {
+            None
+        }
     }
 
     fn can_device_write(&self) -> bool {

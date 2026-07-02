@@ -52,6 +52,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interfaces::gpib::{AsynGpib, GpibCommand, GpibUniversalCommand, SrqStatus};
+use crate::interpose::EomReason;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -67,6 +69,29 @@ pub const DEFAULT_TCP_PORT: u16 = 1234;
 /// Initial output staging buffer capacity. Matches C asyn
 /// `pdpvt->bufCapacity = 4096`. Read path grows as needed.
 pub const DEFAULT_BUF_CAPACITY: usize = 4096;
+
+/// End-of-message reason for a prologix read chunk. Single owner of
+/// the C `readIt` rule (drvPrologixGPIB.c:334-345): the device message
+/// is fully buffered, then served in caller-sized chunks. The final
+/// chunk — the caller buffer (`maxchars`) holds the rest of the
+/// message (`remaining`) — carries `ASYN_EOM_EOS` when an EOS char is
+/// configured, else `ASYN_EOM_END` (binary/EOI mode). A buffer-limited
+/// chunk carries `ASYN_EOM_CNT`; an exact fit (`remaining == maxchars`)
+/// sets both.
+fn read_eom(remaining: usize, maxchars: usize, eos_set: bool) -> EomReason {
+    let mut eom = EomReason::empty();
+    if maxchars >= remaining {
+        eom |= if eos_set {
+            EomReason::EOS
+        } else {
+            EomReason::END
+        };
+    }
+    if remaining >= maxchars {
+        eom |= EomReason::CNT;
+    }
+    eom
+}
 
 /// Mutable per-driver state — last-sent GPIB address (so `++addr`
 /// is suppressed when unchanged), EOS char (or `None` for "let the
@@ -100,6 +125,16 @@ pub struct DrvAsynPrologixPort {
 }
 
 impl DrvAsynPrologixPort {
+    /// Discard any staged read remainder (`read_carry`). C parity:
+    /// `drvPrologixGPIB.c` resets `bufCount = 0` on every transaction
+    /// boundary (write begin/end) and session boundary (connect) so a reply
+    /// tail left unconsumed by a too-small read buffer never leaks into the
+    /// next command's response. Single owner for that invariant — called
+    /// from `write_octet`, `connect`, `io_flush`, and `disconnect`.
+    fn clear_read_carry(&self) {
+        self.state.lock().unwrap().read_carry.clear();
+    }
+
     /// Construct a new Prologix driver. Mirrors C asyn
     /// `prologixGPIBConfigure(portName, host, priority, noAutoConnect)`.
     /// `host` may be `"hostname"` (default port 1234 appended) or
@@ -161,22 +196,41 @@ impl DrvAsynPrologixPort {
         self.state.lock().unwrap().eos
     }
 
-    /// Set EOS char (`Some(c)`) or disable (`None` — EOT marker
-    /// fallback). Mirrors C asyn `prologixSetEos`. The actual wire
-    /// effect is applied lazily on the next read/write — same as C
-    /// asyn which only re-issues `++eot_enable` when toggling
-    /// between "EOS-driven" and "EOT-marker" modes.
-    pub fn set_eos(&self, eos: Option<u8>) -> AsynResult<()> {
-        let mut s = self.state.lock().unwrap();
-        if s.eos == eos {
+    /// The `++eot_enable` argument the bridge needs for the given EOS mode.
+    /// C `prologixSetEos` (drvPrologixGPIB.c:456) sends `++eot_enable (eos<0)`:
+    /// in EOI mode (no eos char) the bridge must append the EOT marker on EOI
+    /// detection so the reader can find the end of message (enable=1); in EOS
+    /// mode the read terminates on the eos char, so the EOT marker must be
+    /// disabled (enable=0) — otherwise the bridge trails it after the eos byte
+    /// and the eos-terminated read never sees its terminator. (C computes this
+    /// from the *stale* pre-update eos and never stores the new value — a bug
+    /// not copied; we derive it from the live state.)
+    fn eot_enable_arg(eos: Option<u8>) -> u8 {
+        u8::from(eos.is_none())
+    }
+
+    /// Set EOS char (`Some(c)`) or disable (`None` — EOI / EOT-marker mode).
+    /// Mirrors C asyn `prologixSetEos` (drvPrologixGPIB.c:439-459), but realizes
+    /// the intent C's never-store bug dropped: the driver-level `eos` actually
+    /// changes, and the bridge's `++eot_enable` is re-issued to follow it (1 in
+    /// EOI mode, 0 in EOS mode, see [`Self::eot_enable_arg`]) so the EOT marker
+    /// never collides with an eos-terminated read. Single owner of the eos
+    /// transition (also reached via `set_input_eos`).
+    pub fn set_eos(&mut self, eos: Option<u8>) -> AsynResult<()> {
+        if self.state.lock().unwrap().eos == eos {
             return Ok(());
         }
-        // C asyn sends `++eot_enable %d` with the *previous* eos<0
-        // boolean to flip the bridge between "use EOI/EOT marker" and
-        // "trust user EOS char". The inner write requires &mut self
-        // routing — we punt the bridge command to the next read/write
-        // path which already knows how to send `++` lines.
-        s.eos = eos;
+        // Re-issue the bridge EOT mode only while connected; otherwise the
+        // connect handshake applies it (it derives `++eot_enable` from this
+        // state). Commit `State.eos` only after a successful bridge write, so a
+        // failed write never leaves the cached mode out of sync with the
+        // device (the DRV-35 commit-after-apply rule).
+        if self.base.connected {
+            let cmd = format!("++eot_enable {}\n", Self::eot_enable_arg(eos));
+            let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
+            self.inner.write_octet(&mut bridge_user, cmd.as_bytes())?;
+        }
+        self.state.lock().unwrap().eos = eos;
         Ok(())
     }
 
@@ -243,7 +297,7 @@ impl DrvAsynPrologixPort {
         let cmd = Self::addr_line(primary, secondary);
         let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
         match self.inner.write_octet(&mut bridge_user, cmd.as_bytes()) {
-            Ok(()) => {
+            Ok(_) => {
                 let mut s = self.state.lock().unwrap();
                 s.last_primary = primary;
                 s.last_secondary = secondary;
@@ -278,6 +332,12 @@ impl PortDriver for DrvAsynPrologixPort {
             s.last_primary = -1;
             s.last_secondary = -1;
         }
+        // C parity: prologixConnect also resets bufCount=0 — a fresh session
+        // must not serve a previous connection's staged reply tail (the F6
+        // staged-read-discard invariant). disconnect clears it, but a
+        // reconnect driven without an intervening disconnect (e.g. the inner
+        // ip_port auto-disconnected on a read error) would otherwise leak it.
+        self.clear_read_carry();
         // Port-level connect: address < 0 in C asyn. For per-device
         // connect (address >= 0) C asyn does nothing protocol-side
         // beyond announcing the exception, since GPIB devices live
@@ -285,10 +345,16 @@ impl PortDriver for DrvAsynPrologixPort {
         if user.addr < 0 {
             self.inner.connect(user)?;
             // 8-line init burst — sent as one TCP write to match
-            // C asyn (single `pasynOctetSyncIO->write`).
+            // C asyn (single `pasynOctetSyncIO->write`). C hardcodes
+            // `++eot_enable 1` here (drvPrologixGPIB.c:182) because its
+            // driver-level eos is always -1 (the never-store bug). This port
+            // does eos at the driver level, so the EOT mode must follow the
+            // configured eos even when it was set before connect: derive it
+            // from State.eos (default None -> 1, matching C's common case).
+            let eot_enable = Self::eot_enable_arg(self.state.lock().unwrap().eos);
             let init = format!(
                 "++savecfg 0\n++mode 1\n++ifc\n++eos 3\n++eoi 1\n\
-                 ++eot_char {EOT_MARKER}\n++eot_enable 1\n++ver\n",
+                 ++eot_char {EOT_MARKER}\n++eot_enable {eot_enable}\n++ver\n",
             );
             let mut tu = AsynUser::default().with_timeout(Duration::from_secs(1));
             self.inner.write_octet(&mut tu, init.as_bytes())?;
@@ -329,7 +395,7 @@ impl PortDriver for DrvAsynPrologixPort {
         }
         // Drop any buffered read remainder — it belongs to the old
         // connection and must not leak into the next session.
-        self.state.lock().unwrap().read_carry.clear();
+        self.clear_read_carry();
         self.base.set_connected(false);
         Ok(())
     }
@@ -339,12 +405,71 @@ impl PortDriver for DrvAsynPrologixPort {
         // The transport flush cannot see `read_carry` (an application
         // buffer), so clear it here too or a stale carry would be
         // returned as the response to the new command.
-        self.state.lock().unwrap().read_carry.clear();
+        self.clear_read_carry();
         self.inner.io_flush(user)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    // C parity: prologix is an asynGpibPort whose octet EOS interface maps to
+    // prologixSetEos / prologixGetEos over the single driver `eos` field
+    // (drvPrologixGPIB.c:422-459), not to a generic base cache. The default
+    // PortDriver::{set,get}_input_eos write `base.input_eos` and forward to an
+    // (empty) interpose stack, so they would store EOS bytes the prologix
+    // read/write path never consults — `get_input_eos` would echo bytes with no
+    // protocol effect. Route the interface to `State.eos`, the field the read
+    // (`++read <eos>` vs `++read eoi`) and write (append-on-`eos>=0`) paths
+    // actually use.
+    fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+        // asynGpib's wrapper rejects eoslen > 1 ("only 1 is allowed",
+        // asynGpib.c:443) and prologixSetEos rejects the same with asynError
+        // "Invalid EOS" (drvPrologixGPIB.c:449-452); 0 disables EOS (eos < 0).
+        let new_eos = match eos.len() {
+            0 => None,
+            1 => Some(eos[0]),
+            _ => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "Invalid EOS".into(),
+                });
+            }
+        };
+        self.set_eos(new_eos)
+    }
+
+    fn get_input_eos(&self) -> Vec<u8> {
+        // C prologixGetEos (drvPrologixGPIB.c:422-437): eos < 0 reports
+        // eoslen 0; otherwise eoslen 1 carrying the single EOS byte.
+        match self.state.lock().unwrap().eos {
+            Some(c) => vec![c],
+            None => Vec::new(),
+        }
+    }
+
+    // C parity: asynGpib's octet vtable leaves setOutputEos / getOutputEos NULL
+    // (asynGpib.c:132 — `...setInputEos, getInputEos, 0, 0`), so a GPIB port has
+    // no output-EOS support; prologix appends its single `eos` on write
+    // (write_octet) rather than a separate output terminator. Reject
+    // set_output_eos instead of silently caching ineffective bytes in
+    // `base.output_eos`, and report none — the output twin of the input-EOS
+    // routing above (same defect family: the EOS interface must reflect the
+    // driver's real EOS state, never a dead base cache).
+    fn set_output_eos(&mut self, _eos: &[u8]) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "output EOS not supported on a GPIB port".into(),
+        })
+    }
+
+    fn get_output_eos(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
+        // C parity: prologixWrite sets bufCount=0 at the start of every
+        // write, discarding any reply tail the previous read left staged —
+        // otherwise the next read returns that stale data as the response to
+        // *this* command (cross-transaction leak).
+        self.clear_read_carry();
         self.set_address(user)?;
         let eos = self.state.lock().unwrap().eos;
         let mut out: Vec<u8> = Vec::with_capacity(data.len() + 4);
@@ -355,10 +480,30 @@ impl PortDriver for DrvAsynPrologixPort {
             Self::stash_char(&mut out, c);
         }
         out.push(b'\n');
-        self.inner.write_octet(user, &out)
+        // Report the caller's data length as bytes transferred, not the
+        // GPIB-framed wire length (`out`): on a successful inner write all of
+        // `data` was accepted (C asyn reports the application payload count).
+        self.inner.write_octet(user, &out)?;
+        Ok(data.len())
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.io_read_octet_eom(user, buf).map(|(n, _)| n)
+    }
+
+    /// Octet read that also reports the end-of-message reason. Single
+    /// owner of the prologix read path; [`read_octet`] delegates here
+    /// and discards the EOM. C `readIt` (drvPrologixGPIB.c:334-349)
+    /// returns `eomReason` (END/EOS/CNT) alongside the byte count; the
+    /// default actor synthesis would report CNT-only and lose the GPIB
+    /// EOI / EOS message boundary.
+    ///
+    /// [`read_octet`]: PortDriver::read_octet
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
         self.base.check_ready()?;
         // Drain bytes left over from a previous read whose buffer was
         // too small before issuing a new bridge `++read` — otherwise
@@ -367,10 +512,12 @@ impl PortDriver for DrvAsynPrologixPort {
         {
             let mut st = self.state.lock().unwrap();
             if !st.read_carry.is_empty() {
-                let n = st.read_carry.len().min(buf.len());
+                let remaining = st.read_carry.len();
+                let n = remaining.min(buf.len());
                 buf[..n].copy_from_slice(&st.read_carry[..n]);
                 st.read_carry.drain(..n);
-                return Ok(n);
+                let eom = read_eom(remaining, buf.len(), st.eos.is_some());
+                return Ok((n, eom));
             }
         }
         self.set_address(user)?;
@@ -428,20 +575,94 @@ impl PortDriver for DrvAsynPrologixPort {
                 Err(e) => return Err(e),
             }
         }
-        // Drop trailing EOT marker when no eos char (it's framing,
-        // not data). When eos is set, the eos char IS data the
-        // record consumer expects, so we leave it.
-        if eos.is_none() && acc.last() == Some(&EOT_MARKER) {
+        // Strip the trailing terminator: the EOT marker in EOI mode (it's
+        // framing, not data) or the matched eos byte in EOS mode. Mirrors
+        // the asynGpib read layer (asynGpib.c:415-419) and the standard
+        // EosInterpose, both of which remove the matched terminator before
+        // the record sees the data; streamDevice and asynRecord expect the
+        // eos-stripped form.
+        if acc.last() == Some(&terminator) {
             acc.pop();
         }
-        let n = acc.len().min(buf.len());
+        let remaining = acc.len();
+        let n = remaining.min(buf.len());
         buf[..n].copy_from_slice(&acc[..n]);
-        if n < acc.len() {
+        if n < remaining {
             // Caller's buffer was too small — stash the remainder so the
             // next read_octet returns it instead of dropping device data.
             self.state.lock().unwrap().read_carry = acc.split_off(n);
         }
-        Ok(n)
+        let eom = read_eom(remaining, buf.len(), eos.is_some());
+        Ok((n, eom))
+    }
+}
+
+/// GPIB bus-control interface, mirroring C `prologixMethods`
+/// (drvPrologixGPIB.c:527-545). Most IEEE-488 control operations are
+/// unimplemented by the Prologix bridge driver in C; only `ifc` and
+/// `srqStatus` are real. This is the first (and only) implementor of
+/// [`AsynGpib`].
+///
+/// NOTE: there is no Rust devGpib / asynManager `findInterface(asynGpibType)`
+/// discovery layer yet, so nothing in the current stack *reaches* this
+/// interface — it provides the bridge's real GPIB command behavior for a
+/// future GPIB device-support layer (the discovery wiring is a separate,
+/// larger gap, not closed here).
+impl AsynGpib for DrvAsynPrologixPort {
+    /// C `prologixAddressedCmd` (drvPrologixGPIB.c:461-467): unimplemented.
+    fn addressed_cmd(&mut self, _user: &AsynUser, _cmd: GpibCommand, _addr: i32) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "prologixAddressedCmd unimplemented".into(),
+        })
+    }
+
+    /// C `prologixUniversalCmd` (drvPrologixGPIB.c:469-474): unimplemented.
+    fn universal_cmd(&mut self, _user: &AsynUser, _cmd: GpibUniversalCommand) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "prologixUniversalCmd unimplemented".into(),
+        })
+    }
+
+    /// C `prologixIfc` (drvPrologixGPIB.c:476-484): assert Interface Clear by
+    /// writing the bridge command `++ifc\n` to the TCP transport.
+    fn ifc(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
+        self.inner.write_octet(&mut bridge_user, b"++ifc\n")?;
+        Ok(())
+    }
+
+    /// C `prologixRen` (drvPrologixGPIB.c:486-491): unimplemented.
+    fn ren(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "prologixRen unimplemented".into(),
+        })
+    }
+
+    /// C `prologixSrqStatus` (drvPrologixGPIB.c:493-498): always reports SRQ
+    /// not asserted (`*srqStatus = 0`) — the bridge driver does not surface
+    /// SRQ state.
+    fn srq_status(&self, _user: &AsynUser) -> AsynResult<SrqStatus> {
+        Ok(SrqStatus {
+            srq_asserted: false,
+            status_byte: None,
+        })
+    }
+
+    /// C `prologixSrqEnable` (drvPrologixGPIB.c:500-504): no-op success.
+    fn srq_enable(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// C `prologixSerialPoll` (drvPrologixGPIB.c:513-518): unimplemented
+    /// (serialPollBegin / serialPoll / serialPollEnd all return asynError).
+    fn serial_poll(&mut self, _user: &AsynUser) -> AsynResult<u8> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "prologixSerialPoll unimplemented".into(),
+        })
     }
 }
 
@@ -609,6 +830,249 @@ mod tests {
         );
     }
 
+    /// DRV-50: `AsynGpib::ifc` asserts Interface Clear by writing `++ifc\n`
+    /// to the bridge (C `prologixIfc`, drvPrologixGPIB.c:476-484).
+    #[test]
+    fn gpib_ifc_writes_bridge_command() {
+        let (port, rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        drv.ifc(&AsynUser::default().with_timeout(Duration::from_secs(2)))
+            .unwrap();
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+        let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let s = String::from_utf8_lossy(&captured).to_string();
+        // Strip the init burst (which contains its own ++ifc\n) and check the
+        // post-init bytes are exactly the ifc command.
+        let init_end = s.find("++ver\n").unwrap() + "++ver\n".len();
+        assert_eq!(&s[init_end..], "++ifc\n", "ifc must write ++ifc\\n");
+    }
+
+    /// DRV-50: the GPIB command interface matches C `prologixMethods`
+    /// (drvPrologixGPIB.c:527-545) — `srqStatus` reports not-asserted,
+    /// `srqEnable` is a no-op success, and every other operation is
+    /// unimplemented (asynError).
+    #[test]
+    fn gpib_command_interface_matches_c_methods() {
+        let mut drv = DrvAsynPrologixPort::new("p", "127.0.0.1:1234", false).unwrap();
+        let user = AsynUser::default();
+
+        // srqStatus: always not asserted (C *srqStatus = 0).
+        let srq = drv.srq_status(&user).unwrap();
+        assert!(!srq.srq_asserted);
+        assert_eq!(srq.status_byte, None);
+
+        // srqEnable: no-op success.
+        assert!(drv.srq_enable(&user, true).is_ok());
+        assert!(drv.srq_enable(&user, false).is_ok());
+
+        // The rest are unimplemented in C → asynError.
+        assert!(drv.addressed_cmd(&user, GpibCommand::GET, 7).is_err());
+        assert!(drv.universal_cmd(&user, GpibUniversalCommand::DCL).is_err());
+        assert!(drv.ren(&user, true).is_err());
+        assert!(drv.serial_poll(&user).is_err());
+    }
+
+    #[test]
+    fn write_discards_staged_read_carry() {
+        // DRV-48: a new write must discard any reply tail the previous read
+        // left staged (C prologixWrite sets bufCount=0 at the start), or the
+        // next read returns that stale data as the response to *this*
+        // command.
+        let (port, _rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        // Simulate a prior small-buffer read that left a tail staged.
+        drv.state.lock().unwrap().read_carry = b"STALE_TAIL".to_vec();
+
+        let mut user_w = AsynUser::default()
+            .with_addr(3)
+            .with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user_w, b"*IDN?").unwrap();
+
+        assert!(
+            drv.state.lock().unwrap().read_carry.is_empty(),
+            "DRV-48: write_octet must clear the staged read_carry"
+        );
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
+    #[test]
+    fn connect_discards_staged_read_carry() {
+        // DRV-51: a fresh session (connect) must discard a prior
+        // connection's staged reply tail (C prologixConnect resets
+        // bufCount=0), so a reconnect without an intervening disconnect does
+        // not leak stale bytes into the first read.
+        let (port, _rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+
+        // Stale tail from a hypothetical prior session.
+        drv.state.lock().unwrap().read_carry = b"OLD_SESSION_TAIL".to_vec();
+
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        assert!(
+            drv.state.lock().unwrap().read_carry.is_empty(),
+            "DRV-51: connect must clear the staged read_carry"
+        );
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
+    /// DRV-46: the octet EOS interface must reflect the driver's real `eos`
+    /// state (C prologixSetEos / prologixGetEos over `pdpvt->eos`), not the
+    /// dead `base.{input,output}_eos` cache. `set_input_eos` routes to
+    /// `State.eos`; `get_input_eos` reports it (eoslen 0 unset / 1 with the
+    /// byte); eoslen > 1 is rejected; output EOS is unsupported on a GPIB port
+    /// (asynGpib leaves the output-EOS vtable slots NULL).
+    #[test]
+    fn eos_interface_routes_to_driver_state() {
+        let mut drv = DrvAsynPrologixPort::new("p", "127.0.0.1:1234", false).unwrap();
+
+        // Default: no EOS -> eoslen 0 (C eos < 0).
+        assert!(drv.get_input_eos().is_empty());
+        assert_eq!(drv.eos(), None);
+
+        // A single EOS byte routes to State.eos and is echoed by get_input_eos.
+        drv.set_input_eos(b"\n").unwrap();
+        assert_eq!(drv.eos(), Some(b'\n'));
+        assert_eq!(drv.get_input_eos(), vec![b'\n']);
+
+        // Clearing (eoslen 0) returns to None.
+        drv.set_input_eos(b"").unwrap();
+        assert_eq!(drv.eos(), None);
+        assert!(drv.get_input_eos().is_empty());
+
+        // eoslen > 1 is rejected (asynGpib "only 1 is allowed" / "Invalid EOS").
+        assert!(drv.set_input_eos(b"\r\n").is_err());
+        // The rejected call must not have mutated the driver EOS state.
+        assert_eq!(drv.eos(), None);
+
+        // Output EOS is unsupported on a GPIB port (C asynGpib NULL vtable).
+        assert!(drv.set_output_eos(b"\n").is_err());
+        assert!(drv.get_output_eos().is_empty());
+    }
+
+    /// DRV-46(b): the bridge `++eot_enable` must follow the configured eos so
+    /// the EOT marker never collides with an eos-terminated read (C
+    /// prologixSetEos design, drvPrologixGPIB.c:456). Setting an eos char while
+    /// connected issues `++eot_enable 0`; clearing it restores `++eot_enable 1`.
+    #[test]
+    fn eos_mode_toggles_bridge_eot_enable() {
+        let (port, rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        drv.set_eos(Some(b'\n')).unwrap(); // enter EOS mode -> eot_enable 0
+        drv.set_eos(None).unwrap(); // leave EOS mode -> eot_enable 1
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+        let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let s = String::from_utf8_lossy(&captured).to_string();
+        // Strip the init burst (its own ++eot_enable) to focus on the post-init
+        // transitions.
+        let init_end = s.find("++ver\n").unwrap() + "++ver\n".len();
+        assert_eq!(
+            &s[init_end..],
+            "++eot_enable 0\n++eot_enable 1\n",
+            "eos set/clear must toggle the bridge EOT mode: {:?}",
+            &s[init_end..]
+        );
+    }
+
+    /// DRV-46(b): an eos char configured before connect makes the connect init
+    /// burst select `++eot_enable 0` — the handshake derives the EOT mode from
+    /// State.eos (C's always-1 connect is only correct because its eos is
+    /// permanently -1).
+    #[test]
+    fn eos_set_before_connect_seeds_eot_enable_off() {
+        let (port, rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        // Set eos while disconnected: no bridge write, just cached state.
+        drv.set_eos(Some(b'\n')).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+        let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let s = String::from_utf8_lossy(&captured).to_string();
+        assert!(
+            s.contains("++eot_enable 0\n"),
+            "init burst must select ++eot_enable 0 when eos preset: {s:?}"
+        );
+        assert!(
+            !s.contains("++eot_enable 1\n"),
+            "no ++eot_enable 1 should appear when eos preset: {s:?}"
+        );
+    }
+
+    /// DRV-47: the end-of-message rule must match C `readIt`
+    /// (drvPrologixGPIB.c:334-345) at every boundary — full fit flags
+    /// the boundary (EOS if configured, else END), a buffer-limited
+    /// chunk flags CNT, and an exact fit flags both.
+    #[test]
+    fn read_eom_rule_matches_c_readit() {
+        // Full fit, binary/EOI mode -> END only.
+        let e = read_eom(5, 16, false);
+        assert!(e.contains(EomReason::END));
+        assert!(!e.contains(EomReason::EOS));
+        assert!(!e.contains(EomReason::CNT));
+        // Full fit, EOS configured -> EOS only.
+        let e = read_eom(5, 16, true);
+        assert!(e.contains(EomReason::EOS));
+        assert!(!e.contains(EomReason::END));
+        assert!(!e.contains(EomReason::CNT));
+        // Buffer-limited (more of the message remains) -> CNT, no boundary.
+        let e = read_eom(20, 8, false);
+        assert!(e.contains(EomReason::CNT));
+        assert!(!e.contains(EomReason::END));
+        assert!(!e.contains(EomReason::EOS));
+        // Exact fit -> boundary AND CNT (C sets both when remaining == maxchars).
+        let e = read_eom(8, 8, false);
+        assert!(e.contains(EomReason::END));
+        assert!(e.contains(EomReason::CNT));
+        let e = read_eom(8, 8, true);
+        assert!(e.contains(EomReason::EOS));
+        assert!(e.contains(EomReason::CNT));
+    }
+
+    /// DRV-47: serving a staged `read_carry` remainder through
+    /// `io_read_octet_eom` must report the boundary — CNT while the
+    /// caller buffer is too small, END once the remainder is fully
+    /// drained (binary/EOI mode, no eos char).
+    #[test]
+    fn read_eom_carry_path_reports_boundary() {
+        let (port, _rx) = start_mock_bridge();
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+
+        // Stage a remainder (EOT marker already stripped, so its end is
+        // the true end of message).
+        drv.state.lock().unwrap().read_carry = b"RESULT".to_vec();
+        let user = AsynUser::default()
+            .with_addr(3)
+            .with_timeout(Duration::from_secs(2));
+
+        // Buffer too small (4 < 6): partial -> CNT, no END.
+        let mut small = [0u8; 4];
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut small).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&small[..4], b"RESU");
+        assert!(eom.contains(EomReason::CNT));
+        assert!(!eom.contains(EomReason::END));
+
+        // Remainder fits -> END, no CNT.
+        let mut rest = [0u8; 16];
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut rest).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&rest[..2], b"LT");
+        assert!(eom.contains(EomReason::END));
+        assert!(!eom.contains(EomReason::CNT));
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
     /// `read_octet` end-to-end: driver sends `++read eoi\n`, the
     /// bridge replies with payload + EOT_MARKER, the driver returns
     /// the payload with the marker stripped. Covers the no-EOS path
@@ -654,20 +1118,32 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"42.5\n",
             "EOT marker should be stripped, leaving `42.5\\n`"
         );
+        // DRV-47: binary/EOI mode, the whole message fits the buffer ->
+        // ASYN_EOM_END (not EOS, no CNT) per C readIt:339-340.
+        assert!(
+            eom.contains(EomReason::END),
+            "EOI message boundary must flag END"
+        );
+        assert!(!eom.contains(EomReason::EOS));
+        assert!(
+            !eom.contains(EomReason::CNT),
+            "full-fit read must NOT flag CNT"
+        );
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }
 
     /// `read_octet` with EOS char set: driver sends `++read <eos>\n`
-    /// and the eos char IS data — must NOT be stripped (it's the
-    /// payload terminator the consumer expects).
+    /// and the matched eos byte is stripped from the data the record
+    /// sees, mirroring the asynGpib read layer (asynGpib.c:415-419) and
+    /// the standard EosInterpose. The boundary still flags EOS.
     #[test]
-    fn read_with_eos_keeps_terminator_byte() {
+    fn read_with_eos_strips_terminator_byte() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
@@ -706,12 +1182,19 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
-            b"OK\n",
-            "eos char must be preserved as part of payload"
+            b"OK",
+            "matched eos byte must be stripped from the payload"
         );
+        // DRV-47: with an EOS char configured the final chunk carries
+        // ASYN_EOM_EOS (not END) per C readIt:337-338.
+        assert!(
+            eom.contains(EomReason::EOS),
+            "EOS-mode message boundary must flag EOS"
+        );
+        assert!(!eom.contains(EomReason::END));
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
     }
 

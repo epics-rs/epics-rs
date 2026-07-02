@@ -86,7 +86,7 @@ impl MotorRecord {
             if self.timing.ntm
                 && (self.pos.rdif >= 0) != self.stat.cdir
                 && self.pos.diff.abs()
-                    > self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd)
+                    > self.timing.ntmf as f64 * (self.retry.bdst.abs() + self.retry.rdbd)
                 && self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY)
                 && !self.stat.mip.contains(MipFlags::STOP)
             {
@@ -177,6 +177,7 @@ impl MotorRecord {
                         self.stat.cdir = hw_forward;
                         effects.commands.push(MotorCommand::Home {
                             forward: hw_forward,
+                            min_velocity: self.effective_vbas(),
                             velocity: self.vel.hvel,
                             acceleration: self.home_accel_egu(),
                         });
@@ -225,6 +226,15 @@ impl MotorRecord {
                     self.retry.rcnt += 1;
                     self.retry.miss = true;
                     self.finalize_or_delay(&mut effects);
+                    // C maybeRetry give-up (1063-1065) re-arms MIP_JOG_REQ
+                    // from the held field and do_work re-fires same-pass —
+                    // identical to the evaluate_position_error give-up, since
+                    // both reach the one maybeRetry. The gate inside
+                    // dispatch_latent_collection (can_accept_command) keeps
+                    // this Pause-reached path parked until Go (matching the
+                    // retry branch's can_accept_command gate at 240) while an
+                    // NTM-stop give-up under Go re-fires the held jog now.
+                    self.dispatch_latent_collection(&mut effects, false);
                 } else {
                     // C 1077-1082 with 1356's dmov=TRUE UNMARKed and
                     // reversed: DMOV never posts 1 — the move stays "not
@@ -391,6 +401,11 @@ impl MotorRecord {
                 if self.internal.pp && self.stat.msta.contains(MstaFlags::DONE) && !self.stat.movn {
                     self.internal.pp = false;
                     self.postprocess_sync();
+                    // This early-return quiesces the axis without finalize_motion
+                    // and dispatches nothing, deferring a held button to a later
+                    // pass. pp is now cleared, so the next forced poll falls
+                    // through to dispatch_latent_collection (427) and resumes it.
+                    self.request_poll_for_held_button(&mut effects);
                     return effects;
                 }
                 // C: ea063f5f — if the record marked an externally initiated
@@ -433,7 +448,7 @@ impl MotorRecord {
     }
 
     /// Finalize motion: set Idle, DMOV=true.
-    pub(crate) fn finalize_motion(&mut self, _effects: &mut ProcessEffects) {
+    pub(crate) fn finalize_motion(&mut self, effects: &mut ProcessEffects) {
         self.set_phase(MotionPhase::Idle);
         self.stat.mip = MipFlags::empty();
         self.stat.dmov = true;
@@ -472,6 +487,42 @@ impl MotorRecord {
         // stop_or_pause return on that pass; completions that keep
         // SPMG=Move reach the chain end and apply, like C.
         self.apply_latent_sync();
+
+        // SYNC is already consumed above and queued_motion was cleared, but a
+        // jog/home/tweak button latched across this completion still resumes
+        // only on a later pass — request the forced poll that delivers it.
+        self.request_poll_for_held_button(effects);
+    }
+
+    /// A jog/home/tweak button latched across a quiescing record pass (a motion
+    /// completion, or the SET-mode pp-resync early-return) resumes only on a
+    /// subsequent pass, where the Idle-arm `dispatch_latent_collection` re-fires
+    /// it. The poll loop now notifies the record only on a changed status (the C
+    /// `statusChanged_` gate, asynMotorAxis.cpp:316-322), so a now-stationary
+    /// axis would never deliver that pass and the held button would strand.
+    /// Request one forced poll (→ `PollDirective::Refresh`) so the deferred
+    /// level-triggered action gets its pass. C strands this case (`special()`
+    /// arms MIP_JOG_REQ only at mip==MIP_DONE, motorRecord.cc:3045, so a button
+    /// pressed during a move is never armed); preserving the resume is a
+    /// deliberate divergence from C's strand of an actively-held button.
+    ///
+    /// Single owner of the rule, called at every quiescing site so the closed-
+    /// loop DOL pull stays excluded (the change-gate leaves it to CP-link/SCAN,
+    /// as C does). Bounded to one forced poll: a limit-blocked jog/home returns
+    /// from `dispatch_latent_buttons` without re-entering a quiescing path,
+    /// `collect_tweak` clears twf/twr on its first attempt, and the pp-resync
+    /// clears `pp` before its forced poll so it cannot re-trigger.
+    pub(crate) fn request_poll_for_held_button(&self, effects: &mut ProcessEffects) {
+        if self.can_accept_command()
+            && (self.ctrl.jogf
+                || self.ctrl.jogr
+                || self.ctrl.homf
+                || self.ctrl.homr
+                || self.ctrl.twf
+                || self.ctrl.twr)
+        {
+            effects.request_poll = true;
+        }
     }
 
     /// C maybeRetry close-enough restore (motorRecord.cc:1096-1101): a
@@ -627,6 +678,19 @@ impl MotorRecord {
                 self.retry.rcnt += 1;
                 self.retry.miss = true;
                 self.finalize_motion(effects);
+                // C maybeRetry give-up (motorRecord.cc:1063-1065):
+                // `mip = MIP_DONE` then re-arm `MIP_JOG_REQ` from the held
+                // jogf/jogr field — unlike the close-enough/rtry==0 branches
+                // (1055/1088 `mip &= MIP_JOG_REQ`), which only PRESERVE an
+                // already-set bit and during a positional move read 0 because
+                // special() arms MIP_JOG_REQ only at mip==MIP_DONE (3042-3053).
+                // dmov stays TRUE through give-up, so do_work re-fires the
+                // armed jog/home in the SAME process pass (1489 `pmr->dmov`).
+                // dispatch_latent_collection is the Rust same-pass do_work
+                // re-fire: finalize_motion above set dmov=true and cleared
+                // mip, so the gate passes and a held jog/home replays now
+                // instead of waiting for the next idle poll.
+                self.dispatch_latent_collection(effects, false);
                 return;
             }
             if self.retry.rmod == RetryMode::InPosition {
@@ -666,6 +730,22 @@ impl MotorRecord {
                 self.retry.miss = false;
                 self.restore_spmg_move_to_pause();
             }
+            if ls_blocks_retry {
+                // C motorRecord.cc:1366-1380 — a positional move halted by a
+                // hardware limit switch in the travel direction forces
+                // `pp = TRUE` and re-arms a GET_INFO cycle; the next callback
+                // runs postProcess (826-849), which adopts the limit readback
+                // into VAL/DVAL/RVAL and zeroes DIFF/RDIF. The Rust poll
+                // already carries the fresh limit readback (process_motor_info
+                // ran this cycle), so postprocess_sync() applies it directly.
+                //
+                // Scope is the LS-stop ALONE: a plain MOVE_ABS never sets `pp`
+                // (the dispatch sites at C 1983/2025/2110/2125 are SET-mode,
+                // HOME, and JOG — not positional moves), so C does NOT sync a
+                // close-enough or rtry-disabled completion. Do not extend the
+                // sync to those branches.
+                self.postprocess_sync();
+            }
             self.finalize_motion(effects);
         }
     }
@@ -695,6 +775,7 @@ impl MotorRecord {
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
+                min_velocity: self.effective_vbas(),
                 velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
@@ -709,6 +790,7 @@ impl MotorRecord {
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
+                min_velocity: self.effective_vbas(),
                 velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
@@ -736,12 +818,14 @@ impl MotorRecord {
         if self.use_relative_moves() {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: pretarget - self.pos.drbv,
+                min_velocity: self.effective_vbas(),
                 velocity: self.backlash_leg_velocity(self.vel.velo),
                 acceleration: self.move_accel_egu(),
             });
         } else {
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position: pretarget,
+                min_velocity: self.effective_vbas(),
                 velocity: self.backlash_leg_velocity(self.vel.velo),
                 acceleration: self.move_accel_egu(),
             });
@@ -767,6 +851,7 @@ impl MotorRecord {
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
+                min_velocity: self.effective_vbas(),
                 velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
@@ -778,6 +863,7 @@ impl MotorRecord {
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
+                min_velocity: self.effective_vbas(),
                 velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });

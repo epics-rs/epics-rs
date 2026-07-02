@@ -12,14 +12,16 @@ pub use epics_base_rs::runtime::supervise::{RestartPolicy, RestartTracker};
 /// Mirrors C procServ `enum RestartMode { restart, norestart, oneshot }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RestartMode {
-    /// Default: relaunch the child whenever it exits.
+    /// Default: relaunch the child whenever it exits. C name: `restart`.
     #[default]
     OnExit,
-    /// Disabled: child exit shuts the supervisor down too. C name:
-    /// `norestart`.
+    /// No auto-restart: the child is not relaunched on exit, but the
+    /// supervisor stays up (only `OneShot` sets `shutdownServer`; C
+    /// `norestart`, procServ.cc:369-371). Toggle back with `^T`.
     Disabled,
-    /// One-shot: relaunch exactly once, then act like `Disabled`.
-    /// C name: `oneshot`.
+    /// One-shot: relaunch once more, then the supervisor exits when the
+    /// child next exits (C `oneshot` gated on `firstRun`,
+    /// procServ.cc:373-375,656).
     OneShot,
 }
 

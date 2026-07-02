@@ -49,9 +49,27 @@ vxi11 = []
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Win32 serial backend (drivers::serial_port on Windows == C
+# drvAsynSerialPortWin32.c): raw CreateFile/DCB/COMMTIMEOUTS/ReadFile/
+# WriteFile/PurgeComm bindings.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_Communication",
+    # ReadFile/WriteFile signatures name OVERLAPPED; CreateFileW names
+    # SECURITY_ATTRIBUTES — both must resolve even though we pass NULL.
+    "Win32_System_IO",
+    "Win32_Security",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+# Integration tests that drive the asyn record through a real CA server's
+# put gate (the process-passive `should_process` path). No dependency cycle:
+# epics-ca-rs does not depend on asyn-rs.
+epics-ca-rs = { workspace = true }
 
 [[bench]]
 name = "throughput"

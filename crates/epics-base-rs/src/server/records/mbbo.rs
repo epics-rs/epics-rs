@@ -79,6 +79,7 @@ pub struct MbboRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// Set by `convert()` when VAL is an illegal state (`> 15` with a
     /// defined state table). C `mbboRecord.c::convert` raises
     /// `SOFT_ALARM/INVALID` for this case; the alarm is actually
@@ -90,6 +91,13 @@ pub struct MbboRecord {
     // when `mlst != val`. Captured during process() because the framework
     // reads monitor_value_changed() after process() has committed mlst.
     value_changed: bool,
+    /// Set by `set_device_did_compute(true)` when a device readback has
+    /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
+    /// `process()` then skips the forward `VAL -> RVAL` `convert()` that
+    /// would recompute RVAL from VAL and discard the readback — C
+    /// `processMbbo` sets `rval`/`val` from the callback and returns without
+    /// re-converting (devAsynInt32.c:1310-1330 / devAsynUInt32Digital.c:945-962).
+    skip_convert: bool,
 }
 
 impl Default for MbboRecord {
@@ -164,8 +172,10 @@ impl Default for MbboRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             soft_alarm: false,
             value_changed: false,
+            skip_convert: false,
         }
     }
 }
@@ -183,6 +193,24 @@ impl MbboRecord {
             self.zrvl, self.onvl, self.twvl, self.thvl, self.frvl, self.fvvl, self.sxvl, self.svvl,
             self.eivl, self.nivl, self.tevl, self.elvl, self.tvvl, self.ttvl, self.ftvl, self.ffvl,
         ]
+    }
+
+    /// Reverse of `convert()`: map an already-`SHFT`-shifted raw to a state
+    /// index. With a defined state table, the index whose ZRVL..FFVL matches,
+    /// else `65535` (unknown state); without one, the raw is the value
+    /// directly. C `processMbbo` readback (devAsynInt32.c:1314-1330 /
+    /// devAsynUInt32Digital.c:948-963); the input twin is `mbbi::raw_to_val`.
+    fn raw_to_val(&self, raw: u32) -> u16 {
+        if !self.sdef {
+            return raw as u16;
+        }
+        let rvs = self.raw_values();
+        for (i, &rv) in rvs.iter().enumerate() {
+            if rv == raw {
+                return i as u16;
+            }
+        }
+        65535
     }
 
     fn compute_sdef(&mut self) {
@@ -586,6 +614,11 @@ static MBBO_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 /// Helper macro: maps EPICS field name strings to struct fields.
@@ -766,7 +799,15 @@ impl Record for MbboRecord {
     /// applies only to INPUT records (ai/bi/mbbi), where VAL is the
     /// engineering value.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        self.convert();
+        // A device readback (`apply_raw_readback`) has already set both RVAL
+        // and VAL from the hardware; skip the forward VAL -> RVAL convert that
+        // would recompute RVAL from VAL and discard it. One-shot (C
+        // `processMbbo` readback returns without re-converting; a normal
+        // process always converts).
+        if !self.skip_convert {
+            self.convert();
+        }
+        self.skip_convert = false;
         self.oraw = self.rval;
         self.orbv = self.rbv;
         // Capture the VAL-change
@@ -794,6 +835,7 @@ impl Record for MbboRecord {
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "OMSL" => omsl: Short, "DOL" => dol: String,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String, "SIMS" => sims: Short,
+            "SDLY" => sdly: Double,
             "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
@@ -820,6 +862,7 @@ impl Record for MbboRecord {
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "OMSL" => omsl: Short, "DOL" => dol: String,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String, "SIMS" => sims: Short,
+            "SDLY" => sdly: Double,
             "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
@@ -833,6 +876,29 @@ impl Record for MbboRecord {
     }
 
     fn can_device_write(&self) -> bool {
+        true
+    }
+
+    fn set_device_did_compute(&mut self, did: bool) {
+        self.skip_convert = did;
+    }
+
+    /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
+    /// the raw and resolve VAL through the state table, mirroring C
+    /// `processMbbo`/`initMbbo` (devAsynInt32.c:1311-1330,1296 /
+    /// devAsynUInt32Digital.c:945-963,930). `RVAL` keeps the masked-but-
+    /// unshifted raw; VAL is the state index of the shifted raw. Returns
+    /// `true` so the store reports `computed` and the framework skips the
+    /// forward convert (via `set_device_did_compute`).
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        let masked = (raw as u32) & self.mask;
+        self.rval = masked;
+        let shifted = if self.shft > 0 {
+            masked.checked_shr(self.shft as u32).unwrap_or(0)
+        } else {
+            masked
+        };
+        self.val = self.raw_to_val(shifted);
         true
     }
 

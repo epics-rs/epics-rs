@@ -147,6 +147,30 @@ impl PvaCodec {
         self.frame(false, CMD_SEARCH, p)
     }
 
+    /// Byte offset of the SEARCH flags octet within a frame built by
+    /// [`Self::build_search_batch`] / [`Self::build_discover_search`]: the
+    /// fixed PVA header ([`PvaHeader::SIZE`]) followed by the 4-byte
+    /// `searchSequenceID`. Pinned by the
+    /// `search_frame_unicast_copy_matches_builder` test.
+    const SEARCH_FLAGS_OFFSET: usize = PvaHeader::SIZE + 4;
+
+    /// Return a copy of an already-built SEARCH frame with the `Unicast`
+    /// flag bit (`0x80`) set in its flags octet. pvxs reuses one SEARCH
+    /// buffer and toggles this bit per destination (`client.cpp:1180-1187`):
+    /// set for a unicast target, clear for broadcast/multicast. The
+    /// `build_*` helpers emit the broadcast shape (bit clear), so the search
+    /// engine sends this unicast copy to a unicast destination — a
+    /// flag-reading peer (pvAccessCPP/Java) keys its local re-broadcast off
+    /// the bit. Other flag bits (e.g. `MustReply` on a discover frame) are
+    /// preserved.
+    pub fn search_frame_unicast_copy(frame: &[u8]) -> Vec<u8> {
+        let mut f = frame.to_vec();
+        if let Some(b) = f.get_mut(Self::SEARCH_FLAGS_OFFSET) {
+            *b |= 0x80;
+        }
+        f
+    }
+
     /// Build a discover-style empty SEARCH packet — flags carry the
     /// `MustReply` bit (0x01), the protocol list is empty, and the
     /// channel list is empty. Mirrors pvxs `tickSearch(SearchKind::
@@ -218,6 +242,19 @@ impl PvaCodec {
 
     pub fn build_put(&self, server_channel_id: u32, ioid: u32, value_data: &[u8]) -> Vec<u8> {
         let p = Self::op_payload(server_channel_id, ioid, 0x00, value_data, self.order());
+        self.frame(false, CMD_PUT, p)
+    }
+
+    /// PUT `GetOPut` phase — `subcmd=0x40` (`QosFlags::GET`), no value body.
+    /// pvxs `clientget.cpp:299-300` (`GPROp::GetOPut`): a get-first builder
+    /// (e.g. enum-by-label / read-modify-write) reads the current value
+    /// through *this* PUT op's own pvRequest mask on the same `ioid`, rather
+    /// than opening a separate `ChannelGet` with an empty all-fields request.
+    /// The server replies with the current value (it derives `isput =
+    /// !(subcmd & 0x40)`, `serverget.cpp:364`), then the client sends the
+    /// `0x00` exec frame with the built value.
+    pub fn build_put_get(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
+        let p = Self::op_payload(server_channel_id, ioid, QosFlags::GET, &[], self.order());
         self.frame(false, CMD_PUT, p)
     }
 
@@ -444,6 +481,37 @@ mod tests {
         assert_eq!(&bytes[16..26], &[0u8; 10]);
         assert_eq!(&bytes[26..28], &[0xff, 0xff]);
         assert_eq!(&bytes[28..32], &[192, 168, 1, 5]);
+    }
+
+    /// PVX-81: `search_frame_unicast_copy` must set exactly the same
+    /// `Unicast` bit the builder sets when asked for `unicast=true`, with no
+    /// other byte difference. Pins `SEARCH_FLAGS_OFFSET` to the real frame
+    /// layout — if the layout shifts, the copy diverges from the builder and
+    /// this fails.
+    #[test]
+    fn search_frame_unicast_copy_matches_builder() {
+        for big_endian in [false, true] {
+            let c = codec(big_endian);
+            let bcast =
+                c.build_search_batch(0x6669_6e64, &[(7, "MY:PV")], [0, 0, 0, 0], 5076, false);
+            let ucast_builder =
+                c.build_search_batch(0x6669_6e64, &[(7, "MY:PV")], [0, 0, 0, 0], 5076, true);
+            let ucast_copy = PvaCodec::search_frame_unicast_copy(&bcast);
+            assert_eq!(
+                ucast_copy, ucast_builder,
+                "flag-flipped copy must equal the unicast-built frame (big_endian={big_endian})"
+            );
+            // And the only delta vs the broadcast frame is the flags octet.
+            assert_eq!(bcast.len(), ucast_copy.len());
+            for (i, (a, b)) in bcast.iter().zip(&ucast_copy).enumerate() {
+                if i == PvaHeader::SIZE + 4 {
+                    assert_eq!(*a & 0x80, 0);
+                    assert_eq!(*b & 0x80, 0x80);
+                } else {
+                    assert_eq!(a, b, "byte {i} must be unchanged");
+                }
+            }
+        }
     }
 
     #[test]

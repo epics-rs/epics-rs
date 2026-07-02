@@ -1002,17 +1002,32 @@ fn cmd_db_load_records() -> CommandDef {
                     p.to_path_buf()
                 }
             };
-            let mut defs = db_loader::parse_db_file(&file_path, &macros, &config)
-                .map_err(|e| format!("parse error: {e}"))?;
+            let (mut defs, breaktables) =
+                db_loader::parse_db_file_with_breaktables(&file_path, &macros, &config)
+                    .map_err(|e| format!("parse error: {e}"))?;
 
             // DTYP override: if macros contain DTYP, override existing DTYP fields
             if let Some(dtyp) = macros.get("DTYP") {
                 db_loader::override_dtyp(&mut defs, dtyp);
             }
 
+            // Merge any `breaktable(...)` definitions into the database's shared
+            // breakpoint-table registry (C `bptList`) and snapshot it for the
+            // records loaded by this command. A record resolves a table loaded
+            // by an earlier or the same `dbLoadRecords` (C ordering).
+            let breaktable_registry =
+                ctx.block_on(async { ctx.db().add_breaktables(breaktables).await });
+
             let count = defs.len();
 
-            for def in defs {
+            for mut def in defs {
+                // Resolve a `LINR` field naming a loaded breakpoint table to its
+                // menuConvert index (shared with the IocBuilder load path).
+                db_loader::resolve_linr_breaktable_names(
+                    &def.record_type,
+                    &mut def.fields,
+                    &breaktable_registry,
+                );
                 let added: Result<(), String> = ctx.block_on(async {
                     // C-parity (dbLexRoutines.c:1170-1188): the SAME
                     // record name re-loaded with the SAME record_type
@@ -1059,6 +1074,9 @@ fn cmd_db_load_records() -> CommandDef {
                     } else {
                         let mut record = db_loader::create_record(&def.record_type)
                             .map_err(|e| format!("{e}"))?;
+                        // The breakpoint-table registry is installed by
+                        // `add_record` (the single creation sink); apply_fields
+                        // only needs the LINR index, already resolved above.
                         if let Err(e) =
                             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                         {
@@ -1585,6 +1603,7 @@ fn dbf_type_name(val: &EpicsValue) -> &'static str {
         EpicsValue::UInt64(_) | EpicsValue::UInt64Array(_) => "DBF_UINT64",
         EpicsValue::UShort(_) | EpicsValue::UShortArray(_) => "DBF_USHORT",
         EpicsValue::ULong(_) | EpicsValue::ULongArray(_) => "DBF_ULONG",
+        EpicsValue::UChar(_) | EpicsValue::UCharArray(_) => "DBF_UCHAR",
         EpicsValue::ShortArray(_) => "DBF_SHORT",
         EpicsValue::FloatArray(_) => "DBF_FLOAT",
         EpicsValue::EnumArray(_) => "DBF_ENUM",
@@ -1866,6 +1885,140 @@ record(mbbo, "DUP:CM") {{
                 inst.record.get_field("ONST"),
                 Some(crate::types::EpicsValue::String("Bayer".into())),
                 "ONST from first block survives (no override)"
+            );
+        });
+    }
+
+    /// Q2: a merge-reload that loads a new breakpoint table AND repoints an
+    /// existing record's LINR to it. The merge branch updates the existing
+    /// instance in place (it never goes back through `add_record`'s install),
+    /// so the registry must reach it via `add_breaktables`' re-install. Proves
+    /// the repointed record linearises through the table loaded in the same
+    /// reload.
+    #[test]
+    fn test_db_load_records_merge_repoints_linr_to_new_breaktable() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+
+        // First load: an `ao` with no breakpoint table.
+        let tmp1 = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp1.as_file(),
+            r#"record(ao, "BPT:RBK") {{ field(DESC, "first") }}"#
+        )
+        .expect("write tempfile 1");
+        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        // Second load: define the table AND repoint the existing record's LINR.
+        let tmp2 = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp2.as_file(),
+            r#"
+breaktable(ramp) {{ 0 0  100 10  300 30 }}
+record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
+"#
+        )
+        .expect("write tempfile 2");
+        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        ctx.block_on(async {
+            let rec = db.get_record("BPT:RBK").await.expect("BPT:RBK exists");
+            let mut inst = rec.write().await;
+            // The merge resolved "ramp" (non-standard) to the first user-table
+            // index (15); standard menuConvert names reserve 3..=14.
+            assert_eq!(
+                inst.record.get_field("LINR"),
+                Some(crate::types::EpicsValue::Short(15))
+            );
+            // eng 5.0 -> raw 50 through the re-installed registry.
+            inst.record
+                .put_field("VAL", crate::types::EpicsValue::Double(5.0))
+                .unwrap();
+            inst.record.process().unwrap();
+            assert_eq!(
+                inst.record.get_field("RVAL"),
+                Some(crate::types::EpicsValue::Long(50)),
+                "merge-repointed LINR must linearise through the new table"
+            );
+        });
+    }
+
+    /// Regression: a record resolved to a breakpoint table in load #1 must
+    /// keep converting through THAT table after load #2 adds an
+    /// alphabetically-earlier table. With the old name-sorted index, loading
+    /// "alpha" shifted "zebra" from index 15 to 16 while the record's frozen
+    /// LINR stayed 15, so re-install silently re-pointed it to "alpha".
+    /// Load-order user-table indices keep "zebra" at 15.
+    #[test]
+    fn test_db_load_records_later_table_does_not_repoint_resolved_record() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+
+        // Load #1: table "zebra" (slope 0.1) + record A referencing it.
+        let tmp1 = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp1.as_file(),
+            r#"
+breaktable(zebra) {{ 0 0  100 10 }}
+record(ai, "A:BPT") {{ field(LINR, "zebra") }}
+"#
+        )
+        .expect("write tempfile 1");
+        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        // Load #2: an alphabetically-earlier table "alpha" (slope 1.0).
+        let tmp2 = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(tmp2.as_file(), r#"breaktable(alpha) {{ 0 0  100 100 }}"#)
+            .expect("write tempfile 2");
+        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        ctx.block_on(async {
+            let rec = db.get_record("A:BPT").await.expect("A:BPT exists");
+            let mut inst = rec.write().await;
+            inst.record
+                .put_field("RVAL", crate::types::EpicsValue::Long(50))
+                .unwrap();
+            inst.record.process().unwrap();
+            // zebra: 50 * 0.1 = 5.0. alpha (the wrong table) would give 50.0.
+            assert_eq!(
+                inst.record.get_field("VAL"),
+                Some(crate::types::EpicsValue::Double(5.0)),
+                "resolved record must still convert through zebra, not the later alpha"
             );
         });
     }

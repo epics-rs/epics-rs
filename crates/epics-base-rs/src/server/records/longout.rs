@@ -40,6 +40,7 @@ pub struct LongoutRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// Output Execution Option (epics-base 7.0.8):
     ///
     /// | OOPT | Meaning                |
@@ -111,10 +112,17 @@ impl Default for LongoutRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             oopt: 0,
             pval: 0,
             first_output_done: false,
-            ooch: 0,
+            // C `longoutRecord.dbd.pod` `field(OOCH,DBF_MENU){ initial("1") }`
+            // (menuYesNo) — the dbd doc states "If OOCH is YES (its default
+            // value)". An unset OOCH defaults to YES(1), not NO(0). Only
+            // affects the OOPT=On Change path (default OOPT=Every Time(0)
+            // ignores OOCH), where YES forces the first write after an OUT
+            // re-point.
+            ooch: 1,
         }
     }
 }
@@ -294,6 +302,11 @@ static LONGOUT_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Short,
         read_only: false,
@@ -406,6 +419,7 @@ impl Record for LongoutRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "PVAL" => Some(EpicsValue::Long(self.pval)),
             "OOCH" => Some(EpicsValue::Short(self.ooch)),
@@ -554,6 +568,11 @@ impl Record for LongoutRecord {
             "SIMS" => {
                 if let EpicsValue::Short(v) = value {
                     self.sims = v;
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
                 }
             }
             "OOPT" => {
@@ -799,11 +818,24 @@ mod tests {
         r.first_output_done = true;
         r.val = 5;
         r.pval = 5;
-        // OOCH=NO (default 0) — OUT change must NOT trigger a write.
+        // OOCH=NO (explicitly set — the dbd default is now YES(1) per
+        // initial("1")) — OUT change must NOT trigger a write.
+        r.ooch = 0;
         r.special("OUT", true).unwrap();
         assert!(
             !r.compute_should_output(),
             "OOCH=NO: OUT change is silent, val==pval still suppresses output"
+        );
+    }
+
+    // C `longoutRecord.dbd.pod` `field(OOCH,DBF_MENU){ initial("1") }` — a
+    // longout built without an explicit OOCH must default to YES(1).
+    #[test]
+    fn ooch_defaults_to_yes_per_dbd_initial() {
+        use crate::server::record::Record;
+        assert_eq!(
+            LongoutRecord::new(0).get_field("OOCH"),
+            Some(EpicsValue::Short(1))
         );
     }
 }

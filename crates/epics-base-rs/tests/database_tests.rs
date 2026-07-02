@@ -2182,31 +2182,60 @@ async fn test_phas_scan_order() {
     assert_eq!(names, vec!["REC_A", "REC_B", "REC_C"]);
 }
 
-#[tokio::test]
-async fn test_depth_limit() {
-    let db = PvDatabase::new();
-    for i in 0..20 {
-        db.add_record(&format!("CHAIN_{i}"), Box::new(AoRecord::new(0.0)))
+/// Run a deep FLNK-processing chain test on a thread with a large stack.
+///
+/// `process_record_with_links` polls the large `process_record_with_links_inner`
+/// future once per FLNK hop, up to `MAX_LINK_DEPTH` (16) frames deep. On
+/// linux-arm64 those frames are big enough that 16 of them overflow the default
+/// 2 MB test-thread stack (SIGABRT); x86_64 and macos-arm64 have smaller frames
+/// and fit. A 16 MB stack clears it. The future is built and awaited on the
+/// spawned thread, so it never crosses the thread boundary and needs no `Send`.
+fn run_deep_flnk_recursion<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn test_depth_limit() {
+    run_deep_flnk_recursion(|| async {
+        let db = PvDatabase::new();
+        for i in 0..20 {
+            db.add_record(&format!("CHAIN_{i}"), Box::new(AoRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        for i in 0..19 {
+            if let Some(rec) = db.get_record(&format!("CHAIN_{i}")).await {
+                let mut inst = rec.write().await;
+                inst.put_common_field(
+                    "FLNK",
+                    EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
+                )
+                .unwrap();
+            }
+        }
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("CHAIN_0", &mut visited, 0)
             .await
             .unwrap();
-    }
-    for i in 0..19 {
-        if let Some(rec) = db.get_record(&format!("CHAIN_{i}")).await {
-            let mut inst = rec.write().await;
-            inst.put_common_field(
-                "FLNK",
-                EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
-            )
-            .unwrap();
-        }
-    }
-
-    let mut visited = HashSet::new();
-    db.process_record_with_links("CHAIN_0", &mut visited, 0)
-        .await
-        .unwrap();
-    assert!(visited.len() <= 17);
-    assert!(visited.contains("CHAIN_0"));
+        assert!(visited.len() <= 17);
+        assert!(visited.contains("CHAIN_0"));
+    });
 }
 
 #[tokio::test]
@@ -2690,6 +2719,14 @@ struct AsyncRecord {
 impl Record for AsyncRecord {
     fn record_type(&self) -> &'static str {
         "async_test"
+    }
+    /// `VAL` is `pp(TRUE)`: a put to VAL processes the record (goes async-
+    /// pending), as it does for any real async record. The put gate is total
+    /// and fail-safe — an unmodeled type processes on PROC only — so this mock
+    /// must declare the pp set its tests rely on rather than free-ride on the
+    /// former process-on-every-put default.
+    fn process_passive_fields(&self) -> &'static [&'static str] {
+        &["VAL"]
     }
     fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::async_pending())
@@ -3762,6 +3799,45 @@ async fn test_udf_cleared_by_process_with_links() {
     assert!(!rec.read().await.common.udf);
 }
 
+/// An asyn int32 readback delivers its value via `apply_raw_readback`
+/// (sets VAL, requests skip-convert), then the record processes. C
+/// `devAsynInt32.c::processAo` sets `pr->udf = isnan(value)` *inside* the
+/// readback (:994); epics-rs sets UDF in the framework process loop instead
+/// (`clears_udf()` true + `value_is_undefined() == val.is_nan()`), so a
+/// finite readback value clears UDF exactly as C does — the device body
+/// does not own UDF. Regression guard for the int32-ao udf-on-readback path
+/// (the recurring "int32-ao udf-on-NaN" residual is framework-handled, not
+/// a divergence).
+#[tokio::test]
+async fn test_ao_asyn_readback_clears_udf_via_framework() {
+    let db = PvDatabase::new();
+    db.add_record("REC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("REC").await.unwrap();
+    assert!(rec.read().await.common.udf, "ao starts undefined");
+
+    // Simulate the asyn readback: device sets VAL from the raw and asks the
+    // framework to skip the forward VAL->RVAL convert.
+    {
+        let mut g = rec.write().await;
+        assert!(g.record.apply_raw_readback(150), "ao claims the readback");
+        g.record.set_device_did_compute(true);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let g = rec.read().await;
+    assert!(
+        !g.common.udf,
+        "finite readback value clears UDF (isnan(value)==false)"
+    );
+    assert_eq!(g.record.get_field("VAL"), Some(EpicsValue::Double(150.0)));
+}
+
 #[tokio::test]
 async fn test_udf_not_cleared_by_clears_udf_false() {
     struct NoClearRecord {
@@ -3908,6 +3984,40 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
             "PP_SRC must have been processed by the PP link, VAL={v}"
         ),
         other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
+/// `process_record` (the public direct-process API) fetches input links like
+/// the engine path. It used to call the reduced `process_local`, which fetched
+/// no INPx, so a direct process of a calc/sub read stale A..U inputs; it now
+/// delegates to the canonical link-fetching engine path.
+#[tokio::test]
+async fn process_record_fetches_input_links() {
+    use epics_base_rs::server::records::ao::AoRecord;
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    // SRC_F latches the constructed VAL=10.
+    db.add_record("SRC_F", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+
+    // DST_F: CALC="A+1", INPA="SRC_F" (NPP — read the current source value).
+    let mut dst = CalcRecord::new("A+1");
+    dst.inpa = "SRC_F".to_string();
+    db.add_record("DST_F", Box::new(dst)).await.unwrap();
+
+    // Direct process via the public API. A=10 must be fetched from SRC_F,
+    // giving VAL=11; the old reduced path left A=0 -> VAL=1.
+    db.process_record("DST_F").await.unwrap();
+
+    match db.get_pv("DST_F").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 11.0).abs() < 1e-10,
+            "process_record must fetch INPA (SRC_F=10): expected 11, got {v}"
+        ),
+        other => panic!("expected Double(11.0), got {other:?}"),
     }
 }
 
@@ -5494,7 +5604,9 @@ async fn test_new_common_fields_get_put() {
 
     {
         let inst = rec.read().await;
-        assert_eq!(inst.get_common_field("SSCN"), Some(EpicsValue::Enum(0)));
+        // C `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`: the
+        // default is the out-of-range "use SCAN" sentinel, not Passive(0).
+        assert_eq!(inst.get_common_field("SSCN"), Some(EpicsValue::Enum(65535)));
     }
     {
         let inst = rec.read().await;
@@ -5543,6 +5655,56 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read().await;
         assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(1)));
     }
+}
+
+/// SSCN (simulation-mode scan) is a `DBF_MENU`/`menuScan` field whose C dbd
+/// default is the out-of-range sentinel 65535 ("use SCAN"), not a real menu
+/// choice. The put path must round-trip both a real menuScan index and the
+/// sentinel, and a put of any out-of-menu value collapses to the sentinel —
+/// matching C `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`.
+#[tokio::test]
+async fn test_sscn_serves_menu_index_and_65535_sentinel() {
+    let db = PvDatabase::new();
+    db.add_record("REC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("REC").await.unwrap();
+
+    // Default is the 65535 sentinel.
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535))
+    );
+
+    // A real menuScan index (2 == "I/O Intr") round-trips.
+    rec.write()
+        .await
+        .put_common_field("SSCN", EpicsValue::Enum(2))
+        .unwrap();
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(2))
+    );
+
+    // Putting the sentinel back restores "use SCAN".
+    rec.write()
+        .await
+        .put_common_field("SSCN", EpicsValue::Enum(65535))
+        .unwrap();
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535))
+    );
+
+    // An out-of-menu index (>9, not 65535) collapses to the sentinel.
+    rec.write()
+        .await
+        .put_common_field("SSCN", EpicsValue::Enum(12))
+        .unwrap();
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535))
+    );
 }
 
 /// epics-base PR #359 (commits 5ba8080f6, aff74638b, 51c5b8f1e,
@@ -6718,6 +6880,102 @@ async fn test_fanout_resolves_sell_link_into_seln() {
     );
 }
 
+/// `seqRecord.c:148` places the SELL→SELN `dbGetLink` *inside* the
+/// `else` of `if (prec->selm == seqSELM_All)`, so an All-mode seq never
+/// refreshes SELN from SELL (unlike fanout/dfanout, whose `dbGetLink` runs
+/// before the SELM switch every cycle — pinned above). The port read SELL
+/// for all three unconditionally, so an All-mode seq spuriously updated SELN
+/// (and would post a SELN monitor) from a live SELL link. Boundary test: All
+/// freezes SELN, Specified refreshes it, with the same live SELL link.
+#[tokio::test]
+async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
+    use epics_base_rs::server::records::seq::SeqRecord;
+
+    // All mode: SELL is live (source value 5) but SELN must stay frozen at
+    // its init value (3) — C does not read SELL in All mode.
+    {
+        let db = PvDatabase::new();
+        db.add_record("SEQALL:SRC", Box::new(LonginRecord::new(5)))
+            .await
+            .unwrap();
+        let mut seq = SeqRecord::new();
+        seq.selm = 0; // All
+        seq.seln = 3; // distinct from the SELL source value (5)
+        seq.sell = "SEQALL:SRC".to_string();
+        db.add_record("SEQALL:REC", Box::new(seq)).await.unwrap();
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SEQALL:REC", &mut visited, 0)
+            .await
+            .unwrap();
+
+        let rec = db.get_record("SEQALL:REC").await.unwrap();
+        let seln = rec.read().await.record.get_field("SELN").unwrap();
+        assert_eq!(
+            seln,
+            EpicsValue::UShort(3),
+            "All-mode seq must NOT refresh SELN from SELL (C seqRecord.c:148 \
+             reads SELL only in the non-All branch); the unconditional read \
+             would have set SELN=5"
+        );
+    }
+
+    // Specified mode: the same live SELL (source value 1) MUST refresh SELN.
+    {
+        let db = PvDatabase::new();
+        db.add_record("SEQSPEC:SRC", Box::new(LonginRecord::new(1)))
+            .await
+            .unwrap();
+        let mut seq = SeqRecord::new();
+        seq.selm = 1; // Specified
+        seq.seln = 0; // stale init value
+        seq.sell = "SEQSPEC:SRC".to_string();
+        db.add_record("SEQSPEC:REC", Box::new(seq)).await.unwrap();
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SEQSPEC:REC", &mut visited, 0)
+            .await
+            .unwrap();
+
+        let rec = db.get_record("SEQSPEC:REC").await.unwrap();
+        let seln = rec.read().await.record.get_field("SELN").unwrap();
+        assert_eq!(
+            seln,
+            EpicsValue::UShort(1),
+            "Specified-mode seq MUST refresh SELN from SELL (C reads it in \
+             the else branch)"
+        );
+    }
+}
+
+/// fanout/dfanout/seq `SELN` carries dbd `initial("1")`: a record
+/// constructed without an explicit SELN must default to 1, not the
+/// hand-coded 0. Observable in SELM=Specified/Mask when the .db omits SELN
+/// (All ignores SELN). dfanout's Specified output is `seln - 1`, so 0 would
+/// drive nothing where C drives OUTA.
+#[tokio::test]
+async fn test_fanout_dfanout_seq_seln_default_is_one() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+    use epics_base_rs::server::records::fanout::FanoutRecord;
+    use epics_base_rs::server::records::seq::SeqRecord;
+
+    assert_eq!(
+        FanoutRecord::new().get_field("SELN"),
+        Some(EpicsValue::UShort(1)),
+        "fanout SELN dbd initial(\"1\")"
+    );
+    assert_eq!(
+        DfanoutRecord::new(0.0).get_field("SELN"),
+        Some(EpicsValue::UShort(1)),
+        "dfanout SELN dbd initial(\"1\")"
+    );
+    assert_eq!(
+        SeqRecord::new().get_field("SELN"),
+        Some(EpicsValue::UShort(1)),
+        "seq SELN dbd initial(\"1\")"
+    );
+}
+
 /// BUG 5 — `putAcks` (C `dbAccess.c:1303-1315`) compares the written
 /// severity against the STORED unacknowledged severity `acks`, not
 /// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)
@@ -7139,7 +7397,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
             if let Some(EpicsValue::Double(v)) = record.get_field("VAL") {
                 record.put_field("VAL", EpicsValue::Double(v * 2.0))?;
             }
-            Ok(())
+            Ok(0)
         });
         inst.subroutine = Some(Arc::new(sub_fn));
     }
@@ -7159,6 +7417,660 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
         ),
         other => panic!("expected Double(10.0), got {other:?}"),
     }
+}
+
+/// A `sub` record must run the shared analog `checkAlarms` (HIHI/HIGH/
+/// LOLO/LOW with HYST + LALM). C `subRecord.c::checkAlarms` (lines 319-373)
+/// is the standard analog limit check; the Rust port previously gave `sub`
+/// no limit fields and skipped the analog-alarm owner entirely, so a `sub`
+/// whose subroutine drove VAL past HIHI never alarmed.
+#[tokio::test]
+async fn sub_record_hihi_alarm_fires_via_shared_owner() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+
+    // FIRE: subroutine drives VAL to 100, HIHI=50/Major -> HIHI_ALARM.
+    db.add_record("SUB_HIHI", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+    // CONTROL: same VAL=100 but HIHI=200 -> no alarm, LALM tracks VAL.
+    db.add_record("SUB_OK", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+
+    for (name, hihi) in [("SUB_HIHI", 50.0), ("SUB_OK", 200.0)] {
+        let arc = db.get_record(name).await.unwrap();
+        let mut inst = arc.write().await;
+        inst.put_common_field("HIHI", EpicsValue::Double(hihi))
+            .unwrap();
+        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
+            record.put_field("VAL", EpicsValue::Double(100.0))?;
+            Ok(0)
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    for name in ["SUB_HIHI", "SUB_OK"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    // FIRE record: severity Major, stat HIHI_ALARM, LALM pinned to the
+    // crossed threshold (C sets `prec->lalm = alev`).
+    {
+        let arc = db.get_record("SUB_HIHI").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Major,
+            "sub VAL=100 over HIHI=50 must raise MAJOR"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::HIHI_ALARM,
+            "sub over-HIHI must surface as HIHI_ALARM"
+        );
+        assert_eq!(
+            inst.record.get_field("LALM"),
+            Some(EpicsValue::Double(50.0)),
+            "C parity: LALM pins to the crossed alarm threshold (HIHI=50)"
+        );
+    }
+    // CONTROL record: no alarm, LALM tracks the current VAL.
+    {
+        let arc = db.get_record("SUB_OK").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "sub VAL=100 under HIHI=200 must not alarm"
+        );
+        assert_eq!(
+            inst.record.get_field("LALM"),
+            Some(EpicsValue::Double(100.0)),
+            "C parity: no alarm leaves LALM = current VAL"
+        );
+    }
+}
+
+/// A `sub` record must gate the `VAL` monitor on MDEL (C `subRecord.c::
+/// monitor` lines 386-394, `recGblCheckDeadband` against MLST). The record
+/// previously carried no MDEL/MLST, so the deadband owner saw
+/// `mdel=0` and posted on every change. MLST tracks the last posted value,
+/// so it is the observable witness of the deadband decision.
+#[tokio::test]
+async fn sub_record_mdel_gates_val_monitor() {
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+    let mut rec = SubRecord::default();
+    rec.val = 100.0;
+    rec.mdel = 10.0;
+    rec.init_record(0).unwrap(); // MLST seeded to 100
+    db.add_record("SUB_MDEL", Box::new(rec)).await.unwrap();
+
+    // Helper: set VAL directly (no subroutine), process, read back MLST.
+    async fn drive(db: &PvDatabase, val: f64) -> f64 {
+        {
+            let arc = db.get_record("SUB_MDEL").await.unwrap();
+            let mut inst = arc.write().await;
+            inst.record
+                .put_field("VAL", EpicsValue::Double(val))
+                .unwrap();
+        }
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SUB_MDEL", &mut visited, 0)
+            .await
+            .unwrap();
+        let arc = db.get_record("SUB_MDEL").await.unwrap();
+        let inst = arc.read().await;
+        inst.record
+            .get_field("MLST")
+            .and_then(|v| v.to_f64())
+            .unwrap()
+    }
+
+    // Change 5 (< MDEL=10) from MLST=100: no monitor, MLST frozen at 100.
+    assert_eq!(
+        drive(&db, 105.0).await,
+        100.0,
+        "VAL change below MDEL must NOT post (MLST stays at last-posted 100)"
+    );
+    // Change 15 (>= MDEL=10) from MLST=100: monitor posts, MLST -> 115.
+    assert_eq!(
+        drive(&db, 115.0).await,
+        115.0,
+        "VAL change at/over MDEL must post and advance MLST to 115"
+    );
+}
+
+/// A `sub` subroutine returning a negative status must raise SOFT_ALARM at
+/// the record's BRSV severity (C `subRecord.c::do_sub`: `if (status < 0)
+/// recGblSetSevr(SOFT_ALARM, prec->brsv)`). The earlier `SubroutineFn`
+/// returned `CaResult<()>`, so a subroutine could not signal an error and
+/// no SOFT_ALARM was ever raised.
+#[tokio::test]
+async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+
+    // FIRE: status -1 with BRSV=Major -> SOFT_ALARM/Major.
+    db.add_record("SUB_SOFT", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+    // CONTROL: status 0 with BRSV=Major -> no alarm.
+    db.add_record("SUB_OK0", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+
+    for (name, status) in [("SUB_SOFT", -1_i64), ("SUB_OK0", 0_i64)] {
+        let arc = db.get_record(name).await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("BRSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(move |_record: &mut dyn Record| Ok(status));
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    for name in ["SUB_SOFT", "SUB_OK0"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    {
+        let arc = db.get_record("SUB_SOFT").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Major,
+            "sub status<0 must raise SOFT_ALARM at BRSV=Major"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::SOFT_ALARM,
+            "sub status<0 must set STAT=SOFT_ALARM"
+        );
+    }
+    {
+        let arc = db.get_record("SUB_OK0").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "sub status==0 must not raise SOFT_ALARM regardless of BRSV"
+        );
+    }
+}
+
+/// An `aSub` publishes the subroutine's return status as VAL (C
+/// `aSubRecord.c:223` `prec->val = status`), overwriting whatever the
+/// closure wrote to VAL, and a negative status raises SOFT_ALARM at BRSV.
+#[tokio::test]
+async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+
+    let db = PvDatabase::new();
+
+    // POSITIVE: closure writes VAL=999 but returns 42 -> VAL must be 42.
+    db.add_record("ASUB_POS", Box::new(ASubRecord::default()))
+        .await
+        .unwrap();
+    // NEGATIVE: returns -5 with BRSV=Minor -> VAL=-5, SOFT_ALARM/Minor.
+    db.add_record("ASUB_NEG", Box::new(ASubRecord::default()))
+        .await
+        .unwrap();
+
+    {
+        let arc = db.get_record("ASUB_POS").await.unwrap();
+        let mut inst = arc.write().await;
+        let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
+            // The closure's own VAL write is discarded by `prec->val = status`.
+            record.put_field("VAL", EpicsValue::Double(999.0))?;
+            Ok(42)
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+    {
+        let arc = db.get_record("ASUB_NEG").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("BRSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(|_record: &mut dyn Record| Ok(-5));
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    for name in ["ASUB_POS", "ASUB_NEG"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    {
+        let arc = db.get_record("ASUB_POS").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Double(42.0)),
+            "aSub VAL must be the return status (42), not the closure's 999"
+        );
+    }
+    {
+        let arc = db.get_record("ASUB_NEG").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Double(-5.0)),
+            "aSub VAL must carry the negative return status (-5)"
+        );
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Minor,
+            "aSub status<0 must raise SOFT_ALARM at BRSV=Minor"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::SOFT_ALARM,
+            "aSub status<0 must set STAT=SOFT_ALARM"
+        );
+    }
+}
+
+/// aSub `EFLG` gates `VALx` output-array monitor posting (C
+/// `aSubRecord.c::monitor`): NEVER suppresses it, ON CHANGE (default) posts on
+/// change, ALWAYS posts every process even when unchanged. Exercised through
+/// the real foreign-process monitor path (`process_record` -> `process_local`).
+#[tokio::test]
+async fn asub_eflg_gates_valx_output_monitor_posting() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+    use epics_base_rs::types::DbFieldType;
+    use std::sync::Mutex;
+
+    let db = PvDatabase::new();
+    db.add_record("ASUB_E", Box::new(ASubRecord::default()))
+        .await
+        .unwrap();
+
+    // Subroutine writes VALA from a shared cell so the test controls whether
+    // the output changes between processes.
+    let out = Arc::new(Mutex::new(vec![1.0_f64, 2.0]));
+    {
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        let out2 = out.clone();
+        let sub_fn: SubroutineFn = Box::new(move |record: &mut dyn Record| {
+            let v = out2.lock().unwrap().clone();
+            record.put_field("VALA", EpicsValue::DoubleArray(v))?;
+            Ok(0)
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    let mut rx = {
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.add_subscriber("VALA", 31, DbFieldType::Double, EventMask::VALUE.bits())
+    }
+    .expect("VALA subscription must be accepted");
+
+    // ON CHANGE (default): first process changes VALA -> event.
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "ON CHANGE: VALA changed from empty default -> monitor event"
+    );
+    // Same VALA again -> no event.
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "ON CHANGE: VALA unchanged -> no monitor event"
+    );
+
+    // ALWAYS: unchanged VALA still posts every process.
+    {
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("EFLG", EpicsValue::Short(2)).unwrap();
+    }
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "ALWAYS: unchanged VALA must still post a monitor event"
+    );
+
+    // NEVER: even a changed VALA is suppressed.
+    {
+        *out.lock().unwrap() = vec![9.0, 8.0];
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("EFLG", EpicsValue::Short(0)).unwrap();
+    }
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "NEVER: changed VALA must post no monitor event"
+    );
+}
+
+/// aSub `LFLG=READ` re-reads the subroutine name from the `SUBL` link each
+/// process and re-resolves the function from the registry when it changed
+/// (C `aSubRecord.c::fetch_values`). A name not in the registry is C
+/// `S_db_BadSub`: the subroutine is not run (VAL frozen), ONAM kept for retry.
+#[tokio::test]
+async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+    use std::collections::HashMap;
+
+    let db = PvDatabase::new();
+
+    // Two registered subroutines; each publishes its identity via VAL (the
+    // aSub return-status -> VAL contract, C `aSubRecord.c:224`).
+    let mk = |status: i64| -> Arc<SubroutineFn> {
+        Arc::new(Box::new(move |_: &mut dyn Record| Ok(status)) as SubroutineFn)
+    };
+    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    registry.insert("sub_a".into(), mk(11));
+    registry.insert("sub_b".into(), mk(22));
+    db.install_subroutine_registry(registry).await;
+
+    // A string record holds the current subroutine name; SUBL is a DB link
+    // to it (the realistic LFLG=READ wiring).
+    db.add_record("NAME_HOLDER", Box::new(StringoutRecord::new("sub_a")))
+        .await
+        .unwrap();
+
+    let mut rec = ASubRecord::default();
+    rec.put_field("LFLG", EpicsValue::Short(1)).unwrap(); // READ
+    rec.put_field("SUBL", EpicsValue::String("NAME_HOLDER".into()))
+        .unwrap();
+    db.add_record("ASUB_L", Box::new(rec)).await.unwrap();
+
+    let proc = |db: &PvDatabase| {
+        let db = db.clone();
+        async move {
+            let mut visited = HashSet::new();
+            db.process_record_with_links("ASUB_L", &mut visited, 0)
+                .await
+                .unwrap();
+        }
+    };
+    let field = |db: &PvDatabase, f: &'static str| {
+        let db = db.clone();
+        async move {
+            let arc = db.get_record("ASUB_L").await.unwrap();
+            let inst = arc.read().await;
+            inst.record.get_field(f)
+        }
+    };
+
+    // First process: name changed (""->sub_a) -> resolve + run sub_a.
+    proc(&db).await;
+    assert_eq!(
+        field(&db, "SNAM").await,
+        Some(EpicsValue::String("sub_a".into())),
+        "SNAM must track the SUBL link value"
+    );
+    assert_eq!(
+        field(&db, "ONAM").await,
+        Some(EpicsValue::String("sub_a".into())),
+        "ONAM must be set to the resolved name"
+    );
+    assert_eq!(
+        field(&db, "VAL").await,
+        Some(EpicsValue::Double(11.0)),
+        "sub_a must have run (VAL = its return status)"
+    );
+
+    // Repoint the holder to sub_b, process: re-resolve + run sub_b.
+    {
+        let arc = db.get_record("NAME_HOLDER").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("sub_b".into()))
+            .unwrap();
+    }
+    proc(&db).await;
+    assert_eq!(
+        field(&db, "ONAM").await,
+        Some(EpicsValue::String("sub_b".into())),
+        "ONAM must follow the changed name"
+    );
+    assert_eq!(
+        field(&db, "VAL").await,
+        Some(EpicsValue::Double(22.0)),
+        "sub_b must have run after the name changed"
+    );
+
+    // Repoint to an unregistered name: C S_db_BadSub -> do_sub skipped.
+    {
+        let arc = db.get_record("NAME_HOLDER").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("missing".into()))
+            .unwrap();
+    }
+    proc(&db).await;
+    assert_eq!(
+        field(&db, "SNAM").await,
+        Some(EpicsValue::String("missing".into())),
+        "SNAM still tracks the link value even when unresolvable"
+    );
+    assert_eq!(
+        field(&db, "ONAM").await,
+        Some(EpicsValue::String("sub_b".into())),
+        "ONAM must be kept (not advanced) on a bad sub, so it retries"
+    );
+    assert_eq!(
+        field(&db, "VAL").await,
+        Some(EpicsValue::Double(22.0)),
+        "bad sub: subroutine not run, VAL frozen at the last good result"
+    );
+}
+
+/// aSub `LFLG=IGNORE` (the default) resolves its subroutine from SNAM once at
+/// init via the function registry (C `aSubRecord.c::init_record` ->
+/// `registryFunctionFind`), wired by `wire_subroutines` on the `.db` path.
+#[tokio::test]
+async fn asub_lflg_ignore_subroutine_wired_by_snam_at_init() {
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use std::collections::HashMap;
+
+    let db_content = r#"
+record(aSub, "ASUB_S") {
+    field(SNAM, "my_routine")
+}
+"#;
+    let (db, _) = IocBuilder::new()
+        .db_string(db_content, &HashMap::new())
+        .unwrap()
+        .register_subroutine("my_routine", |_: &mut dyn Record| Ok(7))
+        .build()
+        .await
+        .unwrap();
+
+    // The routine was wired at init; processing runs it and publishes its
+    // return status as VAL (C `aSubRecord.c:224`).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASUB_S", &mut visited, 0)
+        .await
+        .unwrap();
+    let arc = db.get_record("ASUB_S").await.unwrap();
+    let inst = arc.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Double(7.0)),
+        "aSub LFLG=IGNORE: subroutine resolved from SNAM at init must run"
+    );
+}
+
+/// `sub` and `aSub` INAM init routine: resolved through the function registry
+/// and invoked exactly once at init, before SNAM resolution, return discarded
+/// (C `subRecord.c` / `aSubRecord.c::init_record`).
+#[tokio::test]
+async fn inam_init_routine_runs_once_at_init_for_sub_and_asub() {
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let db_content = r#"
+record(sub, "SUB_INIT") {
+    field(INAM, "sub_init")
+    field(SNAM, "sub_proc")
+}
+record(aSub, "ASUB_INIT") {
+    field(INAM, "asub_init")
+    field(SNAM, "asub_proc")
+}
+"#;
+    let sub_init_calls = Arc::new(AtomicUsize::new(0));
+    let asub_init_calls = Arc::new(AtomicUsize::new(0));
+    let sic = sub_init_calls.clone();
+    let aic = asub_init_calls.clone();
+    let (db, _) = IocBuilder::new()
+        .db_string(db_content, &HashMap::new())
+        .unwrap()
+        .register_subroutine("sub_init", move |rec: &mut dyn Record| {
+            sic.fetch_add(1, Ordering::SeqCst);
+            rec.put_field("VAL", EpicsValue::Double(99.0))?;
+            Ok(0)
+        })
+        .register_subroutine("sub_proc", |_: &mut dyn Record| Ok(0))
+        .register_subroutine("asub_init", move |rec: &mut dyn Record| {
+            aic.fetch_add(1, Ordering::SeqCst);
+            rec.put_field("VAL", EpicsValue::Double(88.0))?;
+            Ok(0)
+        })
+        .register_subroutine("asub_proc", |_: &mut dyn Record| Ok(5))
+        .build()
+        .await
+        .unwrap();
+
+    // Both INAM routines ran exactly once at init, before any processing.
+    assert_eq!(
+        sub_init_calls.load(Ordering::SeqCst),
+        1,
+        "sub INAM init routine runs exactly once at init"
+    );
+    assert_eq!(
+        asub_init_calls.load(Ordering::SeqCst),
+        1,
+        "aSub INAM init routine runs exactly once at init"
+    );
+
+    // The init routine's write is visible after init, before any processing.
+    let sub = db.get_record("SUB_INIT").await.unwrap();
+    assert_eq!(
+        sub.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(99.0)),
+        "sub INAM init write visible after init"
+    );
+    let asub = db.get_record("ASUB_INIT").await.unwrap();
+    assert_eq!(
+        asub.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(88.0)),
+        "aSub INAM init write visible after init"
+    );
+
+    // SNAM process routine is still wired alongside INAM: aSub publishes its
+    // return status as VAL (C `aSubRecord.c:224`).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASUB_INIT", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        asub.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(5.0)),
+        "aSub SNAM routine runs after INAM and publishes its status as VAL"
+    );
+}
+
+/// The public direct-process API `process_record` re-resolves aSub LFLG=READ:
+/// it delegates to the canonical engine path, so a direct process re-reads the
+/// SUBL link, swaps the subroutine, and skips a bad sub like any other process.
+#[tokio::test]
+async fn asub_lflg_read_reresolves_on_foreign_process_path() {
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+    use std::collections::HashMap;
+
+    let db = PvDatabase::new();
+    let mk = |status: i64| -> Arc<SubroutineFn> {
+        Arc::new(Box::new(move |_: &mut dyn Record| Ok(status)) as SubroutineFn)
+    };
+    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    registry.insert("sub_a".into(), mk(11));
+    registry.insert("sub_b".into(), mk(22));
+    db.install_subroutine_registry(registry).await;
+
+    db.add_record("NAME_HOLDER2", Box::new(StringoutRecord::new("sub_a")))
+        .await
+        .unwrap();
+    let mut rec = ASubRecord::default();
+    rec.put_field("LFLG", EpicsValue::Short(1)).unwrap();
+    rec.put_field("SUBL", EpicsValue::String("NAME_HOLDER2".into()))
+        .unwrap();
+    db.add_record("ASUB_F", Box::new(rec)).await.unwrap();
+
+    let val = |db: &PvDatabase| {
+        let db = db.clone();
+        async move {
+            let arc = db.get_record("ASUB_F").await.unwrap();
+            let inst = arc.read().await;
+            inst.record.get_field("VAL")
+        }
+    };
+    let set_name = |db: &PvDatabase, name: &'static str| {
+        let db = db.clone();
+        async move {
+            let arc = db.get_record("NAME_HOLDER2").await.unwrap();
+            let mut inst = arc.write().await;
+            inst.record
+                .put_field("VAL", EpicsValue::String(name.into()))
+                .unwrap();
+        }
+    };
+
+    // Foreign path resolves + runs sub_a.
+    db.process_record("ASUB_F").await.unwrap();
+    assert_eq!(
+        val(&db).await,
+        Some(EpicsValue::Double(11.0)),
+        "foreign path: sub_a resolved and ran"
+    );
+
+    // Repoint -> sub_b: foreign path must re-resolve too.
+    set_name(&db, "sub_b").await;
+    db.process_record("ASUB_F").await.unwrap();
+    assert_eq!(
+        val(&db).await,
+        Some(EpicsValue::Double(22.0)),
+        "foreign path: re-resolved sub_b after the name changed"
+    );
+
+    // Bad sub: foreign path must skip do_sub, VAL frozen (shared one-shot
+    // suppress flag, not an engine-path-only gate).
+    set_name(&db, "missing").await;
+    db.process_record("ASUB_F").await.unwrap();
+    assert_eq!(
+        val(&db).await,
+        Some(EpicsValue::Double(22.0)),
+        "foreign path bad sub: subroutine skipped, VAL frozen"
+    );
 }
 
 /// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last
@@ -7735,4 +8647,310 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
         ),
         other => panic!("expected Double(NaN), got {other:?}"),
     }
+}
+
+/// `promptgroup`/`special(SPC_NOMOD)` config fields must be settable at `.db`
+/// load (dbStaticLib bypasses SPC_NOMOD) yet runtime-immutable, while a `pp`
+/// config field stays writable on both paths. Closes the divergence where the
+/// port rejected the load assignment (`put_field` hard-error) or dropped it
+/// (field absent from `field_list`).
+///
+/// Covered fields (C dbd):
+///   - `histogram.NELM` — `promptgroup special(SPC_NOMOD)`: load resizes bins.
+///   - `compress.NSAM`   — `promptgroup special(SPC_NOMOD)`: load resizes buffer.
+///   - `subArray.MALM`   — `special(SPC_NOMOD)`: load sets, runtime rejects.
+///   - `subArray.INDX`   — `pp(TRUE)`: load AND runtime set.
+#[tokio::test]
+async fn promptgroup_config_fields_load_settable_runtime_immutable() {
+    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+
+    // --- LOAD half: apply_fields (the `.db` load coercion) must store these
+    //     fields, resizing the backing array where one exists. ---
+    let mut hist = create_record("histogram").expect("create histogram");
+    let mut common: Vec<(String, EpicsValue)> = Vec::new();
+    apply_fields(&mut hist, &[("NELM".into(), "5".into())], &mut common)
+        .expect("histogram NELM is .db-settable (promptgroup)");
+    assert_eq!(hist.get_field("NELM"), Some(EpicsValue::Long(5)));
+    match hist.get_field("VAL") {
+        Some(EpicsValue::LongArray(v)) => assert_eq!(v.len(), 5, "NELM load resizes the bin array"),
+        other => panic!("histogram VAL should be a 5-element LongArray, got {other:?}"),
+    }
+
+    let mut comp = create_record("compress").expect("create compress");
+    let mut common = Vec::new();
+    apply_fields(&mut comp, &[("NSAM".into(), "7".into())], &mut common)
+        .expect("compress NSAM is .db-settable (promptgroup)");
+    assert_eq!(comp.get_field("NSAM"), Some(EpicsValue::Long(7)));
+
+    let mut sarr = create_record("subArray").expect("create subArray");
+    let mut common = Vec::new();
+    apply_fields(
+        &mut sarr,
+        &[("MALM".into(), "8".into()), ("INDX".into(), "3".into())],
+        &mut common,
+    )
+    .expect("subArray MALM/INDX are .db-settable (in field_list)");
+    assert_eq!(sarr.get_field("MALM"), Some(EpicsValue::Long(8)));
+    assert_eq!(sarr.get_field("INDX"), Some(EpicsValue::Long(3)));
+
+    // --- RUNTIME half: a CA caput is rejected for the SPC_NOMOD fields by the
+    //     field_io read_only gate, but accepted for the pp field (subArray INDX). ---
+    let db = PvDatabase::new();
+    db.add_record("HIST", create_record("histogram").unwrap())
+        .await
+        .unwrap();
+    db.add_record("COMP", create_record("compress").unwrap())
+        .await
+        .unwrap();
+    db.add_record("SARR", create_record("subArray").unwrap())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("HIST", "NELM", EpicsValue::Long(5))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "histogram NELM is SPC_NOMOD — runtime caput must be rejected"
+    );
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("COMP", "NSAM", EpicsValue::Long(7))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "compress NSAM is SPC_NOMOD — runtime caput must be rejected"
+    );
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("SARR", "MALM", EpicsValue::Long(8))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "subArray MALM is SPC_NOMOD — runtime caput must be rejected"
+    );
+
+    db.put_record_field_from_ca("SARR", "INDX", EpicsValue::Long(2))
+        .await
+        .expect("subArray INDX is pp(TRUE) — runtime caput must succeed");
+    let rec = db.get_record("SARR").await.expect("SARR exists");
+    let indx = rec.read().await.record.get_field("INDX");
+    assert_eq!(indx, Some(EpicsValue::Long(2)), "runtime INDX caput landed");
+}
+
+/// NELM/FTVL runtime-writability must follow each ArrayKind's C dbd, even though
+/// waveform/aai/aao/subArray share one `WaveformRecord`. `field_list()` selects a
+/// kind-correct FieldDesc set so the field_io read_only gate blocks/allows the
+/// right caputs:
+///   - waveform/aai/aao NELM, FTVL: `special(SPC_NOMOD)` -> runtime-immutable.
+///   - subArray NELM: `pp(TRUE)` -> runtime-writable; subArray FTVL: SPC_NOMOD.
+/// Load (apply_fields) stays settable for all of them (SPC_NOMOD blocks only
+/// runtime dbPutField).
+#[tokio::test]
+async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
+    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+
+    // Load still sets NELM/FTVL on a waveform (SPC_NOMOD is runtime-only).
+    let mut wf = create_record("waveform").expect("create waveform");
+    let mut common: Vec<(String, EpicsValue)> = Vec::new();
+    apply_fields(&mut wf, &[("NELM".into(), "4".into())], &mut common)
+        .expect("waveform NELM is .db-settable at load");
+    assert_eq!(wf.get_field("NELM"), Some(EpicsValue::Long(4)));
+
+    let db = PvDatabase::new();
+    db.add_record("WF", create_record("waveform").unwrap())
+        .await
+        .unwrap();
+    db.add_record("SA", create_record("subArray").unwrap())
+        .await
+        .unwrap();
+
+    // waveform/aai/aao: NELM and FTVL are SPC_NOMOD — runtime caput rejected.
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("WF", "NELM", EpicsValue::Long(4))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "waveform NELM is special(SPC_NOMOD) — runtime caput must be rejected"
+    );
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("WF", "FTVL", EpicsValue::Short(2))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "waveform FTVL is special(SPC_NOMOD) — runtime caput must be rejected"
+    );
+
+    // subArray: NELM is pp(TRUE) — runtime caput accepted; FTVL stays SPC_NOMOD.
+    db.put_record_field_from_ca("SA", "NELM", EpicsValue::Long(3))
+        .await
+        .expect("subArray NELM is pp(TRUE) — runtime caput must succeed");
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("SA", "FTVL", EpicsValue::Short(2))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "subArray FTVL is special(SPC_NOMOD) — runtime caput must be rejected"
+    );
+}
+
+/// aSub per-argument element-type fields `FTA..FTU` / `FTVA..FTVU` are
+/// `field(FTx,DBF_MENU){ menu(menuFtype) }` in C `aSubRecord.dbd`. A real `.db`
+/// sets them by menu *label* (`field(FTA,"DOUBLE")`), exactly like waveform
+/// `FTVL`. The loader resolves a menu label only when the record exposes the
+/// field's choice table; without it the label hits the integer parser, which
+/// rejects "DOUBLE" and fails the whole record load. This pins that the labels
+/// resolve through `menuFtype` (STRING=0, …, LONG=5, …, DOUBLE=10) and that the
+/// numeric per-argument fields (`NOx`/`NOVx`) keep loading.
+#[test]
+fn asub_ftype_menu_fields_load_by_label() {
+    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+
+    let mut rec = create_record("aSub").expect("create aSub");
+    let mut common = Vec::new();
+    apply_fields(
+        &mut rec,
+        &[
+            ("FTA".into(), "LONG".into()), // input A element type, menuFtype label
+            ("FTVB".into(), "STRING".into()), // output B element type, menuFtype label
+            ("NOA".into(), "5".into()),    // input A max elements, numeric
+            ("NOVB".into(), "3".into()),   // output B max elements, numeric
+        ],
+        &mut common,
+    )
+    .expect("aSub FTx/FTVx menuFtype labels and NOx/NOVx counts must load from .db");
+
+    assert_eq!(
+        rec.get_field("FTA"),
+        Some(EpicsValue::Short(5)),
+        "FTA=\"LONG\" must resolve to menuFtype index 5"
+    );
+    assert_eq!(
+        rec.get_field("FTVB"),
+        Some(EpicsValue::Short(0)),
+        "FTVB=\"STRING\" must resolve to menuFtype index 0"
+    );
+    assert_eq!(rec.get_field("NOA"), Some(EpicsValue::Long(5)));
+    assert_eq!(rec.get_field("NOVB"), Some(EpicsValue::Long(3)));
+}
+
+/// permissive `OVAL`/`OFLG` are `SPC_NOMOD` trackers that C `monitor()`
+/// never posts (`permissiveRecord.c:90-117` posts only `&prec->val` and
+/// `&prec->wflg`). The framework's generic subscribed-field change loop
+/// would otherwise post any changed subscribed field, so the record lists
+/// them in `event_posted_fields()` to exclude them. A `.OVAL`/`.OFLG`
+/// subscriber must therefore receive no change update even though
+/// `process()` updates both trackers every cycle — while VAL and WFLG must
+/// still post on change.
+#[tokio::test]
+async fn test_permissive_oval_oflg_not_monitor_posted() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::permissive::PermissiveRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("PERM", Box::new(PermissiveRecord::default()))
+        .await
+        .unwrap();
+
+    let mask = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+    // Subscribe at baseline (VAL=WFLG=OVAL=OFLG=0); add_subscriber seeds
+    // last_posted to the current value, so the change must be staged AFTER
+    // subscribing to exercise the generic change loop.
+    let (mut val_rx, mut oval_rx, mut wflg_rx, mut oflg_rx) = {
+        let rec = db.get_record("PERM").await.unwrap();
+        let mut inst = rec.write().await;
+        (
+            inst.add_subscriber("VAL", 1, DbFieldType::UShort, mask)
+                .unwrap(),
+            inst.add_subscriber("OVAL", 2, DbFieldType::UShort, mask)
+                .unwrap(),
+            inst.add_subscriber("WFLG", 3, DbFieldType::UShort, mask)
+                .unwrap(),
+            inst.add_subscriber("OFLG", 4, DbFieldType::UShort, mask)
+                .unwrap(),
+        )
+    };
+    // Stage a change for this cycle: VAL 0->3, WFLG 0->1 (so process also
+    // moves OVAL 0->3 and OFLG 0->1).
+    {
+        let rec = db.get_record("PERM").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.record.put_field("VAL", EpicsValue::UShort(3)).unwrap();
+        inst.record
+            .put_field("WFLG", EpicsValue::UShort(1))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PERM", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(val_rx.try_recv().is_ok(), "VAL change must post a monitor");
+    assert!(
+        wflg_rx.try_recv().is_ok(),
+        "WFLG change must post a monitor"
+    );
+    assert!(
+        oval_rx.try_recv().is_err(),
+        "OVAL is a SPC_NOMOD tracker C never posts; it must not monitor-post"
+    );
+    assert!(
+        oflg_rx.try_recv().is_err(),
+        "OFLG is a SPC_NOMOD tracker C never posts; it must not monitor-post"
+    );
+}
+
+/// state `OVAL` is a `SPC_NOMOD` tracker C `monitor()` never posts
+/// (`stateRecord.c:120-129` posts only `&prec->val[0]`). It is excluded
+/// from the generic subscribed-field change loop via `event_posted_fields()`,
+/// so a `.OVAL` subscriber receives no change update even though `process()`
+/// copies VAL into OVAL on change — while VAL must still post on change.
+#[tokio::test]
+async fn test_state_oval_not_monitor_posted() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::state::StateRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("ST", Box::new(StateRecord::default()))
+        .await
+        .unwrap();
+
+    let mask = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+    // Subscribe at baseline (VAL=OVAL=""); the change is staged afterwards
+    // so process moves OVAL ""->"Run" through the generic change loop.
+    let (mut val_rx, mut oval_rx) = {
+        let rec = db.get_record("ST").await.unwrap();
+        let mut inst = rec.write().await;
+        (
+            inst.add_subscriber("VAL", 1, DbFieldType::String, mask)
+                .unwrap(),
+            inst.add_subscriber("OVAL", 2, DbFieldType::String, mask)
+                .unwrap(),
+        )
+    };
+    {
+        let rec = db.get_record("ST").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("Run".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(val_rx.try_recv().is_ok(), "VAL change must post a monitor");
+    assert!(
+        oval_rx.try_recv().is_err(),
+        "OVAL is a SPC_NOMOD tracker C never posts; it must not monitor-post"
+    );
 }

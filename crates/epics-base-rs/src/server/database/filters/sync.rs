@@ -90,6 +90,16 @@ impl DbStateRegistry {
         s
     }
 
+    /// Look up the named state without creating it — C `dbStateFind`
+    /// (`dbState.c`), which returns `NULL` for an unknown name. The `Db State`
+    /// device support uses this to emit C's one-time "creating new db state"
+    /// notice (`devBiDbState`/`devBoDbState` `add_record`) only on the create
+    /// path, where [`get_or_create`](Self::get_or_create) alone cannot tell a
+    /// fresh state from a pre-existing one.
+    pub fn find(&self, name: &str) -> Option<Arc<DbState>> {
+        self.states.lock().get(name).cloned()
+    }
+
     /// Convenience: set a named state's value. Creates the state if
     /// it didn't exist (with the requested value).
     pub fn set(&self, name: &str, value: bool) {

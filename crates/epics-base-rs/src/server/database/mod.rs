@@ -264,6 +264,19 @@ struct PvDatabaseInner {
     /// acquire these gates, so no two of them can interleave on a
     /// shared record. See [`record_lock`].
     record_locks: record_lock::RecordLockRegistry,
+    /// Subroutine functions by name, retained at runtime so the processing
+    /// path can re-resolve an aSub's subroutine when its name changes
+    /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
+    /// SUBL). Populated once at iocInit from the IocApp/IocBuilder registry;
+    /// read-only thereafter.
+    subroutine_registry: RwLock<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    /// Breakpoint tables by name (C `bptList`), shared by every db-load path so
+    /// `ai`/`ao` records with `LINR >= 3` resolve their linearisation table. An
+    /// `Arc` snapshot is installed on each record at creation; the master grows
+    /// (copy-on-write via [`PvDatabase::add_breaktables`]) as `dbLoadRecords`
+    /// loads more `breaktable(...)` definitions, so build-time and runtime
+    /// loads share one registry.
+    breaktable_registry: RwLock<Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
 }
 
 /// Database of all process variables hosted by this server.
@@ -427,8 +440,98 @@ impl PvDatabase {
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
+                subroutine_registry: RwLock::new(HashMap::new()),
+                breaktable_registry: RwLock::new(Arc::new(
+                    crate::server::cvt_bpt::BreakTableRegistry::new(),
+                )),
             }),
         }
+    }
+
+    /// Merge `tables` into the shared breakpoint-table registry (C `bptList`
+    /// accumulation across `dbLoadDatabase`/`dbLoadRecords`) and return the new
+    /// snapshot. Copy-on-write: a new merged registry replaces the old one.
+    ///
+    /// `add_breaktables` is the single registry-mutation owner, so it also
+    /// restores the invariant *every record can resolve against the current
+    /// registry* on mutation: the new snapshot is re-installed into every
+    /// existing record. That covers a record created before its table was
+    /// loaded (an inline record added before `dbLoadRecords`, or a merge-reload
+    /// that repoints `LINR` to a table loaded in the same command) — neither
+    /// of which goes back through `add_record`'s install. `install_*` is a
+    /// no-op for non-ai/ao records and resets the cached table so the new
+    /// registry wins. Returns the current snapshot unchanged when `tables` is
+    /// empty (no mutation, so no re-install).
+    pub async fn add_breaktables(
+        &self,
+        tables: Vec<crate::server::cvt_bpt::BrkTable>,
+    ) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
+        // Hold the registration gate across the registry write AND the record
+        // snapshot below so this mutation cannot interleave with `add_record`'s
+        // [registry read -> records-map insert] — both are gated by the same
+        // mutex. Without it a record created concurrently could read the
+        // pre-mutation registry (miss the just-loaded table) while not yet
+        // being in the records map for the re-install below, leaving a
+        // table-not-found alarm until the next load / LINR put. `add_record`
+        // holds this gate across its whole body (registry read + map insert),
+        // so taking it here closes that TOCTOU window. No `add_breaktables`
+        // caller already holds the gate, so this is reentrancy-safe.
+        let _gate = self.inner.registration_mutex.lock().await;
+        let snapshot = {
+            let mut guard = self.inner.breaktable_registry.write().await;
+            if tables.is_empty() {
+                return guard.clone();
+            }
+            let mut next = (**guard).clone();
+            for table in tables {
+                next.insert(table);
+            }
+            let snapshot = Arc::new(next);
+            *guard = snapshot.clone();
+            snapshot
+        };
+        // Re-install into existing records. Snapshot the instance handles
+        // under a brief read, then release the map lock BEFORE taking any
+        // per-record write lock — collect-then-act, keeping the invariant
+        // "never hold the records-map lock across a per-record lock" uniform
+        // across the codebase (a7f5a74f). This is defensive: no current path
+        // takes the per-record lock then the records-map lock, so there is no
+        // confirmed cycle; uniform order forecloses one. Same idiom as
+        // `all_record_names`. (The registry write lock was released above.)
+        let instances: Vec<_> = self.inner.records.read().await.values().cloned().collect();
+        for inst in instances {
+            inst.write()
+                .await
+                .record
+                .install_breaktable_registry(snapshot.clone());
+        }
+        snapshot
+    }
+
+    /// Install the by-name subroutine registry, retained for runtime
+    /// re-resolution (aSub LFLG=READ / SUBL). Called once at iocInit with the
+    /// IocApp/IocBuilder registry. See [`Self::find_subroutine_named`].
+    pub async fn install_subroutine_registry(
+        &self,
+        registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
+    ) {
+        *self.inner.subroutine_registry.write().await = registry;
+    }
+
+    /// Look up a registered subroutine by name. The processing path uses this
+    /// to re-resolve an aSub's subroutine when SNAM changes (C `fetch_values`
+    /// `registryFunctionFind`). `None` when the name is not registered, which
+    /// the caller treats as C's `S_db_BadSub` (skip running the subroutine).
+    pub(crate) async fn find_subroutine_named(
+        &self,
+        name: &str,
+    ) -> Option<Arc<crate::server::record::SubroutineFn>> {
+        self.inner
+            .subroutine_registry
+            .read()
+            .await
+            .get(name)
+            .cloned()
     }
 
     /// Atomically claim the right to start the scan scheduler for this DB.
@@ -902,6 +1005,22 @@ impl PvDatabase {
         instance
             .record
             .set_async_context(name.to_string(), self.async_handle());
+
+        // Hand the record the current breakpoint-table registry snapshot so a
+        // LINR>=3 ai/ao record can resolve its table lazily at convert time.
+        // add_record is the single creation sink (IocBuilder, dbLoadRecords,
+        // dbCreateRecord, inline records all funnel through here), so this one
+        // install covers every creation path uniformly. The trait default is a
+        // no-op for records that don't use it; skipped when no tables are
+        // loaded so the common case pays no Arc clone. A record created before
+        // its table is loaded is re-installed by `add_breaktables`.
+        {
+            let snapshot = self.inner.breaktable_registry.read().await.clone();
+            if !snapshot.is_empty() {
+                instance.record.install_breaktable_registry(snapshot);
+            }
+        }
+
         let scan = instance.common.scan;
         let phas = instance.common.phas;
         self.inner
@@ -1609,6 +1728,63 @@ mod tests {
         assert!(via_alias.is_some(), "get_record must resolve alias");
         // Both calls return the same Arc (pointer equality).
         assert!(Arc::ptr_eq(&via_canonical.unwrap(), &via_alias.unwrap()));
+    }
+
+    /// `add_record` is the single creation sink: a record added AFTER its
+    /// breakpoint table is loaded must receive the registry snapshot so a
+    /// `LINR >= 3` conversion resolves — without any explicit per-call-site
+    /// `install_breaktable_registry`. This covers the dbCreateRecord and
+    /// inline-record creation paths that previously skipped the install.
+    #[tokio::test]
+    async fn add_record_installs_breaktable_registry_from_snapshot() {
+        let db = PvDatabase::new();
+        let ramp = crate::server::cvt_bpt::BrkTable::build(
+            "ramp",
+            &[(0.0, 0.0), (100.0, 10.0), (300.0, 30.0)],
+        )
+        .unwrap();
+        db.add_breaktables(vec![ramp]).await;
+
+        let mut rec = crate::server::records::ai::AiRecord::new(0.0);
+        rec.put_field("LINR", EpicsValue::Short(15)).unwrap(); // ramp = first user-table index
+        db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
+
+        let arc = db.get_record("AI:BPT").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+        inst.record.process().unwrap();
+        // raw 50 in [0,100] -> eng 5.0, proving the registry was installed by
+        // add_record alone.
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
+    }
+
+    /// `add_breaktables` re-installs the new snapshot into records that
+    /// already exist, so a record created BEFORE its table was loaded (inline
+    /// records added before dbLoadRecords; merge-reloads repointing LINR) can
+    /// still resolve `LINR >= 3`. Without the re-install the record keeps an
+    /// empty registry and never linearises.
+    #[tokio::test]
+    async fn add_breaktables_reinstalls_registry_into_existing_records() {
+        let db = PvDatabase::new();
+        // Record added while the registry is still empty: add_record installs
+        // nothing (the inline-record / pre-load ordering case).
+        let mut rec = crate::server::records::ai::AiRecord::new(0.0);
+        rec.put_field("LINR", EpicsValue::Short(15)).unwrap(); // ramp = first user-table index
+        db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
+
+        // Load the table afterwards — re-install must reach the existing record.
+        let ramp = crate::server::cvt_bpt::BrkTable::build(
+            "ramp",
+            &[(0.0, 0.0), (100.0, 10.0), (300.0, 30.0)],
+        )
+        .unwrap();
+        db.add_breaktables(vec![ramp]).await;
+
+        let arc = db.get_record("AI:BPT").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+        inst.record.process().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
     }
 
     #[tokio::test]

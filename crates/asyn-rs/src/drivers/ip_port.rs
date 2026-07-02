@@ -61,6 +61,23 @@ pub struct IpPortConfig {
     pub no_delay: bool,
 }
 
+/// Default TCP connect timeout.
+///
+/// Intentional divergence from C (DRV-13). C `drvAsynIPPort.c::connectIt`
+/// (513-523) issues a plain blocking `connect()` with no application-level
+/// timeout, so a connect to an unreachable host blocks on the OS-default SYN
+/// timeout (~75-130 s on Linux). In the Rust port-actor model that block
+/// stalls the port's reconnect cycle (the 2 s auto-reconnect throttle in
+/// `port_actor.rs` cannot fire while the actor is parked inside `connect()`),
+/// so we bound the connect at 5 s and let the actor fail fast into the
+/// retry loop — recovering from a transiently-unreachable device sooner than
+/// C's single long block. This is a deliberate robustness improvement, not a
+/// copied C bug; the trade-off is a device that genuinely needs >5 s to
+/// accept a TCP connection (pathological on a control LAN) would fail here
+/// where C's OS-default block might eventually succeed. C exposes no connect
+/// timeout option, so this is not runtime-settable either.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl IpPortConfig {
     /// Parse a connection specification string.
     ///
@@ -89,7 +106,7 @@ impl IpPortConfig {
                 port: 0,
                 local_port: None,
                 protocol: IpProtocol::Unix,
-                connect_timeout: Duration::from_secs(5),
+                connect_timeout: DEFAULT_CONNECT_TIMEOUT,
                 no_delay: false,
             });
         }
@@ -106,7 +123,7 @@ impl IpPortConfig {
             port,
             local_port,
             protocol: proto,
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             no_delay: true,
         })
     }
@@ -210,7 +227,11 @@ fn parse_host_port(addr_part: &str, orig_spec: &str) -> AsynResult<(String, u16,
 /// Internal I/O state holding the transport socket.
 enum IpIoInner {
     Tcp(TcpStream),
-    Udp(UdpSocket),
+    // C drvAsynIPPort.c::connectIt (513) never connect()s a SOCK_DGRAM
+    // socket; it keeps the resolved remote (`tty->farAddr`) and uses
+    // sendto/recvfrom. We mirror that: the socket is left unconnected and
+    // the resolved peer is carried alongside it for `send_to`.
+    Udp(UdpSocket, std::net::SocketAddr),
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
 }
@@ -259,13 +280,26 @@ impl OctetNext for IpIoState {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
+        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 *after*
+        // the connect check and *before* touching the socket, so a zero-length
+        // request never reaches `stream.read`, where an empty buffer would
+        // yield Ok(0) and be misread as a peer EOF (tearing down the socket).
+        if buf.is_empty() {
+            return Err(maxchars_zero_error());
+        }
         match inner {
             IpIoInner::Tcp(stream) => {
-                stream.set_read_timeout(Some(user.timeout))?;
+                stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 match stream.read(buf) {
-                    Ok(0) => Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: "EOF".into(),
+                    // C drvAsynIPPort.c::readRaw (815-821): recv()==0 on a
+                    // SOCK_STREAM socket means the peer closed — report
+                    // success with ASYN_EOM_END and zero bytes (the driver
+                    // then closes the fd). Returning an error here would hide
+                    // END from close-delimited protocols (HTTP/1.0) that use
+                    // connection-close as the message terminator.
+                    Ok(0) => Ok(OctetReadResult {
+                        nbytes_transferred: 0,
+                        eom_reason: EomReason::END,
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
@@ -278,26 +312,22 @@ impl OctetNext for IpIoState {
                             EomReason::empty()
                         },
                     }),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Err(AsynError::Status {
-                            status: AsynStatus::Timeout,
-                            message: "read timeout".into(),
-                        })
-                    }
-                    Err(e) => Err(AsynError::Io(e)),
+                    Err(e) => Err(classify_read_error(e)),
                 }
             }
-            IpIoInner::Udp(socket) => {
-                socket.set_read_timeout(Some(user.timeout))?;
-                match socket.recv(buf) {
-                    Ok(0) => Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: "EOF".into(),
-                    }),
-                    Ok(n) => Ok(OctetReadResult {
+            IpIoInner::Udp(socket, _peer) => {
+                socket.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
+                // C drvAsynIPPort.c::readRaw (775-789) uses recvfrom on the
+                // unconnected datagram socket so it accepts replies from any
+                // peer (broadcast/multi-peer); the source address is only
+                // used for trace, so we discard it.
+                match socket.recv_from(buf) {
+                    // C drvAsynIPPort.c::readRaw: a SOCK_DGRAM recvfrom()==0
+                    // is a legitimate zero-length datagram, NOT a connection
+                    // close — the EOF/ASYN_EOM_END branch (line 815) is
+                    // SOCK_STREAM only. Report a successful zero-byte read and
+                    // leave the socket open (no teardown).
+                    Ok((n, _src)) => Ok(OctetReadResult {
                         nbytes_transferred: n,
                         // C parity: CNT means the requested count was
                         // reached. A short read leaves the reason empty
@@ -308,25 +338,18 @@ impl OctetNext for IpIoState {
                             EomReason::empty()
                         },
                     }),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Err(AsynError::Status {
-                            status: AsynStatus::Timeout,
-                            message: "read timeout".into(),
-                        })
-                    }
-                    Err(e) => Err(AsynError::Io(e)),
+                    Err(e) => Err(classify_read_error(e)),
                 }
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
-                stream.set_read_timeout(Some(user.timeout))?;
+                stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 match stream.read(buf) {
-                    Ok(0) => Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: "EOF".into(),
+                    // Unix-domain stream EOF = peer closed = END, the same
+                    // stream semantics as the TCP arm above.
+                    Ok(0) => Ok(OctetReadResult {
+                        nbytes_transferred: 0,
+                        eom_reason: EomReason::END,
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
@@ -339,16 +362,7 @@ impl OctetNext for IpIoState {
                             EomReason::empty()
                         },
                     }),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        Err(AsynError::Status {
-                            status: AsynStatus::Timeout,
-                            message: "read timeout".into(),
-                        })
-                    }
-                    Err(e) => Err(AsynError::Io(e)),
+                    Err(e) => Err(classify_read_error(e)),
                 }
             }
         }
@@ -359,19 +373,38 @@ impl OctetNext for IpIoState {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
-        let deadline = std::time::Instant::now() + user.timeout;
+        // C drvAsynIPPort.c::writeRaw (613-614): after the connection check,
+        // a zero-length write returns success immediately and sends nothing —
+        // in particular it must NOT emit an empty UDP datagram. (Any output
+        // EOS has already been appended by the interpose above, so reaching
+        // here with empty data means there is genuinely nothing to send.)
+        if data.is_empty() {
+            return Ok(0);
+        }
+        // Floor the write deadline with the same C poll-interval floor as the
+        // socket send timeout: C writeRaw (615-617) floors a zero timeout to a
+        // 1 ms poll and then attempts the send (poll POLLOUT then send), so a
+        // `timeout == 0` write of a writable socket succeeds. Without the
+        // floor the deadline would be `now`, and `write_with_retry`'s
+        // top-of-loop `now > deadline` check would return Timeout *before*
+        // ever attempting `write` — failing a zero-timeout write that C lets
+        // through. socket_poll_timeout is a no-op for any positive timeout, so
+        // this only affects the `timeout == 0` case.
+        let deadline = std::time::Instant::now() + socket_poll_timeout(user.timeout);
         match inner {
             IpIoInner::Tcp(stream) => {
-                stream.set_write_timeout(Some(user.timeout))?;
+                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)?;
             }
-            IpIoInner::Udp(socket) => {
-                socket.set_write_timeout(Some(user.timeout))?;
-                socket.send(data)?;
+            IpIoInner::Udp(socket, peer) => {
+                socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
+                // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
+                // remote on the unconnected socket.
+                socket.send_to(data, *peer)?;
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
-                stream.set_write_timeout(Some(user.timeout))?;
+                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)?;
             }
         }
@@ -413,10 +446,10 @@ impl OctetNext for IpIoState {
                     let _ = stream.set_nonblocking(false);
                 }
             }
-            Some(IpIoInner::Udp(socket)) => {
+            Some(IpIoInner::Udp(socket, _peer)) => {
                 let restore = socket.set_nonblocking(true);
                 loop {
-                    match socket.recv(&mut scratch) {
+                    match socket.recv_from(&mut scratch) {
                         Ok(_) => continue,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -464,7 +497,210 @@ pub struct DrvAsynIPPort {
     host_info: String,
 }
 
+/// True for a socket read error that C `readRaw` treats as a non-fatal
+/// timeout — the socket is left intact and the caller retries. C
+/// (drvAsynIPPort.c:798-800) excludes BOTH `EWOULDBLOCK` *and* `EINTR` from
+/// the fatal-disconnect disjunct, so a would-block / poll timeout AND a
+/// signal-interrupted read are equally non-fatal. Single owner of that rule,
+/// shared by the IP client read arms (`classify_read_error`) and the IP
+/// server read arms (`ip_server_port`), so "EINTR is non-fatal like
+/// WouldBlock" is defined in exactly one place.
+pub(crate) fn is_nonfatal_read_timeout(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Error for a zero-length read request. C `readRaw` (drvAsynIPPort.c:736-740)
+/// rejects `maxchars == 0` with `asynError` ("maxchars %d. Why <=0?") before
+/// touching the socket. Without this guard a Rust `stream.read(&mut [])`
+/// returns `Ok(0)`, which the TCP read arm interprets as a peer EOF and tears
+/// down a perfectly healthy connection. Single owner of the empty-buffer
+/// rejection, shared by the IP client read and both IP server reads.
+pub(crate) fn maxchars_zero_error() -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: "maxchars 0. Why <=0?".into(),
+    }
+}
+
+/// Classify a failed socket read for the IP client read arms. A non-fatal
+/// timeout (see [`is_nonfatal_read_timeout`]) surfaces as `asynTimeout` with
+/// the socket left intact; any other error is a real transport failure
+/// (`Io`) that the read path's teardown treats as fatal. Single owner of
+/// read-error classification for the TCP/UDP/Unix read arms.
+fn classify_read_error(e: std::io::Error) -> AsynError {
+    if is_nonfatal_read_timeout(e.kind()) {
+        AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+    } else {
+        AsynError::Io(e)
+    }
+}
+
+/// A transport error meaning the socket is broken and the connection must
+/// be torn down (vs a timeout / would-block, which leaves it intact). C
+/// parity: `drvAsynIPPort.c` calls `closeConnection` on any real
+/// `recv`/`send` error but returns `asynTimeout` with the socket intact on
+/// a poll/timeout expiry.
+fn is_fatal_transport_error(e: &AsynError) -> bool {
+    matches!(
+        e,
+        AsynError::Status {
+            status: AsynStatus::Disconnected,
+            ..
+        } | AsynError::Io(_)
+    )
+}
+
+/// Map an `AsynUser` timeout to the socket-level receive/send timeout,
+/// applying the C `drvAsynIPPort` poll-interval floor.
+///
+/// C `readRaw`/`writeRaw` compute `pollmsec = (int)(timeout * 1000)` and
+/// then `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:741-743 and
+/// 615-617): a zero timeout (a poll / non-blocking request) becomes a 1 ms
+/// poll, never an immediate-return zero interval. `std::net`'s
+/// `set_read_timeout`/`set_write_timeout` likewise reject a zero `Duration`
+/// (they return `InvalidInput`), so passing `user.timeout` verbatim would
+/// turn a `timeout == 0` request into a hard error instead of C's 1 ms
+/// poll. Flooring here is the single owner of that mapping for every
+/// IP-family socket-timeout site (client read/write plus the server-mode
+/// reads).
+///
+/// A negative "wait forever" timeout has no representation in the
+/// framework's unsigned `Duration` (DRV-42), so only the zero floor
+/// applies; a positive sub-millisecond timeout is passed through verbatim
+/// (Rust polls at sub-ms granularity where C coarsens to whole ms —
+/// strictly finer, not a regression).
+pub(crate) fn socket_poll_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        timeout
+    }
+}
+
 impl DrvAsynIPPort {
+    /// Tear down the live socket. C parity: `drvAsynIPPort.c::closeConnection`
+    /// (205-217) destroys the fd and fires `exceptionDisconnect` — but
+    /// **only** when the link is *not* connect-per-transaction
+    /// (`!(flags & FLAG_CONNECT_PER_TRANSACTION)`, line 214-216).
+    ///
+    /// For a normal link this drops `connected` to `false` so the actor's
+    /// auto-reconnect (`port_actor.rs`) re-establishes it on the next
+    /// request. For HTTP (connect-per-transaction) the socket churns once
+    /// per request/response, so the logical connection stays *up*: only the
+    /// socket (`io.inner`) is released, `connected` is left `true`, and the
+    /// `Connect` exception does not flap each transaction. The socket is
+    /// reopened lazily on the next write/read (gated on `io.inner.is_none()`,
+    /// not `!connected`).
+    fn drop_connection(&mut self) {
+        self.io.inner = None;
+        if self.config.protocol != IpProtocol::Http {
+            self.base.set_connected(false);
+        }
+    }
+
+    /// Shared read core for [`PortDriver::read_octet`] (which drops the EOM
+    /// reason) and [`PortDriver::io_read_octet_eom`] (which keeps it).
+    /// Dispatches the interpose chain once and applies the C
+    /// `closeConnection` teardown on a fatal error, a
+    /// `disconnectOnReadTimeout` timeout, or a TCP EOF (which the base read
+    /// reports as `ASYN_EOM_END`). Returning the real `eom_reason` here is
+    /// what lets END/EOS reach the actor — the `usize`-only `read_octet`
+    /// would otherwise discard it, so END was never emitted anywhere.
+    fn read_octet_core(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        // HTTP connect-per-transaction: (re)open the socket if there isn't
+        // one. Gated on socket presence (`io.inner.is_none()`), NOT on
+        // `!connected`: an HTTP link stays *logically* connected across
+        // transactions (drop_connection releases only the socket), so the
+        // post-EOF reopen must key off the missing socket. `connect()` is
+        // edge-guarded — it no-ops `set_connected(true)` when already
+        // connected, so reopening does not flap the Connect exception.
+        // Surfacing the connect failure cause (DNS, refused, TLS reset) here
+        // rather than letting check_ready() mask it as a generic
+        // "port disconnected".
+        if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
+            self.connect(&AsynUser::default())?;
+        }
+        self.base.check_ready()?;
+        let result = self
+            .base
+            .interpose_octet
+            .dispatch_read(user, buf, &mut self.io);
+        match result {
+            Ok(r) => {
+                asyn_trace_io!(
+                    Some(self.base.trace),
+                    &self.base.port_name,
+                    TraceMask::IO_DRIVER,
+                    &buf[..r.nbytes_transferred],
+                    "read"
+                );
+                // C drvAsynIPPort.c::readRaw (815-819): a TCP EOF (reported
+                // as ASYN_EOM_END by the base read) is the *only* thing that
+                // closes the connection on a successful read. HTTP is
+                // connect-per-transaction but the response still ends on the
+                // server's close (HTTP/1.0 connection-close = EOF), so it
+                // must drop on EOF too — and ONLY on EOF. Dropping after
+                // every HTTP read (the old `|| Http`) truncated multi-segment
+                // responses: a first read returning one TCP segment (no END)
+                // tore the socket down before the caller could read the rest.
+                // `drop_connection` keeps the logical connection up for HTTP
+                // (no Connect-exception flap); the socket reopens lazily on
+                // the next write.
+                let eof = r.eom_reason.contains(EomReason::END);
+                if eof && self.base.connected {
+                    self.drop_connection();
+                }
+                Ok((r.nbytes_transferred, r.eom_reason))
+            }
+            Err(e) => {
+                let is_timeout = matches!(
+                    e,
+                    AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        ..
+                    }
+                );
+                // C parity: auto-disconnect on:
+                // 1. disconnectOnReadTimeout AND a timeout error AND a
+                //    positive request timeout. C gates this on
+                //    `(disconnectOnReadTimeout) && (timeout > 0)`
+                //    (drvAsynIPPort.c:799), so a `timeout == 0` poll (now a
+                //    1 ms socket poll via `socket_poll_timeout`) that expires
+                //    is reported as `asynTimeout` with the socket left intact,
+                //    never torn down.
+                // 2. Any fatal transport error (connection reset) —
+                //    `is_fatal_transport_error` is the single owner of that
+                //    classification, shared with the write path.
+                let should_disconnect = (self.disconnect_on_read_timeout
+                    && is_timeout
+                    && user.timeout > Duration::ZERO)
+                    || is_fatal_transport_error(&e);
+                if should_disconnect && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "read error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Create a new IP port driver.
     ///
     /// The driver starts disconnected with `auto_connect = true` and `can_block = true`.
@@ -593,19 +829,32 @@ impl DrvAsynIPPort {
         }
     }
 
-    fn connect_udp(&mut self) -> AsynResult<UdpSocket> {
-        let bind_addr = if let Some(local_port) = self.config.local_port {
-            format!("0.0.0.0:{local_port}")
+    fn connect_udp(&mut self) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
+        use std::net::ToSocketAddrs;
+        // C drvAsynIPPort.c::connectIt (484-493) resolves the remote name to
+        // tty->farAddr but (513) does NOT connect() a SOCK_DGRAM socket.
+        // Resolve the peer once, then leave the socket unconnected and bind
+        // a local endpoint of the peer's address family.
+        let remote = format!("{}:{}", self.config.host, self.config.port);
+        let peer = remote
+            .to_socket_addrs()
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP resolve '{remote}': {e}"),
+            })?
+            .next()
+            .ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("UDP resolve '{remote}': no addresses"),
+            })?;
+        let local_port = self.config.local_port.unwrap_or(0);
+        let bind_addr = if peer.is_ipv6() {
+            format!("[::]:{local_port}")
         } else {
-            "0.0.0.0:0".to_string()
+            format!("0.0.0.0:{local_port}")
         };
         let socket = UdpSocket::bind(&bind_addr)?;
-        let remote = format!("{}:{}", self.config.host, self.config.port);
-        socket.connect(&remote).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("UDP connect to '{remote}': {e}"),
-        })?;
-        Ok(socket)
+        Ok((socket, peer))
     }
 
     /// UDP variant builder — applies any combination of `SO_BROADCAST`
@@ -616,8 +865,8 @@ impl DrvAsynIPPort {
         &mut self,
         broadcast: bool,
         reuse_port: bool,
-    ) -> AsynResult<UdpSocket> {
-        let socket = self.connect_udp()?;
+    ) -> AsynResult<(UdpSocket, std::net::SocketAddr)> {
+        let (socket, peer) = self.connect_udp()?;
         if broadcast {
             socket.set_broadcast(true)?;
         }
@@ -634,7 +883,7 @@ impl DrvAsynIPPort {
                 })?;
             }
         }
-        Ok(socket)
+        Ok((socket, peer))
     }
 
     #[cfg(unix)]
@@ -659,6 +908,15 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        // C drvAsynIPPort.c::connectIt (424-427): reject a connect on an
+        // already-open link ("Link already open!") rather than opening a
+        // second socket and leaking the first.
+        if self.io.inner.is_some() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{}: Link already open!", self.base.port_name),
+            });
+        }
         match self.config.protocol {
             IpProtocol::Tcp | IpProtocol::TcpReusePort => {
                 let stream = self.connect_tcp()?;
@@ -681,20 +939,20 @@ impl PortDriver for DrvAsynIPPort {
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
             IpProtocol::Udp => {
-                let socket = self.connect_udp_with_options(false, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(false, false)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             IpProtocol::UdpReusePort => {
-                let socket = self.connect_udp_with_options(false, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(false, true)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             IpProtocol::UdpBroadcast => {
-                let socket = self.connect_udp_with_options(true, false)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(true, false)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             IpProtocol::UdpBroadcastReusePort => {
-                let socket = self.connect_udp_with_options(true, true)?;
-                self.io.inner = Some(IpIoInner::Udp(socket));
+                let (socket, peer) = self.connect_udp_with_options(true, true)?;
+                self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
             #[cfg(unix)]
             IpProtocol::Unix => {
@@ -709,9 +967,15 @@ impl PortDriver for DrvAsynIPPort {
                 });
             }
             IpProtocol::Http => {
-                // C parity: HTTP uses TCP with connect-per-transaction semantics.
-                // Connection is established here, but io_write_octet disconnects after
-                // each write/read cycle.
+                // C parity: HTTP uses TCP with connect-per-transaction
+                // semantics. The socket is opened here on the first connect
+                // and reopened lazily by write_octet/read_octet_core after
+                // each transaction's EOF (`drop_connection` releases the
+                // socket but keeps the link logically connected). C opens the
+                // socket lazily at the first write rather than at connect;
+                // opening it eagerly here is a benign divergence (the idle
+                // socket is reused by the first write, HTTP/1.0 servers wait
+                // for the request).
                 let stream = self.connect_tcp()?;
                 stream.set_nodelay(true)?;
                 self.io.inner = Some(IpIoInner::Tcp(stream));
@@ -743,74 +1007,30 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        // HTTP connect-per-transaction: reconnect if disconnected.
-        // Surface the connect failure cause (DNS, refused, TLS reset)
-        // rather than letting check_ready() mask it as a generic
-        // "port disconnected".
-        if self.config.protocol == IpProtocol::Http && !self.base.connected {
-            self.connect(&AsynUser::default())?;
-        }
-        self.base.check_ready()?;
-        let result = self
-            .base
-            .interpose_octet
-            .dispatch_read(user, buf, &mut self.io);
-        match result {
-            Ok(r) => {
-                asyn_trace_io!(
-                    Some(self.base.trace),
-                    &self.base.port_name,
-                    TraceMask::IO_DRIVER,
-                    &buf[..r.nbytes_transferred],
-                    "read"
-                );
-                // HTTP: disconnect after each read (connect-per-transaction)
-                if self.config.protocol == IpProtocol::Http {
-                    self.io.inner = None;
-                    self.base.set_connected(false);
-                }
-                Ok(r.nbytes_transferred)
-            }
-            Err(ref e) => {
-                let is_timeout = matches!(
-                    e,
-                    AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        ..
-                    }
-                );
-                let is_disconnect = matches!(
-                    e,
-                    AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        ..
-                    }
-                );
-                // C parity: auto-disconnect on:
-                // 1. disconnectOnReadTimeout AND timeout error
-                // 2. Any real error that isn't timeout/WouldBlock (e.g. connection reset, EOF)
-                let should_disconnect = (self.disconnect_on_read_timeout && is_timeout)
-                    || is_disconnect
-                    || (!is_timeout && matches!(e, AsynError::Io(_)));
-                if should_disconnect && self.base.connected {
-                    asyn_trace!(
-                        Some(self.base.trace),
-                        &self.base.port_name,
-                        TraceMask::FLOW,
-                        "read error, disconnecting: {e}"
-                    );
-                    self.io.inner = None;
-                    self.base.set_connected(false);
-                }
-                result.map(|r| r.nbytes_transferred)
-            }
-        }
+        self.read_octet_core(user, buf).map(|(n, _eom)| n)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
-        // HTTP connect-per-transaction: reconnect if disconnected.
-        // Surface the connect failure cause rather than masking it.
-        if self.config.protocol == IpProtocol::Http && !self.base.connected {
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        // Override the synthetic default so the real END/EOS reason from the
+        // base read + interpose chain reaches the actor (C reports eomReason
+        // from readRaw; END marks a TCP EOF, EOS an input-EOS match).
+        self.read_octet_core(user, buf)
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        // HTTP connect-per-transaction: (re)open the socket if there isn't
+        // one. Like the read path, gate on socket presence — an HTTP link
+        // stays logically connected across transactions, so the lazy reopen
+        // keys off `io.inner.is_none()`, not `!connected` (which would never
+        // fire post-EOF since `connected` is left `true`). This is the C
+        // `writeRaw` lazy `connectIt` on `fd == INVALID_SOCKET`
+        // (drvAsynIPPort.c:590-606). Surface the connect failure cause
+        // rather than masking it.
+        if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
@@ -821,10 +1041,31 @@ impl PortDriver for DrvAsynIPPort {
             data,
             "write"
         );
-        self.base
+        match self
+            .base
             .interpose_octet
-            .dispatch_write(user, data, &mut self.io)?;
-        Ok(())
+            .dispatch_write(user, data, &mut self.io)
+        {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // C parity: drvAsynIPPort.c::writeIt closes the connection
+                // on a real send error (ECONNRESET/EPIPE) so the next
+                // request reconnects. The read path already tears down on a
+                // fatal error; without the symmetric write-side teardown a
+                // wedged socket reports `connected` forever and never
+                // self-heals.
+                if is_fatal_transport_error(&e) && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "write error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
@@ -859,14 +1100,43 @@ impl PortDriver for DrvAsynIPPort {
         // configured for the old endpoint. The keys form an if/else chain
         // exactly like C's `epicsStrCaseCmp` cascade.
         if key.eq_ignore_ascii_case("noDelay") {
-            let enabled = value == "Y" || value == "y" || value == "1" || value == "yes";
+            // `noDelay` has no counterpart in C drvAsynIPPort.c::setOption
+            // (which recognizes only `disconnectOnReadTimeout`/`hostInfo`):
+            // C enables TCP_NODELAY unconditionally in connectIt (525-528)
+            // with no runtime toggle. This key is a deliberate Rust extension
+            // (default on via IpPortConfig::parse, matching C; settable off
+            // here). Its value is validated strictly Y/N (case-insensitive)
+            // like every other option value, so a typo errors instead of
+            // silently coercing to "off".
+            let enabled = if value.eq_ignore_ascii_case("Y") {
+                true
+            } else if value.eq_ignore_ascii_case("N") {
+                false
+            } else {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("Invalid noDelay value: '{value}'"),
+                });
+            };
             self.config.no_delay = enabled;
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
             }
         } else if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
-            self.disconnect_on_read_timeout =
-                value == "Y" || value == "y" || value == "1" || value == "yes";
+            // C drvAsynIPPort.c::setOption (924-935): only "Y"/"N"
+            // (case-insensitive) are valid; any other value returns
+            // asynError "Invalid disconnectOnReadTimeout value." rather
+            // than silently coercing the unknown text to "off".
+            if value.eq_ignore_ascii_case("Y") {
+                self.disconnect_on_read_timeout = true;
+            } else if value.eq_ignore_ascii_case("N") {
+                self.disconnect_on_read_timeout = false;
+            } else {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("Invalid disconnectOnReadTimeout value: '{value}'"),
+                });
+            }
         } else if key.eq_ignore_ascii_case("hostInfo") {
             // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
             //
@@ -906,15 +1176,22 @@ impl PortDriver for DrvAsynIPPort {
             self.config.port = new_config.port;
             self.config.local_port = new_config.local_port;
             self.config.protocol = new_config.protocol;
-            // connect_timeout / no_delay are first-set-only in C
-            // too — parseHostInfo doesn't touch them.
+            // connect_timeout / no_delay are not re-applied on a hostInfo
+            // reparse: C parseHostInfo touches neither (no_delay is set
+            // unconditionally in connectIt; C has no connect-timeout option
+            // at all — see DEFAULT_CONNECT_TIMEOUT / DRV-13).
             //
             // C parseHostInfo replaces tty->IPDeviceName with
             // epicsStrDup(hostInfo); store the verbatim spec so a later
             // getOption("hostInfo") echoes the new endpoint, not the old.
             self.host_info = value.to_string();
-        } else {
-            self.base.options.insert(key.to_string(), value.to_string());
+        } else if !key.is_empty() {
+            // C drvAsynIPPort.c::setOption (lines 941-945): any non-empty
+            // unsupported key returns asynError "Unsupported key"; the empty
+            // key is a silent no-op (the `epicsStrCaseCmp(key,"") != 0`
+            // guard). The real handlers above own every supported key, so
+            // there is no generic option store to fall into.
+            return Err(AsynError::OptionNotFound(key.to_string()));
         }
         Ok(())
     }
@@ -1060,6 +1337,86 @@ mod tests {
     }
 
     #[test]
+    fn http_multi_segment_response_not_truncated() {
+        // DRV-7: HTTP is connect-per-transaction, but the response ends on
+        // the server's EOF — not after the first read. The old code dropped
+        // the connection after *every* HTTP read, so a response read in
+        // chunks lost everything past the first chunk (the next read
+        // reconnected to a fresh socket). Fixed: the socket stays up until
+        // EOF, the logical connection never flaps, and the socket reopens
+        // lazily for the next transaction.
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            // Transaction 1: read request, send an 8-byte response, close.
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut req = [0u8; 64];
+            let _ = s1.read(&mut req).unwrap();
+            s1.write_all(b"AAAABBBB").unwrap();
+            drop(s1); // server close -> client's third read sees EOF
+            // Transaction 2: a fresh connection (the lazy reopen), send 4 B.
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.read(&mut req).unwrap();
+            s2.write_all(b"CCCC").unwrap();
+            drop(s2);
+        });
+
+        let mut drv = DrvAsynIPPort::new("httptest", &format!("127.0.0.1:{port} HTTP")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        // --- Transaction 1: write request, read the response in 4-B chunks.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"GET /1\r\n").unwrap();
+
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 4];
+        let (n1, eom1) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"AAAA");
+        assert!(!eom1.contains(EomReason::END), "first chunk is not EOF");
+        // The bug tore the socket down here; the fix keeps it up so the rest
+        // of the response is still readable.
+        assert!(
+            drv.base().connected,
+            "HTTP must stay connected mid-response (no truncation)"
+        );
+        assert!(
+            drv.io.inner.is_some(),
+            "socket must remain open mid-response"
+        );
+
+        let (n2, _) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n2],
+            b"BBBB",
+            "second chunk must be the rest of the response"
+        );
+
+        // Third read hits the server's EOF -> END; the socket is released but
+        // the logical connection stays up (connect-per-transaction = no flap).
+        let (n3, eom3) = drv.io_read_octet_eom(&ruser, &mut buf).unwrap();
+        assert_eq!(n3, 0);
+        assert!(eom3.contains(EomReason::END));
+        assert!(
+            drv.base().connected,
+            "HTTP logical connection must not flap on per-transaction EOF"
+        );
+        assert!(drv.io.inner.is_none(), "socket released after EOF");
+
+        // --- Transaction 2: a new write lazily reopens the socket.
+        drv.write_octet(&mut wuser, b"GET /2\r\n").unwrap();
+        assert!(
+            drv.io.inner.is_some(),
+            "socket must reopen lazily for the next transaction"
+        );
+        let mut buf2 = [0u8; 16];
+        let (n4, _) = drv.io_read_octet_eom(&ruser, &mut buf2).unwrap();
+        assert_eq!(&buf2[..n4], b"CCCC");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn test_read_timeout() {
         let (listener, port) = start_echo_server();
         let _handle = thread::spawn(move || {
@@ -1099,16 +1456,66 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let mut buf = [0u8; 32];
-        let err = drv.read_octet(&user, &mut buf).unwrap_err();
-        match err {
-            AsynError::Status {
-                status: AsynStatus::Disconnected,
-                ..
-            } => {}
-            other => panic!("expected Disconnected (EOF), got {other:?}"),
-        }
+        // C drvAsynIPPort.c::readRaw (815-821): a TCP EOF returns success
+        // with zero bytes and ASYN_EOM_END, then closes the connection.
+        let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        assert!(eom.contains(EomReason::END));
+        // closeConnection ran, so the actor's reconnect can re-open it.
+        assert!(!drv.base().connected);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_is_fatal_transport_error_classification() {
+        // DRV-5/DRV-31 family: a broken-socket error tears the connection
+        // down; a timeout leaves it intact (the actor reconnects on the
+        // next request only when `connected` flips to false).
+        assert!(is_fatal_transport_error(&AsynError::Status {
+            status: AsynStatus::Disconnected,
+            message: "EOF".into(),
+        }));
+        assert!(is_fatal_transport_error(&AsynError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst")
+        )));
+        assert!(!is_fatal_transport_error(&AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }));
+    }
+
+    #[test]
+    fn test_write_error_disconnects() {
+        // DRV-5: a fatal write error must tear down the connection so the
+        // actor's auto-reconnect fires — symmetric with the read path,
+        // which already disconnects on a fatal error.
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream); // peer closes → our later writes get RST/EPIPE
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+        handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let mut last: AsynResult<usize> = Ok(0);
+        for _ in 0..200 {
+            last = drv.write_octet(&mut user, b"ping\n");
+            if last.is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(last.is_err(), "expected a write to the dead peer to fail");
+        assert!(
+            !drv.base().connected,
+            "DRV-5: fatal write error must set connected=false"
+        );
     }
 
     #[test]
@@ -1182,8 +1589,12 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
         drv.set_option("noDelay", "Y").unwrap();
         assert!(drv.config.no_delay);
-        drv.set_option("noDelay", "0").unwrap();
+        drv.set_option("noDelay", "n").unwrap();
         assert!(!drv.config.no_delay);
+        // Value is validated strictly Y/N (case-insensitive); the old loose
+        // coercion silently treated any other token (incl. "0"/"1") as off.
+        assert!(drv.set_option("noDelay", "1").is_err());
+        assert!(drv.set_option("noDelay", "maybe").is_err());
     }
 
     // --- UDP tests ---
@@ -1216,6 +1627,118 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn test_udp_accepts_reply_from_any_peer() {
+        // DRV-1: the datagram socket is left unconnected (C connectIt does
+        // not connect() a SOCK_DGRAM socket), so a reply may arrive from a
+        // different source address than the request was sent to — a device
+        // that answers from another port, or a broadcast request answered by
+        // several peers. A connect()-ed socket silently drops these.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        // Reserve a fixed local port for the driver so the "other peer"
+        // below knows where to answer.
+        let local_port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let (n, _src) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            // Answer from a DIFFERENT socket — a peer we never sent to.
+            let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+            other
+                .send_to(b"pong", format!("127.0.0.1:{local_port}"))
+                .unwrap();
+        });
+
+        let mut drv = DrvAsynIPPort::new(
+            "udptest",
+            &format!("127.0.0.1:{server_port}:{local_port} udp"),
+        )
+        .unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"ping").unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 32];
+        let n = drv.read_octet(&user, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pong");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_udp_empty_datagram_is_not_eof() {
+        // DRV-4: a zero-length UDP datagram is a legitimate read of 0 bytes,
+        // not a connection close. C readRaw only treats recv()==0 as EOF for
+        // SOCK_STREAM; a DGRAM 0-byte recvfrom leaves the port open.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        let mut drv =
+            DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        // Driver sends first so the server learns its source address.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut wuser, b"hello").unwrap();
+        let mut sbuf = [0u8; 16];
+        let (_n, src) = server.recv_from(&mut sbuf).unwrap();
+
+        // Reply with an empty datagram.
+        server.send_to(&[], src).unwrap();
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 32];
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        // The port must remain open — a 0-byte datagram is not EOF.
+        assert!(drv.base().connected);
+
+        // And it can still read a subsequent real datagram.
+        server.send_to(b"world", src).unwrap();
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"world");
+    }
+
+    #[test]
+    fn test_udp_zero_length_write_sends_nothing() {
+        // DRV-14: C writeRaw (613-614) returns success on a zero-length
+        // write without sending — in particular no empty UDP datagram.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        let mut drv =
+            DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        // A zero-length write succeeds but must not put a datagram on the wire.
+        drv.write_octet(&mut wuser, b"").unwrap();
+        let mut sbuf = [0u8; 16];
+        assert!(
+            server.recv_from(&mut sbuf).is_err(),
+            "zero-length write must not emit a datagram"
+        );
+
+        // A real write still goes through.
+        drv.write_octet(&mut wuser, b"data").unwrap();
+        let (n, _src) = server.recv_from(&mut sbuf).unwrap();
+        assert_eq!(&sbuf[..n], b"data");
+    }
+
     // --- disconnectOnReadTimeout tests ---
 
     #[test]
@@ -1236,6 +1759,204 @@ mod tests {
         let mut buf = [0u8; 32];
         let _ = drv.read_octet(&user, &mut buf);
         assert!(!drv.base().connected);
+    }
+
+    #[test]
+    fn socket_poll_timeout_floors_zero_to_one_ms() {
+        // C drvAsynIPPort.c::readRaw/writeRaw floor `(int)(timeout*1000)==0`
+        // to a 1 ms poll; std rejects a zero Duration in set_read_timeout.
+        assert_eq!(
+            socket_poll_timeout(Duration::ZERO),
+            Duration::from_millis(1)
+        );
+        // Positive timeouts pass through verbatim (incl. sub-ms — Rust is
+        // strictly finer than C's whole-ms coarsening).
+        assert_eq!(
+            socket_poll_timeout(Duration::from_micros(500)),
+            Duration::from_micros(500)
+        );
+        assert_eq!(
+            socket_poll_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn zero_timeout_read_polls_without_disconnect() {
+        // C drvAsynIPPort.c::readRaw: a `timeout == 0` read becomes a 1 ms
+        // poll (line 742) and the disconnect-on-read-timeout teardown is
+        // gated on `timeout > 0` (line 799). So a zero-timeout read of a
+        // silent socket must return asynTimeout WITHOUT a hard
+        // Duration::ZERO error and WITHOUT tearing the connection down,
+        // even with disconnectOnReadTimeout enabled.
+        let (listener, port) = start_echo_server();
+        let _handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(5));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        let user = AsynUser::new(0).with_timeout(Duration::ZERO);
+        let mut buf = [0u8; 32];
+        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        match err {
+            AsynError::Status {
+                status: AsynStatus::Timeout,
+                ..
+            } => {}
+            other => panic!("expected Timeout (not a Duration::ZERO error), got {other:?}"),
+        }
+        // timeout == 0 → C `timeout > 0` guard is false → no teardown.
+        assert!(
+            drv.base().connected,
+            "zero-timeout read must not disconnect even with disconnectOnReadTimeout=Y"
+        );
+    }
+
+    #[test]
+    fn classify_read_error_eintr_and_wouldblock_are_nonfatal_timeout() {
+        // C readRaw (798-800) excludes EWOULDBLOCK *and* EINTR from the fatal
+        // disjunct, so a signal-interrupted read must be a non-fatal timeout
+        // (socket intact), identical to a would-block — never an Io→teardown.
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+        ] {
+            let err = classify_read_error(Error::from(kind));
+            match err {
+                AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    ..
+                } => {}
+                other => panic!("{kind:?} must map to a non-fatal Timeout, got {other:?}"),
+            }
+            assert!(
+                !is_fatal_transport_error(&classify_read_error(Error::from(kind))),
+                "{kind:?} must not be a fatal transport error"
+            );
+        }
+        // A genuine transport failure stays fatal (Io) → teardown.
+        let reset = classify_read_error(Error::from(ErrorKind::ConnectionReset));
+        assert!(matches!(reset, AsynError::Io(_)));
+        assert!(is_fatal_transport_error(&reset));
+    }
+
+    #[test]
+    fn zero_timeout_write_attempts_send_not_instant_timeout() {
+        // DRV-11 (write side): C writeRaw floors a zero timeout to a 1 ms
+        // poll then attempts the send (615-617), so a `timeout == 0` write of
+        // a writable socket succeeds. The write deadline must be floored too,
+        // else write_with_retry's top-of-loop deadline check returns Timeout
+        // before ever calling write().
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16];
+            let _ = s.read(&mut buf);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::ZERO);
+        let n = drv.write_octet(&mut wuser, b"x").unwrap();
+        assert_eq!(
+            n, 1,
+            "zero-timeout write of a writable socket must attempt the send, not instant-timeout"
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn zero_length_read_request_rejected_not_eof_teardown() {
+        // DRV-55: C readRaw (736-740) rejects maxchars == 0 with asynError
+        // before touching the socket. A Rust stream.read(&mut []) returns
+        // Ok(0), which the TCP arm would misread as a peer EOF and tear down a
+        // healthy connection. The guard must reject the empty request *and*
+        // leave the socket connected.
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (_s, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut empty: [u8; 0] = [];
+        let res = drv.read_octet(&ruser, &mut empty);
+        assert!(
+            matches!(
+                res,
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    ..
+                })
+            ),
+            "zero-length read must be rejected with asynError, got {res:?}"
+        );
+        assert!(
+            drv.base().connected,
+            "zero-length read must not tear down the connection"
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_disconnect_on_read_timeout_value_validation() {
+        // C drvAsynIPPort.c::setOption (924-935) accepts only "Y"/"N"
+        // (case-insensitive) and returns asynError for anything else,
+        // rather than silently coercing unknown text to "off".
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+        drv.set_option("disconnectOnReadTimeout", "n").unwrap();
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+
+        // Values C never accepts must now error instead of mapping to "off".
+        for bad in ["1", "yes", "true", "", "maybe"] {
+            assert!(
+                drv.set_option("disconnectOnReadTimeout", bad).is_err(),
+                "value {bad:?} should be rejected"
+            );
+        }
+        // The last accepted value (N) is unchanged by the rejected sets.
+        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+    }
+
+    #[test]
+    fn connect_rejects_double_open() {
+        // C drvAsynIPPort.c::connectIt (424-427) returns asynError
+        // "Link already open!" on a connect to an already-open link,
+        // rather than opening a second socket and leaking the first.
+        let (listener, port) = start_echo_server();
+        let _handle = thread::spawn(move || {
+            let _ = listener.accept();
+            thread::sleep(Duration::from_secs(1));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        let err = drv.connect(&user).unwrap_err();
+        assert!(matches!(err, AsynError::Status { .. }));
+        // The original socket is left intact (still connected).
+        assert!(drv.base().connected);
     }
 
     // --- hostInfo option tests ---
@@ -1338,6 +2059,22 @@ mod tests {
         // contract for set and get (C getOption -> "Y"/"N").
         drv.set_option("DISCONNECTONREADTIMEOUT", "Y").unwrap();
         assert_eq!(drv.get_option("disconnectonreadtimeout").unwrap(), "Y");
+    }
+
+    #[test]
+    fn unsupported_option_key_is_rejected() {
+        // C drvAsynIPPort.c::setOption (941-945) / getOption (902-906)
+        // reject any non-empty unsupported key (asynError "Unsupported key")
+        // and never store it, so a later getOption cannot echo it back; the
+        // empty key is a silent no-op.
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        let err = drv.set_option("bogusKey", "value").unwrap_err();
+        assert!(matches!(err, AsynError::OptionNotFound(_)));
+        assert!(drv.get_option("bogusKey").is_err());
+
+        // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
+        drv.set_option("", "ignored").unwrap();
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---

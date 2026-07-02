@@ -138,8 +138,10 @@ const ASYN_FMT_BINARY: i32 = 2;
 /// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
 /// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) and ASCII octet
 /// output (`:1489`) so a configured `\r\n` reaches the driver as the two
-/// raw bytes `0x0D 0x0A`, not the four-byte literal.
-fn translate_escape(s: &str) -> Vec<u8> {
+/// raw bytes `0x0D 0x0A`, not the four-byte literal. Also used by the
+/// `asynOctetCmdResponse` factory to escape the literal command (C
+/// `initCmdBuffer`, devAsynOctet.c) once at build time.
+pub(crate) fn translate_escape(s: &str) -> Vec<u8> {
     translate_escape_bytes(s.as_bytes())
 }
 
@@ -1780,10 +1782,13 @@ impl AsynRecord {
             Some(entry) => {
                 // Resolve drvinfo → reason if specified
                 if !self.drvinfo.is_empty() {
-                    match entry.handle.drv_user_create_blocking(&self.drvinfo) {
-                        Ok(r) => {
-                            self.resolved_reason = r;
-                            self.reason = r as i32;
+                    match entry
+                        .handle
+                        .drv_user_create_blocking(&self.drvinfo, self.addr)
+                    {
+                        Ok(info) => {
+                            self.resolved_reason = info.reason;
+                            self.reason = info.reason as i32;
                         }
                         Err(e) => {
                             self.errs = format!("drvUserCreate failed: {e}");
@@ -3519,7 +3524,7 @@ mod tests {
                 &mut self,
                 _user: &mut AsynUser,
                 _data: &[u8],
-            ) -> crate::error::AsynResult<()> {
+            ) -> crate::error::AsynResult<usize> {
                 Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "write boom".into(),
@@ -3651,7 +3656,7 @@ mod tests {
                 &mut self,
                 _user: &mut AsynUser,
                 _data: &[u8],
-            ) -> crate::error::AsynResult<()> {
+            ) -> crate::error::AsynResult<usize> {
                 Err(boom())
             }
             fn io_read_int32(&mut self, _user: &AsynUser) -> crate::error::AsynResult<i32> {

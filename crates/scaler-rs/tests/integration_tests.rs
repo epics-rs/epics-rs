@@ -575,3 +575,72 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
         "TP recomputed from effective PR1/FREQ"
     );
 }
+
+// ============================================================
+// Scaler: a put to a non-pp field (a preset) must NOT process.
+//
+// C scalerRecord.dbd marks only CNT and CONT pp(TRUE); every preset
+// (PR1..PR64) is special(SPC_MOD), fully applied by special() without
+// processing. Before the `"scaler" => &["CNT", "CONT"]` pp_fields_for
+// entry the record had no entry and ran process() on every put, so a
+// preset put spuriously entered the AutoCount block and armed the
+// counter. Decisive signal: with CONT=1 and DLY1=0 a process arms
+// immediately (SS -> COUNTING); a non-processing preset put leaves
+// SS IDLE.
+// ============================================================
+
+#[tokio::test]
+async fn test_scaler_preset_put_does_not_process() {
+    let db_str = r#"
+record(scaler, "TEST:SCNP") {
+    field(FREQ, "1000000")
+    field(CONT, "1")
+    field(DLY1, "0")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("scaler", || Box::new(ScalerRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // No PINI / no process yet: idle despite CONT=1.
+    assert_eq!(
+        server.get("TEST:SCNP.SS").await.unwrap(),
+        EpicsValue::Short(0),
+        "SS must be IDLE before any process"
+    );
+
+    // Put a preset (PR1) — a special(SPC_MOD), non-pp field. Must apply
+    // via special() but must NOT process (no AutoCount arming).
+    db.put_record_field_from_ca("TEST:SCNP", "PR1", EpicsValue::ULong(5000))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        server.get("TEST:SCNP.SS").await.unwrap(),
+        EpicsValue::Short(0),
+        "a preset put must NOT process — SS must stay IDLE (AutoCount not armed)"
+    );
+    // special() did apply the preset.
+    assert_eq!(
+        server.get("TEST:SCNP.PR1").await.unwrap(),
+        EpicsValue::ULong(5000),
+        "special() must apply the preset value"
+    );
+
+    // Sanity: a real process (PROC) DOES arm AutoCount with CONT=1/DLY1=0.
+    db.put_record_field_from_ca("TEST:SCNP", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        server.get("TEST:SCNP.SS").await.unwrap(),
+        EpicsValue::Short(2),
+        "PROC must process and arm AutoCount (SS -> COUNTING)"
+    );
+}

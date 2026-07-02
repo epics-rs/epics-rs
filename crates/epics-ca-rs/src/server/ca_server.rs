@@ -246,10 +246,14 @@ impl CaServerBuilder {
         self
     }
 
-    /// Register a subroutine function by name (for sub records).
+    /// Register a subroutine function by name (for sub/aSub records).
+    ///
+    /// The closure returns the C `long` status: `Ok(0)` for the normal
+    /// path, `Ok(n)` with `n < 0` to raise `SOFT_ALARM` at `BRSV` (and, for
+    /// `aSub`, publish the status as `VAL`). See `SubroutineFn`.
     pub fn register_subroutine<F>(mut self, name: &str, func: F) -> Self
     where
-        F: Fn(&mut dyn Record) -> CaResult<()> + Send + Sync + 'static,
+        F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
         self.ioc = self.ioc.register_subroutine(name, func);
         self

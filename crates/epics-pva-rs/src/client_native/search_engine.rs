@@ -1117,7 +1117,12 @@ async fn run_engine(
     // ambient `EPICS_PVA_*` reads in the broadcast path.
     udp: UdpSearchParams,
 ) {
-    static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
+    // pvxs has no separate search counter: it reuses each channel's CID as
+    // its searchID (`clientimpl.h:181`). The port keeps searchInstanceID a
+    // distinct namespace, so — in the spirit of pvxs 3b641bed — seed it from
+    // its own distinct non-zero base (port-specific, not a pvxs constant) so
+    // a searchID can never silently alias a CID/SID/IOID.
+    static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(0x5EA5_0000);
 
     let codec = PvaCodec { big_endian: false };
     // All NICs share one ephemeral port (bind_ephemeral_same_port), so
@@ -1866,13 +1871,40 @@ async fn maybe_poke(
 /// and an empty address list this returns an EMPTY list and no SEARCH is
 /// emitted, instead of leaking limited-broadcast traffic onto a LAN the
 /// operator intentionally restricted.
+/// A resolved SEARCH destination tagged with pvxs's per-destination Unicast
+/// classification (`client.cpp:608-616`: `isucast = !isMCast()`, cleared for a
+/// known interface broadcast address). `unicast == true` means the SEARCH
+/// flags octet's Unicast bit (`0x80`) is set for this destination (a genuine
+/// unicast target); `false` for broadcast / multicast. [`broadcast`] uses it
+/// to pick which pre-built frame variant to send.
+#[derive(Clone, Copy, Debug)]
+struct SearchTarget {
+    addr: SocketAddr,
+    unicast: bool,
+}
+
+impl SearchTarget {
+    fn broadcast(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            unicast: false,
+        }
+    }
+    fn unicast(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            unicast: true,
+        }
+    }
+}
+
 fn search_targets(
     bport: u16,
     auto_addr_list: bool,
     extra_targets: &[SocketAddr],
     client_interfaces: &[Ipv4Addr],
-) -> Vec<SocketAddr> {
-    let mut targets: Vec<SocketAddr> = Vec::with_capacity(8);
+) -> Vec<SearchTarget> {
+    let mut targets: Vec<SearchTarget> = Vec::with_capacity(8);
 
     // Auto-expansion destinations — gated on AUTO_ADDR_LIST, matching
     // pvxs's `expandAddrList()` which only runs when autoAddrList is true.
@@ -1885,11 +1917,14 @@ fn search_targets(
         // broadcast, so we also enumerate each up-non-loopback NIC's IPv4
         // broadcast address (otherwise local IOCs on `192.168.X.255:5076`
         // are never reached).
-        targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), bport));
+        targets.push(SearchTarget::broadcast(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            bport,
+        )));
         for sa in crate::config::env::list_broadcast_addresses(bport) {
             // The helper appends 255.255.255.255 too — the dedup below
             // collapses the duplicate.
-            targets.push(sa);
+            targets.push(SearchTarget::broadcast(sa));
         }
         // No implicit loopback unicast here. pvxs's auto-address expansion
         // (config.cpp:624-648 → expandAddrList → evhelper.cpp:625-660)
@@ -1909,25 +1944,53 @@ fn search_targets(
         // interface is listed — a loopback-only list contributes none, so
         // no broadcast leaves the host.
         for sa in crate::config::env::list_broadcast_addresses_on(client_interfaces, bport) {
-            targets.push(sa);
+            targets.push(SearchTarget::broadcast(sa));
         }
         // Loopback unicast only when loopback is an explicitly-listed
         // interface (the all-NIC path adds it unconditionally as a
         // zero-config convenience; here the operator chose the set).
         if client_interfaces.iter().any(|ip| ip.is_loopback()) {
-            targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bport));
+            targets.push(SearchTarget::unicast(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                bport,
+            )));
         }
     }
 
+    // pvxs's `bcasts` set: the (auto-expanded) interface broadcast addresses.
+    // An explicit addr-list entry that names one of these is classified
+    // broadcast, not unicast (client.cpp:614-615 clears `isucast`).
+    let bcast_ips: std::collections::HashSet<IpAddr> = targets
+        .iter()
+        .filter(|t| !t.unicast)
+        .map(|t| t.addr.ip())
+        .collect();
+
     // Explicitly configured / programmatic targets are always sent — they
-    // are the `addressList` itself, present regardless of autoAddrList.
+    // are the `addressList` itself, present regardless of autoAddrList. pvxs
+    // classifies each by address: `isucast = !isMCast()`, cleared for a known
+    // interface broadcast. With autoAddrList off the interface-broadcast set
+    // is empty here, so a directed broadcast placed manually in the addr list
+    // is treated as unicast — a wire-flag-only divergence with no functional
+    // effect (the datagram still reaches the subnet, and the Unicast bit only
+    // governs a re-broadcast trigger that is moot for an already-broadcast
+    // packet).
     for &t in extra_targets {
-        targets.push(t);
+        let ip = t.ip();
+        let is_broadcastish = ip.is_multicast()
+            || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+            || bcast_ips.contains(&ip);
+        targets.push(if is_broadcastish {
+            SearchTarget::broadcast(t)
+        } else {
+            SearchTarget::unicast(t)
+        });
     }
 
-    // Dedup while preserving insertion order.
+    // Dedup by address while preserving insertion order (first classification
+    // wins, so an auto broadcast entry shadows a duplicate extra).
     let mut seen = std::collections::HashSet::new();
-    targets.retain(|t| seen.insert(*t));
+    targets.retain(|t| seen.insert(t.addr));
     targets
 }
 
@@ -1991,7 +2054,17 @@ async fn broadcast(
         client_interfaces,
     );
 
-    for t in targets {
+    // pvxs sends the same SEARCH to every destination but toggles the Unicast
+    // flag per dest (client.cpp:1180-1187): the bit-set frame to a unicast
+    // target, the bit-clear frame to broadcast/multicast. The frames arrive
+    // bit-clear (built `unicast=false`); derive the unicast variant once.
+    let ucast_v4 = PvaCodec::search_frame_unicast_copy(packet_v4);
+    let ucast_v6 = PvaCodec::search_frame_unicast_copy(packet_v6);
+
+    for st in targets {
+        let t = st.addr;
+        let pkt_v4: &[u8] = if st.unicast { &ucast_v4 } else { packet_v4 };
+        let pkt_v6: &[u8] = if st.unicast { &ucast_v6 } else { packet_v6 };
         // Limited broadcast (255.255.255.255) and multicast (224/4)
         // need explicit per-NIC fanout — OS routing alone would only
         // pick the default-route NIC. Per-subnet broadcast and
@@ -2017,16 +2090,16 @@ async fn broadcast(
                     // Per-subnet directed broadcasts and explicit unicast take
                     // the `send_to` path.
                     if client_interfaces.is_empty() {
-                        socket.fanout_to(packet_v4, t).await.map(|_| ())
+                        socket.fanout_to(pkt_v4, t).await.map(|_| ())
                     } else {
-                        fanout_on_interfaces(socket, packet_v4, t, client_interfaces).await
+                        fanout_on_interfaces(socket, pkt_v4, t, client_interfaces).await
                     }
                 } else {
-                    socket.send_to(packet_v4, t).await.map(|_| ())
+                    socket.send_to(pkt_v4, t).await.map(|_| ())
                 }
             }
             SocketAddr::V6(_) => match socket_v6 {
-                Some(s6) => s6.send_to(packet_v6, t).await.map(|_| ()),
+                Some(s6) => s6.send_to(pkt_v6, t).await.map(|_| ()),
                 None => Err(std::io::Error::new(
                     std::io::ErrorKind::AddrNotAvailable,
                     "no IPv6 search socket; v6 entry routed despite v6 disabled",
@@ -5266,6 +5339,12 @@ mod tests {
 
     // ---- search_targets: AUTO_ADDR_LIST gating (pvxs expandAddrList) ----
 
+    /// Test helper: the address set of a target list (drops the per-target
+    /// unicast classification).
+    fn target_addrs(targets: &[SearchTarget]) -> Vec<SocketAddr> {
+        targets.iter().map(|t| t.addr).collect()
+    }
+
     /// AUTO_ADDR_LIST=NO with an empty configured address list must yield
     /// NO destinations — pvxs skips expandAddrList and sends only to the
     /// (empty) addressList, so no SEARCH is emitted at all. The pre-fix
@@ -5322,7 +5401,7 @@ mod tests {
     fn search_targets_loopback_only_interface_list_no_broadcast() {
         let targets = search_targets(5076, true, &[], &[Ipv4Addr::LOCALHOST]);
         assert!(
-            !targets.iter().any(|t| match t {
+            !targets.iter().any(|t| match t.addr {
                 SocketAddr::V4(v4) => !v4.ip().is_loopback(),
                 SocketAddr::V6(_) => true,
             }),
@@ -5331,14 +5410,15 @@ mod tests {
         assert!(
             !targets
                 .iter()
-                .any(|t| matches!(t, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+                .any(|t| matches!(t.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
             "loopback-only interface list must not emit limited broadcast: {targets:?}"
         );
         // The loopback unicast convenience is still present (loopback is
-        // the explicitly-listed interface).
+        // the explicitly-listed interface) and is classified unicast.
+        let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
         assert!(
-            targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076)),
-            "loopback unicast expected when loopback is the listed interface"
+            targets.iter().any(|t| t.addr == lo && t.unicast),
+            "loopback unicast expected (flag set) when loopback is the listed interface"
         );
     }
 
@@ -5348,12 +5428,37 @@ mod tests {
     fn search_targets_auto_off_sends_only_configured_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
         let targets = search_targets(5076, false, &[extra], &[]);
-        assert_eq!(targets, vec![extra]);
+        assert_eq!(target_addrs(&targets), vec![extra]);
+        // A plain addr-list host is a unicast destination (pvxs sets the
+        // Unicast flag bit for it; PVX-81).
+        assert!(
+            targets.iter().all(|t| t.unicast),
+            "an explicit non-broadcast addr-list entry must be classified unicast"
+        );
         assert!(
             !targets
                 .iter()
-                .any(|t| matches!(t, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+                .any(|t| matches!(t.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
             "no limited broadcast may be added when AUTO_ADDR_LIST is off"
+        );
+    }
+
+    /// PVX-81 classification edge: a multicast address in EPICS_PVA_ADDR_LIST
+    /// is NOT a unicast destination (pvxs `isucast = !isMCast()`), so its
+    /// SEARCH keeps the Unicast bit clear; a plain host alongside it is
+    /// unicast.
+    #[test]
+    fn search_targets_multicast_extra_is_not_unicast() {
+        let mcast: SocketAddr = "224.0.2.3:5076".parse().unwrap();
+        let host: SocketAddr = "10.0.0.7:5076".parse().unwrap();
+        let targets = search_targets(5076, false, &[mcast, host], &[]);
+        assert!(
+            targets.iter().any(|t| t.addr == mcast && !t.unicast),
+            "a multicast addr-list entry must be classified non-unicast"
+        );
+        assert!(
+            targets.iter().any(|t| t.addr == host && t.unicast),
+            "a plain host addr-list entry must be classified unicast"
         );
     }
 
@@ -5363,13 +5468,20 @@ mod tests {
     fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
         let targets = search_targets(5076, true, &[extra], &[]);
+        let limited = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076);
         assert!(
-            targets.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076)),
+            target_addrs(&targets).contains(&limited),
             "AUTO_ADDR_LIST=YES must add the limited broadcast destination"
         );
+        // PVX-81 classification: the limited broadcast is non-unicast (flag
+        // clear); the explicit host extra is unicast (flag set).
         assert!(
-            targets.contains(&extra),
-            "configured extras are always included"
+            targets.iter().any(|t| t.addr == limited && !t.unicast),
+            "the limited broadcast must be classified non-unicast"
+        );
+        assert!(
+            targets.iter().any(|t| t.addr == extra && t.unicast),
+            "configured extras are always included and classified unicast"
         );
     }
 
@@ -5384,14 +5496,14 @@ mod tests {
         let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
         let targets = search_targets(5076, true, &[], &[]);
         assert!(
-            !targets.contains(&lo),
+            !target_addrs(&targets).contains(&lo),
             "default auto-address path must not inject an implicit loopback target: {targets:?}"
         );
         // An explicit EPICS_PVA_ADDR_LIST=127.0.0.1 entry (carried in
         // extra_targets) still reaches loopback — the parity-correct path.
         let with_explicit = search_targets(5076, true, &[lo], &[]);
         assert!(
-            with_explicit.contains(&lo),
+            target_addrs(&with_explicit).contains(&lo),
             "explicit addr-list loopback entry must still target loopback: {with_explicit:?}"
         );
     }

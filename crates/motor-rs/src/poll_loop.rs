@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asyn_rs::interfaces::motor::AsynMotor;
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use asyn_rs::user::AsynUser;
 use tokio::sync::mpsc;
 
@@ -28,6 +28,14 @@ pub struct MotorPollLoop {
     forced_fast_polls_remaining: u32,
     last_moving: bool,
     status_seq: u64,
+    /// Last status delivered to the record. An autonomous (timed) idle poll
+    /// notifies the record only when the freshly polled status differs from
+    /// this — the analogue of C `asynMotorAxis::callParamCallbacks` firing the
+    /// status callback only when `statusChanged_` is set (asynMotorAxis.cpp:
+    /// 316-322), so a stationary axis does not re-post DIFF/RDIF every idle
+    /// period. A forced poll (StartPolling, i.e. request_poll/status_refresh)
+    /// bypasses this and always notifies.
+    last_status: Option<MotorStatus>,
 }
 
 impl MotorPollLoop {
@@ -51,11 +59,22 @@ impl MotorPollLoop {
             forced_fast_polls_remaining: 0,
             last_moving: false,
             status_seq: 1, // starts at 1 (init already wrote seq=1)
+            last_status: None,
         }
     }
 
     /// Poll the motor and write stamped status to shared state.
-    async fn poll_and_notify(&mut self) {
+    ///
+    /// `force` distinguishes the two C poll paths. A forced poll (the analogue
+    /// of C `motorUpdateStatus_` forcing `statusChanged_=1`, asynMotorController
+    /// .cpp:217-222) always bumps the sequence and pulses io_intr, so the
+    /// record re-processes — this is how request_poll / status_refresh (STUP,
+    /// implicit GET_INFO, settle-resume, startup) clear STUP=BUSY and refresh
+    /// readbacks even on a stationary axis. An autonomous (timed) poll passes
+    /// `force=false` and notifies only when the polled status differs from the
+    /// last one delivered — the analogue of C's `statusChanged_` gate, so a
+    /// settled, unchanging axis does not re-post DIFF/RDIF every idle period.
+    async fn poll_and_notify(&mut self, force: bool) {
         let user = AsynUser::new(0);
         let status = {
             let mut motor = match self.motor.lock() {
@@ -67,7 +86,15 @@ impl MotorPollLoop {
                 Err(_) => return,
             }
         };
+        // The poll rate decision (moving vs idle) always tracks the latest
+        // poll, independent of whether the record is notified.
         self.last_moving = status.moving;
+        if !force && self.last_status.as_ref() == Some(&status) {
+            // Autonomous idle poll, status unchanged → no record pass (C posts
+            // nothing when statusChanged_ stays 0).
+            return;
+        }
+        self.last_status = Some(status.clone());
         self.status_seq += 1;
         {
             match self.device_state.lock() {
@@ -132,7 +159,9 @@ impl MotorPollLoop {
                             Some(PollCommand::StartPolling) => {
                                 active = true;
                                 self.forced_fast_polls_remaining = self.forced_fast_polls_config;
-                                self.poll_and_notify().await;
+                                // Command-triggered (request_poll/status_refresh
+                                // /keep-alive resume): force the post.
+                                self.poll_and_notify(true).await;
                             }
                             Some(PollCommand::StopPolling) => {
                                 active = false;
@@ -149,8 +178,14 @@ impl MotorPollLoop {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(interval) => {
-                        self.poll_and_notify().await;
+                    // C asynMotorController.cpp:633-634: idlePollPeriod_ == 0
+                    // blocks on the event (no timed poll). A zero effective
+                    // interval disables this timed arm so the loop is
+                    // event-driven only, never busy-spinning on sleep(0).
+                    _ = tokio::time::sleep(interval), if !interval.is_zero() => {
+                        // Autonomous timed poll: notify only on a real change
+                        // (C statusChanged_ gate).
+                        self.poll_and_notify(false).await;
                     }
                 }
             } else {
@@ -159,7 +194,8 @@ impl MotorPollLoop {
                     Some(PollCommand::StartPolling) => {
                         active = true;
                         self.forced_fast_polls_remaining = self.forced_fast_polls_config;
-                        self.poll_and_notify().await;
+                        // Command-triggered: force the post (see active arm).
+                        self.poll_and_notify(true).await;
                     }
                     Some(PollCommand::StopPolling) => {
                         active = false;

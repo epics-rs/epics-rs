@@ -525,7 +525,13 @@ impl EpidFastDeviceSupport {
         epid.p = pvt.p;
         epid.i = pvt.i;
         epid.d = pvt.d;
-        epid.dt = pvt.dt;
+        // C `update_params` writes `pepid->dt = pPvt->timePerPointActual`
+        // unconditionally on every record process (devEpidFast.c:330), so
+        // DT always reflects the current achieved time-per-point. Source
+        // it from `time_per_point_actual` directly rather than from the
+        // `dt` mirror, which `do_pid` updates only when a data callback
+        // fires — otherwise DT would read 0 until the first callback.
+        epid.dt = pvt.time_per_point_actual;
         epid.fbop = if pvt.fbop { 1 } else { 0 };
     }
 }

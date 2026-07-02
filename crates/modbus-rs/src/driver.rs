@@ -253,6 +253,17 @@ impl IoStatistics {
             self.histogram[bin] = self.histogram[bin].saturating_add(1);
         }
     }
+
+    /// Erase the read-time histogram counts. The single owner of the
+    /// "zero the histogram" transition that C performs on an ENABLE_HISTOGRAM
+    /// OFF→ON edge (drvModbusAsyn.cpp:636-638) and on a HISTOGRAM_BIN_TIME
+    /// change (:799-800), so stale counts are neither carried across a
+    /// re-enable nor misattributed when the bin width changes. Only the `ioc`
+    /// histogram-control write arms invoke it, so it is gated with them.
+    #[cfg(feature = "ioc")]
+    pub(crate) fn clear_histogram(&mut self) {
+        self.histogram.fill(0);
+    }
 }
 
 /// A byte-stream transport — the underlying `asyn-rs` octet port the framed
@@ -261,6 +272,14 @@ impl IoStatistics {
 pub trait OctetTransport: Send + Sync {
     /// Send a fully framed request.
     fn write_frame(&mut self, data: &[u8]) -> ModbusResult<()>;
+    /// Re-send an already-transmitted frame after a UDP read failure. C
+    /// resends via the raw `pasynOctet->write` (`modbusInterpose.c:358`),
+    /// bypassing `writeIt` and therefore its pre-write `writeDelay` pacing
+    /// (`:246`). The default mirrors `write_frame`; a transport that paces
+    /// writes overrides this to skip the delay so retransmits are not slowed.
+    fn resend_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
+        self.write_frame(data)
+    }
     /// Receive one framed response, waiting up to `timeout`.
     fn read_frame(&mut self, timeout: Duration) -> ModbusResult<Vec<u8>>;
 }
@@ -485,6 +504,11 @@ impl ModbusEngine {
         let is_udp = self.framer.link_type() == LinkType::Udp;
 
         let started = Instant::now();
+        // The transport write/read cycle. C `doModbusIO` increments
+        // `IOErrors_`/`currentIOErrors_` ONLY here, gated on the `writeRead`
+        // transport status (drvModbusAsyn.cpp:2204-2208) — it is the single
+        // I/O-error site. A Modbus exception response or a malformed frame is
+        // not a transport failure and must never reach it.
         let response_pdu = match self.transact(transport, &framed, expected_txid, is_udp) {
             Ok(pdu) => pdu,
             Err(e) => {
@@ -493,43 +517,42 @@ impl ModbusEngine {
                 return Err(e);
             }
         };
+        // Transport succeeded: record the cycle time (C updates LastIOTime /
+        // MaxIOTime / the histogram on every successful writeRead, before the
+        // exception check, drvModbusAsyn.cpp:2211-2225) and clear the
+        // consecutive-error counter (C resets `currentIOErrors_` on the
+        // error→success transport edge, :2200; an unconditional reset on
+        // success yields the same observable value — it stays 0 across further
+        // successes — so no `prevIOStatus_` field is needed).
         self.stats.record_timing(started.elapsed());
+        self.stats.current_io_errors = 0;
 
-        // Decode the response PDU, tolerating the "Acknowledge" exception
-        // (code 5) — the C code treats it as a non-fatal warning.
+        // Decode the response PDU. A Modbus exception response (`fcode & 0x80`)
+        // is not a transport error: C `goto done` past the OK switch without
+        // touching readOK_/writeOK_/IOErrors_ (drvModbusAsyn.cpp:2229-2246).
+        // Exception 5 ("Acknowledge" — the command will take a long time)
+        // returns asynSuccess with no data; any other exception returns
+        // asynError. Either way no counter moves.
         let resp = match ResponsePdu::parse(&response_pdu) {
             Ok(resp) => resp,
-            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => {
-                if function.is_read() {
-                    self.stats.read_ok += 1;
-                } else {
-                    self.stats.write_ok += 1;
-                }
-                self.stats.current_io_errors = 0;
-                return Ok(Vec::new());
-            }
-            Err(e) => {
-                self.stats.io_errors += 1;
-                self.stats.current_io_errors += 1;
-                return Err(e);
-            }
+            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
 
-        let words = match self.parse_response(function, len, &resp) {
-            Ok(words) => words,
-            Err(e) => {
-                self.stats.io_errors += 1;
-                self.stats.current_io_errors += 1;
-                return Err(e);
-            }
-        };
+        // A real (non-exception) response of this function class arrived. C
+        // bumps readOK_/writeOK_ at the TOP of each function case, BEFORE the
+        // per-function content validation (`readOK_++` at drvModbusAsyn.cpp:
+        // 2254/2278/2300, `writeOK_++` at :2325/2333/2341). A frame whose word
+        // count then fails to match still counts as readOK_ and returns
+        // asynError with no IOErrors_ bump (:2284-2290/2306-2312) — so the OK
+        // counter must move before `parse_response` runs its `nread == len`
+        // check.
         if function.is_read() {
             self.stats.read_ok += 1;
         } else {
             self.stats.write_ok += 1;
         }
-        self.stats.current_io_errors = 0;
-        Ok(words)
+        self.parse_response(function, len, &resp)
     }
 
     /// Transmit `framed` and receive the matching response PDU. For TCP the
@@ -548,21 +571,42 @@ impl ModbusEngine {
         loop {
             match transport.read_frame(READ_TIMEOUT) {
                 Ok(raw) => {
-                    let unwrapped = self.framer.unwrap_response(&raw)?;
-                    match unwrapped.transaction_id {
-                        // TCP/UDP: a stale reply from an earlier request —
-                        // keep reading without retransmitting. Bound the skip
-                        // count so a peer that keeps sending mismatched-TXID
-                        // frames cannot trap us in an unbounded loop (each
-                        // `read_frame` succeeds, so the timeout never fires).
-                        Some(tid) if tid != expected_txid => {
+                    match self.framer.unwrap_response(&raw) {
+                        Ok(unwrapped) => match unwrapped.transaction_id {
+                            // TCP/UDP: a stale reply from an earlier request —
+                            // keep reading without retransmitting. Bound the
+                            // skip count so a peer that keeps sending
+                            // mismatched-TXID frames cannot trap us in an
+                            // unbounded loop (each `read_frame` succeeds, so the
+                            // timeout never fires).
+                            Some(tid) if tid != expected_txid => {
+                                stale_frames += 1;
+                                if stale_frames > MAX_STALE_FRAMES {
+                                    return Err(ModbusError::Timeout);
+                                }
+                                continue;
+                            }
+                            _ => return Ok(unwrapped.pdu),
+                        },
+                        // C's TCP/UDP read loop (modbusInterpose.c:366) only
+                        // breaks when the reply is >= 2 bytes AND its
+                        // transaction ID matches; a reply too short to yield a
+                        // matching TXID falls through and re-reads. Mirror that
+                        // for the MBAP-framed links: skip a too-short frame
+                        // (bounded by the same stale-frame guard) instead of
+                        // ending the transaction on a single spurious short
+                        // read. RTU/ASCII read once in C (no loop), so their
+                        // short-frame / CRC failures still propagate.
+                        Err(ModbusError::FrameTooShort { .. })
+                            if matches!(self.framer.link_type(), LinkType::Tcp | LinkType::Udp) =>
+                        {
                             stale_frames += 1;
                             if stale_frames > MAX_STALE_FRAMES {
                                 return Err(ModbusError::Timeout);
                             }
                             continue;
                         }
-                        _ => return Ok(unwrapped.pdu),
+                        Err(e) => return Err(e),
                     }
                 }
                 Err(e) => {
@@ -575,7 +619,11 @@ impl ModbusEngine {
                     if is_udp {
                         udp_retries += 1;
                         if udp_retries < UDP_MAX_RETRIES {
-                            transport.write_frame(framed)?;
+                            // C resends through the raw octet write
+                            // (modbusInterpose.c:358), not `writeIt`, so the
+                            // pre-write `writeDelay` pacing (:246) is skipped on
+                            // a retransmit. `resend_frame` is the no-delay path.
+                            transport.resend_frame(framed)?;
                             continue;
                         }
                     }
@@ -671,9 +719,11 @@ impl ModbusEngine {
 mod tests {
     use super::*;
 
-    /// A mock transport: records writes, replays a queue of canned responses.
+    /// A mock transport: records initial writes and retransmits separately,
+    /// and replays a queue of canned responses.
     struct MockTransport {
         written: Vec<Vec<u8>>,
+        resent: Vec<Vec<u8>>,
         responses: std::collections::VecDeque<ModbusResult<Vec<u8>>>,
     }
 
@@ -681,6 +731,7 @@ mod tests {
         fn new(responses: Vec<ModbusResult<Vec<u8>>>) -> Self {
             Self {
                 written: Vec::new(),
+                resent: Vec::new(),
                 responses: responses.into_iter().collect(),
             }
         }
@@ -689,6 +740,10 @@ mod tests {
     impl OctetTransport for MockTransport {
         fn write_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
             self.written.push(data.to_vec());
+            Ok(())
+        }
+        fn resend_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
+            self.resent.push(data.to_vec());
             Ok(())
         }
         fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
@@ -1022,6 +1077,63 @@ mod tests {
         assert_eq!(words, vec![0x1234]);
     }
 
+    /// R1: a spurious too-short TCP reply (one that cannot yield a matching
+    /// transaction ID) is skipped and the loop re-reads, mirroring C's
+    /// `if (nbytesActual >= 2)` fall-through (modbusInterpose.c:366). A single
+    /// short read must not end the transaction.
+    #[test]
+    fn do_modbus_io_skips_too_short_tcp_frame() {
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        let resp_pdu = [0x01u8, 0x03, 0x02, 0x12, 0x34];
+        // First reply is a spurious short frame (below the MBAP header); the
+        // second is the real, txid-matching reply.
+        let mut transport = MockTransport::new(vec![
+            Ok(vec![0xAA, 0xBB, 0xCC]),
+            Ok(tcp_response(1, &resp_pdu)),
+        ]);
+        let words = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap();
+        assert_eq!(words, vec![0x1234]);
+    }
+
+    /// R1 boundary: RTU reads exactly once in C (no MBAP loop), so a too-short
+    /// RTU frame is a hard error, not a re-read. If it wrongly re-read, the
+    /// queue would drain to the `Timeout` fallback; assert it surfaces the
+    /// `FrameTooShort` instead.
+    #[test]
+    fn do_modbus_io_rtu_short_frame_errors_without_reread() {
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Rtu,
+        )
+        .unwrap();
+        let mut transport = MockTransport::new(vec![Ok(vec![0x01, 0x03])]);
+        let err = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ModbusError::FrameTooShort { .. }),
+            "RTU short frame must error, not re-read into a timeout: {err:?}"
+        );
+    }
+
     #[test]
     fn do_modbus_io_modbus_exception_is_error() {
         let mut engine = ModbusEngine::new(
@@ -1045,7 +1157,12 @@ mod tests {
             err,
             ModbusError::Exception(ExceptionCode::IllegalDataAddress)
         ));
-        assert_eq!(engine.stats.io_errors, 1);
+        // C parity (drvModbusAsyn.cpp:2239-2246): a non-Acknowledge Modbus
+        // exception sets asynError and `goto done` past the OK switch. It is
+        // NOT a transport `writeRead` failure (the only IOErrors_ site,
+        // :2204-2208), so neither IOErrors_ nor readOK_ moves.
+        assert_eq!(engine.stats.io_errors, 0);
+        assert_eq!(engine.stats.read_ok, 0);
     }
 
     #[test]
@@ -1068,7 +1185,10 @@ mod tests {
             )
             .unwrap();
         assert!(words.is_empty());
-        assert_eq!(engine.stats.write_ok, 1);
+        // C parity (drvModbusAsyn.cpp:2231-2238/2245): exception 5 sets
+        // asynSuccess and `goto done` past the writeOK_/readOK_ switch — no OK
+        // counter moves, and it is not a transport error so IOErrors_ stays 0.
+        assert_eq!(engine.stats.write_ok, 0);
         assert_eq!(engine.stats.io_errors, 0);
     }
 
@@ -1182,6 +1302,11 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ModbusError::MalformedResponse(_)));
+        // C parity (drvModbusAsyn.cpp:2278-2290): readOK_++ runs before the
+        // register `nread != len` check, so the mismatch frame counts as
+        // readOK_ and returns asynError with no IOErrors_ bump.
+        assert_eq!(engine.stats.read_ok, 1);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]
@@ -1222,7 +1347,12 @@ mod tests {
             .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 1)
             .unwrap_err();
         assert!(matches!(err, ModbusError::MalformedResponse(_)));
-        assert_eq!(engine.stats.io_errors, 1);
+        // C parity (drvModbusAsyn.cpp:2300-2312): readOK_++ runs at the top of
+        // the REPORT_SLAVE_ID case BEFORE the `nread != len` check, so a
+        // count-mismatch frame still counts as readOK_ then returns asynError
+        // via `goto done` — with no IOErrors_ bump (that is transport-only).
+        assert_eq!(engine.stats.read_ok, 1);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]
@@ -1301,10 +1431,45 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ModbusError::Timeout));
-        // 1 initial send + 4 retransmits; the success frame stays queued.
-        assert_eq!(transport.written.len(), 5);
+        // 1 initial send via `write_frame` + 4 retransmits via `resend_frame`;
+        // the success frame stays queued.
+        assert_eq!(transport.written.len(), 1);
+        assert_eq!(transport.resent.len(), 4);
         assert_eq!(transport.responses.len(), 1);
         assert_eq!(engine.stats.io_errors, 1);
+    }
+
+    #[test]
+    fn udp_retransmit_resends_via_no_delay_path() {
+        // R53/3a regression: C applies `writeDelay` only in `writeIt`
+        // (modbusInterpose.c:246); the UDP read-failure retransmit resends
+        // through the raw `pasynOctet->write` (:358), bypassing the delay.
+        // `transact` must therefore issue retransmits via `resend_frame`
+        // (the no-delay path), not `write_frame`, and resend the exact same
+        // framed bytes as the initial send.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Udp,
+        )
+        .unwrap();
+        let valid = tcp_response(1, &[0x01, 0x03, 0x02, 0x12, 0x34]);
+        // One read failure forces a single retransmit, then a valid reply.
+        let mut transport = MockTransport::new(vec![Err(ModbusError::Timeout), Ok(valid)]);
+        engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap();
+        assert_eq!(transport.written.len(), 1, "initial send via write_frame");
+        assert_eq!(transport.resent.len(), 1, "retransmit via resend_frame");
+        // The retransmit must resend the identical framed request.
+        assert_eq!(transport.resent[0], transport.written[0]);
+        assert_eq!(engine.stats.read_ok, 1);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]

@@ -33,11 +33,19 @@ pub struct MbboDirectRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     // VAL change gate. C
     // mbboDirectRecord.c:311-314 monitor() raises DBE_VALUE|DBE_LOG for VAL
     // only when `mlst != val`. Captured during process() because the
     // framework reads monitor_value_changed() after process() commits mlst.
     value_changed: bool,
+    /// Set by `set_device_did_compute(true)` when a device readback has
+    /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
+    /// `process()` then skips the forward `VAL -> RVAL` convert that would
+    /// recompute RVAL from VAL and discard the readback — C `processMbboDirect`
+    /// sets `rval`/`val` from the callback and returns without re-converting
+    /// (devAsynUInt32Digital.c:1084-1090).
+    skip_convert: bool,
 }
 
 impl Default for MbboDirectRecord {
@@ -61,7 +69,9 @@ impl Default for MbboDirectRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             value_changed: false,
+            skip_convert: false,
         }
     }
 }
@@ -214,6 +224,11 @@ static MBBO_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 fn mbbo_direct_fields() -> &'static [FieldDesc] {
@@ -233,6 +248,34 @@ impl Record for MbboDirectRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         mbbo_direct_fields()
+    }
+
+    fn set_device_did_compute(&mut self, did: bool) {
+        self.skip_convert = did;
+    }
+
+    /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
+    /// the raw and set VAL to the shifted masked value, mirroring C
+    /// `processMbboDirect`/`initMbboDirect` (devAsynUInt32Digital.c:1084-1090,
+    /// 1058-1065). RVAL keeps the masked-but-unshifted raw; VAL is the shifted
+    /// value (no state table — Direct is the raw value). The B0..B1F bits are
+    /// re-derived from the new VAL. Returns `true` so the store reports
+    /// `computed` and the framework skips the forward convert (via
+    /// `set_device_did_compute`).
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        let masked = if self.mask != 0 {
+            (raw as u32) & self.mask
+        } else {
+            raw as u32
+        };
+        self.rval = masked;
+        self.val = if self.shft > 0 {
+            masked.checked_shr(self.shft as u32).unwrap_or(0)
+        } else {
+            masked
+        };
+        self.val_to_bits();
+        true
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboDirectRecord.dbd.pod`): the
@@ -324,15 +367,22 @@ impl Record for MbboDirectRecord {
     /// applies only to INPUT records.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `mbboDirectRecord.c::convert` — RVAL = (VAL << SHFT) & MASK on a
-        // 32-bit epicsUInt32 (RVAL/MASK are DBF_ULONG).
-        let mut raw = self.val;
-        if self.shft > 0 {
-            raw = raw.wrapping_shl(self.shft as u32);
+        // 32-bit epicsUInt32 (RVAL/MASK are DBF_ULONG) — unless a device
+        // readback (`apply_raw_readback`) already set both RVAL and VAL, in
+        // which case skip the forward convert that would recompute RVAL from
+        // VAL and discard it. One-shot (C `processMbboDirect` readback returns
+        // without re-converting; a normal process always converts).
+        if !self.skip_convert {
+            let mut raw = self.val;
+            if self.shft > 0 {
+                raw = raw.wrapping_shl(self.shft as u32);
+            }
+            if self.mask != 0 {
+                raw &= self.mask;
+            }
+            self.rval = raw;
         }
-        if self.mask != 0 {
-            raw &= self.mask;
-        }
-        self.rval = raw;
+        self.skip_convert = false;
         // C `mbboDirectRecord.c` — RBV is updated ONLY by device support
         // (the hardware read-back); record support never assigns it.
         // Forcing `RBV = RVAL` here would mask hardware disagreement,
@@ -368,6 +418,7 @@ impl Record for MbboDirectRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
@@ -479,6 +530,13 @@ impl Record for MbboDirectRecord {
                     self.sims = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIMS".into()));
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SDLY".into()));
                 }
             }
             _ => {

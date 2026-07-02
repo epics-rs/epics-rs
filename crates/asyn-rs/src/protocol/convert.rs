@@ -25,9 +25,14 @@ impl From<&RequestOp> for PortCommand {
                 buf_size: *buf_size,
             },
             RequestOp::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
-            RequestOp::OctetWriteRead { data, buf_size } => Self::OctetWriteRead {
+            RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            } => Self::OctetWriteRead {
                 data: data.clone(),
                 buf_size: *buf_size,
+                flush: *flush,
             },
             RequestOp::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
             RequestOp::OctetReadBinary { buf_size } => Self::OctetReadBinary {
@@ -80,8 +85,9 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::GetAutoConnect => Self::GetAutoConnect,
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
-            RequestOp::DrvUserCreate { drv_info } => Self::DrvUserCreate {
+            RequestOp::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
                 drv_info: drv_info.clone(),
+                addr: *addr,
             },
             RequestOp::CallParamCallbacks { addr, .. } => Self::CallParamCallbacks { addr: *addr },
             RequestOp::GetOption { key } => Self::GetOption { key: key.clone() },
@@ -115,9 +121,14 @@ impl From<&PortCommand> for RequestOp {
                 buf_size: *buf_size,
             },
             PortCommand::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
-            PortCommand::OctetWriteRead { data, buf_size } => Self::OctetWriteRead {
+            PortCommand::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            } => Self::OctetWriteRead {
                 data: data.clone(),
                 buf_size: *buf_size,
+                flush: *flush,
             },
             PortCommand::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
             PortCommand::OctetReadBinary { buf_size } => Self::OctetReadBinary {
@@ -174,8 +185,9 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::GetAutoConnect => Self::GetAutoConnect,
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
-            PortCommand::DrvUserCreate { drv_info } => Self::DrvUserCreate {
+            PortCommand::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
                 drv_info: drv_info.clone(),
+                addr: *addr,
             },
             PortCommand::CallParamCallbacks { addr } => Self::CallParamCallbacks {
                 addr: *addr,
@@ -309,6 +321,7 @@ mod tests {
             RequestOp::OctetWriteRead {
                 data: vec![4, 5],
                 buf_size: 128,
+                flush: true,
             },
             RequestOp::UInt32DigitalRead { mask: 0xFF },
             RequestOp::UInt32DigitalWrite {
@@ -332,6 +345,7 @@ mod tests {
             RequestOp::UnblockProcess,
             RequestOp::DrvUserCreate {
                 drv_info: "INFO".into(),
+                addr: 0,
             },
             RequestOp::GetOption { key: "baud".into() },
             RequestOp::SetOption {

@@ -34,6 +34,7 @@ pub struct Int64outRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
 }
 
 impl Default for Int64outRecord {
@@ -59,6 +60,7 @@ impl Default for Int64outRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
         }
     }
 }
@@ -173,6 +175,11 @@ static INT64OUT_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Record for Int64outRecord {
@@ -258,6 +265,7 @@ impl Record for Int64outRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
         }
     }
@@ -381,6 +389,13 @@ impl Record for Int64outRecord {
                     self.sims = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIMS".into()));
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SDLY".into()));
                 }
             }
             _ => return Err(CaError::FieldNotFound(name.to_string())),

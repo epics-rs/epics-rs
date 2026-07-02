@@ -59,6 +59,13 @@ pub enum RequestOp {
     OctetWriteRead {
         data: Vec<u8>,
         buf_size: usize,
+        /// Whether to drain the driver's input buffer before the write.
+        /// `true` = `asynOctetSyncIO::writeRead` (flush → write → read), the
+        /// StreamDevice/asynRecord pattern that discards stale warm-line bytes.
+        /// `false` = `devAsynOctet` raw write-then-read (no flush) — the
+        /// command-response dset (`callbackSiCmdResponse`) returns whatever the
+        /// device sends, including bytes already in the buffer.
+        flush: bool,
     },
     /// Binary octet write: writes `data` raw with the driver's output EOS
     /// temporarily suppressed. C parity: asynRecord binary output
@@ -146,6 +153,9 @@ pub enum RequestOp {
     /// Resolve a driver info string to a parameter reason index.
     DrvUserCreate {
         drv_info: String,
+        /// The record's asyn `addr`, so a multi-device driver can reject an
+        /// out-of-range address at bind time (C `drvUserCreate` `checkOffset`).
+        addr: i32,
     },
     /// Read an enum value (index + string choices).
     EnumRead,
@@ -255,6 +265,9 @@ pub struct RequestResult {
     pub uint_val: Option<u32>,
     /// Reason index (from DrvUserCreate).
     pub reason: Option<usize>,
+    /// Per-record octet length cap (from DrvUserCreate; C `modbusDrvUser_t.len`).
+    /// `None` when the drvInfo carried no cap.
+    pub max_octet_len: Option<usize>,
     /// Enum index (from EnumRead).
     pub enum_index: Option<usize>,
     /// Driver enum string/value/severity table (from EnumRead). C asyn
@@ -280,6 +293,15 @@ pub struct RequestResult {
     pub alarm_severity: u16,
     /// Timestamp from the driver param store (populated on reads).
     pub timestamp: Option<SystemTime>,
+    /// Device read auxiliary status (C `pasynUser->auxStatus`), populated on
+    /// reads from the param store alongside the value. Distinct from
+    /// [`Self::status`] (the request/op outcome that drives an `Err`/Error
+    /// reply): a read OP can succeed and return a value while `aux_status`
+    /// flags that value invalid. Device support gates the value store on this —
+    /// C `processAi` stores the value only when `result.status == asynSuccess`
+    /// and otherwise returns -1 keeping the prior value (devAsynInt32.c:848-855)
+    /// — the same way the I/O Intr ring gates on `CachedInterrupt.aux_status`.
+    pub aux_status: AsynStatus,
     /// Option value string (from GetOption).
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
@@ -307,6 +329,7 @@ impl RequestResult {
             float_val: None,
             uint_val: None,
             reason: None,
+            max_octet_len: None,
             enum_index: None,
             enum_entries: None,
             int32_array: None,
@@ -318,6 +341,7 @@ impl RequestResult {
             alarm_status: 0,
             alarm_severity: 0,
             timestamp: None,
+            aux_status: AsynStatus::Success,
             option_value: None,
             bounds: None,
             eom_reason: 0,
@@ -326,6 +350,17 @@ impl RequestResult {
 
     pub fn write_ok() -> Self {
         Self::base()
+    }
+
+    /// Octet write result carrying the number of bytes transferred
+    /// (C `asynOctet::write`'s `*nbytesTransfered`). Used by
+    /// `PortHandle::write_octet` / `SyncIO::write_octet` to report how
+    /// many bytes the driver actually wrote on success.
+    pub fn write_n(nbytes: usize) -> Self {
+        Self {
+            nbytes,
+            ..Self::base()
+        }
     }
 
     pub fn octet_read(buf: Vec<u8>, nbytes: usize) -> Self {
@@ -378,9 +413,10 @@ impl RequestResult {
         }
     }
 
-    pub fn drv_user_create(reason: usize) -> Self {
+    pub fn drv_user_create(reason: usize, max_octet_len: Option<usize>) -> Self {
         Self {
             reason: Some(reason),
+            max_octet_len,
             ..Self::base()
         }
     }

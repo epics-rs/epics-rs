@@ -300,6 +300,18 @@ pub struct AsynDeviceSupport {
     /// SIZV at init time when available; otherwise fall back to the
     /// stringin-grade 256-byte default.
     octet_max_size: usize,
+    /// Per-record octet length cap from `drv_user_create` (C
+    /// `modbusDrvUser_t.len` parsed from a `TYPE=N` drvInfo). `Some(n)` caps
+    /// `octet_max_size` to `min(octet_max_size, n)` at init, mirroring C
+    /// `getStringLen` (drvModbusAsyn.cpp:2367-2377); `None` leaves the buffer
+    /// length alone. Resolved once at bind because per-record driver state is
+    /// not threaded per-I/O in asyn-rs.
+    octet_len_cap: Option<usize>,
+    /// `Some` ⟹ this is `asynOctetCmdResponse`: an escape-translated literal
+    /// command (C `initCmdBuffer`, devAsynOctet.c) written before each read so
+    /// the reply lands in VAL. `read_op` emits `OctetWriteRead` instead of a
+    /// plain `OctetRead` when present. `None` for ordinary `asynOctetRead`.
+    octet_cmd: Option<Vec<u8>>,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
     /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
@@ -312,6 +324,37 @@ pub struct AsynDeviceSupport {
     /// If true, this is a write-only device support (e.g. asynOctetWrite).
     /// read() returns no-op to avoid overwriting the record's native value type.
     write_only: bool,
+    /// asynOctetWriteBinary: write the record's full NORD bytes with NO NUL-trim
+    /// (C `callbackWfWriteBinary`, devAsynOctet.c:1086-1091, `writeIt(bptr, nord)`),
+    /// versus asynOctetWrite which trims at the first NUL (`my_strnlen`). Only
+    /// meaningful together with `write_only`.
+    octet_binary: bool,
+    /// `Some` ⟹ averaging device support (`asynInt32Average` /
+    /// `asynFloat64Average`, both ai-only). The always-on interrupt callback
+    /// accumulates samples into the [`SumAverager`](crate::interfaces::average::SumAverager);
+    /// the periodic record process drains the arithmetic mean — C
+    /// `interruptCallbackAverage` (devAsynInt32.c:870-872 /
+    /// devAsynFloat64.c:687-694) + `processAiAverage` (devAsynInt32.c:895-918 /
+    /// devAsynFloat64.c:716-735). Only the periodic-SCAN model (mean of all
+    /// samples since the last process) is ported; the I/O Intr SVAL-decimation
+    /// model is a documented residual.
+    average: Option<Arc<AverageState>>,
+    /// RAII handle for the averaging synchronous interrupt callback — dropping
+    /// unregisters it. Distinct from `interrupt_sub` (the mailbox/value path):
+    /// averaging needs every sample, so it registers a synchronous callback
+    /// (C `registerInterruptUser`), not a coalescing mailbox subscription.
+    average_callback_sub: Option<crate::interrupt::SyncCallbackSubscription>,
+    /// `Some` ⟹ time-series device support (`asynInt32TimeSeries` /
+    /// `asynFloat64TimeSeries` / `asynInt64TimeSeries`, all waveform-only). The
+    /// always-on interrupt callback appends each driver sample into the array
+    /// while `BUSY`; the record process (RARM-driven + the completion callback)
+    /// commits the buffer to VAL/NORD/BUSY — C `devAsynXXXTimeSeries.h`
+    /// `interruptCallback` + `process`. `None` for every other DTYP.
+    time_series: Option<Arc<TimeSeriesState>>,
+    /// RAII handle for the time-series synchronous accumulating callback —
+    /// dropping unregisters it (mirrors `average_callback_sub`; the time-series
+    /// support also needs every sample, so a synchronous callback, not a mailbox).
+    time_series_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// RAII interrupt subscription — dropping unsubscribes.
     interrupt_sub: Option<InterruptSubscription>,
     /// Per-record ring buffer of interrupt values, FIFO-ordered. The
@@ -360,6 +403,159 @@ pub struct AsynDeviceSupport {
     enum_interrupt_sub: Option<InterruptSubscription>,
 }
 
+/// Shared state for an averaging (`asynInt32Average` / `asynFloat64Average`)
+/// record. The always-on interrupt callback (registered in
+/// [`AsynDeviceSupport::io_intr_receiver`]) pushes each driver sample into
+/// `averager` and stashes the sample's driver alarm in `last_alarm`; the
+/// periodic record-process `read()` drains the arithmetic mean and applies
+/// the alarm. Mirrors C `devPvt.sum`/`numAverage` (devAsynInt32.c:98-99) plus
+/// the `alarmStatus`/`alarmSeverity` captured in `interruptCallbackAverage`
+/// (devAsynInt32.c:705-707). Behind an `Arc` because the interrupt callback
+/// runs off the record-process thread, exactly like `interrupt_fifo`.
+struct AverageState {
+    averager: crate::interfaces::average::SumAverager,
+    /// The two status channels C `processAiAverage` reads, held under one lock
+    /// so the drain reads them atomically against the accumulating callback.
+    status: std::sync::Mutex<AverageStatus>,
+    /// Mode 1 (SCAN="I/O Intr") decimation count: C `numToAverage =
+    /// (int)(pai->sval + 0.5)`, floored at 1 (devAsynInt32.c:674-675). C reads
+    /// `pai->sval` live in the callback; the Rust analogue snapshots SVAL from
+    /// the record at init and on each process (`refresh_average_decimation_threshold`),
+    /// so a runtime SVAL change takes effect at the next process. Default 1.
+    /// Unused in Mode 2 (periodic SCAN).
+    num_to_average: std::sync::atomic::AtomicI64,
+}
+
+/// The two status channels C's averaging device support accumulates across a
+/// period. C `interruptCallbackAverage` does
+/// `result.status |= auxStatus; result.alarmStatus = alarmStatus;
+/// result.alarmSeverity = alarmSeverity` per sample (devAsynInt32.c:705-707,
+/// devAsynFloat64.c:516-518); `processAiAverage` then maps `result.status` via
+/// `asynStatusToEpicsAlarm` and gates the store on `result.status ==
+/// asynSuccess` (devAsynInt32.c:915-927, devAsynFloat64.c:732-754).
+#[derive(Default)]
+struct AverageStatus {
+    /// Last sample's EPICS `(alarm_status, alarm_severity)` (C
+    /// `result.alarmStatus`/`alarmSeverity`). On a transport-success period
+    /// these pass straight through; on a transport error C's
+    /// `asynStatusToEpicsAlarm` fills only the still-`NO_ALARM` fields, so a
+    /// sample's own EPICS alarm still wins.
+    last_alarm: (u16, u16),
+    /// Accumulated asyn transport status (C `result.status |= auxStatus`).
+    /// `None` ⟹ every sample this period was `asynSuccess`; `Some(s)` ⟹ a
+    /// non-success transport status occurred, which makes the period a
+    /// transport error (discard the averaged value, raise the mapped alarm).
+    /// Reset each consumed period (C resets `result.status = asynSuccess`).
+    aux_error: Option<crate::error::AsynStatus>,
+}
+
+impl AverageState {
+    fn new() -> Self {
+        Self {
+            averager: crate::interfaces::average::SumAverager::new(),
+            status: std::sync::Mutex::new(AverageStatus::default()),
+            num_to_average: std::sync::atomic::AtomicI64::new(1),
+        }
+    }
+}
+
+/// Time-series accumulation buffer, typed to the record's FTVL. Resolved at
+/// `init()` from FTVL (which C requires be the signed/unsigned EPICS type of the
+/// interface: Int32→LONG/ULONG, Float64→DOUBLE, Int64→INT64/UINT64). The driver
+/// sample is appended in the element type so the committed VAL matches FTVL.
+enum TsBuf {
+    Long(Vec<i32>),
+    Int64(Vec<i64>),
+    UInt64(Vec<u64>),
+    Double(Vec<f64>),
+}
+
+impl TsBuf {
+    fn len(&self) -> usize {
+        match self {
+            Self::Long(v) => v.len(),
+            Self::Int64(v) => v.len(),
+            Self::UInt64(v) => v.len(),
+            Self::Double(v) => v.len(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Long(v) => v.clear(),
+            Self::Int64(v) => v.clear(),
+            Self::UInt64(v) => v.clear(),
+            Self::Double(v) => v.clear(),
+        }
+    }
+
+    /// Append one driver sample (C `interruptCallback`: `pData[nord] = value`).
+    /// The interface and FTVL are paired by construction (validated at init), so
+    /// the matching arm always fires; a non-matching ParamValue is ignored.
+    fn push(&mut self, value: &crate::param::ParamValue) {
+        use crate::param::ParamValue;
+        match (self, value) {
+            (Self::Long(v), ParamValue::Int32(x)) => v.push(*x),
+            (Self::Int64(v), ParamValue::Int64(x)) => v.push(*x),
+            (Self::UInt64(v), ParamValue::Int64(x)) => v.push(*x as u64),
+            (Self::Double(v), ParamValue::Float64(x)) => v.push(*x),
+            _ => {}
+        }
+    }
+
+    /// Snapshot the accumulated samples as the record VAL value. `set_val`/
+    /// `put_field("VAL")` then sets `NORD = len` (C `pwf->nord = pPvt->nord`).
+    fn to_epics_value(&self) -> EpicsValue {
+        match self {
+            Self::Long(v) => EpicsValue::LongArray(v.clone()),
+            Self::Int64(v) => EpicsValue::Int64Array(v.clone()),
+            Self::UInt64(v) => EpicsValue::UInt64Array(v.clone()),
+            Self::Double(v) => EpicsValue::DoubleArray(v.clone()),
+        }
+    }
+}
+
+/// Shared state for a time-series (`asynInt32TimeSeries` /
+/// `asynFloat64TimeSeries` / `asynInt64TimeSeries`) waveform record. The
+/// always-on accumulating callback (registered in `io_intr_receiver`) appends
+/// samples while `busy`; the record process commits them. Mirrors C
+/// `devAsynXXXTimeSeries.h`'s `devAsynWfPvt` (busy/nord live here; the array is
+/// `buf`, committed to the record VAL each process rather than written into the
+/// record buffer from the callback — the asyn-rs callback runs inline in the
+/// driver notify and holds no record lock).
+struct TimeSeriesState {
+    inner: std::sync::Mutex<TimeSeriesInner>,
+}
+
+struct TimeSeriesInner {
+    /// Acquisition active (C `pPvt->busy`). The callback appends only while set;
+    /// the process state machine sets it from RARM and the callback clears it
+    /// when the buffer fills.
+    busy: bool,
+    /// Buffer capacity = record NELM, captured at init.
+    nelm: usize,
+    /// Accumulated samples, typed to FTVL (set at init; `None` until then or if
+    /// FTVL is invalid — the record then never acquires, matching C's dead record).
+    buf: Option<TsBuf>,
+    /// Transport status of the most recent erroring sample (C `pPvt->status =
+    /// pasynUser->auxStatus`), applied as a READ_ALARM and cleared by the next
+    /// process.
+    status: crate::error::AsynStatus,
+}
+
+impl TimeSeriesState {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TimeSeriesInner {
+                busy: false,
+                nelm: 0,
+                buf: None,
+                status: crate::error::AsynStatus::Success,
+            }),
+        }
+    }
+}
+
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
 struct CachedInterrupt {
     value: crate::param::ParamValue,
@@ -371,6 +567,11 @@ struct CachedInterrupt {
     /// read path's `RequestResult` alarm carrier.
     alarm_status: u16,
     alarm_severity: u16,
+    /// asyn transport status carried by the ring element (C
+    /// `ringBuffer[].status = pasynUser->auxStatus`, devAsynInt32.c:600). The
+    /// read maps it to an alarm and gates the value store on `Success`, exactly
+    /// as C `processAi`/`processBo`/array `process()` gate on `result.status`.
+    aux_status: crate::error::AsynStatus,
 }
 
 /// Per-record ring buffer for I/O Intr callbacks. Mirrors C
@@ -444,6 +645,8 @@ impl AsynDeviceSupport {
             int32_mask: None,
             max_array_elements: 307200,
             octet_max_size: 256,
+            octet_len_cap: None,
+            octet_cmd: None,
             last_alarm_status: 0,
             last_alarm_severity: 0,
             last_ts: None,
@@ -452,6 +655,11 @@ impl AsynDeviceSupport {
             initial_readback: false,
             asyn_readback: false,
             write_only: false,
+            octet_binary: false,
+            average: None,
+            average_callback_sub: None,
+            time_series: None,
+            time_series_sub: None,
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             output_callback_pending: false,
@@ -630,39 +838,85 @@ fn asyn_to_ca_error(e: AsynError) -> CaError {
 /// (7, 2) — condition 7 is STATE_ALARM, not READ_ALARM (which is 1), and
 /// MAJOR(2) instead of INVALID(3) — and Disabled was lumped with
 /// Disconnected as COMM_ALARM(9) instead of DISABLE_ALARM(18).
-fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
+/// Map an asyn transport status to the EPICS (alarm condition, severity) it
+/// implies — C `asynStatusToEpicsAlarm` with `defaultSevr = INVALID_ALARM`
+/// (asynEpicsUtils.c:238-265). `default_stat` is the condition C uses for the
+/// `asynError`/unknown arm: `READ_ALARM` for input device support,
+/// `WRITE_ALARM` for output. `Timeout`/`Overflow`/`Disconnected`/`Disabled`
+/// map to fixed conditions regardless of direction; `asynSuccess` → (NO_ALARM,
+/// NO severity). This is the per-status mapping only; C's fill-in rule
+/// (overwrite a field only while it is still NO_ALARM, so a sample's own EPICS
+/// alarm is preserved) is applied by callers that carry a base alarm.
+fn asyn_status_to_alarm_with_default(
+    status: crate::error::AsynStatus,
+    default_stat: u16,
+) -> (u16, u16) {
     use crate::error::AsynStatus;
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
     let invalid = AlarmSeverity::Invalid as u16;
-    match e {
-        AsynError::Status {
-            status: AsynStatus::Success,
-            ..
-        } => (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16),
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        } => (alarm_status::TIMEOUT_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Overflow,
-            ..
-        } => (alarm_status::HW_LIMIT_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Disconnected,
-            ..
-        } => (alarm_status::COMM_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Disabled,
-            ..
-        } => (alarm_status::DISABLE_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Error,
-            ..
-        } => (alarm_status::READ_ALARM, invalid),
-        // Non-status asyn errors take C's asynError/default branch.
-        _ => (alarm_status::READ_ALARM, invalid),
+    match status {
+        AsynStatus::Success => (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16),
+        AsynStatus::Timeout => (alarm_status::TIMEOUT_ALARM, invalid),
+        AsynStatus::Overflow => (alarm_status::HW_LIMIT_ALARM, invalid),
+        AsynStatus::Disconnected => (alarm_status::COMM_ALARM, invalid),
+        AsynStatus::Disabled => (alarm_status::DISABLE_ALARM, invalid),
+        AsynStatus::Error => (default_stat, invalid),
     }
+}
+
+/// Resolve the EPICS alarm an interrupt sample raises from its own EPICS alarm
+/// (`sample_alarm`) and its asyn transport status (`aux`), mirroring C
+/// `asynStatusToEpicsAlarm`'s fill-in (asynEpicsUtils.c:238-265): on
+/// `asynSuccess` the sample's alarm passes through unchanged; otherwise the
+/// transport-mapped alarm fills a field only while it is still `NO_ALARM`, so a
+/// sample's own EPICS alarm wins. Shared by the averaging drain and the regular
+/// I/O Intr ring read; each caller owns its own value-discard gate.
+fn resolve_intr_alarm(
+    sample_alarm: (u16, u16),
+    aux: crate::error::AsynStatus,
+    default_stat: u16,
+) -> (u16, u16) {
+    if aux == crate::error::AsynStatus::Success {
+        return sample_alarm;
+    }
+    let (mstat, msev) = asyn_status_to_alarm_with_default(aux, default_stat);
+    (
+        if sample_alarm.0 == 0 {
+            mstat
+        } else {
+            sample_alarm.0
+        },
+        if sample_alarm.1 == 0 {
+            msev
+        } else {
+            sample_alarm.1
+        },
+    )
+}
+
+/// Map an asyn transport error to an EPICS alarm with an explicit direction
+/// default. C `devAsynOctet` (processCommon, devAsynOctet.c:806-807) maps a
+/// transfer failure with `pPvt->isOutput ? WRITE_ALARM : READ_ALARM`, so an
+/// output (write-only) record raises WRITE_ALARM where an input read raises
+/// READ_ALARM. `default_stat` carries that direction; it feeds both the
+/// `asynError`/unknown arm and the status-mapped `asynError`/default within
+/// [`asyn_status_to_alarm_with_default`] (specific statuses —
+/// Timeout/Overflow/Disconnected/Disabled — map direction-independently).
+fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u16) {
+    use epics_base_rs::server::record::AlarmSeverity;
+    match e {
+        AsynError::Status { status, .. } => {
+            asyn_status_to_alarm_with_default(*status, default_stat)
+        }
+        // Non-status asyn errors take C's asynError/default branch.
+        _ => (default_stat, AlarmSeverity::Invalid as u16),
+    }
+}
+
+/// [`asyn_error_to_alarm_with_default`] with C's input default (`READ_ALARM`).
+fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
+    asyn_error_to_alarm_with_default(e, epics_base_rs::server::recgbl::alarm_status::READ_ALARM)
 }
 
 /// Convert an asyn ParamValue to an EpicsValue.
@@ -924,8 +1178,21 @@ impl AsynDeviceSupport {
             "asynInt32" => Some(RequestOp::Int32Read),
             "asynInt64" => Some(RequestOp::Int64Read),
             "asynFloat64" => Some(RequestOp::Float64Read),
-            "asynOctet" => Some(RequestOp::OctetRead {
-                buf_size: self.octet_max_size,
+            // asynOctet: a plain read, OR a write-then-read when a literal
+            // command is cached (asynOctetCmdResponse, C `callbackSiCmdResponse`
+            // devAsynOctet.c:853-855 — write the command, then read the reply
+            // into VAL). flush=false: C does plain writeIt → readIt on the raw
+            // asynOctet interface with NO pre-flush, so the reply includes any
+            // bytes already on the warm line (unlike asynOctetSyncIO::writeRead).
+            "asynOctet" => Some(match &self.octet_cmd {
+                Some(cmd) => RequestOp::OctetWriteRead {
+                    data: cmd.clone(),
+                    buf_size: self.octet_max_size,
+                    flush: false,
+                },
+                None => RequestOp::OctetRead {
+                    buf_size: self.octet_max_size,
+                },
             }),
             "asynUInt32Digital" => Some(RequestOp::UInt32DigitalRead { mask: self.mask }),
             "asynEnum" => Some(RequestOp::EnumRead),
@@ -988,7 +1255,65 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// Truncate an octet **write** payload to the per-record length cap, mirroring
+    /// C `writeOctet`'s `getStringLen(pasynUser, maxChars)` = `min(maxChars,
+    /// drvUser->len)` (drvModbusAsyn.cpp:1521/1524/1531). The cap is the raw
+    /// per-record LEN (`octet_len_cap`; `None` ⇒ C `len == -1` ⇒ uncapped). SIZV
+    /// does NOT bound writes — C's `maxChars` is the actual data length, not the
+    /// record buffer — so this uses `octet_len_cap`, not `octet_max_size`.
+    fn cap_octet_write(&self, mut data: Vec<u8>) -> Vec<u8> {
+        if let Some(cap) = self.octet_len_cap {
+            data.truncate(cap);
+        }
+        data
+    }
+
+    /// Truncate a delivered octet **read** value to the per-record buffer length,
+    /// mirroring C's I/O-Intr poller `getStringLen(pasynUser, sizeof(stringBuffer))`
+    /// = `min(buffer, drvUser->len)` (drvModbusAsyn.cpp:1914). The polled read caps
+    /// at the driver via `buf_size`, but the I/O-Intr ring fires the driver's full
+    /// block (the poller is per-reason, shared by records with different LEN), so the
+    /// cap is applied here, consumer-side, where the per-record `octet_max_size`
+    /// (= min(SIZV, LEN)) lives. asynOctet reads are delivered as `EpicsValue::String`
+    /// (result_to_value / param_value_to_epics_value); only that variant is capped,
+    /// leaving array-interface `CharArray` reads (bounded by `max_array_elements`)
+    /// untouched. Bytes are truncated verbatim — `PvString` is raw bytes, matching the
+    /// polled path's `&d[..n]` slice.
+    fn cap_octet_read_value(&self, val: EpicsValue) -> EpicsValue {
+        match val {
+            EpicsValue::String(s) if s.len() > self.octet_max_size => EpicsValue::String(
+                epics_base_rs::types::PvString::from_bytes(&s.as_bytes()[..self.octet_max_size]),
+            ),
+            other => other,
+        }
+    }
+
     /// Build a `RequestOp` for writing an `EpicsValue` for the current interface type.
+    /// asynOctetWriteBinary: build the write op for exactly NORD bytes, INCLUDING
+    /// any interior NUL. C `callbackWfWriteBinary` (devAsynOctet.c:1086-1091) does
+    /// `writeIt(pasynUser, pwf->bptr, pwf->nord)` — no `my_strnlen` NUL-trim
+    /// (contrast `callbackWfWrite`, :1071-1076, which trims). A plain `OctetWrite`
+    /// is emitted, NOT `OctetWriteBinary`: devAsynOctet does NO output-EOS
+    /// suppression, so the port's configured OEOS is still appended. (The name
+    /// collides with asynRecord OFMT=Binary, which DOES clear OEOS — a different
+    /// dset with different semantics; routing here to `OctetWriteBinary` would
+    /// wrongly strip the terminator.)
+    fn binary_write_op(&self, record: &dyn Record, val: &EpicsValue) -> Option<RequestOp> {
+        let EpicsValue::CharArray(data) = val else {
+            // Not a CHAR waveform value (not expected for this dset): fall back to
+            // the text path rather than silently dropping the write.
+            return self.write_op(val);
+        };
+        // Size by the record's NORD (C `pwf->nord`), clamped to the value length.
+        let nord = match record.get_field("NORD") {
+            Some(EpicsValue::Long(n)) => (n.max(0) as usize).min(data.len()),
+            _ => data.len(),
+        };
+        Some(RequestOp::OctetWrite {
+            data: self.cap_octet_write(data[..nord].to_vec()),
+        })
+    }
+
     fn write_op(&self, val: &EpicsValue) -> Option<RequestOp> {
         // First try exact match, then coerce numeric types to match the interface.
         // C EPICS always converts record VAL to the interface type (e.g. ao→double).
@@ -1018,20 +1343,20 @@ impl AsynDeviceSupport {
                 Some(RequestOp::Float64Write { value: *v as f64 })
             }
             ("asynOctet", EpicsValue::String(s)) => Some(RequestOp::OctetWrite {
-                data: s.as_bytes().to_vec(),
+                data: self.cap_octet_write(s.as_bytes().to_vec()),
             }),
             ("asynOctet", EpicsValue::CharArray(data)) => {
                 // Trim trailing nulls (waveform FTVL=CHAR pads to NELM)
                 let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 Some(RequestOp::OctetWrite {
-                    data: data[..len].to_vec(),
+                    data: self.cap_octet_write(data[..len].to_vec()),
                 })
             }
             // Coerce numeric types to octet (e.g. longout writing to NDArrayPort string param)
             ("asynOctet", v) => {
                 let s = format!("{v}");
                 Some(RequestOp::OctetWrite {
-                    data: s.as_bytes().to_vec(),
+                    data: self.cap_octet_write(s.as_bytes().to_vec()),
                 })
             }
             ("asynUInt32Digital", EpicsValue::Long(v)) => Some(RequestOp::UInt32DigitalWrite {
@@ -1085,10 +1410,20 @@ impl AsynDeviceSupport {
     ///   record exposing `ESLO` (the ai linearization field, same discriminator
     ///   as the init-time [`Self::apply_linear_eslo_eoff`]); without it the raw
     ///   counts reached VAL straight and the computed ESLO/EOFF were dead.
-    ///   mbbi/bi (no ESLO) keep the direct VAL path — their `set_val` re-derives
-    ///   from RVAL+state-table internally.
-    /// - everything else: set VAL directly, return `true` (device support
-    ///   produced the final value, as before).
+    /// - records (`asynInt32` or `asynUInt32Digital`) with a non-trivial
+    ///   `raw -> VAL` convert claim the raw via `apply_raw_readback` (`true`):
+    ///   it sets both RVAL and VAL the way C's `processXxx` does, and returning
+    ///   `true` (computed) makes the framework skip the record's forward
+    ///   convert, which would otherwise recompute RVAL from the stale VAL and
+    ///   discard the readback. Outputs: ao (engineering inverse), mbbo/bo/
+    ///   mbboDirect (state table / 0-1 / bit map). Inputs: bi (0/1 map,
+    ///   `processBi`), mbbi (mask/shift/state index, `processMbbi`), mbbiDirect
+    ///   (mask/shift/bits, `processMbbiDirect`). The hook is the *device-distinct*
+    ///   entry — the Soft Channel path stays on `set_val`, so it does not
+    ///   collide with a soft-link value write.
+    /// - everything else (longin/longout): set VAL directly, return `true`
+    ///   (device support produced the final value, as before) — longin/longout
+    ///   VAL *is* the raw (no convert).
     fn store_read_value(&mut self, record: &mut dyn Record, val: EpicsValue) -> bool {
         if self.iface_type == "asynFloat64" {
             if let EpicsValue::Double(raw) = val {
@@ -1097,11 +1432,47 @@ impl AsynDeviceSupport {
                     let _ = record.set_val(EpicsValue::Double(eng));
                     return true;
                 }
+                // asynFloat64 ao output readback: the record owns the forward
+                // ASLO/AOFF scaling (`VAL = value*ASLO + AOFF`), the float64
+                // twin of `apply_raw_readback`. ai is caught above (it carries
+                // SMOO); ao has ASLO/AOFF but no SMOO so it lands here. C
+                // `processAo` (devAsynFloat64.c:646-649). Returning `true`
+                // skips the forward convert, matching INIT_DO_NOT_CONVERT.
+                if record.apply_float64_readback(raw) {
+                    return true;
+                }
             }
         }
-        if self.iface_type == "asynInt32" {
+        if self.iface_type == "asynInt32" || self.iface_type == "asynUInt32Digital" {
             if let EpicsValue::Long(raw) = val {
-                if record.get_field("ESLO").is_some() {
+                // Records own their `raw -> record-value` mapping: ao's
+                // engineering inverse, mbbo/bo/mbboDirect's state-table / 0-1 /
+                // bit map (outputs), and bi's 0/1 map + mbbi's state index +
+                // mbbiDirect's mask/shift/bits (inputs). `apply_raw_readback`
+                // stores RVAL and computes VAL, and we return `true` (computed)
+                // so the framework skips the record's forward convert, which
+                // would recompute RVAL from the stale VAL and discard the
+                // readback. C `processAo` (devAsynInt32.c:973-994),
+                // `processMbbo`/`processBo`
+                // (devAsynInt32.c:1310-1330,1202-1203 /
+                // devAsynUInt32Digital.c:945-962,731-732),
+                // `processMbboDirect` (devAsynUInt32Digital.c:1084-1090),
+                // `processBi` (devAsynInt32.c / devAsynUInt32Digital.c:689),
+                // `processMbbi` (devAsynInt32.c:1270 / devAsynUInt32Digital.c:903)
+                // and `processMbbiDirect` (devAsynUInt32Digital.c:1031) all set
+                // both fields from the callback and return without re-converting.
+                // The hook is iface-agnostic (it uses the record's own
+                // MASK/SHFT/state table), so the one dispatch covers both the
+                // asynInt32 and the asynUInt32Digital readback. ai routes via
+                // the ESLO branch below; longin declines (default `false`).
+                if record.apply_raw_readback(raw) {
+                    return true;
+                }
+                // asynInt32 ai linear convert: raw -> RVAL, then the framework
+                // runs the `raw -> eng` convert (C `processAi` return 0). Gated
+                // on ESLO (the ai linearization field); a no-ESLO record that
+                // did not claim the readback above falls through to set_val.
+                if self.iface_type == "asynInt32" && record.get_field("ESLO").is_some() {
                     let _ = record.put_field("RVAL", EpicsValue::Long(raw));
                     return false;
                 }
@@ -1144,6 +1515,63 @@ impl AsynDeviceSupport {
         out
     }
 
+    /// The raw value an output record sends to the device — the write-side
+    /// twin of [`AsynDeviceSupport::store_read_value`]'s readback. C device
+    /// support writes the record's raw, post-OROC output, **not** the
+    /// engineering `VAL`:
+    /// - `asynInt32` / `asynUInt32Digital`: `pr->rval`, the raw the record's
+    ///   convert produced from `OVAL` — `processAo` (devAsynInt32.c:997),
+    ///   `processMbbo` (:1332), `processBo` (:1206), `processMbboDirect`
+    ///   (devAsynUInt32Digital.c). `longout`/`int64out` carry no `RVAL` (VAL
+    ///   *is* the raw) so they keep `VAL`, matching `processLongout`.
+    /// - `asynFloat64` ao: `(OVAL - AOFF) / ASLO`, anchored on the
+    ///   OROC-rate-limited `OVAL` (devAsynFloat64.c:651-654) — the inverse of
+    ///   [`Record::apply_float64_readback`], so a value written, read back, and
+    ///   re-scaled round-trips.
+    ///
+    /// `RVAL`/`OVAL` are current here: the OUT stage runs after the record's
+    /// convert (the soft OUT-link write already anchors on `OVAL`). Default
+    /// ASLO=1/AOFF=0 and an identity LINR keep `rval == val`, so the
+    /// unconfigured output is unchanged. The previous `record.val()` anchor
+    /// dropped the eng→raw conversion (int32 ao/mbbo) and OROC ramping
+    /// (float64 ao) at the device.
+    fn device_output_value(&self, record: &dyn Record) -> Option<EpicsValue> {
+        match self.iface_type.as_str() {
+            "asynFloat64" => {
+                // Anchor on OVAL (post-OROC); fall back to VAL if absent.
+                let oval = match record.get_field("OVAL") {
+                    Some(EpicsValue::Double(o)) => Some(o),
+                    _ => match record.val() {
+                        Some(EpicsValue::Double(v)) => Some(v),
+                        _ => None,
+                    },
+                };
+                match oval {
+                    Some(oval) => {
+                        let field = |name: &str| match record.get_field(name) {
+                            Some(EpicsValue::Double(x)) => x,
+                            _ => 0.0,
+                        };
+                        let aslo = field("ASLO");
+                        let aoff = field("AOFF");
+                        let mut out = oval - aoff;
+                        if aslo != 0.0 {
+                            out /= aslo;
+                        }
+                        Some(EpicsValue::Double(out))
+                    }
+                    None => record.val(),
+                }
+            }
+            "asynInt32" | "asynUInt32Digital" => match record.get_field("RVAL") {
+                Some(EpicsValue::Long(r)) => Some(EpicsValue::Long(r)),
+                Some(EpicsValue::ULong(r)) => Some(EpicsValue::Long(r as i32)),
+                _ => record.val(),
+            },
+            _ => record.val(),
+        }
+    }
+
     /// Push a driver's asynEnum table onto the record's state fields at init
     /// — the C `setEnums` call from `initCommon:314`. Discriminates the
     /// record family via [`EnumRecordShape::of_record`] and applies the
@@ -1160,17 +1588,44 @@ impl AsynDeviceSupport {
             let _ = record.put_field(&field, value);
         }
     }
+
+    /// Snapshot the Mode 1 averaging decimation threshold from the record's
+    /// SVAL. C `interruptCallbackAverage` reads `pai->sval` live each callback
+    /// (devAsynInt32.c:674); the callback runs off the record thread here, so
+    /// the count is snapshotted into the shared atomic at init and on each
+    /// process instead — a runtime SVAL change takes effect at the next
+    /// process. `numToAverage = (int)(sval + 0.5)`, floored at 1
+    /// (devAsynInt32.c:674-675). No-op for non-averaging records.
+    fn refresh_average_decimation_threshold(&self, record: &dyn Record) {
+        if let Some(acc) = &self.average {
+            if let Some(EpicsValue::Double(sval)) = record.get_field("SVAL") {
+                let n = (sval + 0.5) as i64;
+                acc.num_to_average
+                    .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if !self.reason_set {
-            match self.handle.drv_user_create_blocking(&self.drv_info) {
-                Ok(reason) => {
-                    self.reason = reason;
+            // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
+            // rejects an out-of-range offset here at bind time (C `drvUserCreate`
+            // `checkOffset`) instead of alarming on every I/O.
+            match self
+                .handle
+                .drv_user_create_blocking(&self.drv_info, self.addr)
+            {
+                Ok(info) => {
+                    self.reason = info.reason;
+                    // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
+                    // `octet_max_size` below, after SIZV finalizes the buffer.
+                    self.octet_len_cap = info.max_octet_len;
                 }
                 Err(e) => {
-                    // Param not found — this record has no corresponding driver param.
+                    // Param not found, or the driver rejected the bind (e.g. an
+                    // out-of-range offset) — this record cannot bind to a param.
                     eprintln!(
                         "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
                         self.handle.port_name(),
@@ -1190,6 +1645,51 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
+        // Time-series FTVL validation + buffer sizing. C `initRecord`
+        // (devAsynXXXTimeSeries.h:73-77) requires FTVL be the signed or unsigned
+        // EPICS type of the interface, else errlogPrintf + pact=1 (dead record).
+        // Mirror that: on an invalid FTVL the buffer stays `None`, so the record
+        // never accumulates or commits. menuFtype indices: LONG=5, ULONG=6,
+        // INT64=7, UINT64=8, DOUBLE=10.
+        if let Some(ts) = self.time_series.clone() {
+            let ftvl = match record.get_field("FTVL") {
+                Some(EpicsValue::Short(v)) => v,
+                _ => -1,
+            };
+            let buf = match self.iface_type.as_str() {
+                "asynInt32" => match ftvl {
+                    5 | 6 => Some(TsBuf::Long(Vec::new())),
+                    _ => None,
+                },
+                "asynInt64" => match ftvl {
+                    7 => Some(TsBuf::Int64(Vec::new())),
+                    8 => Some(TsBuf::UInt64(Vec::new())),
+                    _ => None,
+                },
+                "asynFloat64" => match ftvl {
+                    10 => Some(TsBuf::Double(Vec::new())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match buf {
+                Some(b) => {
+                    let mut st = ts.inner.lock().unwrap();
+                    st.nelm = self.max_array_elements;
+                    st.buf = Some(b);
+                }
+                None => {
+                    eprintln!(
+                        "[asyn] TimeSeries port='{}' drv_info='{}': FTVL must be the \
+                         signed/unsigned EPICS type of {} — record will not acquire",
+                        self.handle.port_name(),
+                        self.drv_info,
+                        self.iface_type
+                    );
+                }
+            }
+        }
+
         // Read SIZV from lsi/lso/printf records to size the asynOctet
         // read buffer. C parity: devAsynOctet.c:1103 passes
         // `plsi->sizv` to initCommon as the per-record buffer size;
@@ -1202,6 +1702,14 @@ impl DeviceSupport for AsynDeviceSupport {
             if sizv > 0 {
                 self.octet_max_size = sizv as usize;
             }
+        }
+
+        // Apply the per-record octet cap from `drv_user_create` after SIZV has
+        // finalized the buffer length, mirroring C `getStringLen`: the effective
+        // length is `min(buffer_len, drvUser->len)` (drvModbusAsyn.cpp:2367-2377).
+        // A driver with no cap returns `None`, leaving the buffer length intact.
+        if let Some(cap) = self.octet_len_cap {
+            self.octet_max_size = self.octet_max_size.min(cap);
         }
 
         // asynUInt32Digital MASK/SHFT propagation. C devAsynUInt32Digital.c
@@ -1222,6 +1730,49 @@ impl DeviceSupport for AsynDeviceSupport {
             let shft = compute_mask_shift(self.mask);
             let _ = record.put_field("MASK", EpicsValue::Long(self.mask as i32));
             let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
+        }
+
+        // asynInt32 mbbi/mbbo MASK positioning. C devAsynInt32.c initMbbi
+        // (1246-1247) / initMbbo (1290-1291):
+        //
+        //     if (pr->nobt == 0) pr->mask = 0xffffffff;
+        //     pr->mask <<= pr->shft;
+        //
+        // The asynInt32 device support POSITIONS the record's mask so
+        // `rval = value & mask` (processMbbi/processMbbo) selects the field at
+        // bits [SHFT, SHFT+NOBT). Without it, `apply_raw_readback`'s
+        // `raw & mask` strips exactly the SHFT-selected bits (and a NOBT=0
+        // record masks every bit to 0). uint32digital records get their
+        // already-positioned `@asynMask` above instead; only mbbi/mbbo carry
+        // NOBT under asynInt32 (bi/bo/ai/ao/longin have none; mbbiDirect/
+        // mbboDirect are uint32digital-only), so NOBT presence selects them.
+        //
+        // C shifts the record's CURRENT mask, overriding to 0xffffffff only
+        // when NOBT==0. mbbiRecord/mbboRecord init (mbbiRecord.c:128-130) sets
+        // that current mask to a `.db`-loaded MASK, or to `(1<<NOBT)-1` only
+        // when MASK was 0 — so mirroring `current << SHFT` here (rather than
+        // rebuilding `(1<<NOBT)-1`) preserves a `.db`-set custom MASK and
+        // yields 0 for the degenerate NOBT>32 (record mask stays 0), both
+        // exactly C. `wire_device_to_record` (device_support.rs) calls `init`
+        // exactly once per record, like C's once-only `initMbbi`, so the
+        // in-place positioning is never re-applied (no double-shift).
+        if self.iface_type == "asynInt32" {
+            if let Some(EpicsValue::UShort(nobt)) = record.get_field("NOBT") {
+                let shft = match record.get_field("SHFT") {
+                    Some(EpicsValue::UShort(s)) => s as u32,
+                    _ => 0,
+                };
+                let base: u32 = if nobt == 0 {
+                    0xFFFF_FFFF
+                } else {
+                    match record.get_field("MASK") {
+                        Some(EpicsValue::ULong(m)) => m,
+                        _ => 0,
+                    }
+                };
+                let positioned = base.checked_shl(shft).unwrap_or(0);
+                let _ = record.put_field("MASK", EpicsValue::Long(positioned as i32));
+            }
         }
 
         // ai/ao LINEAR ESLO/EOFF wiring.
@@ -1280,11 +1831,44 @@ impl DeviceSupport for AsynDeviceSupport {
                     .with_addr(self.addr)
                     .with_timeout(self.timeout);
                 if let Ok(result) = self.handle.submit_blocking(op, user) {
-                    if let Some(val) = self.result_to_value(&result) {
-                        let _ = record.set_val(val);
+                    // Seed the output record's value only on a successful read,
+                    // mirroring C initAo/initLongout/initMbbo: `if (status ==
+                    // asynSuccess) { pao->rval = value } return
+                    // INIT_DO_NOT_CONVERT` (devAsynInt32.c:955-959, :1080-1082).
+                    // A non-success initial read leaves the .db default — the
+                    // init-time member of the aux_status value-store family
+                    // (process-time members gated in the ring/polled/average
+                    // paths).
+                    if result.aux_status == crate::error::AsynStatus::Success {
+                        if let Some(val) = self.result_to_value(&result) {
+                            // ao seeds VAL from the raw readback via its
+                            // `raw -> eng` inverse: C `initAo` sets `rval=value`
+                            // and returns INIT_OK so aoRecord runs the readback
+                            // convert (devAsynInt32.c:947-957). longout/mbbo
+                            // have no such inverse (VAL == raw / state-map) and
+                            // decline the hook (default `false`). An asynFloat64
+                            // ao seeds VAL with the forward ASLO/AOFF scaling
+                            // (C `initAo`, devAsynFloat64.c:627-629) via the
+                            // float64 readback hook.
+                            let seeded = match val {
+                                EpicsValue::Long(raw) => record.apply_raw_readback(raw),
+                                EpicsValue::Double(raw) => record.apply_float64_readback(raw),
+                                _ => false,
+                            };
+                            if !seeded {
+                                let _ = record.set_val(val);
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        // Mode 1 averaging: snapshot the SVAL decimation count so the first
+        // decimation period uses the configured value before the first process
+        // refreshes it (C reads pai->sval live; devAsynInt32.c:674).
+        if self.scan == ScanType::IoIntr {
+            self.refresh_average_decimation_threshold(record);
         }
         Ok(())
     }
@@ -1294,18 +1878,243 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
-        // Write-only (asynOctetWrite): waveform is an input record type so
-        // process calls read(), not write(). Perform the write here instead.
+        // Time-series device support: the record process. C
+        // `devAsynXXXTimeSeries.h::process` applies RARM, commits NORD/BUSY, and
+        // resets RARM — the accumulating callback owns the array. RARM is a
+        // process-passive field (waveformRecord.dbd.pod RARM pp(TRUE)), so a
+        // `caput RARM` lands here; the buffer-full callback and the Read FLNK
+        // also drive process. The buffer is committed to VAL (which sets NORD)
+        // rather than the callback writing the record array directly — the
+        // asyn-rs sync callback holds no record lock.
+        if let Some(ts) = self.time_series.clone() {
+            use epics_base_rs::server::records::waveform::WaveformRecord;
+            let Some(wf) = record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<WaveformRecord>())
+            else {
+                // TimeSeries dsets are waveform-only; a non-waveform record
+                // cannot carry RARM/BUSY — nothing to commit.
+                return Ok(DeviceReadOutcome::ok());
+            };
+            // Invalid FTVL leaves `buf` None: the record cannot acquire. C makes
+            // it DEAD at init (`goto bad; pr->pact=1`, devAsynXXXTimeSeries.h:73-77,
+            // 118-120) so it never processes and BUSY stays 0. The port has no
+            // device-driven dead-record, so read() is inert here — leaving BUSY,
+            // NORD, VAL and RARM untouched — so a stray `caput RARM` cannot flip
+            // BUSY or emit completion traffic on a misconfigured record.
+            if ts.inner.lock().unwrap().buf.is_none() {
+                return Ok(DeviceReadOutcome::computed());
+            }
+            let rarm = wf.rarm;
+            let (arr, busy, status) = {
+                let mut st = ts.inner.lock().unwrap();
+                // C process RARM switch (devAsynXXXTimeSeries.h): 1=start
+                // (zero nord + arm), 2=stop, 3=resume, 0=no-op. "Start" clears
+                // the buffer; the others only flip BUSY.
+                match rarm {
+                    1 => {
+                        if let Some(buf) = st.buf.as_mut() {
+                            buf.clear();
+                        }
+                        st.busy = true;
+                    }
+                    2 => st.busy = false,
+                    3 => st.busy = true,
+                    _ => {}
+                }
+                let arr = st.buf.as_ref().map(TsBuf::to_epics_value);
+                let busy = st.busy;
+                // Consume the accumulated transport status (C applies it then
+                // resets pPvt->status = asynSuccess).
+                let status = std::mem::replace(&mut st.status, crate::error::AsynStatus::Success);
+                (arr, busy, status)
+            };
+            // Commit the current samples to VAL — `set_val` routes to
+            // put_field("VAL") for waveform and sets NORD = len (C
+            // `pwf->nord = pPvt->nord`). A None buffer (invalid FTVL) commits
+            // nothing, leaving VAL/NORD untouched.
+            if let Some(arr) = arr {
+                let _ = wf.set_val(arr);
+            }
+            // Sync the device-only fields the framework does not touch: BUSY
+            // reflects acquisition; RARM resets to 0 (C `pwf->rarm = 0`).
+            wf.busy = busy;
+            wf.rarm = 0;
+            // C `if (pPvt->status != asynSuccess) recGblSetSevr(prec, READ_ALARM,
+            // INVALID_ALARM)`; success clears to NO_ALARM. Input default
+            // READ_ALARM (waveform is an input record).
+            let (a_status, a_sev) = resolve_intr_alarm(
+                (0, 0),
+                status,
+                epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+            );
+            self.last_alarm_status = a_status;
+            self.last_alarm_severity = a_sev;
+            // VAL written directly → skip the record's RVAL→VAL convert.
+            return Ok(DeviceReadOutcome::computed());
+        }
+
+        // asynOctetCmdResponse misconfiguration: C initCmdBuffer
+        // (devAsynOctet.c:631-637) rejects the command outright —
+        // recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM) + INIT_ERROR — when, and
+        // ONLY when, the RAW userParam (the pre-escape DRVINFO) is empty:
+        // `strlen(pPvt->userParam) == 0`. The translated byte length (bufLen) is
+        // computed later (:641) and may be 0 for a non-empty DRVINFO that escapes
+        // to a leading NUL — that case is NOT rejected; C does a 0-byte
+        // writeIt+readIt. So gate the reject on the raw DRVINFO, not on the
+        // post-truncation command: a Some(empty) octet_cmd from a leading-NUL
+        // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
+        // a plain asynOctetRead, so this only fires for a CmdResponse record.
+        if self.octet_cmd.is_some() && self.drv_info.is_empty() {
+            self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+            self.last_alarm_severity = epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
+            return Ok(DeviceReadOutcome::ok());
+        }
+
+        // Write-only (asynOctetWrite / asynOctetWriteBinary): waveform is an input
+        // record type so process calls read(), not write(). Perform the write
+        // here instead. The binary variant sends the full NORD bytes (no NUL-trim);
+        // the text variant trims at the first NUL via write_op.
+        //
+        // Route through `device_output_value` like the write()/write_begin()
+        // entries so the raw-output anchor invariant holds by construction, not
+        // by "this path is octet-only": for asynOctet it returns VAL unchanged
+        // (the `_` arm), but a future scalar write_only DTYP would then anchor on
+        // RVAL/OVAL automatically instead of silently bypassing it.
         if self.write_only {
-            if let Some(val) = record.val() {
-                if let Some(op) = self.write_op(&val) {
+            if let Some(val) = self.device_output_value(&*record) {
+                let op = if self.octet_binary {
+                    self.binary_write_op(&*record, &val)
+                } else {
+                    self.write_op(&val)
+                };
+                if let Some(op) = op {
                     let user = AsynUser::new(self.reason)
                         .with_addr(self.addr)
                         .with_timeout(self.timeout);
-                    let _ = self.handle.submit_blocking(op, user);
+                    // Apply the write result's alarm, mirroring the read path
+                    // (and C callbackWfWrite/WriteBinary: writeIt -> result.status
+                    // -> finish recGblSetSevr, devAsynOctet.c:1071-1076,1086-1091).
+                    // A successful write carries NO_ALARM (clears any prior); a
+                    // failure maps via asyn_error_to_alarm. Without this the
+                    // write-only path swallowed every write failure silently.
+                    // This is an output (isOutput=1) record, so a generic
+                    // transport failure raises WRITE_ALARM, not READ_ALARM
+                    // (C processCommon: isOutput ? WRITE_ALARM : READ_ALARM,
+                    // devAsynOctet.c:806-807; partial write recGblSetSevr
+                    // WRITE_ALARM, :685).
+                    match self.handle.submit_blocking(op, user) {
+                        Ok(result) => {
+                            self.last_alarm_status = result.alarm_status;
+                            self.last_alarm_severity = result.alarm_severity;
+                        }
+                        Err(e) => {
+                            let (alarm_status, alarm_severity) = asyn_error_to_alarm_with_default(
+                                &e,
+                                epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
+                            );
+                            self.last_alarm_status = alarm_status;
+                            self.last_alarm_severity = alarm_severity;
+                        }
+                    }
                 }
             }
             return Ok(DeviceReadOutcome::ok());
+        }
+
+        // Mode 1 averaging (SCAN="I/O Intr"): the decimated mean is delivered
+        // through the IoIntr ring — `io_intr_receiver` decimates every
+        // round(SVAL) samples into `interrupt_fifo` and wakes the record (C
+        // `interruptCallbackAverage` isIOIntrScan branch, devAsynInt32.c:
+        // 673-702). Refresh the live SVAL threshold, then fall through to the
+        // ring-pop path below which drains the decimated value (C
+        // `processAiAverage` `getCallbackValue` branch, :895-898). Do NOT drain
+        // the running mean here — that is the Mode 2 periodic model.
+        if self.average.is_some() && self.scan == ScanType::IoIntr {
+            self.refresh_average_decimation_threshold(record);
+        }
+        // Mode 2 averaging (periodic SCAN): the always-on interrupt callback
+        // (io_intr_receiver) has been accumulating samples into the SumAverager
+        // since iocInit. On each periodic record process, drain the arithmetic
+        // mean since the last process and reset — C `processAiAverage`
+        // (devAsynInt32.c:895-918, devAsynFloat64.c:716-735). Reuses the normal
+        // ai store paths: int32 routes the rounded mean to RVAL (the ai record's
+        // convert applies ESLO/EOFF), float64 sets VAL directly (ASLO/AOFF/SMOO
+        // applied in-dset) — averaging only changes the *source* of the raw
+        // value, exactly as CmdResponse reused the octet reply→VAL.
+        else if let Some(acc) = self.average.clone() {
+            // C `processAiAverage` computes and RESETS the accumulator
+            // (numAverage=0, sum=0) BEFORE the transport-status check, so the
+            // period's samples are consumed even on a transport-error cycle —
+            // the checked drain already resets the averager.
+            let drained = if self.iface_type == "asynInt32" {
+                acc.averager
+                    .read_and_reset_int32_checked()
+                    .map(EpicsValue::Long)
+            } else {
+                acc.averager
+                    .read_and_reset_checked()
+                    .map(EpicsValue::Double)
+            };
+            // Snapshot the two status channels atomically against the callback.
+            // Reset the accumulated transport status only when a period was
+            // consumed (C resets `result.status = asynSuccess` on the
+            // failure branch; on the success branch it was already success).
+            // A zero-samples cycle leaves it untouched — and count==0 means no
+            // sample was pushed, so `aux_error` is `None` there regardless.
+            let (last_alarm, transport) = {
+                let mut st = acc.status.lock().unwrap();
+                let snap = (st.last_alarm, st.aux_error);
+                if drained.is_some() {
+                    st.aux_error = None;
+                }
+                snap
+            };
+            match drained {
+                Some(val) => {
+                    // Final alarm = last sample's EPICS alarm, with C's
+                    // `asynStatusToEpicsAlarm` fill-in (shared resolver). Average
+                    // dsets are ai-only, so the input default READ_ALARM applies.
+                    let (status, severity) = resolve_intr_alarm(
+                        last_alarm,
+                        transport.unwrap_or(crate::error::AsynStatus::Success),
+                        epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+                    );
+                    self.last_alarm_status = status;
+                    self.last_alarm_severity = severity;
+                    if transport.is_some() {
+                        // Transport-error period: C `processAiAverage` discards
+                        // the averaged value — `if (result.status ==
+                        // asynSuccess) { store } else { result.status =
+                        // asynSuccess; return -1 }` (devAsynInt32.c:919-927,
+                        // devAsynFloat64.c:736-754). `computed()` skips the
+                        // store so RVAL/VAL keep their previous value; the
+                        // mapped READ/TIMEOUT/...@INVALID alarm above stands.
+                        return Ok(DeviceReadOutcome::computed());
+                    }
+                    // Transport success: store the mean (C return 0/2).
+                    let skip_convert = self.store_read_value(record, val);
+                    return Ok(if skip_convert {
+                        DeviceReadOutcome::computed()
+                    } else {
+                        DeviceReadOutcome::ok()
+                    });
+                }
+                None => {
+                    // No samples since the last process. C `processAiAverage`
+                    // sets UDF_ALARM/INVALID and returns -2 (VAL untouched) —
+                    // devAsynInt32.c:900-904, devAsynFloat64.c:721-725.
+                    // `computed()` skips the RVAL→VAL convert so VAL keeps its
+                    // previous value (no store_read_value call). NOTE: C also
+                    // sets the record's `udf=1` boolean; device support has no
+                    // channel to set that field here — the UDF_ALARM/INVALID
+                    // alarm is raised, the `udf` boolean is the documented gap.
+                    self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::UDF_ALARM;
+                    self.last_alarm_severity =
+                        epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
+                    return Ok(DeviceReadOutcome::computed());
+                }
+            }
         }
 
         // For I/O Intr records, pop the oldest entry from the ring
@@ -1338,22 +2147,57 @@ impl DeviceSupport for AsynDeviceSupport {
             }
             let mut skip_convert = true;
             if let Some(ci) = entry {
-                // Array interrupts carry the native element type; convert to this
-                // record's interface type so a mismatched FTVL gets the same
-                // per-type `convert` the polled path applies (C fires all six
-                // array interfaces, NDPluginStdArrays.cpp:169-197). Scalar
-                // interfaces fall back to the verbatim mapping.
-                let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
-                    .or_else(|| param_value_to_epics_value(&ci.value));
-                if let Some(val) = val {
-                    skip_convert = self.store_read_value(record, val);
-                }
+                // Direction-aware default for the transport-status mapping: C
+                // `asynStatusToEpicsAlarm` takes READ_ALARM for input device
+                // support (processAi, devAsynInt32.c:844) and WRITE_ALARM for
+                // scalar output readback (processBo/Lo/Mbbo, :1201). Array dsets
+                // use READ_ALARM even for aao output (devAsynXXXArray.cpp's
+                // single shared process(), :330-331), so an array iface is
+                // always READ_ALARM; otherwise an asyn:READBACK output is
+                // WRITE_ALARM and a plain input I/O Intr is READ_ALARM. The
+                // default only affects the asynError/unknown arm.
+                let default_stat = if self.iface_type.ends_with("Array") {
+                    epics_base_rs::server::recgbl::alarm_status::READ_ALARM
+                } else if self.asyn_readback {
+                    epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM
+                } else {
+                    epics_base_rs::server::recgbl::alarm_status::READ_ALARM
+                };
+                // Apply the sample's alarm with the transport-status fill-in
+                // (C devAsynInt32.c:844-847; sample EPICS alarm wins, transport
+                // status fills only NO_ALARM fields). Unconditional, like the
+                // pop/overflow/output_callback_pending/timestamp above and here
+                // — C sets `time` even on a transport error (devAsynXXXArray.c:
+                // 327) and always recGblSetSevr's the mapped alarm.
+                let (status, severity) = resolve_intr_alarm(
+                    (ci.alarm_status, ci.alarm_severity),
+                    ci.aux_status,
+                    default_stat,
+                );
+                self.last_alarm_status = status;
+                self.last_alarm_severity = severity;
                 self.last_ts = Some(ci.timestamp);
-                // C devAsynInt32.c:843-847 — apply the driver alarm carried
-                // by the ring-buffer element. Symmetric with the polled
-                // read path (last_alarm_* set from RequestResult below).
-                self.last_alarm_status = ci.alarm_status;
-                self.last_alarm_severity = ci.alarm_severity;
+                // C gates the value store on the transport status:
+                // `if (result.status == asynSuccess) { pr->rval = … } else
+                // return -1` (processAi devAsynInt32.c:844-855, processBo
+                // :1201-1204), and the array process() copies bptr/nord only
+                // `if (rp->status == asynSuccess)` (devAsynXXXArray.cpp:317).
+                // On a transport error keep the prior value (skip the store);
+                // `skip_convert` stays true so the record skips the RVAL→VAL
+                // convert and keeps its previous value = C return -1.
+                if ci.aux_status == crate::error::AsynStatus::Success {
+                    // Array interrupts carry the native element type; convert to
+                    // this record's interface type so a mismatched FTVL gets the
+                    // same per-type `convert` the polled path applies (C fires
+                    // all six array interfaces, NDPluginStdArrays.cpp:169-197).
+                    // Scalar interfaces fall back to the verbatim mapping.
+                    let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
+                        .or_else(|| param_value_to_epics_value(&ci.value))
+                        .map(|v| self.cap_octet_read_value(v));
+                    if let Some(val) = val {
+                        skip_convert = self.store_read_value(record, val);
+                    }
+                }
             }
             // Honor store_read_value's skip-convert decision: computed()
             // (skip RVAL→VAL convert, C return 2) for paths that produced
@@ -1373,8 +2217,17 @@ impl DeviceSupport for AsynDeviceSupport {
                 .with_timeout(self.timeout);
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
-                    if let Some(val) = self.result_to_value(&result) {
-                        skip_convert = self.store_read_value(record, val);
+                    // Gate the value store on the device read status, mirroring
+                    // C processAi: `if (result.status == asynSuccess) { pr->rval
+                    // = value } else { return -1 }` keeps the prior value on a
+                    // non-success read (devAsynInt32.c:848-855). The alarm/time
+                    // are applied unconditionally (C maps the alarm and
+                    // recGblSetSevr's it before the status gate, :844-847) — same
+                    // store-only gate as the I/O Intr ring.
+                    if result.aux_status == crate::error::AsynStatus::Success {
+                        if let Some(val) = self.result_to_value(&result) {
+                            skip_convert = self.store_read_value(record, val);
+                        }
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
@@ -1400,7 +2253,7 @@ impl DeviceSupport for AsynDeviceSupport {
         if !self.reason_set {
             return Ok(());
         }
-        if let Some(val) = record.val() {
+        if let Some(val) = self.device_output_value(record) {
             if let Some(op) = self.write_op(&val) {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
@@ -1472,7 +2325,9 @@ impl DeviceSupport for AsynDeviceSupport {
         &mut self,
         record: &mut dyn Record,
     ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
-        let val = match record.val() {
+        // Same raw-output anchor as the synchronous write() — the async path
+        // (blocking ports, e.g. motors) must not bypass the RVAL/OVAL anchor.
+        let val = match self.device_output_value(record) {
             Some(v) => v,
             None => return Ok(None),
         };
@@ -1511,6 +2366,211 @@ impl DeviceSupport for AsynDeviceSupport {
         if !self.reason_set {
             return None;
         }
+
+        // Time-series device support (asynInt32/Float64/Int64TimeSeries):
+        // register an ALWAYS-ON synchronous accumulating callback (C
+        // `registerInterruptUser(interruptCallback)`, devAsynXXXTimeSeries.h:159).
+        // Like averaging it must observe EVERY sample, so a sync callback, not a
+        // coalescing mailbox. The callback appends to the buffer only while BUSY
+        // (C `if (pPvt->busy)`) and, when the buffer fills, clears BUSY and wakes
+        // the record to process (C `callbackRequestProcessCallback`,
+        // devAsynXXXTimeSeries.h:201-211). Process registration/cancellation by
+        // BUSY (C process) is folded into this always-on callback's BUSY gate —
+        // a not-busy sample is a no-op either way, so the observable behaviour is
+        // identical without dynamic register/cancel churn.
+        if let Some(ts) = self.time_series.clone() {
+            let filter = InterruptFilter {
+                reason: Some(self.reason),
+                addr: Some(self.addr),
+                uint32_mask: None,
+                // Per-interface routing: a driver that fires interface-typed
+                // values (e.g. Modbus) must reach this accumulating callback
+                // with only this record's interface, or a single poll's several
+                // typed fires would each be accumulated as separate samples.
+                iface: self.iface,
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let sub = self
+                .handle
+                .interrupts()
+                .register_sync_callback(filter, move |iv| {
+                    let mut st = ts.inner.lock().unwrap();
+                    // Not acquiring (C `if (pPvt->busy)` guard): nothing to do.
+                    if !st.busy {
+                        return;
+                    }
+                    let nelm = st.nelm;
+                    // Append while room remains (C `if (pPvt->nord < pwf->nelm)`).
+                    // A None buffer (FTVL invalid) or a full buffer returns.
+                    let full = match st.buf.as_mut() {
+                        Some(buf) if buf.len() < nelm => {
+                            buf.push(&iv.value);
+                            buf.len() >= nelm
+                        }
+                        _ => return,
+                    };
+                    // Transport status: C updates `pPvt->status = pasynUser->
+                    // auxStatus` on EVERY callback, even when not acquiring
+                    // (devAsynXXXTimeSeries.h:213 is outside the `if(busy)`).
+                    // Here it is reached only while acquiring (the not-busy guard
+                    // returned above) — a deliberate divergence: an error on a
+                    // sample received while stopped does not leak into the next
+                    // acquisition's alarm. Within acquisition the behaviour is C's:
+                    // keep the first non-success status until the next process.
+                    if st.status == crate::error::AsynStatus::Success
+                        && iv.aux_status != crate::error::AsynStatus::Success
+                    {
+                        st.status = iv.aux_status;
+                    }
+                    // Completion. DIVERGENCE from C: C completes LAZILY — the
+                    // sample that fills the last slot is stored and acquisition
+                    // stays busy; the NEXT sample finds `nord == nelm`, is
+                    // discarded, and only then clears busy + processes
+                    // (devAsynXXXTimeSeries.h:203-211). That delays completion by
+                    // one sample and hangs busy=1 forever if the stream stops at
+                    // exactly NELM. This port completes EAGERLY on the filling
+                    // sample: identical stored data (the first NELM samples; the
+                    // would-be C trigger sample is dropped by the not-busy guard
+                    // either way) but deterministic completion. try_send: the
+                    // callback runs inline in the driver notify and must not block;
+                    // a full wakeup channel means a process is already pending.
+                    if full {
+                        st.busy = false;
+                        drop(st);
+                        let _ = tx.try_send(());
+                    }
+                });
+            self.time_series_sub = Some(sub);
+            return Some(rx);
+        }
+
+        // Averaging device support (asynInt32Average / asynFloat64Average):
+        // register an ALWAYS-ON accumulating callback regardless of SCAN (C
+        // enables the averaging callback unconditionally, devAsynInt32.c:385-386).
+        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
+        // not a mailbox subscription: averaging must observe every sample, and
+        // the mailbox coalesces rapid updates to the latest — which would drop
+        // samples and corrupt the mean.
+        if let Some(acc) = self.average.clone() {
+            let filter = InterruptFilter {
+                reason: Some(self.reason),
+                addr: Some(self.addr),
+                uint32_mask: None,
+                // Averaging accumulates every sample; restrict to this record's
+                // interface so a per-interface driver's parallel typed fires for
+                // one poll are not each pushed as a separate sample.
+                iface: self.iface,
+            };
+            // asynInt32Average applies the same @asynMask nbits the polled
+            // read does (devAsynInt32.c:537-540); asynFloat64Average has no mask.
+            let int32_mask = self.int32_mask;
+            let is_int32 = self.iface_type == "asynInt32";
+
+            // Mode 1 — SCAN="I/O Intr": C `interruptCallbackAverage` isIOIntrScan
+            // branch (devAsynInt32.c:673-702). Accumulate every sample, and every
+            // round(SVAL) samples decimate the mean into the IoIntr ring and
+            // `scanIoRequest` the record; read() drains the ring
+            // (`getCallbackValue`). The ring entry carries the TRIGGERING sample's
+            // status/alarm — C `rp->status = pasynUser->auxStatus` (:685-687), NOT
+            // the Mode 2 OR-accumulation.
+            if self.scan == ScanType::IoIntr {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                let fifo = self.interrupt_fifo.clone();
+                let sub = self
+                    .handle
+                    .interrupts()
+                    .register_sync_callback(filter, move |iv| {
+                        use std::sync::atomic::Ordering;
+                        let sample = match &iv.value {
+                            crate::param::ParamValue::Int32(v) => {
+                                Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
+                            }
+                            crate::param::ParamValue::Float64(v) => Some(*v),
+                            _ => None,
+                        };
+                        let Some(s) = sample else {
+                            return;
+                        };
+                        // C: numAverage++; sum += value (devAsynInt32.c:665-666).
+                        acc.averager.push(s);
+                        // C: numToAverage = (int)(sval+0.5), min 1; decimate
+                        // when numAverage >= numToAverage (devAsynInt32.c:674-676).
+                        let n = acc.num_to_average.load(Ordering::Relaxed).max(1) as u64;
+                        if acc.averager.count() < n {
+                            return;
+                        }
+                        // C: dval = round(sum/numAverage); reset sum/count
+                        // (devAsynInt32.c:679-683). The checked drains reset
+                        // atomically and return Some (count >= n >= 1 here).
+                        let value = if is_int32 {
+                            crate::param::ParamValue::Int32(
+                                acc.averager.read_and_reset_int32_checked().unwrap_or(0),
+                            )
+                        } else {
+                            crate::param::ParamValue::Float64(
+                                acc.averager.read_and_reset_checked().unwrap_or(0.0),
+                            )
+                        };
+                        let entry = CachedInterrupt {
+                            value,
+                            timestamp: iv.timestamp,
+                            // C takes the triggering sample's status/alarm, NOT
+                            // an OR-accumulation (rp->status = pasynUser->
+                            // auxStatus, devAsynInt32.c:685-687).
+                            alarm_status: iv.alarm_status,
+                            alarm_severity: iv.alarm_severity,
+                            aux_status: iv.aux_status,
+                        };
+                        // C: ring full → evict oldest + overflow, NO
+                        // scanIoRequest; fresh add → scanIoRequest
+                        // (devAsynInt32.c:688-701).
+                        let was_fresh = {
+                            let mut g = fifo.lock().unwrap();
+                            g.push_with_overflow(entry)
+                        };
+                        // try_send: the callback runs inline in the driver
+                        // notify() and must not block; a full wakeup channel
+                        // means a process is already pending and will drain the
+                        // ring (C does not re-request when one is pending).
+                        if was_fresh {
+                            let _ = tx.try_send(());
+                        }
+                    });
+                self.average_callback_sub = Some(sub);
+                return Some(rx);
+            }
+
+            // Mode 2 — periodic SCAN: accumulate every sample; the periodic
+            // record process drains the running mean in read(). The callback
+            // OR-accumulates the transport status and stashes the last sample's
+            // EPICS alarm (devAsynInt32.c:705-707, devAsynFloat64.c:516-518) —
+            // once any sample is non-success the period stays a transport error
+            // (asynSuccess == 0, so the OR is sticky). Return None: no
+            // per-callback reprocess wakeup (the record scans on its own period).
+            let sub = self
+                .handle
+                .interrupts()
+                .register_sync_callback(filter, move |iv| {
+                    let sample = match &iv.value {
+                        crate::param::ParamValue::Int32(v) => {
+                            Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
+                        }
+                        crate::param::ParamValue::Float64(v) => Some(*v),
+                        _ => None,
+                    };
+                    if let Some(s) = sample {
+                        acc.averager.push(s);
+                        let mut st = acc.status.lock().unwrap();
+                        st.last_alarm = (iv.alarm_status, iv.alarm_severity);
+                        if iv.aux_status != crate::error::AsynStatus::Success {
+                            st.aux_error = Some(iv.aux_status);
+                        }
+                    }
+                });
+            self.average_callback_sub = Some(sub);
+            return None;
+        }
+
         if self.scan != ScanType::IoIntr && !self.asyn_readback {
             return None;
         }
@@ -1534,6 +2594,13 @@ impl DeviceSupport for AsynDeviceSupport {
             reason: Some(self.reason),
             addr: Some(self.addr),
             uint32_mask: if is_uint32 { Some(mask) } else { None },
+            // Per-interface routing (C's per-interface interrupt lists): a
+            // driver firing interface-typed values reaches this record only with
+            // its own interface, so an asynUInt32Digital bi gets the raw word to
+            // mask and an asynInt32 ai gets the int to ESLO-convert — not the one
+            // collapsed value. A single-value driver fires untyped and still
+            // reaches here (InterruptFilter::iface).
+            iface: self.iface,
         };
 
         let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
@@ -1572,6 +2639,10 @@ impl DeviceSupport for AsynDeviceSupport {
                     // NO_ALARM even when the driver flagged an alarm.
                     alarm_status: iv.alarm_status,
                     alarm_severity: iv.alarm_severity,
+                    // Carry the transport status too (C ring `rp->status =
+                    // pasynUser->auxStatus`, devAsynInt32.c:600); the read maps
+                    // it and gates the value store.
+                    aux_status: iv.aux_status,
                 };
                 // C parity (devAsynInt32.c:564-576):
                 //   - On overflow (ring full), drop oldest +
@@ -1597,8 +2668,19 @@ impl DeviceSupport for AsynDeviceSupport {
     /// Decouple its poll-feedback wiring from the `SCAN` menu so the callback
     /// processes it even when `SCAN != "I/O Intr"`. Plain `SCAN="I/O Intr"`
     /// records (`asyn_readback == false`) keep the SCAN-gated behaviour.
+    ///
+    /// Averaging records (`average.is_some()`) also need the driver-callback
+    /// path wired regardless of SCAN — the accumulating interrupt must run on
+    /// every driver sample while the record scans periodically. C enables the
+    /// averaging callback always, independent of SCAN (devAsynInt32.c:385-386).
+    /// `io_intr_receiver` returns `None` for the average case, so this only
+    /// arms the accumulating subscription; it spawns no reprocess task (the
+    /// record scans on its own period, not per callback).
     fn io_intr_scan_independent(&self) -> bool {
-        self.asyn_readback
+        // Time-series records are SCAN="Passive" (driven by RARM puts, the Read
+        // FLNK, and the completion callback) but must still receive the
+        // accumulating callback regardless of SCAN — same as averaging.
+        self.asyn_readback || self.average.is_some() || self.time_series.is_some()
     }
 
     fn arm_readback_callback(&mut self) {
@@ -1659,6 +2741,11 @@ impl DeviceSupport for AsynDeviceSupport {
             reason: Some(self.reason),
             addr: Some(self.addr),
             uint32_mask: None,
+            // The enum table is re-propagated via the untyped
+            // `call_param_callbacks` path (iface `None`), which matches any
+            // filter; tagging with this record's interface stays consistent
+            // with the other subscriptions and never gates those fires out.
+            iface: self.iface,
         };
         let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
         self.enum_interrupt_sub = Some(sub);
@@ -1711,9 +2798,42 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
             return base.to_string();
         }
     }
-    // Octet direction suffixes: asynOctetRead/Write → asynOctet
-    if dtyp == "asynOctetRead" || dtyp == "asynOctetWrite" {
+    // Octet direction suffixes: asynOctetRead/Write → asynOctet.
+    // asynOctetCmdResponse (write-then-read, carried by `octet_cmd`) and
+    // asynOctetWriteBinary (write-only, no-NUL-trim, carried by `octet_binary`)
+    // also resolve to the asynOctet interface — C devAsynOctet.c registers every
+    // one of these dsets on asynOctet; the direction/behavior is record state,
+    // not a distinct interface.
+    if dtyp == "asynOctetRead"
+        || dtyp == "asynOctetWrite"
+        || dtyp == "asynOctetWriteBinary"
+        || dtyp == "asynOctetCmdResponse"
+    {
         return "asynOctet".to_string();
+    }
+    // Averaging DTYPs use the base interface for driver I/O; averaging is a
+    // device-support behaviour carried by `average`, not a distinct interface
+    // (C `asynInt32Average` registers on asynInt32, `asynFloat64Average` on
+    // asynFloat64 — devAsynInt32.c:870-872 / devAsynFloat64.c:687-694).
+    if dtyp == "asynInt32Average" {
+        return "asynInt32".to_string();
+    }
+    if dtyp == "asynFloat64Average" {
+        return "asynFloat64".to_string();
+    }
+    // Time-series DTYPs likewise use the base interface for driver I/O; the
+    // scalar-into-array accumulation is a device-support behaviour carried by
+    // `time_series` (C `asynInt32TimeSeries` registers on asynInt32, etc. —
+    // devAsynXXXTimeSeries.h INTERFACE_TYPE: asynInt32Type/asynFloat64Type/
+    // asynInt64Type).
+    if dtyp == "asynInt32TimeSeries" {
+        return "asynInt32".to_string();
+    }
+    if dtyp == "asynFloat64TimeSeries" {
+        return "asynFloat64".to_string();
+    }
+    if dtyp == "asynInt64TimeSeries" {
+        return "asynInt64".to_string();
     }
     dtyp.to_string()
 }
@@ -1742,8 +2862,10 @@ pub fn universal_asyn_factory(
     let (link_str, is_output) = if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
         (ctx.out, true)
     } else if ctx.inp.contains("@asyn") || ctx.inp.contains("@asynMask") {
-        // asynOctetWrite uses INP field for output (C EPICS convention for waveform records)
-        let is_write_dtyp = ctx.dtyp == "asynOctetWrite";
+        // asynOctetWrite / asynOctetWriteBinary use the INP field for output
+        // (C waveform-output-via-INP convention; initWfWrite / initWfWriteBinary
+        // both pass &pwf->inp with isOutput=1, devAsynOctet.c:1065,1080).
+        let is_write_dtyp = ctx.dtyp == "asynOctetWrite" || ctx.dtyp == "asynOctetWriteBinary";
         (ctx.inp, is_write_dtyp)
     } else {
         return None;
@@ -1772,11 +2894,64 @@ pub fn universal_asyn_factory(
 
     let mut adapter = AsynDeviceSupport::from_handle(entry.handle, link, &dtyp);
 
+    // asynOctetCmdResponse: the DRVINFO is a LITERAL command, not a param name
+    // (C `asynSiOctetCmdResponse` passes useDrvUser=0 → no drvUserCreate). Escape-
+    // translate it once (C `initCmdBuffer`, devAsynOctet.c) and cache it; each
+    // process writes the command then reads the reply into VAL (`read_op` emits
+    // `OctetWriteRead`). Pre-set `reason_set` so `init()` skips the param
+    // resolution that would fail on a command string — reason stays 0, and octet
+    // I/O keys off the addr, not the reason.
+    if ctx.dtyp == "asynOctetCmdResponse" {
+        // C initCmdBuffer (devAsynOctet.c:639-641) runs dbTranslateEscape then
+        // bufLen = strlen(buffer): an escaped NUL (\0 / \000) terminates the
+        // command, so only the bytes up to the first NUL are written. Truncate
+        // at the first NUL to match the bytes C actually puts on the wire. The
+        // truncated command may be empty (a leading-NUL command, strlen 0); that
+        // is NOT a misconfiguration — C still writes 0 bytes then reads. Only a
+        // raw-empty DRVINFO is rejected, and that is gated in read() on the raw
+        // drv_info (C `strlen(userParam)`), not on this truncated command.
+        let mut cmd = crate::asyn_record::translate_escape(&adapter.drv_info);
+        if let Some(nul) = cmd.iter().position(|&b| b == 0) {
+            cmd.truncate(nul);
+        }
+        adapter.octet_cmd = Some(cmd);
+        adapter.reason_set = true;
+    }
+
+    // asynInt32Average / asynFloat64Average: averaging device support. C
+    // `initAiAverage` (devAsynInt32.c:760+, devAsynFloat64.c) registers an
+    // always-on accumulating interrupt; the periodic record process drains
+    // the mean. The DRVINFO is a real param (useDrvUser=1), so `reason_set`
+    // is left false and `init()` runs `drv_user_create` as for a plain
+    // asynInt32/asynFloat64 ai. The accumulating subscription is registered
+    // in `io_intr_receiver` (which `io_intr_scan_independent` enables here).
+    if ctx.dtyp == "asynInt32Average" || ctx.dtyp == "asynFloat64Average" {
+        adapter.average = Some(Arc::new(AverageState::new()));
+    }
+
+    // asynInt32TimeSeries / asynFloat64TimeSeries / asynInt64TimeSeries:
+    // time-series device support (waveform-only). The DRVINFO is a real param
+    // (useDrvUser=1), so `reason_set` is left false and `init()` runs
+    // `drv_user_create` as for a plain scalar record; init also validates FTVL
+    // and sizes the buffer from NELM. The accumulating subscription is armed in
+    // `io_intr_receiver` (which `io_intr_scan_independent` enables here).
+    if ctx.dtyp == "asynInt32TimeSeries"
+        || ctx.dtyp == "asynFloat64TimeSeries"
+        || ctx.dtyp == "asynInt64TimeSeries"
+    {
+        adapter.time_series = Some(Arc::new(TimeSeriesState::new()));
+    }
+
     if is_output {
-        if ctx.dtyp == "asynOctetWrite" {
-            // asynOctetWrite is write-only — no reads allowed.
-            // Reading would replace waveform CharArray with String, breaking element_count.
+        if ctx.dtyp == "asynOctetWrite" || ctx.dtyp == "asynOctetWriteBinary" {
+            // asynOctetWrite / asynOctetWriteBinary are write-only — no reads
+            // allowed. Reading would replace the waveform CharArray with a String,
+            // breaking element_count.
             adapter.write_only = true;
+            // asynOctetWriteBinary writes the full NORD bytes with NO NUL-trim
+            // (C callbackWfWriteBinary, devAsynOctet.c:1086-1091), unlike
+            // asynOctetWrite which trims at the first NUL (my_strnlen, :1071-1076).
+            adapter.octet_binary = ctx.dtyp == "asynOctetWriteBinary";
         } else {
             // Output records: read back current driver value on init.
             // Mirrors C `initAo` / `initBo` / `initLongout` / `initMbbo`
@@ -1880,6 +3055,49 @@ mod tests {
             asyn_error_to_alarm(&AsynError::PortNotFound("p".into())),
             (1, 3)
         );
+    }
+
+    /// Output (write-only) device support maps a transfer failure with C's
+    /// WRITE_ALARM default (processCommon: `isOutput ? WRITE_ALARM : READ_ALARM`,
+    /// devAsynOctet.c:806-807). Only the generic-`asynError` arm and the
+    /// non-status arm change with direction; the specific transport statuses
+    /// (Timeout/Overflow/Disconnected/Disabled) map direction-independently.
+    #[test]
+    fn asyn_error_to_alarm_write_default_is_write_alarm() {
+        use crate::error::AsynStatus;
+        use epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM;
+        let mk = |s: AsynStatus| {
+            asyn_error_to_alarm_with_default(
+                &AsynError::Status {
+                    status: s,
+                    message: String::new(),
+                },
+                WRITE_ALARM,
+            )
+        };
+        // Generic asynError -> the direction default = WRITE_ALARM(2), INVALID(3).
+        assert_eq!(
+            mk(AsynStatus::Error),
+            (2, 3),
+            "output asynError default => WRITE_ALARM(2), not READ_ALARM(1)"
+        );
+        // Non-status error also takes the direction default.
+        assert_eq!(
+            asyn_error_to_alarm_with_default(&AsynError::PortNotFound("p".into()), WRITE_ALARM),
+            (2, 3)
+        );
+        // Specific statuses stay direction-independent.
+        assert_eq!(
+            mk(AsynStatus::Timeout),
+            (10, 3),
+            "Timeout independent of dir"
+        );
+        assert_eq!(
+            mk(AsynStatus::Disconnected),
+            (9, 3),
+            "Disconnected independent of dir"
+        );
+        assert_eq!(mk(AsynStatus::Success), (0, 0));
     }
 
     /// Regression: the IocBuilder companion helper exists
@@ -2313,6 +3531,432 @@ mod tests {
         ads
     }
 
+    /// Build a Passive asynInt32 input adapter whose port has VAL pre-seeded to
+    /// `value` with the given device read `status`. Used to exercise the polled
+    /// read value-discard gate: a non-success param status must keep the prior
+    /// record value (C processAi return -1) while still raising the alarm.
+    fn make_seeded_int32_adapter(
+        value: i32,
+        status: crate::error::AsynStatus,
+    ) -> AsynDeviceSupport {
+        let mut driver = TestPort::new();
+        driver.base.params.set_int32(0, 0, value).unwrap();
+        driver
+            .base
+            .params
+            .set_param_status(0, 0, status, 0, 0)
+            .unwrap();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-seeded-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32");
+        ads.set_record_info("TEST:SEED", ScanType::Passive);
+        ads.reason_set = true; // reason defaults to 0 = VAL; skip init's drv_user_create
+        ads
+    }
+
+    /// Build an averaging (`asynInt32Average` / `asynFloat64Average`) adapter:
+    /// a plain ai adapter on the base interface with `average` set, on a
+    /// periodic (non-IoIntr) SCAN. The accumulating interrupt is armed by
+    /// calling `io_intr_receiver()` (which `io_intr_scan_independent` would
+    /// gate in production); the port is never read by the average path.
+    fn make_average_adapter(iface: &str) -> AsynDeviceSupport {
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-average-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
+        ads.average = Some(Arc::new(AverageState::new()));
+        ads.set_record_info("TEST:AVG", ScanType::Passive);
+        ads
+    }
+
+    /// Poll the averager until at least `n` samples have accumulated (the
+    /// interrupt callback runs on a spawned task). Panics if `n` never arrives.
+    async fn await_average_count(acc: &Arc<AverageState>, n: u64) {
+        for _ in 0..200 {
+            if acc.averager.count() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("averager never reached {n} samples");
+    }
+
+    /// Build a time-series adapter on the given (already normalized) base
+    /// interface, with `time_series` armed and a Passive record scan — the
+    /// shape the factory produces for `asynXxxTimeSeries`.
+    fn make_timeseries_adapter(iface: &str) -> AsynDeviceSupport {
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-ts-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
+        ads.time_series = Some(Arc::new(TimeSeriesState::new()));
+        ads.set_record_info("TEST:TS", ScanType::Passive);
+        ads
+    }
+
+    /// Poll the time-series buffer until it holds at least `n` samples (the
+    /// accumulating callback runs on a spawned task). Panics if `n` never arrives.
+    async fn await_ts_len(ts: &Arc<TimeSeriesState>, n: usize) {
+        for _ in 0..200 {
+            let len = ts
+                .inner
+                .lock()
+                .unwrap()
+                .buf
+                .as_ref()
+                .map(TsBuf::len)
+                .unwrap_or(0);
+            if len >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("time-series buffer never reached {n} samples");
+    }
+
+    /// asynInt32TimeSeries happy path: RARM=1 starts acquisition (BUSY=1,
+    /// NORD=0), the callback appends only while BUSY, the buffer fills at NELM
+    /// (BUSY auto-clears), and the completion process commits VAL/NORD. C
+    /// `devAsynXXXTimeSeries.h` interruptCallback + process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_int32_accumulates_while_armed_then_commits_on_full() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long); // FTVL=LONG
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+
+        // Arming returns a reprocess wakeup channel (unlike averaging).
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "time-series records get a per-callback reprocess channel"
+        );
+
+        // A sample before RARM=1 (not BUSY) must be dropped (C `if (pPvt->busy)`).
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(99),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            ts.inner.lock().unwrap().buf.as_ref().unwrap().len(),
+            0,
+            "samples before RARM=1 are not accumulated"
+        );
+
+        // caput RARM=1 → start: BUSY=1, NORD=0, RARM reset to 0.
+        rec.rarm = 1;
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "VAL written directly → convert skipped"
+        );
+        assert_eq!(rec.rarm, 0, "process resets RARM to 0");
+        assert!(rec.busy, "RARM=1 sets BUSY (acquiring)");
+        assert_eq!(rec.nord, 0, "start zeroes NORD");
+
+        // Stream NELM samples → buffer fills, BUSY auto-clears on the last.
+        for v in [10, 20, 30, 40] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 4).await;
+        assert!(
+            !ts.inner.lock().unwrap().busy,
+            "buffer full clears BUSY (acquisition complete)"
+        );
+
+        // The completion process commits the array.
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute);
+        assert_eq!(rec.nord, 4, "NORD = samples accumulated");
+        assert!(!rec.busy, "BUSY cleared after completion");
+        match &rec.val {
+            EpicsValue::LongArray(v) => {
+                assert_eq!(&v[..4], &[10, 20, 30, 40], "VAL holds the samples")
+            }
+            other => panic!("VAL should be LongArray, got {other:?}"),
+        }
+    }
+
+    /// RARM=2 stops acquisition mid-fill: the partial buffer commits (NORD =
+    /// samples so far), BUSY clears, and a later RARM=3 resumes appending into
+    /// the same buffer. C process RARM 2=stop / 3=resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_rarm_stop_commits_partial_then_resume_continues() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(8, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+
+        // Start, accumulate 2 of 8.
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [11, 22] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 2).await;
+
+        // Stop: BUSY=0, partial commit (NORD=2, VAL[..2] = samples).
+        rec.rarm = 2;
+        ads.read(&mut rec).unwrap();
+        assert!(!rec.busy, "RARM=2 clears BUSY");
+        assert_eq!(rec.nord, 2, "stop commits the partial buffer (NORD=2)");
+        match &rec.val {
+            EpicsValue::LongArray(v) => assert_eq!(&v[..2], &[11, 22]),
+            other => panic!("got {other:?}"),
+        }
+
+        // A sample while stopped is dropped.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(99),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            ts.inner.lock().unwrap().buf.as_ref().unwrap().len(),
+            2,
+            "stopped acquisition does not accumulate"
+        );
+
+        // Resume: BUSY=1, appends continue into the same buffer.
+        rec.rarm = 3;
+        ads.read(&mut rec).unwrap();
+        assert!(rec.busy, "RARM=3 re-arms BUSY");
+        for v in [33, 44] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 4).await;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 4, "resume continued the same buffer");
+        match &rec.val {
+            EpicsValue::LongArray(v) => assert_eq!(&v[..4], &[11, 22, 33, 44]),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// asynFloat64TimeSeries commits a DOUBLE array (FTVL=DOUBLE).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_float64_commits_double_array() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynFloat64");
+        let mut rec = WaveformRecord::new(3, DbFieldType::Double);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [1.5, 2.5, 3.5] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Float64(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 3).await;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 3);
+        assert!(!rec.busy, "BUSY clears when the buffer fills");
+        match &rec.val {
+            EpicsValue::DoubleArray(v) => assert_eq!(&v[..3], &[1.5, 2.5, 3.5]),
+            other => panic!("VAL should be DoubleArray, got {other:?}"),
+        }
+    }
+
+    /// asynInt64TimeSeries commits an INT64 array (FTVL=INT64).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_int64_commits_int64_array() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt64");
+        let mut rec = WaveformRecord::new(2, DbFieldType::Int64);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [9_000_000_000_i64, -9_000_000_000_i64] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int64(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 2).await;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 2);
+        match &rec.val {
+            EpicsValue::Int64Array(v) => {
+                assert_eq!(&v[..2], &[9_000_000_000_i64, -9_000_000_000_i64])
+            }
+            other => panic!("VAL should be Int64Array, got {other:?}"),
+        }
+    }
+
+    /// FTVL not the signed/unsigned EPICS type of the interface → C errors the
+    /// record (dead). The port leaves the buffer unset, so the record never
+    /// acquires: no sample is accumulated even after RARM=1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_invalid_ftvl_never_acquires() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        // asynInt32 requires FTVL LONG/ULONG; DOUBLE is invalid.
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(4, DbFieldType::Double);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(
+            ts.inner.lock().unwrap().buf.is_none(),
+            "invalid FTVL leaves the buffer unset (record does not acquire)"
+        );
+        assert!(ads.io_intr_receiver().is_some());
+
+        // A caput RARM=1 must not bring the misconfigured record to life: C's
+        // record is dead (pact=1) so BUSY stays 0 and it never processes.
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        assert!(
+            !rec.busy,
+            "invalid-FTVL record stays inert (BUSY=0) like C's dead record"
+        );
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(7),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            ts.inner.lock().unwrap().buf.is_none(),
+            "no buffer → nothing accumulates"
+        );
+        assert_eq!(rec.nord, 0, "NORD untouched when the record cannot acquire");
+        assert!(
+            !rec.busy,
+            "BUSY remains 0 — the inert read() never flips it"
+        );
+    }
+
+    /// The factory maps each TimeSeries DTYP to its base interface and arms the
+    /// accumulation: a Passive waveform built through `universal_asyn_factory`
+    /// gets a reprocess channel only via the time-series path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_factory_arms_accumulation_for_waveform() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("ts-factory-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "ts_factory".into(), interrupts);
+        crate::asyn_record::register_port(
+            "ts_factory",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynInt32TimeSeries",
+            inp: "@asyn(ts_factory,0)VAL",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+        dev.set_record_info("TEST:TS:FACTORY", ScanType::Passive);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        dev.init(&mut rec).unwrap();
+        assert!(
+            dev.io_intr_receiver().is_some(),
+            "factory must map asynInt32TimeSeries → asynInt32 and arm accumulation"
+        );
+    }
+
     #[test]
     fn test_io_intr_receiver_none_when_passive() {
         let mut ads = make_adapter(ScanType::Passive);
@@ -2513,6 +4157,7 @@ mod tests {
                     timestamp: SystemTime::UNIX_EPOCH,
                     alarm_status: 0,
                     alarm_severity: 0,
+                    aux_status: crate::error::AsynStatus::Success,
                 });
         }
         let len = |ads: &AsynDeviceSupport| ads.interrupt_fifo.lock().unwrap().entries.len();
@@ -2789,6 +4434,457 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(val, 77, "longin VAL set directly to the raw count");
+    }
+
+    // --- averaging device support (asynInt32Average / asynFloat64Average)
+    //     C interruptCallbackAverage + processAiAverage, periodic-SCAN model ---
+
+    /// asynInt32Average: the always-on interrupt accumulates samples; the
+    /// periodic process drains the rounded arithmetic mean to RVAL and runs
+    /// the ai convert (C `processAiAverage` `pr->rval = dval; return 0`,
+    /// devAsynInt32.c:906-910). Mean of [10,20,30,40] = 25 → RVAL → VAL
+    /// (LINR=NO_CONVERSION). The drain resets the accumulator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_int32_drains_rounded_mean_to_rval_and_resets() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        let mut rec = AiRecord::new(0.0);
+        rec.linr = 0; // NO_CONVERSION: VAL == RVAL after convert
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        // Average arms the accumulating interrupt but returns no reprocess
+        // wakeup — the record scans periodically (periodic-SCAN model).
+        assert!(
+            ads.io_intr_receiver().is_none(),
+            "averaging records get no per-callback reprocess channel"
+        );
+
+        for v in [10, 20, 30, 40] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_average_count(&acc, 4).await;
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            !outcome.did_compute,
+            "int32 average routes the mean→RVAL and runs the ai convert (C return 0)"
+        );
+        let rval = match rec.get_field("RVAL").unwrap() {
+            EpicsValue::Long(v) => v,
+            _ => panic!(),
+        };
+        assert_eq!(rval, 25, "mean of [10,20,30,40] = 25 → RVAL");
+        rec.process().unwrap();
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 25.0).abs() < 1e-9,
+            "NO_CONVERSION ai: VAL == RVAL = 25"
+        );
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "the drain must reset the accumulator (C numAverage=0, sum=0)"
+        );
+    }
+
+    /// asynFloat64Average: the periodic process drains the mean directly to
+    /// VAL (C `processAiAverage` applies ASLO/AOFF/SMOO and returns `2`,
+    /// devAsynFloat64.c:727-735). Mean of [1,2,6] = 3.0. ASLO=1/AOFF=0/SMOO=0
+    /// leave the mean unscaled. The drain resets the accumulator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_float64_drains_mean_to_val_and_resets() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        for v in [1.0, 2.0, 6.0] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Float64(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_average_count(&acc, 3).await;
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "float64 average sets VAL directly and skips the convert (C return 2)"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!((val - 3.0).abs() < 1e-9, "mean of [1,2,6] = 3.0 → VAL");
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "the drain must reset the accumulator"
+        );
+    }
+
+    /// Zero samples since the last process: C `processAiAverage` sets
+    /// `UDF_ALARM`/`INVALID` and returns `-2` — VAL is left untouched
+    /// (devAsynFloat64.c:721-725). No averaging into a zero-divide, no
+    /// stale-value reuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_zero_samples_raises_udf_invalid_and_keeps_val() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(7.5); // pre-existing VAL
+        ads.init(&mut rec).unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        // No samples notified → the accumulator is empty.
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "zero-samples skips the convert so VAL is not overwritten from RVAL"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            )),
+            "zero-samples must raise UDF_ALARM/INVALID (C return -2)"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 7.5).abs() < 1e-9,
+            "zero-samples must leave VAL untouched, got {val}"
+        );
+    }
+
+    /// The driver alarm carried by a sample propagates through the average:
+    /// `interruptCallbackAverage` captures `alarmStatus`/`alarmSeverity`
+    /// (devAsynInt32.c:705-707) and `processAiAverage` applies it
+    /// (recGblSetSevr, :915-918). A COMM/INVALID sample must surface on read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_propagates_last_sample_driver_alarm() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Float64(5.0),
+            timestamp: SystemTime::now(),
+            alarm_status: 9,   // COMM_ALARM
+            alarm_severity: 3, // INVALID
+            ..Default::default()
+        });
+        await_average_count(&acc, 1).await;
+
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((9, 3)),
+            "the sample's driver alarm (COMM/INVALID) must propagate on read"
+        );
+    }
+
+    /// A transport-error period (a sample carries `aux_status != Success`):
+    /// C `processAiAverage` discards the averaged value (RVAL/VAL stay stale,
+    /// return -1) and raises the transport-mapped alarm via
+    /// `asynStatusToEpicsAlarm` (devAsynInt32.c:919-927, devAsynFloat64.c:736-754;
+    /// asynEpicsUtils.c:238-265). The period is still consumed (sum/numAverage
+    /// reset before the status check), so the next read sees no samples.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_transport_error_discards_value_and_raises_mapped_alarm() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(42.0); // pre-existing VAL
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        // A sample with a transport error (Timeout) during the period.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Float64(5.0),
+            timestamp: SystemTime::now(),
+            aux_status: crate::error::AsynStatus::Timeout,
+            ..Default::default()
+        });
+        await_average_count(&acc, 1).await;
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "transport-error period skips the store (C return -1)"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 42.0).abs() < 1e-9,
+            "transport error must discard the averaged value (VAL stays stale), got {val}"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((10, 3)),
+            "transport Timeout must map to TIMEOUT_ALARM/INVALID"
+        );
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "the period is consumed even on a transport error (sum/numAverage reset)"
+        );
+
+        // The accumulated transport status reset with the period: a subsequent
+        // read with no samples is the ordinary zero-samples UDF case.
+        let outcome2 = ads.read(&mut rec).unwrap();
+        assert!(outcome2.did_compute);
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            )),
+            "transport status reset → next empty read is zero-samples UDF, not a stale transport error"
+        );
+    }
+
+    /// C `asynStatusToEpicsAlarm` only fills a still-`NO_ALARM` field, so a
+    /// sample's own EPICS alarm wins over the transport-status mapping
+    /// (asynEpicsUtils.c:242-264). A Timeout transport status with a sample
+    /// EPICS alarm of COMM/MAJOR surfaces as COMM/MAJOR — not TIMEOUT/INVALID —
+    /// while the transport error still gates the store off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_sample_epics_alarm_wins_over_transport_mapping() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(42.0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Float64(5.0),
+            timestamp: SystemTime::now(),
+            aux_status: crate::error::AsynStatus::Timeout, // would map to (10, 3)
+            alarm_status: 9,                               // COMM_ALARM (sample's own)
+            alarm_severity: 2,                             // MAJOR
+            ..Default::default()
+        });
+        await_average_count(&acc, 1).await;
+
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((9, 2)),
+            "the sample's EPICS alarm (COMM/MAJOR) must win over the transport Timeout mapping"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 42.0).abs() < 1e-9,
+            "the transport error still discards the value regardless of which alarm wins"
+        );
+    }
+
+    // --- asyn Average Mode 1 (SCAN="I/O Intr" SVAL-decimation,
+    //     C `interruptCallbackAverage` isIOIntrScan branch) ---
+
+    /// Mode 1 decimates the running mean into the IoIntr ring every
+    /// `round(SVAL)` samples (C devAsynInt32.c:673-702): below the threshold
+    /// the ring stays empty; the `round(SVAL)`-th sample pushes the mean and
+    /// resets the accumulator. Unlike Mode 2, the averaging adapter returns a
+    /// per-decimation reprocess wakeup (`io_intr_receiver` → `Some`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_mode1_io_intr_decimates_every_sval_samples_into_ring() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        ads.set_record_info("TEST:AVG", ScanType::IoIntr); // Mode 1
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 4.0; // numToAverage = round(4.0) = 4
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        let fifo = ads.interrupt_fifo.clone();
+
+        // Mode 1 delivers a reprocess wakeup channel (Mode 2 returns None).
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "Mode 1 (SCAN=I/O Intr) averaging delivers a per-decimation reprocess wakeup"
+        );
+
+        // 3 samples (< SVAL=4): accumulate, no decimation, ring stays empty.
+        for v in [10, 20, 30] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_average_count(&acc, 3).await;
+        assert!(
+            fifo.lock().unwrap().pop().is_none(),
+            "3 < SVAL=4: no decimation yet, the ring is empty"
+        );
+
+        // 4th sample reaches the threshold: mean of [10,20,30,40] = 25 is
+        // pushed and the accumulator resets.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(40),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        let value = await_fifo_value(&fifo).await;
+        assert!(
+            matches!(value, crate::param::ParamValue::Int32(25)),
+            "the SVAL-th sample decimates the rounded mean (round((10+20+30+40)/4) = 25) into the ring, got {value:?}"
+        );
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "decimation resets the accumulator (C numAverage=0, sum=0)"
+        );
+    }
+
+    /// C floors the decimation count at 1: `numToAverage = (int)(sval+0.5); if
+    /// (numToAverage < 1) numToAverage = 1` (devAsynInt32.c:674-675). With
+    /// SVAL=0 every single sample decimates (the mean of one sample is itself).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_mode1_sval_below_one_floors_to_one_sample() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        ads.set_record_info("TEST:AVG", ScanType::IoIntr);
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 0.0; // round(0.0) = 0 → floored to 1
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        assert!(ads.io_intr_receiver().is_some());
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(42),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        let value = await_fifo_value(&fifo).await;
+        assert!(
+            matches!(value, crate::param::ParamValue::Int32(42)),
+            "SVAL=0 floors to 1: every sample decimates, mean of one sample is itself, got {value:?}"
+        );
+    }
+
+    /// The decimated ring entry carries the TRIGGERING sample's transport
+    /// status and EPICS alarm — C `rp->status = pasynUser->auxStatus`
+    /// (devAsynInt32.c:685-687), NOT the Mode 2 OR-accumulation. Earlier
+    /// samples' error statuses are summed into the *value* but do not taint the
+    /// entry's status: only the triggering (4th) sample's status rides the ring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_mode1_decimated_entry_carries_triggering_sample_status() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        ads.set_record_info("TEST:AVG", ScanType::IoIntr);
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 4.0;
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        assert!(ads.io_intr_receiver().is_some());
+
+        // Samples 1-3 carry a transport Timeout; they are still summed into the
+        // mean, but their status must NOT survive to the ring entry.
+        for v in [10, 20, 30] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                aux_status: crate::error::AsynStatus::Timeout,
+                ..Default::default()
+            });
+        }
+        // The 4th (triggering) sample is clean (Success) but carries its own
+        // EPICS alarm; the ring entry must reflect THIS sample.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(40),
+            timestamp: SystemTime::now(),
+            aux_status: crate::error::AsynStatus::Success,
+            alarm_status: 9,   // COMM_ALARM (triggering sample's own)
+            alarm_severity: 2, // MAJOR
+            ..Default::default()
+        });
+
+        // Pop the full decimated entry (await_fifo_value returns only the value).
+        let entry = {
+            let mut got = None;
+            for _ in 0..200 {
+                if let Some(e) = fifo.lock().unwrap().pop() {
+                    got = Some(e);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            got.expect("decimated entry never reached the ring")
+        };
+        assert!(
+            matches!(entry.value, crate::param::ParamValue::Int32(25)),
+            "all four samples are summed into the mean (round((10+20+30+40)/4) = 25), got {:?}",
+            entry.value
+        );
+        assert_eq!(
+            entry.aux_status,
+            crate::error::AsynStatus::Success,
+            "the entry takes the triggering sample's transport status (Success), not the OR of the earlier Timeouts"
+        );
+        assert_eq!(
+            (entry.alarm_status, entry.alarm_severity),
+            (9, 2),
+            "the entry takes the triggering sample's EPICS alarm (COMM/MAJOR)"
+        );
     }
 
     // --- driver enum-string table -> record state fields
@@ -3100,6 +5196,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH + Duration::from_millis(t_ms),
             alarm_status: 0,
             alarm_severity: 0,
+            aux_status: crate::error::AsynStatus::Success,
         }
     }
 
@@ -3269,6 +5366,83 @@ mod tests {
         assert_eq!(ads.octet_max_size, 1024);
     }
 
+    /// A per-record octet cap from `drv_user_create` (DrvUserInfo.max_octet_len,
+    /// the asyn-rs home for C `modbusDrvUser_t.len`) reduces `octet_max_size` to
+    /// `min(buffer_len, cap)` at init, mirroring C `getStringLen`. The cap is
+    /// applied AFTER SIZV finalizes the buffer, and a cap that exceeds the
+    /// buffer leaves the length intact.
+    #[test]
+    fn octet_len_cap_from_drv_user_create_reduces_buffer() {
+        // A port whose drv_user_create returns a fixed octet cap.
+        struct CapPort {
+            base: PortDriverBase,
+            cap: usize,
+        }
+        impl PortDriver for CapPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn drv_user_create(
+                &mut self,
+                _drv_info: &str,
+                _addr: i32,
+            ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
+                Ok(crate::port::DrvUserInfo {
+                    reason: 0,
+                    max_octet_len: Some(self.cap),
+                })
+            }
+        }
+        fn adapter_with_cap(cap: usize) -> AsynDeviceSupport {
+            let mut base = PortDriverBase::new("capport", 1, PortFlags::default());
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            let driver = CapPort { base, cap };
+            let interrupts = Arc::new(InterruptManager::new(256));
+            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let actor = PortActor::new(Box::new(driver), rx);
+            std::thread::Builder::new()
+                .name("cap-actor".into())
+                .spawn(move || actor.run())
+                .unwrap();
+            let handle = PortHandle::new(tx, "capport".into(), interrupts);
+            let link = AsynLink {
+                port_name: "capport".into(),
+                addr: 0,
+                timeout: Duration::from_secs(1),
+                drv_info: "VAL".into(),
+            };
+            let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+            ads.set_record_info("TEST:CAP", ScanType::Passive);
+            ads
+        }
+
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        // cap 5 < default buffer 256 → reduced to 5.
+        let mut ads = adapter_with_cap(5);
+        let mut rec = LsiRecord::new("");
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 5);
+
+        // cap 512 applies to the SIZV-finalized buffer (1024) → 512, proving the
+        // cap runs after SIZV.
+        let mut ads = adapter_with_cap(512);
+        let mut rec = LsiRecord::new("");
+        rec.sizv = 1024;
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 512);
+
+        // cap 4096 > buffer 256 → buffer unchanged (C `getStringLen` only caps
+        // when drvUser->len < maxLen).
+        let mut ads = adapter_with_cap(4096);
+        let mut rec = LsiRecord::new("");
+        ads.init(&mut rec).unwrap();
+        assert_eq!(ads.octet_max_size, 256);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_record_info_enables_readback_for_truthy_value() {
         // info("asyn:READBACK", "1") on a Passive output must allow
@@ -3363,6 +5537,7 @@ mod tests {
                 timestamp: SystemTime::UNIX_EPOCH,
                 alarm_status: 3,   // e.g. READ_ALARM
                 alarm_severity: 1, // e.g. MINOR
+                aux_status: crate::error::AsynStatus::Success,
             });
         }
         ads.read(&mut rec).unwrap();
@@ -3387,6 +5562,745 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
         assert_eq!(ads.last_alarm(), None, "clean entry => no alarm");
+    }
+
+    /// A transport-error I/O Intr sample (`aux_status != Success`): C `processAi`
+    /// maps the status via `asynStatusToEpicsAlarm` and returns -1, DISCARDING
+    /// the value so RVAL/VAL keep their prior content (devAsynInt32.c:844-855).
+    /// The port dropped `iv.aux_status`, storing the bad value with no alarm.
+    #[test]
+    fn io_intr_read_transport_error_discards_value_and_maps_timeout() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // asynInt32 input
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // Seed a known prior value with a clean interrupt.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(11, 0));
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(11)));
+        assert_eq!(ads.last_alarm(), None);
+        // Now a transport-error interrupt carrying a different value.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Timeout,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(11)),
+            "transport error must keep the prior value (C return -1), not store 99"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((10, 3)),
+            "transport Timeout maps to TIMEOUT_ALARM(10)/INVALID(3)"
+        );
+    }
+
+    /// The `asynError`/unknown transport status takes C's direction-dependent
+    /// `defaultStat`: READ_ALARM for an input I/O Intr record (processAi,
+    /// devAsynInt32.c:844).
+    #[test]
+    fn io_intr_read_input_error_default_is_read_alarm() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // input, asyn_readback=false
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Error,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((1, 3)),
+            "input asynError default => READ_ALARM(1)/INVALID(3)"
+        );
+    }
+
+    /// Contrast with the input case: a scalar `asyn:READBACK` OUTPUT record takes
+    /// WRITE_ALARM for the `asynError`/unknown default (processBo, devAsynInt32.c:
+    /// 1201). Same shared ring read, direction picked from `asyn_readback`.
+    #[test]
+    fn io_intr_readback_output_error_default_is_write_alarm() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::Passive); // scalar asynInt32
+        ads.set_asyn_readback(true); // output readback path
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Error,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((2, 3)),
+            "scalar output readback asynError default => WRITE_ALARM(2)/INVALID(3)"
+        );
+    }
+
+    /// C `asynStatusToEpicsAlarm` fills a field only while it is still NO_ALARM
+    /// (asynEpicsUtils.c:242-264), so a sample's own EPICS alarm wins over the
+    /// transport-status mapping.
+    #[test]
+    fn io_intr_read_sample_epics_alarm_wins_over_transport_mapping() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 7,   // STATE_ALARM (sample's own)
+                alarm_severity: 2, // MAJOR
+                aux_status: crate::error::AsynStatus::Timeout, // would map to (10, 3)
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((7, 2)),
+            "sample STATE_ALARM/MAJOR must win over the transport Timeout mapping"
+        );
+    }
+
+    /// The discard skips only the value store, NEVER the entry consume: C resets
+    /// the ring tail on every `getCallbackValue` regardless of status. A
+    /// transport-error entry is popped, and the next clean entry is the value
+    /// stored — the ring stays balanced.
+    #[test]
+    fn io_intr_read_transport_error_consumes_entry_keeps_ring_balanced() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        {
+            let mut g = ads.interrupt_fifo.lock().unwrap();
+            g.push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Disconnected,
+            });
+            g.push_with_overflow(intr_entry(50, 0)); // clean follow-up
+        }
+        // First read: error entry consumed (popped), value discarded.
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(0)),
+            "error value discarded"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((9, 3)),
+            "Disconnected maps to COMM_ALARM(9)/INVALID(3)"
+        );
+        assert_eq!(
+            ads.interrupt_fifo.lock().unwrap().entries.len(),
+            1,
+            "the error entry must be consumed, leaving exactly the clean follow-up"
+        );
+        // Second read: the clean entry is the value stored.
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(50)));
+        assert_eq!(ads.last_alarm(), None);
+    }
+
+    /// Array dsets gate the same way (devAsynXXXArray.cpp:317 copies bptr/nord
+    /// only on `rp->status == asynSuccess`) but use READ_ALARM as the default
+    /// EVEN for aao output (the single shared process(), :330-331). So an array
+    /// `asyn:READBACK` output discards the array on error and raises READ_ALARM,
+    /// not WRITE_ALARM.
+    #[test]
+    fn io_intr_array_transport_error_discards_array_and_maps_read_alarm() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        // Build an asynInt32Array adapter on the readback (output) path.
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-arr-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32Array");
+        ads.set_record_info("TEST:ARR", ScanType::Passive);
+        ads.set_asyn_readback(true); // array OUTPUT readback (aao)
+        let mut rec = WaveformRecord::new(8, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+
+        // Seed a known prior array via a clean interrupt.
+        let clean = std::sync::Arc::from([1i32, 2, 3].as_slice());
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32Array(clean),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::LongArray(vec![1, 2, 3])));
+
+        // A transport-error array interrupt carrying different data.
+        let bad = std::sync::Arc::from([9i32, 9, 9].as_slice());
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32Array(bad),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Error,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::LongArray(vec![1, 2, 3])),
+            "transport error must keep the prior array (C devAsynXXXArray.cpp:317)"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((1, 3)),
+            "array dset uses READ_ALARM(1) even for aao output, not WRITE_ALARM"
+        );
+    }
+
+    /// Polled (non-interrupt) read with a non-success device status must DISCARD
+    /// the value and keep the record's prior value, mirroring C processAi:
+    /// `if (result.status == asynSuccess) { pr->rval = value } else { return -1 }`
+    /// (devAsynInt32.c:848-855). The alarm is still raised (mapped + recGblSetSevr
+    /// before the gate, :844-847). This is the polled-read sibling of the I/O
+    /// Intr ring's aux_status store gate.
+    #[test]
+    fn polled_read_transport_error_discards_value_keeps_prior() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Error);
+        let mut rec = LonginRecord::new(0);
+        rec.put_field("VAL", EpicsValue::Long(77)).unwrap(); // prior value
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(77)),
+            "non-success device read must keep the prior VAL (C return -1), not store 5"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((1, 3)),
+            "the alarm is still raised: READ_ALARM(1)/INVALID(3)"
+        );
+    }
+
+    /// Boundary contrast to the discard case: a success device status on the same
+    /// polled-read harness stores the value and raises no alarm.
+    #[test]
+    fn polled_read_success_stores_value() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Success);
+        let mut rec = LonginRecord::new(0);
+        rec.put_field("VAL", EpicsValue::Long(77)).unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(5)),
+            "a success device read stores the value"
+        );
+        assert_eq!(ads.last_alarm(), None, "success read raises no alarm");
+    }
+
+    /// Init-time output readback (asyn:READBACK) seeds the record's value only on
+    /// a successful read, mirroring C initAo/initLongout/initMbbo: `if (status ==
+    /// asynSuccess) { pao->rval = value } return INIT_DO_NOT_CONVERT`
+    /// (devAsynInt32.c:955-959, :1080-1082). A non-success initial read leaves the
+    /// .db default — the init-time member of the aux_status value-store family.
+    #[test]
+    fn init_readback_transport_error_keeps_db_default() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Error);
+        ads.initial_readback = true;
+        let mut rec = LongoutRecord::new(77); // .db default
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(77)),
+            "a non-success initial read must leave the .db default (C INIT_DO_NOT_CONVERT)"
+        );
+    }
+
+    /// Boundary contrast: a successful initial read seeds the device value.
+    #[test]
+    fn init_readback_success_seeds_value() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Success);
+        ads.initial_readback = true;
+        let mut rec = LongoutRecord::new(77);
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(5)),
+            "a successful initial read seeds the device value"
+        );
+    }
+
+    /// An asynInt32 ao with a non-trivial ESLO/EOFF: the init seed must store
+    /// the raw to RVAL and run the `raw -> eng` inverse, seeding VAL with the
+    /// engineering value (C `initAo`: rval=value, INIT_OK → readback convert,
+    /// devAsynInt32.c:947-957), NOT the raw counts.
+    #[test]
+    fn init_readback_ao_seeds_engineering_val_not_raw() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Success);
+        ads.initial_readback = true;
+        let mut rec = AoRecord::new(0.0);
+        rec.linr = 2; // LINEAR
+        rec.eslo = 2.0;
+        rec.eoff = 10.0;
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("RVAL"),
+            Some(EpicsValue::Long(5)),
+            "raw readback stored to RVAL"
+        );
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => assert!(
+                (v - 20.0).abs() < 1e-9,
+                "VAL = raw*ESLO + EOFF = 5*2 + 10 = 20 (engineering), got {v}"
+            ),
+            other => panic!("expected Double(20.0), got {other:?}"),
+        }
+    }
+
+    /// The process-time driver readback (asyn:READBACK) for an asynInt32 ao:
+    /// the ring-pop store routes the raw through `apply_raw_readback`, so VAL
+    /// gets the engineering value and the outcome is `computed` (the framework
+    /// then skips ao's forward convert via `set_device_did_compute`). Contrast
+    /// the input ai path, which routes raw -> RVAL and returns `ok` (convert).
+    #[test]
+    fn io_intr_readback_ao_inverts_raw_to_engineering_val() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_adapter(ScanType::Passive); // scalar asynInt32
+        ads.set_asyn_readback(true); // output readback path
+        let mut rec = AoRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        rec.linr = 2; // LINEAR
+        rec.eslo = 2.0;
+        rec.eoff = 10.0;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(5),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "ao readback produces VAL itself → computed (framework skips the forward convert)"
+        );
+        assert_eq!(
+            rec.get_field("RVAL"),
+            Some(EpicsValue::Long(5)),
+            "raw readback stored to RVAL"
+        );
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => assert!(
+                (v - 20.0).abs() < 1e-9,
+                "VAL = 5*2 + 10 = 20 (engineering), not the raw 5, got {v}"
+            ),
+            other => panic!("expected Double(20.0), got {other:?}"),
+        }
+    }
+
+    /// An `asynInt32` mbbo (no ESLO) driver readback: the store routes the raw
+    /// through `apply_raw_readback` (the dispatch is no longer ESLO-gated), so
+    /// VAL is the resolved STATE INDEX, not the raw counts, and the outcome is
+    /// `computed` (the framework skips the forward VAL->RVAL convert).
+    #[test]
+    fn io_intr_readback_mbbo_asynint32_maps_raw_to_state_index() {
+        use epics_base_rs::server::records::mbbo::MbboRecord;
+        let mut ads = make_adapter(ScanType::Passive); // scalar asynInt32
+        ads.set_asyn_readback(true);
+        let mut rec = MbboRecord::new(0);
+        rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+        rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+        rec.init_record(0).unwrap(); // computes sdef=true
+        ads.init(&mut rec).unwrap();
+        rec.mask = 0x0C; // bits 2-3
+        rec.shft = 2;
+        // raw 0x08 → masked 0x08 → shifted 2 → state TWVL=2 → index 2.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(0x08),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "mbbo readback resolves VAL itself → computed (framework skips forward convert)"
+        );
+        assert_eq!(rec.rval, 0x08, "RVAL keeps the masked (unshifted) raw");
+        assert_eq!(rec.val, 2, "VAL is the state index, not the raw 8");
+    }
+
+    /// The same mbbo readback delivered on `asynUInt32Digital`: the dispatch
+    /// covers both int-delivering ifaces with the one iface-agnostic hook, so a
+    /// uint32digital mbbo readback also resolves through the state map (the
+    /// gap-surveyor's untraced sibling — confirmed and covered).
+    #[test]
+    fn io_intr_readback_mbbo_uint32digital_routes_through_state_map() {
+        use epics_base_rs::server::records::mbbo::MbboRecord;
+        let mut ads = make_adapter(ScanType::Passive);
+        ads.set_iface_type("asynUInt32Digital");
+        ads.set_asyn_readback(true);
+        let mut rec = MbboRecord::new(0);
+        rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+        rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+        rec.init_record(0).unwrap();
+        ads.init(&mut rec).unwrap();
+        rec.mask = 0x0C;
+        rec.shft = 2;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x08),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "uint32digital mbbo readback computed");
+        assert_eq!(rec.rval, 0x08, "RVAL keeps the masked raw");
+        assert_eq!(rec.val, 2, "VAL resolved through the state map, not raw 8");
+    }
+
+    /// An `asynInt32` bo (no ESLO, mask 0) driver readback: VAL = (raw != 0),
+    /// RVAL = raw (unmasked, C `processBo` :1202-1203), `computed`.
+    #[test]
+    fn io_intr_readback_bo_asynint32_maps_raw_to_binary() {
+        use epics_base_rs::server::records::bo::BoRecord;
+        let mut ads = make_adapter(ScanType::Passive);
+        ads.set_asyn_readback(true);
+        let mut rec = BoRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // mask stays 0 (asynInt32 bo): RVAL = raw, VAL = (raw != 0).
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(0x2A),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "bo readback computed");
+        assert_eq!(rec.rval, 0x2A, "RVAL keeps the raw");
+        assert_eq!(rec.val, 1, "VAL = (raw != 0) = 1, not the raw 42");
+    }
+
+    /// An `asynInt32` I/O Intr `bi` input: the device raw enters RVAL and
+    /// biRecord's `rval -> 0/1` convert resolves VAL. C `processBi`
+    /// (devAsynInt32.c) sets `rval = value` (mask 0) and returns 0. Before the
+    /// fix the raw fell to the default `set_val` and landed in VAL verbatim
+    /// (raw 5 → val 5); now VAL is the 0/1 the record exposes.
+    #[test]
+    fn io_intr_readback_bi_asynint32_maps_raw_to_binary() {
+        use epics_base_rs::server::records::bi::BiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // input, asynInt32
+        let mut rec = BiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // mask stays 0 (asynInt32 bi): RVAL = raw, VAL = (raw != 0).
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(5),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "bi readback resolves VAL itself → computed"
+        );
+        assert_eq!(rec.rval, 5, "RVAL keeps the unmasked raw");
+        assert_eq!(rec.val, 1, "VAL = (raw != 0) = 1, not the raw 5");
+    }
+
+    /// An `asynUInt32Digital` I/O Intr `bi` input: `processBi` masks
+    /// (`rval = value & mask`, devAsynUInt32Digital.c:689), then VAL =
+    /// (rval != 0). The dispatch's one iface-agnostic hook covers this iface
+    /// too. A high-bit raw resolves to 1 (not stored as 128).
+    #[test]
+    fn io_intr_readback_bi_uint32digital_applies_mask() {
+        use epics_base_rs::server::records::bi::BiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.set_iface_type("asynUInt32Digital");
+        let mut rec = BiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // Set MASK after init: `init` propagates the adapter's default full
+        // mask (0xFFFFFFFF) onto the record (devAsynUInt32Digital MASK/SHFT
+        // wiring). Override it to a single high bit to prove MASK gating.
+        rec.mask = 0x80;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x80),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "uint32digital bi readback computed");
+        assert_eq!(rec.rval, 0x80, "RVAL = raw & mask");
+        assert_eq!(rec.val, 1, "high-bit mask hit → val 1, not 128");
+        // A raw whose set bits fall entirely outside MASK → masked 0 → val 0.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x01),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.rval, 0, "out-of-mask bits masked away");
+        assert_eq!(rec.val, 0, "masked-to-zero raw → val 0");
+    }
+
+    /// An `asynUInt32Digital` I/O Intr `mbbiDirect` input (its only dset,
+    /// `asynMbbiDirectUInt32Digital`): `processMbbiDirect` sets
+    /// `rval = value & mask` (devAsynUInt32Digital.c:1031); mbbiDirectRecord
+    /// resolves VAL = (masked >> SHFT) and the bit fields. Before the fix the
+    /// raw landed in VAL verbatim (no MASK, no SHFT, wrong bits).
+    #[test]
+    fn io_intr_readback_mbbi_direct_uint32digital_maps_mask_shift_bits() {
+        use epics_base_rs::server::records::mbbi_direct::MbbiDirectRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.set_iface_type("asynUInt32Digital");
+        let mut rec = MbbiDirectRecord::default();
+        ads.init(&mut rec).unwrap();
+        // Set MASK/SHFT after init: `init` propagates the adapter's default
+        // full mask (0xFFFFFFFF → SHFT 0) onto the record. Override to bits 2-5
+        // / SHFT 2 to exercise the mask + shift path.
+        rec.mask = 0x3C; // bits 2-5
+        rec.shft = 2;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x3C),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "mbbiDirect readback computed");
+        assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
+        assert_eq!(
+            rec.val, 0x0F,
+            "VAL = (raw & mask) >> SHFT, not the raw 0x3C"
+        );
+        assert_eq!(rec.bits[0], 1);
+        assert_eq!(rec.bits[3], 1);
+    }
+
+    /// The `apply_raw_readback` hook in isolation: given an already-positioned
+    /// mask/shift, the device raw enters RVAL masked (C `processMbbi`
+    /// `rval = value & mask`, devAsynInt32.c:1270) and mbbiRecord's convert
+    /// shifts (>>SHFT) then resolves the state index — out-of-mask bits are
+    /// stripped. (The init path that POSITIONS the mask is covered by
+    /// `io_intr_readback_mbbi_asynint32_positions_nobt_mask`.)
+    #[test]
+    fn io_intr_readback_mbbi_asynint32_masks_and_maps_state() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // input, asynInt32
+        let mut rec = MbbiRecord::new(0);
+        rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+        rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+        rec.init_record(0).unwrap(); // computes sdef=true
+        ads.init(&mut rec).unwrap();
+        // Set an already-positioned mask/shift directly to exercise the hook
+        // (init-path positioning is tested separately).
+        rec.mask = 0x0C; // bits 2-3
+        rec.shft = 2;
+        // raw 0x88 -> masked 0x08 (0x80 stripped) -> shifted 2 -> TWVL=2 -> idx 2.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(0x88),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "mbbi readback computed");
+        assert_eq!(
+            rec.rval, 0x08,
+            "RVAL = raw & mask (out-of-mask 0x80 stripped)"
+        );
+        assert_eq!(rec.val, 2, "state index 2 (TWVL), not leaked/unknown");
+    }
+
+    /// asynInt32 mbbi MASK positioning through the REAL init path. C
+    /// devAsynInt32 initMbbi (devAsynInt32.c:1246-1247): `if(nobt==0)
+    /// mask=0xffffffff; mask <<= shft`. mbbiRecord leaves MASK = (1<<NOBT)-1
+    /// unshifted; the device support positions it. Goes through `init_record`
+    /// then `ads.init` with NOBT/SHFT set (no manual `rec.mask =`), so it
+    /// exercises the unshifted mask the real init path produces.
+    #[test]
+    fn io_intr_readback_mbbi_asynint32_positions_nobt_mask() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // asynInt32
+        let mut rec = MbbiRecord::new(0);
+        rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+        rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+        rec.put_field("THVL", EpicsValue::ULong(3)).unwrap();
+        rec.put_field("NOBT", EpicsValue::UShort(4)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+        rec.init_record(0).unwrap(); // mbbiRecord: MASK = (1<<4)-1 = 0x0F unshifted
+        ads.init(&mut rec).unwrap(); // positions MASK to 0x0F << 4 = 0xF0
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0xF0)),
+            "asynInt32 mbbi MASK positioned: ((1<<NOBT)-1) << SHFT"
+        );
+        // value 0x30 = field 3 at bits 4-7 -> rval = 0x30 & 0xF0 = 0x30 -> >>4
+        // = 3 -> THVL=3 -> state index 3. Before the fix the unshifted 0x0F
+        // mask gave 0x30 & 0x0F = 0 -> index 0 (the SHFT>0 regression).
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(0x30),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "mbbi readback computed");
+        assert_eq!(rec.rval, 0x30, "RVAL = value & positioned mask");
+        assert_eq!(rec.val, 3, "field 3 at bits 4-7 -> state index 3 (THVL)");
+    }
+
+    /// asynInt32 mbbi NOBT=0 edge: C initMbbi sets `mask=0xffffffff` before
+    /// the shift (devAsynInt32.c:1246). mbbiRecord leaves MASK=0 for NOBT=0,
+    /// so without the fallback `raw & 0` would zero every readback.
+    #[test]
+    fn mbbi_asynint32_nobt0_positions_full_mask() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = MbbiRecord::new(0);
+        rec.put_field("NOBT", EpicsValue::UShort(0)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+        rec.init_record(0).unwrap(); // NOBT=0 -> mbbiRecord leaves MASK=0
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0xFFFF_FFF0)),
+            "NOBT=0 -> mask 0xffffffff << SHFT (C initMbbi), not 0"
+        );
+    }
+
+    /// The same positioning applies to asynInt32 mbbo — R24's mbbo readback
+    /// had the identical unshifted-mask gap (its `apply_raw_readback` also
+    /// does `raw & mask`). One adapter owner positions both records, mirroring
+    /// C devAsynInt32 initMbbo (devAsynInt32.c:1290-1291).
+    #[test]
+    fn mbbo_asynint32_positions_nobt_mask() {
+        use epics_base_rs::server::records::mbbo::MbboRecord;
+        let mut ads = make_adapter(ScanType::Passive); // output
+        let mut rec = MbboRecord::new(0);
+        rec.put_field("NOBT", EpicsValue::UShort(3)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(5)).unwrap();
+        rec.init_record(0).unwrap(); // mbboRecord: MASK = (1<<3)-1 = 0x07 unshifted
+        ads.init(&mut rec).unwrap(); // positions to 0x07 << 5 = 0xE0
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0xE0)),
+            "asynInt32 mbbo MASK positioned: ((1<<NOBT)-1) << SHFT"
+        );
+    }
+
+    /// Positioning shifts the record's CURRENT mask, so a `.db`-set custom
+    /// MASK (≠ (1<<NOBT)-1) is preserved and shifted — exactly C initMbbi,
+    /// which does `pr->mask <<= shft` over the .db-loaded mask (mbbiRecord
+    /// init only recomputes (1<<NOBT)-1 when MASK==0, mbbiRecord.c:128-130).
+    /// Rebuilding from NOBT would clobber it (the Round 27 divergence).
+    #[test]
+    fn mbbi_asynint32_preserves_db_set_mask() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // asynInt32
+        let mut rec = MbbiRecord::new(0);
+        // A .db that sets a custom (non-contiguous) MASK alongside NOBT/SHFT.
+        rec.put_field("MASK", EpicsValue::ULong(0x05)).unwrap();
+        rec.put_field("NOBT", EpicsValue::UShort(4)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+        rec.init_record(0).unwrap(); // MASK!=0 -> mbbiRecord leaves it 0x05
+        ads.init(&mut rec).unwrap(); // positions the CURRENT mask: 0x05 << 4 = 0x50
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0x50)),
+            "custom .db MASK 0x05 shifted (0x05<<4), not rebuilt to ((1<<4)-1)<<4 = 0xF0"
+        );
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a
@@ -3438,6 +6352,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             alarm_status: 0,
             alarm_severity: 0,
+            aux_status: crate::error::AsynStatus::Success,
         });
     }
 
@@ -3504,6 +6419,164 @@ mod tests {
         assert_eq!(rec.val(), Some(EpicsValue::Double(15.0)));
     }
 
+    /// The process-time driver readback for an `asynFloat64` ao: the store path
+    /// routes the raw double through `apply_float64_readback`, which applies the
+    /// forward `ASLO`/`AOFF` scaling (`VAL = value*ASLO + AOFF`) and the outcome
+    /// is `computed` (the framework skips ao's forward convert). C `processAo`
+    /// (devAsynFloat64.c:646-649). ao carries no SMOO so it never enters the ai
+    /// branch above.
+    #[test]
+    fn io_intr_readback_float64_ao_applies_aslo_aoff() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        rec.aslo = 2.0;
+        rec.aoff = 1.0;
+
+        push_f64(&ads, 10.0);
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "float64 ao readback produces VAL itself → computed"
+        );
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(21.0)),
+            "VAL = raw*ASLO + AOFF = 10*2 + 1 = 21"
+        );
+    }
+
+    /// The device write for an `asynFloat64` ao reverses `ASLO`/`AOFF` and
+    /// anchors on the OROC-rate-limited `OVAL`: `device = (OVAL - AOFF) / ASLO`
+    /// (C `processAo`, devAsynFloat64.c:651-654) — the inverse of the readback.
+    /// Together they round-trip: a value written out, read back, re-scaled
+    /// returns the same value.
+    #[test]
+    fn float64_ao_write_reverses_aslo_aoff_and_round_trips() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        rec.aslo = 2.0;
+        rec.aoff = 1.0;
+        rec.oval = 21.0; // post-OROC output the device write anchors on
+        // OVAL = 21 -> device = (21 - 1) / 2 = 10.
+        let written = ads.device_output_value(&rec).unwrap();
+        assert_eq!(
+            written,
+            EpicsValue::Double(10.0),
+            "device = (OVAL - AOFF) / ASLO = (21 - 1) / 2 = 10"
+        );
+        // Round-trip: that device value, read back, re-scales to the original.
+        let mut readback = AoRecord::new(0.0);
+        readback.aslo = 2.0;
+        readback.aoff = 1.0;
+        let EpicsValue::Double(dev) = written else {
+            panic!("expected Double");
+        };
+        assert!(readback.apply_float64_readback(dev));
+        assert_eq!(
+            readback.val(),
+            Some(EpicsValue::Double(21.0)),
+            "readback of (OVAL-AOFF)/ASLO re-scales to the original output"
+        );
+    }
+
+    /// The asynFloat64 ao write anchors on OVAL (post-OROC), not VAL: when OROC
+    /// has rate-limited the output, the device receives the ramped OVAL while
+    /// VAL holds the (jumped) setpoint. C `processAo` uses `pr->oval`
+    /// (devAsynFloat64.c:651).
+    #[test]
+    fn float64_ao_write_anchors_on_oval_not_val() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        // ASLO=1/AOFF=0 (identity scaling) to isolate the OVAL-vs-VAL anchor.
+        rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap(); // setpoint
+        rec.oval = 40.0; // OROC ramped only partway this cycle
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Double(40.0),
+            "device receives the OROC-rate-limited OVAL (40), not the VAL setpoint (100)"
+        );
+    }
+
+    /// The default ao (ASLO=1, AOFF=0) is an identity in both directions — no
+    /// behaviour change for the unconfigured float64 ao.
+    #[test]
+    fn float64_ao_default_scaling_is_identity() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        // Defaults: ASLO=1.0, AOFF=0.0.
+        push_f64(&ads, 7.5);
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(7.5)),
+            "default readback is identity (raw*1 + 0)"
+        );
+        rec.oval = 7.5;
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Double(7.5),
+            "default write is identity ((7.5-0)/1)"
+        );
+    }
+
+    /// An asynInt32 ao writes its raw RVAL (the convert output from OVAL), not
+    /// the engineering VAL. C `processAo` writes `pr->rval`
+    /// (devAsynInt32.c:997). With a LINEAR conversion VAL≠RVAL, so this is
+    /// observable. (RVAL = convert(VAL) is exercised by the ao convert/readback
+    /// tests; here it is seeded directly to isolate the device-write anchor.)
+    #[test]
+    fn int32_ao_write_sends_rval_not_eng_val() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let ads = make_adapter(ScanType::Passive); // asynInt32
+        let mut rec = AoRecord::new(0.0);
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap(); // engineering
+        rec.rval = 20; // raw counts (e.g. ESLO=0.5: 10 / 0.5 = 20)
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Long(20),
+            "device receives RVAL (20 counts), not eng VAL (10)"
+        );
+    }
+
+    /// An asynInt32 mbbo writes its state-mapped RVAL, not the VAL index. C
+    /// `processMbbo` writes `pr->rval` (devAsynInt32.c:1332). RVAL is ULong and
+    /// must be coerced to the Int32 write type.
+    #[test]
+    fn int32_mbbo_write_sends_state_rval_not_index() {
+        use epics_base_rs::server::records::mbbo::MbboRecord;
+        let ads = make_adapter(ScanType::Passive); // asynInt32
+        let mut rec = MbboRecord::new(0);
+        // RVAL holds the state value (e.g. 0x2A) while VAL holds the index.
+        rec.put_field("RVAL", EpicsValue::ULong(0x2A)).unwrap();
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Long(0x2A),
+            "device receives the state-mapped RVAL (0x2A), not the VAL index"
+        );
+    }
+
+    /// longout carries no RVAL (VAL *is* the raw), so the device write stays on
+    /// VAL — matching C `processLongout` (writes `pr->val`). Confirms the
+    /// RVAL-anchor does not over-reach to conversion-less outputs.
+    #[test]
+    fn int32_longout_write_keeps_val() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let ads = make_adapter(ScanType::Passive); // asynInt32
+        let rec = LongoutRecord::new(77);
+        assert!(rec.get_field("RVAL").is_none(), "longout has no RVAL");
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Long(77),
+            "longout device write stays on VAL (no RVAL to anchor)"
+        );
+    }
+
     /// PR #162: `aai` (array analog input) and `aao` (array analog output)
     /// records use direction-specific DTYPs like `asynFloat64ArrayIn` and
     /// `asynFloat64ArrayOut` that must collapse to the underlying interface
@@ -3544,5 +6617,677 @@ mod tests {
         // (C EPICS lsi/lso/printf adapter convention).
         assert_eq!(normalize_asyn_dtyp("asynOctetRead"), "asynOctet");
         assert_eq!(normalize_asyn_dtyp("asynOctetWrite"), "asynOctet");
+        // asynOctetCmdResponse also collapses to asynOctet — the write-then-read
+        // is carried by octet_cmd, not a distinct interface.
+        assert_eq!(normalize_asyn_dtyp("asynOctetCmdResponse"), "asynOctet");
+        // asynOctetWriteBinary likewise — write-only/no-NUL-trim is carried by
+        // octet_binary, not a distinct interface.
+        assert_eq!(normalize_asyn_dtyp("asynOctetWriteBinary"), "asynOctet");
+        // TimeSeries DTYPs map to their base interface — the scalar-into-array
+        // accumulation is carried by `time_series`, not a distinct interface.
+        assert_eq!(normalize_asyn_dtyp("asynInt32TimeSeries"), "asynInt32");
+        assert_eq!(normalize_asyn_dtyp("asynFloat64TimeSeries"), "asynFloat64");
+        assert_eq!(normalize_asyn_dtyp("asynInt64TimeSeries"), "asynInt64");
+    }
+
+    /// Mock octet port for asynOctetWriteBinary / asynOctetWrite: records every
+    /// write payload and accepts any DRVINFO as a param (useDrvUser=1, so init's
+    /// drv_user_create succeeds and the write-only read() path runs).
+    struct BinaryWritePort {
+        base: PortDriverBase,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        /// When true, every write fails with a Timeout status (to exercise the
+        /// write-only alarm path).
+        fail: bool,
+    }
+    impl PortDriver for BinaryWritePort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        // useDrvUser=1: the DRVINFO is a real param. Accept any name (reason 0) so
+        // the test need not pre-register params on the mock.
+        fn drv_user_create(
+            &mut self,
+            _drv_info: &str,
+            _addr: i32,
+        ) -> AsynResult<crate::port::DrvUserInfo> {
+            Ok(crate::port::DrvUserInfo::from_reason(0))
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            if self.fail {
+                // A generic asynError (not a specific Timeout/Overflow/…): this
+                // is the only arm whose alarm depends on the direction default,
+                // so it exercises the WRITE_ALARM-for-output mapping.
+                return Err(AsynError::Status {
+                    status: crate::protocol::status::AsynStatus::Error,
+                    message: "mock write error".into(),
+                });
+            }
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+    }
+
+    /// Spawn a [`BinaryWritePort`] actor; returns its handle + the write recorder.
+    fn spawn_binary_write_port(name: &str) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        spawn_binary_write_port_inner(name, false)
+    }
+
+    /// Spawn a [`BinaryWritePort`] whose writes always fail (Timeout).
+    fn spawn_failing_write_port(name: &str) -> PortHandle {
+        spawn_binary_write_port_inner(name, true).0
+    }
+
+    fn spawn_binary_write_port_inner(
+        name: &str,
+        fail: bool,
+    ) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = BinaryWritePort {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            writes: writes.clone(),
+            fail,
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(port), rx);
+        std::thread::Builder::new()
+            .name("binwrite-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, name.into(), interrupts);
+        (handle, writes)
+    }
+
+    /// asynOctetWriteBinary writes the full NORD bytes — INCLUDING an interior NUL
+    /// — through the whole factory→init→read path, matching C callbackWfWriteBinary
+    /// (devAsynOctet.c:1086-1091, writeIt(bptr, nord), no my_strnlen trim).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_binary_writes_full_nord_bytes_including_interior_nul() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, writes) = spawn_binary_write_port("binwrite_wb");
+        crate::asyn_record::register_port(
+            "binwrite_wb",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetWriteBinary",
+            inp: "@asyn(binwrite_wb,0)REG",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        // NORD = 3, with an interior NUL; asynOctetWrite would trim at the NUL.
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![vec![0x01, 0x00, 0x02]],
+            "binary write must send the full NORD bytes, interior NUL included"
+        );
+    }
+
+    /// Contrast: the text asynOctetWrite trims the same payload at the first NUL
+    /// (C callbackWfWrite my_strnlen) — proving octet_binary is the only switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_text_trims_at_first_nul() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, writes) = spawn_binary_write_port("binwrite_text");
+        crate::asyn_record::register_port(
+            "binwrite_text",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetWrite",
+            inp: "@asyn(binwrite_text,0)REG",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![vec![0x01]],
+            "text write must trim at the first NUL"
+        );
+    }
+
+    /// binary_write_op emits a plain OctetWrite (EOS-appending), NOT
+    /// OctetWriteBinary (EOS-suppressing). devAsynOctet does no EOS manipulation;
+    /// routing to OctetWriteBinary would wrongly strip the port's configured OEOS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_binary_op_is_plain_octetwrite_not_eos_suppressed() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, _writes) = spawn_binary_write_port("binwrite_op");
+        let link = AsynLink {
+            port_name: "binwrite_op".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "REG".into(),
+        };
+        let ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        let val = rec.val().unwrap();
+        let op = ads.binary_write_op(&rec, &val);
+        match op {
+            Some(RequestOp::OctetWrite { data }) => {
+                assert_eq!(data, vec![0x01, 0x00, 0x02], "full NORD bytes, no trim");
+            }
+            other => panic!("expected plain OctetWrite (EOS appended), got {other:?}"),
+        }
+    }
+
+    /// A failing octet write on the write-only path must surface the driver's
+    /// alarm via last_alarm(), matching C callbackWfWrite/WriteBinary
+    /// (writeIt -> result.status -> finish recGblSetSevr). The path previously
+    /// swallowed the submit result, so a write failure raised no alarm. Shared by
+    /// asynOctetWrite (tested here) and asynOctetWriteBinary.
+    ///
+    /// The mock fails with a generic asynError, whose alarm is the only one that
+    /// depends on the direction default: because this is an output (isOutput=1)
+    /// record, C maps it to WRITE_ALARM, not READ_ALARM (processCommon,
+    /// devAsynOctet.c:806-807).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_failure_raises_write_alarm_on_write_only_path() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let handle = spawn_failing_write_port("binwrite_fail");
+        let link = AsynLink {
+            port_name: "binwrite_fail".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "REG".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.write_only = true;
+        ads.reason_set = true;
+        ads.set_record_info("TEST:WFAIL", ScanType::Passive);
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x41, 0x42]))
+            .unwrap();
+        ads.read(&mut rec).unwrap();
+
+        // Generic asynError on an output record -> WRITE_ALARM/INVALID (NOT
+        // READ_ALARM, which the path used before the direction fix).
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            )),
+            "a write failure on an output record must raise WRITE_ALARM, not be swallowed or READ_ALARM"
+        );
+    }
+
+    /// Mock octet port for asynOctetCmdResponse: records every write payload and
+    /// the flush/write/read call order, and returns a fixed reply on read.
+    struct CmdResponsePort {
+        base: PortDriverBase,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        sequence: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        reply: Vec<u8>,
+    }
+    impl PortDriver for CmdResponsePort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            self.sequence.lock().unwrap().push("flush");
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            self.sequence.lock().unwrap().push("write");
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            self.sequence.lock().unwrap().push("read");
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            Ok(n)
+        }
+    }
+
+    type CmdRecorder = (
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        Arc<std::sync::Mutex<Vec<&'static str>>>,
+    );
+
+    /// Spawn a [`CmdResponsePort`] actor and return its [`PortHandle`] plus the
+    /// shared write-payload / call-order recorders.
+    fn spawn_cmd_response_port(name: &str, reply: &[u8]) -> (PortHandle, CmdRecorder) {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sequence = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = CmdResponsePort {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            writes: writes.clone(),
+            sequence: sequence.clone(),
+            reply: reply.to_vec(),
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(port), rx);
+        std::thread::Builder::new()
+            .name("cmdresp-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, name.into(), interrupts);
+        (handle, (writes, sequence))
+    }
+
+    /// `read_op` emits a write-then-read (`OctetWriteRead`) carrying the cached
+    /// command when one is present (asynOctetCmdResponse), and a plain
+    /// `OctetRead` otherwise (asynOctetRead) — the one routing decision the
+    /// feature adds.
+    #[test]
+    fn read_op_selects_write_read_only_when_command_present() {
+        let (handle, _) = spawn_cmd_response_port("cmdresp_readop", b"");
+        let link = AsynLink {
+            port_name: "cmdresp_readop".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_max_size = 128;
+
+        // No command → plain read.
+        match ads.read_op() {
+            Some(RequestOp::OctetRead { buf_size }) => assert_eq!(buf_size, 128),
+            other => panic!("expected OctetRead, got {other:?}"),
+        }
+
+        // Command cached → write-then-read carrying the command bytes.
+        ads.octet_cmd = Some(b"*IDN?\r\n".to_vec());
+        match ads.read_op() {
+            Some(RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            }) => {
+                assert_eq!(data, b"*IDN?\r\n".to_vec());
+                assert_eq!(buf_size, 128);
+                // C devAsynOctet command-response does NOT flush before the write
+                // (raw writeIt → readIt), unlike asynOctetSyncIO::writeRead.
+                assert!(!flush, "CmdResponse must not pre-flush the input buffer");
+            }
+            other => panic!("expected OctetWriteRead, got {other:?}"),
+        }
+    }
+
+    /// The per-record octet length cap (`octet_len_cap`, the asyn-rs home for C
+    /// `modbusDrvUser_t.len`) truncates the octet WRITE payload,
+    /// mirroring C `writeOctet`'s `getStringLen(maxChars) = min(data_len, len)`
+    /// (drvModbusAsyn.cpp:1521/1524/1531). SIZV / `octet_max_size` does NOT bound
+    /// writes; `None` (C `len == -1`) leaves the payload intact. Covers the text,
+    /// CharArray, and over-long-cap edges.
+    #[test]
+    fn octet_len_cap_truncates_write_payload() {
+        let (handle, _) = spawn_cmd_response_port("octetcap_write", b"");
+        let link = AsynLink {
+            port_name: "octetcap_write".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        // A large read buffer must NOT bound the write (C maxChars is data length).
+        ads.octet_max_size = 256;
+
+        // No cap (C len == -1): full payload written.
+        ads.octet_len_cap = None;
+        match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABCDEFG".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+
+        // LEN=3: write truncated to 3 bytes (C getStringLen min(7,3)=3).
+        ads.octet_len_cap = Some(3);
+        match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABC".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+
+        // CharArray write (waveform FTVL=CHAR) is capped on the same path.
+        match ads.write_op(&EpicsValue::CharArray(b"ABCDEFG".to_vec())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABC".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+
+        // A cap longer than the data is a no-op (min(7,99)=7).
+        ads.octet_len_cap = Some(99);
+        match ads.write_op(&EpicsValue::String("ABCDEFG".into())) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ABCDEFG".to_vec()),
+            other => panic!("expected OctetWrite, got {other:?}"),
+        }
+    }
+
+    /// A poller-fired octet value (delivered as `EpicsValue::String`) is capped at
+    /// `octet_max_size` (= min(SIZV, LEN)),
+    /// mirroring C's poller `getStringLen(sizeof stringBuffer) = min(buffer, len)`
+    /// (drvModbusAsyn.cpp:1914). The polled read caps at the driver via `buf_size`;
+    /// the I/O-Intr ring fires the full block, so the cap is applied consumer-side.
+    /// Array-interface `CharArray` reads are left untouched.
+    #[test]
+    fn octet_max_size_caps_io_intr_read_value() {
+        let (handle, _) = spawn_cmd_response_port("octetcap_read", b"");
+        let link = AsynLink {
+            port_name: "octetcap_read".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_max_size = 5;
+
+        // Over the cap → truncated to 5 bytes.
+        match ads.cap_octet_read_value(EpicsValue::String("ABCDEFG".into())) {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), b"ABCDE"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        // Under the cap → untouched.
+        match ads.cap_octet_read_value(EpicsValue::String("AB".into())) {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), b"AB"),
+            other => panic!("expected String, got {other:?}"),
+        }
+        // Array-interface CharArray reads are NOT octet-capped (bounded by
+        // max_array_elements elsewhere).
+        let long = vec![1u8; 10];
+        match ads.cap_octet_read_value(EpicsValue::CharArray(long.clone())) {
+            EpicsValue::CharArray(v) => assert_eq!(v, long),
+            other => panic!("expected CharArray, got {other:?}"),
+        }
+    }
+
+    /// Full asynOctetCmdResponse chain through the factory: the literal DRVINFO
+    /// command is escape-translated and cached (octet_cmd) with reason_set
+    /// pre-set (C useDrvUser=0), so init() skips param resolution and each
+    /// process writes the command then reads the reply into VAL (C
+    /// `callbackSiCmdResponse`, devAsynOctet.c). Asserted end-to-end on stringin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_factory_writes_escaped_command_then_reads_reply() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_factory", b"IDN-OK");
+        crate::asyn_record::register_port(
+            "cmdresp_factory",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
+        // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetCmdResponse",
+            inp: "@asyn(cmdresp_factory,0)*IDN?\\r\\n",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = StringinRecord::new("");
+        // init() must succeed without the command being a real param — proves the
+        // reason_set pre-set (useDrvUser=0) skips drv_user_create.
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        // The escaped command was written once (\r\n → 0x0D 0x0A), before the read.
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![b"*IDN?\x0d\x0a".to_vec()],
+            "the escaped literal command is written once"
+        );
+        let seq = sequence.lock().unwrap().clone();
+        let w = seq.iter().position(|&s| s == "write").unwrap();
+        let r = seq.iter().position(|&s| s == "read").unwrap();
+        assert!(w < r, "command write must precede the reply read: {seq:?}");
+        // C devAsynOctet command-response does plain writeIt → readIt with NO
+        // flush — the warm-line bytes are part of the reply, not discarded.
+        assert!(
+            !seq.contains(&"flush"),
+            "CmdResponse must not pre-flush the input buffer: {seq:?}"
+        );
+
+        // The reply landed in VAL.
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::String("IDN-OK".into())),
+            "the device reply must be stored in VAL"
+        );
+    }
+
+    /// An escaped NUL in the asynOctetCmdResponse command terminates it: C
+    /// initCmdBuffer (devAsynOctet.c:639-641) sets bufLen = strlen(buffer) after
+    /// dbTranslateEscape, so the bytes from the NUL onward are never written.
+    /// The factory truncates at the first NUL to match the wire bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_command_truncates_at_embedded_nul() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, _sequence)) = spawn_cmd_response_port("cmdresp_nul", b"R");
+        crate::asyn_record::register_port(
+            "cmdresp_nul",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
+        // NUL, so only "AB" reaches the wire.
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetCmdResponse",
+            inp: "@asyn(cmdresp_nul,0)AB\\000CD",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = StringinRecord::new("");
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![b"AB".to_vec()],
+            "the command is truncated at the embedded NUL (C strlen)"
+        );
+    }
+
+    /// A LEADING-NUL command (raw DRVINFO non-empty, escapes to a leading NUL so
+    /// the truncated command is empty) is NOT a misconfiguration: C keys the
+    /// empty-reject on strlen(userParam) — the RAW pre-escape DRVINFO
+    /// (devAsynOctet.c:631-632) — which is non-empty here, so it computes
+    /// bufLen=0 and does a 0-byte writeIt+readIt with NO alarm. base-rs must do
+    /// the same, NOT raise LINK_ALARM (which is reserved for a raw-empty DRVINFO).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_leading_nul_command_writes_zero_bytes_no_alarm() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_lnul", b"OK");
+        crate::asyn_record::register_port(
+            "cmdresp_lnul",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
+        // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty
+        // command -> C writes 0 bytes then reads.
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetCmdResponse",
+            inp: "@asyn(cmdresp_lnul,0)\\000CD",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = StringinRecord::new("");
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        // A single 0-byte write, then the read — no LINK_ALARM, unlike a
+        // raw-empty DRVINFO.
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![Vec::<u8>::new()],
+            "a leading-NUL command writes exactly 0 bytes (C bufLen=0)"
+        );
+        let seq = sequence.lock().unwrap().clone();
+        assert_eq!(
+            seq,
+            vec!["write", "read"],
+            "0-byte write then read: {seq:?}"
+        );
+        assert_eq!(
+            dev.last_alarm(),
+            None,
+            "a leading-NUL command must NOT raise LINK_ALARM (C does not reject it)"
+        );
+        // The reply still lands in VAL.
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::String("OK".into())));
+    }
+
+    /// The asynOctetCmdResponse reply reaches an array-backed (waveform CHAR)
+    /// record's VAL, not only a string record — the octet reply→VAL coercion
+    /// holds for the CharArray shape. Built with the factory's octet_cmd +
+    /// reason_set wiring applied directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_reply_reaches_waveform_char_val() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, (writes, _)) = spawn_cmd_response_port("cmdresp_wf", b"PONG");
+        let link = AsynLink {
+            port_name: "cmdresp_wf".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            // Raw DRVINFO must match the cached command: the empty-reject guard
+            // keys on a non-empty raw drv_info (C strlen(userParam)).
+            drv_info: "PING\\r".to_string(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        // Mirror the factory: cache the escaped command + pre-set reason_set.
+        ads.octet_cmd = Some(crate::asyn_record::translate_escape("PING\\r"));
+        ads.reason_set = true;
+        ads.set_record_info("TEST:WF", ScanType::Passive);
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(writes.lock().unwrap().clone(), vec![b"PING\x0d".to_vec()]);
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"PONG".to_vec())),
+            "reply bytes must populate the waveform CHAR VAL"
+        );
+    }
+
+    /// The asynOctetCmdResponse reply reaches an lsi (long string in) VAL — the
+    /// third C-registered record row (stringin/waveform/lsi). The reply is short,
+    /// so no SIZV truncation applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_reply_reaches_lsi_val() {
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        let (handle, (writes, _)) = spawn_cmd_response_port("cmdresp_lsi", b"STATUS=OK");
+        let link = AsynLink {
+            port_name: "cmdresp_lsi".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            // Raw DRVINFO must match the cached command (see the waveform case).
+            drv_info: "READ?\\n".to_string(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_cmd = Some(crate::asyn_record::translate_escape("READ?\\n"));
+        ads.reason_set = true;
+        ads.set_record_info("TEST:LSI", ScanType::Passive);
+
+        let mut rec = LsiRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(writes.lock().unwrap().clone(), vec![b"READ?\x0a".to_vec()]);
+        // lsi backs VAL with a byte buffer, so the reply reads back as a
+        // CharArray (matching the waveform CHAR shape, not a fixed String).
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"STATUS=OK".to_vec())),
+            "reply must populate the lsi VAL"
+        );
+    }
+
+    /// An asynOctetCmdResponse record with an EMPTY command (DRVINFO escaped to
+    /// nothing) is a misconfiguration: C initCmdBuffer (devAsynOctet.c:632-637)
+    /// rejects it with LINK_ALARM/INVALID + INIT_ERROR. base-rs holds the record
+    /// at LINK_ALARM/INVALID and performs NO I/O (no empty command is written).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_empty_command_holds_link_alarm_and_writes_nothing() {
+        use epics_base_rs::server::record::AlarmSeverity;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_empty", b"unused");
+        let link = AsynLink {
+            port_name: "cmdresp_empty".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        // What the factory builds for an empty DRVINFO: octet_cmd = Some(empty).
+        ads.octet_cmd = Some(Vec::new());
+        ads.reason_set = true;
+        ads.set_record_info("TEST:EMPTY", ScanType::Passive);
+
+        let mut rec = StringinRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        // No I/O at all — not even an empty write.
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "empty command must not write to the device"
+        );
+        assert!(
+            sequence.lock().unwrap().is_empty(),
+            "empty command must perform no driver I/O"
+        );
+        // Held at LINK_ALARM / INVALID (C recGblSetSevr(LINK_ALARM, INVALID)).
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                AlarmSeverity::Invalid as u16
+            )),
+            "empty command must hold the record at LINK_ALARM/INVALID"
+        );
     }
 }

@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
@@ -48,6 +50,23 @@ pub struct ScalcoutRecord {
     /// unconditionally, so this caches the OOPT decision and gates
     /// the OUT-link write on it.
     cached_should_output: bool,
+    /// Output delay in seconds — C `sCalcoutRecord.c` `prec->odly`. When
+    /// an output should fire and `odly > 0`, the OUT-link write is deferred
+    /// by `odly` seconds (C `process` lines 400-408).
+    pub odly: f64,
+    /// Delay-active flag — C `prec->dlya`. Set to 1 on the delaying cycle
+    /// (posted DBE_VALUE) and cleared to 0 on the delayed continuation
+    /// (C `process` lines 401/425). Distinguishes the continuation re-entry.
+    dlya: i16,
+    /// Snapshot of the delaying cycle's output decision, restored into
+    /// `cached_should_output` on the continuation so the deferred OUT write
+    /// honours the original cycle's OOPT result. Mirrors calcout.rs.
+    pending_output: bool,
+    /// `OEVT` ("Event To Issue") — C `sCalcoutRecord.c` `prec->oevt`
+    /// (DBF_USHORT). When output fires and `oevt > 0`, `execOutput` posts
+    /// the numeric software event (`post_event((int)oevt)`); see
+    /// [`Record::output_event`].
+    oevt: u16,
 }
 
 impl Default for ScalcoutRecord {
@@ -75,6 +94,10 @@ impl Default for ScalcoutRecord {
             prev_sval: PvString::new(),
             calc_alarm: false,
             cached_should_output: false,
+            odly: 0.0,
+            dlya: 0,
+            pending_output: false,
+            oevt: 0,
         }
     }
 }
@@ -217,6 +240,21 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ODLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLYA",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OEVT",
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     // Input links
@@ -434,11 +472,34 @@ impl Record for ScalcoutRecord {
 
     // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
     // for string output side, but OUT writeback only reads OVAL).
+    //
+    // As in `calcout`, C's `oval = ivov` lives inside the `if (doOutput)`-gated
+    // `execOutput` (sCalcoutRecord.c), so a non-output INVALID cycle must NOT
+    // clobber OVAL to IVOV. Gate on `cached_should_output` (this cycle's
+    // doOutput decision). The calc-failure `val = ivov` substitution earlier in
+    // `process()` is a separate, pre-existing path and is unaffected here.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        self.put_field("OVAL", ivov)
+        if self.cached_should_output {
+            self.put_field("OVAL", ivov)
+        } else {
+            Ok(())
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // ODLY continuation: this is the delayed re-process scheduled by a
+        // previous cycle (C `sCalcoutRecord.c::process` `pact==TRUE` + `dlya`
+        // branch, lines 421-432). Do NOT re-evaluate CALC / OCAL / should_output
+        // — C clears DLYA and runs `execOutput` directly. Honour the output
+        // decision the original cycle captured, clear DLYA, and let the
+        // framework write the OUT link. Mirrors calcout.rs.
+        if self.dlya == 1 {
+            self.dlya = 0;
+            self.cached_should_output = self.pending_output;
+            self.pending_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
         self.prev_val = self.val;
         self.prev_sval = self.sval.clone();
 
@@ -468,26 +529,51 @@ impl Record for ScalcoutRecord {
             true
         };
 
+        // IVOA=Don't_drive on a failed calc vetoes the OUT WRITE only. C
+        // applies the veto inside `execOutput` (sCalcoutRecord.c:430), which
+        // runs AFTER the ODLY decision — so an OOPT-fires + ODLY>0 cycle must
+        // still schedule the delay, pulse DLYA, and fire FLNK on the
+        // continuation; only the OUT link stays unwritten. Modelling the veto
+        // as an early `return` skipped the ODLY branch entirely.
+        let mut ivoa_veto_out = false;
         if calc_failed {
             self.calc_alarm = true;
-            // Invalid calc — check IVOA
-            match self.ivoa {
-                1 => {
-                    // Don't drive output — suppress the OUT write.
-                    self.cached_should_output = false;
-                    return Ok(ProcessOutcome::complete());
-                }
-                2 => {
-                    self.val = self.ivov;
-                }
-                _ => {} // Continue
+            // C `sCalcoutRecord.c:361-363`: a failed sCalcPerform forces
+            // VAL=-1 and SVAL="***ERROR***" (the CALC_ALARM severity itself
+            // is raised by the framework from the CALC_ALARM field). Before
+            // this the failed cycle kept the previous VAL/SVAL with no value
+            // sentinel, diverging from C.
+            self.val = -1.0;
+            self.sval = PvString::from("***ERROR***");
+            // IVOA on the INVALID cycle. C applies it inside `execOutput`
+            // (sCalcoutRecord.c:786-808): Don't_drive skips the write,
+            // Set_to_IVOV sets `oval = ivov` (line 798) — NOT `val`. Only the
+            // Don't_drive veto needs an in-record flag here; the OVAL=IVOV
+            // substitution is owned by the framework's IVOA gate
+            // (`apply_invalid_output_value`), which fires because the
+            // CALC_ALARM the framework raises in `evaluate_alarms` drives this
+            // cycle INVALID. Setting `self.val = ivov` here was wrong: it
+            // clobbered VAL (C keeps VAL=-1) and duplicated the framework's
+            // OVAL write.
+            if self.ivoa == 1 {
+                ivoa_veto_out = true; // Don't drive outputs
             }
         }
 
-        // Determine output
-        let do_output = self.should_output();
-        self.cached_should_output = do_output;
-        if do_output {
+        // OOPT decides whether output fires — this gates the ODLY delay + DLYA
+        // pulse + completion (C `doOutput`). The IVOA=Don't_drive veto removes
+        // only the OUT write. `write_out == oopt_fires` on every
+        // non-Don't_drive path, so OVAL/OUT behaviour is unchanged there.
+        let oopt_fires = self.should_output();
+        let write_out = oopt_fires && !ivoa_veto_out;
+        // C `execOutput` (sCalcoutRecord.c:760-777) computes OVAL/OSV via the
+        // DOPT switch on EVERY output cycle, *before* the IVOA decision (the
+        // Don't_drive `break` is at :795). So OVAL is recomputed even when the
+        // OUT write is vetoed — gate this on `oopt_fires`, not `write_out`.
+        // (`write_out` still gates the OUT write below via cached_should_output;
+        // on every non-Don't_drive path the two are equal, so OVAL is unchanged
+        // there.)
+        if oopt_fires {
             if self.dopt == 1 {
                 // Use OCAL. A broken OCAL (compile OR eval failure)
                 // raises CALC_ALARM — sibling calcout.rs does the same,
@@ -510,11 +596,22 @@ impl Record for ScalcoutRecord {
                                 }
                             },
                             Err(_) => {
+                                // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
+                                // a failed OCAL sCalcPerform forces OVAL=-1 and
+                                // OSV="***ERROR***" — the OCAL-side mirror of the
+                                // CALC-fail VAL=-1 sentinel. Previously OVAL/OSV
+                                // were left stale.
+                                self.oval = -1.0;
+                                self.osv = PvString::from("***ERROR***");
                                 self.calc_alarm = true;
                             }
                         }
                     } else {
-                        // OCAL non-empty but compile failed.
+                        // OCAL non-empty but compile failed — C's sCalcPerform
+                        // fails identically on an unparsable expression, so the
+                        // same OVAL=-1/OSV="***ERROR***" sentinel applies.
+                        self.oval = -1.0;
+                        self.osv = PvString::from("***ERROR***");
                         self.calc_alarm = true;
                     }
                 }
@@ -524,6 +621,32 @@ impl Record for ScalcoutRecord {
                 self.osv = self.sval.clone();
             }
         }
+
+        // ODLY (C `sCalcoutRecord.c::process` lines 399-408): when an output
+        // should fire and ODLY > 0, defer the OUT-link write by ODLY seconds.
+        // The delaying cycle sets DLYA=1, posts it (DBE_VALUE), schedules the
+        // delayed callback, and `return 0` BEFORE `monitor()`/`recGblFwdLink()`
+        // — so VAL/OVAL monitors and the forward link fire once on the delayed
+        // (continuation) cycle, not now. Model this as an async-pending-notify
+        // pass: post only DLYA now, suppress this cycle's output, and re-process
+        // after the delay; the `dlya == 1` branch at the top then emits.
+        // Mirrors calcout.rs.
+        if oopt_fires && self.odly > 0.0 {
+            self.dlya = 1;
+            self.pending_output = write_out;
+            self.cached_should_output = false;
+            let delay = std::time::Duration::from_secs_f64(self.odly);
+            return Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPendingNotify(vec![(
+                    "DLYA".to_string(),
+                    EpicsValue::Short(1),
+                )]),
+                actions: vec![ProcessAction::ReprocessAfter(delay)],
+                device_did_compute: false,
+            });
+        }
+
+        self.cached_should_output = write_out;
         Ok(ProcessOutcome::complete())
     }
 
@@ -542,6 +665,9 @@ impl Record for ScalcoutRecord {
             "OUT" => Some(EpicsValue::String(self.out.clone().into())),
             "WAIT" => Some(EpicsValue::Short(self.wait)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            "ODLY" => Some(EpicsValue::Double(self.odly)),
+            "DLYA" => Some(EpicsValue::Short(self.dlya)),
+            "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
@@ -648,6 +774,20 @@ impl Record for ScalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("PREC".into())),
             },
+            "ODLY" => {
+                self.odly = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?;
+                Ok(())
+            }
+            "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
+            "OEVT" => {
+                self.oevt = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OEVT".into()))?
+                    as u16;
+                Ok(())
+            }
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     self.num_vals[idx] = value
@@ -707,6 +847,20 @@ impl Record for ScalcoutRecord {
             &[("OUT", "OVAL")]
         } else {
             &[]
+        }
+    }
+
+    /// `OEVT` ("Event To Issue"): post the numeric output event when output
+    /// fires. C `sCalcoutRecord.c` `execOutput` does `if (pcalc->oevt > 0)
+    /// post_event((int)pcalc->oevt);` right after `writeValue`, gated to the
+    /// same OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`)
+    /// — the framework adds the IVOA `Don't_drive` veto. Stringified so the
+    /// numeric event matches a `SCAN="Event"` record's `EVNT`.
+    fn output_event(&self) -> Option<String> {
+        if self.cached_should_output && self.oevt > 0 {
+            Some(self.oevt.to_string())
+        } else {
+            None
         }
     }
 
@@ -845,9 +999,69 @@ mod tests {
         rec.calc = "???invalid".into();
         rec.compiled_calc = None;
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap();
+        rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
+            .unwrap();
         rec.process().unwrap();
-        // No compiled calc → nothing happens, oval stays 0
-        assert_eq!(rec.oval, 0.0);
+        // Don't_drive suppresses only the OUT *write* — multi_output_links is
+        // empty (cached_should_output false).
+        assert!(
+            rec.multi_output_links().is_empty(),
+            "IVOA=Don't_drive suppresses the OUT write"
+        );
+        // C `execOutput` still runs the DOPT switch on this output cycle
+        // (sCalcoutRecord.c:760-777, before the Don't_drive break at :795), so
+        // OVAL is recomputed from VAL (=-1 calc-fail sentinel), NOT left stale.
+        assert_eq!(
+            rec.oval, -1.0,
+            "Don't_drive recomputes OVAL from the calc-fail VAL=-1, not 0"
+        );
+    }
+
+    #[test]
+    fn scalcout_ivoa_dont_drive_still_delays_via_odly() {
+        // R47 gap: calc-fail + IVOA=Don't_drive + OOPT-fires + ODLY>0. C
+        // schedules the ODLY delay regardless of IVOA (sCalcoutRecord.c:399-408
+        // is upstream of execOutput, where the Don't_drive veto applies at
+        // :430 on the continuation) — so the record still pulses DLYA 1→0 and
+        // fires FLNK on the continuation; only the OUT write is suppressed. It
+        // must NOT complete immediately as the old IVOA==1 early-return did.
+        let mut rec = ScalcoutRecord::new();
+        rec.calc = "???invalid".into();
+        rec.compiled_calc = None; // calc fails
+        rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
+        rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
+            .unwrap();
+        rec.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
+        // OOPT=0 (Every): output fires.
+        let outcome = rec.process().unwrap();
+        // Delaying cycle: DLYA set, ReprocessAfter scheduled, OUT suppressed.
+        assert_eq!(
+            rec.get_field("DLYA"),
+            Some(EpicsValue::Short(1)),
+            "Don't_drive must still delay: DLYA set"
+        );
+        assert!(
+            rec.multi_output_links().is_empty(),
+            "Don't_drive suppresses the OUT write on the delaying cycle"
+        );
+        assert!(
+            outcome
+                .actions
+                .iter()
+                .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+            "Don't_drive + ODLY>0 schedules the delayed re-process"
+        );
+        // Continuation: DLYA clears; OUT stays unwritten (the veto holds).
+        rec.process().unwrap();
+        assert_eq!(
+            rec.get_field("DLYA"),
+            Some(EpicsValue::Short(0)),
+            "DLYA cleared on the continuation"
+        );
+        assert!(
+            rec.multi_output_links().is_empty(),
+            "Don't_drive: OUT stays unwritten on the continuation"
+        );
     }
 
     #[test]
@@ -858,5 +1072,53 @@ mod tests {
         rec.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
         assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(2)));
         assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::Double(99.0)));
+    }
+
+    #[test]
+    fn scalcout_calc_fail_sets_error_sentinel() {
+        // C `sCalcoutRecord.c:361-363`: a failed sCalcPerform forces VAL=-1
+        // and SVAL="***ERROR***". Start VAL from a known-good value so the
+        // sentinel is unambiguous (not just the default 0).
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 7.0, "good calc seeds VAL");
+        // Now break the CALC: a bare binary operator underflows the stack.
+        rec.put_field("CALC", EpicsValue::String("+".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, -1.0, "calc-fail forces VAL=-1 (C:361)");
+        assert_eq!(rec.sval, "***ERROR***", "calc-fail forces SVAL (C:363)");
+    }
+
+    #[test]
+    fn scalcout_ocal_fail_sets_oval_error_sentinel() {
+        // C execOutput Use_OVAL (sCalcoutRecord.c:771-773): a failed OCAL
+        // sCalcPerform forces OVAL=-1 and OSV="***ERROR***" — the OCAL-side
+        // mirror of the CALC-fail VAL sentinel. CALC itself stays valid here,
+        // so only the OCAL/OVAL side carries the sentinel.
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
+        rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
+        rec.put_field("OCAL", EpicsValue::String("5".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.oval, 5.0, "good OCAL seeds OVAL");
+        assert_eq!(rec.val, 3.0, "CALC side is unaffected");
+        // Break OCAL: a bare binary operator underflows the stack.
+        rec.put_field("OCAL", EpicsValue::String("+".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.oval, -1.0, "OCAL-fail forces OVAL=-1 (C:771)");
+        assert_eq!(rec.osv, "***ERROR***", "OCAL-fail forces OSV (C:772)");
+        // VAL stays at the good CALC result — the sentinel is OCAL-side only.
+        assert_eq!(
+            rec.val, 3.0,
+            "OCAL-fail must NOT touch VAL (C sets oval, not val)"
+        );
     }
 }

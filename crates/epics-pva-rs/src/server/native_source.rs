@@ -135,60 +135,10 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
     if let EpicsValue::Enum(v) = &snap.value {
         return build_nt_enum(i32::from(*v), snap);
     }
-    let value_field = match &snap.value {
-        EpicsValue::Double(v) => PvField::Scalar(ScalarValue::Double(*v)),
-        EpicsValue::Float(v) => PvField::Scalar(ScalarValue::Float(*v)),
-        EpicsValue::Long(v) => PvField::Scalar(ScalarValue::Int(*v)),
-        EpicsValue::Short(v) => PvField::Scalar(ScalarValue::Short(*v)),
-        EpicsValue::Char(v) => PvField::Scalar(ScalarValue::UByte(*v)),
-        EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
-        // Transient NTEnum carrier never reaches a record snapshot (coerced in
-        // base at the link-write boundary); serve its index like a DBF_ENUM.
-        EpicsValue::EnumWithChoices { index, .. } => {
-            PvField::Scalar(ScalarValue::Int(*index as i32))
-        }
-        EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
-        EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
-        // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
-        EpicsValue::UInt64(v) => PvField::Scalar(ScalarValue::ULong(*v)),
-        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
-        // (pvxs `ioc/typeutils.cpp:38-44`: DBR_USHORT→UInt16, DBR_ULONG→UInt32).
-        EpicsValue::UShort(v) => PvField::Scalar(ScalarValue::UShort(*v)),
-        EpicsValue::ULong(v) => PvField::Scalar(ScalarValue::UInt(*v)),
-        EpicsValue::DoubleArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
-        }
-        EpicsValue::FloatArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Float(*x)).collect())
-        }
-        EpicsValue::LongArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Int(*x)).collect())
-        }
-        EpicsValue::ShortArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Short(*x)).collect())
-        }
-        EpicsValue::CharArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UByte(*x)).collect())
-        }
-        EpicsValue::EnumArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Int(*x as i32)).collect())
-        }
-        EpicsValue::StringArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::String(x.clone())).collect())
-        }
-        EpicsValue::Int64Array(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::Long(*x)).collect())
-        }
-        EpicsValue::UInt64Array(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::ULong(*x)).collect())
-        }
-        EpicsValue::UShortArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UShort(*x)).collect())
-        }
-        EpicsValue::ULongArray(v) => {
-            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UInt(*x)).collect())
-        }
-    };
+    // The `EpicsValue → PVA value leaf` correspondence (incl. the `DBF_CHAR`
+    // signedness) is owned once in `crate::leaf_convert`, shared with the
+    // monitor-filter backward bridge so the two cannot drift apart.
+    let value_field = crate::leaf_convert::epics_value_to_pv_leaf(&snap.value);
 
     let is_array = matches!(value_field, PvField::ScalarArray(_));
     let struct_id = if is_array {
@@ -217,33 +167,11 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
     if matches!(&snap.value, EpicsValue::Enum(_)) {
         return nt_enum_desc();
     }
-    let (value_desc, is_array) = match &snap.value {
-        EpicsValue::Double(_) => (FieldDesc::Scalar(ScalarType::Double), false),
-        EpicsValue::Float(_) => (FieldDesc::Scalar(ScalarType::Float), false),
-        EpicsValue::Long(_) => (FieldDesc::Scalar(ScalarType::Int), false),
-        EpicsValue::Short(_) => (FieldDesc::Scalar(ScalarType::Short), false),
-        EpicsValue::Char(_) => (FieldDesc::Scalar(ScalarType::UByte), false),
-        EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
-        EpicsValue::EnumWithChoices { .. } => (FieldDesc::Scalar(ScalarType::Int), false),
-        EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
-        EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
-        EpicsValue::UInt64(_) => (FieldDesc::Scalar(ScalarType::ULong), false),
-        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
-        // (pvxs `ioc/typeutils.cpp:38-44`).
-        EpicsValue::UShort(_) => (FieldDesc::Scalar(ScalarType::UShort), false),
-        EpicsValue::ULong(_) => (FieldDesc::Scalar(ScalarType::UInt), false),
-        EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
-        EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
-        EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
-        EpicsValue::ShortArray(_) => (FieldDesc::ScalarArray(ScalarType::Short), true),
-        EpicsValue::CharArray(_) => (FieldDesc::ScalarArray(ScalarType::UByte), true),
-        EpicsValue::EnumArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
-        EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
-        EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
-        EpicsValue::UInt64Array(_) => (FieldDesc::ScalarArray(ScalarType::ULong), true),
-        EpicsValue::UShortArray(_) => (FieldDesc::ScalarArray(ScalarType::UShort), true),
-        EpicsValue::ULongArray(_) => (FieldDesc::ScalarArray(ScalarType::UInt), true),
-    };
+    // Same single owner as the value leaf (`crate::leaf_convert`): the
+    // descriptor is the type-only projection of `epics_value_to_pv_leaf`, so
+    // the served value and its advertised type cannot diverge.
+    let value_desc = crate::leaf_convert::epics_value_to_field_desc_leaf(&snap.value);
+    let is_array = matches!(value_desc, FieldDesc::ScalarArray(_));
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"
     } else {
@@ -322,7 +250,7 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
         .push(("choices".into(), PvField::ScalarArray(choices)));
 
     // pvxs NTEnum `display` is the anonymous `Struct("display", {description})`
-    // (no `display_t` id, no limits/units) — distinct from the NTScalar display.
+    // (description only, no limits/units/precision — narrower than the NTScalar display).
     let mut display = PvStructure::new("");
     let description = snap
         .display
@@ -370,7 +298,8 @@ fn timestamp_desc() -> FieldDesc {
 
 fn display_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "display_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_display`).
+        struct_id: String::new(),
         fields: vec![
             ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
@@ -383,7 +312,8 @@ fn display_desc() -> FieldDesc {
 
 fn control_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "control_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_control`).
+        struct_id: String::new(),
         fields: vec![
             ("limitLow".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("limitHigh".into(), FieldDesc::Scalar(ScalarType::Double)),
@@ -394,7 +324,8 @@ fn control_desc() -> FieldDesc {
 
 fn value_alarm_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "valueAlarm_t".into(),
+        // Anonymous id to match the value builder / pvxs (see `build_value_alarm`).
+        struct_id: String::new(),
         fields: vec![
             ("active".into(), FieldDesc::Scalar(ScalarType::Boolean)),
             (
@@ -524,7 +455,12 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
 }
 
 fn build_display(snap: &Snapshot) -> PvField {
-    let mut d = PvStructure::new("display_t");
+    // Anonymous id: pvxs builds `display`/`control`/`valueAlarm` with the
+    // 2-arg `members::Struct(name, children)` form (`src/nt.cpp:60`/`:89`/
+    // `:99`), which leaves `id = ""` — only `alarm`/`timeStamp` use the
+    // 3-arg id form. A non-empty `display_t` serialized an extra
+    // length-prefixed id and diverged from pvxs byte-for-byte.
+    let mut d = PvStructure::new("");
     // pvxs `iocsource.cpp:306-308` sets `display.description` from the
     // record's DESC field; in Rust it is `DisplayInfo.description`,
     // one field over from the limits/units this already reads. It was
@@ -556,7 +492,9 @@ fn build_display(snap: &Snapshot) -> PvField {
 }
 
 fn build_control(snap: &Snapshot) -> PvField {
-    let mut c = PvStructure::new("control_t");
+    // Anonymous id — pvxs `Struct("control", {…})` (`src/nt.cpp:89`), see
+    // `build_display`.
+    let mut c = PvStructure::new("");
     let (lo, hi) = if let Some(ctrl) = &snap.control {
         (ctrl.lower_ctrl_limit, ctrl.upper_ctrl_limit)
     } else {
@@ -579,7 +517,9 @@ fn build_value_alarm(snap: &Snapshot) -> PvField {
     // per-limit severities / `active` / `hysteresis` are not part of
     // DBR_AL_DOUBLE (pvxs leaves them untouched in this path), so they
     // remain 0/false until a record exposes LSV/HSV etc.
-    let mut v = PvStructure::new("valueAlarm_t");
+    // Anonymous id — pvxs `Struct("valueAlarm", {…})` (`src/nt.cpp:99`), see
+    // `build_display`.
+    let mut v = PvStructure::new("");
     v.fields.push((
         "active".into(),
         PvField::Scalar(ScalarValue::Boolean(false)),
@@ -1164,7 +1104,7 @@ mod tests {
         PvField::Scalar(ScalarValue::Double(v))
     }
 
-    /// Look up a scalar sub-field of a `time_t`/`display_t`/`valueAlarm_t`
+    /// Look up a scalar sub-field of a timeStamp/display/valueAlarm meta
     /// structure by name, for the NT-meta synthesizer regression tests.
     fn scalar(s: &PvStructure, name: &str) -> ScalarValue {
         match &s
@@ -1388,6 +1328,81 @@ mod tests {
             bv.get_field("choices"),
             Some(PvField::ScalarArray(c)) if c.is_empty()
         ));
+    }
+
+    /// `DBF_CHAR` is signed on the pvAccess wire: pvxs `fromDbrType` maps
+    /// `DBR_CHAR -> TypeCode::Int8` and `DBR_UCHAR -> TypeCode::UInt8`
+    /// (`ioc/typeutils.cpp:32-35`). A `Char` value of 200 (0xC8) must serve as
+    /// the signed byte −56 with a `byte` descriptor, not unsigned 200/`ubyte`
+    /// — while the unsigned `UChar` twin stays `ubyte`/200. Both the value and
+    /// the descriptor path are covered so they cannot drift apart.
+    #[test]
+    fn dbf_char_serves_as_signed_byte_uchar_stays_unsigned() {
+        let ts = std::time::UNIX_EPOCH;
+
+        // Scalar DBF_CHAR → signed byte (value + descriptor).
+        let snap = Snapshot::new(EpicsValue::Char(200), 0, 0, ts);
+        let PvField::Structure(s) = snapshot_to_pv_field(&snap) else {
+            panic!("NTScalar value must be a structure");
+        };
+        let Some(PvField::Scalar(ScalarValue::Byte(b))) = s.get_field("value") else {
+            panic!(
+                "DBF_CHAR value must be a signed byte scalar, got {:?}",
+                s.get_field("value")
+            );
+        };
+        assert_eq!(*b, -56, "DBF_CHAR 200 must serve as signed byte −56");
+        let FieldDesc::Structure { fields, .. } = snapshot_to_field_desc(&snap) else {
+            panic!("NTScalar descriptor must be a structure");
+        };
+        assert!(
+            matches!(
+                fields.iter().find(|(n, _)| n == "value").unwrap().1,
+                FieldDesc::Scalar(ScalarType::Byte)
+            ),
+            "DBF_CHAR descriptor must be signed `byte`"
+        );
+
+        // Scalar DBF_UCHAR → unsigned byte (the untouched twin).
+        let usnap = Snapshot::new(EpicsValue::UChar(200), 0, 0, ts);
+        let PvField::Structure(us) = snapshot_to_pv_field(&usnap) else {
+            panic!("structure");
+        };
+        let Some(PvField::Scalar(ScalarValue::UByte(u))) = us.get_field("value") else {
+            panic!("DBF_UCHAR value must be an unsigned byte scalar");
+        };
+        assert_eq!(*u, 200, "DBF_UCHAR must stay unsigned 200");
+
+        // Array DBF_CHAR[] → signed byte[], element-wise (value + descriptor).
+        let asnap = Snapshot::new(EpicsValue::CharArray(vec![200, 0, 127]), 0, 0, ts);
+        let PvField::Structure(a) = snapshot_to_pv_field(&asnap) else {
+            panic!("structure");
+        };
+        let Some(PvField::ScalarArray(arr)) = a.get_field("value") else {
+            panic!("DBF_CHAR[] value must be a scalar array");
+        };
+        assert_eq!(
+            arr,
+            &vec![
+                ScalarValue::Byte(-56),
+                ScalarValue::Byte(0),
+                ScalarValue::Byte(127),
+            ],
+            "DBF_CHAR[] must serve as signed byte[]"
+        );
+        let FieldDesc::Structure {
+            fields: afields, ..
+        } = snapshot_to_field_desc(&asnap)
+        else {
+            panic!("structure");
+        };
+        assert!(
+            matches!(
+                afields.iter().find(|(n, _)| n == "value").unwrap().1,
+                FieldDesc::ScalarArray(ScalarType::Byte)
+            ),
+            "DBF_CHAR[] descriptor must be signed `byte[]`"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, FieldMetadataOverride, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
@@ -15,6 +15,42 @@ const SUFFIX: [char; NUM_ARGS] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
     'T', 'U',
 ];
+
+/// `EFLG` (`menu(aSubEFLG)`) — when the record posts output-array DB events.
+/// C `aSubRecord.c::monitor` (the `switch (prec->eflg)`).
+const EFLG_NEVER: i16 = 0;
+const EFLG_ON_CHANGE: i16 = 1;
+const EFLG_ALWAYS: i16 = 2;
+
+/// `menu(aSubEFLG)` choice labels (`aSubRecord.dbd.pod`).
+const ASUB_EFLG_CHOICES: &[&str] = &["NEVER", "ON CHANGE", "ALWAYS"];
+
+/// `menu(aSubLFLG)` choice labels (`aSubRecord.dbd.pod`): IGNORE=0 (resolve
+/// SNAM once at init), READ=1 (re-read the name from the SUBL link every
+/// process). The READ behaviour is owned by the processing path
+/// (`fetch_values`), which holds the link + subroutine registry.
+const ASUB_LFLG_CHOICES: &[&str] = &["IGNORE", "READ"];
+
+/// The output-array fields whose monitor posting `EFLG` gates: `VALA..VALU`
+/// (the output values) and `NEVA..NEVU` (their element counts). C
+/// `aSubRecord.c::monitor` posts `vala[i]` and `neva[i]` together inside the
+/// `EFLG` switch. Leaked once for the `'static` lifetime the posting hooks
+/// require (mirrors `multi_input_links`).
+fn asub_output_event_fields() -> &'static [&'static str] {
+    use std::sync::OnceLock;
+    static FIELDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    FIELDS.get_or_init(|| {
+        SUFFIX
+            .iter()
+            .flat_map(|&c| {
+                [
+                    Box::leak(format!("VAL{c}").into_boxed_str()) as &'static str,
+                    Box::leak(format!("NEV{c}").into_boxed_str()) as &'static str,
+                ]
+            })
+            .collect()
+    })
+}
 
 /// aSub (array subroutine) record.
 ///
@@ -54,6 +90,35 @@ pub struct ASubRecord {
     pub nea: [i32; NUM_ARGS],
     /// Output elements-used `NEVA..NEVU`.
     pub neva: [i32; NUM_ARGS],
+    /// Bad-return severity (`menuAlarmSevr`, default NO_ALARM). C
+    /// `aSubRecord.c::do_sub` raises `SOFT_ALARM` at this severity when the
+    /// subroutine returns a negative status (applied by the framework's
+    /// `run_registered_subroutine`, which also publishes the status as VAL).
+    pub brsv: i16,
+    /// Display precision `PREC` for VAL. C `aSubRecord.c::get_precision`
+    /// returns `prec->prec` as the precision of VAL (and any non-link field);
+    /// the per-channel value fields use their link's precision, which the port
+    /// does not track.
+    pub prec: i16,
+    /// Output event flag `EFLG` (`menu(aSubEFLG)`, default ON CHANGE). C
+    /// `aSubRecord.c::monitor` gates `VALA..VALU`/`NEVA..NEVU` event posting:
+    /// NEVER (never post), ON CHANGE (post on change — the framework default),
+    /// ALWAYS (post every process).
+    pub eflg: i16,
+    /// Subroutine-name input mode `LFLG` (`menu(aSubLFLG)`, default IGNORE). C
+    /// `aSubRecord.c::fetch_values`: READ re-reads SNAM from the SUBL link
+    /// each process and re-resolves the subroutine when it changes (the
+    /// framework's processing path performs the read + re-resolution, as it
+    /// owns the link and subroutine registry).
+    pub lflg: i16,
+    /// Subroutine-name input link `SUBL` (`DBF_INLINK`). C `init_record`
+    /// seeds SNAM from a constant SUBL; with LFLG=READ, `fetch_values` reads
+    /// the current name from this link every process.
+    pub subl: String,
+    /// Old subroutine name `ONAM`. C `fetch_values` re-resolves the
+    /// subroutine only when SNAM differs from ONAM; ONAM is set to SNAM on a
+    /// successful swap.
+    pub onam: PvString,
 }
 
 impl Default for ASubRecord {
@@ -72,6 +137,12 @@ impl Default for ASubRecord {
             nova: [1; NUM_ARGS],
             nea: [1; NUM_ARGS],
             neva: [1; NUM_ARGS],
+            brsv: 0,
+            prec: 0,
+            eflg: EFLG_ON_CHANGE,
+            lflg: 0,
+            subl: String::new(),
+            onam: PvString::new(),
         }
     }
 }
@@ -141,9 +212,43 @@ impl ASubRecord {
                 read_only: false,
             },
             FieldDesc {
+                // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
                 name: "INAM",
                 dbf_type: DbFieldType::String,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "BRSV",
+                dbf_type: DbFieldType::Short,
                 read_only: false,
+            },
+            FieldDesc {
+                name: "PREC",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "EFLG",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "LFLG",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            // SUBL/ONAM are `special(SPC_NOMOD)` in C: client runtime puts are
+            // blocked (read_only), but the `.db` loader and the framework's
+            // own processing writes go through `put_field` directly.
+            FieldDesc {
+                name: "SUBL",
+                dbf_type: DbFieldType::String,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "ONAM",
+                dbf_type: DbFieldType::String,
+                read_only: true,
             },
         ];
         // Per-channel field families. Names are leaked to obtain the
@@ -220,6 +325,12 @@ impl Record for ASubRecord {
             "VAL" => return Some(EpicsValue::Double(self.val)),
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
             "INAM" => return Some(EpicsValue::String(self.inam.clone())),
+            "BRSV" => return Some(EpicsValue::Short(self.brsv)),
+            "PREC" => return Some(EpicsValue::Short(self.prec)),
+            "EFLG" => return Some(EpicsValue::Short(self.eflg)),
+            "LFLG" => return Some(EpicsValue::Short(self.lflg)),
+            "SUBL" => return Some(EpicsValue::String(self.subl.clone().into())),
+            "ONAM" => return Some(EpicsValue::String(self.onam.clone())),
             _ => {}
         }
         let (prefix, idx) = parse_channel(name)?;
@@ -259,6 +370,52 @@ impl Record for ASubRecord {
                 return match value {
                     EpicsValue::String(s) => {
                         self.inam = s;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                };
+            }
+            "BRSV" => {
+                self.brsv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("BRSV".into()))?
+                    as i16;
+                return Ok(());
+            }
+            "PREC" => {
+                self.prec = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("PREC".into()))?
+                    as i16;
+                return Ok(());
+            }
+            "EFLG" => {
+                self.eflg = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("EFLG".into()))?
+                    as i16;
+                return Ok(());
+            }
+            "LFLG" => {
+                self.lflg = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("LFLG".into()))?
+                    as i16;
+                return Ok(());
+            }
+            "SUBL" => {
+                return match value {
+                    EpicsValue::String(s) => {
+                        self.subl = s.as_str_lossy().into_owned();
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                };
+            }
+            "ONAM" => {
+                return match value {
+                    EpicsValue::String(s) => {
+                        self.onam = s;
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),
@@ -318,6 +475,53 @@ impl Record for ASubRecord {
         use std::sync::OnceLock;
         static FIELDS: OnceLock<Vec<FieldDesc>> = OnceLock::new();
         FIELDS.get_or_init(ASubRecord::descriptors)
+    }
+
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        // EFLG is `menu(aSubEFLG)`, LFLG is `menu(aSubLFLG)`; serve their
+        // labels so a `.db` `field(EFLG,"ON CHANGE")` / `field(LFLG,"READ")`
+        // resolves and a client reads them as DBR_ENUM.
+        match field {
+            "EFLG" => Some(ASUB_EFLG_CHOICES),
+            "LFLG" => Some(ASUB_LFLG_CHOICES),
+            _ => None,
+        }
+    }
+
+    fn force_posted_fields(&self) -> &'static [&'static str] {
+        // EFLG=ALWAYS: C `monitor()` posts every `vala[i]`/`neva[i]` each
+        // process regardless of change — the framework's force-post path.
+        if self.eflg == EFLG_ALWAYS {
+            asub_output_event_fields()
+        } else {
+            &[]
+        }
+    }
+
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        // EFLG=NEVER: C `monitor()` posts no `vala[i]`/`neva[i]` events.
+        // Excluding them from generic change-detection suppresses the post.
+        // (VAL, the scalar return status, is not in this set — C posts it on
+        // change independent of EFLG.)
+        if self.eflg == EFLG_NEVER {
+            asub_output_event_fields()
+        } else {
+            &[]
+        }
+    }
+
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        // C `aSubRecord.c::get_precision` reports `prec->prec` as VAL's display
+        // precision. (The per-channel value fields use their link's precision
+        // in C; the port does not model per-link precision, so only VAL is
+        // served here.)
+        if field.eq_ignore_ascii_case("VAL") {
+            return Some(FieldMetadataOverride {
+                precision: Some(self.prec),
+                ..Default::default()
+            });
+        }
+        None
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
@@ -388,5 +592,126 @@ mod tests {
     fn twenty_one_multi_input_links() {
         let rec = ASubRecord::default();
         assert_eq!(rec.multi_input_links().len(), 21);
+    }
+
+    /// PREC round-trips and is served as VAL's display precision (C
+    /// `aSubRecord.c::get_precision` returns `prec->prec` for VAL).
+    #[test]
+    fn prec_round_trips_and_serves_val_precision() {
+        let mut rec = ASubRecord::default();
+        assert_eq!(rec.get_field("PREC"), Some(EpicsValue::Short(0)));
+        assert_eq!(
+            rec.field_metadata_override("VAL").and_then(|o| o.precision),
+            Some(0)
+        );
+
+        rec.put_field("PREC", EpicsValue::Short(4)).unwrap();
+        assert_eq!(rec.get_field("PREC"), Some(EpicsValue::Short(4)));
+        assert_eq!(
+            rec.field_metadata_override("VAL").and_then(|o| o.precision),
+            Some(4),
+            "PREC must be served as VAL display precision"
+        );
+        // Non-VAL fields carry no precision override.
+        assert!(rec.field_metadata_override("SNAM").is_none());
+    }
+
+    /// EFLG gates output-array posting. C `aSubRecord.c::monitor`:
+    /// NEVER posts no `VALx`/`NEVx`; ON CHANGE (default) leaves them to the
+    /// framework's change-detection; ALWAYS force-posts them every process.
+    #[test]
+    fn eflg_drives_output_event_posting_policy() {
+        let mut rec = ASubRecord::default();
+        // Default ON CHANGE: neither force-post nor suppress.
+        assert_eq!(rec.eflg, EFLG_ON_CHANGE);
+        assert!(rec.force_posted_fields().is_empty());
+        assert!(rec.event_posted_fields().is_empty());
+
+        // ALWAYS: VALx/NEVx force-posted every cycle (21 + 21 = 42 fields).
+        rec.put_field("EFLG", EpicsValue::Short(EFLG_ALWAYS))
+            .unwrap();
+        assert_eq!(rec.get_field("EFLG"), Some(EpicsValue::Short(2)));
+        assert_eq!(rec.force_posted_fields().len(), NUM_ARGS * 2);
+        assert!(rec.force_posted_fields().contains(&"VALA"));
+        assert!(rec.force_posted_fields().contains(&"NEVU"));
+        assert!(rec.event_posted_fields().is_empty());
+
+        // NEVER: VALx/NEVx excluded from posting; VAL scalar not in the set.
+        rec.put_field("EFLG", EpicsValue::Short(EFLG_NEVER))
+            .unwrap();
+        assert!(rec.force_posted_fields().is_empty());
+        assert_eq!(rec.event_posted_fields().len(), NUM_ARGS * 2);
+        assert!(rec.event_posted_fields().contains(&"VALA"));
+        assert!(!rec.event_posted_fields().contains(&"VAL"));
+    }
+
+    /// EFLG loads from a `.db` menu label (C `field(EFLG,"ALWAYS")`).
+    #[test]
+    fn eflg_loads_from_menu_label() {
+        use crate::server::db_loader::{apply_fields, create_record};
+        let mut rec = create_record("aSub").unwrap();
+        let mut common = Vec::new();
+        apply_fields(&mut rec, &[("EFLG".into(), "ALWAYS".into())], &mut common)
+            .expect("EFLG menu label must load");
+        assert_eq!(rec.get_field("EFLG"), Some(EpicsValue::Short(2)));
+    }
+
+    /// BRSV round-trips as a `menuAlarmSevr` index (C `aSubRecord.c` BRSV,
+    /// the severity used when the subroutine returns a negative status).
+    #[test]
+    fn brsv_round_trips() {
+        let mut rec = ASubRecord::default();
+        assert_eq!(rec.get_field("BRSV"), Some(EpicsValue::Short(0)));
+        rec.put_field("BRSV", EpicsValue::Short(3)).unwrap();
+        assert_eq!(rec.get_field("BRSV"), Some(EpicsValue::Short(3)));
+    }
+
+    /// LFLG/SUBL/ONAM round-trip and default to IGNORE / empty / empty
+    /// (C `aSubRecord.c` defaults; ONAM init-copies the empty SNAM).
+    #[test]
+    fn lflg_subl_onam_round_trip() {
+        let mut rec = ASubRecord::default();
+        assert_eq!(rec.get_field("LFLG"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("SUBL"), Some(EpicsValue::String("".into())));
+        assert_eq!(rec.get_field("ONAM"), Some(EpicsValue::String("".into())));
+
+        rec.put_field("LFLG", EpicsValue::Short(1)).unwrap();
+        rec.put_field("SUBL", EpicsValue::String("HOLDER".into()))
+            .unwrap();
+        rec.put_field("ONAM", EpicsValue::String("prev".into()))
+            .unwrap();
+        assert_eq!(rec.get_field("LFLG"), Some(EpicsValue::Short(1)));
+        assert_eq!(
+            rec.get_field("SUBL"),
+            Some(EpicsValue::String("HOLDER".into()))
+        );
+        assert_eq!(
+            rec.get_field("ONAM"),
+            Some(EpicsValue::String("prev".into()))
+        );
+    }
+
+    /// `field(LFLG,"READ")` resolves via the `menu(aSubLFLG)` labels;
+    /// `field(SUBL,"...")` loads even though SUBL is `special(SPC_NOMOD)`
+    /// (the loader writes through `put_field`, bypassing the runtime gate).
+    #[test]
+    fn lflg_subl_load_from_db() {
+        use crate::server::db_loader::{apply_fields, create_record};
+        let mut rec = create_record("aSub").unwrap();
+        let mut common = Vec::new();
+        apply_fields(
+            &mut rec,
+            &[
+                ("LFLG".into(), "READ".into()),
+                ("SUBL".into(), "NAME_HOLDER".into()),
+            ],
+            &mut common,
+        )
+        .expect("LFLG menu label and SUBL link must load");
+        assert_eq!(rec.get_field("LFLG"), Some(EpicsValue::Short(1)));
+        assert_eq!(
+            rec.get_field("SUBL"),
+            Some(EpicsValue::String("NAME_HOLDER".into()))
+        );
     }
 }

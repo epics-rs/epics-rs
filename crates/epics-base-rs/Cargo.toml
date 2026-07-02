@@ -39,6 +39,9 @@ epics-ca-rs = { path = "../epics-ca-rs" }
 tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+# Test-only: captures the `errlog` `tracing` sink so `tests/stdio_device.rs`
+# can assert the `stdio` "errlog" stream actually printed the record's VAL.
+tracing-subscriber = "0.3"
 
 [features]
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::

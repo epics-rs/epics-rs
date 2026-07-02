@@ -38,6 +38,18 @@ pub fn octet_cstr(s: &str) -> &str {
     }
 }
 
+/// Byte-level twin of [`octet_cstr`]: the prefix of `data` up to the first NUL
+/// byte. C's outbound `stringWrite` publishes `std::string(stringData.data())`
+/// (drvMqtt.cpp:716), built from a `char*`, i.e. the raw bytes up to the first
+/// NUL with no UTF-8 re-encoding. Returns the slice so a non-UTF-8 octet write
+/// reaches the wire byte-for-byte.
+pub fn octet_bytes_cstr(data: &[u8]) -> &[u8] {
+    match data.iter().position(|&b| b == 0) {
+        Some(i) => &data[..i],
+        None => data,
+    }
+}
+
 /// Encode a value for publishing according to the topic address format.
 ///
 /// If `addr.normalize_on_off` is true, string values are normalized
@@ -63,6 +75,11 @@ pub fn encode_flat(value: &DecodedValue) -> String {
         DecodedValue::Int32(v) => v.to_string(),
         // C parity: FLAT scalar float publishes `std::to_string(epicsFloat64)`
         // (drvMqtt.cpp:651), specified as sprintf "%f" — always 6 decimals.
+        // Rust's `{:.6}` matches C for every finite value and for ±inf
+        // ("inf"/"-inf"), but prints "NaN" where glibc "%f" prints lowercase
+        // "nan"; normalise the NaN spelling to match C's wire bytes (the
+        // FLOATARRAY path already lowercases via `format_ostream_double`).
+        DecodedValue::Float64(v) if v.is_nan() => "nan".to_string(),
         DecodedValue::Float64(v) => format!("{v:.6}"),
         DecodedValue::UInt32(v) => v.to_string(),
         DecodedValue::String(v) => v.clone(),
@@ -194,11 +211,11 @@ fn boolean_payload_to_int(s: &str) -> Option<i64> {
 fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
     let trimmed = raw.trim();
     match value_type {
-        // INT/FLOAT/DIGITAL parse the RAW payload: C's isInteger/isFloat
-        // (drvMqtt.cpp:376-401) require the whole string to be digits/number
-        // with no surrounding whitespace, so a payload like "42\n" is rejected
-        // (the prior value is kept), not silently accepted as 42. Rust's
-        // integer/float FromStr rejects leading/trailing whitespace identically.
+        // INT/DIGITAL parse the RAW payload: C's isInteger (drvMqtt.cpp:376-387)
+        // is a hand-rolled digit scan with no whitespace skip, so a payload like
+        // " 42" or "42\n" is rejected (the prior value is kept), not silently
+        // accepted as 42. Rust's integer FromStr rejects surrounding whitespace
+        // identically. FLOAT differs (C uses strtof) -- see its arm below.
         ValueType::Int => {
             if let Some(b) = boolean_payload_to_int(raw) {
                 return Ok(DecodedValue::Int32(b as i32));
@@ -209,7 +226,13 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
             Ok(DecodedValue::Int32(v))
         }
         ValueType::Float => {
+            // C validates floats with isFloat -> strtof (drvMqtt.cpp:393-401),
+            // which SKIPS leading whitespace but requires the parse to reach
+            // end-of-string (trailing whitespace/garbage rejected). So " 4.2"
+            // is a valid 4.2 in C while "4.2 " is refused. trim_start() before
+            // parse() mirrors that: accept leading ws, still reject trailing.
             let v: f64 = raw
+                .trim_start()
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("FLOAT parse: {e}")))?;
             Ok(DecodedValue::Float64(v))
@@ -217,6 +240,16 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
         ValueType::Digital => {
             if let Some(b) = boolean_payload_to_int(raw) {
                 return Ok(DecodedValue::UInt32(b as u32));
+            }
+            // C parity: DIGITAL parses with `isInteger(val, isSigned=false)`
+            // (drvMqtt.cpp:294,376-387), which treats a leading '+'/'-' as a
+            // non-digit and rejects it (only all-digit payloads pass). Rust's
+            // `u32::from_str` rejects '-' but *accepts* a leading '+', so guard
+            // it explicitly to match C's accept set.
+            if raw.starts_with('+') {
+                return Err(MqttError::ValueConversion(
+                    "DIGITAL parse: leading '+' not allowed (unsigned)".into(),
+                ));
             }
             let v: u32 = raw
                 .parse()
@@ -264,7 +297,7 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
     }
     let carrier = match value {
         serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => dump_sorted(other),
     };
 
     // Octet/String is C's one non-parsing arm: `setStringParam(val)` uses
@@ -276,6 +309,38 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
     decode_flat(&carrier, value_type)
 }
 
+/// Serialize a JSON value the way C's `fieldAddr->dump()` does (drvMqtt.cpp:265):
+/// compact, with object keys in **sorted** order at every level, because
+/// nlohmann's `json` is backed by a `std::map` (drvMqtt.h:19). serde_json with
+/// the `preserve_order` feature — which the shipped IOC build links transitively
+/// via `epics-base-rs` — would otherwise emit keys in document order, so a JSON
+/// object/array carrier on a STRING topic stored different bytes than C. Rebuild
+/// the value with sorted keys first, then serialize. Scalars are unaffected (the
+/// rebuild clones them), so only composite carriers change.
+fn dump_sorted(value: &serde_json::Value) -> String {
+    fn sort_value(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                // With `preserve_order`, `Map` is an `IndexMap` that keeps
+                // insertion order, so inserting in sorted order yields sorted
+                // output; without it `Map` is a `BTreeMap` (already sorted).
+                let sorted: serde_json::Map<String, serde_json::Value> = entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), sort_value(v)))
+                    .collect();
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(elems) => {
+                serde_json::Value::Array(elems.iter().map(sort_value).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    sort_value(value).to_string()
+}
+
 /// Recursively search for `target_key` anywhere in the JSON value,
 /// depth-first, first match wins.
 ///
@@ -285,16 +350,26 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
 /// like `a.b` is one literal key (C parses jsonField as the entire
 /// arguments-remainder, drvMqtt.cpp:92), never a dot-separated path. At
 /// each object level the key is checked before recursing into its value,
-/// so traversal order mirrors C; serde_json's default `Map` is a sorted
-/// `BTreeMap`, matching nlohmann's default sorted `std::map` iteration.
+/// and keys are visited in SORTED order to mirror C's iteration (see the
+/// `Object` arm).
 fn extract_json_field<'a>(
     json: &'a serde_json::Value,
     target_key: &str,
 ) -> Option<&'a serde_json::Value> {
     match json {
         serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                if key == target_key {
+            // C `findJsonField` iterates an `nlohmann::json` object whose
+            // default backing is a sorted `std::map` (drvMqtt.h:19
+            // `using json = nlohmann::json`), so keys are visited in sorted
+            // order, each checked before descending into its value. serde_json's
+            // `Map` is an `IndexMap` (document order) whenever `preserve_order`
+            // is enabled — which the shipped IOC build is, transitively via
+            // `epics-base-rs` — so iterate a sorted key view to reproduce C's
+            // order deterministically, independent of the linked feature set.
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in entries {
+                if key.as_str() == target_key {
                     return Some(value);
                 }
                 if let Some(found) = extract_json_field(value, target_key) {
@@ -319,27 +394,70 @@ fn extract_json_field<'a>(
 /// Also handles bracket-wrapped arrays like `[1,2,3]`.
 fn parse_int_array(s: &str) -> MqttResult<Vec<i32>> {
     let s = s.trim_start_matches('[').trim_end_matches(']');
-    let separator = if s.contains(',') { ',' } else { ' ' };
-    s.split(separator)
-        .map(|part| {
-            part.trim()
-                .parse::<i32>()
-                .map_err(|e| MqttError::ValueConversion(format!("INTARRAY element: {e}")))
-        })
-        .collect()
+    let out: MqttResult<Vec<i32>> = if s.contains(',') {
+        // First-seen comma locks the comma separator (C drvMqtt.cpp:473); a
+        // comma skips trailing spaces (`:481-483`), so trim each element. A
+        // double comma leaves an empty element that fails to parse — rejected,
+        // matching C. The `"1 ,2"` leniency (space-then-comma) is kept.
+        s.split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<i32>()
+                    .map_err(|e| MqttError::ValueConversion(format!("INTARRAY element: {e}")))
+            })
+            .collect()
+    } else {
+        // Space separator: C skips a *run* of whitespace between numbers
+        // (loop-top `while isspace` skip, drvMqtt.cpp:447), so `"1  2"` is
+        // `[1,2]`. `split_whitespace` collapses consecutive whitespace and
+        // ignores leading/trailing, reproducing that (vs `split(' ')`, which
+        // emitted an empty element on a double space and rejected the value).
+        s.split_whitespace()
+            .map(|part| {
+                part.parse::<i32>()
+                    .map_err(|e| MqttError::ValueConversion(format!("INTARRAY element: {e}")))
+            })
+            .collect()
+    };
+    let out = out?;
+    if out.is_empty() {
+        // C rejects an empty / all-whitespace / `"[]"` payload
+        // (drvMqtt.cpp:428,444,448); never yield an empty array.
+        return Err(MqttError::ValueConversion("INTARRAY: empty value".into()));
+    }
+    Ok(out)
 }
 
 /// Parse a comma-separated or space-separated list of floats.
 fn parse_float_array(s: &str) -> MqttResult<Vec<f64>> {
     let s = s.trim_start_matches('[').trim_end_matches(']');
-    let separator = if s.contains(',') { ',' } else { ' ' };
-    s.split(separator)
-        .map(|part| {
-            part.trim()
-                .parse::<f64>()
-                .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
-        })
-        .collect()
+    let out: MqttResult<Vec<f64>> = if s.contains(',') {
+        // First-seen comma locks the comma separator (C drvMqtt.cpp:550); see
+        // `parse_int_array` for the comma/double-comma/`"1 ,2"` rationale.
+        s.split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<f64>()
+                    .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
+            })
+            .collect()
+    } else {
+        // Space separator collapses whitespace runs (C drvMqtt.cpp:532); see
+        // `parse_int_array`.
+        s.split_whitespace()
+            .map(|part| {
+                part.parse::<f64>()
+                    .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
+            })
+            .collect()
+    };
+    let out = out?;
+    if out.is_empty() {
+        // C rejects an empty / all-whitespace / `"[]"` payload
+        // (drvMqtt.cpp:511,527,533); never yield an empty array.
+        return Err(MqttError::ValueConversion("FLOATARRAY: empty value".into()));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -379,12 +497,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_flat_float_digital_whitespace_rejected() {
+    fn decode_flat_float_leading_ws_ok_trailing_rejected() {
+        // C isFloat -> strtof (drvMqtt.cpp:393-401) skips leading whitespace
+        // but requires whole-string consumption: " 4.2" is a valid 4.2, while
+        // "4.2\n"/"4.2 " (trailing) are refused and the prior VAL kept.
         let f = TopicAddress::parse("FLAT:FLOAT test/t").unwrap();
+        assert_eq!(
+            decode_payload(" 4.2", &f).unwrap(),
+            DecodedValue::Float64(4.2)
+        );
         assert!(decode_payload("4.2\n", &f).is_err());
-        assert!(decode_payload(" 4.2", &f).is_err());
+        assert!(decode_payload("4.2 ", &f).is_err());
+        // DIGITAL uses isInteger (no ws skip), so any surrounding ws is refused.
         let d = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
         assert!(decode_payload("7 ", &d).is_err());
+        assert!(decode_payload(" 7", &d).is_err());
     }
 
     #[test]
@@ -399,6 +526,19 @@ mod tests {
         let addr = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
         let val = decode_payload("255", &addr).unwrap();
         assert_eq!(val, DecodedValue::UInt32(255));
+    }
+
+    /// C parity: DIGITAL uses `isInteger(val, isSigned=false)` (drvMqtt.cpp:294),
+    /// so a leading sign is a non-digit and the payload is rejected. Rust's
+    /// `u32::from_str` accepts a leading '+', so it must be guarded out.
+    #[test]
+    fn decode_flat_digital_rejects_leading_plus() {
+        let addr = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
+        assert!(decode_payload("+5", &addr).is_err());
+        // '-5' is rejected by u32::from_str already; confirm it stays rejected.
+        assert!(decode_payload("-5", &addr).is_err());
+        // A plain unsigned digit string still decodes.
+        assert_eq!(decode_payload("5", &addr).unwrap(), DecodedValue::UInt32(5));
     }
 
     #[test]
@@ -447,6 +587,57 @@ mod tests {
         assert_eq!(val, DecodedValue::Float64Array(vec![1.1, 2.2, 3.3]));
     }
 
+    /// MQ32: a space separator collapses a run of whitespace between numbers,
+    /// matching C's loop-top `while isspace` skip (drvMqtt.cpp:447). `split(' ')`
+    /// previously emitted an empty element on a double space and rejected the
+    /// value — a Rust-worse-than-C regression.
+    #[test]
+    fn decode_flat_int_array_double_space() {
+        let addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
+        assert_eq!(
+            decode_payload("1  2", &addr).unwrap(),
+            DecodedValue::Int32Array(vec![1, 2])
+        );
+        // Inside brackets too, after the bracket strip.
+        assert_eq!(
+            decode_payload("[1   2   3]", &addr).unwrap(),
+            DecodedValue::Int32Array(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn decode_flat_float_array_double_space() {
+        let addr = TopicAddress::parse("FLAT:FLOATARRAY test/t").unwrap();
+        assert_eq!(
+            decode_payload("1.5   2.5", &addr).unwrap(),
+            DecodedValue::Float64Array(vec![1.5, 2.5])
+        );
+    }
+
+    /// MQ32: collapsing whitespace must NOT turn an empty / all-whitespace /
+    /// `"[]"` payload into an empty array — C rejects those (drvMqtt.cpp:428,
+    /// 444,448 for ints; :511,527,533 for floats).
+    #[test]
+    fn decode_flat_array_empty_is_rejected() {
+        let int_addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
+        assert!(decode_payload("", &int_addr).is_err());
+        assert!(decode_payload("   ", &int_addr).is_err());
+        assert!(decode_payload("[]", &int_addr).is_err());
+        assert!(decode_payload("[ ]", &int_addr).is_err());
+        let flt_addr = TopicAddress::parse("FLAT:FLOATARRAY test/t").unwrap();
+        assert!(decode_payload("", &flt_addr).is_err());
+        assert!(decode_payload("[]", &flt_addr).is_err());
+    }
+
+    /// MQ32: the comma branch is unchanged — a double comma still rejects
+    /// (empty element fails to parse, matching C's strictness), so the fix did
+    /// not loosen the comma path.
+    #[test]
+    fn decode_flat_int_array_double_comma_still_rejected() {
+        let addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
+        assert!(decode_payload("1,,2", &addr).is_err());
+    }
+
     #[test]
     fn decode_flat_invalid_int() {
         let addr = TopicAddress::parse("FLAT:INT test/t").unwrap();
@@ -478,6 +669,20 @@ mod tests {
         let addr = TopicAddress::parse("JSON:FLOAT device/data c").unwrap();
         let val = decode_payload(r#"{"a": {"b": {"c": 9.99}}}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::Float64(9.99));
+    }
+
+    #[test]
+    fn decode_json_field_search_is_sorted_order() {
+        // C `findJsonField` iterates a sorted `std::map` (drvMqtt.h:19), so a
+        // key that recurs at two depths resolves in C's sorted-DFS order, NOT
+        // document order. For target `value` in `{"value":1,"data":{"value":2}}`
+        // the sorted top-level keys are [`data`, `value`]; C descends `data`
+        // first and returns the nested 2 before ever reaching the top `value`.
+        // Document-order iteration (serde_json `preserve_order`, the IOC build)
+        // would wrongly return 1 — this pins the build-independent sorted order.
+        let addr = TopicAddress::parse("JSON:INT dev/data value").unwrap();
+        let val = decode_payload(r#"{"value": 1, "data": {"value": 2}}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32(2));
     }
 
     #[test]
@@ -520,6 +725,42 @@ mod tests {
         let addr = TopicAddress::parse("JSON:STRING device/data count").unwrap();
         let val = decode_payload(r#"{"count": 42}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::String("42".into()));
+    }
+
+    /// MQ40: a JSON field resolving to an object/array on a STRING topic is
+    /// stored as C's `dump()` does — compact with object keys SORTED at every
+    /// level (nlohmann std::map backing, drvMqtt.cpp:265) — not in serde
+    /// document order.
+    #[test]
+    fn decode_json_object_carrier_keys_sorted() {
+        let addr = TopicAddress::parse("JSON:STRING dev/data obj").unwrap();
+        // Document order is b,a but the stored carrier must be sorted a,b.
+        let val = decode_payload(r#"{"obj": {"b": 1, "a": 2}}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::String(r#"{"a":2,"b":1}"#.into()));
+    }
+
+    #[test]
+    fn decode_json_nested_object_carrier_keys_sorted() {
+        let addr = TopicAddress::parse("JSON:STRING dev/data obj").unwrap();
+        // Sorting is recursive: the nested object's keys sort too.
+        let val = decode_payload(r#"{"obj": {"b": {"d": 1, "c": 2}, "a": 3}}"#, &addr).unwrap();
+        assert_eq!(
+            val,
+            DecodedValue::String(r#"{"a":3,"b":{"c":2,"d":1}}"#.into())
+        );
+    }
+
+    #[test]
+    fn decode_json_array_of_objects_carrier_keys_sorted() {
+        let addr = TopicAddress::parse("JSON:STRING dev/data arr").unwrap();
+        // Objects nested inside an array carrier are sorted too; array element
+        // order is preserved.
+        let val =
+            decode_payload(r#"{"arr": [{"y": 1, "x": 2}, {"b": 3, "a": 4}]}"#, &addr).unwrap();
+        assert_eq!(
+            val,
+            DecodedValue::String(r#"[{"x":2,"y":1},{"a":4,"b":3}]"#.into())
+        );
     }
 
     #[test]

@@ -92,6 +92,20 @@ pub const HSC_ERROR_MESSAGES: [&str; 14] = [
     "Invalid Motor Specified",
 ];
 
+/// Classify a controller `ERROR;` response into `(error_code, message)`,
+/// matching C's `numWords`-based handling (xia_slit.st:1253-1262): a code-less
+/// `ERROR;` (`None`) reports `ERROR_UNKNOWN` with "<id>: unknown error", while a
+/// code present in the 0..13 table reports that code and its `hscErrors[]` text.
+/// An out-of-table code also maps to `ERROR_UNKNOWN` (C indexes `hscErrors[]`
+/// unguarded there — a C boundary bug we deliberately do not copy). Shared by
+/// both HSC ports so they cannot disagree on the code-less case.
+pub fn classify_hsc_error(code: Option<i32>, id: &str) -> (i32, String) {
+    match code {
+        Some(c) if (0..14).contains(&c) => (c, HSC_ERROR_MESSAGES[c as usize].to_string()),
+        _ => (ERROR_UNKNOWN, format!("{id}: unknown error")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HSC1 Control/Status Word bits
 // ---------------------------------------------------------------------------
@@ -376,35 +390,37 @@ pub fn dial_to_raw(dial: f64, origin: i32) -> i32 {
 
 /// Validate an HSC module ID string.
 ///
-/// Valid formats: `XIAHSC-C-NNNN`, `C-NNNN`, or `CNNNN`
-/// where C is a letter and NNNN is a number.
-pub fn validate_hsc_id(id: &str) -> bool {
+/// C tries `sscanf` against `XIAHSC-%c-%d` then `%c-%d` (both hyphenated). When
+/// `allow_bare` is set it also accepts the hyphen-less `%c%d` (CNNNN) form: only
+/// xia_slit has that third `sscanf` (xia_slit.st:681); xiahsc has just the two
+/// hyphenated forms (xiahsc.st:444-449), so it must pass `allow_bare = false`.
+/// The `XIAHSC-` prefix path always requires the inner hyphen (C format 1).
+pub fn validate_hsc_id(id: &str, allow_bare: bool) -> bool {
     if id.is_empty() {
         return false;
     }
-    // Try XIAHSC-C-NNNN
+    // Format 1: "XIAHSC-C-NNNN" — the inner "C-NNNN" is always hyphenated.
     if let Some(rest) = id.strip_prefix("XIAHSC-") {
-        return parse_id_suffix(rest);
+        return parse_id_suffix(rest, false);
     }
-    // Try C-NNNN
-    parse_id_suffix(id)
+    // Format 2: "C-NNNN" (always); Format 3: "CNNNN" (xia_slit only).
+    parse_id_suffix(id, allow_bare)
 }
 
-/// Parse the `C-NNNN` or `CNNNN` portion of an HSC ID.
-fn parse_id_suffix(s: &str) -> bool {
+/// Parse the `C-NNNN` (always) or `CNNNN` (only when `allow_bare`) portion.
+fn parse_id_suffix(s: &str, allow_bare: bool) -> bool {
     let mut chars = s.chars();
-    let first = match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => c,
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
         _ => return false,
     };
     let rest: String = chars.collect();
     // With hyphen: C-NNNN
     if let Some(num_str) = rest.strip_prefix('-') {
-        return num_str.parse::<i32>().is_ok() && !num_str.is_empty();
+        return !num_str.is_empty() && num_str.parse::<i32>().is_ok();
     }
-    // Without hyphen: CNNNN
-    let _ = first; // already consumed
-    rest.parse::<i32>().is_ok() && !rest.is_empty()
+    // Without hyphen: CNNNN — only valid where the bare form is allowed.
+    allow_bare && !rest.is_empty() && rest.parse::<i32>().is_ok()
 }
 
 /// Decode the HSC control/status word into individual flags.
@@ -951,13 +967,8 @@ impl HscController {
                 }
             }
             HscResponse::Error { id, code } => {
-                let code_val = code.unwrap_or(0);
-                let msg = if (0..14).contains(&code_val) {
-                    HSC_ERROR_MESSAGES[code_val as usize].to_string()
-                } else {
-                    format!("{}: unknown error", id)
-                };
-                self.error = code.unwrap_or(ERROR_UNKNOWN);
+                let (err, msg) = classify_hsc_error(*code, id);
+                self.error = err;
                 self.error_msg = msg;
                 // Mark the axis as idle on error
                 if id == &self.h_id {
@@ -1130,14 +1141,14 @@ pub async fn run<R, W>(
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
-                if !validate_hsc_id(&ctrl.h_id) {
+                if !validate_hsc_id(&ctrl.h_id, false) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "H ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
-                if !validate_hsc_id(&ctrl.v_id) {
+                if !validate_hsc_id(&ctrl.v_id, false) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "V ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
@@ -1821,18 +1832,32 @@ mod tests {
 
     #[test]
     fn valid_hsc_ids() {
-        assert!(validate_hsc_id("XIAHSC-H-1234"));
-        assert!(validate_hsc_id("H-1234"));
-        assert!(validate_hsc_id("V-5678"));
-        assert!(validate_hsc_id("A1234"));
+        // Hyphenated forms are valid in both ports.
+        for allow_bare in [false, true] {
+            assert!(validate_hsc_id("XIAHSC-H-1234", allow_bare));
+            assert!(validate_hsc_id("H-1234", allow_bare));
+            assert!(validate_hsc_id("V-5678", allow_bare));
+        }
+    }
+
+    #[test]
+    fn bare_id_only_valid_for_xia_slit() {
+        // The hyphen-less CNNNN form is xia_slit's third sscanf only
+        // (xia_slit.st:681); xiahsc (xiahsc.st:444-449) rejects it.
+        assert!(validate_hsc_id("A1234", true));
+        assert!(!validate_hsc_id("A1234", false));
+        // The XIAHSC- prefix always requires the inner hyphen (C format 1).
+        assert!(!validate_hsc_id("XIAHSC-A1234", true));
     }
 
     #[test]
     fn invalid_hsc_ids() {
-        assert!(!validate_hsc_id(""));
-        assert!(!validate_hsc_id("1234"));
-        assert!(!validate_hsc_id("-1234"));
-        assert!(!validate_hsc_id("H-"));
+        for allow_bare in [false, true] {
+            assert!(!validate_hsc_id("", allow_bare));
+            assert!(!validate_hsc_id("1234", allow_bare));
+            assert!(!validate_hsc_id("-1234", allow_bare));
+            assert!(!validate_hsc_id("H-", allow_bare));
+        }
     }
 
     // -- Control/Status Word tests --
@@ -1942,6 +1967,26 @@ mod tests {
         assert!(!ctrl.h_busy);
         assert_eq!(ctrl.error, 6);
         assert_eq!(ctrl.error_msg, "Value Out of Range");
+    }
+
+    #[test]
+    fn classify_hsc_error_codeless_is_unknown_not_index_zero() {
+        // Code-less "ERROR;" -> ERROR_UNKNOWN + "<id>: unknown error"
+        // (xia_slit.st:1253-1256), NOT error 0 / "Missing Command".
+        assert_eq!(
+            classify_hsc_error(None, "H-1"),
+            (ERROR_UNKNOWN, "H-1: unknown error".to_string())
+        );
+        // In-table code -> that code + its hscErrors[] text.
+        assert_eq!(
+            classify_hsc_error(Some(9), "H-1"),
+            (9, "No Movement Required".to_string())
+        );
+        // Out-of-table code -> ERROR_UNKNOWN (no unguarded index like C).
+        assert_eq!(
+            classify_hsc_error(Some(14), "V-1"),
+            (ERROR_UNKNOWN, "V-1: unknown error".to_string())
+        );
     }
 
     #[test]

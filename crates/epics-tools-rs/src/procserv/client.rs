@@ -130,12 +130,47 @@ pub fn spawn_client(
     let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(64);
 
     match incoming.stream {
-        ClientStream::Tcp(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
+        ClientStream::Tcp(s) => {
+            // C enables SO_KEEPALIVE on every accepted client socket
+            // (clientFactory.cc:146) so a silently-dropped peer (cable
+            // pull) is eventually surfaced as a write error instead of
+            // pending forever. UNIX sockets have no meaningful keepalive,
+            // so this is TCP-only, as in C.
+            set_keepalive(&s);
+            spawn_split(s, id, incoming.readonly, inbound_tx, out_rx)
+        }
         #[cfg(unix)]
         ClientStream::Unix(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
     }
 
     (meta, out_tx)
+}
+
+/// Enable `SO_KEEPALIVE` on a TCP client socket (C `clientFactory.cc:146`).
+/// tokio's `TcpStream` exposes no keepalive setter, so go through the raw
+/// fd. A failure is logged and tolerated — keepalive is a liveness
+/// optimization, not a correctness requirement.
+fn set_keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: `stream` owns a valid open socket fd for the duration of the
+    // borrow; `setsockopt` with a `c_int` optval is the standard
+    // SO_KEEPALIVE call and does not retain the pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            std::ptr::addr_of!(on).cast(),
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "procserv-rs: SO_KEEPALIVE failed"
+        );
+    }
 }
 
 /// Generic helper that splits any AsyncRead+AsyncWrite stream and
@@ -160,18 +195,25 @@ fn spawn_split<S>(
             match reader.read(&mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
+                    // A logger (readonly) client's input never reaches the
+                    // telnet state machine: C only calls `telnet_recv` for
+                    // `!_readonly` (clientFactory.cc:192). We still read (to
+                    // detect EOF/disconnect) but discard the bytes without
+                    // parsing, so a logger that sends IAC gets no telnet
+                    // replies and no data is forwarded (PS-38).
+                    if readonly {
+                        continue;
+                    }
                     for ev in parser.feed(&buf[..n]) {
                         match ev {
                             TelnetEvent::Data(d) => {
-                                if !readonly
-                                    && inbound
-                                        .send((id, InboundEvent::Data { bytes: d }))
-                                        .await
-                                        .is_err()
+                                if inbound
+                                    .send((id, InboundEvent::Data { bytes: d }))
+                                    .await
+                                    .is_err()
                                 {
                                     return;
                                 }
-                                // readonly: silently discard
                             }
                             TelnetEvent::Reply(r) => {
                                 if inbound
@@ -194,19 +236,13 @@ fn spawn_split<S>(
         let _ = inbound.send((id, InboundEvent::Disconnected)).await;
     });
 
-    // Write task: drain outbound_rx → IAC-escape → socket.
+    // Write task: drain outbound_rx → IAC-escape → socket. The telnet
+    // negotiation is NOT a write-task prelude — C writes the greeting/info
+    // banner first and only then calls `telnet_negotiate`
+    // (clientFactory.cc:153-174), so the supervisor enqueues the banner
+    // `Bytes` frame followed by the negotiation `RawIac` frame (PS-26).
+    // This loop just drains them in order.
     tokio::spawn(async move {
-        // Send initial IAC negotiation as the first thing the peer
-        // sees, mirroring C `clientItem::clientItem` end-of-ctor calls
-        // to telnet_negotiate.
-        let init = crate::procserv::telnet::initial_negotiation();
-        if writer.write_all(&init).await.is_err() {
-            return;
-        }
-        if writer.flush().await.is_err() {
-            return;
-        }
-
         while let Some(frame) = outbound_rx.recv().await {
             match frame {
                 OutboundFrame::Bytes(b) => {
@@ -249,6 +285,30 @@ mod tests {
         (server, client)
     }
 
+    /// PS-25: `set_keepalive` must actually set `SO_KEEPALIVE` on the
+    /// socket. Read it back with `getsockopt`.
+    #[tokio::test]
+    async fn set_keepalive_enables_so_keepalive() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = paired_streams().await;
+        set_keepalive(&server);
+
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid fd, correctly-sized optval/optlen out-params.
+        let rc = unsafe {
+            libc::getsockopt(
+                server.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of_mut!(val).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed");
+        assert_ne!(val, 0, "SO_KEEPALIVE not enabled");
+    }
+
     #[tokio::test]
     async fn read_data_propagates_inbound_event() {
         let (server, mut client) = paired_streams().await;
@@ -262,11 +322,10 @@ mod tests {
             in_tx,
         );
 
-        // The client first sees the server's negotiation handshake;
-        // skip past it.
-        let mut neg = [0u8; 6];
-        client.read_exact(&mut neg).await.unwrap();
-
+        // The write task no longer emits a negotiation prelude (PS-26:
+        // the supervisor enqueues the banner then the IAC frame); a raw
+        // `spawn_client` sends nothing until a frame is queued, so there
+        // is nothing to skip here.
         client.write_all(b"hi\n").await.unwrap();
         let event = timeout(Duration::from_secs(1), in_rx.recv())
             .await
@@ -292,13 +351,65 @@ mod tests {
             in_tx,
         );
 
-        let mut neg = [0u8; 6];
-        client.read_exact(&mut neg).await.unwrap();
         client.write_all(b"ignored\n").await.unwrap();
 
         // No Data event should arrive; allow up to 200ms.
         let res = timeout(Duration::from_millis(200), in_rx.recv()).await;
         assert!(res.is_err(), "readonly client must not produce Data events");
+    }
+
+    /// PS-38: a readonly (logger) client's input never reaches the telnet
+    /// state machine, so an IAC negotiation it sends gets no reply — C only
+    /// runs `telnet_recv` for `!_readonly` (clientFactory.cc:192). The same
+    /// bytes DO produce a reply on a control client, proving the readonly
+    /// gate is what suppresses it (not inert input).
+    #[tokio::test]
+    async fn readonly_client_telnet_negotiation_gets_no_reply() {
+        // IAC DO <unsupported opt 0x42> — a control client replies WONT.
+        const IAC_DO_UNSUPPORTED: &[u8] = &[0xFF, 0xFD, 0x42];
+
+        // Control client: the negotiation yields a TelnetReply.
+        {
+            let (server, mut client) = paired_streams().await;
+            let (in_tx, mut in_rx) = mpsc::channel(8);
+            let (_meta, _out_tx) = spawn_client(
+                IncomingClient {
+                    stream: ClientStream::Tcp(server),
+                    peer: ClientPeer::Tcp("127.0.0.1:1".parse().unwrap()),
+                    readonly: false,
+                },
+                in_tx,
+            );
+            client.write_all(IAC_DO_UNSUPPORTED).await.unwrap();
+            let event = timeout(Duration::from_secs(1), in_rx.recv())
+                .await
+                .expect("control client should reply to IAC")
+                .unwrap();
+            assert!(
+                matches!(event, (_, InboundEvent::TelnetReply { .. })),
+                "control client must produce a telnet reply, got {event:?}"
+            );
+        }
+
+        // Readonly client: the same bytes produce nothing.
+        {
+            let (server, mut client) = paired_streams().await;
+            let (in_tx, mut in_rx) = mpsc::channel(8);
+            let (_meta, _out_tx) = spawn_client(
+                IncomingClient {
+                    stream: ClientStream::Tcp(server),
+                    peer: ClientPeer::Tcp("127.0.0.1:1".parse().unwrap()),
+                    readonly: true,
+                },
+                in_tx,
+            );
+            client.write_all(IAC_DO_UNSUPPORTED).await.unwrap();
+            let res = timeout(Duration::from_millis(200), in_rx.recv()).await;
+            assert!(
+                res.is_err(),
+                "readonly client must not produce a telnet reply"
+            );
+        }
     }
 
     #[tokio::test]
@@ -314,10 +425,8 @@ mod tests {
             in_tx,
         );
 
-        // Skip the negotiation handshake.
-        let mut neg = [0u8; 6];
-        client.read_exact(&mut neg).await.unwrap();
-
+        // No negotiation prelude (PS-26): the first bytes on the wire are
+        // this payload, IAC-escaped.
         // Send a payload containing a literal 0xFF — must be doubled
         // on the wire.
         out_tx

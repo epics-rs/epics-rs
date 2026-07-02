@@ -305,7 +305,12 @@ impl PvaLinkConfig {
                 }
                 "MS" => cfg.sevr = SevrMode::Ms,
                 "MSI" => cfg.sevr = SevrMode::Msi,
-                "MSS" => cfg.sevr = SevrMode::Ms, // MSS == MS at our granularity
+                // pvxs aliases MSS onto MS itself, not a Rust limitation:
+                // its `sevr` enum has no MSS variant (pvalink.h:83-86) and
+                // the string parser maps it explicitly (pvalink_jlif.cpp:179-183,
+                // "not sure how to handle mapping severity for MSS … handling as
+                // alias for MS until then"). Exact parity, not coarse granularity.
+                "MSS" => cfg.sevr = SevrMode::Ms,
                 "NMS" => cfg.sevr = SevrMode::Nms,
                 _ => {}
             }

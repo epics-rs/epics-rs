@@ -86,6 +86,67 @@ async fn put_then_get_round_trips_double() {
     assert!(matches!(value, PvField::Scalar(ScalarValue::Double(v)) if (*v - 7.5).abs() < 1e-9));
 }
 
+/// pvxs `IOCSource::doPreProcessing` parity (iocsource.cpp:363-375,
+/// invoked from singlesource.cpp:354-356): a QSRV put to a `DISP=1`
+/// record is rejected in *every* process mode, before any write. The
+/// `Force` (process=true) and `Inhibit` (process=false) routes go
+/// through `put_pv`, which does not itself gate DISP, so without the
+/// boundary gate they would write/process a record an operator has
+/// frozen — a safety-interlock bypass reachable via a standard
+/// `record._options.process` pvRequest option.
+#[tokio::test]
+async fn disp_disabled_record_rejects_put_in_every_process_mode() {
+    use epics_bridge_rs::qsrv::{ProcessMode, PutOptions};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:ai_disp", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    // Operator freezes the record: DISP=1 (set through the internal
+    // `put_pv`, which by design does not gate DISP).
+    db.put_pv("TEST:ai_disp.DISP", EpicsValue::Char(1))
+        .await
+        .unwrap();
+
+    let ch = BridgeChannel::from_cached(
+        db.clone(),
+        "TEST:ai_disp".into(),
+        "TEST:ai_disp".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Double,
+    );
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(9.0))));
+
+    for mode in [
+        ProcessMode::Passive,
+        ProcessMode::Force,
+        ProcessMode::Inhibit,
+    ] {
+        let opts = PutOptions {
+            process: mode,
+            block: false,
+        };
+        let err = ch
+            .put_with_options(&put, opts)
+            .await
+            .expect_err("DISP=1 must reject the put in every process mode");
+        assert!(
+            err.to_string().to_lowercase().contains("disabled")
+                || err.to_string().to_lowercase().contains("disp"),
+            "expected a DISP rejection, got: {err}"
+        );
+    }
+
+    // No write leaked through any mode — the frozen VAL is unchanged.
+    let result = ch.get(&empty_request()).await.expect("get");
+    let value = extract_value(&result).expect("NTScalar.value");
+    assert!(matches!(value, PvField::Scalar(ScalarValue::Double(v)) if (*v - 1.0).abs() < 1e-9));
+}
+
 /// pvxs `testGetPut64` parity: 64-bit integer round-trip through a
 /// long record (the record-side coercion drops to i32 internally,
 /// but the Rust path encodes as Long → EpicsValue::Long, so we

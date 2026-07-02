@@ -378,7 +378,8 @@ pub struct AlarmFields {
 pub struct TimingFields {
     pub dly: f64,
     pub ntm: bool,
-    pub ntmf: f64,
+    /// C motorRecord.dbd:789 — NTMF is DBF_USHORT, not a float.
+    pub ntmf: u16,
 }
 
 impl Default for TimingFields {
@@ -386,7 +387,7 @@ impl Default for TimingFields {
         Self {
             dly: 0.0,
             ntm: true,
-            ntmf: 2.0,
+            ntmf: 2,
         }
     }
 }

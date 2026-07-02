@@ -53,9 +53,10 @@ impl Default for DeviceState {
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
+use crate::interfaces::InterfaceType;
 use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
 use crate::interrupt::{InterruptManager, InterruptValue};
-use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType};
+use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
 use crate::user::AsynUser;
 
@@ -749,6 +750,9 @@ impl PortDriverBase {
                 aux_status,
                 alarm_status,
                 alarm_severity,
+                // Untyped: a single cached value per (reason,addr) reaches
+                // every subscribing interface (the pre-per-interface path).
+                iface: None,
             });
         }
         Ok(())
@@ -790,6 +794,8 @@ impl PortDriverBase {
                 aux_status,
                 alarm_status,
                 alarm_severity,
+                // Untyped (see `call_param_callbacks`).
+                iface: None,
             });
         }
         Ok(())
@@ -801,6 +807,79 @@ impl PortDriverBase {
     /// `read_*_array()` overrides rather than the param cache (e.g. pixel data).
     pub fn mark_param_changed(&mut self, index: usize, addr: i32) -> AsynResult<()> {
         self.params.mark_changed(index, addr)
+    }
+
+    /// Fire one per-interface I/O Intr callback carrying an interface-typed value.
+    ///
+    /// `call_param_callbacks` stores **one** value per `(reason, addr)` and
+    /// notifies it untyped, so every record on that reason — whatever its DTYP's
+    /// interface — receives the same value. For a driver whose single raw datum
+    /// is exposed on several asyn interfaces at once (e.g. a Modbus register read
+    /// by an `asynInt32` ai, an `asynUInt32Digital` bi, and an `asynFloat64` ai
+    /// simultaneously), that collapse delivers a wrong-typed value to all but one
+    /// of them. C's `drvModbusAsyn::readPoller` instead decodes the one register
+    /// block **separately per interface** and invokes each interface's own
+    /// interrupt list (`int32`/`uInt32Digital`/`float64`,
+    /// drvModbusAsyn.cpp:1706/1736/1808). This is the analogue: the driver
+    /// decodes per interface and fires each value tagged with its `iface`, so the
+    /// interrupt filter routes it only to records on that interface
+    /// ([`InterruptFilter::iface`]). `uint32_changed_mask` is the changed-bit
+    /// mask for the `UInt32Digital` interface (a record's `@asynMask` gates on it,
+    /// `asynPortDriver.cpp:720`); pass `0` for the other interfaces, whose
+    /// subscribers carry no mask filter.
+    pub fn notify_interface_value(
+        &self,
+        reason: usize,
+        addr: i32,
+        iface: InterfaceType,
+        value: ParamValue,
+        uint32_changed_mask: u32,
+    ) {
+        let ts = self.current_timestamp();
+        self.interrupts.notify(InterruptValue {
+            reason,
+            addr,
+            value,
+            timestamp: ts,
+            uint32_changed_mask,
+            // A successful per-interface decode (the caller fires only after the
+            // raw read succeeded); a transport failure aborts the poll before
+            // any fire, matching C's `if (ioStatus_) ... return` in readPoller.
+            aux_status: AsynStatus::Success,
+            alarm_status: 0,
+            alarm_severity: 0,
+            iface: Some(iface),
+        });
+    }
+}
+
+/// Result of resolving a record's driver-info string at bind time — the
+/// asyn-rs analogue of what C `drvUserCreate` writes into `pasynUser`.
+///
+/// `reason` is the shared parameter index (every record with the same drvInfo
+/// resolves to it). The remaining fields carry **per-record** driver state the
+/// lookup derived from this particular drvInfo string (C stashes the same in
+/// `pasynUser->drvUser`), which the binding applies to that record's I/O.
+#[derive(Debug, Default)]
+pub struct DrvUserInfo {
+    /// Shared parameter index for this drvInfo (C `pasynUser->reason`).
+    pub reason: usize,
+    /// Optional per-record octet length cap — the asyn-rs home for C's
+    /// `modbusDrvUser_t.len` (`drvUserCreate` parses `TYPE=N`; `getStringLen`
+    /// caps the asyn octet `maxLen` to it, drvModbusAsyn.cpp:2367-2377). `None`
+    /// when the drvInfo carried no cap; the binding then uses the record buffer
+    /// length alone. The binding applies `min(buffer_len, cap)`.
+    pub max_octet_len: Option<usize>,
+}
+
+impl DrvUserInfo {
+    /// A resolution carrying only the shared reason and no per-record cap — the
+    /// default-lookup result.
+    pub fn from_reason(reason: usize) -> Self {
+        Self {
+            reason,
+            ..Self::default()
+        }
     }
 }
 
@@ -976,12 +1055,13 @@ pub trait PortDriver: Send + Sync + 'static {
         Ok(n)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let s = String::from_utf8_lossy(data).into_owned();
         self.base_mut()
             .params
             .set_string(user.reason, user.addr, s)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        self.base_mut().call_param_callbacks(user.addr)?;
+        Ok(data.len())
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
@@ -1191,7 +1271,7 @@ pub trait PortDriver: Send + Sync + 'static {
         Ok((n, eom))
     }
 
-    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.write_octet(user, data)
     }
 
@@ -1268,7 +1348,14 @@ pub trait PortDriver: Send + Sync + 'static {
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        self.base_mut().input_eos = eos.to_vec();
+        // Single write owner for input EOS: `base.input_eos` is the
+        // queryable cache (`get_input_eos`, binary-suppress save/restore),
+        // and the same value is forwarded to the interpose stack so an
+        // installed `EosInterpose` actually terminates reads on it. Empty
+        // stack = no-op forward; C routes `setInputEos` the same way.
+        let base = self.base_mut();
+        base.input_eos = eos.to_vec();
+        base.interpose_octet.set_input_eos(eos);
         Ok(())
     }
 
@@ -1283,7 +1370,12 @@ pub trait PortDriver: Send + Sync + 'static {
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        self.base_mut().output_eos = eos.to_vec();
+        // Single write owner for output EOS (see `set_input_eos`): cache in
+        // base and forward to the interpose stack so `EosInterpose` appends
+        // the terminator on write.
+        let base = self.base_mut();
+        base.output_eos = eos.to_vec();
+        base.interpose_octet.set_output_eos(eos);
         Ok(())
     }
 
@@ -1301,13 +1393,23 @@ pub trait PortDriver: Send + Sync + 'static {
 
     // --- drvUser ---
 
-    /// Resolve a driver info string to a parameter index.
-    /// Default: look up by parameter name.
-    fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
-        self.base()
+    /// Resolve a record's driver-info string (and its asyn `addr`) to a
+    /// [`DrvUserInfo`] at bind time — the asyn-rs analogue of C `drvUserCreate`.
+    ///
+    /// Takes `&mut self` so a driver can register a parameter on demand from the
+    /// resolved drvInfo (C Autoparam lazy creation) rather than requiring it be
+    /// declared up front, and `addr` so a multi-device driver can reject an
+    /// out-of-range address at bind time (C `drvUserCreate` runs `checkOffset`,
+    /// drvModbusAsyn.cpp:378-384) instead of alarming on every I/O.
+    ///
+    /// Default: look up the shared reason by parameter name; ignore `addr`.
+    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+        let reason = self
+            .base()
             .params
             .find_param(drv_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))
+            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+        Ok(DrvUserInfo::from_reason(reason))
     }
 
     // --- Capabilities ---
@@ -1406,10 +1508,10 @@ mod tests {
 
     #[test]
     fn test_drv_user_create() {
-        let drv = TestDriver::new();
-        assert_eq!(drv.drv_user_create("VAL").unwrap(), 0);
-        assert_eq!(drv.drv_user_create("TEMP").unwrap(), 1);
-        assert!(drv.drv_user_create("NOPE").is_err());
+        let mut drv = TestDriver::new();
+        assert_eq!(drv.drv_user_create("VAL", 0).unwrap().reason, 0);
+        assert_eq!(drv.drv_user_create("TEMP", 0).unwrap().reason, 1);
+        assert!(drv.drv_user_create("NOPE", 0).is_err());
     }
 
     #[test]
@@ -1796,6 +1898,81 @@ mod tests {
                 .push_octet_interpose(Box::new(NoopInterpose));
             assert_eq!(guard.base().interpose_octet.len(), 1);
         }
+    }
+
+    /// The `set_input_eos` write owner must forward the terminator to an
+    /// installed `EosInterpose`, not just cache it in `base.input_eos` —
+    /// otherwise a runtime IEOS change never terminates reads (the F7 gap).
+    #[test]
+    fn test_set_input_eos_reaches_installed_interpose() {
+        use crate::interpose::eos::EosInterpose;
+        use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+
+        struct RawSource {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl OctetNext for RawSource {
+            fn read(&mut self, _u: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                let avail = self.data.len() - self.pos;
+                let n = avail.min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(OctetReadResult {
+                    nbytes_transferred: n,
+                    eom_reason: EomReason::CNT,
+                })
+            }
+            fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self, _u: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut drv = TestDriver::new();
+        drv.base_mut()
+            .push_octet_interpose(Box::new(EosInterpose::default()));
+
+        // Set IEOS through the driver trait: caches in base AND must reach
+        // the interpose.
+        drv.set_input_eos(b"\n").unwrap();
+        assert_eq!(drv.base().input_eos, b"\n");
+
+        let user = AsynUser::default();
+        // "ab\n" exactly: the EOS read returns "ab" and leaves no read-ahead
+        // in the interpose buffer, so the cleared-EOS read below genuinely
+        // reads the next source fresh.
+        let mut src = RawSource {
+            data: b"ab\n".to_vec(),
+            pos: 0,
+        };
+        let mut buf = [0u8; 16];
+        let r = drv
+            .base_mut()
+            .interpose_octet
+            .dispatch_read(&user, &mut buf, &mut src)
+            .unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"ab");
+        assert!(r.eom_reason.contains(EomReason::EOS));
+
+        // Clearing IEOS (binary-suppress path) must also reach the interpose:
+        // the read then passes through with no EOS termination.
+        drv.set_input_eos(b"").unwrap();
+        assert_eq!(drv.base().input_eos, b"");
+        let mut src2 = RawSource {
+            data: b"xy\nz".to_vec(),
+            pos: 0,
+        };
+        let mut buf2 = [0u8; 16];
+        let r2 = drv
+            .base_mut()
+            .interpose_octet
+            .dispatch_read(&user, &mut buf2, &mut src2)
+            .unwrap();
+        assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
+        assert!(!r2.eom_reason.contains(EomReason::EOS));
     }
 
     #[test]

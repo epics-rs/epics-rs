@@ -84,6 +84,380 @@ fn test_ao_record() {
     }
 }
 
+// asyn output readback (devAsynInt32.c processAo/initAo): an asynInt32 output
+// record reads the device's current value back through the `raw → eng` INVERSE
+// of convert(). AoRecord::apply_raw_readback stores the raw to RVAL and
+// computes VAL; the skip_convert gate stops process()'s forward convert from
+// overwriting the readback.
+#[test]
+fn test_ao_readback_inverts_full_conversion_chain() {
+    // C processAo readback (devAsynInt32.c:973-994) is convert() inverted in
+    // reverse field order — un-ROFF, un-ASLO/AOFF, then ESLO/EOFF.
+    // raw=10: (10+1)*2 + 3 = 25; LINEAR: 25*5 + 7 = 132.
+    let mut rec = AoRecord::new(0.0);
+    rec.roff = 1;
+    rec.aslo = 2.0;
+    rec.aoff = 3.0;
+    rec.linr = 2; // LINEAR
+    rec.eslo = 5.0;
+    rec.eoff = 7.0;
+    assert!(
+        rec.apply_raw_readback(10),
+        "ao owns the raw->eng readback convert"
+    );
+    assert_eq!(rec.rval, 10, "raw value stored to RVAL");
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!((v - 132.0).abs() < 1e-9, "got {v}"),
+        other => panic!("expected Double(132.0), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ao_readback_no_conversion_passthrough() {
+    // LINR=NO_CONVERSION, default ASLO=1/AOFF=0/ROFF=0 → VAL == raw.
+    let mut rec = AoRecord::new(0.0);
+    rec.linr = 0;
+    assert!(rec.apply_raw_readback(42));
+    assert_eq!(rec.rval, 42);
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!((v - 42.0).abs() < 1e-9, "got {v}"),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ao_readback_skip_convert_bypasses_forward_convert() {
+    // C `processAo` returns from its readback branch WITHOUT calling convertAo
+    // (devAsynInt32.c:970-994): the readback applies neither drive limits nor
+    // OROC. The skip_convert gate (set via set_device_did_compute) mirrors that
+    // — process() must not run the forward convert that would clamp VAL.
+    let mut rec = AoRecord::new(0.0);
+    rec.linr = 2; // LINEAR
+    rec.eslo = 1.0;
+    rec.eoff = 0.0;
+    rec.drvl = 0.0;
+    rec.drvh = 100.0; // a forward convert would clamp VAL to this
+    assert!(rec.apply_raw_readback(150)); // eng VAL = 150 (eslo=1, eoff=0)
+    assert_eq!(rec.rval, 150);
+    assert!((rec.val - 150.0).abs() < 1e-9);
+
+    // did_compute → skip the forward convert this cycle.
+    rec.set_device_did_compute(true);
+    let _ = rec.process().unwrap();
+    assert!(
+        (rec.val - 150.0).abs() < 1e-9,
+        "readback VAL must not be drive-clamped by a skipped forward convert"
+    );
+    assert_eq!(rec.rval, 150, "readback RVAL preserved");
+
+    // One-shot: the next normal process runs the forward convert, which DOES
+    // drive-clamp VAL (150 → 100) — proving the gate was what bypassed it.
+    let _ = rec.process().unwrap();
+    assert!(
+        (rec.val - 100.0).abs() < 1e-9,
+        "forward convert now clamps VAL to DRVH"
+    );
+}
+
+// The asynFloat64 ao readback hook applies the forward ASLO/AOFF scaling
+// (VAL = value*ASLO + AOFF) and sets VAL only — a float64 ao carries no raw
+// path, so RVAL is untouched. C `initAo`/`processAo` (devAsynFloat64.c:627-629
+// / :646-649). Contrast apply_raw_readback (int32), which also seeds RVAL.
+#[test]
+fn test_ao_float64_readback_applies_aslo_aoff_val_only() {
+    let mut rec = AoRecord::new(0.0);
+    rec.aslo = 2.0;
+    rec.aoff = 1.0;
+    rec.rval = 999; // sentinel: the float64 readback must not touch RVAL
+    assert!(rec.apply_float64_readback(10.0));
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!(
+            (v - 21.0).abs() < 1e-9,
+            "VAL = raw*ASLO + AOFF = 10*2 + 1 = 21, got {v}"
+        ),
+        other => panic!("expected Double(21.0), got {other:?}"),
+    }
+    assert_eq!(rec.rval, 999, "float64 ao readback leaves RVAL untouched");
+}
+
+// The default apply_float64_readback declines (returns false): a non-float64
+// output (e.g. mbbo) keeps the int32 raw path and must not be re-routed here.
+#[test]
+fn test_mbbo_declines_float64_readback() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    let mut rec = MbboRecord::new(0);
+    assert!(
+        !rec.apply_float64_readback(3.0),
+        "mbbo declines the float64 readback hook (keeps the int32 raw path)"
+    );
+}
+
+// The default apply_raw_readback returns false: an input record (ai) whose own
+// convert() is already raw->eng must NOT claim to handle the readback, or the
+// asyn store would skip the framework's RVAL->VAL convert that ai relies on.
+#[test]
+fn test_ai_does_not_claim_raw_readback() {
+    let mut rec = AiRecord::new(0.0);
+    assert!(
+        !rec.apply_raw_readback(5),
+        "ai keeps the legacy raw->RVAL + framework-convert path"
+    );
+}
+
+// C processMbbo readback (devAsynInt32.c:1311-1330 / devAsynUInt32Digital.c
+// :945-962): rval = value & mask; if shft>0 rval>>=shft; val = state index of
+// the shifted raw. RVAL keeps the masked (unshifted) raw.
+#[test]
+fn test_mbbo_readback_maps_raw_to_state_index() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    let mut rec = MbboRecord::new(0);
+    // State table ZRVL=0, ONVL=1, TWVL=2 → defined states 0/1/2.
+    rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+    rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+    rec.init_record(0).unwrap(); // computes sdef=true
+    // Set MASK/SHFT after init so the nobt-derived init mask doesn't clobber.
+    rec.mask = 0x0C; // bits 2-3
+    rec.shft = 2;
+    // raw 0x08 → masked 0x08 → shifted (>>2) = 2 → TWVL=2 → state index 2.
+    assert!(
+        rec.apply_raw_readback(0x08),
+        "mbbo owns the readback state map"
+    );
+    assert_eq!(rec.rval, 0x08, "RVAL keeps the masked (unshifted) raw");
+    assert_eq!(rec.val, 2, "shifted raw 2 → state index 2 (TWVL)");
+}
+
+// No state matches the shifted raw → VAL = 65535 (C "unknown state"), the
+// reverse of mbbi::raw_to_val.
+#[test]
+fn test_mbbo_readback_unknown_state_is_65535() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    let mut rec = MbboRecord::new(0);
+    rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.mask = 0x0C;
+    rec.shft = 2;
+    // raw 0x0C → masked 0x0C → shifted 3; no state has raw value 3.
+    assert!(rec.apply_raw_readback(0x0C));
+    assert_eq!(rec.rval, 0x0C);
+    assert_eq!(rec.val, 65535, "no matching state → unknown sentinel");
+}
+
+// C processBo readback: val = (rval != 0). asynUInt32Digital masks
+// (rval = value & mask, :731-732); asynInt32 does not (rval = value,
+// :1202-1203). The `mask != 0` split reproduces both: mask set → masked,
+// mask 0 → raw.
+#[test]
+fn test_bo_readback_maps_raw_to_binary_both_mask_modes() {
+    use epics_base_rs::server::records::bo::BoRecord;
+    // mask != 0 (digital): rval = raw & mask, val = (rval != 0).
+    let mut rec = BoRecord::new(0);
+    rec.mask = 0x04;
+    assert!(rec.apply_raw_readback(0x04));
+    assert_eq!(rec.rval, 0x04);
+    assert_eq!(rec.val, 1);
+    // Out-of-mask bits only → masked 0 → val 0.
+    assert!(rec.apply_raw_readback(0x02));
+    assert_eq!(rec.rval, 0);
+    assert_eq!(rec.val, 0);
+    // mask == 0 (asynInt32 bo): rval = raw (unmasked), val = (raw != 0).
+    let mut rec2 = BoRecord::new(0);
+    rec2.mask = 0;
+    assert!(rec2.apply_raw_readback(0x02));
+    assert_eq!(
+        rec2.rval, 0x02,
+        "asynInt32 bo keeps the unmasked raw in RVAL"
+    );
+    assert_eq!(rec2.val, 1);
+}
+
+// The skip_convert gate (set via set_device_did_compute) makes process() skip
+// the forward convert that would recompute RVAL from VAL and discard the
+// readback — C processBo returns from its readback branch without converting.
+#[test]
+fn test_bo_readback_skip_convert_preserves_rval() {
+    use epics_base_rs::server::records::bo::BoRecord;
+    let mut rec = BoRecord::new(0);
+    rec.mask = 0; // asynInt32 bo: RVAL holds the raw, not just 0/1
+    assert!(rec.apply_raw_readback(0x2A)); // rval=0x2A, val=1
+    assert_eq!(rec.rval, 0x2A);
+    assert_eq!(rec.val, 1);
+    rec.set_device_did_compute(true);
+    let _ = rec.process().unwrap();
+    assert_eq!(rec.rval, 0x2A, "skip_convert preserves the readback RVAL");
+    // One-shot: the next normal process runs val_to_rval (mask=0 → rval=val=1),
+    // proving the gate is what bypassed it.
+    let _ = rec.process().unwrap();
+    assert_eq!(
+        rec.rval, 1,
+        "forward convert recomputes rval from val (mask=0)"
+    );
+}
+
+// C processMbboDirect readback (devAsynUInt32Digital.c:1084-1090): rval =
+// value & mask; if shft>0 rval>>=shft; val = rval (no state table). The
+// skip_convert gate preserves the readback RVAL including bits below SHFT that
+// the forward convert ((val<<shft)&mask) would truncate.
+#[test]
+fn test_mbbo_direct_readback_maps_raw_and_skip_convert_preserves_low_bits() {
+    use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
+    let mut rec = MbboDirectRecord::default();
+    rec.mask = 0x0F;
+    rec.shft = 2;
+    // raw 0x0F → masked 0x0F → val = 0x0F >> 2 = 3; bits 0,1 set.
+    assert!(rec.apply_raw_readback(0x0F));
+    assert_eq!(rec.rval, 0x0F, "RVAL keeps the masked (unshifted) raw");
+    assert_eq!(rec.val, 3, "VAL = masked raw >> SHFT");
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[1], 1);
+    rec.set_device_did_compute(true);
+    let _ = rec.process().unwrap();
+    assert_eq!(
+        rec.rval, 0x0F,
+        "skip_convert preserves the readback RVAL with its sub-SHFT bits"
+    );
+    // One-shot: the next normal process forward-converts, which truncates the
+    // low bits: (3 << 2) & 0x0F = 0x0C — proving the gate mattered.
+    let _ = rec.process().unwrap();
+    assert_eq!(
+        rec.rval, 0x0C,
+        "forward convert loses the sub-SHFT bits the readback preserved"
+    );
+}
+
+// INPUT twin of the bo readback. C processBi sets rval then biRecord converts
+// val = (rval != 0): asynInt32 processBi does NOT mask (rval = value, initBi
+// passes a NULL mask → mask 0); asynUInt32Digital processBi masks (rval =
+// value & mask, devAsynUInt32Digital.c:689). The `mask != 0` split reproduces
+// both. Before this fix the device raw fell to the default set_val and landed
+// the raw count in VAL (e.g. 0x80 → val=128) instead of the 0/1 bi exposes.
+#[test]
+fn test_bi_readback_maps_raw_to_binary_both_mask_modes() {
+    // asynInt32 bi (mask == 0): rval = raw, val = (raw != 0). A non-binary raw
+    // resolves to 1, it is NOT stored verbatim.
+    let mut rec = BiRecord::new(0);
+    rec.mask = 0;
+    assert!(rec.apply_raw_readback(5), "bi claims the device readback");
+    assert_eq!(rec.rval, 5, "asynInt32 bi keeps the unmasked raw in RVAL");
+    assert_eq!(rec.val, 1, "VAL is 0/1, not the raw count");
+    assert!(rec.apply_raw_readback(0));
+    assert_eq!(rec.val, 0);
+    // asynUInt32Digital bi (mask != 0): rval = raw & mask, val = (rval != 0).
+    let mut rec2 = BiRecord::new(0);
+    rec2.mask = 0x80;
+    assert!(rec2.apply_raw_readback(0x80));
+    assert_eq!(rec2.rval, 0x80);
+    assert_eq!(
+        rec2.val, 1,
+        "high-bit mask hit → val 1 (C gives 1, not 128)"
+    );
+    // A raw whose set bits are all outside the mask → masked 0 → val 0.
+    assert!(rec2.apply_raw_readback(0x01));
+    assert_eq!(rec2.rval, 0);
+    assert_eq!(rec2.val, 0, "bits outside MASK do not set VAL");
+}
+
+// INPUT twin of the mbboDirect readback (asynUInt32Digital only). C
+// processMbbiDirect sets rval = value & mask (devAsynUInt32Digital.c:1031);
+// mbbiDirectRecord convert resolves val = (masked >> SHFT) and the bit fields.
+// Before this fix the raw fell to the default set_val → VAL = raw verbatim (no
+// MASK, no SHFT, wrong bits).
+#[test]
+fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
+    use epics_base_rs::server::records::mbbi_direct::MbbiDirectRecord;
+    let mut rec = MbbiDirectRecord::default();
+    rec.mask = 0x3C; // bits 2-5
+    rec.shft = 2;
+    // raw 0x3C → masked 0x3C → val = 0x3C >> 2 = 0x0F; bits 0-3 set.
+    assert!(
+        rec.apply_raw_readback(0x3C),
+        "mbbiDirect claims the readback"
+    );
+    assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
+    assert_eq!(rec.val, 0x0F, "VAL = masked raw >> SHFT");
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[3], 1);
+    assert_eq!(rec.bits[4], 0);
+    // The skip_convert gate preserves the readback RVAL (incl. sub-SHFT bits a
+    // forward convert would truncate) — C processMbbiDirect returns 0 from its
+    // readback without re-converting.
+    rec.set_device_did_compute(true);
+    let _ = rec.process().unwrap();
+    assert_eq!(rec.rval, 0x3C, "skip_convert preserves the readback RVAL");
+    assert_eq!(rec.val, 0x0F);
+    // Bits outside MASK are dropped: raw 0xC0 (bits 6-7) & 0x3C = 0 → val 0.
+    assert!(rec.apply_raw_readback(0xC0));
+    assert_eq!(rec.rval, 0);
+    assert_eq!(rec.val, 0, "out-of-mask bits do not reach VAL");
+}
+
+// Family boundary: longin's VAL *is* the raw (C processLi sets pr->val, no
+// RVAL->VAL convert), so it declines apply_raw_readback and the asyn store
+// keeps routing it through set_val (the default hook returns false).
+#[test]
+fn test_longin_declines_raw_readback() {
+    use epics_base_rs::server::records::longin::LonginRecord;
+    assert!(
+        !LonginRecord::new(0).apply_raw_readback(3),
+        "longin VAL is the raw — no convert to claim"
+    );
+}
+
+// mbbi asyn device readback (input twin of mbbo): C processMbbi masks on both
+// ifaces (rval = value & mask, devAsynInt32.c:1270 / devAsynUInt32Digital.c:903)
+// then mbbiRecord convert shifts (>>SHFT) and resolves the state index. The
+// `& mask` is the masking the prior set_val omitted — out-of-mask bits are
+// stripped, not leaked into the state lookup.
+#[test]
+fn test_mbbi_readback_masks_shifts_and_maps_state() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let mut rec = MbbiRecord::new(0);
+    rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+    rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+    rec.init_record(0).unwrap(); // computes sdef=true
+    rec.mask = 0x0C; // bits 2-3
+    rec.shft = 2;
+    // raw 0x08 -> masked 0x08 -> shifted (>>2) = 2 -> TWVL=2 -> state index 2.
+    assert!(
+        rec.apply_raw_readback(0x08),
+        "mbbi claims the device readback"
+    );
+    assert_eq!(rec.rval, 0x08, "RVAL = raw & mask (C processMbbi)");
+    assert_eq!(rec.val, 2, "shifted raw 2 -> state index 2 (TWVL)");
+    // Mask gating: an out-of-mask 0x80 bit is stripped, NOT leaked. Before the
+    // fix set_val left rval unmasked, so 0x88 would have shifted to 0x22 and
+    // missed the state table (val 65535).
+    assert!(rec.apply_raw_readback(0x88));
+    assert_eq!(rec.rval, 0x08, "out-of-mask 0x80 bit masked away");
+    assert_eq!(rec.val, 2, "still resolves to TWVL, not an unknown state");
+}
+
+// mbbi Soft Channel set_val is now a pass-through (C devMbbiSoft read_mbbi
+// returns 2: the link value lands in VAL as the index, no state-table map).
+// Before the fix set_val reverse-mapped a numeric link through raw_to_val,
+// diverging from C whenever the source value was not a state RVAL.
+#[test]
+fn test_mbbi_set_val_is_soft_channel_passthrough() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let mut rec = MbbiRecord::new(0);
+    rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+    rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+    rec.init_record(0).unwrap();
+    // A numeric soft-link value is the index, verbatim.
+    rec.set_val(EpicsValue::Long(2)).unwrap();
+    assert_eq!(rec.val, 2, "soft-link value is the index, not state-mapped");
+    // A value matching no state RVAL still passes through (old: raw_to_val ->
+    // 65535 unknown-state; C devMbbiSoft -> the value itself).
+    rec.set_val(EpicsValue::Long(7)).unwrap();
+    assert_eq!(
+        rec.val, 7,
+        "pass-through, not the 65535 unknown-state sentinel"
+    );
+    // Enum and ZRST..FFST string puts still resolve to the index directly.
+    rec.set_val(EpicsValue::Enum(1)).unwrap();
+    assert_eq!(rec.val, 1);
+}
+
 #[test]
 fn test_bi_record() {
     let mut rec = BiRecord::new(0);
@@ -1724,6 +2098,43 @@ fn test_ai_simm_get_field_stays_short() {
     let mut rec = AiRecord::new(1.0);
     rec.simm = 2;
     assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(2)));
+}
+
+// dfanout OMSL/IVOA are DBF_MENU (menuOmsl / menuIvoa), so
+// the snapshot boundary must serve them as DBR_ENUM with the menu labels,
+// not a bare DBR_SHORT. dfanout's own menu_field_choices overrides only
+// SELM, so OMSL/IVOA fall through to the shared (field-name) registry. A
+// sub-agent reported them served as SHORT; this pins the ENUM form (already
+// produced since the menu-serving owner landed) so the finding stays closed.
+#[test]
+fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+    let mut rec = DfanoutRecord::new(0.0);
+    rec.omsl = 1; // closed_loop
+    rec.ivoa = 2; // Set output to IVOV
+    // Promotion is boundary-only: the raw record keeps Short so internal
+    // OMSL/IVOA match arms are unaffected.
+    assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(2)));
+    let inst = RecordInstance::new("DFAN:MENU".into(), rec);
+
+    let omsl = inst.snapshot_for_field("OMSL").unwrap();
+    assert_eq!(omsl.value, EpicsValue::Enum(1));
+    assert_eq!(
+        omsl.enums.as_ref().unwrap().strings,
+        vec!["supervisory", "closed_loop"]
+    );
+
+    let ivoa = inst.snapshot_for_field("IVOA").unwrap();
+    assert_eq!(ivoa.value, EpicsValue::Enum(2));
+    assert_eq!(
+        ivoa.enums.as_ref().unwrap().strings,
+        vec![
+            "Continue normally",
+            "Don't drive outputs",
+            "Set output to IVOV"
+        ]
+    );
 }
 
 // MPST/APST on lsi are menu(menuPost): On Change (0), Always (1). The value

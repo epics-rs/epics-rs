@@ -21,6 +21,7 @@ pub mod codec;
 pub mod config;
 pub mod error;
 pub mod format;
+pub(crate) mod leaf_convert;
 pub mod log;
 pub mod nt;
 pub mod proto;

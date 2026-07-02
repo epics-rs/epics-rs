@@ -32,7 +32,11 @@ use super::beacon_throttle::BeaconTracker;
 use super::search_engine::SearchEngine;
 use super::server_conn::{ConnConfig, ServerConn};
 
-static NEXT_CID: AtomicU32 = AtomicU32::new(1);
+// pvxs seeds each ID namespace from a distinct non-zero base (commit
+// 3b641bed) so a misused id fails loudly instead of aliasing a live one.
+// CID base = pvxs `clientimpl.h:263` `nextCID=0x12345678` (pvxs reuses the
+// CID as the channel's searchID, `clientimpl.h:181`).
+static NEXT_CID: AtomicU32 = AtomicU32::new(0x1234_5678);
 
 #[derive(Clone)]
 pub enum ChannelState {

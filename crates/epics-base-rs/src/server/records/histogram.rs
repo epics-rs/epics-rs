@@ -41,13 +41,20 @@ pub struct HistogramRecord {
     pub sval: f64,
     pub siml: String,
     pub sims: i16,
+    pub sdly: f64,
     pub oldsimm: i16,
 }
 
 impl Default for HistogramRecord {
     fn default() -> Self {
-        let nelm = 10;
-        let ulim = 10.0;
+        // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }`:
+        // an unset NELM defaults to 1 bucket, not 10. NELM is read-only and
+        // sizes VAL, so a .db that omits it must read back NELM=1 / a
+        // 1-element VAL to match C. ULIM and LLIM carry NO C `initial(...)`
+        // (`field(ULIM,DBF_DOUBLE)` / `field(LLIM,DBF_DOUBLE)`), so C defaults
+        // both to 0.0 and `init_record` derives WDTH = (ULIM-LLIM)/NELM = 0.
+        let nelm = 1;
+        let ulim = 0.0;
         let llim = 0.0;
         Self {
             val: vec![0; nelm as usize],
@@ -70,6 +77,7 @@ impl Default for HistogramRecord {
             sval: 0.0,
             siml: String::new(),
             sims: 0,
+            sdly: -1.0,
             oldsimm: 0,
         }
     }
@@ -229,6 +237,11 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // OLDSIMM is special(SPC_NOMOD) — the saved previous simulation mode,
     // not client-writable (histogramRecord.dbd.pod:270-274).
     FieldDesc {
@@ -277,6 +290,7 @@ impl Record for HistogramRecord {
             "SVAL" => Some(EpicsValue::Double(self.sval)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "OLDSIMM" => Some(EpicsValue::Short(self.oldsimm)),
             _ => None,
         }
@@ -388,8 +402,32 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
             },
-            // OLDSIMM is special(SPC_NOMOD) — saved copy, not client-writable.
-            "NELM" | "WDTH" | "MCNT" | "OLDSIMM" => Err(CaError::ReadOnlyField(name.to_string())),
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SDLY".into())),
+            },
+            // C `field(NELM,DBF_USHORT){ promptgroup special(SPC_NOMOD) }`:
+            // settable at `.db` load (dbStaticLib bypasses SPC_NOMOD), runtime-
+            // immutable. The runtime block is the field_io `read_only` gate (the
+            // FieldDesc carries `read_only: true`), so a CA/PVA caput is still
+            // rejected; this arm serves only the load path (`apply_fields`),
+            // sizing the bin array exactly like `new()`.
+            "NELM" => match value {
+                EpicsValue::Long(n) => {
+                    let n = n.max(1);
+                    self.nelm = n as i32;
+                    self.val = vec![0; n as usize];
+                    self.recompute_wdth();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("NELM".into())),
+            },
+            // WDTH/MCNT are computed runtime fields (no promptgroup) and OLDSIMM
+            // is the SPC_NOMOD saved copy — never client-writable, even at load.
+            "WDTH" | "MCNT" | "OLDSIMM" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -418,6 +456,28 @@ impl Record for HistogramRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }` —
+    // a histogram built without an explicit NELM defaults to 1 bucket (and a
+    // 1-element VAL), not the old hand-coded 10.
+    #[test]
+    fn nelm_defaults_to_one_per_dbd_initial() {
+        let rec = HistogramRecord::default();
+        assert_eq!(rec.nelm, 1);
+        assert_eq!(rec.val.len(), 1, "VAL is sized by NELM");
+        assert_eq!(rec.get_field("NELM"), Some(EpicsValue::Long(1)));
+    }
+
+    #[test]
+    fn ulim_llim_default_to_zero_per_absent_dbd_initial() {
+        // C `field(ULIM,DBF_DOUBLE)` / `field(LLIM,DBF_DOUBLE)` carry no
+        // `initial(...)`, so both default to 0.0 and `init_record` derives
+        // WDTH = (ULIM-LLIM)/NELM = 0.
+        let rec = HistogramRecord::default();
+        assert_eq!(rec.ulim, 0.0, "ULIM has no C initial -> 0.0");
+        assert_eq!(rec.llim, 0.0, "LLIM has no C initial -> 0.0");
+        assert_eq!(rec.wdth, 0.0, "WDTH = (ULIM-LLIM)/NELM = 0");
+    }
 
     /// a counter at the `UINT_MAX` bit pattern must wrap to 0,
     /// never panic the way a signed `i32 += 1` would at overflow.

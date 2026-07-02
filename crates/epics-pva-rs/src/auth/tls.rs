@@ -60,7 +60,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -144,6 +144,32 @@ pub fn tls_disabled() -> bool {
             .map(|s| s.trim().to_ascii_uppercase()),
         Ok(s) if s == "YES" || s == "1" || s == "TRUE"
     )
+}
+
+/// Resolve the shared TLS key-logger from `$SSLKEYLOGFILE`.
+///
+/// pvxs honours `$SSLKEYLOGFILE` (`ossl.cpp:148-160`, `:221-223`): when the env
+/// var names a writable file, it installs an OpenSSL keylog callback on the
+/// shared `SSL_CTX` so the per-session pre-master secrets are appended there for
+/// Wireshark / `tshark` decryption. rustls exposes the identical hook via
+/// `Config::key_log`, and `rustls::KeyLogFile` reads the same `SSLKEYLOGFILE`
+/// env var. Resolved once so the security-sensitive NOTICE is emitted a single
+/// time, mirroring pvxs's one-shot `commonSetup` message; `None` when unset so
+/// the rustls default (`NoKeyLog`) stays in place.
+fn ssl_key_log() -> Option<Arc<dyn rustls::KeyLog>> {
+    static KEYLOG: OnceLock<Option<Arc<dyn rustls::KeyLog>>> = OnceLock::new();
+    KEYLOG
+        .get_or_init(|| match std::env::var_os("SSLKEYLOGFILE") {
+            Some(path) if !path.is_empty() => {
+                eprintln!(
+                    "NOTICE: debug logging TLS SECRETS to SSLKEYLOGFILE={}",
+                    path.to_string_lossy()
+                );
+                Some(Arc::new(rustls::KeyLogFile::new()) as Arc<dyn rustls::KeyLog>)
+            }
+            _ => None,
+        })
+        .clone()
 }
 
 /// Load a server-side TLS configuration from environment variables.
@@ -234,9 +260,12 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
             .build()
             .map_err(|e| TlsConfigError::Verifier(e.to_string()))?
     };
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)?;
+    if let Some(key_log) = ssl_key_log() {
+        config.key_log = key_log;
+    }
 
     Ok(Some(TlsServerConfig {
         config: Arc::new(config),
@@ -273,7 +302,7 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
 
     let builder = ClientConfig::builder().with_root_certificates(roots);
 
-    let config = if let Ok(keychain) = std::env::var("EPICS_PVA_TLS_KEYCHAIN") {
+    let mut config = if let Ok(keychain) = std::env::var("EPICS_PVA_TLS_KEYCHAIN") {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let keychain = crate::config::env::expand_dollar_vars(&keychain);
         // pvxs splits the keychain spec at the first `;` (`ossl.cpp:232-238`):
@@ -301,6 +330,9 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     } else {
         builder.with_no_client_auth()
     };
+    if let Some(key_log) = ssl_key_log() {
+        config.key_log = key_log;
+    }
 
     Ok(Some(TlsClientConfig {
         config: Arc::new(config),

@@ -317,6 +317,11 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
             let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
             format!("[{}]", parts.join(","))
         }
+        EpicsValue::UChar(v) => v.to_string(),
+        EpicsValue::UCharArray(arr) => {
+            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        }
         EpicsValue::StringArray(arr) => {
             let parts: Vec<_> = arr
                 .iter()
@@ -388,6 +393,8 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         EpicsValue::ULong(v) => v.to_string(),
         EpicsValue::UShortArray(arr) => c_array(arr.iter()),
         EpicsValue::ULongArray(arr) => c_array(arr.iter()),
+        EpicsValue::UChar(v) => v.to_string(),
+        EpicsValue::UCharArray(arr) => c_array(arr.iter()),
         EpicsValue::StringArray(arr) => c_array(arr.iter().cloned()),
     }
 }
@@ -415,6 +422,7 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
             s.parse::<u16>().ok().map(EpicsValue::Enum)
         }
         EpicsValue::Char(_) => s.parse::<u8>().ok().map(EpicsValue::Char),
+        EpicsValue::UChar(_) => s.parse::<u8>().ok().map(EpicsValue::UChar),
         EpicsValue::DoubleArray(_) => {
             parse_array_str(s, |v| v.parse::<f64>().ok()).map(EpicsValue::DoubleArray)
         }
@@ -446,6 +454,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         }
         EpicsValue::ULongArray(_) => {
             parse_array_str(s, |v| v.parse::<u32>().ok()).map(EpicsValue::ULongArray)
+        }
+        EpicsValue::UCharArray(_) => {
+            parse_array_str(s, |v| v.parse::<u8>().ok()).map(EpicsValue::UCharArray)
         }
         EpicsValue::StringArray(_) => {
             let inner = s.trim_start_matches('[').trim_end_matches(']');

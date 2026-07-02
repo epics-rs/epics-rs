@@ -15,7 +15,18 @@ pub struct StampedStatus {
 pub enum PollDirective {
     #[default]
     None,
+    /// Keep the autonomous idle poller alive (the settled-idle keep-alive,
+    /// deduped against an already-running poller). Does NOT force a status
+    /// post — idle polls are change-gated in the poll loop.
     Start,
+    /// Force a one-shot poll + status post now, even if the polled status is
+    /// unchanged, and (re)start the poller. The analogue of C
+    /// `motorUpdateStatus_` forcing `statusChanged_ = 1`
+    /// (asynMotorController.cpp:217-222): emitted for `request_poll` /
+    /// `status_refresh` (STUP / implicit GET_INFO / settle-resume / startup
+    /// readback) so the record's STUP=BUSY ack clears even on a stationary axis
+    /// whose status did not change.
+    Refresh,
     Stop,
 }
 
@@ -45,7 +56,16 @@ impl DeviceActions {
     pub fn merge_newer(&mut self, newer: DeviceActions) {
         self.commands.extend(newer.commands);
         if newer.poll != PollDirective::None {
-            self.poll = newer.poll;
+            // A pending `Refresh` (forced status post — the STUP/GET_INFO ack
+            // depends on it reaching the poll loop) must not be downgraded to a
+            // plain keep-alive `Start` by a later batch. Every other
+            // combination takes the newer directive.
+            self.poll = if self.poll == PollDirective::Refresh && newer.poll == PollDirective::Start
+            {
+                PollDirective::Refresh
+            } else {
+                newer.poll
+            };
         }
         if newer.schedule_delay.is_some() {
             self.schedule_delay = newer.schedule_delay;
@@ -132,6 +152,34 @@ mod tests {
         };
         a.merge_newer(b);
         assert_eq!(a.poll, PollDirective::Stop);
+    }
+
+    #[test]
+    fn merge_newer_refresh_not_downgraded_to_start() {
+        // A pending forced Refresh must survive a later keep-alive Start so the
+        // STUP/GET_INFO ack still reaches the poll loop.
+        let mut a = DeviceActions {
+            poll: PollDirective::Refresh,
+            ..Default::default()
+        };
+        let b = DeviceActions {
+            poll: PollDirective::Start,
+            ..Default::default()
+        };
+        a.merge_newer(b);
+        assert_eq!(a.poll, PollDirective::Refresh);
+
+        // The reverse — a newer Refresh over an older Start — upgrades.
+        let mut c = DeviceActions {
+            poll: PollDirective::Start,
+            ..Default::default()
+        };
+        let d = DeviceActions {
+            poll: PollDirective::Refresh,
+            ..Default::default()
+        };
+        c.merge_newer(d);
+        assert_eq!(c.poll, PollDirective::Refresh);
     }
 
     #[test]

@@ -9,7 +9,9 @@ mod include;
 mod substitution;
 #[cfg(test)]
 pub(crate) use include::parse_include_directive;
-pub use include::{DbLoadConfig, expand_includes, override_dtyp, parse_db_file};
+pub use include::{
+    DbLoadConfig, expand_includes, override_dtyp, parse_db_file, parse_db_file_with_breaktables,
+};
 pub use substitution::{TemplateLoad, load_substitution_file, parse_substitutions};
 
 /// Factory function that creates a record instance.
@@ -95,8 +97,20 @@ pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaRes
 
 /// Parse an EPICS .db file with macro substitution.
 pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<DbRecordDef>> {
+    parse_db_with_breaktables(input, macros).map(|(records, _breaktables)| records)
+}
+
+/// Like [`parse_db`] but also returns the `breaktable(...)` definitions found
+/// in the text (C `dbBreakBody`, `dbLexRoutines.c`). The IOC builder feeds
+/// these into the breakpoint-table registry so `ai`/`ao` records with
+/// `LINR >= 3` can resolve their linearisation table.
+pub fn parse_db_with_breaktables(
+    input: &str,
+    macros: &HashMap<String, String>,
+) -> CaResult<(Vec<DbRecordDef>, Vec<crate::server::cvt_bpt::BrkTable>)> {
     let expanded = substitute_macros(input, macros);
     let mut records = Vec::new();
+    let mut breaktables: Vec<crate::server::cvt_bpt::BrkTable> = Vec::new();
     // Standalone `alias("record","newname")` directives (dbYacc.y:275).
     // Resolved against the record list after the full file is parsed
     // so the alias target may appear before or after the directive.
@@ -162,6 +176,95 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
             global_aliases.push((target, alias_name));
+            continue;
+        }
+
+        // `breaktable(name) { raw eng  raw eng  ... }` (dbYacc.y / C
+        // `dbBreakBody`, dbLexRoutines.c:1003-1080). The body is a flat list
+        // of numbers in `(raw, eng)` pairs, whitespace- or comma-separated;
+        // `BrkTable::build` computes the interval slopes and validates the
+        // table (>= 2 points, monotonic, no zero slope).
+        if word == "breaktable" {
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            expect_char(&chars, &mut pos, &mut col, '(', line)?;
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            // The name is a quoted string or a bare identifier (C accepts both).
+            let bt_name = if pos < chars.len() && chars[pos] == '"' {
+                read_quoted_string(&chars, &mut pos, &mut line, &mut col)?
+            } else {
+                read_word(&chars, &mut pos, &mut col)
+            };
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            expect_char(&chars, &mut pos, &mut col, ')', line)?;
+            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+            expect_char(&chars, &mut pos, &mut col, '{', line)?;
+
+            // Read numeric tokens until the closing brace. Numbers are
+            // separated by whitespace and/or commas (C `tokenVALUE` lexing).
+            let is_number_char =
+                |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | ':' | '.');
+            let mut nums: Vec<f64> = Vec::new();
+            loop {
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                if pos >= chars.len() {
+                    return Err(CaError::DbParseError {
+                        line,
+                        column: col,
+                        message: "unexpected end of file in breaktable body".into(),
+                    });
+                }
+                if chars[pos] == '}' {
+                    pos += 1;
+                    col += 1;
+                    break;
+                }
+                if chars[pos] == ',' {
+                    pos += 1;
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                let mut tok = String::new();
+                while pos < chars.len() && is_number_char(chars[pos]) {
+                    tok.push(chars[pos]);
+                    pos += 1;
+                    col += 1;
+                }
+                if tok.is_empty() {
+                    return Err(CaError::DbParseError {
+                        line,
+                        column: col,
+                        message: format!(
+                            "breaktable {bt_name}: expected a number, got '{}'",
+                            chars[pos]
+                        ),
+                    });
+                }
+                let num: f64 = tok.parse().map_err(|_| CaError::DbParseError {
+                    line,
+                    column: start,
+                    message: format!("breaktable {bt_name}: non-numeric value '{tok}'"),
+                })?;
+                nums.push(num);
+            }
+
+            // C `dbBreakBody`: an odd count is a missing raw/eng partner.
+            if nums.len() % 2 != 0 {
+                return Err(CaError::DbParseError {
+                    line,
+                    column: col,
+                    message: format!("breaktable {bt_name}: Raw value missing"),
+                });
+            }
+            let pairs: Vec<(f64, f64)> = nums.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+            let table = crate::server::cvt_bpt::BrkTable::build(bt_name, &pairs).map_err(|e| {
+                CaError::DbParseError {
+                    line,
+                    column: col,
+                    message: e,
+                }
+            })?;
+            breaktables.push(table);
             continue;
         }
 
@@ -300,7 +403,7 @@ pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<D
         }
     }
 
-    Ok(records)
+    Ok((records, breaktables))
 }
 
 /// Resolution options for the macLib expansion engine ([`expand_macros`]).
@@ -925,6 +1028,7 @@ pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
         "seq" => Ok(Box::new(seq::SeqRecord::default())),
         "sseq" => Ok(Box::new(sseq::SseqRecord::default())),
         "scalcout" => Ok(Box::new(scalcout::ScalcoutRecord::default())),
+        "acalcout" => Ok(Box::new(acalcout::AcalcoutRecord::default())),
         "transform" => Ok(Box::new(transform::TransformRecord::default())),
         "calcout" => Ok(Box::new(calcout::CalcoutRecord::default())),
         "dfanout" => Ok(Box::new(dfanout::DfanoutRecord::default())),
@@ -933,6 +1037,8 @@ pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
         "sel" => Ok(Box::new(sel::SelRecord::default())),
         "sub" => Ok(Box::new(sub_record::SubRecord::default())),
         "aSub" => Ok(Box::new(asub_record::ASubRecord::default())),
+        "permissive" => Ok(Box::new(permissive::PermissiveRecord::default())),
+        "state" => Ok(Box::new(state::StateRecord::default())),
         _ => Err(CaError::DbParseError {
             line: 0,
             column: 0,
@@ -955,6 +1061,31 @@ pub fn create_record_with_factories(
 
 /// Apply fields from a DbRecordDef to a record.
 /// Returns the record along with any common field values.
+/// Rewrite a `LINR` field that names a loaded breakpoint table to the numeric
+/// `menuConvert` index that selects it. C extends the `menuConvert` menu with
+/// one name-sorted choice per loaded table, so the first table is index 3
+/// ([`crate::server::cvt_bpt::BreakTableRegistry`]). Only `ai`/`ao` carry a
+/// `LINR` field; fixed labels (`NO_CONVERSION`/`SLOPE`/`LINEAR`) and numeric
+/// values match no table name and are left for [`apply_fields`]'s menu
+/// resolution. A no-op when the registry is empty. Shared by the IocBuilder
+/// and `dbLoadRecords` load paths so both resolve table names identically.
+pub fn resolve_linr_breaktable_names(
+    record_type: &str,
+    fields: &mut [(String, String)],
+    registry: &crate::server::cvt_bpt::BreakTableRegistry,
+) {
+    if registry.is_empty() || !matches!(record_type, "ai" | "ao") {
+        return;
+    }
+    for (fname, fvalue) in fields.iter_mut() {
+        if fname.eq_ignore_ascii_case("LINR") {
+            if let Some(idx) = registry.linr_index_of(fvalue) {
+                *fvalue = idx.to_string();
+            }
+        }
+    }
+}
+
 pub fn apply_fields(
     record: &mut Box<dyn Record>,
     fields: &[(String, String)],
@@ -1471,6 +1602,74 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_breaktable_basic() {
+        let input = r#"
+breaktable(typeJdegC) {
+    0    0
+    365  67.0
+    1000 178.0
+}
+record(ai, "T") { field(LINR, "typeJdegC") }
+"#;
+        let (records, breaktables) = parse_db_with_breaktables(input, &HashMap::new()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(breaktables.len(), 1);
+        let t = &breaktables[0];
+        assert_eq!(t.name, "typeJdegC");
+        assert_eq!(t.points.len(), 3);
+        assert_eq!(t.points[0].raw, 0.0);
+        assert_eq!(t.points[0].eng, 0.0);
+        // slope[0] = (67-0)/(365-0).
+        assert!((t.points[0].slope - (67.0 / 365.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_breaktable_quoted_name_and_commas() {
+        let input = r#"breaktable("tbl") { 0,0, 10,100 }"#;
+        let (_records, breaktables) = parse_db_with_breaktables(input, &HashMap::new()).unwrap();
+        assert_eq!(breaktables.len(), 1);
+        assert_eq!(breaktables[0].name, "tbl");
+        assert_eq!(breaktables[0].points.len(), 2);
+        assert!((breaktables[0].points[0].slope - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_breaktable_odd_count_errors() {
+        let input = r#"breaktable(bad) { 0 0 10 }"#;
+        let err = parse_db_with_breaktables(input, &HashMap::new()).unwrap_err();
+        match err {
+            CaError::DbParseError { message, .. } => {
+                assert!(message.contains("Raw value missing"), "{message}")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_linr_breaktable_names_rewrites_to_index() {
+        use crate::server::cvt_bpt::{BreakTableRegistry, BrkTable};
+        let mut reg = BreakTableRegistry::new();
+        reg.insert(BrkTable::build("alpha", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
+
+        // A registered non-standard table name on an ai/ao LINR is rewritten to
+        // its index — the first user-table slot (15), since the standard
+        // menuConvert names reserve 3..=14.
+        let mut fields = vec![("LINR".to_string(), "alpha".to_string())];
+        resolve_linr_breaktable_names("ai", &mut fields, &reg);
+        assert_eq!(fields[0].1, "15");
+
+        // A fixed menuConvert label matches no table name and is untouched.
+        let mut fixed = vec![("LINR".to_string(), "LINEAR".to_string())];
+        resolve_linr_breaktable_names("ai", &mut fixed, &reg);
+        assert_eq!(fixed[0].1, "LINEAR");
+
+        // A non-ai/ao record's field is never rewritten.
+        let mut other = vec![("LINR".to_string(), "alpha".to_string())];
+        resolve_linr_breaktable_names("bo", &mut other, &reg);
+        assert_eq!(other[0].1, "alpha");
+    }
+
+    #[test]
     fn test_sub_record_register_and_call() {
         use crate::server::record::{Record, RecordInstance, SubroutineFn};
         use crate::server::records::sub_record::SubRecord;
@@ -1486,7 +1685,7 @@ mod tests {
             if let Some(EpicsValue::Double(v)) = record.get_field("VAL") {
                 record.put_field("VAL", EpicsValue::Double(v * 2.0))?;
             }
-            Ok(())
+            Ok(0)
         });
         instance.subroutine = Some(Arc::new(sub_fn));
 

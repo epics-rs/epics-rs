@@ -500,8 +500,9 @@ struct RawGroupDef {
     // real / string JSON scalar to its string form (data.cpp:402-461).
     // Capturing the raw `serde_json::Value` (not `Option<String>`) keeps a
     // non-string `+id` from failing the whole-file `serde_json::from_str`;
-    // the `as<string>` coercion and its NoConvert/per-group-skip outcome
-    // run in `raw_to_group_def`, inside the per-group recovery boundary.
+    // the `as<string>` coercion runs in `raw_to_group_def` (a non-coercible
+    // value drops this group — stricter than pvxs, see the annotation-coercion
+    // divergence note).
     #[serde(rename = "+id", default)]
     id: Option<serde_json::Value>,
     // pvxs tracks `+atomic` as a value plus a presence bit
@@ -515,8 +516,9 @@ struct RawGroupDef {
     // the whole-file parse and preserves the presence bit: `None` == not
     // specified by THIS fragment, so a later fragment that omits `+atomic`
     // must not clobber an earlier explicit setting during merge. The
-    // `as<bool>` coercion and its NoConvert/per-group-skip outcome run in
-    // `raw_to_group_def`.
+    // `as<bool>` coercion runs in `raw_to_group_def` (a non-coercible value
+    // drops this group — stricter than pvxs, see the annotation-coercion
+    // divergence note).
     #[serde(rename = "+atomic", default)]
     atomic: Option<serde_json::Value>,
     #[serde(flatten)]
@@ -538,6 +540,30 @@ fn sort_members_canonical(members: &mut [GroupMember]) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Annotation coercion vs. pvxs — an INTENTIONAL, stricter-than-pvxs divergence.
+//
+// pvxs coerces each `+`-annotation with `Value::as<T>()` inside a yajl SAX
+// callback. When `as<T>()` raises `NoConvert` (a non-string/number scalar, an
+// array/object, or an unparsable string), the callback wrapper `yajlProcess`
+// (groupconfigprocessor.cpp:1048-1059) stores the message and returns -1 — but
+// yajl's `_CC_CHK` (`libcom/yajl/yajl_parser.c:175-181`) cancels the parse ONLY
+// on a FALSY (0) return, so a -1 does NOT cancel. The coercion error is
+// therefore SILENTLY SWALLOWED and the group is built and served with the
+// annotation left at its default. (Arrays are worse still: pvxs registers no
+// array callbacks, so `+id:[1,2]` decomposes into scalar callbacks and `+id`
+// keeps the FIRST element → `structureId = "1"`.)
+//
+// The `json_value_as_{bool,string,i64}` helpers below return `None` on a
+// non-coercible value, and their callers turn that into a per-group SKIP. That
+// is deliberately STRICTER than pvxs: we surface a malformed annotation as a
+// dropped group instead of copying pvxs's swallow-and-serve (a `_CC_CHK`
+// return-value bug), per the campaign rule to match pvxs without copying its
+// bugs. Net divergence (degenerate config only): a group whose annotation fails
+// to coerce is dropped in Rust where pvxs would serve it with the annotation
+// defaulted. This is NOT a parity match — do not describe it as one.
+// ---------------------------------------------------------------------------
+
 /// Coerce a JSON `+atomic` value to a bool exactly as pvxs
 /// `Value::as<bool>` coerces the parsed group-config scalar
 /// (groupprocessorcontext.cpp:29 → data.cpp:402-461): a JSON bool maps
@@ -545,8 +571,9 @@ fn sort_members_canonical(members: &mut [GroupMember]) {
 /// matching `copyOutScalar`'s `bool(src)` cast); a JSON string accepts
 /// only the exact tokens `"true"`/`"false"` (no trim, case-sensitive).
 /// Any other value (other string, array, object, null) is unconvertible
-/// — `None` mirrors pvxs's NoConvert, which the caller turns into a
-/// per-group skip. JSON-value sibling of [`crate::qsrv::channel`]'s
+/// — `None` → the caller SKIPS this group (stricter than pvxs, which swallows
+/// the `as<bool>` NoConvert and serves the group; see the annotation-coercion
+/// divergence note above). JSON-value sibling of [`crate::qsrv::channel`]'s
 /// `scalar_as_bool`, which applies the same `as<bool>` rule to a runtime
 /// pvRequest `ScalarValue`.
 fn json_value_as_bool(v: &serde_json::Value) -> Option<bool> {
@@ -576,13 +603,64 @@ fn json_value_as_bool(v: &serde_json::Value) -> Option<bool> {
 /// directly; a JSON bool becomes `"true"`/`"false"` (the Bool→String
 /// store branch, data.cpp:436); a JSON number becomes its base-10 form
 /// (`copyOutScalar`'s `SB()<<src`, data.cpp:409). Any other value (array,
-/// object, null) is unconvertible — `None` mirrors pvxs's NoConvert,
-/// which the caller turns into a per-group skip.
+/// object, null) is unconvertible — `None` → the caller SKIPS this group
+/// (stricter than pvxs, which swallows the `as<std::string>` NoConvert and
+/// serves the group; see the annotation-coercion divergence note above).
 fn json_value_as_string(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
         serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Parse a string to `i64` exactly as pvxs `parseTo<int64_t>` does
+/// (`util.cpp:803-817`): `std::stoll(s, &idx, 0)` — base auto-detected
+/// (`0x`/`0X` hex, a leading `0` octal, else decimal), an optional sign,
+/// leading whitespace skipped and trailing whitespace tolerated; any other
+/// trailing character is `NoConvert`. `None` mirrors that throw.
+fn parse_stoll_base0(s: &str) -> Option<i64> {
+    // stoll skips leading whitespace and its caller tolerates trailing
+    // whitespace, so trimming both reproduces the accepted set.
+    let t = s.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (radix, digits) =
+        if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            (16, hex)
+        } else if body.len() > 1 && body.starts_with('0') {
+            (8, &body[1..])
+        } else {
+            (10, body)
+        };
+    let mag = i64::from_str_radix(digits, radix).ok()?;
+    if neg { mag.checked_neg() } else { Some(mag) }
+}
+
+/// Coerce a JSON `+putorder` value to an `i64` exactly as pvxs
+/// `Value::as<int64_t>()` coerces the parsed scalar
+/// (groupprocessorcontext.cpp:75 → data.cpp:426/448): a JSON integer maps
+/// directly; a JSON real truncates toward zero (`copyOutScalar` static_cast);
+/// a JSON bool becomes 1/0; a JSON string is parsed via
+/// [`parse_stoll_base0`] (pvxs `parseTo<int64_t>`). Any other value (array,
+/// object, null) or an unparsable string is unconvertible — `None` → the caller
+/// SKIPS this group (stricter than pvxs, which swallows the `as<int64_t>`
+/// NoConvert and serves the group; see the annotation-coercion divergence note
+/// above).
+fn json_value_as_i64(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|u| u as i64))
+            .or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::Bool(b) => Some(*b as i64),
+        serde_json::Value::String(s) => parse_stoll_base0(s),
         _ => None,
     }
 }
@@ -666,19 +744,15 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     }
 
     // pvxs assigns `+atomic` via `value.as<bool>()` and `+id` via
-    // `value.as<std::string>()` (groupprocessorcontext.cpp:29,33). A value
-    // that cannot coerce raises NoConvert, which pvxs catches per group —
-    // the bad group is dropped and its siblings survive
-    // (groupconfigprocessor.cpp:128-163). Run the coercion here, inside the
-    // per-group recovery boundary, so a numeric/real/string `+atomic` (or a
-    // non-string `+id`) no longer fails the whole-file `serde_json::from_str`.
-    // pvxs assigns `+atomic` via `value.as<bool>()` and `+id` via
-    // `value.as<std::string>()` (groupprocessorcontext.cpp:29,33). A value
-    // that cannot coerce raises NoConvert, which pvxs catches per group —
-    // the bad group is dropped and its siblings survive
-    // (groupconfigprocessor.cpp:128-163). Run the coercion here, inside the
-    // per-group recovery boundary, so a numeric/real/string `+atomic` (or a
-    // non-string `+id`) no longer fails the whole-file `serde_json::from_str`.
+    // `value.as<std::string>()` (groupprocessorcontext.cpp:29,33). Capturing
+    // the raw `serde_json::Value` and coercing here (not in the whole-file
+    // `serde_json::from_str`) lets a numeric/real/string `+atomic` or a
+    // non-string `+id` coerce like pvxs instead of failing the whole file. A
+    // value that cannot coerce returns `Err` → this group is dropped. That skip
+    // is deliberately STRICTER than pvxs: pvxs's `as<T>()` raises NoConvert
+    // inside the yajl callback, which swallows it (returns -1, `_CC_CHK` does
+    // not cancel) and serves the group with the annotation defaulted — we do
+    // NOT copy that swallow. See the annotation-coercion divergence note above.
     let (atomic, atomic_is_set) = match &raw.atomic {
         // Unset: pvxs's runtime rule `atomic != False`
         // (groupconfigprocessor.cpp:436) resolves atomic (`true`) but
@@ -731,33 +805,70 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     Ok(def)
 }
 
+/// Validate a group member field-name path against the pvxs `FieldName`
+/// constructor grammar (`ioc/fieldname.cpp:29-67`), which **throws** on a
+/// malformed path — an empty leading/interior component (`.a`, `a..b`) or a
+/// bad array subscript (`a[x]`; plus the stricter-than-pvxs `a[]`/`a[-1]` forms
+/// documented in the `parse_field_path_checked` divergence note). pvxs runs
+/// this via `fieldName(def.name)`
+/// (`field.cpp:21`) inside the `createGroups` per-group `try`
+/// (`groupconfigprocessor.cpp:431-446`), so a throw aborts just that group's
+/// build (logged, group not served) while siblings still load. Here the error
+/// propagates out of `parse_member` → `raw_to_group_def`, whose caller already
+/// implements the same per-group recovery (`tracing::warn!("ignoring invalid
+/// QSRV group")`). The grammar itself lives in one place — the canonical
+/// `super::group::parse_field_path_checked`, which the navigation parser also
+/// uses — so build-time validation and runtime navigation can never diverge.
+fn validate_field_name(field_name: &str) -> BridgeResult<()> {
+    super::group::parse_field_path_checked(field_name)
+        .map(|_| ())
+        .map_err(BridgeError::GroupConfigError)
+}
+
 fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<GroupMember> {
+    // pvxs constructs `FieldName(def.name)` before anything else in the field
+    // definition; a malformed path throws and aborts this group's build.
+    validate_field_name(field_name)?;
+
     let obj = value.as_object().ok_or_else(|| {
         BridgeError::GroupConfigError(format!("field '{field_name}' must be an object"))
     })?;
 
-    let mapping = match obj.get("+type").and_then(|v| v.as_str()) {
-        Some("scalar") | None => FieldMapping::Scalar,
-        Some("plain") => FieldMapping::Plain,
-        Some("meta") => FieldMapping::Meta,
-        Some("any") => FieldMapping::Any,
-        Some("proc") => FieldMapping::Proc,
-        Some("structure") => FieldMapping::Structure,
-        Some("const") => FieldMapping::Const,
-        Some(other) => {
-            // pvxs logs an unknown mapping +type and keeps the default
-            // (scalar) mapping rather than rejecting the config
-            // (ioc/groupprocessorcontext.cpp:43-63; the default mapping
-            // type is Scalar, fieldconfig.h:24-37). Warn and fall back to
-            // Scalar — the normal +channel validation below then decides
-            // whether the member (and so the group) is usable.
-            tracing::warn!(
-                field = field_name,
-                bad_type = other,
-                "unknown QSRV group member +type; defaulting to scalar"
-            );
-            FieldMapping::Scalar
-        }
+    // pvxs reads `+type` via `value.as<std::string>()`
+    // (groupprocessorcontext.cpp:44), coercing bool/number to a string like
+    // every other member annotation; a non-coercible array/object returns
+    // `None` → this group is dropped (stricter than pvxs — see the
+    // annotation-coercion divergence note). Absent → the default Scalar mapping.
+    let mapping = match obj.get("+type") {
+        None => FieldMapping::Scalar,
+        Some(v) => match json_value_as_string(v).as_deref() {
+            Some("scalar") => FieldMapping::Scalar,
+            Some("plain") => FieldMapping::Plain,
+            Some("meta") => FieldMapping::Meta,
+            Some("any") => FieldMapping::Any,
+            Some("proc") => FieldMapping::Proc,
+            Some("structure") => FieldMapping::Structure,
+            Some("const") => FieldMapping::Const,
+            Some(other) => {
+                // pvxs logs an unknown mapping +type and keeps the default
+                // (scalar) mapping rather than rejecting the config
+                // (ioc/groupprocessorcontext.cpp:43-63; the default mapping
+                // type is Scalar, fieldconfig.h:24-37). Warn and fall back to
+                // Scalar — the normal +channel validation below then decides
+                // whether the member (and so the group) is usable.
+                tracing::warn!(
+                    field = field_name,
+                    bad_type = other,
+                    "unknown QSRV group member +type; defaulting to scalar"
+                );
+                FieldMapping::Scalar
+            }
+            None => {
+                return Err(BridgeError::GroupConfigError(format!(
+                    "field '{field_name}': +type value {v} is not a string, number, or bool"
+                )));
+            }
+        },
     };
 
     // Structure and Const mappings have no backing channel.
@@ -776,13 +887,22 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             }
             String::new()
         }
-        _ => obj
-            .get("+channel")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
+        _ => {
+            // pvxs reads `+channel` via `value.as<std::string>()`
+            // (groupprocessorcontext.cpp:66), coercing bool/number; a
+            // non-coercible array/object returns `None` → this group is dropped
+            // (stricter than pvxs — see the annotation-coercion divergence
+            // note). Distinguish an absent +channel (missing) from a
+            // present-but-non-coercible one.
+            let v = obj.get("+channel").ok_or_else(|| {
                 BridgeError::GroupConfigError(format!("field '{field_name}' missing +channel"))
+            })?;
+            json_value_as_string(v).ok_or_else(|| {
+                BridgeError::GroupConfigError(format!(
+                    "field '{field_name}': +channel value {v} is not a string, number, or bool"
+                ))
             })?
-            .to_string(),
+        }
     };
 
     // Parse constant value for Const mapping.
@@ -821,63 +941,99 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
     let triggers = if mapping == FieldMapping::Structure || mapping == FieldMapping::Const {
         TriggerDef::None
     } else {
-        match obj.get("+trigger").and_then(|v| v.as_str()) {
-            Some("*") => TriggerDef::All,
-            // pvxs groupconfigprocessor.cpp:323 defaults a
-            // missing `+trigger` to self-trigger (only this member's
-            // own field re-emits in the group), not All. The Rust
-            // path treated None as All and emitted a full-group
-            // changed bitset on every member event — distinct from
-            // pvxs's narrow self-trigger delta visible in
-            // testqgroup.cpp:220 (NTEnum group: only `value.index`
-            // bit set on a VAL update).
-            // this per-member default is only provisional. pvxs
-            // applies the self-trigger fallback at the GROUP level and only
-            // when the whole group declares no triggers
-            // (`groupconfigprocessor.cpp:317-339`). In a group where any
-            // member has an explicit `+trigger`, a no-`+trigger` member is
-            // silent. `GroupPvDef::resolve_self_trigger_default` demotes
-            // `SelfOnly` → `None` for such mixed groups after all members
-            // are assembled.
-            // An explicit `+trigger:""` is NOT distinct from a missing
-            // `+trigger`: pvxs stores both as the empty string
-            // (`fieldconfig.h:50-54`) and sets `hasTriggers` only for a
-            // NON-empty trigger string (`groupconfigprocessor.cpp:297-309`).
-            // So an empty trigger gets the same provisional self-trigger
-            // default and is resolved at group scope — a one-member
-            // `"+trigger":""` group, or an all-empty group, still
-            // self-triggers (`:317-339`). Materializing `None` here made an
-            // explicit `""` permanent silence even with no non-empty sibling
-            // trigger, diverging from pvxs. `None` (silence) is produced
-            // only by `resolve_self_trigger_default` (mixed groups) and for
-            // channel-less Structure/Const members above.
-            None | Some("") => TriggerDef::SelfOnly,
-            // pvxs `defineTriggers` (groupconfigprocessor.cpp:299-309)
-            // splits a non-empty `+trigger` with `std::getline(.,',')` and
-            // inserts each substring VERBATIM — it does not trim whitespace.
-            // Trigger resolution (`:394-408`) then looks each name up exactly
-            // in `fieldMap`, so `"a, b"` keeps the target `" b"` and reports
-            // it as a nonexistent field rather than triggering `b`. Trimming
-            // here would make Rust trigger `b`, diverging from pvxs and
-            // changing the group's changed-bitset/monitor fanout.
-            Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.to_string()).collect()),
+        // pvxs reads `+trigger` via `value.as<std::string>()`
+        // (groupprocessorcontext.cpp:72), coercing bool/number; a non-coercible
+        // array/object returns `None` → this group is dropped (stricter than
+        // pvxs — see the annotation-coercion divergence note). An absent key is
+        // the provisional self-trigger default.
+        match obj.get("+trigger") {
+            None => TriggerDef::SelfOnly,
+            Some(v) => match json_value_as_string(v).as_deref() {
+                Some("*") => TriggerDef::All,
+                // pvxs groupconfigprocessor.cpp:323 defaults a
+                // missing `+trigger` to self-trigger (only this member's
+                // own field re-emits in the group), not All. The Rust
+                // path treated None as All and emitted a full-group
+                // changed bitset on every member event — distinct from
+                // pvxs's narrow self-trigger delta visible in
+                // testqgroup.cpp:220 (NTEnum group: only `value.index`
+                // bit set on a VAL update).
+                // this per-member default is only provisional. pvxs
+                // applies the self-trigger fallback at the GROUP level and only
+                // when the whole group declares no triggers
+                // (`groupconfigprocessor.cpp:317-339`). In a group where any
+                // member has an explicit `+trigger`, a no-`+trigger` member is
+                // silent. `GroupPvDef::resolve_self_trigger_default` demotes
+                // `SelfOnly` → `None` for such mixed groups after all members
+                // are assembled.
+                // An explicit `+trigger:""` is NOT distinct from a missing
+                // `+trigger`: pvxs stores both as the empty string
+                // (`fieldconfig.h:50-54`) and sets `hasTriggers` only for a
+                // NON-empty trigger string (`groupconfigprocessor.cpp:297-309`).
+                // So an empty trigger gets the same provisional self-trigger
+                // default and is resolved at group scope — a one-member
+                // `"+trigger":""` group, or an all-empty group, still
+                // self-triggers (`:317-339`). Materializing `None` here made an
+                // explicit `""` permanent silence even with no non-empty sibling
+                // trigger, diverging from pvxs. `None` (silence) is produced
+                // only by `resolve_self_trigger_default` (mixed groups) and for
+                // channel-less Structure/Const members above.
+                Some("") => TriggerDef::SelfOnly,
+                // pvxs `defineTriggers` (groupconfigprocessor.cpp:299-309)
+                // splits a non-empty `+trigger` with `std::getline(.,',')` and
+                // inserts each substring VERBATIM — it does not trim whitespace.
+                // Trigger resolution (`:394-408`) then looks each name up exactly
+                // in `fieldMap`, so `"a, b"` keeps the target `" b"` and reports
+                // it as a nonexistent field rather than triggering `b`. Trimming
+                // here would make Rust trigger `b`, diverging from pvxs and
+                // changing the group's changed-bitset/monitor fanout.
+                Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.to_string()).collect()),
+                None => {
+                    return Err(BridgeError::GroupConfigError(format!(
+                        "field '{field_name}': +trigger value {v} is not a string, number, or bool"
+                    )));
+                }
+            },
         }
     };
 
-    // pvxs reads `+putorder` as the full `int64_t`
-    // (groupprocessorcontext.cpp:74-78); when the explicit value equals
-    // the absent-sentinel `i64::MIN` it increments to `i64::MIN + 1` so
-    // an explicit minimum order is never confused with "no +putorder".
+    // pvxs reads `+putorder` via `value.as<int64_t>()`
+    // (groupprocessorcontext.cpp:74-78), coercing bool/real/string; a
+    // non-coercible array/object (or unparsable string) returns `None` → this
+    // group is dropped (stricter than pvxs — see the annotation-coercion
+    // divergence note). When the coerced value
+    // equals the absent-sentinel `i64::MIN` it increments to `i64::MIN + 1`
+    // so an explicit minimum order is never confused with "no +putorder".
     // We keep the value at full width and apply the same sentinel bump.
-    let put_order = obj
-        .get("+putorder")
-        .and_then(|v| v.as_i64())
-        .map(|n| if n == i64::MIN { i64::MIN + 1 } else { n });
+    let put_order = match obj.get("+putorder") {
+        None => None,
+        Some(v) => match json_value_as_i64(v) {
+            Some(n) => Some(if n == i64::MIN { i64::MIN + 1 } else { n }),
+            None => {
+                return Err(BridgeError::GroupConfigError(format!(
+                    "field '{field_name}': +putorder value {v} is not an integer, bool, or numeric string"
+                )));
+            }
+        },
+    };
 
-    let struct_id = obj
-        .get("+id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // pvxs reads member `+id` via `value.as<std::string>()`
+    // (groupprocessorcontext.cpp:69), coercing bool/number; a non-coercible
+    // array/object returns `None` → this group is dropped (stricter than pvxs —
+    // see the annotation-coercion divergence note). Unlike the group-level
+    // `+id`, the member-level assignment does not collapse an empty string, so a
+    // coerced `""` is preserved as an (anonymous) struct id.
+    let struct_id = match obj.get("+id") {
+        None => None,
+        Some(v) => match json_value_as_string(v) {
+            Some(s) => Some(s),
+            None => {
+                return Err(BridgeError::GroupConfigError(format!(
+                    "field '{field_name}': +id value {v} is not a string, number, or bool"
+                )));
+            }
+        },
+    };
 
     Ok(GroupMember {
         field_name: field_name.to_string(),
@@ -1585,11 +1741,14 @@ mod tests {
         }
     }
 
-    /// A `+atomic` value
-    /// that `as<bool>` cannot coerce (a non-`"true"`/`"false"` string,
-    /// array, object, null) raises NoConvert in pvxs, which is caught per
-    /// group — the bad group is dropped, its valid siblings survive
-    /// (groupconfigprocessor.cpp:128-163). It must NOT fail the whole file.
+    /// A `+atomic` value that `as<bool>` cannot coerce (a non-`"true"`/`"false"`
+    /// string, array, object, null) makes Rust DROP that one group while its
+    /// valid siblings survive, and never fail the whole file. This is stricter
+    /// than pvxs: pvxs's `as<bool>` NoConvert is swallowed inside the yajl
+    /// callback (returns -1, `_CC_CHK` does not cancel) and the group is served
+    /// with `+atomic` defaulted — we deliberately do NOT copy that swallow (see
+    /// the annotation-coercion divergence note). This test pins the stricter
+    /// Rust drop, not a pvxs match.
     #[test]
     fn config_bad_atomic_skips_only_that_group() {
         let json = r#"{
@@ -1617,9 +1776,12 @@ mod tests {
         );
     }
 
-    /// Same defect family as `+atomic` coercion, applied to
-    /// `+id`. A `+id` that `as<std::string>` cannot coerce (array,
-    /// object, null) is a per-group NoConvert, not a whole-file failure.
+    /// Same defect family as `+atomic` coercion, applied to `+id`. A `+id` that
+    /// `as<std::string>` cannot coerce (array, object, null) makes Rust drop
+    /// that one group, not fail the whole file — stricter than pvxs, which
+    /// swallows the NoConvert and serves the group (and for an array `+id:[1,2]`
+    /// even keeps the first element `"1"`; see the annotation-coercion
+    /// divergence note). This test pins the stricter Rust drop.
     #[test]
     fn config_bad_id_skips_only_that_group() {
         let json = r#"{
@@ -2510,5 +2672,125 @@ mod tests {
 
         let groups = parse_group_config(json).unwrap();
         assert!(groups[0].members[0].channel.is_empty());
+    }
+
+    /// Q1: a group with a malformed member field-name path is refused (pvxs's
+    /// `FieldName` ctor throws), skipping just that group via the per-group
+    /// recovery boundary — a valid sibling group in the same config still
+    /// loads. The old parser silently normalized the bad name and served a
+    /// well-formed-but-different structure.
+    #[test]
+    fn malformed_member_field_name_skips_only_that_group() {
+        // `bad..path` has an empty interior component; `arr[x]` a non-integer
+        // subscript. Each pvxs `FieldName` ctor throws → group not served.
+        let json = r#"{
+            "GRP:emptycomp": { "bad..path": { "+channel": "R:a" } },
+            "GRP:badsub":    { "arr[x]":    { "+channel": "R:b" } },
+            "GRP:ok":        { "val":       { "+channel": "R:c" } }
+        }"#;
+
+        let groups = parse_group_config(json).unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["GRP:ok"],
+            "only the valid sibling loads; the two malformed groups are skipped, got {names:?}"
+        );
+    }
+
+    /// Q1: a single trailing dot is dropped (pvxs `getline` fails the terminal
+    /// empty extraction at EOF), so a member named `a.` builds field `a` and
+    /// the group loads — it must NOT be rejected as a malformed component.
+    #[test]
+    fn trailing_dot_member_name_is_accepted() {
+        let json = r#"{
+            "GRP:trail": { "a.": { "+channel": "R:a" } }
+        }"#;
+
+        let groups = parse_group_config(json).unwrap();
+        assert_eq!(groups.len(), 1, "trailing dot is not a malformed component");
+        assert_eq!(
+            groups[0].members.len(),
+            1,
+            "the member builds and the group loads"
+        );
+    }
+
+    // ---- Q2: member-level annotations coerce via as<T>() like group-level ----
+
+    /// `parse_stoll_base0` mirrors pvxs `parseTo<int64_t>` (`std::stoll(s,_,0)`):
+    /// base auto-detect, sign, leading/trailing whitespace tolerated.
+    #[test]
+    fn parse_stoll_base0_matches_pvxs() {
+        assert_eq!(parse_stoll_base0("2"), Some(2));
+        assert_eq!(parse_stoll_base0("-7"), Some(-7));
+        assert_eq!(parse_stoll_base0("+9"), Some(9));
+        assert_eq!(parse_stoll_base0("0x10"), Some(16), "hex auto-detect");
+        assert_eq!(parse_stoll_base0("010"), Some(8), "octal auto-detect");
+        assert_eq!(parse_stoll_base0("  42  "), Some(42), "leading/trailing ws");
+        assert_eq!(parse_stoll_base0("2x"), None, "extraneous trailing char");
+        assert_eq!(parse_stoll_base0("abc"), None, "non-numeric");
+        assert_eq!(parse_stoll_base0(""), None, "empty");
+    }
+
+    /// A `+putorder` given as a numeric string coerces to the integer (pvxs
+    /// `as<int64_t>()`), instead of the old `.as_i64()` silently dropping it.
+    #[test]
+    fn member_putorder_coerces_numeric_string() {
+        let json = r#"{
+            "GRP:po": {
+                "a": { "+channel": "R:a", "+putorder": "2" },
+                "b": { "+channel": "R:b", "+putorder": 1 }
+            }
+        }"#;
+        let groups = parse_group_config(json).unwrap();
+        let g = &groups[0];
+        let a = g.members.iter().find(|m| m.field_name == "a").unwrap();
+        let b = g.members.iter().find(|m| m.field_name == "b").unwrap();
+        assert_eq!(a.put_order, Some(2), "string \"2\" coerces to 2");
+        assert_eq!(b.put_order, Some(1));
+    }
+
+    /// A numeric member `+id` and a numeric `+channel` coerce to their string
+    /// form (pvxs `as<std::string>()`), instead of being dropped.
+    #[test]
+    fn member_id_and_channel_coerce_numeric() {
+        let json = r#"{
+            "GRP:idch": {
+                "a": { "+channel": 5, "+id": 7 }
+            }
+        }"#;
+        let groups = parse_group_config(json).unwrap();
+        let a = &groups[0].members[0];
+        assert_eq!(a.channel, "5", "numeric +channel coerces to \"5\"");
+        assert_eq!(
+            a.struct_id.as_deref(),
+            Some("7"),
+            "numeric +id coerces to \"7\""
+        );
+    }
+
+    /// A non-coercible member annotation (array/object) makes Rust drop that
+    /// one group while the sibling valid group still loads. This is stricter
+    /// than pvxs: pvxs's member `as<T>()` NoConvert is swallowed inside the yajl
+    /// callback (returns -1, `_CC_CHK` does not cancel), so pvxs would serve
+    /// `GRP:bad` with `+id` defaulted — and for `+id:[1,2]` it decomposes the
+    /// array into scalar callbacks and keeps the FIRST element (`structureId =
+    /// "1"`). We deliberately do NOT copy that swallow (see the
+    /// annotation-coercion divergence note). This test pins the stricter Rust
+    /// drop, not a pvxs match.
+    #[test]
+    fn member_noncoercible_annotation_skips_only_that_group() {
+        let json = r#"{
+            "GRP:bad": { "a": { "+channel": "R:a", "+id": [1, 2] } },
+            "GRP:ok":  { "b": { "+channel": "R:b" } }
+        }"#;
+        let groups = parse_group_config(json).unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["GRP:ok"],
+            "the array-valued +id group is skipped, sibling loads, got {names:?}"
+        );
     }
 }

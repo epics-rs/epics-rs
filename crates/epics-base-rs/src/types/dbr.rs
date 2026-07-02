@@ -102,6 +102,18 @@ pub enum DbFieldType {
     /// Over PVA pvxs serves it natively as `uint` (`ioc/typeutils.cpp:43-44`:
     /// `DBR_ULONG -> TypeCode::UInt32`).
     ULong = 10,
+    /// Internal-only type for unsigned 8-bit EPICS fields (C `DBF_UCHAR`,
+    /// dbStatic `dbfType` index 2 / `waveform` `FTVL=UCHAR`). Unlike the
+    /// signed `Char` (epicsInt8), this is epicsUInt8. The CA wire protocol
+    /// has no unsigned types, so the IOC promotes `DBF_UCHAR` to `DBR_CHAR`
+    /// — the same 1-byte wire type as `Char` (the C `dbDBRnewToDBRold` table,
+    /// `db_convert.h`: `4, /*DBR_UCHAR to DBR_CHAR*/`); the raw bytes are
+    /// identical, only the signedness of the interpretation differs. Over PVA
+    /// pvxs serves it natively as `ubyte` (`ioc/typeutils.cpp:34-35`:
+    /// `DBR_UCHAR -> TypeCode::UInt8`), distinct from `Char`'s signed `byte`.
+    /// The discriminant is an internal marker (not a CA wire code); see
+    /// [`Self::ca_wire_type`].
+    UChar = 11,
 }
 
 impl DbFieldType {
@@ -130,7 +142,7 @@ impl DbFieldType {
             Self::String => 40, // MAX_STRING_SIZE
             Self::Short | Self::Enum | Self::UShort => 2,
             Self::Float | Self::Long | Self::ULong => 4,
-            Self::Char => 1,
+            Self::Char | Self::UChar => 1,
             Self::Double | Self::Int64 | Self::UInt64 => 8,
         }
     }
@@ -139,11 +151,14 @@ impl DbFieldType {
     /// no CA wire code, so they report the signed CA type the IOC promotes
     /// them to (C `dbDBRnewToDBRold`, `db_convert.h`): `Int64`/`UInt64`/
     /// `ULong` → `DBR_DOUBLE` (6), `UShort` → `DBR_LONG` (5, the smallest
-    /// signed CA type that holds the full `0..=65535` range).
+    /// signed CA type that holds the full `0..=65535` range), `UChar` →
+    /// `DBR_CHAR` (4, same 1-byte wire type — the bytes are identical, only
+    /// the interpretation is unsigned).
     fn ca_wire_type(&self) -> u16 {
         match self {
             Self::Int64 | Self::UInt64 | Self::ULong => Self::Double as u16,
             Self::UShort => Self::Long as u16,
+            Self::UChar => Self::Char as u16,
             other => *other as u16,
         }
     }

@@ -25,21 +25,30 @@
 //! - motor: `epics-modules/motor/motorApp/MotorSrc/motorRecord.dbd`
 //!   (plus motor-rs extension fields documented at the entry)
 //!
-//! A record type that is **not** listed here returns `None`: the put gate
-//! then falls back to the legacy "process on every put" behavior, so
-//! record types whose DBD pp-flags have not been modeled (records in other
-//! crates — scaler, std, optics — and test records) keep working
-//! unchanged. `asynRecord` is intentionally omitted: it has two impls
-//! across crates (`epics-base-rs` and `asyn-rs`) and is covered by the
-//! ASYN parity findings, so it stays on the legacy path here.
+//! The table is **total and fail-safe**: an unlisted record type returns the
+//! empty slice (`&[]`) and emits a one-time `tracing::warn!`, so a put to its
+//! fields never auto-processes (only `PROC` does). This makes spurious
+//! processing **opt-in** — a record type must declare its `pp(TRUE)` set to
+//! get any field-triggered processing — instead of the former fail-dangerous
+//! default where an unmodeled type processed on *every* put (the structural
+//! root of the process-on-every-put defect family: throttle/epid/timestamp/
+//! scaler/table/asyn). Every instantiable record type is modeled (base records
+//! plus the module-crate records scaler, std epid/throttle/timestamp, optics
+//! table, asyn), and `create_record` rejects unknown types, so the warning
+//! path is reachable only by a *future* record type registered without an
+//! entry — where the loud warning surfaces the omission in testing rather than
+//! as silent under-processing. `asynRecord` has two impls across crates
+//! (`epics-base-rs` stub + `asyn-rs` functional) but both report the type
+//! string `"asyn"`, so the single `"asyn"` entry covers both.
 
-/// `pp(TRUE)` field names for `record_type`, sourced from the upstream DBD,
-/// or `None` when the type has not been modeled (legacy always-process).
+/// `pp(TRUE)` field names for `record_type`, transcribed verbatim from the
+/// upstream DBD. **Total**: an unmodeled type returns `&[]` (and warns once),
+/// so the put gate processes it on `PROC` only — never on a field put.
 ///
-/// The empty slice (`Some(&[])`, e.g. `event`, `histogram`) is distinct
-/// from `None`: it means "modeled, no field forces processing" — a put to
-/// any field of such a record never drives processing (only `PROC` does).
-pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
+/// A modeled type with no processing field (`event`, `histogram`) also
+/// returns `&[]`, but silently: it is a deliberate "PROC-only" entry in the
+/// match, not the warned fallthrough.
+pub fn pp_fields_for(record_type: &str) -> &'static [&'static str] {
     // mbbi and mbbo share the identical 50-name pp(TRUE) set.
     const MBB_PP: &[&str] = &[
         "VAL", "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL",
@@ -49,7 +58,7 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
         "ELSV", "TVSV", "TTSV", "FTSV", "FFSV", "UNSV", "COSV", "RVAL",
     ];
 
-    Some(match record_type {
+    match record_type {
         "ai" => &[
             "VAL", "LINR", "EGUF", "EGUL", "AOFF", "ASLO", "HIHI", "LOLO", "HIGH", "LOW", "HHSV",
             "LLSV", "HSV", "LSV", "ESLO", "EOFF", "ROFF", "RVAL",
@@ -153,12 +162,17 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "JVEL",
             "PCO_ENABLE",
         ],
+        // permissiveRecord.dbd.pod: VAL, WFLG, LABL are pp(TRUE)
+        // (OVAL/OFLG are SPC_NOMOD trackers).
+        "permissive" => &["VAL", "WFLG", "LABL"],
         "printf" => &["VAL", "FMT"],
         "sel" => &[
             "HIHI", "LOLO", "HIGH", "LOW", "HHSV", "LLSV", "HSV", "LSV", "A", "B", "C", "D", "E",
             "F", "G", "H", "I", "J", "K", "L",
         ],
         "seq" => &["VAL"],
+        // stateRecord.dbd.pod: only VAL is pp(TRUE) (OVAL is SPC_NOMOD).
+        "state" => &["VAL"],
         "stringin" => &["VAL", "SVAL"],
         "stringout" => &["VAL"],
         "sub" => &[
@@ -179,11 +193,137 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF",
             "GG", "HH", "II", "JJ", "KK", "LL",
         ],
+        // aCalcout pp(TRUE) set (aCalcoutRecord.dbd): scalar A..L + array
+        // AA..LL inputs, CALC/OCAL, alarm limits, plus the array result/sizing
+        // fields AVAL/OAV/PAVL/POAV/NUSE that C marks pp(TRUE).
+        "acalcout" => &[
+            "AVAL", "NUSE", "PAVL", "CALC", "OCAL", "HIHI", "LOLO", "HIGH", "LOW", "HHSV", "LLSV",
+            "HSV", "LSV", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "AA", "BB",
+            "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL", "OAV", "POAV",
+        ],
         "swait" => &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
         "transform" => &[
             "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
         ],
         "sseq" => &["VAL"],
-        _ => return None,
-    })
+        // scaler module scalerRecord.dbd: only CNT and CONT are pp(TRUE).
+        // Every preset/gate/config field (PR1..PR64, G1..G64, TP, RATE, …)
+        // is special(SPC_MOD) and fully applied by scaler `special()` — a
+        // put to one must NOT process. Without this a preset put ran
+        // process(), whose autocount block could re-arm the counter / send
+        // device commands. CNT (start/stop) and CONT (rescan) still process.
+        "scaler" => &["CNT", "CONT"],
+        // optics module tableRecord.dbd: the 45 pp(TRUE) fields are the user
+        // motion drives + geometry params (LX..Z, YANG), the absolute and
+        // relative user limits (UHAX..ULZ, UHAXR..ULZR), the action flags
+        // (INIT/ZERO/SYNC/READ) and the menus (GEOM/AUNIT). Every other field
+        // — including the SPC_MOD-but-not-pp VAL/L2Z/SSET/SUSE and all the
+        // SPC_NOMOD readbacks — is applied by `on_put` (table's special()
+        // equivalent) and must NOT process. Without this a put to a config or
+        // readback field ran process(), whose "Calc & Move" branch drives the
+        // motor output links — a spurious motion command.
+        "table" => &[
+            "LX", "LZ", "SX", "SY", "SZ", "RX", "RY", "RZ", "YANG", "AX", "AY", "AZ", "X", "Y",
+            "Z", "UHAX", "UHAY", "UHAZ", "UHX", "UHY", "UHZ", "ULAX", "ULAY", "ULAZ", "ULX", "ULY",
+            "ULZ", "UHAXR", "UHAYR", "UHAZR", "UHXR", "UHYR", "UHZR", "ULAXR", "ULAYR", "ULAZR",
+            "ULXR", "ULYR", "ULZR", "INIT", "ZERO", "SYNC", "READ", "GEOM", "AUNIT",
+        ],
+        // std module epidRecord.dbd: only VAL is pp(TRUE); every other
+        // field is plain or special(SPC_NOMOD) with no pp. Without this a
+        // put to a gain (KP/KI/KD), a limit, or a link (STPL/INP/OUTL/TRIG)
+        // spuriously ran the PID compute and could write the OUTL actuator.
+        "epid" => &["VAL"],
+        // std module timestampRecord.dbd: VAL and RVAL are pp(TRUE); OVAL
+        // is special(SPC_NOMOD) and TST is a plain menu. Without this a put
+        // to TST (the time format) spuriously re-read the clock and fired
+        // FLNK. No output link, so no external write — but still a
+        // wire-observable spurious FLNK/clock-read divergence.
+        "timestamp" => &["VAL", "RVAL"],
+        // std module throttleRecord.dbd: only VAL is pp(TRUE). OUT, SINP,
+        // DLY and SYNC are special(SPC_MOD) with no pp — a put to them is
+        // handled by throttle `special()` (link re-classify / valueSync /
+        // delay clamp) and must NOT process the record.
+        "throttle" => &["VAL"],
+        // asyn module asynRecord.dbd: the 7 pp(TRUE) fields are the output /
+        // command fields AOUT, BOUT, I32OUT, UI32OUT, F64OUT (octet/register
+        // writes) and UCMD, ACMD (GPIB commands). Every config field
+        // (PORT/ADDR/TMOD/IFACE/options/trace…) is non-pp and applied by
+        // asyn-rs `special()` off the process path. Without this a put to a
+        // non-pp config field ran process(), which for TMOD != NoI/O performs
+        // real port read/write — a spurious device-I/O command. Both the
+        // asyn-rs functional impl and the epics-base-rs stub report "asyn".
+        "asyn" => &[
+            "AOUT", "BOUT", "I32OUT", "UI32OUT", "F64OUT", "UCMD", "ACMD",
+        ],
+        // Fail-safe fallthrough: an unmodeled type processes on PROC only.
+        // Unreachable for any instantiable record (create_record rejects
+        // unknown types and every built/registered type is listed above), so
+        // this fires only for a future record type registered without an
+        // entry — the one-time warning surfaces that omission loudly.
+        other => {
+            warn_unknown_record_type_once(other);
+            &[]
+        }
+    }
+}
+
+/// Emit a one-time `tracing::warn!` the first time an unmodeled `record_type`
+/// reaches [`pp_fields_for`]'s fallthrough. Deduplicated per type string so a
+/// hot put path does not spam the log.
+fn warn_unknown_record_type_once(record_type: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let is_new = warned
+        .lock()
+        .map(|mut set| set.insert(record_type.to_string()))
+        .unwrap_or(true);
+    if is_new {
+        tracing::warn!(
+            record_type,
+            "record type has no pp_fields_for entry; its field puts will never \
+             auto-process (PROC-only). Add its pp(TRUE) set to pp_fields_for."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pp_fields_for;
+
+    /// The flip's core contract: the table is total and fail-safe. An
+    /// unmodeled type returns the empty slice (was `None` → process-on-every-
+    /// put), so the put gate processes it on `PROC` only. Against the former
+    /// `Option` signature this would not even compile.
+    #[test]
+    fn unmodeled_type_returns_empty_not_processing() {
+        assert!(
+            pp_fields_for("__definitely_not_a_record_type__").is_empty(),
+            "an unmodeled record type must return &[] (fail-safe, PROC-only)"
+        );
+    }
+
+    /// A modeled type that declares pp fields is non-empty, so its pp puts
+    /// still process — the flip narrows nothing for modeled types.
+    #[test]
+    fn modeled_type_with_pp_is_non_empty() {
+        assert!(
+            pp_fields_for("ai").contains(&"VAL"),
+            "ai declares VAL pp(TRUE); the modeled set must survive the flip"
+        );
+        assert!(
+            pp_fields_for("asyn").contains(&"AOUT"),
+            "asyn declares AOUT pp(TRUE); a put to AOUT must still process"
+        );
+    }
+
+    /// A modeled type with no processing field (`event`, `histogram`) also
+    /// returns `&[]` — same value as the unmodeled fallthrough, but a
+    /// deliberate match arm (no warning). Distinguishes the two `&[]` sources.
+    #[test]
+    fn modeled_empty_type_returns_empty() {
+        assert!(pp_fields_for("event").is_empty());
+        assert!(pp_fields_for("histogram").is_empty());
+    }
 }

@@ -16,7 +16,7 @@ use super::link::{ParsedLink, parse_link_v2, parse_output_link_v2};
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
-use super::scan::ScanType;
+use super::scan::{ScanType, SimModeScan};
 
 /// Put-notify completion wait-set — the C `dbNotify.c` `processNotify`
 /// waitList analogue (`dbNotifyAdd` / `dbNotifyCompletion`).
@@ -107,10 +107,12 @@ pub(crate) struct MetadataSnapshot {
 /// below feed the live-computed `field_metadata_override`, never the
 /// cache — its invalidation on their write is harmless).
 ///
-/// Currently uncovered (because they are not yet populated by any
+/// Currently uncovered (because it is not yet populated by any
 /// `populate_*` function): `DESC` (would map to `display.description`
-/// — populate hook missing), `Q:form` info tag (would map to
-/// `display.form`). Add to this set if/when those are wired up.
+/// — populate hook missing). The `Q:form` info tag is now wired
+/// (`populate_display_info` -> `display.form`), but as an immutable
+/// load-time info tag — not a runtime field — it needs no cache
+/// invalidation and so is intentionally absent from this field set.
 fn is_metadata_field(name: &str) -> bool {
     matches!(
         name,
@@ -246,6 +248,14 @@ pub struct RecordInstance {
     /// post mask. False for every record without the MPST/APST/HASH
     /// mechanism.
     pub(crate) array_hash_changed: bool,
+    /// One-shot "skip the registered subroutine this cycle" signal for aSub
+    /// `LFLG=READ`. The async processing path resolves the `SUBL` link before
+    /// taking this lock; when the resolved name is bad (C `fetch_values` ->
+    /// `S_db_BadSub`) or the link read failed, C `process` runs `do_sub` only
+    /// on `!status`, so the subroutine is skipped. Set by the resolution
+    /// apply, consumed (and cleared) by [`Self::run_registered_subroutine`];
+    /// `false` for every record without a pending bad re-resolution.
+    pub(crate) suppress_subroutine_run: bool,
     /// Generation counter for ReprocessAfter timer cancellation.
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
@@ -294,10 +304,10 @@ pub struct RecordInstance {
     ///
     /// If a future change adds a new field to `populate_display_info`,
     /// `populate_control_info`, or `populate_enum_info` (e.g. populating
-    /// `display.form` from a record's `Q:form` info tag, or
     /// `display.description` from DESC), the new source field name MUST
     /// also be added to `is_metadata_field` so writes to it invalidate
-    /// the cache.
+    /// the cache. (The `Q:form` -> `display.form` mapping is exempt: it
+    /// reads an immutable load-time info tag, not a runtime field.)
     pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
 }
 
@@ -316,10 +326,11 @@ impl RecordInstance {
             // because `self.common.analog_alarm` was None at the
             // mutation site. Confirmed via
             // calcRecord.dbd.pod:716-744 (HIHI..LLSV) and
-            // calcoutRecord.dbd.pod:1103+ (same).
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
-                Some(AnalogAlarmConfig::default())
-            }
+            // calcoutRecord.dbd.pod:1103+ (same). `sub` carries the same
+            // HIHI/HIGH/LOLO/LOW + HHSV/HSV/LSV/LLSV set
+            // (subRecord.dbd.pod:569-642) and runs the analog `checkAlarms`.
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
+            | "sub" => Some(AnalogAlarmConfig::default()),
             _ => None,
         };
         let mut common = CommonFields::default();
@@ -341,6 +352,7 @@ impl RecordInstance {
             notify: None,
             last_posted: HashMap::new(),
             array_hash_changed: false,
+            suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             info: HashMap::new(),
             metadata_cache: StdMutex::new(None),
@@ -635,6 +647,32 @@ impl RecordInstance {
     }
 
     /// Populate DisplayInfo from record fields if applicable.
+    /// Resolve the `Q:form` info-tag value to a `display.form` menu index.
+    ///
+    /// pvxs publishes the fixed seven-entry form menu
+    /// (Default/String/Binary/Decimal/Hex/Exponential/Engineering) for every
+    /// numeric value and, for the VAL field only, sets `display.form.index`
+    /// to the slot whose name equals the field's `Q:form` info tag
+    /// (`iocsource.cpp:42-62`, case-sensitive). Unset or unrecognised ->
+    /// `None` (form stays 0 = Default), exactly as pvxs leaves the index
+    /// untouched on no match.
+    fn q_form_index(&self) -> Option<i16> {
+        const FORM_NAMES: [&str; 7] = [
+            "Default",
+            "String",
+            "Binary",
+            "Decimal",
+            "Hex",
+            "Exponential",
+            "Engineering",
+        ];
+        let tag = self.info.get("Q:form")?;
+        FORM_NAMES
+            .iter()
+            .position(|name| name == tag)
+            .map(|i| i as i16)
+    }
+
     fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
@@ -841,6 +879,17 @@ impl RecordInstance {
                 });
             }
             _ => {}
+        }
+        // Apply the `Q:form` display-format hint. The match above builds
+        // `snap.display` only for numeric record types — the same set for
+        // which pvxs emits `display.form.choices` — so a present `Q:form`
+        // tag maps to `display.form.index` exactly when pvxs applies it
+        // (`iocsource.cpp:42-62`, VAL-only; the per-record DisplayInfo here
+        // *is* the VAL field's metadata).
+        if let Some(display) = snap.display.as_mut() {
+            if let Some(form) = self.q_form_index() {
+                display.form = form;
+            }
         }
     }
 
@@ -1101,7 +1150,7 @@ impl RecordInstance {
             "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
             "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
             "SCAN" => Some(EpicsValue::Enum(self.common.scan as u16)),
-            "SSCN" => Some(EpicsValue::Enum(self.common.sscn as u16)),
+            "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
             "PINI" => Some(EpicsValue::Char(if self.common.pini { 1 } else { 0 })),
             "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
@@ -1304,9 +1353,9 @@ impl RecordInstance {
             }
             "SSCN" => {
                 let new_sscn = match &value {
-                    EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
-                    EpicsValue::Enum(v) => ScanType::from_u16(*v),
-                    EpicsValue::String(s) => ScanType::from_str(s.as_str_lossy().as_ref())?,
+                    EpicsValue::Short(v) => SimModeScan::from_u16(*v as u16),
+                    EpicsValue::Enum(v) => SimModeScan::from_u16(*v),
+                    EpicsValue::String(s) => SimModeScan::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.sscn = new_sscn;
@@ -1653,7 +1702,8 @@ impl RecordInstance {
         }
 
         match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
+            | "sub" => {
                 if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
                     let val = match self.record.val() {
                         Some(EpicsValue::Double(v)) => v,
@@ -1822,8 +1872,52 @@ impl RecordInstance {
     /// Previously only `process_local` invoked the subroutine, so on the
     /// main engine path `VAL`/`VALA..VALU`/`OUTA..OUTU` never updated.
     pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
-        if let Some(ref sub_fn) = self.subroutine {
-            sub_fn(&mut *self.record)?;
+        use crate::server::recgbl::{self, alarm_status};
+
+        // aSub `LFLG=READ`: a `SUBL` re-resolution that found a bad/unregistered
+        // name (C `fetch_values` -> `S_db_BadSub`) or failed to read the link
+        // signals "skip do_sub this cycle" — C `process` runs `do_sub` only on
+        // `!status`. One-shot: taken (cleared) whether or not a subroutine is
+        // set, so it never leaks into the next cycle. The single consumer of
+        // the flag, shared by every process path.
+        if std::mem::take(&mut self.suppress_subroutine_run) {
+            return Ok(());
+        }
+
+        // Clone the Arc so the borrow on `self.subroutine` is released
+        // before we mutate `self.record` / `self.common` below.
+        let Some(sub_fn) = self.subroutine.clone() else {
+            return Ok(());
+        };
+        // C `do_sub` returns the subroutine's `long` status.
+        let status = sub_fn(&mut *self.record)?;
+
+        // aSub publishes the status as VAL (C `aSubRecord.c:223`
+        // `prec->val = status`). The subroutine's computed outputs live in
+        // VALA..VALU, so VAL is the return code and overwrites whatever the
+        // closure may have written to VAL. `sub` does NOT do this — its VAL
+        // is the value the subroutine computed.
+        if self.record.record_type() == "aSub" {
+            let _ = self
+                .record
+                .put_field("VAL", EpicsValue::Double(status as f64));
+        }
+
+        // A negative status raises SOFT_ALARM at the record's BRSV severity
+        // (C `do_sub`: `if (status < 0) recGblSetSevr(SOFT_ALARM,
+        // prec->brsv)`). It accumulates into nsta/nsev for this cycle's
+        // recGblResetAlarms commit and runs before checkAlarms, so a higher
+        // analog severity (e.g. the shared analog-alarm owner) still wins via
+        // the raise-only rule. BRSV defaults to NO_ALARM, under which
+        // recGblSetSevr is a no-op.
+        if status < 0 {
+            let brsv = self
+                .record
+                .get_field("BRSV")
+                .and_then(|v| v.to_f64())
+                .map(|f| AlarmSeverity::from_u16(f as u16))
+                .unwrap_or(AlarmSeverity::NoAlarm);
+            recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::SOFT_ALARM, brsv);
         }
         Ok(())
     }
@@ -2055,6 +2149,39 @@ impl RecordInstance {
             // _guard drops here, clearing the processing flag
             return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }
+        if process_result == RecordProcessResult::CompleteNoEmit {
+            // The record accumulated this cycle without emitting (compress
+            // `status == 1`). C `compressRecord.c:365` runs the completion
+            // epilogue (udf clear, timestamp, monitor, FLNK) only on an emit
+            // cycle (`if (status != 1)`), so a non-emitting cycle must publish
+            // nothing — skip the epilogue and return an empty snapshot, exactly
+            // as the production engine path does in `processing.rs`. This keeps
+            // the emit-gate uniform across both process-dispatch paths so the
+            // invariant holds by construction, not by "process_local never
+            // produces it". CompleteNoEmit is synchronous (PACT already
+            // cleared); the `_guard` drops here, clearing the processing flag.
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        }
+
+        // `CompleteDeferOutput` (swait ODLY delay-start) is NOT special-cased
+        // here: it deliberately shares the Complete value-side snapshot builder
+        // below. C `swaitRecord.c::process` posts the value side (`monitor()`,
+        // line 475) on the delaying cycle, so building the snapshot now is the
+        // correct, parity-matching behavior — unlike `CompleteNoEmit` above,
+        // whose fall-through would wrongly emit. The variant's *other* halves —
+        // holding PACT across the delay and deferring OUT/OEVT/FLNK to the
+        // `ReprocessAfter` continuation — are the engine path's responsibility
+        // (`processing.rs::process_record_with_links_inner`); `process_local` is
+        // a body-only test helper that dispatches no FLNK/output and no
+        // `ProcessAction`, and no test drives a swait ODLY record through it. So
+        // the invariant still holds by construction across both dispatch paths:
+        // both publish the value side here, both leave the output side to the
+        // engine.
 
         // UDF update before alarm evaluation — C parity (see
         // `processing.rs`). A NaN / undefined value keeps UDF true so
@@ -2893,6 +3020,32 @@ mod metadata_cache_tests {
 
         // Cache is now populated
         assert!(inst.metadata_cache.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn q_form_info_tag_sets_display_form_index() {
+        // pvxs maps the `Q:form` info tag to `display.form.index` for the
+        // VAL field (iocsource.cpp:42-62). "Hex" is slot 4 of the
+        // seven-entry menu (Default/String/Binary/Decimal/Hex/...).
+        let mut inst = ai_instance();
+        inst.set_info("Q:form", "Hex");
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        let display = snap.display.expect("ai snapshot must have display");
+        assert_eq!(display.form, 4, "Q:form=Hex -> display.form index 4");
+    }
+
+    #[test]
+    fn q_form_absent_or_unknown_leaves_form_default() {
+        // No `Q:form` tag -> form stays 0 (Default).
+        let inst = ai_instance();
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(snap.display.expect("ai display").form, 0);
+
+        // Unrecognised tag -> pvxs leaves the index untouched (0).
+        let mut inst2 = ai_instance();
+        inst2.set_info("Q:form", "Nonsense");
+        let snap2 = inst2.snapshot_for_field("VAL").unwrap();
+        assert_eq!(snap2.display.expect("ai display").form, 0);
     }
 
     /// the served `timeStamp.userTag` defaults to the record's `utag`

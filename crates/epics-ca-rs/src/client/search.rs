@@ -285,12 +285,15 @@ struct SearchEngineState {
     /// trips OPEN with an exponentially-doubled cooldown so we don't
     /// hammer a flapping server.
     breakers: CircuitBreakerRegistry,
-    /// Sequence number for datagram validation (matches C EPICS
-    /// lastReceivedSeqNo).  Embedded in VERSION header CID field;
-    /// servers echo it back, letting us reject stale responses.
+    /// Rolling per-datagram sequence number, embedded in the outgoing
+    /// VERSION header CID field with the `sequenceNoIsValid` marker
+    /// (matches C `dgSeqNo`). libca's server echoes it so libca's
+    /// `searchTimer` can score RTT and drop stale rounds; the Rust
+    /// client sends it for wire-parity but — like C `searchRespAction`
+    /// — resolves every SEARCH reply unconditionally, so the echoed
+    /// value is never consumed (libca's timer tuning is not modelled by
+    /// the Rust retry-ring; see `handle_search_response`).
     dgram_seq: u32,
-    /// Last validated sequence number from a VERSION response.
-    last_valid_seq: Option<u32>,
     /// Per-destination last UDP send-error kind. Mirrors libca cae597d
     /// (`udpiiu::SearchDestUDP::_lastError`): a persistent sendto()
     /// failure (e.g. firewall, unreachable broadcast) repeats at search
@@ -341,7 +344,6 @@ impl SearchEngineState {
             penalty: HashMap::new(),
             breakers: CircuitBreakerRegistry::new(),
             dgram_seq: 0,
-            last_valid_seq: None,
             send_errors: HashMap::new(),
             ignored_servers: super::epics_rs_client_ignore().into_iter().collect(),
             resolved: HashMap::new(),
@@ -1067,25 +1069,23 @@ fn handle_udp_response(
     src: SocketAddr,
     response_tx: &mpsc::UnboundedSender<SearchResponse>,
 ) {
-    handle_search_response(state, data, src, response_tx, /*is_tcp=*/ false);
+    handle_search_response(state, data, src, response_tx);
 }
 
-/// C `libca/tcpiiu.cpp::searchRespNotify` accepts TCP search
-/// replies directly — TCP search replies from
+/// C `libca/tcpiiu.cpp::searchRespNotify` accepts TCP search replies
+/// directly — TCP search replies from
 /// `rsrv/camessage.c::search_reply_tcp` carry no per-reply VERSION
-/// header. The UDP freshness check (`last_valid_seq`) does not
-/// apply on TCP. Pre-fix Rust fed TCP responses into the same UDP
-/// handler, so a SEARCH reply was accepted only when a VERSION
-/// happened to land in the same TCP segment — making TCP discovery
-/// depend on TCP segmentation. The `is_tcp` flag bypasses the
-/// VERSION-required gate on the TCP path.
+/// header. Since `handle_search_response` now resolves every reply
+/// unconditionally (matching C `searchRespAction`), the TCP and UDP
+/// paths are identical; this wrapper remains as the named TCP entry
+/// point for the nameserver read loop.
 fn handle_tcp_response(
     state: &mut SearchEngineState,
     data: &[u8],
     src: SocketAddr,
     response_tx: &mpsc::UnboundedSender<SearchResponse>,
 ) {
-    handle_search_response(state, data, src, response_tx, /*is_tcp=*/ true);
+    handle_search_response(state, data, src, response_tx);
 }
 
 fn handle_search_response(
@@ -1093,26 +1093,25 @@ fn handle_search_response(
     data: &[u8],
     src: SocketAddr,
     response_tx: &mpsc::UnboundedSender<SearchResponse>,
-    is_tcp: bool,
 ) {
     if data.len() < CaHeader::SIZE {
         return;
     }
 
-    // C `udpiiu.cpp::postMsg` resets `lastReceivedSeqNoIsValid`
-    // and `lastReceivedSeqNo` at the start of every UDP datagram so a
-    // VERSION-bearing reply in datagram N cannot mark datagram N+1's
-    // SEARCH-only reply as fresh. Pre-fix Rust kept `last_valid_seq`
-    // across datagrams, so the same SEARCH-only reply was dropped
-    // first datagram but accepted later after an unrelated VERSION-
-    // bearing response set the marker. Reset here to keep the
-    // freshness check datagram-local.
-    //
-    // TCP replies carry no VERSION; pre-seed `last_valid_seq`
-    // to `Some(0)` so the SEARCH-required-VERSION gate further
-    // below treats every TCP search reply as valid (libca
-    // `searchRespNotify` does no seq check on TCP).
-    state.last_valid_seq = if is_tcp { Some(0) } else { None };
+    // C `udpiiu.cpp::searchRespAction` transfers the channel to its
+    // virtual circuit on EVERY SEARCH reply, and `cac.cpp:651` /
+    // `searchTimer.cpp:323` uninstall the channel from the search list
+    // unconditionally — the per-datagram sequence number
+    // (`lastReceivedSeqNo`, recorded by `versionAction`) gates only
+    // libca's RTT estimate and immediate-resend optimisation, never
+    // whether the channel is found. We follow that: a reply resolves
+    // its cid whenever the cid is still `pending` (the natural
+    // resolve-once guard), regardless of any VERSION seq marker in the
+    // datagram, so a legacy or third-party reply that arrives without a
+    // leading VERSION — which libca still accepts — is no longer
+    // dropped. The rolling `dgram_seq` is still sent (see
+    // `fire_searches`) for wire-parity; Rust just does not consume the
+    // echo, as its retry-ring does not model libca's `searchTimer`.
 
     let recv_time = Instant::now();
     let mut offset = 0;
@@ -1134,29 +1133,14 @@ fn handle_search_response(
         }
 
         match hdr.cmmd {
-            CA_PROTO_VERSION => {
-                // Any VERSION in the datagram marks subsequent SEARCH
-                // responses as fresh.  If the server echoed our
-                // sequenceNoIsValid flag, record the exact seq_no.
-                //
-                // C `caProto.h:128` defines `sequenceNoIsValid = 1` —
-                // an equality marker placed in `m_dataType` of the
-                // per-datagram VERSION header (C `cas_send_dg_msg`,
-                // `caserverio.c:194-197`). Pre-fix Rust treated this
-                // as a `0x8000` bitmask, which never matched a real
-                // C server (the high bit is unused) and disabled the
-                // stale-response search-timer validation entirely.
-                if hdr.data_type == 1 {
-                    state.last_valid_seq = Some(hdr.cid);
-                } else {
-                    // Server didn't echo our seq — still accept
-                    // responses in this datagram (older servers,
-                    // or our own Rust IOC, don't echo the flag).
-                    state.last_valid_seq = Some(0);
-                }
-                offset += CaHeader::SIZE + align8(hdr.postsize as usize);
-                continue;
-            }
+            // A per-datagram CA_PROTO_VERSION carries libca's echoed
+            // sequence number, which in C gates only the RTT estimate
+            // and the immediate-resend timer optimisation — never
+            // channel resolution (`searchRespAction` resolves without
+            // consulting it). The Rust retry-ring does not model that
+            // timer, so we ignore the VERSION reply; the offset advance
+            // at the bottom of the loop skips its (empty) body.
+            CA_PROTO_VERSION => {}
             CA_PROTO_SEARCH => {
                 let server_port = hdr.data_type;
                 // CA v4.8+: cid contains server IP. Both 0 (INADDR_ANY)
@@ -1198,8 +1182,8 @@ fn handle_search_response(
                 }
 
                 // multiply-defined-PV detection runs
-                // BEFORE the penalty / breaker / `last_valid_seq`
-                // gates. libca `cac.cpp:591-661` runs this check on
+                // BEFORE the penalty / breaker gates. libca
+                // `cac.cpp:591-661` runs this check on
                 // every SEARCH reply for a known cid with no per-
                 // server filtering and no seq-number gating between.
                 // Pre-fix Rust put the duplicate-detect after those
@@ -1271,14 +1255,6 @@ fn handle_search_response(
                     continue;
                 }
 
-                // Reject stale responses from previous search rounds.
-                // A valid VERSION with our sequence must precede SEARCH
-                // responses in the same datagram.
-                if state.last_valid_seq.is_none() {
-                    offset += CaHeader::SIZE + align8(hdr.postsize as usize);
-                    continue;
-                }
-
                 if let Some(p) = state.pending.get(&cid) {
                     // A connect normally follows this Found — consume the
                     // breaker probe slot here. `allow()` performs the
@@ -1317,7 +1293,7 @@ fn handle_search_response(
                     let _ = response_tx.send(SearchResponse::Found { cid, server_addr });
                 }
                 // Duplicate-detect was here; moved above the
-                // penalty / breaker / `last_valid_seq` gates.
+                // penalty / breaker gates.
             }
             CA_PROTO_NOT_FOUND => {
                 // Server explicitly told us the PV is not on it. We don't
@@ -1435,11 +1411,13 @@ async fn process_bucket(
 
 /// Build batched UDP SEARCH datagrams for `cids` and send via every
 /// destination + nameserver channel. One VERSION header per datagram
-/// carries the rolling sequence number so stale responses are
-/// rejected (matches C EPICS dgSeqNoAtTimerExpire). Used both by the
-/// per-tick bucket processor and by the immediate-fire path that
-/// runs right after handle_request to avoid the up-to-1-tick wait
-/// on the first attempt.
+/// carries the rolling sequence number with the `sequenceNoIsValid`
+/// marker (matches C EPICS `dgSeqNo`); libca's server echoes it to
+/// feed libca's `searchTimer` RTT/stale-round scoring. The Rust client
+/// sends it for wire-parity but resolves replies unconditionally (see
+/// `handle_search_response`). Used both by the per-tick bucket
+/// processor and by the immediate-fire path that runs right after
+/// handle_request to avoid the up-to-1-tick wait on the first attempt.
 async fn fire_searches(
     state: &mut SearchEngineState,
     cids: &[u32],
@@ -1457,7 +1435,10 @@ async fn fire_searches(
         // must be echoed in the reply VERSION (C `cas_send_dg_msg`,
         // `caserverio.c:194-197`). Pre-fix Rust sent `0x8000`, which
         // libca never recognises — the server then never echoed the
-        // seqno and the client could not reject stale responses.
+        // seqno. We send the correct marker for wire-parity; the
+        // echoed value feeds only libca's own RTT timer, which the
+        // Rust client does not consume (it resolves replies
+        // unconditionally, matching C `searchRespAction`).
         h.data_type = 1;
         h.cid = state.dgram_seq;
         h.to_bytes()
@@ -2531,5 +2512,98 @@ mod tests {
             resp_rx.try_recv().is_err(),
             "no further responses expected after the single Found"
         );
+    }
+
+    /// R2-26 regression: a UDP SEARCH reply that arrives WITHOUT a
+    /// leading `CA_PROTO_VERSION` in its datagram must still resolve the
+    /// channel. C `udpiiu.cpp::searchRespAction` transfers the channel
+    /// to its virtual circuit on every reply, and `cac.cpp:651` /
+    /// `searchTimer.cpp:323` uninstall it from the search list
+    /// unconditionally — the per-datagram sequence marker gates only
+    /// libca's RTT/timer tuning, never resolution. Pre-fix Rust gated
+    /// resolution on a same-datagram VERSION (`last_valid_seq.is_none()`
+    /// → drop), silently dropping legacy / third-party replies and never
+    /// connecting the channel.
+    #[test]
+    fn r2_26_unsequenced_udp_search_reply_resolves() {
+        let server: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+        let cid = 7u32;
+
+        let mut state = SearchEngineState::new();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<SearchResponse>();
+
+        schedule_initial(&mut state, cid, "R2:26:PV");
+        // `search_reply` builds a SEARCH-only datagram — no VERSION
+        // header precedes it, exactly the case the pre-fix gate dropped.
+        handle_udp_response(&mut state, &search_reply(cid, server), server, &resp_tx);
+
+        match resp_rx.try_recv() {
+            Ok(SearchResponse::Found {
+                cid: found_cid,
+                server_addr,
+            }) => {
+                assert_eq!(found_cid, cid);
+                assert_eq!(server_addr, server);
+            }
+            Ok(_) => {
+                panic!("unsequenced UDP SEARCH reply must resolve as Found, got another variant")
+            }
+            Err(e) => {
+                panic!("unsequenced UDP SEARCH reply must resolve as Found, got recv error {e:?}")
+            }
+        }
+        // The cid is now resolved (removed from pending); the
+        // pending-membership check — not any seq marker — is the
+        // resolve-once guard.
+        assert!(
+            !state.pending.contains_key(&cid),
+            "resolved cid must leave the pending set"
+        );
+    }
+
+    /// R2-26 companion: the modern common case — a UDP datagram that
+    /// DOES carry a leading `CA_PROTO_VERSION` before the SEARCH reply —
+    /// must still resolve after the VERSION arm became a no-op. Guards
+    /// against the VERSION message being mis-parsed or its payload
+    /// mis-skipped now that it no longer records a sequence number.
+    #[test]
+    fn r2_26_version_prefixed_udp_search_reply_still_resolves() {
+        let server: SocketAddr = "10.0.0.8:5064".parse().unwrap();
+        let cid = 8u32;
+
+        let mut state = SearchEngineState::new();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<SearchResponse>();
+
+        schedule_initial(&mut state, cid, "R2:26:PV2");
+        // Prepend a per-datagram VERSION header (data_type=1 marks
+        // sequenceNoIsValid, cid carries the echoed seq), as a modern
+        // rsrv reply datagram does, then the SEARCH reply.
+        let mut dgram = {
+            let mut v = CaHeader::new(CA_PROTO_VERSION);
+            v.data_type = 1;
+            v.cid = 42;
+            v.count = CA_MINOR_VERSION;
+            v.to_bytes().to_vec()
+        };
+        dgram.extend_from_slice(&search_reply(cid, server));
+        handle_udp_response(&mut state, &dgram, server, &resp_tx);
+
+        match resp_rx.try_recv() {
+            Ok(SearchResponse::Found {
+                cid: found_cid,
+                server_addr,
+            }) => {
+                assert_eq!(found_cid, cid);
+                assert_eq!(server_addr, server);
+            }
+            Ok(_) => {
+                panic!(
+                    "VERSION-prefixed UDP SEARCH reply must resolve as Found, got another variant"
+                )
+            }
+            Err(e) => panic!(
+                "VERSION-prefixed UDP SEARCH reply must resolve as Found, got recv error {e:?}"
+            ),
+        }
     }
 }

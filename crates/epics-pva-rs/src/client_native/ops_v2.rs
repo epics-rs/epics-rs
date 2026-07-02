@@ -77,12 +77,19 @@ fn decode_get_field_or_reset(server: &ServerConn, frame: &Frame) -> PvaResult<Ge
     decode_get_field_response(frame).inspect_err(|_| server.close())
 }
 
-static NEXT_IOID: AtomicU32 = AtomicU32::new(1);
+// pvxs seeds each ID namespace from a distinct non-zero base (commit
+// 3b641bed). IOID base = pvxs `clientimpl.h:106` `nextIOID=0x10002000`.
+static NEXT_IOID: AtomicU32 = AtomicU32::new(0x1000_2000);
 fn alloc_ioid() -> u32 {
     NEXT_IOID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Default pipeline window for monitors. Tuned to match pvxs.
+/// Default credit window (`queueSize`) used **once a monitor is
+/// pipelined** but the pvRequest names no `queueSize` — pvxs
+/// `MonitorBuilder`'s `queueSize=4` default (`clientmon.cpp:50`). This is
+/// the fallback queue depth, NOT a default that turns pipelining on: the
+/// default monitor is non-pipelined (`PvaClientBuilder::pipeline_size`
+/// defaults to 0, matching pvxs `pipeline=false`).
 pub const DEFAULT_PIPELINE_SIZE: u32 = 4;
 
 /// MONITOR_ACK replenishment threshold for a pipeline window of
@@ -1532,9 +1539,13 @@ async fn op_put_inner(
 /// (pvput.cpp:409) so it can resolve an enum write by choice label
 /// (pvput.cpp:186-188); here the snapshot is fetched only for the
 /// prototypes that need it, so an ordinary scalar PUT keeps its single
-/// round trip and a write-only PV is not gated on a GET. A failed snapshot
-/// is best-effort (`None`): the builder still runs and falls back to the
-/// no-snapshot path.
+/// round trip and a write-only PV is not gated on a GET. The snapshot rides
+/// the put's own op as pvxs's `GPROp::GetOPut` phase (`subcmd=0x40` on the
+/// same `ioid`), not a separate `ChannelGet`. A snapshot that returns an
+/// error *status* is best-effort (`None`): the builder still runs and falls
+/// back to the no-snapshot path. A transport failure (send / timeout /
+/// malformed reply) fails the op instead, because the snapshot shares the
+/// op's frame stream and a late reply would desync the exec await.
 async fn op_put_inner_build<FB, WP>(
     channel: &Arc<Channel>,
     raw_pv_req: Option<&[u8]>,
@@ -1587,11 +1598,29 @@ where
 
     // Get-first snapshot for builders that resolve against the current
     // value (e.g. an enum write matched by choice label). Fetched only when
-    // the prototype calls for it, and best-effort — a failure leaves the
-    // builder to fall back to its no-snapshot path. pvput.cpp:409 (get=true)
-    // / pvput.cpp:186-188.
+    // the prototype calls for it. pvput.cpp:409 (get=true) / pvput.cpp:186-188.
+    //
+    // pvxs reads the snapshot via `GPROp::GetOPut` — a CMD_PUT data-phase
+    // frame with `subcmd=0x40` and no value body, on THIS put's own `ioid`,
+    // so the server returns the current value through the put's own
+    // pvRequest mask before the exec (clientget.cpp:258,299-300,536). The
+    // previous code opened a separate `ChannelGet` with an empty all-fields
+    // pvRequest — an extra op/RTT, a fresh ioid, and a wider field read than
+    // the put mask. An error STATUS reply stays best-effort (`None`): the
+    // builder runs and falls back to its no-snapshot path (an enum-by-label
+    // build then fails on its own). But because the snapshot now shares this
+    // op's frame stream, a transport failure (send / timeout / malformed
+    // reply) must fail the op rather than fall back — a late snapshot reply
+    // would desync the exec done-frame await. A malformed reply also resets
+    // the circuit (pvxs `M.fault()`), via `decode_op_or_reset`.
     let previous = if wants_previous(&intro) {
-        op_get(channel, &[], op_timeout).await.ok().map(|(_, v)| v)
+        let get_oput = codec.build_put_get(sid, ioid);
+        server.send_for_channel(sid, get_oput).await?;
+        let snap_frame = await_frame(&mut stream, op_timeout).await?;
+        match decode_op_or_reset(&server, &snap_frame, Some(&intro))? {
+            OpResponse::Data(d) => Some(d.value),
+            _ => None,
+        }
     } else {
         None
     };
@@ -4636,14 +4665,19 @@ fn value_target_is_enum(intro: &FieldDesc) -> bool {
 /// The `value.choices` labels from a previously-fetched value snapshot, used
 /// to resolve an enum write by label. `None` when the snapshot is absent or
 /// does not carry a `value.choices` string array.
+///
+/// A decoded wire value carries a string array as the canonical typed form
+/// [`PvField::ScalarArrayTyped`] — both the GET snapshot path and the in-PUT
+/// `GetOPut` path go through `decode_pv_field_with_bitset_cached`, which
+/// emits `ScalarArrayTyped` for `string[]`. Locally-built values may instead
+/// use the untyped [`PvField::ScalarArray`]. Resolving the label must accept
+/// either, else an enum-by-label put silently falls through to the integer
+/// fallback and rejects every real label.
 fn enum_choices_from_previous(previous: &PvField) -> Option<Vec<String>> {
+    let labels = |items: &[ScalarValue]| items.iter().map(|sv| sv.to_string()).collect::<Vec<_>>();
     match value_at_path(previous, &["value", "choices"])? {
-        PvField::ScalarArray(items) => Some(
-            items
-                .iter()
-                .map(|sv| sv.to_string())
-                .collect::<Vec<String>>(),
-        ),
+        PvField::ScalarArray(items) => Some(labels(&items)),
+        PvField::ScalarArrayTyped(a) => Some(labels(&a.to_scalar_values())),
         _ => None,
     }
 }
@@ -6075,6 +6109,45 @@ mod tests {
             // The container and the choices array must NOT be marked — else
             // the server would overwrite its menu with an empty array.
             assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
+        }
+
+        /// The wire decode yields `value.choices` as the canonical typed
+        /// array ([`PvField::ScalarArrayTyped`]), not the untyped
+        /// [`PvField::ScalarArray`] the other fixtures hand-build. Label
+        /// resolution must accept it too — otherwise an enum-by-label put
+        /// over the wire (where the get-first snapshot always decodes typed)
+        /// silently falls through to the integer fallback and rejects every
+        /// real label.
+        #[test]
+        fn label_resolves_via_typed_choices_array() {
+            let intro = nt_enum();
+            let mut enum_v = PvStructure::new("enum_t");
+            enum_v
+                .fields
+                .push(("index".to_string(), PvField::Scalar(ScalarValue::Int(0))));
+            enum_v.fields.push((
+                "choices".to_string(),
+                PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::String(
+                    ["OFF", "ON", "AUTO"]
+                        .into_iter()
+                        .map(epics_base_rs::types::PvString::from)
+                        .collect(),
+                )),
+            ));
+            let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
+            root.fields
+                .push(("value".to_string(), PvField::Structure(enum_v)));
+            let previous = PvField::Structure(root);
+
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["AUTO"]), Some(&previous)).unwrap();
+            assert_eq!(
+                index_of(&value),
+                2,
+                "typed-array choices must resolve the label to its position"
+            );
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
             assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
         }
 

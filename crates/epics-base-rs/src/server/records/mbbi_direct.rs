@@ -24,6 +24,7 @@ pub struct MbbiDirectRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     skip_convert: bool,
     // VAL change gate. C
     // mbbiDirectRecord.c:228-231 monitor() raises DBE_VALUE|DBE_LOG for VAL
@@ -47,6 +48,7 @@ impl Default for MbbiDirectRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             skip_convert: false,
             value_changed: false,
         }
@@ -179,6 +181,11 @@ static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 /// Full field table: the 11 scalar fields followed by the 32 bit fields.
@@ -277,6 +284,7 @@ impl Record for MbbiDirectRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
@@ -355,6 +363,13 @@ impl Record for MbbiDirectRecord {
                     return Err(CaError::TypeMismatch("SIMS".into()));
                 }
             }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SDLY".into()));
+                }
+            }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
                     let bit = match value {
@@ -375,6 +390,32 @@ impl Record for MbbiDirectRecord {
 
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
+    }
+
+    /// asyn device readback (asynUInt32Digital only — `asynMbbiDirectUInt32Digital`
+    /// is the sole mbbiDirect dset, devAsynUInt32Digital.c:165): `processMbbiDirect`
+    /// sets `pr->rval = value & mask` (devAsynUInt32Digital.c:1031) and returns 0,
+    /// so mbbiDirectRecord's `rval -> (>> SHFT) -> VAL` + bit-field convert resolves
+    /// VAL. The hook runs that convert inline and returns `true` so the framework's
+    /// `set_device_did_compute(true)` makes `process()` skip the (identical) forward
+    /// pass. Without it the raw word lands verbatim in VAL via the default `set_val`
+    /// (no MASK, no SHFT, wrong bits). Device-distinct entry — the Soft Channel path
+    /// stays on `set_val` (C `devMbbiDirectSoft` returns 2). Input twin of
+    /// `mbbo_direct::apply_raw_readback`.
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        let masked = if self.mask != 0 {
+            (raw as u32) & self.mask
+        } else {
+            raw as u32
+        };
+        self.rval = masked;
+        self.val = if self.shft > 0 {
+            masked.checked_shr(self.shft as u32).unwrap_or(0)
+        } else {
+            masked
+        };
+        self.val_to_bits();
+        true
     }
 
     /// `mbbiDirect` has an `RVAL → VAL` `convert()` step. A `Soft

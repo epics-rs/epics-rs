@@ -19,6 +19,9 @@ use epics_base_rs::server::iocsh::registry::{
 };
 
 use crate::drivers::ip_port::DrvAsynIPPort;
+use crate::drivers::prologix::DrvAsynPrologixPort;
+use crate::drivers::serial_port::DrvAsynSerialPort;
+use crate::error::AsynResult;
 use crate::manager::PortManager;
 use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
@@ -40,7 +43,9 @@ pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) ->
     for def in build_asyn_commands(mgr) {
         app = app.register_shell_command(def);
     }
-    app.register_startup_command(drv_asyn_ip_port_configure_command(trace))
+    app = app.register_startup_command(drv_asyn_ip_port_configure_command(trace.clone()));
+    app = app.register_startup_command(drv_asyn_serial_port_configure_command(trace.clone()));
+    app.register_startup_command(drv_asyn_prologix_port_configure_command(trace))
 }
 
 fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
@@ -101,7 +106,9 @@ pub fn register_asyn_commands_on_shell(
     for def in build_asyn_commands(mgr) {
         shell.register(def);
     }
-    shell.register(drv_asyn_ip_port_configure_command(trace));
+    shell.register(drv_asyn_ip_port_configure_command(trace.clone()));
+    shell.register(drv_asyn_serial_port_configure_command(trace.clone()));
+    shell.register(drv_asyn_prologix_port_configure_command(trace));
 }
 
 /// Build the six iocsh `CommandDef`s without binding them to a
@@ -414,14 +421,15 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     out
 }
 
-/// Keeps the [`PortRuntimeHandle`]s created by `drvAsynIPPortConfigure`
+/// Keeps the [`PortRuntimeHandle`]s created by the port-configure iocsh
+/// commands (`drvAsynIPPortConfigure`, `drvAsynSerialPortConfigure`)
 /// alive for the process lifetime. Dropping a handle shuts the port's
 /// actor thread down, so a startup-script-created port must be parked
 /// somewhere with a 'static lifetime.
-static IP_PORT_RUNTIMES: OnceLock<Mutex<Vec<PortRuntimeHandle>>> = OnceLock::new();
+static PORT_RUNTIMES: OnceLock<Mutex<Vec<PortRuntimeHandle>>> = OnceLock::new();
 
-fn keep_ip_port_runtime(handle: PortRuntimeHandle) {
-    IP_PORT_RUNTIMES
+fn keep_port_runtime(handle: PortRuntimeHandle) {
+    PORT_RUNTIMES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -438,11 +446,32 @@ fn keep_ip_port_runtime(handle: PortRuntimeHandle) {
 /// registry so `asynRecord` device support resolves it by name. The
 /// runtime handle is parked in a process-lifetime static.
 ///
-/// `priority` and `noProcessEos` are accepted for startup-script
-/// compatibility but have no effect: the Rust runtime schedules every
-/// port actor uniformly (priority is advisory in C too), and the IP
-/// driver never auto-installs an EOS interpose, so `noProcessEos` is
-/// already the default. `noAutoConnect` is honored.
+/// `priority` is accepted for startup-script compatibility but has no
+/// effect: the Rust runtime schedules every port actor uniformly
+/// (priority is advisory in C too). `noAutoConnect` and `noProcessEos`
+/// are honored — by default the command installs an EOS interpose (C
+/// `drvAsynIPPort.c:1065-1066` `asynInterposeEosConfig`), and a nonzero
+/// `noProcessEos` suppresses it.
+/// Build a configured IP port driver: parse host info, honor
+/// `noAutoConnect`, and install the default EOS interpose unless
+/// `noProcessEos` (C `drvAsynIPPort.c:1065-1066`). Shared by the iocsh
+/// command and its tests so the install decision has a single owner.
+fn build_configured_ip_port(
+    port: &str,
+    host: &str,
+    no_auto_connect: bool,
+    no_process_eos: bool,
+) -> AsynResult<DrvAsynIPPort> {
+    let mut driver = DrvAsynIPPort::new(port, host)?;
+    if no_auto_connect {
+        driver.base_mut().auto_connect = false;
+    }
+    if !no_process_eos {
+        driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+    }
+    Ok(driver)
+}
+
 pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
     CommandDef::new(
         "drvAsynIPPortConfigure",
@@ -483,23 +512,168 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "hostInfo required".to_string())?;
             let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
+            let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
 
-            let mut driver = match DrvAsynIPPort::new(&port, &host) {
-                Ok(d) => d,
-                Err(e) => {
-                    ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
-            if no_auto_connect {
-                driver.base_mut().auto_connect = false;
-            }
+            let driver =
+                match build_configured_ip_port(&port, &host, no_auto_connect, no_process_eos) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
             crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_ip_port_runtime(handle);
+            keep_port_runtime(handle);
             ctx.println(&format!(
                 "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `drvAsynSerialPortConfigure` iocsh command.
+///
+/// C parity: `drvAsynSerialPort.c::drvAsynSerialPortConfigure(portName,
+/// ttyName, priority, noAutoConnect, noProcessEos)`. `ttyName` is the
+/// serial device path (see [`DrvAsynSerialPort::new`]).
+///
+/// The created port is registered in the [`crate::asyn_record`] port
+/// registry so `asynRecord` device support resolves it by name. As with
+/// the IP command, `priority` is accepted for startup-script
+/// compatibility but has no effect (the Rust runtime schedules port
+/// actors uniformly); `noAutoConnect` and `noProcessEos` are honored —
+/// by default an EOS interpose is installed (C
+/// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
+/// suppressed by a nonzero `noProcessEos`.
+pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+    CommandDef::new(
+        "drvAsynSerialPortConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "ttyName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noAutoConnect",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noProcessEos",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
+         - create a serial octet port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let tty = arg_str(args, 1)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "ttyName required".to_string())?;
+            let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
+            let no_process_eos = arg_int(args, 4).unwrap_or(0) != 0;
+
+            let driver =
+                match DrvAsynSerialPort::configure(&port, &tty, no_auto_connect, no_process_eos) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+
+            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            keep_port_runtime(handle);
+            ctx.println(&format!(
+                "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `prologixGPIBConfigure` iocsh command.
+///
+/// C parity: `drvPrologixGPIB.c::prologixGPIBConfigure(portName, host,
+/// priority, noAutoConnect)` (lines 547-628). `host` may be `"hostname"`
+/// (the bridge's fixed `:1234 TCP` is appended) or `"hostname:port"`; see
+/// [`DrvAsynPrologixPort::new`]. The created GPIB port is registered in the
+/// [`crate::asyn_record`] port registry so `asynRecord` device support
+/// resolves it by name.
+///
+/// As with the IP/serial commands, `priority` is accepted for startup-script
+/// compatibility but has no effect (the Rust runtime schedules port actors
+/// uniformly); `noAutoConnect` is honored. There is no `noProcessEos` arg —
+/// the prologix driver owns EOS itself (it passes `noProcessEos=1` to its
+/// inner `_TCP` IP port, mirroring C's `drvAsynIPPortConfigure(... 1)` at
+/// drvPrologixGPIB.c:575).
+pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+    CommandDef::new(
+        "prologixGPIBConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "host",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "priority",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+            ArgDesc {
+                name: "noAutoConnect",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "prologixGPIBConfigure portName host [priority] [noAutoConnect] \
+         - create a Prologix GPIB-Ethernet port",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port = arg_str(args, 0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "portName required".to_string())?;
+            let host = arg_str(args, 1)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "host required".to_string())?;
+            let no_auto_connect = arg_int(args, 3).unwrap_or(0) != 0;
+
+            let driver = match DrvAsynPrologixPort::new(&port, &host, no_auto_connect) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.println(&format!("prologixGPIBConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+
+            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            keep_port_runtime(handle);
+            ctx.println(&format!(
+                "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
             ));
             Ok(CommandOutcome::Continue)
         },
@@ -746,6 +920,51 @@ mod tests {
         );
     }
 
+    /// C drvAsynIPPort.c:1065-1066: an IP port gets an EOS interpose by
+    /// default, suppressed by `noProcessEos`.
+    #[test]
+    fn build_configured_ip_port_installs_eos_unless_suppressed() {
+        let default_port =
+            build_configured_ip_port("ip_eos_default", "127.0.0.1:9100", false, false).unwrap();
+        assert_eq!(
+            default_port.base().interpose_octet.len(),
+            1,
+            "default IP port must auto-install the EOS interpose"
+        );
+
+        let suppressed =
+            build_configured_ip_port("ip_eos_off", "127.0.0.1:9100", false, true).unwrap();
+        assert_eq!(
+            suppressed.base().interpose_octet.len(),
+            0,
+            "noProcessEos must suppress the EOS interpose"
+        );
+    }
+
+    /// `drvAsynSerialPortConfigure` creates a serial octet port and
+    /// registers it in the asyn_record registry. `DrvAsynSerialPort::new`
+    /// only parses the tty path (no open), so no device is needed.
+    #[test]
+    fn drv_asyn_serial_port_configure_registers_port() {
+        let cmd = drv_asyn_serial_port_configure_command(Arc::new(TraceManager::new()));
+        assert_eq!(cmd.name, "drvAsynSerialPortConfigure");
+        assert_eq!(cmd.args.len(), 5);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_serial_cfg_test".into()),
+                ArgValue::String("/dev/ttyS0".into()),
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_serial_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
+    }
+
     /// A missing required argument is rejected without creating a port.
     #[test]
     fn drv_asyn_ip_port_configure_rejects_missing_host() {
@@ -756,5 +975,44 @@ mod tests {
             .call(&[ArgValue::String("iocsh_ip_cfg_nohost".into())], &ctx);
         assert!(result.is_err());
         assert!(crate::asyn_record::get_port("iocsh_ip_cfg_nohost").is_none());
+    }
+
+    /// DRV-49: `prologixGPIBConfigure` creates a Prologix GPIB port and
+    /// registers it in the asyn_record registry so it is reachable from a
+    /// startup script. `DrvAsynPrologixPort::new` only parses the host (no
+    /// connect), so no bridge is needed. C `prologixGPIBConfigure` takes 4
+    /// args (portName, host, priority, noAutoConnect); priority is dropped.
+    #[test]
+    fn drv_asyn_prologix_port_configure_registers_port() {
+        let cmd = drv_asyn_prologix_port_configure_command(Arc::new(TraceManager::new()));
+        assert_eq!(cmd.name, "prologixGPIBConfigure");
+        assert_eq!(cmd.args.len(), 4);
+
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[
+                ArgValue::String("iocsh_prologix_cfg_test".into()),
+                ArgValue::String("127.0.0.1:1234".into()),
+            ],
+            &ctx,
+        );
+        assert!(result.is_ok(), "command failed: {:?}", result.err());
+        assert!(
+            crate::asyn_record::get_port("iocsh_prologix_cfg_test").is_some(),
+            "port must be resolvable via the asyn_record registry"
+        );
+    }
+
+    /// A missing required argument is rejected without creating a port.
+    #[test]
+    fn drv_asyn_prologix_port_configure_rejects_missing_host() {
+        let cmd = drv_asyn_prologix_port_configure_command(Arc::new(TraceManager::new()));
+        let ctx = make_ctx();
+        let result = cmd.handler.call(
+            &[ArgValue::String("iocsh_prologix_cfg_nohost".into())],
+            &ctx,
+        );
+        assert!(result.is_err());
+        assert!(crate::asyn_record::get_port("iocsh_prologix_cfg_nohost").is_none());
     }
 }

@@ -148,6 +148,7 @@ impl AsynMotor for SimMotor {
         &mut self,
         _user: &AsynUser,
         position: f64,
+        _min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
@@ -168,6 +169,7 @@ impl AsynMotor for SimMotor {
         &mut self,
         _user: &AsynUser,
         distance: f64,
+        _min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
@@ -187,7 +189,14 @@ impl AsynMotor for SimMotor {
         Ok(())
     }
 
-    fn home(&mut self, _user: &AsynUser, velocity: f64, forward: bool) -> AsynResult<()> {
+    fn home(
+        &mut self,
+        _user: &AsynUser,
+        _min_velocity: f64,
+        velocity: f64,
+        _acceleration: f64,
+        forward: bool,
+    ) -> AsynResult<()> {
         // Simulate homing by moving to 0
         self.target = 0.0;
         self.velocity = velocity.abs().max(0.001);
@@ -255,6 +264,7 @@ impl AsynMotor for SimMotor {
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
+        _min_velocity: f64,
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
@@ -378,7 +388,7 @@ mod tests {
         assert!(at_home.encoder_home, "encoder index asserts at home");
         assert!(at_home.home);
 
-        motor.move_absolute(&user, 10.0, 10000.0, 1.0).unwrap();
+        motor.move_absolute(&user, 10.0, 0.0, 10000.0, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let away = motor.poll(&user).unwrap();
         assert!(away.has_encoder);
@@ -390,7 +400,7 @@ mod tests {
     fn test_sim_motor_move_completes() {
         let user = AsynUser::new(0);
         let mut motor = SimMotor::new();
-        motor.move_absolute(&user, 10.0, 10000.0, 1.0).unwrap(); // very fast
+        motor.move_absolute(&user, 10.0, 0.0, 10000.0, 1.0).unwrap(); // very fast
         std::thread::sleep(Duration::from_millis(10));
         let status = motor.poll(&user).unwrap();
         assert!(status.done);
@@ -401,7 +411,7 @@ mod tests {
     fn test_sim_motor_stop() {
         let user = AsynUser::new(0);
         let mut motor = SimMotor::new();
-        motor.move_absolute(&user, 1000.0, 1.0, 1.0).unwrap(); // slow, long move
+        motor.move_absolute(&user, 1000.0, 0.0, 1.0, 1.0).unwrap(); // slow, long move
         std::thread::sleep(Duration::from_millis(10));
         motor.stop(&user, 1.0).unwrap();
         let status = motor.poll(&user).unwrap();
@@ -422,7 +432,7 @@ mod tests {
     fn test_sim_motor_home() {
         let user = AsynUser::new(0);
         let mut motor = SimMotor::new().with_position(10.0);
-        motor.home(&user, 10000.0, true).unwrap();
+        motor.home(&user, 0.0, 10000.0, 1.0, true).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let status = motor.poll(&user).unwrap();
         assert!(status.done);

@@ -189,7 +189,13 @@ fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
     let limit = limit.max(1);
     let shared = Arc::new(MonitorQueueShared {
         inner: Mutex::new(MonitorQueueInner {
-            items: VecDeque::with_capacity(limit),
+            // Grow lazily. `limit` is the client-supplied queueSize (unbounded
+            // u32) and must never be pre-allocated — a single MONITOR INIT with
+            // an enormous queueSize would otherwise force a multi-GB reservation
+            // and abort the process. `post` bounds live length to `limit` via
+            // tail-squash, so lazy growth preserves the same semantics; pvxs
+            // likewise never pre-sizes its monitor deque.
+            items: VecDeque::new(),
             limit,
             producer_done: false,
         }),
@@ -1444,15 +1450,20 @@ impl super::source::ChannelSource for SharedSource {
     ) -> impl std::future::Future<
         Output = Option<super::source::SubscriptionSeed<super::source::MonitorUpdate>>,
     > + Send {
-        let _ = (ctx, opts);
+        let _ = ctx;
+        // pvxs `op->limit = qSize` (servermon.cpp:533-543): the client's
+        // `record._options.queueSize` sizes the source-side accrual buffer, so
+        // a STOP->START or INIT->START window holds up to `queueSize` distinct
+        // posts, not just the latest. Falls back to the pvxs default
+        // of 4 (servermon.cpp:66) when the client requests no queueSize.
+        let queue_limit = opts.queue_size.map(|n| (n as usize).max(1)).unwrap_or(4);
         let pv = if checked.allows_read() {
             self.pvs.lock().get(checked.pv_name()).cloned()
         } else {
             None
         };
         async move {
-            // pvxs servermon.cpp:66: default queue limit = 4.
-            let (initial, inbox) = pv.and_then(|p| p.subscribe_seeded(4))?;
+            let (initial, inbox) = pv.and_then(|p| p.subscribe_seeded(queue_limit))?;
             let (tx, rx) = mpsc::channel::<PvField>(1);
             tokio::spawn(async move {
                 let mut inbox = inbox;
@@ -1604,6 +1615,30 @@ mod tests {
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Int(v))));
         PvField::Structure(s)
+    }
+
+    /// A client-supplied `queueSize` must never be eagerly pre-allocated: an INIT
+    /// with a hostile queueSize would otherwise force a multi-GB reservation and
+    /// abort the process. `make_monitor_queue` grows lazily and `post` bounds live
+    /// length to `limit`, so the huge limit is honored logically without the
+    /// allocation.
+    #[test]
+    fn make_monitor_queue_does_not_preallocate_client_limit() {
+        let huge = 1_000_000_000usize;
+        let (outbox, inbox) = make_monitor_queue(huge);
+        // Construction reserves nothing.
+        assert_eq!(inbox.shared.inner.lock().items.capacity(), 0);
+        // Posting eight values grows the deque only to serve those live items.
+        for i in 0..8 {
+            outbox.post(nt_scalar_int_value(i), false);
+        }
+        let inner = inbox.shared.inner.lock();
+        assert!(inner.items.len() <= inner.limit);
+        assert!(
+            inner.items.capacity() < huge,
+            "capacity {} must stay lazy, not track the client limit {huge}",
+            inner.items.capacity(),
+        );
     }
 
     /// NTScalar<Int> with a `time_t` `timeStamp` member. Bit numbering:

@@ -113,6 +113,13 @@ fn native_placeholder(native_type: DbFieldType, element_count: u32) -> EpicsValu
         DbFieldType::UShort => EpicsValue::UShortArray(vec![0; n]),
         DbFieldType::ULong if scalar => EpicsValue::ULong(0),
         DbFieldType::ULong => EpicsValue::ULongArray(vec![0; n]),
+        // DBF_UCHAR promotes to DBR_CHAR over CA (db_convert.h), so a CA
+        // upstream reports it as DBF_CHAR, not DBF_UCHAR — this branch is
+        // unreachable for a CA upstream but mapped for completeness. Its
+        // `dbr_type()` is `Char`, keeping the advertised create-channel type
+        // DBF_CHAR on this branch.
+        DbFieldType::UChar if scalar => EpicsValue::UChar(0),
+        DbFieldType::UChar => EpicsValue::UCharArray(vec![0; n]),
     }
 }
 
@@ -169,6 +176,15 @@ struct UpstreamSubscription {
     /// Mirrors C ca-gateway's separate `pv->propMonitor()`
     /// (`gatePv.cc:1705`, `:1749-1752`).
     prop_task: Option<JoinHandle<()>>,
+    /// Whether the connect-time DBR_CTRL metadata seed actually landed.
+    /// When `false` (the 500 ms seed timed out or errored), a
+    /// [`Self::prop_task`] spawned later (the no-cache lazy path in
+    /// [`UpstreamManager::ensure_prop_monitor`]) must NOT skip its first
+    /// DBE_PROPERTY event — that event carries the full metadata and seeds
+    /// what the connect-time get missed. The cached path reads this from the
+    /// local seed outcome directly; storing it here lets the lazy path honor
+    /// the same invariant. See [`UpstreamManager::spawn_prop_forward_task`].
+    seed_succeeded: bool,
     /// Live `.pvlist` ASG/ASL for this shadow PV, shared by-`Arc` with
     /// the read and write hook closures so a `AS`/`PVL` reload can swap
     /// the group/level in place. Replaces the previous by-value
@@ -297,6 +313,13 @@ pub struct UpstreamManager {
     /// (gateServer.cc:1294-1356, set once via setConnectTimeout,
     /// gateway.cc:1147) rather than a second hard-coded clock.
     connect_timeout: Duration,
+    /// Bound on the best-effort connect-time DBR_CTRL metadata seed in
+    /// `ensure_subscribed` (default 500 ms). A slow/denied metadata read
+    /// must not stall the subscription; when it exceeds this budget the seed
+    /// is abandoned and the property monitor's first event seeds instead
+    /// (see `seed_succeeded`). Not a public knob — tests set it to
+    /// `Duration::ZERO` to deterministically exercise the seed-miss recovery.
+    metadata_seed_timeout: Duration,
     /// Cache mode (C `cacheMode` / `-no_cache`). Gates whether
     /// `ensure_subscribed` holds a persistent upstream monitor and serves
     /// GETs from the shadow snapshot (`Cached`) or forwards each GET to
@@ -376,6 +399,7 @@ impl UpstreamManager {
             subs: parking_lot::Mutex::new(HashMap::new()),
             pending: parking_lot::Mutex::new(HashMap::new()),
             connect_timeout: cfg.connect_timeout,
+            metadata_seed_timeout: Duration::from_millis(500),
             cache_mode: cfg.cache_mode,
             event_mask: cfg.event_mask,
             access_notifier: Arc::new(ArcSwapOption::empty()),
@@ -595,19 +619,21 @@ impl UpstreamManager {
                 }
             };
 
-        // read initial upstream write-access and create a flag
+        // read initial upstream read+write access and create the flags
         // the access hook AND write-hook closures share. `channel.info()`
         // reads a cached snapshot — no round-trip — and succeeds here
         // because `channel.get()` above already waited for connection.
         // Defaults to true (permissive) on the rare timeout/error path so
-        // we match the C gateway's connect-time behaviour (activate() calls
-        // ca_write_access only after the channel is operational).
-        let upstream_write_init = channel
-            .info()
-            .await
-            .map(|i| i.access_rights.write)
-            .unwrap_or(true);
+        // we match the C gateway's connect-time behaviour (activate() reads
+        // ca_read_access/ca_write_access only after the channel is
+        // operational). One `info()` snapshot feeds both flags so read and
+        // write can't come from inconsistent reads.
+        let (upstream_read_init, upstream_write_init) = match channel.info().await {
+            Ok(i) => (i.access_rights.read, i.access_rights.write),
+            Err(_) => (true, true),
+        };
         let upstream_write = Arc::new(AtomicBool::new(upstream_write_init));
+        let upstream_read = Arc::new(AtomicBool::new(upstream_read_init));
 
         // Atomically register the shadow PV WITH its WriteHook
         // attached. `add_pv_with_hook` constructs the PV with the
@@ -637,6 +663,7 @@ impl UpstreamManager {
             acl.clone(),
             self.write_env.access.clone(),
             upstream_write.clone(),
+            upstream_read.clone(),
         );
         // If a prior subscribe attempt left a stale shadow entry (it
         // would have been cleaned up by the failure path, but a hot
@@ -697,44 +724,66 @@ impl UpstreamManager {
         // units / precision / limits / enum-labels instead of zeroed ones —
         // even before any property *change* occurs. Best-effort and bounded
         // (500 ms): a slow or denied metadata read must not fail the
-        // subscription, since the value path is already wired above and a
-        // later property event will refresh it. Mirrors C `gatePvData::getCB`
+        // subscription, since the value path is already wired above. When it
+        // does NOT seed (timeout or error), `seed_succeeded` stays false and
+        // the property monitor's FIRST event is consumed to seed instead of
+        // being skipped as a redundant confirmation — so a slow initial get
+        // never leaves metadata zeroed. Mirrors C `gatePvData::getCB`
         // decoding the initial control get through `runDataCB` →
-        // `vc->setPvData(dd)` in BOTH cache modes (gatePv.cc:1689-1696),
-        // before any monitor is enabled; the DBE_PROPERTY monitor handled
-        // below keeps it refreshed on later upstream metadata changes.
-        match tokio::time::timeout(
-            Duration::from_millis(500),
-            channel.get_with_metadata(DbrClass::Ctrl),
-        )
-        .await
-        {
-            Ok(Ok(meta_snap)) => {
-                if let Err(e) = self
+        // `vc->setPvData(dd)` and only THEN enabling `propMonitor()`
+        // (gatePv.cc:1688-1705); C sequences the monitor after the get, we
+        // instead make the first-event skip conditional on the seed outcome.
+        let seed_succeeded = if self.metadata_seed_timeout.is_zero() {
+            // A zero seed budget means "spend no time on the connect-time
+            // seed" — skip it entirely and let the property monitor's first
+            // event seed. Deterministic (no timeout race), and the recovery
+            // path tests exercise the seed-miss branch this way, since an
+            // in-process upstream's CTRL get resolves from cached channel
+            // metadata too fast to time out.
+            false
+        } else {
+            match tokio::time::timeout(
+                self.metadata_seed_timeout,
+                channel.get_with_metadata(DbrClass::Ctrl),
+            )
+            .await
+            {
+                Ok(Ok(meta_snap)) => match self
                     .shadow_db
                     .set_pv_metadata(served_name, &meta_snap)
                     .await
                 {
-                    tracing::debug!(
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::debug!(
+                            pv = upstream_name,
+                            served = served_name,
+                            error = %e,
+                            "ca-gateway-rs: initial CTRL metadata seed skipped; \
+                             property monitor's first event will seed it"
+                        );
+                        false
+                    }
+                },
+                Ok(Err(e)) => {
+                    tracing::info!(
                         pv = upstream_name,
-                        served = served_name,
                         error = %e,
-                        "ca-gateway-rs: initial CTRL metadata seed skipped"
+                        "ca-gateway-rs: initial CTRL metadata get failed; \
+                         property monitor's first event will seed it"
                     );
+                    false
+                }
+                Err(_) => {
+                    tracing::info!(
+                        pv = upstream_name,
+                        "ca-gateway-rs: initial CTRL metadata get timed out; \
+                         property monitor's first event will seed it"
+                    );
+                    false
                 }
             }
-            Ok(Err(e)) => tracing::info!(
-                pv = upstream_name,
-                error = %e,
-                "ca-gateway-rs: initial CTRL metadata get failed; shadow \
-                 metadata stays empty until an upstream property event"
-            ),
-            Err(_) => tracing::info!(
-                pv = upstream_name,
-                "ca-gateway-rs: initial CTRL metadata get timed out; shadow \
-                 metadata stays empty until an upstream property event"
-            ),
-        }
+        };
 
         // Subscribe the persistent upstream monitor — CACHED mode only.
         //
@@ -789,11 +838,18 @@ impl UpstreamManager {
         // callback does not wake every client; the downstream side applies
         // the further `oldaccess != access` filter.
         let access_rights_watcher = channel.on_access_rights_change({
-            let flag = upstream_write.clone();
+            let write_flag = upstream_write.clone();
+            let read_flag = upstream_read.clone();
             let notifier = self.access_notifier.clone();
             move |rights| {
-                let prev = flag.swap(rights.write, Ordering::Relaxed);
-                if prev != rights.write {
+                // C accessCB (gatePv.cc:1851-1852) updates BOTH read and
+                // write from ca_read_access/ca_write_access; postAccessRights
+                // re-pushes when the computed level changed on either bit.
+                // Track both flags and wake downstream clients if either
+                // flipped.
+                let prev_w = write_flag.swap(rights.write, Ordering::Relaxed);
+                let prev_r = read_flag.swap(rights.read, Ordering::Relaxed);
+                if prev_w != rights.write || prev_r != rights.read {
                     if let Some(n) = notifier.load_full() {
                         n.notify();
                     }
@@ -819,7 +875,7 @@ impl UpstreamManager {
         let prop_task = if self.cache_mode.is_no_cache() {
             None
         } else {
-            Some(self.spawn_prop_forward_task(served_name, channel.clone()))
+            Some(self.spawn_prop_forward_task(served_name, channel.clone(), seed_succeeded))
         };
 
         // subscription dedup keys on `served_name` so a
@@ -831,6 +887,7 @@ impl UpstreamManager {
                 channel,
                 task,
                 prop_task,
+                seed_succeeded,
                 acl,
                 _access_rights_watcher: access_rights_watcher,
             },
@@ -1036,14 +1093,18 @@ impl UpstreamManager {
     /// undefined (control-DBR) timestamp; `post_pv_property` refreshes the
     /// shadow metadata and posts that snapshot to downstream property
     /// subscribers WITHOUT inventing a wall-clock time. Mirrors C
-    /// `gatePvData::propEventCB` (gatePv.cc:1534-1607): the very first event
-    /// is ignored — it is the subscription's initial-state confirmation, not
-    /// a change (C `propGetPending()` / `markPropNoGetPending`,
-    /// gatePv.cc:1564-1568), and the initial metadata already came from the
-    /// connect-time control get in `ensure_subscribed`. Every later event
-    /// (including a reconnect's initial event, which may carry metadata that
-    /// changed during the outage) refreshes `setPvData` and posts
-    /// `propertyEventMask()`.
+    /// `gatePvData::propEventCB` (gatePv.cc:1534-1607): the first event is
+    /// the subscription's initial-state confirmation (C `propGetPending()` /
+    /// `markPropNoGetPending`, gatePv.cc:1564-1568). It is skipped as
+    /// redundant ONLY when `seed_succeeded` — i.e. the connect-time control
+    /// get in `ensure_subscribed` already seeded metadata. If that seed did
+    /// NOT land (slow/failed 500 ms get), the first event is instead consumed
+    /// to seed: it drives the same `get_with_metadata(DbrClass::Ctrl)` the
+    /// seed would have, closing the window where a stable PV's metadata would
+    /// otherwise stay zeroed until a *second* property change that may never
+    /// come. Every later event (including a reconnect's initial event, which
+    /// may carry metadata that changed during the outage) refreshes
+    /// `setPvData` and posts `propertyEventMask()`.
     ///
     /// Re-subscribes with exponential backoff on upstream disconnect, exits
     /// cleanly on `CaError::Shutdown` or cache eviction, and changes no
@@ -1058,6 +1119,7 @@ impl UpstreamManager {
         &self,
         served_name: &str,
         channel: Arc<CaChannel>,
+        seed_succeeded: bool,
     ) -> JoinHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
@@ -1066,12 +1128,17 @@ impl UpstreamManager {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // The very first event of the FIRST subscription is the
-            // initial-state confirmation; the connect-time control get
-            // already seeded metadata, so skip it (C ignore-first-propEvent,
-            // gatePv.cc:1564-1568). Tracked across reconnects so a
-            // reconnect's initial event DOES refresh — it may carry metadata
-            // that changed while upstream was gone.
-            let mut first_event_seen = false;
+            // initial-state confirmation. Skip it as redundant ONLY when the
+            // connect-time control get already seeded metadata
+            // (`seed_succeeded`) — mirrors C ignore-first-propEvent
+            // (gatePv.cc:1564-1568), which is safe there because C enables
+            // propMonitor() only after getCB seeds (gatePv.cc:1702-1705).
+            // When the seed did NOT land (slow/failed 500 ms get), consume the
+            // first event to seed instead — its DBR_CTRL payload carries the
+            // full metadata, so metadata is never left zeroed. Tracked across
+            // reconnects so a reconnect's initial event DOES refresh — it may
+            // carry metadata that changed while upstream was gone.
+            let mut first_event_seen = !seed_succeeded;
             loop {
                 let mut monitor = match channel
                     .subscribe_with_mask_autosize(0.0, DBE_PROPERTY)
@@ -1216,15 +1283,15 @@ impl UpstreamManager {
         if !self.cache_mode.is_no_cache() {
             return;
         }
-        let channel = {
+        let (channel, seed_succeeded) = {
             let subs = self.subs.lock();
             match subs.get(served_name) {
-                Some(sub) if sub.prop_task.is_none() => sub.channel.clone(),
+                Some(sub) if sub.prop_task.is_none() => (sub.channel.clone(), sub.seed_succeeded),
                 // No subscription (evicted) or a prop task already runs.
                 _ => return,
             }
         };
-        let handle = self.spawn_prop_forward_task(served_name, channel);
+        let handle = self.spawn_prop_forward_task(served_name, channel, seed_succeeded);
         let mut subs = self.subs.lock();
         match subs.get_mut(served_name) {
             // Re-check: another caller may have raced a prop task in, or the
@@ -1421,14 +1488,18 @@ impl UpstreamManager {
 /// the access-rights report matches what the write hook will actually
 /// enforce.
 ///
-/// `upstream_write` mirrors the upstream IOC's `ca_write_access(chID)`,
-/// set at connect time and kept live by `on_access_rights_change`. The write
-/// decision is now `local_acf_write && upstream_write`, matching C
-/// `gateVcChan::writeAccess` (gateVc.cc:341): `asclient->writeAccess() && vc->writeAccess()`.
+/// `upstream_write`/`upstream_read` mirror the upstream IOC's
+/// `ca_write_access(chID)`/`ca_read_access(chID)`, set at connect time and
+/// kept live by `on_access_rights_change`. The decisions are
+/// `local_acf_write && upstream_write` and `local_acf_read && upstream_read`,
+/// matching C `gateVcChan::writeAccess`/`readAccess` (gateVc.cc:341/326):
+/// `asclient->writeAccess() && vc->writeAccess()` /
+/// `asclient->readAccess() && vc->readAccess()`.
 fn build_access_hook(
     acl: PvAclCell,
     access: Arc<ArcSwap<AccessConfig>>,
     upstream_write: Arc<AtomicBool>,
+    upstream_read: Arc<AtomicBool>,
 ) -> epics_base_rs::server::pv::AccessHook {
     Arc::new(move |user: &str, host: &str| {
         let cfg = access.load();
@@ -1437,7 +1508,8 @@ fn build_access_hook(
         let pv_acl = acl.load();
         let asg_ref = pv_acl.asg.as_deref().unwrap_or("DEFAULT");
         let asl = pv_acl.asl;
-        let read = cfg.can_read(asg_ref, asl, user, host);
+        let local_read = cfg.can_read(asg_ref, asl, user, host);
+        let read = local_read && upstream_read.load(Ordering::Relaxed);
         let local_write = if user.is_empty() && cfg.has_rules() {
             false
         } else {
@@ -2113,11 +2185,12 @@ ASG(DEFAULT) {
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
         let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl {
             asg: Some("DEFAULT".to_string()),
             asl: 0,
         }));
-        let hook = build_access_hook(acl, access, upstream_write);
+        let hook = build_access_hook(acl, access, upstream_write, upstream_read);
 
         // Privileged user: read granted, write denied (no WRITE rule).
         let alice = hook("alice", "host1");
@@ -2144,8 +2217,9 @@ ASG(DEFAULT) {
     fn br_fr1_access_hook_allow_all_grants_both() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
-        let hook = build_access_hook(acl, access, upstream_write);
+        let hook = build_access_hook(acl, access, upstream_write, upstream_read);
         let d = hook("anyone", "anywhere");
         assert!(d.read && d.write, "allow-all must grant read and write");
     }
@@ -2158,8 +2232,9 @@ ASG(DEFAULT) {
     fn br_r51_upstream_write_denied_overrides_local_acf_allow() {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let upstream_write = Arc::new(AtomicBool::new(false));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
-        let hook = build_access_hook(acl, access, upstream_write.clone());
+        let hook = build_access_hook(acl, access, upstream_write.clone(), upstream_read);
 
         let d = hook("alice", "host1");
         assert!(d.read, "read must still be granted by allow-all");
@@ -2172,6 +2247,33 @@ ASG(DEFAULT) {
         upstream_write.store(true, Ordering::Relaxed);
         let d2 = hook("alice", "host1");
         assert!(d2.write, "write must be granted once upstream restores it");
+    }
+
+    /// GW-40: read-access must bridge the upstream IOC's `ca_read_access`
+    /// symmetrically with write — `local_acf_read && upstream_read` — so an
+    /// upstream that revokes read to the gateway's client reports read=false
+    /// downstream even under a local allow-all ACF. Mirrors C
+    /// `gateVcChan::readAccess` (gateVc.cc:326):
+    /// `asclient->readAccess() && vc->readAccess()`.
+    #[test]
+    fn br_gw40_upstream_read_denied_overrides_local_acf_allow() {
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(false));
+        let acl = Arc::new(ArcSwap::from_pointee(PvAcl { asg: None, asl: 0 }));
+        let hook = build_access_hook(acl, access, upstream_write, upstream_read.clone());
+
+        let d = hook("alice", "host1");
+        assert!(
+            !d.read,
+            "upstream read-denied must override local allow-all"
+        );
+        assert!(d.write, "write must still be granted by allow-all");
+
+        // Restoring upstream read-access restores read permission.
+        upstream_read.store(true, Ordering::Relaxed);
+        let d2 = hook("alice", "host1");
+        assert!(d2.read, "read must be granted once upstream restores it");
     }
 
     /// the access hook must enforce the LIVE per-PV ASG/ASL, not the one
@@ -2196,11 +2298,12 @@ ASG(NewGroup) {
             AccessConfig::from_string(acf).expect("ACF parses"),
         ));
         let upstream_write = Arc::new(AtomicBool::new(true));
+        let upstream_read = Arc::new(AtomicBool::new(true));
         let acl = Arc::new(ArcSwap::from_pointee(PvAcl {
             asg: Some("OldGroup".to_string()),
             asl: 1,
         }));
-        let hook = build_access_hook(acl.clone(), access, upstream_write);
+        let hook = build_access_hook(acl.clone(), access, upstream_write, upstream_read);
 
         // Under OldGroup, alice has READ; bob does not.
         assert!(hook("alice", "h").read, "OldGroup grants alice READ");
@@ -2270,6 +2373,111 @@ ASG(NewGroup) {
         assert!(
             !mgr.update_acl(name, Some("NewGroup".to_string()), 0),
             "an unchanged ASG/ASL reports false"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// GW-23: when the connect-time DBR_CTRL metadata seed does NOT land,
+    /// the property monitor's first event must SEED metadata rather than
+    /// skip it as a redundant confirmation — otherwise a stable PV's
+    /// units/precision/limits stay zeroed until a second property change
+    /// that may never come. C avoids the gap by enabling `propMonitor()`
+    /// only after `getCB` seeds (gatePv.cc:1702-1705); we instead make the
+    /// first-event skip conditional on the seed outcome (`seed_succeeded`).
+    /// Forcing a zero seed budget makes every connect-time seed miss, so a
+    /// non-empty downstream `units` proves the first-event recovery seeded
+    /// it. Reverting `first_event_seen = !seed_succeeded` to `= false`
+    /// leaves units empty and fails this test.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br_gw23_seed_miss_first_prop_event_seeds_metadata() {
+        use epics_base_rs::server::snapshot::{DisplayInfo, Snapshot};
+
+        let name = "GW23:seed:pv";
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+
+        // Grab the upstream db before `server` moves into the run task, so
+        // we can give the UPSTREAM PV real display metadata (units="mm").
+        // A seeded shadow is then distinguishable from an unseeded one — the
+        // negotiation GET seeds only value, never display (upstream.rs:577).
+        let up_db = server.database().clone();
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut ctrl = Snapshot::new(
+            EpicsValue::Double(1.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        ctrl.display = Some(DisplayInfo {
+            units: "mm".into(),
+            precision: 3,
+            ..Default::default()
+        });
+        up_db
+            .set_pv_metadata(name, &ctrl)
+            .await
+            .expect("upstream PV display metadata installed");
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mut mgr = pinned_manager(db.clone()).await;
+        // Force every connect-time CTRL seed to miss (private test seam) so
+        // the recovery path — first property event seeds — is exercised.
+        mgr.metadata_seed_timeout = Duration::ZERO;
+
+        mgr.ensure_subscribed(name, name, None, 0)
+            .await
+            .expect("ensure_subscribed connects to the hosted upstream");
+
+        // Precondition: the seed genuinely MISSED — the shadow's units must
+        // be empty right after ensure_subscribed, before the prop task runs.
+        // Without this guard the test would pass vacuously if the seed ever
+        // silently succeeded (the units would already be present).
+        {
+            let pv = db.find_pv(name).await.expect("shadow registered");
+            let immediate = pv
+                .snapshot()
+                .await
+                .display
+                .map(|d| d.units.to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                immediate, "",
+                "seed must have missed (ZERO budget) leaving units empty, so \
+                 the first-event recovery is what this test exercises"
+            );
+        }
+
+        // The cached property task subscribes DBE_PROPERTY, receives its
+        // initial-state event, and — because the seed missed — consumes it
+        // to seed metadata (get_with_metadata → post_pv_property). Poll the
+        // shadow until its display units appear (bounded ~2 s).
+        let mut units = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(pv) = db.find_pv(name).await {
+                if let Some(d) = pv.snapshot().await.display {
+                    let u = d.units.to_string();
+                    if !u.is_empty() {
+                        units = u;
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            units, "mm",
+            "seed missed → the property monitor's first event must seed the \
+             shadow metadata (GW-23), not leave units zeroed"
         );
 
         mgr.shutdown().await;

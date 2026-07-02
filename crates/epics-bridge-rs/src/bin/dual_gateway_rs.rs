@@ -31,7 +31,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 
 use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer, PutLogScope};
 use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
@@ -453,158 +454,190 @@ async fn run_pva_gateway(args: &Args) -> Result<(), String> {
         .map_err(|e| format!("PVA runtime error: {e}"))
 }
 
-/// Merge a TOML `ConfigFile` into the CLI [`Args`]. CLI values that
-/// were explicitly supplied (i.e. differ from clap default) win;
-/// otherwise we fall back to the TOML value. We use the simple rule
-/// "TOML fills in any field where the CLI is at its default" rather
-/// than introspecting clap's `matches.contains_id` because most
-/// dual-gateway operators set things explicitly via either CLI *or*
-/// TOML, not both.
-fn merge_config(args: &mut Args, cfg: &ConfigFile) {
-    // CA section
-    if let Some(enabled) = cfg.ca.enabled {
-        if !enabled {
-            args.no_ca = true;
+/// Merge a TOML `ConfigFile` into the CLI [`Args`]. A TOML value fills a
+/// field only when the operator did NOT pass that flag on the command
+/// line; an explicit CLI flag always wins.
+///
+/// Which fields came from the command line is read from clap via
+/// [`ArgMatches::value_source`], not by comparing each field against its
+/// hardcoded default literal. The literal comparison silently stopped
+/// honouring the TOML the moment a default changed, and could not tell
+/// "operator typed the default value" from "operator typed nothing" —
+/// `value_source` distinguishes them by construction.
+fn merge_config(args: &mut Args, cfg: &ConfigFile, matches: &ArgMatches) {
+    // True when flag `id` was supplied on the command line (its value did
+    // not come from clap's default), so the CLI must override the TOML.
+    let cli_set = |id: &str| {
+        !matches!(
+            matches.value_source(id),
+            None | Some(ValueSource::DefaultValue)
+        )
+    };
+
+    // ── CA section ────────────────────────────────────────────────
+    // `enabled = false` disables the CA side. `--no-ca` already set the
+    // flag and TOML never clears it, so an explicit CLI still wins.
+    if cfg.ca.enabled == Some(false) {
+        args.no_ca = true;
+    }
+    if !cli_set("ca_pvlist") {
+        if let Some(v) = &cfg.ca.pvlist {
+            args.ca_pvlist = Some(v.clone());
         }
     }
-    if args.ca_pvlist.is_none() {
-        args.ca_pvlist = cfg.ca.pvlist.clone();
-    }
-    if args.ca_access.is_none() {
-        args.ca_access = cfg.ca.access.clone();
-    }
-    if args.ca_putlog.is_none() {
-        args.ca_putlog = cfg.ca.putlog.clone();
-    }
-    if !args.ca_putlog_all {
-        if let Some(true) = cfg.ca.putlog_all {
-            args.ca_putlog_all = true;
+    if !cli_set("ca_access") {
+        if let Some(v) = &cfg.ca.access {
+            args.ca_access = Some(v.clone());
         }
     }
-    if args.ca_preload.is_none() {
-        args.ca_preload = cfg.ca.preload.clone();
-    }
-    if args.ca_command.is_none() {
-        args.ca_command = cfg.ca.command.clone();
-    }
-    if args.ca_report.is_none() {
-        args.ca_report = cfg.ca.report.clone();
-    }
-    if !args.ca_no_report {
-        if let Some(true) = cfg.ca.no_report {
-            args.ca_no_report = true;
+    if !cli_set("ca_putlog") {
+        if let Some(v) = &cfg.ca.putlog {
+            args.ca_putlog = Some(v.clone());
         }
     }
-    if args.ca_port == 0 {
-        if let Some(p) = cfg.ca.port {
-            args.ca_port = p;
+    if !cli_set("ca_putlog_all") {
+        if let Some(v) = cfg.ca.putlog_all {
+            args.ca_putlog_all = v;
         }
     }
-    if args.ca_sip.is_none() {
-        args.ca_sip = cfg.ca.sip.clone();
-    }
-    if args.ca_signore.is_none() {
-        args.ca_signore = cfg.ca.signore.clone();
-    }
-    if args.ca_cip.is_none() {
-        args.ca_cip = cfg.ca.cip.clone();
-    }
-    if args.ca_cport.is_none() {
-        args.ca_cport = cfg.ca.cport;
-    }
-    if !args.ca_read_only {
-        if let Some(true) = cfg.ca.read_only {
-            args.ca_read_only = true;
+    if !cli_set("ca_preload") {
+        if let Some(v) = &cfg.ca.preload {
+            args.ca_preload = Some(v.clone());
         }
     }
-    if !args.ca_no_cache {
-        if let Some(true) = cfg.ca.no_cache {
-            args.ca_no_cache = true;
+    if !cli_set("ca_command") {
+        if let Some(v) = &cfg.ca.command {
+            args.ca_command = Some(v.clone());
         }
     }
-    if args.ca_stats_prefix.is_none() {
-        args.ca_stats_prefix = cfg.ca.stats_prefix.clone();
+    if !cli_set("ca_report") {
+        if let Some(v) = &cfg.ca.report {
+            args.ca_report = Some(v.clone());
+        }
     }
-    if args.ca_heartbeat_interval == 1 {
+    if !cli_set("ca_no_report") {
+        if let Some(v) = cfg.ca.no_report {
+            args.ca_no_report = v;
+        }
+    }
+    if !cli_set("ca_port") {
+        if let Some(v) = cfg.ca.port {
+            args.ca_port = v;
+        }
+    }
+    if !cli_set("ca_sip") {
+        if let Some(v) = &cfg.ca.sip {
+            args.ca_sip = Some(v.clone());
+        }
+    }
+    if !cli_set("ca_signore") {
+        if let Some(v) = &cfg.ca.signore {
+            args.ca_signore = Some(v.clone());
+        }
+    }
+    if !cli_set("ca_cip") {
+        if let Some(v) = &cfg.ca.cip {
+            args.ca_cip = Some(v.clone());
+        }
+    }
+    if !cli_set("ca_cport") {
+        if let Some(v) = cfg.ca.cport {
+            args.ca_cport = Some(v);
+        }
+    }
+    if !cli_set("ca_read_only") {
+        if let Some(v) = cfg.ca.read_only {
+            args.ca_read_only = v;
+        }
+    }
+    if !cli_set("ca_no_cache") {
+        if let Some(v) = cfg.ca.no_cache {
+            args.ca_no_cache = v;
+        }
+    }
+    if !cli_set("ca_stats_prefix") {
+        if let Some(v) = &cfg.ca.stats_prefix {
+            args.ca_stats_prefix = Some(v.clone());
+        }
+    }
+    if !cli_set("ca_heartbeat_interval") {
         if let Some(v) = cfg.ca.heartbeat_interval {
             args.ca_heartbeat_interval = v;
         }
     }
-    if args.ca_cleanup_interval == 10 {
+    if !cli_set("ca_cleanup_interval") {
         if let Some(v) = cfg.ca.cleanup_interval {
             args.ca_cleanup_interval = v;
         }
     }
-    if args.ca_stats_interval == 10 {
+    if !cli_set("ca_stats_interval") {
         if let Some(v) = cfg.ca.stats_interval {
             args.ca_stats_interval = v;
         }
     }
-    if args.ca_connect_timeout == 1 {
+    if !cli_set("ca_connect_timeout") {
         if let Some(v) = cfg.ca.connect_timeout {
             args.ca_connect_timeout = v;
         }
     }
-    if args.ca_inactive_timeout == 60 * 60 * 2 {
+    if !cli_set("ca_inactive_timeout") {
         if let Some(v) = cfg.ca.inactive_timeout {
             args.ca_inactive_timeout = v;
         }
     }
-    if args.ca_dead_timeout == 60 * 2 {
+    if !cli_set("ca_dead_timeout") {
         if let Some(v) = cfg.ca.dead_timeout {
             args.ca_dead_timeout = v;
         }
     }
-    if args.ca_disconnect_timeout == 60 * 60 * 2 {
+    if !cli_set("ca_disconnect_timeout") {
         if let Some(v) = cfg.ca.disconnect_timeout {
             args.ca_disconnect_timeout = v;
         }
     }
-    if args.ca_reconnect_inhibit == 60 * 5 {
+    if !cli_set("ca_reconnect_inhibit") {
         if let Some(v) = cfg.ca.reconnect_inhibit {
             args.ca_reconnect_inhibit = v;
         }
     }
 
-    // PVA section
-    if let Some(enabled) = cfg.pva.enabled {
-        if !enabled {
-            args.no_pva = true;
-        }
+    // ── PVA section ───────────────────────────────────────────────
+    if cfg.pva.enabled == Some(false) {
+        args.no_pva = true;
     }
-    if args.pva_bind.to_string() == "0.0.0.0" {
+    if !cli_set("pva_bind") {
         if let Some(b) = &cfg.pva.bind {
             if let Ok(ip) = b.parse() {
                 args.pva_bind = ip;
             }
         }
     }
-    if args.pva_tcp_port == 5075 {
-        if let Some(p) = cfg.pva.tcp_port {
-            args.pva_tcp_port = p;
+    if !cli_set("pva_tcp_port") {
+        if let Some(v) = cfg.pva.tcp_port {
+            args.pva_tcp_port = v;
         }
     }
-    if args.pva_udp_port == 5076 {
-        if let Some(p) = cfg.pva.udp_port {
-            args.pva_udp_port = p;
+    if !cli_set("pva_udp_port") {
+        if let Some(v) = cfg.pva.udp_port {
+            args.pva_udp_port = v;
         }
     }
-    if args.pva_connect_timeout_secs == 5 {
+    if !cli_set("pva_connect_timeout_secs") {
         if let Some(v) = cfg.pva.connect_timeout_secs {
             args.pva_connect_timeout_secs = v;
         }
     }
-    if args.pva_cleanup_interval_secs == 30 {
+    if !cli_set("pva_cleanup_interval_secs") {
         if let Some(v) = cfg.pva.cleanup_interval_secs {
             args.pva_cleanup_interval_secs = v;
         }
     }
-    if args.pva_control_prefix.is_empty() {
+    if !cli_set("pva_control_prefix") {
         if let Some(s) = &cfg.pva.control_prefix {
             args.pva_control_prefix = s.clone();
         }
     }
-    if args.pva_prefetch.is_empty() {
+    if !cli_set("pva_prefetch") {
         if let Some(v) = &cfg.pva.prefetch {
             args.pva_prefetch = v.clone();
         }
@@ -612,7 +645,14 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
 }
 
 fn main() -> ExitCode {
-    let mut args = Args::parse();
+    // Keep the raw `ArgMatches` so `merge_config` can ask clap which
+    // flags the operator actually typed (vs. clap-supplied defaults),
+    // then materialise the typed `Args` from the same matches.
+    let matches = Args::command().get_matches();
+    let mut args = match Args::from_arg_matches(&matches) {
+        Ok(args) => args,
+        Err(e) => e.exit(),
+    };
     init_tracing(args.verbose);
 
     if args.print_default_config {
@@ -622,7 +662,7 @@ fn main() -> ExitCode {
 
     if let Some(path) = args.config.clone() {
         match load_config(&path) {
-            Ok(cfg) => merge_config(&mut args, &cfg),
+            Ok(cfg) => merge_config(&mut args, &cfg, &matches),
             Err(e) => {
                 eprintln!("dual-gateway-rs: {e}");
                 return ExitCode::FAILURE;
@@ -737,5 +777,79 @@ async fn async_main(args: Args) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_and_matches(argv: &[&str]) -> (Args, ArgMatches) {
+        let matches = Args::command()
+            .try_get_matches_from(argv)
+            .expect("args parse");
+        let args = Args::from_arg_matches(&matches).expect("args from matches");
+        (args, matches)
+    }
+
+    fn cfg(toml_src: &str) -> ConfigFile {
+        toml::from_str(toml_src).expect("toml parse")
+    }
+
+    #[test]
+    fn toml_fills_fields_the_cli_omitted() {
+        let (mut args, matches) = args_and_matches(&["dual-gateway-rs"]);
+        let c =
+            cfg("[ca]\ndead_timeout = 45\npvlist = \"/etc/gw.pvlist\"\n[pva]\ntcp_port = 6000\n");
+        merge_config(&mut args, &c, &matches);
+        assert_eq!(args.ca_dead_timeout, 45);
+        assert_eq!(
+            args.ca_pvlist.as_deref(),
+            Some(std::path::Path::new("/etc/gw.pvlist"))
+        );
+        assert_eq!(args.pva_tcp_port, 6000);
+    }
+
+    #[test]
+    fn explicit_cli_flag_beats_toml() {
+        let (mut args, matches) = args_and_matches(&[
+            "dual-gateway-rs",
+            "--ca-dead-timeout",
+            "999",
+            "--pva-tcp-port",
+            "7000",
+        ]);
+        let c = cfg("[ca]\ndead_timeout = 45\n[pva]\ntcp_port = 6000\n");
+        merge_config(&mut args, &c, &matches);
+        assert_eq!(args.ca_dead_timeout, 999);
+        assert_eq!(args.pva_tcp_port, 7000);
+    }
+
+    #[test]
+    fn cli_typing_the_default_value_still_blocks_toml() {
+        // The exact case the old default-literal comparison got wrong:
+        // typing the clap default (`120`) explicitly must still count as
+        // an operator choice and block the TOML override.
+        let (mut args, matches) =
+            args_and_matches(&["dual-gateway-rs", "--ca-dead-timeout", "120"]);
+        let c = cfg("[ca]\ndead_timeout = 45\n");
+        merge_config(&mut args, &c, &matches);
+        assert_eq!(args.ca_dead_timeout, 120);
+    }
+
+    #[test]
+    fn defaults_survive_when_neither_source_sets() {
+        let (mut args, matches) = args_and_matches(&["dual-gateway-rs"]);
+        merge_config(&mut args, &cfg(""), &matches);
+        assert_eq!(args.ca_dead_timeout, 120);
+        assert_eq!(args.pva_tcp_port, 5075);
+    }
+
+    #[test]
+    fn toml_enabled_false_disables_that_side_only() {
+        let (mut args, matches) = args_and_matches(&["dual-gateway-rs"]);
+        merge_config(&mut args, &cfg("[pva]\nenabled = false\n"), &matches);
+        assert!(args.no_pva);
+        assert!(!args.no_ca);
     }
 }

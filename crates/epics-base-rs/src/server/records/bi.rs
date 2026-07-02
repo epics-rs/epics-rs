@@ -27,6 +27,7 @@ pub struct BiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
     skip_convert: bool,
     // VAL change gate. C
@@ -54,6 +55,7 @@ impl Default for BiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             skip_convert: false,
             value_changed: false,
         }
@@ -145,6 +147,11 @@ static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Record for BiRecord {
@@ -186,6 +193,34 @@ impl Record for BiRecord {
 
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.skip_convert = did_compute;
+    }
+
+    /// asyn device readback: a raw hardware word read through `asynInt32`
+    /// (`processBi` `pr->rval = value`, MASK unset so 0 — `initBi` passes
+    /// NULL for the mask, devAsynInt32.c) or `asynUInt32Digital` (`processBi`
+    /// `pr->rval = value & mask`, devAsynUInt32Digital.c:689) enters RVAL, and
+    /// biRecord's `rval -> 0/1` convert resolves VAL. C returns 0 from
+    /// `processBi`, so the record runs that convert; the hook performs the
+    /// (identical) convert inline and returns `true` so the framework's
+    /// `set_device_did_compute(true)` makes `process()` skip the forward pass
+    /// — which would otherwise recompute VAL from the same RVAL (a no-op here,
+    /// but the structural guarantee the output family relies on).
+    ///
+    /// This is the *device-distinct* entry: it is reached only from
+    /// `store_read_value`, never from the Soft Channel path, which stays on
+    /// `set_val` and writes the resolved link value straight into VAL (C
+    /// `devBiSoft` `read_bi` returns 2). Routing the device raw here instead of
+    /// through `set_val` keeps `set_val` single-meaning (a Soft Channel `bi`
+    /// linked to a non-binary source still passes its value through as C does).
+    /// Input twin of `bo::apply_raw_readback` (same `mask != 0` split).
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        self.rval = if self.mask != 0 {
+            (raw as u32) & self.mask
+        } else {
+            raw as u32
+        };
+        self.val = if self.rval != 0 { 1 } else { 0 };
+        true
     }
 
     /// `bi` has an `RVAL → VAL` `convert()` step. A `Soft Channel` `bi`
@@ -266,6 +301,7 @@ impl Record for BiRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
         }
     }
@@ -411,6 +447,13 @@ impl Record for BiRecord {
             "SIMS" => match value {
                 EpicsValue::Short(v) => {
                     self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

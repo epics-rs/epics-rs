@@ -61,7 +61,11 @@ impl Default for DfanoutRecord {
         Self {
             val: 0.0,
             selm: 0,
-            seln: 0,
+            // C `dfanoutRecord.dbd.pod` `field(SELN,DBF_USHORT){ initial("1") }`:
+            // an unset SELN defaults to 1, not 0. For dfanout Specified the
+            // selected output is `seln - 1` (dfanoutRecord.c:316-322), so the
+            // C default 1 drives OUTA while 0 would drive nothing.
+            seln: 1,
             outa: String::new(),
             outb: String::new(),
             outc: String::new(),

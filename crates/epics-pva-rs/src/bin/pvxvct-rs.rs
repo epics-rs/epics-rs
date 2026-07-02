@@ -28,7 +28,7 @@ use tokio::sync::mpsc::Receiver;
 use epics_pva_rs::client_native::decode::try_parse_frame;
 use epics_pva_rs::client_native::udp::{CollectedDatagram, UdpManager};
 use epics_pva_rs::config::Endpoint;
-use epics_pva_rs::proto::{Command, ReadExt, decode_size, decode_string, ip_from_bytes};
+use epics_pva_rs::proto::{Command, ReadExt, decode_size_nonnull, decode_string, ip_from_bytes};
 
 #[derive(Parser)]
 #[command(
@@ -364,7 +364,15 @@ async fn run_listener(mut rx: Receiver<CollectedDatagram>, filters: Arc<Filters>
                 addr_arr[..resp_addr.len().min(16)]
                     .copy_from_slice(&resp_addr[..resp_addr.len().min(16)]);
                 let resp_ip = ip_from_bytes(&addr_arr).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                let n_protos = decode_size(&mut cur, order).ok().flatten().unwrap_or(0);
+                // pvxs decodes the protocol count as a non-null Size
+                // (`allow_null=false`) and faults the whole SEARCH on `0xFF`.
+                // A null count here means the rest of the frame can't be
+                // parsed, so skip displaying this malformed frame rather
+                // than silently treating it as zero protocols.
+                let n_protos = match decode_size_nonnull(&mut cur, order, "search protocol count") {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
                 for _ in 0..n_protos {
                     let _ = decode_string(&mut cur, order);
                 }

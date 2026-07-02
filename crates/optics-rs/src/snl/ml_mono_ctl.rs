@@ -77,12 +77,22 @@ pub enum MlMonoState {
 
 /// Calculate effective 2d-spacing from layer spacing D and diffraction order.
 /// Returns (two_d, is_error, message).
+///
+/// C computes `result = (2*D)/Order` unconditionally and returns it, only
+/// raising opAlert when `Order < 1` (ml_monoCtl.st:1314-1329). A `0 < Order < 1`
+/// therefore still yields a finite 2d in C; returning 0.0 zeroed the E/lambda
+/// DRVH-DRVL limits instead. We reproduce the finite quotient and the alert, but
+/// guard `Order <= 0` so we never produce C's bare `2*D/0` infinity.
 pub fn calc_2d_spacing(d: f64, order: f64) -> (f64, bool, &'static str) {
-    if order < 1.0 {
+    if order <= 0.0 {
         return (0.0, true, "Order must be >= 1");
     }
     let two_d = (2.0 * d) / order;
-    (two_d, false, "New effective d spacing")
+    if order < 1.0 {
+        (two_d, true, "Order must be >= 1")
+    } else {
+        (two_d, false, "New effective d spacing")
+    }
 }
 
 /// Convert energy (keV) to wavelength (Angstrom).
@@ -944,8 +954,15 @@ mod tests {
 
     #[test]
     fn test_calc_2d_spacing_invalid_order() {
-        let (_, err, _) = calc_2d_spacing(25.0, 0.5);
+        // 0 < Order < 1: C still returns the finite (2*D)/Order with opAlert set,
+        // NOT 0.0 (which would zero the E/lambda limits).
+        let (two_d, err, _) = calc_2d_spacing(25.0, 0.5);
         assert!(err);
+        assert!((two_d - 100.0).abs() < 1e-9);
+        // Order <= 0: guarded to avoid C's 2*D/0 infinity.
+        let (two_d0, err0, _) = calc_2d_spacing(25.0, 0.0);
+        assert!(err0);
+        assert_eq!(two_d0, 0.0);
     }
 
     #[test]

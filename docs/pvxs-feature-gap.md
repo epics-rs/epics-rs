@@ -1,6 +1,6 @@
 # pvxs ↔ epics-pva-rs / epics-bridge-rs 기능 차이 분석
 
-> 작성일: 2026-05-16
+> 작성일: 2026-05-16 · **재검증: 2026-06-28 (§0.5 참조 — 현재 상태의 단일 출처)**
 > 분석 대상:
 > - **pvxs** (C++ 레퍼런스): `~/codes/epics-modules/pvxs` → 실제 위치 `~/codes/pvxs`,
 >   `tls` 브랜치 tip `9beba6b` (2026-04-12). 최신 태그 `1.5.1` (2026-02), 릴리스노트는 `1.5.2 UNRELEASED`까지.
@@ -11,6 +11,43 @@
 > 머지된 PR·open/closed 이슈를 `gh`로 조사, pvxs C++ 소스와 두 Rust 크레이트의 소스를
 > 멀티에이전트로 인벤토리하여 대조함. 전수 sweep은 본 문서의 격차 목록을 확정했으며
 > §2~§5 외의 추가 기능 누락은 발견되지 않음(상세는 부록 C).
+
+---
+
+## 0.5 재검증 로그 (2026-06-28, workspace v0.20.3)
+
+> 본 문서 본문(§0~§6, 부록)은 **2026-05-16 / v0.17.2 시점의 베이스라인**이다.
+> 2026-06-28 caucus 재베이스라인 라운드에서 §2~§5를 현재 두 크레이트
+> (v0.20.3) 소스와 pvxs `tls` 브랜치에 다시 대조했다. 결론: 본문 격차 표는
+> **상당수 stale**(이후 구현됨)이며, 진짜 미해결분은 아래 잔존(residual)
+> 목록으로 좁혀졌다. **현재 상태의 단일 출처는 이 로그**이며, 아래에 명시한
+> 행은 본문 표보다 이 로그가 우선한다(베이스라인 표는 이력 보존용으로 둔다).
+
+### 이번 라운드에서 닫은 격차 (per-feature 커밋, 모두 main, 미push)
+
+| 커밋 | 닫은 본문 항목 | 근거 |
+|---|---|---|
+| `6eabcaae` | §2.6 `SSLKEYLOGFILE ❌` → ✅ | server+client rustls `config.key_log`를 `$SSLKEYLOGFILE` 설정 시 `KeyLogFile`로 배선(`auth/tls.rs`). pvxs `5db9222f` 대응 |
+| `67b10ff1` | 부록 C "ID 충돌 탐지 `3b641bed` 채택 권장" → 채택됨 | SID/CID/IOID/searchID 카운터를 서로 다른 비-0 base에서 시작 |
+| `29a0aa9e` | §2.8 info `-v` 자격증명 표시 없음 → ✅ | `pvinfo-rs -v`가 서버 자격증명 표시(pvxs `066ae597` 대응). `--show-credentials`와 독립 OR |
+| `cfa75c58` | §4.1 `info(Q:form,...)` ⚠️확인필요 → ✅ | base `populate_display_info`가 Q:form info 태그를 7-name 메뉴로 `display.form` index에 매핑(pvxs `iocsource.cpp:42-62` 대응, VAL 한정) |
+| `beffbb85` | §2.3 `serverInfo`/`server` PV 표기 정정 | Rust 서버가 `server_native::server_info::ServerInfoSource`로 `server` PV를 이미 호스팅함을 doc에 반영 |
+| `3b1733b0` | §5-8 `ca_gateway` preload_path 주석 stale 정정 | lazy-resolution은 `install_search_resolver`로 동작 중; preload는 opt-in eager-prefetch |
+| `cf52451c` | §4.2/§5-2 pvalink `MSS` 처분 정정 | `MSS→MS`는 **pvxs 자체 aliasing**(`pvalink.h:83-86` MSS 변형 없음, `pvalink_jlif.cpp:179-183` 명시 매핑). Rust 한계 아님 = 정확한 parity |
+| `593f2027` | §4.1 iocsh `pvxsr` 없음 → ✅ | QSRV iocsh `pvxsr [<detail>]` 추가(pvxs `iochooks.cpp:188-214` casr 대응). native `PvaServer`가 bind 직후 `ServerReportHandle`(공유 peer 레지스트리 + bound-port/config + abort 핸들)를 `watch` 채널로 publish → 양 shell 경로(`run_with_shell`/`run_with_source_and_shell`)가 autosave처럼 자동 등록. 구조 변경 sign-off 받고 진행 |
+
+### 의도적 잔존 (residual) — 처분과 근거
+
+| 항목 | 처분 | 근거 |
+|---|---|---|
+| `reExec`/`autoExec` Expert API (§2.1) | 잔존 (M, expert-only) | pvxs `reExecGet`/`reExecPut`는 전문가용 재실행 API. 영향 낮음, 일반 GET/PUT 경로는 동등 |
+| `pvxsi` (QSRV iocsh target_information 덤프) | 잔존 (cosmetic) | 진단용 자격증명/타깃 정보 출력. 와이어/기능 영향 없음 |
+| `EPICS_PVA_MAX_SEARCH_PERIOD` (§2.2, 이슈 #155) | 격차 아님 | pvxs도 제안 단계로 미구현 — 양쪽 모두 없음 |
+| `SSLKEYLOGFILE` open-failure 진단 | 잔존 (minor) | `6eabcaae`는 enable 시 NOTICE 출력. pvxs는 파일 열기 실패 시 추가 Warning. rustls `KeyLogFile`이 열기/쓰기를 내부 처리하므로 실패 경고 경로만 미세 차이 |
+
+> 남은 잔존은 모두 cosmetic/expert-only/양쪽-공통 부재로 와이어·기능
+> parity에 영향 없음. (casr-격차였던 `pvxsr`은 `593f2027`에서 구조 변경
+> 승인 후 구현 완료 — 위 표로 이동.)
 
 ---
 

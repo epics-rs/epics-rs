@@ -1317,10 +1317,49 @@ fn test_miss_when_retries_exhausted() {
 }
 
 #[test]
+fn test_ls_stop_syncs_drive_values_to_readback() {
+    // C motorRecord.cc:1366-1380 → postProcess (826-849): a positional
+    // move halted by a hardware limit switch in the travel direction
+    // forces pp=TRUE and re-arms GET_INFO, and the next callback adopts
+    // the limit readback into VAL/DVAL/RVAL (DIFF/RDIF zeroed). Without
+    // this sync the record advertises the unreached target forever.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.conv.mres = 1.0;
+    rec.retry.rtry = 3; // retry would fire on a 1.0 error...
+    // Commanded the +direction into the high limit; the switch is struck.
+    rec.stat.cdir = true;
+    rec.limits.hls = true;
+    // Target 10, but the axis stopped at the limit (9.0) one EGU short.
+    rec.pos.dval = 10.0;
+    rec.pos.val = 10.0;
+    rec.pos.rval = 10;
+    rec.pos.drbv = 9.0;
+    rec.pos.rbv = 9.0;
+
+    let _ = rec.check_completion();
+
+    assert_eq!(rec.stat.phase, MotionPhase::Idle, "LS-stop finalizes");
+    assert!(
+        !rec.stat.mip.contains(MipFlags::RETRY),
+        "the limit suppresses the retry"
+    );
+    assert_eq!(
+        rec.pos.val, 9.0,
+        "VAL adopts the limit readback (C postProcess)"
+    );
+    assert_eq!(rec.pos.dval, 9.0, "DVAL adopts the dial limit readback");
+    assert_eq!(rec.pos.rval, 9, "RVAL = NINT(DVAL/MRES) at the limit");
+    assert_eq!(rec.pos.diff, 0.0, "DIFF zeroed at the limit");
+    assert_eq!(rec.pos.rdif, 0, "RDIF zeroed at the limit");
+}
+
+#[test]
 fn test_ntm_retarget_direction_change() {
     let mut rec = MotorRecord::new();
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
     rec.retry.bdst = 0.0;
     rec.retry.rdbd = 0.0;
     rec.internal.ldvl = 10.0;
@@ -1402,7 +1441,7 @@ fn test_val_write_during_stop_replan_supersedes_parked_target() {
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
     rec.stat.msta = MstaFlags::DONE;
 
     rec.pos.dval = 50.0;
@@ -2920,28 +2959,49 @@ fn test_accs_default_mirrors_accl() {
 }
 
 #[test]
-fn test_put_accl_recalculates_accs_and_switches_accu() {
+fn test_put_accl_recalculates_accs_and_leaves_accu_untouched() {
+    // C special() motorRecordACCL (motorRecord.cc:2735-2742): recompute ACCS
+    // from ACCL but DO NOT change ACCU (63bfe5d0 made ACCU a user control).
     let mut rec = MotorRecord::new();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
-    rec.vel.accu = AccsUsed::Accs; // start from Accs
+    rec.vel.accu = AccsUsed::Accs; // start from Accs — must survive the put
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accl);
+    assert_eq!(rec.vel.accu, AccsUsed::Accs);
     assert!((rec.vel.accl - 2.0).abs() < 1e-12);
     // ACCS = (10 - 0) / 2 = 5
     assert!((rec.vel.accs - 5.0).abs() < 1e-12);
 }
 
 #[test]
-fn test_put_accs_recalculates_accl_and_switches_accu() {
+fn test_put_accs_recalculates_accl_and_leaves_accu_untouched() {
+    // C special() motorRecordACCS (motorRecord.cc:2745-2752): recompute ACCL
+    // from ACCS but DO NOT change ACCU.
     let mut rec = MotorRecord::new();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
+    rec.vel.accu = AccsUsed::Accl; // default master — must survive the put
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accs);
+    assert_eq!(rec.vel.accu, AccsUsed::Accl);
     assert!((rec.vel.accs - 4.0).abs() < 1e-12);
     // ACCL = (10 - 0) / 4 = 2.5
     assert!((rec.vel.accl - 2.5).abs() < 1e-12);
+}
+
+#[test]
+fn test_put_accs_nonpositive_derives_from_accl_not_literal() {
+    // C special() motorRecordACCS (motorRecord.cc:2745-2748): a non-positive
+    // ACCS is derived from ACCL via updateACCSfromACCL (accs = velo/accl), NOT
+    // forced to a literal 1.0.
+    let mut rec = MotorRecord::new();
+    rec.vel.velo = 10.0;
+    rec.vel.vbas = 0.0;
+    rec.vel.accl = 2.0;
+    rec.put_field("ACCS", EpicsValue::Double(0.0)).unwrap();
+    // accs <= 0 → accs = (10 - 0) / 2 = 5 (from ACCL), not 1.0
+    assert!((rec.vel.accs - 5.0).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+    // ACCL stays consistent: (10 - 0) / 5 = 2 (round-trip)
+    assert!((rec.vel.accl - 2.0).abs() < 1e-12, "ACCL={}", rec.vel.accl);
 }
 
 #[test]
@@ -3343,7 +3403,8 @@ fn test_move_accel_uses_accs_directly_when_accu_is_accs() {
     let mut rec = MotorRecord::new();
     rec.vel.vbas = 0.0;
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
-    rec.put_field("ACCS", EpicsValue::Double(7.0)).unwrap(); // ACCU→Accs
+    rec.put_field("ACCS", EpicsValue::Double(7.0)).unwrap();
+    rec.put_field("ACCU", EpicsValue::Short(1)).unwrap(); // select ACCS as master
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
     let accel = effects.commands.iter().find_map(|c| match c {
@@ -3359,10 +3420,10 @@ fn test_move_accel_accu_accs_ignores_velo_vbas() {
     // C accEGUfromVelo: ACCU=Accs returns ACCS unconditionally — VELO/VBAS
     // do not enter the calculation.
     let mut rec = MotorRecord::new();
-    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap(); // ACCU→Accs
+    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(99.0)).unwrap();
     rec.put_field("VBAS", EpicsValue::Double(50.0)).unwrap();
-    // re-assert ACCU=Accs (VELO/VBAS puts cascade but must not change accu)
+    // select ACCS as master (ACCS/VELO/VBAS puts do not change ACCU themselves)
     rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(500.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
@@ -3491,7 +3552,7 @@ fn test_move_to_home_defaults_to_move_absolute() {
     let mut sim = motor_rs::sim_motor::SimMotor::new();
     let user = AsynUser::new(0);
     // move_to_home's default impl delegates to move_absolute(position=3.0).
-    sim.move_to_home(&user, 3.0, 1.0, 0.5).unwrap();
+    sim.move_to_home(&user, 3.0, 0.0, 1.0, 0.5).unwrap();
     let status = sim.poll(&user).unwrap();
     // The sim must now be moving toward 3.0 from its start at 0.0.
     assert!(status.moving, "move_to_home should start a move");
@@ -3593,10 +3654,18 @@ fn test_default_asyn_motor_enable_pco_is_noop() {
             _: f64,
             _: f64,
             _: f64,
+            _: f64,
         ) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
-        fn home(&mut self, _: &AsynUser, _: f64, _: bool) -> asyn_rs::error::AsynResult<()> {
+        fn home(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: bool,
+        ) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
         fn stop(&mut self, _: &AsynUser, _: f64) -> asyn_rs::error::AsynResult<()> {
@@ -3699,17 +3768,47 @@ fn test_accl_stays_positive_when_velo_equals_vbas() {
 }
 
 #[test]
-fn test_accu_cascade_safe_when_velo_equals_vbas() {
-    // span <= 0.0 → apply_accu_cascade leaves master untouched.
+fn test_accu_cascade_recomputes_slave_with_full_velo_when_velo_equals_vbas() {
+    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): at velo <= vbas the
+    // numerator is the full velo (not the span), and the slave is STILL
+    // recomputed/posted — it is not left at its stale value.
     let mut rec = MotorRecord::new();
     rec.vel.accu = AccsUsed::Accl;
     rec.vel.accl = 2.0;
-    rec.vel.accs = 5.0; // pre-existing slave value
+    rec.vel.accs = 5.0; // pre-existing slave value (must be overwritten)
     rec.vel.vbas = 5.0;
     rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap();
-    // ACCS slave should not be set to 0 just because span == 0
-    assert!(rec.vel.accs > 0.0);
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    // velo == vbas → numerator = velo = 5.0; ACCS = 5.0 / 2.0 = 2.5
+    assert!((rec.vel.accs - 2.5).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_put_accl_recomputes_accs_with_full_velo_when_velo_le_vbas() {
+    // C updateACCSfromACCL (motorRecord.cc:512-521): writing ACCL recomputes
+    // ACCS; at velo <= vbas the numerator is the full velo, not the span.
+    let mut rec = MotorRecord::new();
+    rec.vel.vbas = 8.0;
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
+    rec.vel.accs = 99.0; // stale slave that must be overwritten
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
+    assert_eq!(rec.vel.accu, AccsUsed::Accl);
+    // velo < vbas → numerator = velo = 5.0; ACCS = 5.0 / 2.0 = 2.5
+    assert!((rec.vel.accs - 2.5).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_put_accs_recomputes_accl_with_full_velo_when_velo_le_vbas() {
+    // C updateACCLfromACCS (motorRecord.cc:499-510): writing ACCS recomputes
+    // ACCL; at velo <= vbas the numerator is the full velo, not the span.
+    let mut rec = MotorRecord::new();
+    rec.vel.vbas = 8.0;
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
+    rec.vel.accl = 99.0; // stale slave that must be overwritten
+    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
+    // ACCS put no longer switches ACCU (R22 / 63bfe5d0); default master survives.
+    assert_eq!(rec.vel.accu, AccsUsed::Accl);
+    // velo < vbas → numerator = velo = 5.0; ACCL = 5.0 / 4.0 = 1.25
+    assert!((rec.vel.accl - 1.25).abs() < 1e-12, "ACCL={}", rec.vel.accl);
 }
 
 // --- Home ignores soft limit error (C: dbcf4bc2 2011-10, 85511023 2013-06) ---
@@ -4065,6 +4164,39 @@ fn test_val_write_does_not_clear_buttons_when_not_homing() {
     // Buttons stay at default; nothing surprising
     assert!(!rec.ctrl.homf);
     assert!(!rec.ctrl.homr);
+}
+
+#[test]
+fn test_urip_skipped_at_init_readback_applied_on_poll() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // R41 / C process_motor_info(pmr, initcall): the URIP RDBL scaling is
+    // gated `else if (urip==Yes && initcall==false)` (motorRecord.cc:3682),
+    // so the init readback seeds RRBV/DRBV from the MOTOR position, not the
+    // external readback link. Subsequent runtime polls (initcall=false) DO
+    // apply the link. An earlier Rust gate on `self.initialized` never
+    // skipped the init readback because `determine_event` flips it true
+    // before dispatching Startup.
+    let status = MotorStatus {
+        position: 3.0, // motor dial position
+        done: true,
+        moving: false,
+        ..Default::default()
+    };
+
+    // Init readback: URIP suppressed, DRBV adopts the motor position (3.0).
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.conv.urip = true;
+    rec.conv.rres = 1.0;
+    rec.conv.rdbl_value = Some(7.0); // external link disagrees with the motor
+    rec.initial_readback(&status);
+    assert_eq!(rec.pos.rrbv, 3, "init readback adopts the motor position");
+    assert_eq!(rec.pos.drbv, 3.0, "init DRBV from motor position, not RDBL");
+
+    // A runtime poll on the same record DOES apply the URIP link (7.0).
+    rec.process_motor_info(&status);
+    assert_eq!(rec.pos.rrbv, 7, "runtime poll applies the URIP RDBL link");
+    assert_eq!(rec.pos.drbv, 7.0, "runtime DRBV from the external link");
 }
 
 // --- URIP RDBL error (C: db5da2f0 2017-05, 7493d50b 2018-04) ---
@@ -5856,6 +5988,10 @@ fn test_accs_roundtrip_via_pv() {
     rec.vel.vbas = 0.0;
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     assert_eq!(rec.get_field("ACCS"), Some(EpicsValue::Double(4.0)));
+    // ACCS put does not switch ACCU (R22 / 63bfe5d0); it stays the default Accl.
+    assert_eq!(rec.get_field("ACCU"), Some(EpicsValue::Short(0)));
+    // ACCU is an independent user/autosave control.
+    rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
     assert_eq!(rec.get_field("ACCU"), Some(EpicsValue::Short(1)));
 }
 

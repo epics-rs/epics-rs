@@ -448,7 +448,7 @@ fn spmg_pause_sends_stop_and_arms_paused_resume() {
 fn ntm_retargets_while_in_motion() {
     let mut rec = make_record();
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
 
     // Start move to 50
     rec.pos.dval = 50.0;
@@ -968,6 +968,44 @@ fn coalesced_put_and_status_split_into_two_passes() {
 }
 
 #[test]
+fn move_start_notify_posts_diff_and_rdif() {
+    // R2: C do_work move block (motorRecord.cc:2248-2256) marks M_DIFF/M_RDIF
+    // before too_small/LVIO, so monitor() posts the new full-distance
+    // following error on the move-start pass. The Rust DMOV 1->0 notify must
+    // carry DIFF and RDIF, not just the position triplet.
+    use epics_base_rs::server::record::RecordProcessResult;
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record(); // mres = 0.001
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup: drbv = 0.0
+    state.lock().unwrap().pending_actions.take();
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let outcome = rec.process().unwrap();
+    let fields = match outcome.result {
+        RecordProcessResult::AsyncPendingNotify(fields) => fields,
+        other => panic!("expected move-start AsyncPendingNotify, got {other:?}"),
+    };
+    // diff = dval - drbv = 10 - 0 = 10; rdif = NINT(diff/mres) = 10/0.001 = 10000.
+    let diff = fields.iter().find(|(n, _)| n == "DIFF").map(|(_, v)| v);
+    let rdif = fields.iter().find(|(n, _)| n == "RDIF").map(|(_, v)| v);
+    assert_eq!(
+        diff,
+        Some(&EpicsValue::Double(10.0)),
+        "move-start notify posts DIFF = dval - drbv"
+    );
+    assert_eq!(
+        rdif,
+        Some(&EpicsValue::Int64(10000)),
+        "move-start notify posts RDIF = NINT(diff/mres)"
+    );
+}
+
+#[test]
 fn coalesced_put_and_delay_expiry_keeps_watchdog() {
     // The settle-delay timer is one-shot (poll_loop::spawn_delay): an
     // expiry consumed by a put-owned pass has no second chance, and
@@ -1106,12 +1144,13 @@ fn sim_motor_end_to_end() {
     // Execute command on motor — use very high velocity for test speed
     if let MotorCommand::MoveAbsolute {
         position,
+        min_velocity,
         acceleration,
         ..
     } = &effects.commands[0]
     {
         motor
-            .move_absolute(&user, *position, 100000.0, *acceleration)
+            .move_absolute(&user, *position, *min_velocity, 100000.0, *acceleration)
             .unwrap();
     }
 
@@ -1293,12 +1332,13 @@ fn sim_motor_sequential_moves() {
         for cmd in &effects.commands {
             if let MotorCommand::MoveAbsolute {
                 position,
+                min_velocity,
                 velocity,
                 acceleration,
             } = cmd
             {
                 motor
-                    .move_absolute(&user, *position, *velocity, *acceleration)
+                    .move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                     .unwrap();
             }
         }
@@ -1338,12 +1378,13 @@ fn rbv_updates_during_move() {
     for cmd in &effects.commands {
         if let MotorCommand::MoveAbsolute {
             position,
+            min_velocity,
             velocity,
             acceleration,
         } = cmd
         {
             motor
-                .move_absolute(&user, *position, *velocity, *acceleration)
+                .move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                 .unwrap();
         }
     }
@@ -1398,12 +1439,13 @@ fn sim_motor_homing() {
     for cmd in &effects.commands {
         if let MotorCommand::MoveAbsolute {
             position,
+            min_velocity,
             velocity,
             acceleration,
         } = cmd
         {
             motor
-                .move_absolute(&user, *position, *velocity, *acceleration)
+                .move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                 .unwrap();
         }
     }
@@ -1433,10 +1475,15 @@ fn sim_motor_homing() {
 
     for cmd in &effects.commands {
         if let MotorCommand::Home {
-            velocity, forward, ..
+            min_velocity,
+            velocity,
+            acceleration,
+            forward,
         } = cmd
         {
-            motor.home(&user, *velocity, *forward).unwrap();
+            motor
+                .home(&user, *min_velocity, *velocity, *acceleration, *forward)
+                .unwrap();
         }
     }
 
@@ -1456,5 +1503,235 @@ fn sim_motor_homing() {
         (rec.pos.drbv - 0.0).abs() < 0.01,
         "After homing, DRBV should be near 0, got {}",
         rec.pos.drbv
+    );
+}
+
+// --- R3: maybeRetry give-up re-arms a held jog/home same-pass ---
+//
+// C `maybeRetry` give-up (motorRecord.cc:1063-1065) sets `mip = MIP_DONE`
+// then re-arms `MIP_JOG_REQ` from the held jogf/jogr field; dmov stays
+// TRUE so `do_work` re-fires the armed motion in the SAME process pass
+// (1489). The close-enough/rtry==0 branches instead do
+// `mip &= MIP_JOG_REQ` (1055/1088), which during a positional move reads
+// 0 — special() arms MIP_JOG_REQ only at mip==MIP_DONE (3042-3053) — so
+// they drop the jog this pass and let the next idle poll pick it up.
+
+/// Drive a positional move to the retry-exhaustion (give-up) edge.
+/// Returns with the record one short-completion away from give-up:
+/// rtry=1, rcnt already 1, phase back in MainMove.
+fn arm_give_up(rec: &mut MotorRecord) {
+    rec.retry.rdbd = 0.01;
+    rec.retry.rtry = 1;
+    rec.retry.frac = 1.0;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+    // First short completion: retries (rcnt -> 1), re-dispatches the move.
+    complete_move(rec, 9.5);
+    let _ = rec.check_completion();
+    assert_eq!(rec.retry.rcnt, 1, "first short completion retries");
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+}
+
+#[test]
+fn give_up_refires_held_jogf_same_pass() {
+    let mut rec = make_record();
+    arm_give_up(&mut rec);
+
+    // Operator holds JOGF during the move; SPMG stays Go (default).
+    rec.ctrl.jogf = true;
+
+    // Second short completion: rcnt(1) >= rtry(1) -> give up.
+    complete_move(&mut rec, 9.5);
+    let effects = rec.check_completion();
+
+    assert!(rec.retry.miss, "give-up latches MISS");
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Jog,
+        "held JOGF re-fires in the give-up pass"
+    );
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "give-up must re-fire the held jog same-pass, got {:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn give_up_refires_held_homf_same_pass() {
+    let mut rec = make_record();
+    arm_give_up(&mut rec);
+
+    rec.ctrl.homf = true;
+
+    complete_move(&mut rec, 9.5);
+    let effects = rec.check_completion();
+
+    assert!(rec.retry.miss);
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. })),
+        "give-up must re-fire the held home same-pass, got {:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn give_up_no_button_finalizes_quietly() {
+    let mut rec = make_record();
+    arm_give_up(&mut rec);
+
+    // No button held.
+    complete_move(&mut rec, 9.5);
+    let effects = rec.check_completion();
+
+    assert!(rec.retry.miss);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert!(
+        effects.commands.is_empty(),
+        "no held button: give-up emits no command, got {:?}",
+        effects.commands
+    );
+    assert!(
+        !effects.status_refresh,
+        "CALLBACK_DATA give-up must not fire the implicit GET_INFO"
+    );
+}
+
+#[test]
+fn close_enough_defers_held_jog_to_next_idle_poll() {
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.5;
+    rec.retry.rtry = 3;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    // Operator holds JOGF during the move; SPMG stays Go.
+    rec.ctrl.jogf = true;
+
+    // Close-enough completion (within rdbd): C drops the jog this pass.
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "close-enough must NOT re-fire the jog in the completion pass, got {:?}",
+        effects.commands
+    );
+    // ...but it MUST request the forced poll that delivers the resume pass —
+    // otherwise the change-gate suppresses the unchanged settle poll and the
+    // held jog strands. (This is the unit-level guard of the R65 fix; the
+    // second check_completion below only proves the resume given a pass.)
+    assert!(
+        effects.request_poll,
+        "completion with a held jog must request the forced settle poll"
+    );
+
+    // The next idle poll (level-triggered) re-fires the held jog.
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "idle poll must resume the held jog, got {:?}",
+        effects.commands
+    );
+}
+
+/// The SET-mode pp-resync early-return (state_machine.rs:401) quiesces the axis
+/// WITHOUT finalize_motion and dispatches nothing — a formerly-bypassing member
+/// of the held-button deferral family. With the idle-poll change-gate it would
+/// strand a held jog. The shared `request_poll_for_held_button` owner now closes
+/// it too: the pp-resync must request the forced poll.
+#[test]
+fn pp_resync_requests_forced_poll_for_held_jog() {
+    let mut rec = make_record();
+    // dispatch_res_reanchor (SET && !IGSET) armed pp + a forced poll; the
+    // forced poll lands on this Idle-arm pp-resync with a jog still held.
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.internal.pp = true;
+    rec.ctrl.jogf = true;
+    // Reached only with the axis already done and idle (make_record sets
+    // msta=DONE; a fresh record is Idle with movn=false).
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(!rec.stat.movn);
+
+    let effects = rec.check_completion();
+
+    assert!(!rec.internal.pp, "the pp-resync consumes pp");
+    assert!(
+        effects.request_poll,
+        "the pp-resync early-return must request a forced poll so the held jog is not stranded by the change-gate"
+    );
+}
+
+#[test]
+fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.5;
+    rec.retry.rtry = 3;
+    // Motion initiated by the Move button (one-shot): SPMG = Move.
+    rec.ctrl.spmg = SpmgMode::Move;
+    rec.internal.lspg = SpmgMode::Move;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    rec.ctrl.jogf = true;
+
+    // Close-enough completion: restore_spmg_move_to_pause flips Move->Pause.
+    complete_move(&mut rec, 10.0);
+    let _ = rec.check_completion();
+    assert_eq!(
+        rec.ctrl.spmg,
+        SpmgMode::Pause,
+        "Move one-shot restores SPMG to Pause at close-enough"
+    );
+
+    // Idle poll while Paused: the held jog must NOT re-fire.
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert_ne!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects.commands.is_empty(),
+        "Paused: held jog must wait for SPMG=Go, got {:?}",
+        effects.commands
+    );
+
+    // Operator presses Go: the held jog now re-fires.
+    rec.ctrl.spmg = SpmgMode::Go;
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "SPMG=Go resumes the held jog, got {:?}",
+        effects.commands
     );
 }

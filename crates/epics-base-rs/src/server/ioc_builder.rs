@@ -11,6 +11,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{self, Record, SubroutineFn};
 use crate::types::EpicsValue;
 
+use super::cvt_bpt::BrkTable;
 use super::database::PvDatabase;
 use super::device_support;
 use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
@@ -25,6 +26,10 @@ pub struct IocBuilder {
     pvs: Vec<(String, EpicsValue)>,
     records: Vec<(String, Box<dyn Record>)>,
     db_defs: Vec<db_loader::DbRecordDef>,
+    /// `breaktable(...)` definitions parsed from the loaded `.db`/`.dbd` text,
+    /// used to populate the breakpoint-table registry for `ai`/`ao` records
+    /// with `LINR >= 3`.
+    breaktables: Vec<BrkTable>,
     device_factories: HashMap<String, DeviceSupportFactory>,
     /// Fallback factory consulted when the static `device_factories`
     /// map has no entry for a record's DTYP. Mirrors
@@ -43,20 +48,25 @@ impl IocBuilder {
     /// is pre-registered so `.db` files can use the canonical DTYP
     /// names with zero extra setup.
     pub fn new() -> Self {
-        let mut device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
-        // epics-base 3.15.4: built-in `getenv` device support.
-        device_factories.insert(
-            "getenv".to_string(),
-            Box::new(|| -> Box<dyn device_support::DeviceSupport> {
-                Box::new(super::builtin_devices::GetenvDeviceSupport::new())
-            }),
-        );
+        // No context-free built-in device support: every base builtin
+        // (`Soft Timestamp`, `stdio`, `Db State`, `getenv`) needs the record's
+        // INST_IO `INP`/`OUT`, which only the dynamic factory's
+        // `DeviceSupportContext` carries — so all base builtins are dispatched
+        // below, and this static map starts empty (users register their own
+        // context-free device support into it via `register_device_support`).
+        let device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
         Self {
             pvs: Vec::new(),
             records: Vec::new(),
             db_defs: Vec::new(),
+            breaktables: Vec::new(),
             device_factories,
-            dynamic_device_factory: None,
+            // The base built-in device support — all needing the runtime
+            // context (INP/OUT). Pre-registered as the base of the
+            // dynamic-factory chain so a user's
+            // `register_dynamic_device_support` factory takes priority and
+            // falls through to here.
+            dynamic_device_factory: Some(Box::new(super::builtin_devices::builtin_dynamic_factory)),
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),
             autosave_config: None,
@@ -84,15 +94,17 @@ impl IocBuilder {
     /// Load records from a .db file.
     pub fn db_file(mut self, path: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
         let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
-        let defs = db_loader::parse_db(&content, macros)?;
+        let (defs, breaktables) = db_loader::parse_db_with_breaktables(&content, macros)?;
         self.db_defs.extend(defs);
+        self.breaktables.extend(breaktables);
         Ok(self)
     }
 
     /// Load records from a .db string.
     pub fn db_string(mut self, content: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
-        let defs = db_loader::parse_db(content, macros)?;
+        let (defs, breaktables) = db_loader::parse_db_with_breaktables(content, macros)?;
         self.db_defs.extend(defs);
+        self.breaktables.extend(breaktables);
         Ok(self)
     }
 
@@ -143,10 +155,12 @@ impl IocBuilder {
         self
     }
 
-    /// Register a subroutine function by name (for sub records).
+    /// Register a subroutine function by name (for sub/aSub records).
+    /// The closure returns the C `long` status (`Ok(0)` normal, `Ok(n<0)`
+    /// raises `SOFT_ALARM`/`BRSV`; `aSub` publishes it as `VAL`).
     pub fn register_subroutine<F>(mut self, name: &str, func: F) -> Self
     where
-        F: Fn(&mut dyn Record) -> CaResult<()> + Send + Sync + 'static,
+        F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
         self.subroutine_registry
             .insert(name.to_string(), Arc::new(Box::new(func)));
@@ -174,6 +188,15 @@ impl IocBuilder {
     /// caller can start the autosave loop).
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
         let db = Arc::new(PvDatabase::new());
+
+        // Breakpoint-table registry (C `bptList`): merge every loaded
+        // `breaktable(...)` into the database's shared registry (the single
+        // owner — also grown later by runtime `dbLoadRecords`) and take a
+        // snapshot to install on this build's `ai`/`ao` records. Name-sorted by
+        // `BreakTableRegistry`, so `LINR = 3` selects the first table. When no
+        // tables were loaded the snapshot is empty and never installed (zero
+        // overhead for IOCs that use none).
+        let breaktable_registry = db.add_breaktables(self.breaktables).await;
 
         // 1. Simple PVs
         for (name, value) in self.pvs {
@@ -206,9 +229,20 @@ impl IocBuilder {
         }
 
         // 3. .db definitions — create records, apply fields, init, wire device support & subs
-        for def in self.db_defs {
+        for mut def in self.db_defs {
             let mut record =
                 db_loader::create_record_with_factories(&def.record_type, &self.record_factories)?;
+
+            // Resolve a `LINR` field that names a loaded breakpoint table to the
+            // numeric `menuConvert` index that selects it (before apply_fields,
+            // which only knows the fixed menuConvert labels). The registry
+            // itself is installed by `add_record` (the single creation sink).
+            db_loader::resolve_linr_breaktable_names(
+                &def.record_type,
+                &mut def.fields,
+                &breaktable_registry,
+            );
+
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;
 
@@ -329,8 +363,34 @@ impl IocBuilder {
                         device_support::wire_device_to_record(&mut instance, dev);
                     }
                 }
-                // Subroutine resolution for sub records
-                if instance.record.record_type() == "sub" {
+                // Subroutine resolution for sub / aSub records (C
+                // `init_record` -> `registryFunctionFind` for both types).
+                let rt = instance.record.record_type();
+                if rt == "sub" || rt == "aSub" {
+                    // INAM: invoke the init routine once, before SNAM
+                    // resolution (C `init_record`: `registryFunctionFind(inam)`
+                    // then `(*psubroutine)(prec)`, return discarded; a missing
+                    // function is an init error -> stderr).
+                    if let Some(EpicsValue::String(inam)) = instance.record.get_field("INAM") {
+                        let inam = inam.as_str_lossy();
+                        if !inam.is_empty() {
+                            match self.subroutine_registry.get(inam.as_ref()) {
+                                Some(init_fn) => {
+                                    let init_fn = init_fn.clone();
+                                    if let Err(e) = init_fn(&mut *instance.record) {
+                                        eprintln!(
+                                            "iocInit: {}.INAM '{inam}' init routine failed: {e}",
+                                            def.name
+                                        );
+                                    }
+                                }
+                                None => eprintln!(
+                                    "iocInit: {}.INAM function '{inam}' not found",
+                                    def.name
+                                ),
+                            }
+                        }
+                    }
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
                         if let Some(sub_fn) =
                             self.subroutine_registry.get(snam.as_str_lossy().as_ref())
@@ -341,6 +401,12 @@ impl IocBuilder {
                 }
             }
         }
+
+        // Retain the registry in the database for runtime re-resolution
+        // (aSub LFLG=READ / SUBL); the static SNAM wiring above already
+        // performed init-time resolution (C `init_record`).
+        db.install_subroutine_registry(self.subroutine_registry.clone())
+            .await;
 
         // 4. Autosave restore
         if let Some(ref autosave_cfg) = self.autosave_config {
@@ -487,6 +553,42 @@ record(ai, "AI:WITH:INFO") {
         assert_eq!(inst.get_info("asyn:READBACK"), Some("1"));
         assert_eq!(inst.get_info("Q:group"), Some("myGroup"));
         assert_eq!(inst.get_info("missing"), None);
+    }
+
+    /// End-to-end breakpoint table: a `breaktable(...)` plus an `ai` whose
+    /// `LINR` names it must, after `build()`, resolve the name to its
+    /// `menuConvert` index AND convert raw -> eng through the installed
+    /// registry. Proves the full loader -> registry -> record wiring.
+    #[tokio::test]
+    async fn db_string_breaktable_linr_resolves_and_converts() {
+        let db_content = r#"
+breaktable(ramp) {
+    0    0
+    100  10
+    300  30
+}
+record(ai, "AI:BPT") {
+    field(LINR, "ramp")
+}
+"#;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .db_string(db_content, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let rec = db.get_record("AI:BPT").await.unwrap();
+        let mut inst = rec.write().await;
+        // "ramp" is a non-standard name -> first user-table index (15); the
+        // standard menuConvert names reserve 3..=14.
+        assert_eq!(inst.record.get_field("LINR"), Some(EpicsValue::Short(15)));
+        // The installed registry makes the conversion work end-to-end:
+        // raw 50 in [0,100] -> eng 5.0.
+        inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+        inst.record.process().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
     }
 
     /// Regression: IocBuilder must consult the dynamic

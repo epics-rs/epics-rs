@@ -53,12 +53,24 @@ fn pvxs_parse_addr_list_default_port_substituted() {
 }
 
 #[test]
-fn pvxs_parse_addr_list_comma_separator() {
-    // pvxs accepts comma OR whitespace separators.
+fn pvxs_addr_list_comma_is_ttl_modifier_not_a_separator() {
+    // pvxs splits EPICS_PVA_ADDR_LIST on WHITESPACE only — `split_addr_into`
+    // (config.cpp:159-160) scans with find_first_of(" \t\r\n"). Within one
+    // token a comma introduces the multicast TTL, `<IP>,<ttl#>[@iface]`
+    // (`SockEndpoint`, config.cpp:32-57); it is NOT a second-address
+    // separator. So "1.1.1.1,2.2.2.2" is a single token whose TTL "2.2.2.2"
+    // fails to parse as an integer: pvxs throws in the SockEndpoint ctor and
+    // split_addr_into drops the whole token (config.cpp:171-174), yielding
+    // zero addresses. (The previous assertion of two addresses assumed a
+    // comma separator pvxs does not have; the crate's own unit test at
+    // client_native/search.rs already pins the same "1.2.3.4,5.6.7.8" input
+    // as empty.)
     let addrs = parse_addr_list("1.1.1.1,2.2.2.2");
-    assert_eq!(addrs.len(), 2);
-    assert_eq!(format!("{}", addrs[0].ip()), "1.1.1.1");
-    assert_eq!(format!("{}", addrs[1].ip()), "2.2.2.2");
+    assert!(
+        addrs.is_empty(),
+        "comma is pvxs's multicast-TTL modifier, not an address separator; \
+         an invalid TTL drops the whole token (got {addrs:?})"
+    );
 }
 
 #[test]

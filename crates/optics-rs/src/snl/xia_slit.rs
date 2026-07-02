@@ -870,14 +870,14 @@ pub async fn run<R, W>(
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
-                if !validate_hsc_id(&ctrl.h_id) {
+                if !validate_hsc_id(&ctrl.h_id, true) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "H ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
-                if !validate_hsc_id(&ctrl.v_id) {
+                if !validate_hsc_id(&ctrl.v_id, true) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "V ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
@@ -1285,15 +1285,13 @@ pub async fn run<R, W>(
                     match kind {
                         FifoResponseKind::Empty | FifoResponseKind::Ok => {}
                         FifoResponseKind::Error { code } => {
-                            let code_val = code.unwrap_or(0);
-                            if (0..14).contains(&code_val) {
-                                ctrl.error = code_val;
-                                ctrl.error_msg =
-                                    xiahsc::HSC_ERROR_MESSAGES[code_val as usize].to_string();
-                            } else {
-                                ctrl.error = ERROR_UNKNOWN;
-                                ctrl.error_msg = format!("{}: unknown error", parsed.id);
-                            }
+                            // C: a code-less "ERROR;" (numWords==2) is
+                            // ERROR_UNKNOWN / "<id>: unknown error", NOT error 0
+                            // (xia_slit.st:1253-1262). `unwrap_or(0)` had mapped
+                            // the code-less case to NO_ERROR. Shared with xiahsc.
+                            let (err, msg) = xiahsc::classify_hsc_error(code, &parsed.id);
+                            ctrl.error = err;
+                            ctrl.error_msg = msg;
                             if parsed.id == ctrl.h_id {
                                 ctrl.h_is_moving = false;
                                 ctrl.h_busy = false;

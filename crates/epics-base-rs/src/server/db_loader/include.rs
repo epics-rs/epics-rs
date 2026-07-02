@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use crate::error::{CaError, CaResult};
 
 use super::DbRecordDef;
-use super::parse_db;
 use super::substitute_macros;
 
 /// Configuration for file-based DB loading with include support.
@@ -28,8 +27,19 @@ pub fn parse_db_file(
     macros: &HashMap<String, String>,
     config: &DbLoadConfig,
 ) -> CaResult<Vec<DbRecordDef>> {
+    parse_db_file_with_breaktables(path, macros, config).map(|(records, _breaktables)| records)
+}
+
+/// Like [`parse_db_file`] but also returns the `breaktable(...)` definitions,
+/// for the `dbLoadRecords` runtime path to merge into the database's shared
+/// breakpoint-table registry.
+pub fn parse_db_file_with_breaktables(
+    path: &Path,
+    macros: &HashMap<String, String>,
+    config: &DbLoadConfig,
+) -> CaResult<(Vec<DbRecordDef>, Vec<crate::server::cvt_bpt::BrkTable>)> {
     let content = expand_includes(path, macros, config)?;
-    parse_db(&content, macros)
+    super::parse_db_with_breaktables(&content, macros)
 }
 
 /// Expand `include "..."` directives recursively.

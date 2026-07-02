@@ -93,6 +93,56 @@ impl PvDatabase {
         self.put_pv_inner(name, value, false).await
     }
 
+    /// C `IOCSource::doPreProcessing` gate (pvxs `iocsource.cpp:363-375`).
+    ///
+    /// Reject an *external* put (a PVA/CA client put routed through QSRV)
+    /// that C refuses before any write: a put to a `DISP=1` record's
+    /// non-DISP field (`S_db_putDisabled`) or to a read-only / `SPC_NOMOD`
+    /// field (`S_db_noMod`). No value is written — this is a precondition
+    /// check only. It mirrors the two gates inside
+    /// [`Self::put_record_field_from_ca`] (the Passive route) so the QSRV
+    /// `Force`/`Inhibit` routes — which go through [`Self::put_pv`] — enforce
+    /// the same preconditions. `put_pv` itself is the internal `dbPut`
+    /// analogue and deliberately does not gate DISP (internal
+    /// link/processing puts must bypass it), so the gate lives at the
+    /// external put boundary, exactly as C places `doPreProcessing` in the
+    /// source layer rather than in `dbPut`.
+    pub async fn check_external_put_preconditions(
+        &self,
+        record_name: &str,
+        field: &str,
+    ) -> CaResult<()> {
+        let field_upper = field.to_ascii_uppercase();
+        // A missing record is not a DISP/read-only precondition violation:
+        // stay silent and let the downstream put report the not-found (for
+        // QSRV, inside its own `asTrapWrite` bracket). C's `doPreProcessing`
+        // only runs against an established channel — the record is
+        // guaranteed present there — and a `BridgeChannel` likewise always
+        // binds a real record in production.
+        let Some(rec) = self.get_record(record_name).await else {
+            return Ok(());
+        };
+        let instance = rec.read().await;
+        // DISP=1 blocks a put to any field except DISP itself
+        // (C: `precord->disp && pfield != &precord->disp` → S_db_putDisabled).
+        if instance.common.disp && field_upper != "DISP" {
+            return Err(CaError::PutDisabled(field_upper));
+        }
+        // Read-only / SPC_NOMOD field
+        // (C: `special == SPC_ATTRIBUTE` → S_db_noMod) — same `read_only`
+        // flag the Passive route checks, so all three modes gate uniformly.
+        let is_read_only = instance
+            .record
+            .field_list()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(&field_upper))
+            .is_some_and(|f| f.read_only);
+        if is_read_only {
+            return Err(CaError::ReadOnlyField(field_upper));
+        }
+        Ok(())
+    }
+
     async fn put_pv_inner(
         &self,
         name: &str,
@@ -539,6 +589,58 @@ impl PvDatabase {
             .map(|_| ())
     }
 
+    /// Process a record UNCONDITIONALLY with a put-notify wait-set, returning
+    /// the completion receiver — the QSRV `record[process=true,block=true]`
+    /// (Force + block) barrier.
+    ///
+    /// C `dbProcessNotify`: pvxs routes a blocking forced put through
+    /// `dbProcessNotify` (`singlesource.cpp:360-369`), whose completion fires
+    /// only after the record's whole processing chain — including async device
+    /// work (a motor move, an asyn-backed AO) — settles. The value is written
+    /// by the caller's preceding [`Self::put_pv`] (the `dbPut` analogue, no
+    /// process); this entry then mints the wait-set, registers it into the
+    /// record's `notify` slot so PACT records join it, and runs the full
+    /// unconditional [`Self::process_record_with_links`] cycle (C `dbProcess`,
+    /// the Force analogue). A fully synchronous chain returns `Ok(None)` (the
+    /// wait-set already drained); an async record returns `Ok(Some(rx))` for
+    /// the caller to await. A concurrent put-callback already in flight on the
+    /// record is rejected with `PutCallbackInProgress`, matching the PROC path.
+    pub async fn process_record_with_notify(
+        &self,
+        record_name: &str,
+    ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
+        let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+        let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
+        {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before taking the per-record write lock.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            let Some(rec_arc) = rec_arc else {
+                return Err(CaError::ChannelNotFound(record_name.to_string()));
+            };
+            let mut guard = rec_arc.write().await;
+            if guard.notify.is_some() {
+                return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+            }
+            guard.notify = Some(notify.clone());
+        }
+        let mut visited = HashSet::new();
+        self.process_record_with_links(record_name, &mut visited, 0)
+            .await?;
+        // The wait-set fires the oneshot only after the whole FLNK/OUT chain
+        // (sync + async) settles. Already-completed ⟹ fully synchronous ⟹
+        // report immediate success; otherwise hand the receiver back to await
+        // the deferred async completion.
+        if notify.completed() {
+            Ok(None)
+        } else {
+            Ok(Some(completion_rx))
+        }
+    }
+
     async fn put_record_field_from_ca_inner(
         &self,
         record_name: &str,
@@ -614,8 +716,13 @@ impl PvDatabase {
                     let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
                     let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
                     {
-                        let rec = self.inner.records.read().await;
-                        if let Some(rec_arc) = rec.get(record_name) {
+                        // Collect-then-act: clone the handle under a brief map
+                        // read, drop the map lock before the per-record write.
+                        let rec_arc = {
+                            let recs = self.inner.records.read().await;
+                            recs.get(record_name).cloned()
+                        };
+                        if let Some(rec_arc) = rec_arc {
                             let mut guard = rec_arc.write().await;
                             if guard.notify.is_some() {
                                 return Err(CaError::PutCallbackInProgress(
@@ -824,16 +931,17 @@ impl PvDatabase {
                     }
                 }
             } else {
+                // Suppress the immediate value-field post only when this put
+                // will itself drive a reprocess (the cycle re-posts the field).
+                // `process_passive_fields()` is total/fail-safe: a put to a
+                // non-pp field — including any field of an unmodeled type
+                // (`&[]`) — does not reprocess, so it is not suppressed here.
                 let suppress_value_field_post = field == instance.record.primary_field()
-                    && match instance.record.process_passive_fields() {
-                        Some(pp) => pp.iter().any(|f| f.eq_ignore_ascii_case(&field)),
-                        // Un-modeled record types keep the legacy "process on
-                        // every put" behavior (`should_process = true` below),
-                        // so the reprocess cycle posts the value field —
-                        // suppress the immediate post here to avoid a
-                        // duplicate event.
-                        None => true,
-                    };
+                    && instance
+                        .record
+                        .process_passive_fields()
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(&field));
                 if !suppress_value_field_post {
                     instance.notify_field(
                         &field,
@@ -846,13 +954,24 @@ impl PvDatabase {
                 // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors
                 // posted here, mirroring the explicit `db_post_events` a C
                 // `special()` makes — these fields are not pp(TRUE), so no
-                // process cycle would otherwise post them.
+                // process cycle would otherwise post them. Each post carries
+                // VALUE|LOG unless the record names the field in
+                // `value_only_change_fields()` — a record whose C `special()`
+                // posts the field with a literal `DBE_VALUE` (e.g. table SET,
+                // tableRecord.c:659) gets the LOG bit stripped, honoring the
+                // same value-only contract as the change-detection path.
+                let side_effect_value_only = instance.record.value_only_change_fields();
                 for sf in instance.record.monitor_side_effect_fields(&field) {
-                    instance.notify_field(
-                        sf,
-                        crate::server::recgbl::EventMask::VALUE
-                            | crate::server::recgbl::EventMask::LOG,
-                    );
+                    use crate::server::recgbl::EventMask;
+                    let mask = if side_effect_value_only
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(sf))
+                    {
+                        EventMask::VALUE
+                    } else {
+                        EventMask::VALUE | EventMask::LOG
+                    };
+                    instance.notify_field(sf, mask);
                 }
             }
 
@@ -902,26 +1021,27 @@ impl PvDatabase {
         // `dbrType < DBR_PUT_ACKT`.) Processing on every put would
         // double-process scanned records and spuriously process puts to
         // non-`pp` fields (extra FLNK / monitors / device writes /
-        // timestamps). A record type whose DBD pp-flags are not modeled
-        // returns `None` and keeps the legacy "process on every put"
-        // behavior so un-modeled types (other crates, tests) are unchanged.
+        // timestamps). `process_passive_fields()` is total and fail-safe: an
+        // unmodeled type returns `&[]` (and warns once), so it processes on
+        // `PROC` only — spurious processing is opt-in (a type must declare its
+        // pp set), never the default.
         let should_process = {
             let instance = rec.read().await;
-            match instance.record.process_passive_fields() {
-                Some(pp) => {
-                    instance.common.scan == crate::server::record::ScanType::Passive
-                        && pp.iter().any(|f| f.eq_ignore_ascii_case(&field))
-                }
-                None => true,
-            }
+            instance.common.scan == crate::server::record::ScanType::Passive
+                && instance.record.processes_after_put(&field)
         };
 
         if !should_process {
             // No processing cycle. C never sets `putf` on this path, so
             // clear the flag the field-put set at entry, and report
             // immediate (synchronous) completion to a WRITE_NOTIFY caller.
-            let recs = self.inner.records.read().await;
-            if let Some(rec_arc) = recs.get(record_name) {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write().await;
                 if !guard.is_processing() {
                     guard.common.putf = false;
@@ -948,8 +1068,13 @@ impl PvDatabase {
             let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
             let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
             {
-                let rec = self.inner.records.read().await;
-                if let Some(rec_arc) = rec.get(record_name) {
+                // Collect-then-act: clone the handle under a brief map read,
+                // drop the map lock before the per-record write.
+                let rec_arc = {
+                    let recs = self.inner.records.read().await;
+                    recs.get(record_name).cloned()
+                };
+                if let Some(rec_arc) = rec_arc {
                     let mut guard = rec_arc.write().await;
                     if guard.notify.is_some() {
                         return Err(CaError::PutCallbackInProgress(record_name.to_string()));
@@ -983,8 +1108,13 @@ impl PvDatabase {
         // matches the identical gates in processing.rs (line 694) and
         // record_instance.rs (line 1381).
         if field == "VAL" {
-            let recs = self.inner.records.read().await;
-            if let Some(rec_arc) = recs.get(record_name) {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write().await;
                 if guard.record.soft_channel_skips_convert() {
                     guard.record.set_device_did_compute(true);
@@ -1038,8 +1168,13 @@ impl PvDatabase {
         // the completion path) so the PUTF marker survives the
         // device-write round trip.
         if !originating_pending {
-            let rec = self.inner.records.read().await;
-            if let Some(rec_arc) = rec.get(record_name) {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write().await;
                 if !guard.is_processing() {
                     guard.common.putf = false;

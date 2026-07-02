@@ -530,7 +530,7 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "NTMF",
-        dbf_type: DbFieldType::Double,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     // Public C motorRecord.dbd link / menu surface (motorRecord.dbd:233-265,
@@ -786,7 +786,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         // Timing
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
-        "NTMF" => Some(EpicsValue::Double(rec.timing.ntmf)),
+        "NTMF" => Some(EpicsValue::UShort(rec.timing.ntmf)),
         // Public C motorRecord.dbd link / menu / string surface.
         "OUT" => Some(EpicsValue::String(rec.links.out.clone().into())),
         "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone().into())),
@@ -1449,13 +1449,22 @@ pub(crate) fn motor_put_field(
         },
         "ACCL" => match value {
             EpicsValue::Double(v) => {
-                // C: ACCL must be > 0 (forces to 0.1 if <= 0)
+                // C special() motorRecordACCL (motorRecord.cc:2735-2742): floor
+                // ACCL to 0.1 if <= 0, then updateACCSfromACCL. ACCU is NOT
+                // touched — 63bfe5d0 made ACCU a user/autosave control and
+                // dropped the 36177f7b auto-switch from the accel helpers.
                 rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
-                // C: 36177f7b — writing ACCL switches ACCU to Accl and recalcs ACCS
-                rec.vel.accu = AccsUsed::Accl;
-                let span = rec.vel.velo - rec.effective_vbas();
-                if rec.vel.accl > 0.0 && span > 0.0 {
-                    rec.vel.accs = span / rec.vel.accl;
+                // C updateACCSfromACCL (motorRecord.cc:512-521): numerator is
+                // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
+                // the full velo and still recomputes ACCS.
+                let vbas = rec.effective_vbas();
+                let numerator = if rec.vel.velo > vbas {
+                    rec.vel.velo - vbas
+                } else {
+                    rec.vel.velo
+                };
+                if rec.vel.accl > 0.0 {
+                    rec.vel.accs = numerator / rec.vel.accl;
                 }
                 Ok(())
             }
@@ -1463,13 +1472,28 @@ pub(crate) fn motor_put_field(
         },
         "ACCS" => match value {
             EpicsValue::Double(v) => {
-                // C: ACCS must be > 0 (use 1.0 fallback)
-                rec.vel.accs = if v <= 0.0 { 1.0 } else { v };
-                // C: 36177f7b — writing ACCS switches ACCU to Accs and recalcs ACCL
-                rec.vel.accu = AccsUsed::Accs;
-                let span = rec.vel.velo - rec.effective_vbas();
-                if rec.vel.accs > 0.0 && span > 0.0 {
-                    rec.vel.accl = span / rec.vel.accs;
+                // C special() motorRecordACCS (motorRecord.cc:2745-2752): the
+                // raw put lands in ACCS; if it is non-positive C derives ACCS
+                // from ACCL (updateACCSfromACCL, accs = velo/accl — NOT a
+                // literal 1.0), then recomputes ACCL from ACCS
+                // (updateACCLfromACCS). ACCU is NOT touched (63bfe5d0 dropped
+                // the 36177f7b auto-switch).
+                rec.vel.accs = v;
+                // C numerator is (velo - vbas) only while velo > vbas; at
+                // velo <= vbas C uses the full velo.
+                let vbas = rec.effective_vbas();
+                let numerator = if rec.vel.velo > vbas {
+                    rec.vel.velo - vbas
+                } else {
+                    rec.vel.velo
+                };
+                // updateACCSfromACCL: sanitize a non-positive ACCS from ACCL.
+                if rec.vel.accs <= 0.0 && rec.vel.accl > 0.0 {
+                    rec.vel.accs = numerator / rec.vel.accl;
+                }
+                // updateACCLfromACCS: keep ACCL consistent with ACCS.
+                if rec.vel.accs > 0.0 {
+                    rec.vel.accl = numerator / rec.vel.accs;
                 }
                 Ok(())
             }
@@ -1983,9 +2007,11 @@ pub(crate) fn motor_put_field(
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "NTMF" => match value {
-            EpicsValue::Double(v) => {
-                // C: NTMF minimum is 2.0
-                rec.timing.ntmf = if v < 2.0 { 2.0 } else { v };
+            EpicsValue::UShort(v) => {
+                // C motorRecord.cc:3093-3100: integer compare, minimum 2.
+                // The DBF_USHORT field already truncated any fractional CA
+                // put before special() runs.
+                rec.timing.ntmf = if v < 2 { 2 } else { v };
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -2142,19 +2168,24 @@ fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult
 /// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
 /// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
 fn apply_accu_cascade(rec: &mut MotorRecord) {
-    let span = rec.vel.velo - rec.effective_vbas();
-    if span <= 0.0 {
-        return; // C: span must be positive; otherwise leave master untouched
-    }
+    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): the accel-rate
+    // numerator is (velo - vbas) only while velo > vbas; at velo <= vbas C
+    // uses the full velo, and recomputes/posts the slave field in BOTH cases.
+    let vbas = rec.effective_vbas();
+    let numerator = if rec.vel.velo > vbas {
+        rec.vel.velo - vbas
+    } else {
+        rec.vel.velo
+    };
     match rec.vel.accu {
         AccsUsed::Accl => {
             if rec.vel.accl > 0.0 {
-                rec.vel.accs = span / rec.vel.accl;
+                rec.vel.accs = numerator / rec.vel.accl;
             }
         }
         AccsUsed::Accs => {
             if rec.vel.accs > 0.0 {
-                rec.vel.accl = span / rec.vel.accs;
+                rec.vel.accl = numerator / rec.vel.accs;
             }
         }
     }
@@ -2540,6 +2571,7 @@ fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
             | DbFieldType::Long
             | DbFieldType::Int64
             | DbFieldType::Char
+            | DbFieldType::UChar
             | DbFieldType::Enum
             | DbFieldType::UShort
             | DbFieldType::ULong
@@ -2582,7 +2614,7 @@ fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
         }
         "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
         _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
-            DbFieldType::Char => Some((255.0, 0.0)),
+            DbFieldType::Char | DbFieldType::UChar => Some((255.0, 0.0)),
             DbFieldType::Short => Some((32767.0, -32768.0)),
             DbFieldType::Enum | DbFieldType::UShort => Some((65535.0, 0.0)),
             DbFieldType::Long => Some((2147483647.0, -2147483648.0)),

@@ -85,11 +85,13 @@ fn backlash_positive_bdst_negative_move() {
     assert!(!rec.stat.dmov);
     if let MotorCommand::MoveAbsolute {
         position,
+        min_velocity,
         velocity,
         acceleration,
     } = &effects.commands[0]
     {
         assert!((*position - (-10.0)).abs() < 1e-10);
+        assert_eq!(*min_velocity, 0.0); // VBAS (base velocity) threaded to the driver
         assert_eq!(*velocity, 5.0); // BVEL
         // EGU/sec²: (BVEL - VBAS) / BACC = (5.0 - 0.0) / 0.5
         assert_eq!(*acceleration, 10.0);
@@ -591,5 +593,55 @@ fn jog_takeout_leg_velocity_floored_above_vbas() {
     assert!(
         (*velocity - (rec.vel.vbas + 0.001)).abs() < 1e-9,
         "velo <= vbas floors to vbas + |mres|, got {velocity}"
+    );
+}
+
+/// Helper: the min_velocity (base velocity / VBAS) carried by the first
+/// Move{Absolute,Relative} command in `effects`.
+fn first_move_min_velocity(effects: &ProcessEffects) -> Option<f64> {
+    effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveAbsolute { min_velocity, .. }
+        | MotorCommand::MoveRelative { min_velocity, .. } => Some(*min_velocity),
+        _ => None,
+    })
+}
+
+/// VBAS (base/start velocity) must reach the driver as the move command's
+/// `min_velocity` — canonical asyn `move(position, relative, minVelocity, ...)`
+/// emits it as `SET_VEL_BASE` ahead of the move. The interface previously
+/// dropped it, so every move ran the driver's default base velocity regardless
+/// of VBAS. A non-zero VBAS must appear on the emitted move.
+#[test]
+fn vbas_threaded_into_move_command_as_min_velocity() {
+    let mut rec = make_record();
+    rec.vel.vbas = 2.0; // non-zero base velocity (EGU/sec)
+
+    rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert_eq!(
+        first_move_min_velocity(&effects),
+        Some(2.0),
+        "VBAS must reach the driver as the move command min_velocity"
+    );
+}
+
+/// A controller that does not support a base velocity advertises it via MSTA
+/// bit 15 (`VBAS_UNSUPPORTED`, epics-modules/motor #76); for those the move
+/// command's `min_velocity` must be 0 even when VBAS is configured, mirroring
+/// `effective_vbas()`.
+#[test]
+fn vbas_unsupported_forces_move_min_velocity_zero() {
+    let mut rec = make_record();
+    rec.vel.vbas = 2.0;
+    rec.stat.msta.insert(MstaFlags::VBAS_UNSUPPORTED);
+
+    rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert_eq!(
+        first_move_min_velocity(&effects),
+        Some(0.0),
+        "VBAS_UNSUPPORTED forces min_velocity to 0 regardless of VBAS"
     );
 }

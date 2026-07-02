@@ -31,18 +31,18 @@ use crate::types::DbFieldType;
 /// lock, so the `fetch_add` that issues tokens is serialized and tokens are
 /// strictly increasing.
 #[derive(Clone, Default)]
-pub(crate) struct LinkStatusGen(Arc<AtomicU64>);
+pub struct LinkStatusGen(Arc<AtomicU64>);
 
 impl LinkStatusGen {
     /// Issue the token for a newly spawned refresh, superseding any token
     /// already in flight. Call on the issuing thread, before `tokio::spawn`.
-    pub(crate) fn next(&self) -> u64 {
+    pub fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// True while `token` is still the latest issued — i.e. no later refresh
     /// has started. Check inside the spawned task immediately before posting.
-    pub(crate) fn is_current(&self, token: u64) -> bool {
+    pub fn is_current(&self, token: u64) -> bool {
         self.0.load(Ordering::SeqCst) == token
     }
 }
@@ -51,7 +51,7 @@ impl LinkStatusGen {
 /// C `menu(sseqLNKV)` (sseqRecord.dbd:20) and `menu(calcoutINAV)`
 /// (calcoutRecord.dbd.pod:45-50): 0=Ext PV NC, 1=Ext PV OK, 2=Local PV,
 /// 3=Constant.
-pub(crate) const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
+pub const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 /// Link-status menu indices. Index 1 (`EXT`, external PV connected) is a
 /// valid menu value but is never *produced* by this port: epics-base-rs has
@@ -59,9 +59,9 @@ pub(crate) const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Loc
 /// link always reports `EXT_NC` (see [`classify_link`]). The choice label is
 /// still served via [`LINK_STATUS_CHOICES`], so the `EXT` constant is
 /// intentionally omitted here — nothing emits it.
-pub(crate) const LINK_EXT_NC: i16 = 0; // external PV, not connected
-pub(crate) const LINK_LOC: i16 = 2; // local PV (this IOC's database)
-pub(crate) const LINK_CON: i16 = 3; // constant / unset link
+pub const LINK_EXT_NC: i16 = 0; // external PV, not connected
+pub const LINK_LOC: i16 = 2; // local PV (this IOC's database)
+pub const LINK_CON: i16 = 3; // constant / unset link
 
 /// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1).
 /// Used for every constant, external, and unresolvable link. C
@@ -80,10 +80,9 @@ pub(crate) const DBF_UNKNOWN: i16 = -1;
 /// CA `DBR_DOUBLE` value 6. The two orderings diverge because `DBF_INT64` /
 /// `DBF_UINT64` occupy slots 7/8 ahead of `DBF_FLOAT` / `DBF_DOUBLE`.
 ///
-/// The Rust model has a single `Char` (no signed/unsigned split): it maps to
-/// `DBF_CHAR` (1), the dbStatic field type CA `DBR_CHAR` resolves to
-/// (dbFldTypes.h:77). A `DBF_UCHAR` (2) source is not separately
-/// representable, and a `DBF_MENU` (12) field is modelled as `Enum`
+/// The Rust model distinguishes signed `Char` (`DBF_CHAR` = 1, the dbStatic
+/// field type CA `DBR_CHAR` resolves to, dbFldTypes.h:77) from unsigned
+/// `UChar` (`DBF_UCHAR` = 2). A `DBF_MENU` (12) field is modelled as `Enum`
 /// (`DBF_ENUM` = 11) — the same kind of collapse [`DBF_UNKNOWN`] documents
 /// for `DBF_NOACCESS`. The match is exhaustive so a new `DbFieldType` variant
 /// forces a deliberate code assignment here rather than a silent default.
@@ -91,6 +90,7 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
     match ft {
         DbFieldType::String => 0,  // DBF_STRING
         DbFieldType::Char => 1,    // DBF_CHAR
+        DbFieldType::UChar => 2,   // DBF_UCHAR
         DbFieldType::Short => 3,   // DBF_SHORT
         DbFieldType::UShort => 4,  // DBF_USHORT
         DbFieldType::Long => 5,    // DBF_LONG
@@ -110,7 +110,7 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// Returns `(status, field_type)`. An external (CA/PVA) link is reported as
 /// not-connected: epics-base-rs has no client to confirm a remote field's
 /// connection state or type.
-pub(crate) async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
+pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
     match parse_link_v2(link).link_type() {
         // Empty / constant link: C → CON, no resolvable field type.
         LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),

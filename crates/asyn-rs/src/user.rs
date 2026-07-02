@@ -12,7 +12,13 @@ pub struct AsynUser {
     pub reason: usize,
     /// Sub-address for multi-device ports. Always 0 for single-device ports.
     pub addr: i32,
-    /// I/O timeout in seconds. Only meaningful for drivers that perform real I/O.
+    /// I/O timeout. Only meaningful for drivers that perform real I/O.
+    ///
+    /// This is an unsigned `Duration`, so unlike C asyn's `double`
+    /// `pasynUser->timeout` it cannot carry the negative "wait forever"
+    /// sentinel (a finite timeout is always supplied). A deliberate
+    /// framework-wide divergence: every blocking driver operation is bounded,
+    /// so a stuck device cannot wedge the port actor thread indefinitely.
     pub timeout: Duration,
     /// Queue priority.
     pub priority: QueuePriority,

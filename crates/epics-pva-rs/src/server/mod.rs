@@ -1,5 +1,6 @@
 //! PVA server components — protocol bridge, server wrapper, protocol runner.
 
+pub mod iocsh;
 pub mod native_source;
 pub mod pva_server;
 

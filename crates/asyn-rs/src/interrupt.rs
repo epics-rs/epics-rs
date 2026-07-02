@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 
 use crate::error::AsynStatus;
+use crate::interfaces::InterfaceType;
 use crate::param::ParamValue;
 
 /// Filter for selecting which interrupts to receive.
@@ -18,6 +19,83 @@ pub struct InterruptFilter {
     /// If set, only interrupts where changed bits overlap this mask are forwarded.
     /// C parity: pInterrupt->mask in asynUInt32DigitalInterrupt.
     pub uint32_mask: Option<u32>,
+    /// If set, only receive interrupts whose value was produced for this asyn
+    /// interface. `None` = accept any interface (the legacy/untyped path).
+    ///
+    /// C asyn keeps a separate interrupt list per interface type
+    /// (`int32InterruptList` / `float64InterruptList` /
+    /// `uInt32DigitalInterruptList` …, asynManager interruptBase is allocated
+    /// per interface), so one reason delivers an interface-correct value to
+    /// each record by the interface its DTYP bound. A record subscribes with
+    /// its own interface here; a driver that fires per-interface values
+    /// (`PortDriverBase::notify_interface_value`) tags each, and only the
+    /// matching records receive it. A driver that fires a single untyped value
+    /// (`call_param_callbacks`) leaves the value's `iface` `None`, which every
+    /// subscriber still accepts — preserving the pre-per-interface behaviour.
+    pub iface: Option<InterfaceType>,
+}
+
+impl InterruptFilter {
+    /// Whether an interrupt value passes this filter (reason + addr +
+    /// UInt32Digital changed-bit mask). Shared by the mailbox and the
+    /// synchronous-callback delivery paths.
+    fn matches(&self, iv: &InterruptValue) -> bool {
+        if let Some(r) = self.reason {
+            if iv.reason != r {
+                return false;
+            }
+        }
+        if let Some(a) = self.addr {
+            if iv.addr != a {
+                return false;
+            }
+        }
+        if let Some(m) = self.uint32_mask {
+            if iv.uint32_changed_mask & m == 0 {
+                return false;
+            }
+        }
+        // Per-interface routing: a typed value (driver fired it for a specific
+        // interface) reaches only subscribers on that interface. An untyped
+        // value (`iv.iface == None`, the `call_param_callbacks` path) reaches
+        // every subscriber, and a subscriber with no interface filter
+        // (`self.iface == None`) accepts every value — so the gate fires only
+        // when both sides name an interface and they differ. This mirrors C's
+        // per-interface interrupt lists without changing single-value drivers.
+        if let (Some(want), Some(got)) = (self.iface, iv.iface) {
+            if want != got {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a value fired for `(reason, addr, iface)` could reach this
+    /// subscriber, ignoring the UInt32Digital changed-bit gate. This is the
+    /// *presence* predicate (would a fire ever land here), not the per-value
+    /// [`matches`](Self::matches) gate: a polling driver uses it to skip the
+    /// cost of decoding+firing an interface with no subscriber, mirroring C
+    /// `readPoller` iterating an empty interrupt list. The `uint32_mask` gate is
+    /// deliberately skipped — it depends on which bits *changed* this poll, a
+    /// per-value property, whereas presence is independent of the value.
+    fn accepts(&self, reason: usize, addr: i32, iface: InterfaceType) -> bool {
+        if let Some(r) = self.reason {
+            if reason != r {
+                return false;
+            }
+        }
+        if let Some(a) = self.addr {
+            if addr != a {
+                return false;
+            }
+        }
+        if let Some(want) = self.iface {
+            if want != iface {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Value delivered through the interrupt system.
@@ -51,6 +129,10 @@ pub struct InterruptValue {
     pub alarm_status: u16,
     /// C parity: `pasynUser->alarmSeverity` (asynPortDriver.cpp:635).
     pub alarm_severity: u16,
+    /// The asyn interface this value was decoded for, or `None` when the
+    /// driver fired a single untyped value (the `call_param_callbacks` path).
+    /// See [`InterruptFilter::iface`] for the per-interface routing contract.
+    pub iface: Option<InterfaceType>,
 }
 
 impl Default for InterruptValue {
@@ -64,6 +146,7 @@ impl Default for InterruptValue {
             aux_status: AsynStatus::Success,
             alarm_status: 0,
             alarm_severity: 0,
+            iface: None,
         }
     }
 }
@@ -86,22 +169,44 @@ struct SubscriptionMailbox {
 
 impl SubscriptionMailbox {
     fn matches(&self, iv: &InterruptValue) -> bool {
-        if let Some(r) = self.filter.reason {
-            if iv.reason != r {
-                return false;
-            }
-        }
-        if let Some(a) = self.filter.addr {
-            if iv.addr != a {
-                return false;
-            }
-        }
-        if let Some(m) = self.filter.uint32_mask {
-            if iv.uint32_changed_mask & m == 0 {
-                return false;
-            }
-        }
-        true
+        self.filter.matches(iv)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous callback subscription (averaging device support)
+// ---------------------------------------------------------------------------
+
+/// A synchronous interrupt callback, invoked INLINE inside `notify()` for every
+/// matching value — no coalescing, no channel, no sample loss. This is the
+/// faithful analogue of C `registerInterruptUser`: the driver calls the
+/// callback directly per sample (asynPortDriver.cpp). Required by averaging
+/// device support (`asynInt32Average` / `asynFloat64Average`), which must
+/// accumulate EVERY sample (C `interruptCallbackAverage` does `sum += value`
+/// per callback, devAsynInt32.c:665-666). The mailbox path coalesces rapid
+/// updates to the latest, and the broadcast path drops on lag — either would
+/// silently corrupt the mean, so averaging cannot use them.
+struct SyncCallback {
+    filter: InterruptFilter,
+    callback: Box<dyn Fn(&InterruptValue) + Send + Sync>,
+    active: AtomicBool,
+}
+
+/// RAII handle for a synchronous interrupt callback. Dropping it deactivates
+/// the callback and removes it from the shared list (mirrors
+/// [`InterruptSubscription`]).
+pub struct SyncCallbackSubscription {
+    callback: Arc<SyncCallback>,
+    state: Arc<InterruptSharedState>,
+}
+
+impl Drop for SyncCallbackSubscription {
+    fn drop(&mut self) {
+        self.callback.active.store(false, Ordering::Release);
+        self.state
+            .sync_callbacks
+            .lock()
+            .retain(|c| c.active.load(Ordering::Relaxed));
     }
 }
 
@@ -170,6 +275,9 @@ pub struct InterruptSharedState {
     async_tx: broadcast::Sender<InterruptValue>,
     /// Mailbox-based subscriptions for filtered subscribers (I/O Intr records).
     mailboxes: parking_lot::Mutex<Vec<Arc<SubscriptionMailbox>>>,
+    /// Synchronous callbacks invoked inline in `notify()` (averaging device
+    /// support — every sample, no coalescing). See [`SyncCallback`].
+    sync_callbacks: parking_lot::Mutex<Vec<Arc<SyncCallback>>>,
     /// Total number of notify() calls.
     notify_count: AtomicU64,
     /// Number of times a mailbox value was overwritten before the consumer read it.
@@ -199,6 +307,7 @@ impl InterruptManager {
             state: Arc::new(InterruptSharedState {
                 async_tx,
                 mailboxes: parking_lot::Mutex::new(Vec::new()),
+                sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
             }),
@@ -225,6 +334,7 @@ impl InterruptManager {
             state: Arc::new(InterruptSharedState {
                 async_tx: sender,
                 mailboxes: parking_lot::Mutex::new(Vec::new()),
+                sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
             }),
@@ -242,9 +352,58 @@ impl InterruptManager {
         self.state.async_tx.clone()
     }
 
+    /// Register a synchronous interrupt callback (averaging device support).
+    ///
+    /// The callback is invoked INLINE inside every matching [`notify`](Self::notify)
+    /// — synchronously, on the notifying thread, with no coalescing and no
+    /// channel. This is the faithful analogue of C `registerInterruptUser`
+    /// (asynPortDriver.cpp), required where the consumer must observe every
+    /// sample (e.g. `interruptCallbackAverage`'s `sum += value`). Returns an
+    /// RAII [`SyncCallbackSubscription`]; dropping it unregisters the callback.
+    /// The callback must be cheap (it runs on the port-actor thread) and must
+    /// not call back into the interrupt system.
+    pub fn register_sync_callback<F>(
+        &self,
+        filter: InterruptFilter,
+        callback: F,
+    ) -> SyncCallbackSubscription
+    where
+        F: Fn(&InterruptValue) + Send + Sync + 'static,
+    {
+        let cb = Arc::new(SyncCallback {
+            filter,
+            callback: Box::new(callback),
+            active: AtomicBool::new(true),
+        });
+        self.state.sync_callbacks.lock().push(cb.clone());
+        SyncCallbackSubscription {
+            callback: cb,
+            state: self.state.clone(),
+        }
+    }
+
     /// Send an interrupt to all subscribers (both broadcast and mailbox).
     pub fn notify(&self, value: InterruptValue) {
         self.state.notify_count.fetch_add(1, Ordering::Relaxed);
+
+        // Synchronous callbacks (averaging device support): invoke inline for
+        // every matching value, no coalescing — C registerInterruptUser. Snapshot
+        // the active callbacks under the lock, then invoke after releasing it so a
+        // callback cannot block concurrent register/drop. The snapshot is empty
+        // (no allocation) in the common no-averaging case.
+        let sync_cbs: Vec<Arc<SyncCallback>> = {
+            let guard = self.state.sync_callbacks.lock();
+            guard
+                .iter()
+                .filter(|c| c.active.load(Ordering::Relaxed))
+                .cloned()
+                .collect()
+        };
+        for cb in &sync_cbs {
+            if cb.filter.matches(&value) {
+                (cb.callback)(&value);
+            }
+        }
 
         // Deliver to mailbox subscribers (filtered, coalescing).
         let subs = self.state.mailboxes.lock();
@@ -295,6 +454,84 @@ impl InterruptManager {
             },
             InterruptReceiver { mailbox },
         )
+    }
+
+    /// True if any active mailbox subscription would receive a value fired for
+    /// `(reason, addr, iface)`.
+    ///
+    /// A polling driver (e.g. Modbus `readPoller`) uses this to skip the cost of
+    /// decoding+firing an interface that no record is bound to — mirroring C,
+    /// where an empty interrupt list means the per-element `readPlcInt32` /
+    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1822-1854). This gates
+    /// only the expensive whole-block ARRAY decode, and array interfaces are
+    /// bound exclusively through coalescing mailbox subscriptions — so only
+    /// `mailboxes` are consulted. Sync-callback bindings (averaging /
+    /// time-series) are scalar-only and never bind an array interface, and
+    /// broadcast subscribers (`subscribe_async`, transports/tests) are
+    /// observers, not bindings; neither needs to gate an array decode. (For
+    /// *which offsets to poll at all*, both mailbox and sync-callback bindings
+    /// matter — see [`subscribed_bindings`].)
+    ///
+    /// [`subscribed_bindings`]: Self::subscribed_bindings
+    pub fn has_subscriber(&self, reason: usize, addr: i32, iface: InterfaceType) -> bool {
+        self.state
+            .mailboxes
+            .lock()
+            .iter()
+            .any(|s| s.active.load(Ordering::Relaxed) && s.filter.accepts(reason, addr, iface))
+    }
+
+    /// The distinct `(reason, addr)` pairs of every active record binding —
+    /// both coalescing mailbox subscriptions (I/O-Intr records) AND synchronous
+    /// callbacks (averaging / time-series device support) — that pins a
+    /// concrete reason AND address.
+    ///
+    /// A polling driver (Modbus `readPoller`) drives its fire set directly from
+    /// this — exactly C's model, where `readPoller` fires every record on the
+    /// interrupt list (populated at `registerInterruptUser`), with no
+    /// dependence on whether the record was ever read. The interrupt registry
+    /// is the single owner of "which records want a fire"; the driver holds no
+    /// parallel set to keep in sync.
+    ///
+    /// BOTH subscription kinds are record bindings and must be enumerated: an
+    /// averaging ai (`asynInt32Average`) or a time-series waveform registers
+    /// only a [`register_sync_callback`], no mailbox, so a mailbox-only set
+    /// would never poll it and the record would silently get zero samples.
+    /// Only the broadcast path (`subscribe_async`, used by transports/tests) is
+    /// excluded — it is an observer, not a record binding. A wildcard
+    /// subscription (reason or addr `None`) names no single offset to poll and
+    /// is skipped; every record binding sets both (the asyn device support
+    /// fills `reason`/`addr` from its link), so none are lost.
+    ///
+    /// [`register_sync_callback`]: Self::register_sync_callback
+    pub fn subscribed_bindings(&self) -> Vec<(usize, i32)> {
+        let concrete = |f: &InterruptFilter| match (f.reason, f.addr) {
+            (Some(r), Some(a)) => Some((r, a)),
+            _ => None,
+        };
+        // Snapshot each list's concrete bindings under its own lock, then dedup
+        // outside the locks (a callback never re-enters these).
+        let mailbox_pairs: Vec<(usize, i32)> = {
+            let g = self.state.mailboxes.lock();
+            g.iter()
+                .filter(|s| s.active.load(Ordering::Relaxed))
+                .filter_map(|s| concrete(&s.filter))
+                .collect()
+        };
+        let sync_pairs: Vec<(usize, i32)> = {
+            let g = self.state.sync_callbacks.lock();
+            g.iter()
+                .filter(|c| c.active.load(Ordering::Relaxed))
+                .filter_map(|c| concrete(&c.filter))
+                .collect()
+        };
+        let mut out: Vec<(usize, i32)> = Vec::new();
+        for p in mailbox_pairs.into_iter().chain(sync_pairs) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 
     // --- Metrics ---
@@ -644,5 +881,219 @@ mod tests {
         assert_eq!(im.notify_count(), n as u64);
         // n-1 overwrites of the slot before the consumer drained it.
         assert_eq!(im.coalesce_count(), (n - 1) as u64);
+    }
+
+    /// Per-interface routing (the modbus R54 fix): one reason+addr firing
+    /// several interface-typed values delivers each only to the subscriber on
+    /// that interface, and an untyped value reaches every subscriber.
+    #[tokio::test]
+    async fn notify_routes_typed_values_per_interface() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+        let (_si, mut rx_int) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::Int32),
+            ..Default::default()
+        });
+        let (_su, mut rx_uint) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::UInt32Digital),
+            uint32_mask: Some(0xFF),
+        });
+
+        // One reason fires two interface-typed values (the per-interface shape
+        // `PortDriverBase::notify_interface_value` emits).
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::Int32(7),
+            iface: Some(InterfaceType::Int32),
+            ..Default::default()
+        });
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::UInt32Digital(0xAB),
+            iface: Some(InterfaceType::UInt32Digital),
+            uint32_changed_mask: !0,
+            ..Default::default()
+        });
+
+        let dur = std::time::Duration::from_millis(100);
+        // The Int32 subscriber sees the Int32 value...
+        let vi = tokio::time::timeout(dur, rx_int.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(vi.value, ParamValue::Int32(7)),
+            "got {:?}",
+            vi.value
+        );
+        // ...and the UInt32Digital subscriber sees the UInt32 value.
+        let vu = tokio::time::timeout(dur, rx_uint.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(vu.value, ParamValue::UInt32Digital(0xAB)),
+            "got {:?}",
+            vu.value
+        );
+        // Each received ONLY its own interface's value (the other was filtered
+        // out, not merely coalesced): a second recv has nothing to deliver.
+        let short = std::time::Duration::from_millis(30);
+        assert!(
+            tokio::time::timeout(short, rx_int.recv()).await.is_err(),
+            "Int32 subscriber must not receive the UInt32 fire"
+        );
+        assert!(
+            tokio::time::timeout(short, rx_uint.recv()).await.is_err(),
+            "UInt32 subscriber must not receive the Int32 fire"
+        );
+
+        // An untyped value (the `call_param_callbacks` path, iface None) still
+        // reaches an interface-filtered subscriber — backward compatibility.
+        im.notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: ParamValue::Int32(99),
+            iface: None,
+            ..Default::default()
+        });
+        let vi = tokio::time::timeout(dur, rx_int.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(vi.value, ParamValue::Int32(99)));
+    }
+
+    /// The subscriber-presence gate a polling driver uses to skip an interface
+    /// with no record bound (R56 array fan-out): `has_subscriber` is true iff an
+    /// active mailbox filter would accept a fire for that `(reason, addr, iface)`,
+    /// an untyped (`iface == None`) subscriber accepts any interface, and a drop
+    /// unregisters.
+    #[tokio::test]
+    async fn has_subscriber_reports_presence_per_iface() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+        // No subscribers yet.
+        assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
+
+        let (sub, _rx) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::Int32Array),
+            ..Default::default()
+        });
+        // Present for the matching tuple; absent for a different iface/addr/reason.
+        assert!(im.has_subscriber(0, 0, InterfaceType::Int32Array));
+        assert!(!im.has_subscriber(0, 0, InterfaceType::Float64Array));
+        assert!(!im.has_subscriber(0, 1, InterfaceType::Int32Array));
+        assert!(!im.has_subscriber(1, 0, InterfaceType::Int32Array));
+
+        // An untyped subscriber (no iface filter) is present for every iface.
+        let (sub2, _rx2) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(5),
+            ..Default::default()
+        });
+        assert!(im.has_subscriber(5, 99, InterfaceType::Float64Array));
+
+        // Dropping the subscription unregisters it.
+        drop(sub);
+        assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
+        drop(sub2);
+        assert!(!im.has_subscriber(5, 99, InterfaceType::Float64Array));
+    }
+
+    #[tokio::test]
+    async fn subscribed_bindings_enumerates_distinct_concrete_pairs() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+        assert!(im.subscribed_bindings().is_empty());
+
+        // Two ifaces on the SAME (reason, addr) collapse to one binding.
+        let (s_a, _r0) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(2),
+            addr: Some(7),
+            iface: Some(InterfaceType::Int32Array),
+            ..Default::default()
+        });
+        let (s_b, _r1) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(2),
+            addr: Some(7),
+            iface: Some(InterfaceType::Float64Array),
+            ..Default::default()
+        });
+        // A distinct addr is its own binding.
+        let (s_other, _r2) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(2),
+            addr: Some(8),
+            iface: Some(InterfaceType::Int32Array),
+            ..Default::default()
+        });
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+
+        // A wildcard subscription (addr None) pins no offset and is skipped.
+        let (s_wild, _r3) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(9),
+            ..Default::default()
+        });
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+
+        // Sync-callback bindings (averaging / time-series) MUST be enumerated
+        // too — they are record bindings, not observers. A sync callback at a
+        // fresh (reason, addr) adds a binding; one co-located with a mailbox
+        // binding dedups.
+        let sc_new = im.register_sync_callback(
+            InterruptFilter {
+                reason: Some(3),
+                addr: Some(1),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let sc_dup = im.register_sync_callback(
+            InterruptFilter {
+                reason: Some(2),
+                addr: Some(8),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8), (3, 1)]);
+
+        // Dropping the sync callback removes its binding; the co-located one
+        // leaves (2, 8) alive via the surviving mailbox subscription.
+        drop(sc_new);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+        drop(sc_dup);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+
+        // The pair stays alive while either iface subscription survives.
+        drop(s_a);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 7), (2, 8)]);
+        drop(s_b);
+        let mut got = im.subscribed_bindings();
+        got.sort();
+        assert_eq!(got, vec![(2, 8)]);
+
+        drop(s_other);
+        drop(s_wild);
+        assert!(im.subscribed_bindings().is_empty());
     }
 }

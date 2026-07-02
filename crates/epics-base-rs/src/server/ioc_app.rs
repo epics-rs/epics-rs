@@ -383,23 +383,27 @@ pub struct IocApplication {
 
 impl IocApplication {
     pub fn new() -> Self {
-        let mut device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
-        // epics-base 3.15.4: built-in `getenv` device support for
-        // stringin / lsi — pre-registered so .db files can use the
-        // canonical DTYP name with zero extra setup.
-        device_factories.insert(
-            "getenv".to_string(),
-            Box::new(|| -> Box<dyn DeviceSupport> {
-                Box::new(crate::server::builtin_devices::GetenvDeviceSupport::new())
-            }),
-        );
+        // No context-free built-in device support: every base builtin
+        // (`Soft Timestamp`, `stdio`, `Db State`, `getenv`) needs the record's
+        // INST_IO `INP`/`OUT`, which only the dynamic factory's
+        // `DeviceSupportContext` carries — so all base builtins are dispatched
+        // below, and this static map starts empty (users register their own
+        // context-free device support into it via `register_device_support`).
+        let device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
         Self {
             // SERVER-side port: caservertask.c:491-498 honours
             // EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT > 5064.
             port: cas_server_port(),
             tcp_port: None,
             device_factories,
-            dynamic_device_factory: None,
+            // The base built-in device support — all needing the runtime
+            // context (INP/OUT). Pre-registered as the base of the
+            // dynamic-factory chain so a user's
+            // `register_dynamic_device_support` factory takes priority and
+            // falls through to here.
+            dynamic_device_factory: Some(Box::new(
+                crate::server::builtin_devices::builtin_dynamic_factory,
+            )),
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),
             acf: None,
@@ -535,10 +539,12 @@ impl IocApplication {
         self
     }
 
-    /// Register a subroutine function by name (for sub records).
+    /// Register a subroutine function by name (for sub/aSub records).
+    /// The closure returns the C `long` status (`Ok(0)` normal, `Ok(n<0)`
+    /// raises `SOFT_ALARM`/`BRSV`; `aSub` publishes it as `VAL`).
     pub fn register_subroutine<F>(mut self, name: &str, func: F) -> Self
     where
-        F: Fn(&mut dyn Record) -> CaResult<()> + Send + Sync + 'static,
+        F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
         self.subroutine_registry
             .insert(name.to_string(), Arc::new(Box::new(func)));
@@ -835,6 +841,11 @@ impl IocApplication {
         let record_count =
             wire_device_support(&db, &device_factories, &dynamic_device_factory).await?;
         announce!(InitHookState::AfterInitDevSup);
+        // Retain the registry in the database for runtime re-resolution
+        // (aSub LFLG=READ / SUBL); `wire_subroutines` then performs the
+        // static init-time SNAM resolution (C `init_record`).
+        db.install_subroutine_registry(subroutine_registry.clone())
+            .await;
         wire_subroutines(&db, &subroutine_registry).await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
@@ -1106,7 +1117,34 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
     for name in names {
         if let Some(rec_arc) = db.get_record(&name).await {
             let mut instance = rec_arc.write().await;
-            if instance.record.record_type() == "sub" {
+            // Both `sub` and `aSub` resolve their subroutine from SNAM via the
+            // function registry at init (C `subRecord.c` / `aSubRecord.c`
+            // `init_record` -> `registryFunctionFind`).
+            let rt = instance.record.record_type();
+            if rt == "sub" || rt == "aSub" {
+                // INAM: invoke the init routine exactly once at init, before
+                // SNAM resolution (C `subRecord.c` / `aSubRecord.c`
+                // `init_record`: `registryFunctionFind(inam)` then
+                // `(*psubroutine)(prec)`, return value discarded; a missing
+                // function is an init error -> stderr).
+                if let Some(crate::types::EpicsValue::String(inam)) =
+                    instance.record.get_field("INAM")
+                {
+                    let inam = inam.as_str_lossy();
+                    if !inam.is_empty() {
+                        match registry.get(inam.as_ref()) {
+                            Some(init_fn) => {
+                                let init_fn = init_fn.clone();
+                                if let Err(e) = init_fn(&mut *instance.record) {
+                                    eprintln!(
+                                        "iocInit: {name}.INAM '{inam}' init routine failed: {e}"
+                                    );
+                                }
+                            }
+                            None => eprintln!("iocInit: {name}.INAM function '{inam}' not found"),
+                        }
+                    }
+                }
                 if let Some(crate::types::EpicsValue::String(snam)) =
                     instance.record.get_field("SNAM")
                 {

@@ -378,6 +378,16 @@ pub struct BridgeChannel {
     /// [`FilterChain::apply_to_read_value`]. PUT writes the raw value
     /// (filters are read-side only).
     channel_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// An INDEPENDENT re-parse of the same channel-filter suffix, for the
+    /// monitor's PROPERTY subscription. pvxs builds `pPropertiesChannel`
+    /// from `dbChannelName(sInfo->chan)` — the same filtered channel name
+    /// (`singlesrcsubscriptionctx.cpp:24`) — so both the value and property
+    /// dbChannels carry the client's filter, each with its own state
+    /// (`dbChannelCreate` re-parses the suffix per channel,
+    /// `dbChannel.c:471`). Held separately from `channel_filters` so a
+    /// stateful filter (`dbnd` last-sent, `dec` counter) on the value
+    /// subscription never shares state with the property subscription.
+    property_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// Access control context — checked on every get/put.
     access: super::provider::AccessContext,
 }
@@ -400,6 +410,9 @@ impl BridgeChannel {
             nt_type,
             value_dbf,
             channel_filters: std::sync::Arc::new(
+                epics_base_rs::server::database::filters::FilterChain::new(),
+            ),
+            property_filters: std::sync::Arc::new(
                 epics_base_rs::server::database::filters::FilterChain::new(),
             ),
             access: super::provider::AccessContext::allow_all(),
@@ -431,14 +444,28 @@ impl BridgeChannel {
         // EPICS `dbChannelCreate()` (`dbChannel.c:512-529`). Fail-open
         // to an unfiltered monitor would silently drop the requested
         // throttling/slicing semantics.
-        let channel_filters = match parsed.json_suffix.as_deref() {
-            Some(json) => std::sync::Arc::new(
-                epics_base_rs::server::database::filters::try_parse_filter_chain(json)
-                    .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?,
-            ),
-            None => {
-                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
+        // Parse the suffix into TWO independent chains: one for the value
+        // subscription / GET read path (`channel_filters`) and one for the
+        // monitor's PROPERTY subscription (`property_filters`). pvxs builds
+        // the property dbChannel from the same filtered channel name
+        // (`singlesrcsubscriptionctx.cpp:24`), and `dbChannelCreate`
+        // re-parses the suffix per channel (`dbChannel.c:471`), so each
+        // channel owns independent filter state — a stateful `dbnd`/`dec`
+        // on the value stream must not have its baseline/counter perturbed
+        // by a DBE_PROPERTY event on the property stream.
+        let (channel_filters, property_filters) = match parsed.json_suffix.as_deref() {
+            Some(json) => {
+                let value = epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                    .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?;
+                let property =
+                    epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                        .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?;
+                (std::sync::Arc::new(value), std::sync::Arc::new(property))
             }
+            None => (
+                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+                std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
+            ),
         };
         // EPICS `$` long-string field modifier (C `dbChannel.c:486-505`):
         // a trailing `$` re-views a `DBF_STRING` or link field as a
@@ -547,6 +574,7 @@ impl BridgeChannel {
             nt_type,
             value_dbf,
             channel_filters,
+            property_filters,
             access: super::provider::AccessContext::allow_all(),
         })
     }
@@ -586,6 +614,20 @@ impl BridgeChannel {
         value: &PvStructure,
         opts: PutOptions,
     ) -> BridgeResult<()> {
+        // C `IOCSource::doPreProcessing` (iocsource.cpp:363-375), which
+        // pvxs runs on every QSRV put in every process mode
+        // (singlesource.cpp:354-356) BEFORE the write-ACF check: reject a
+        // put to a DISP-disabled record (except the DISP field) or a
+        // read-only field. The `Passive` route enforces this inside
+        // `put_record_field_from_ca`, but the `Force`/`Inhibit` routes go
+        // through `put_pv` (the internal `dbPut` analogue, which by design
+        // does not gate DISP), so the gate must run at this boundary for
+        // all three process modes.
+        self.db
+            .check_external_put_preconditions(&self.record_name, &self.field)
+            .await
+            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+
         // One access evaluation yields both the allow/deny decision and
         // the matched rule's TRAPWRITE flag (`WriteGrant`). The grant is
         // the single source of "is this a trapped write" — the PUT below
@@ -723,11 +765,33 @@ impl BridgeChannel {
                         .put_pv(&format!("{}.{}", self.record_name, self.field), value)
                         .await
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    let mut visited = std::collections::HashSet::new();
-                    self.db
-                        .process_record_with_links(&self.record_name, &mut visited, 0)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    if opts.block {
+                        // pvxs honors `block` for Force exactly as for Passive:
+                        // a `record[process=true,block=true]` put routes through
+                        // `dbProcessNotify` and the reply is withheld until
+                        // processing — including async device completion (a
+                        // motor move, an asyn-backed AO) — finishes
+                        // (`singlesource.cpp:360-369`; `if forceProcessing==False
+                        // doWait=false` clears the wait for Inhibit only, never
+                        // for Force). The bare `process_record_with_links` below
+                        // returns success as soon as the record goes PACT, so a
+                        // blocking forced put to an async record must instead
+                        // await the put-notify completion.
+                        let notify_rx = self
+                            .db
+                            .process_record_with_notify(&self.record_name)
+                            .await
+                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                        if let Some(rx) = notify_rx {
+                            let _ = rx.await;
+                        }
+                    } else {
+                        let mut visited = std::collections::HashSet::new();
+                        self.db
+                            .process_record_with_links(&self.record_name, &mut visited, 0)
+                            .await
+                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    }
                 }
             }
             Ok(())
@@ -840,8 +904,12 @@ impl BridgeChannel {
         .with_access(self.access.clone())
         // thread the channel's parsed filter chain (from the
         // pvxs `PV.VAL{...}` JSON suffix) into the monitor so its
-        // subscription installs the filters at the dbChannel level.
-        .with_filters(self.channel_filters.clone());
+        // subscription installs the filters at the dbChannel level. The
+        // value stream and the PROPERTY stream each get an independent
+        // re-parse of the same suffix (pvxs builds both dbChannels from
+        // the same filtered name, with per-channel filter state).
+        .with_filters(self.channel_filters.clone())
+        .with_property_filters(self.property_filters.clone());
         if let Some(mask) = value_mask {
             monitor = monitor.with_value_mask(mask);
         }
@@ -1400,5 +1468,194 @@ mod tests {
             .await
             .expect("unfiltered channel must create");
         assert!(ch.channel_filters.is_empty());
+    }
+
+    // ---- Force + block (record[process=true,block=true]) end-to-end wiring ----
+
+    /// End-to-end proof that `put_with_options(Force, block)` routes a
+    /// *synchronous* forced put through the put-notify barrier
+    /// (`process_record_with_notify`) and returns only after the full
+    /// processing cycle — including the OUT link write — has run. This is the
+    /// `BridgeChannel` PUT-path twin of the `epics-base-rs`
+    /// `force_block_sync_record_returns_none_and_processes` primitive test:
+    /// the primitive proves the database method drives the OUT link; this
+    /// proves the bridge Force+block branch actually calls it.
+    #[tokio::test]
+    async fn put_force_block_sync_drives_out_link_before_returning() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TGT0", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // scalcout ODLY=0: CALC="42" ⇒ VAL=OVAL=42, OOPT=Every ⇒ OUT fires
+        // with no delay, so the whole cycle (incl. the OUT write) is synchronous.
+        let mut sc = ScalcoutRecord::default();
+        sc.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
+        sc.oopt = 0;
+        sc.put_field("ODLY", EpicsValue::Double(0.0)).unwrap();
+        sc.put_field("OUT", EpicsValue::String("TGT0".into()))
+            .unwrap();
+        db.add_record("SC0", Box::new(sc)).await.unwrap();
+
+        let ch = BridgeChannel::new(db.clone(), "SC0")
+            .await
+            .expect("channel over scalcout VAL must create");
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        ch.put_with_options(
+            &put,
+            PutOptions {
+                process: ProcessMode::Force,
+                block: true,
+            },
+        )
+        .await
+        .expect("forced blocking put must succeed");
+
+        // The barrier held until processing finished: the OUT link drove
+        // TGT0.VAL = 42 before the PUT returned.
+        let tgt = db.get_record("TGT0").await.unwrap();
+        let v = tgt.read().await.record.get_field("VAL");
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(42.0)),
+            "Force+block must have driven the OUT write before returning, got {v:?}"
+        );
+    }
+
+    /// End-to-end proof that `put_with_options(Force, block)` HOLDS the reply
+    /// barrier for an *async* record: with ODLY=100 s the record stays PACT
+    /// across the (un-fireable-in-test) delay, so the put-notify completion
+    /// never arrives and the PUT future must not resolve. A regression that
+    /// reverted the Force+block branch to the bare `process_record_with_links`
+    /// (which returns as soon as the record goes PACT) would let the PUT
+    /// return immediately — the timeout below would NOT fire and this test
+    /// would fail. The timeout firing is the barrier proof.
+    #[tokio::test]
+    async fn put_force_block_async_holds_barrier_until_processing_done() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TGT1", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // ODLY=100 s: the OUT write is deferred and the record stays PACT
+        // across the (un-fireable-in-test) delay — the async shape a blocking
+        // forced put must wait on.
+        let mut sc = ScalcoutRecord::default();
+        sc.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
+        sc.oopt = 0;
+        sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
+        sc.put_field("OUT", EpicsValue::String("TGT1".into()))
+            .unwrap();
+        db.add_record("SC1", Box::new(sc)).await.unwrap();
+
+        let ch = BridgeChannel::new(db.clone(), "SC1")
+            .await
+            .expect("channel over scalcout VAL must create");
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        let putting = ch.put_with_options(
+            &put,
+            PutOptions {
+                process: ProcessMode::Force,
+                block: true,
+            },
+        );
+        // The barrier must hold: the put future cannot resolve while the
+        // record is PACT on the 100 s delay. If it resolves, the Force+block
+        // wiring regressed to a non-blocking process call.
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), putting).await;
+        assert!(
+            outcome.is_err(),
+            "Force+block put must NOT return while the async record is PACT; \
+             it returned {outcome:?} — the reply barrier regressed"
+        );
+
+        // The barrier is genuinely async-pending: DLYA armed, OUT still deferred.
+        let sc_rec = db.get_record("SC1").await.unwrap();
+        let dlya = sc_rec.read().await.record.get_field("DLYA");
+        assert_eq!(
+            dlya,
+            Some(EpicsValue::Short(1)),
+            "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
+        );
+        let tgt = db.get_record("TGT1").await.unwrap();
+        let v = tgt.read().await.record.get_field("VAL");
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(0.0)),
+            "OUT must stay deferred until the delay completes, got {v:?}"
+        );
+    }
+
+    /// The barrier's RELEASE path: a Force+block put to an async record whose
+    /// delay DOES complete in-test must return `Ok` only AFTER the deferred
+    /// OUT link fired. `ODLY≈0.05 s` arms the async barrier; the real tokio
+    /// timer fires within the 5 s guard; the reprocess drives OUT → TGT2.VAL=42
+    /// and completes the put-notify wait-set → the put resolves. A barrier that
+    /// held forever (rx never fired even after the timer) would hang and trip
+    /// the timeout. The sync test and the async-hold test never observe this
+    /// successful completion — this is the third boundary the reviewer flagged.
+    #[tokio::test]
+    async fn put_force_block_async_releases_after_delay_completes() {
+        use epics_base_rs::server::record::Record;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("TGT2", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // Short ODLY: the record goes PACT and arms the delay, then the timer
+        // fires and the reprocess drives the OUT — the async barrier both holds
+        // and then releases inside the test.
+        let mut sc = ScalcoutRecord::default();
+        sc.put_field("CALC", EpicsValue::String("42".into()))
+            .unwrap();
+        sc.oopt = 0;
+        sc.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
+        sc.put_field("OUT", EpicsValue::String("TGT2".into()))
+            .unwrap();
+        db.add_record("SC2", Box::new(sc)).await.unwrap();
+
+        let ch = BridgeChannel::new(db.clone(), "SC2")
+            .await
+            .expect("channel over scalcout VAL must create");
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ch.put_with_options(
+                &put,
+                PutOptions {
+                    process: ProcessMode::Force,
+                    block: true,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "Force+block put must release with Ok once the ODLY delay completes, got {outcome:?}"
+        );
+        // Released only after the deferred OUT actually fired.
+        let tgt = db.get_record("TGT2").await.unwrap();
+        let v = tgt.read().await.record.get_field("VAL");
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(42.0)),
+            "the barrier must release only after the deferred OUT drove TGT2.VAL=42, got {v:?}"
+        );
     }
 }

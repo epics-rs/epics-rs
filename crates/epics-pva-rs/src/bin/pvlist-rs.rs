@@ -14,8 +14,9 @@
 //! The `pvlist-rs <ip>` form mirrors pvxs `pvxlist <ip>` (`tools/list.cpp`
 //! query mode): it sends an RPC to the server's special `server` PV
 //! with `op=channels` (or `op=info` for `-i`). pvxs/Java PVA servers
-//! expose this `ServerSource` PV; the query therefore works against
-//! them even though the Rust server does not yet host the `server` PV.
+//! expose this `ServerSource` PV — and so does the Rust server, via
+//! `server_native::server_info::ServerInfoSource` — so the query works
+//! against all of them.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};

@@ -18,11 +18,11 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::ForkptyResult;
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{Pid, chdir, execvp};
@@ -32,6 +32,22 @@ use tokio::task::JoinHandle;
 
 use crate::procserv::error::{ProcServError, ProcServResult};
 
+/// Faithful child-exit classification, mirroring C procServ's
+/// `WIFEXITED` / `WIFSIGNALED` split in the SIGCHLD reaper
+/// (`procServ.cc:794-805`). A signal death must NOT be collapsed into a
+/// `128 + signo` exit code: C reports "killed by signal N" distinctly
+/// from "Normal exit status = N", and `main` returns the `WEXITSTATUS`
+/// (not `128+sig`) as procServ's own exit status (`procServ.cc:798,701`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExit {
+    /// `WIFEXITED` — child exited normally with this status code.
+    Exited(i32),
+    /// `WIFSIGNALED` — child was terminated by this signal number.
+    Signaled(i32),
+    /// `waitpid` failed or returned an unhandled status (stopped/continued).
+    Unknown,
+}
+
 /// Lifecycle event emitted by [`ChildHandle`] over its event channel.
 #[derive(Debug)]
 pub enum ChildEvent {
@@ -39,17 +55,27 @@ pub enum ChildEvent {
     Output(Vec<u8>),
     /// Child process terminated. The supervisor consults the restart
     /// policy and either re-spawns or exits.
-    Exited { status: Option<ExitStatus> },
+    Exited { exit: ChildExit },
 }
 
 /// Configuration for one child launch. Mirrors the subset of
 /// [`crate::procserv::config::ChildConfig`] this module needs.
 #[derive(Debug, Clone)]
 pub struct ChildSpec {
+    /// The positional command — presented as argv[0] to the child, and
+    /// the exec target unless [`Self::child_exec`] overrides it.
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub ignore_chars: Vec<u8>,
+    /// `RLIMIT_CORE` soft limit to set in the child before `exec`
+    /// (`--coresize`). `None` ⇒ leave the inherited limit untouched.
+    pub core_size: Option<u64>,
+    /// Override executable to `exec` instead of [`Self::program`]
+    /// (`--exec`). `None` ⇒ exec `program`. argv[0] stays `program`
+    /// regardless, so a different binary runs under the original
+    /// command line.
+    pub child_exec: Option<PathBuf>,
 }
 
 /// Handle to a running child process. Cloning is cheap (Arcs inside).
@@ -214,6 +240,17 @@ impl ChildHandle {
 /// NOT call `setsid` here again — it would return `EPERM` because
 /// we're already a session leader.
 fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
+    // Apply the core-dump rlimit before chdir/exec, matching C's order
+    // (processFactory.cc:206-210): `getrlimit` to keep the hard limit,
+    // set only the soft limit (`rlim_cur`) to `coreSize`. Best-effort —
+    // C ignores the setrlimit return too. getrlimit/setrlimit are
+    // async-signal-safe, so this is safe in the post-forkpty child.
+    if let Some(core) = spec.core_size
+        && let Ok((_, hard)) = getrlimit(Resource::RLIMIT_CORE)
+    {
+        let _ = setrlimit(Resource::RLIMIT_CORE, core, hard);
+    }
+
     if let Some(ref cwd) = spec.cwd {
         let c_cwd = match CString::new(cwd.as_os_str().as_encoded_bytes()) {
             Ok(c) => c,
@@ -228,15 +265,31 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
         }
     }
 
-    let prog = match CString::new(spec.program.as_os_str().as_encoded_bytes()) {
+    // argv[0] presented to the child is always the positional command
+    // (`spec.program`), so a `--exec` override runs a different binary
+    // under the original command line. C `childExec` (procServ.cc:62,
+    // 459-462); C's argv[0]-is-the-prior-token quirk is not reproduced.
+    let arg0 = match CString::new(spec.program.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
         Err(_) => {
             eprintln!("procserv child: program name contains NUL");
             std::process::exit(126);
         }
     };
+    // The binary actually exec'd: the `--exec` override if set, else the
+    // command itself. `execvp` PATH-searches a slashless name, like C.
+    let exec_target = match &spec.child_exec {
+        Some(exe) => match CString::new(exe.as_os_str().as_encoded_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("procserv child: exec path contains NUL");
+                std::process::exit(126);
+            }
+        },
+        None => arg0.clone(),
+    };
     let mut argv: Vec<CString> = Vec::with_capacity(1 + spec.args.len());
-    argv.push(prog.clone());
+    argv.push(arg0);
     for a in &spec.args {
         match CString::new(a.as_bytes()) {
             Ok(c) => argv.push(c),
@@ -248,12 +301,12 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
     }
 
     let argv_refs: Vec<&std::ffi::CStr> = argv.iter().map(|c| c.as_c_str()).collect();
-    match execvp(prog.as_c_str(), &argv_refs) {
+    match execvp(exec_target.as_c_str(), &argv_refs) {
         Ok(infallible) => match infallible {},
         Err(e) => {
             eprintln!(
                 "procserv child: execvp({}) failed: {e}",
-                spec.program.display()
+                spec.child_exec.as_ref().unwrap_or(&spec.program).display()
             );
             std::process::exit(127);
         }
@@ -329,23 +382,16 @@ fn spawn_reaper(pid: Pid, alive: Arc<AtomicBool>, tx: mpsc::Sender<ChildEvent>) 
         let res = tokio::task::spawn_blocking(move || waitpid(pid, None))
             .await
             .ok();
-        let exit_code = match res {
-            Some(Ok(WaitStatus::Exited(_, code))) => Some(make_exit_status(code)),
-            Some(Ok(WaitStatus::Signaled(_, sig, _))) => Some(make_exit_status(128 + sig as i32)),
-            _ => None,
+        // Preserve C's WIFEXITED/WIFSIGNALED distinction (procServ.cc:794-805):
+        // a signal death is reported as such, never folded into 128+sig.
+        let exit = match res {
+            Some(Ok(WaitStatus::Exited(_, code))) => ChildExit::Exited(code),
+            Some(Ok(WaitStatus::Signaled(_, sig, _))) => ChildExit::Signaled(sig as i32),
+            _ => ChildExit::Unknown,
         };
         alive.store(false, Ordering::Release);
-        let _ = tx.send(ChildEvent::Exited { status: exit_code }).await;
+        let _ = tx.send(ChildEvent::Exited { exit }).await;
     })
-}
-
-#[cfg(unix)]
-fn make_exit_status(code: i32) -> ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    // Pack code into the wait-status form. ExitStatusExt::from_raw
-    // takes a raw `wait()` status; for an "exited normally" status
-    // that's `code << 8`.
-    ExitStatus::from_raw(code << 8)
 }
 
 #[cfg(test)]
@@ -386,6 +432,8 @@ mod tests {
             args: vec!["hello procserv".into()],
             cwd: None,
             ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -397,6 +445,68 @@ mod tests {
         assert!(text.contains("hello procserv"), "got: {text:?}");
     }
 
+    /// Drain until the channel closes, returning the final exit
+    /// classification (the last `Exited` seen). Mirrors
+    /// [`drain_until_closed`] but keeps the [`ChildExit`] value.
+    async fn drain_for_exit(
+        rx: &mut mpsc::Receiver<ChildEvent>,
+        deadline: tokio::time::Instant,
+    ) -> Option<ChildExit> {
+        let mut exit = None;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(ChildEvent::Output(_)) => {}
+                    Some(ChildEvent::Exited { exit: e }) => exit = Some(e),
+                    None => break,
+                },
+                _ = sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        exit
+    }
+
+    /// A normal exit is classified `Exited(code)` carrying the real
+    /// status code — `/bin/sh -c 'exit 3'` reports `Exited(3)`, never
+    /// a signal (C WIFEXITED, procServ.cc:794-798).
+    #[tokio::test]
+    async fn normal_exit_reports_exit_code() {
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "exit 3".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: None,
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let exit = drain_for_exit(&mut rx, deadline).await;
+        assert_eq!(exit, Some(ChildExit::Exited(3)), "got: {exit:?}");
+    }
+
+    /// A signal death is classified `Signaled(sig)` — NOT folded into a
+    /// `128 + sig` exit code (C WIFSIGNALED, procServ.cc:801-805).
+    /// SIGKILL (9) a `sleep` and confirm the reaper reports `Signaled(9)`.
+    #[tokio::test]
+    async fn signal_death_reports_signal_not_128_plus_sig() {
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["30".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: None,
+        };
+        let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        // Let the child reach its sleep, then SIGKILL its group.
+        sleep(Duration::from_millis(150)).await;
+        handle.signal(9).expect("signal");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let exit = drain_for_exit(&mut rx, deadline).await;
+        assert_eq!(exit, Some(ChildExit::Signaled(9)), "got: {exit:?}");
+    }
+
     #[tokio::test]
     async fn write_stdin_filters_ignore_chars() {
         // `cat` echoes stdin to stdout; we'll feed it bytes and
@@ -406,6 +516,8 @@ mod tests {
             args: vec![],
             cwd: None,
             ignore_chars: vec![b'X'],
+            core_size: None,
+            child_exec: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
 
@@ -427,6 +539,83 @@ mod tests {
         assert!(
             !text.contains('X'),
             "X bytes should not appear, got: {text:?}"
+        );
+    }
+
+    /// `core_size` must set the child's `RLIMIT_CORE` soft limit before
+    /// exec (C `setCoreSize`, processFactory.cc:206-210). Verify via
+    /// `ulimit -c`, which prints the soft limit in 512- or 1024-byte
+    /// blocks (platform-dependent). When the inherited hard limit allows
+    /// a distinctive 1 MiB soft cap, assert the reported block count
+    /// matches; otherwise just assert the child still execs with the
+    /// limit applied (no clean distinctive value is settable).
+    #[tokio::test]
+    async fn core_size_applies_rlimit_core_to_child() {
+        let (_soft, hard) = getrlimit(Resource::RLIMIT_CORE).expect("getrlimit");
+        let one_mib: u64 = 1024 * 1024;
+        let strong = hard >= one_mib; // can set a clean, distinctive cap
+        let target = if strong { one_mib } else { hard };
+
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "ulimit -c".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: Some(target),
+            child_exec: None,
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
+        let text = String::from_utf8_lossy(&output);
+        let reported = text
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+
+        if strong {
+            // 1 MiB ÷ 512 = 2048 blocks; ÷ 1024 = 1024 blocks.
+            let blocks_512 = (target / 512).to_string();
+            let blocks_1024 = (target / 1024).to_string();
+            assert!(
+                reported == blocks_512 || reported == blocks_1024,
+                "child ulimit -c should reflect the 1 MiB core_size \
+                 ({blocks_512} or {blocks_1024} blocks); got {reported:?}"
+            );
+        } else {
+            // Hard limit too small for a distinctive cap — just prove the
+            // child execed and produced ulimit output with the limit set.
+            assert!(
+                !reported.is_empty(),
+                "child should exec and report its core limit; got {text:?}"
+            );
+        }
+    }
+
+    /// `child_exec` (`--exec`) runs a different binary than the positional
+    /// command while presenting argv[0] = the command (C `childExec`,
+    /// procServ.cc:459-462). `program` is a bare display name (not a real
+    /// binary) and `child_exec` is `/bin/sh`: the shell must run (proving
+    /// the exec target is `/bin/sh`, not the name) and `echo $0` must print
+    /// the display name (proving argv[0]).
+    #[tokio::test]
+    async fn child_exec_runs_override_binary_with_command_as_argv0() {
+        let spec = ChildSpec {
+            program: PathBuf::from("ioc-display-name"),
+            args: vec!["-c".into(), "echo $0".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: Some(PathBuf::from("/bin/sh")),
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("ioc-display-name"),
+            "child_exec should run /bin/sh with argv[0]=program; got {text:?}"
         );
     }
 }

@@ -112,7 +112,10 @@ fn test_process_sends_value_with_delay() {
     rec.val = 42.0;
     let outcome = rec.process().unwrap();
     assert_eq!(rec.sent, 42.0);
-    assert_eq!(rec.wait, 1); // Busy during delay
+    // C `valuePut` clears `prec->wait = FALSE` right after the OUT write
+    // (throttleRecord.c:575): the value is written, nothing is queued, so
+    // WAIT is clear through the cooldown even though the timer is armed.
+    assert_eq!(rec.wait, 0, "immediate send wrote the value -> WAIT clear");
     // Should have ReprocessAfter action and WriteDbLink for OUT
     let has_reprocess = outcome
         .actions
@@ -134,7 +137,10 @@ fn test_process_queues_during_delay() {
     rec.val = 42.0;
     rec.process().unwrap(); // First value sent, delay starts
     assert_eq!(rec.sent, 42.0);
-    assert_eq!(rec.wait, 1);
+    // First (immediate) send wrote the value; nothing is queued, so WAIT
+    // is clear during the cooldown (C `valuePut` clears it at
+    // throttleRecord.c:575).
+    assert_eq!(rec.wait, 0, "immediate send -> WAIT clear, none queued");
 
     // Second value during delay — should be queued
     rec.val = 99.0;
@@ -148,6 +154,10 @@ fn test_process_queues_during_delay() {
         "Should have ReprocessAfter for pending drain"
     );
     assert_eq!(rec.sent, 42.0); // Not sent yet — still in delay
+    // A value is now queued, un-written: C `process()` set `prec->wait =
+    // TRUE` (:287) and the in-progress delay means `enterValue` never
+    // calls `valuePut` to clear it (:525). WAIT == "a value is pending".
+    assert_eq!(rec.wait, 1, "value queued during the delay -> WAIT set");
 }
 
 #[test]
@@ -279,12 +289,15 @@ fn test_pending_value_clamped_to_drive_limit_on_drain() {
     rec.val = 50.0;
     rec.process().unwrap();
     assert_eq!(rec.sent, 50.0);
-    assert_eq!(rec.wait, 1);
+    // Immediate send wrote the value -> WAIT clear (C `valuePut`:575).
+    assert_eq!(rec.wait, 0, "immediate send -> WAIT clear, none queued");
 
     // Out-of-range value arrives DURING the delay window — queued RAW.
     rec.val = 150.0;
     rec.process().unwrap();
     assert_eq!(rec.sent, 50.0, "queued value must not be sent yet");
+    // The clamped value is now queued, un-written -> WAIT set (C :287).
+    assert_eq!(rec.wait, 1, "value queued during the delay -> WAIT set");
 
     // Wait past the delay, then reprocess to drain the queued value.
     std::thread::sleep(std::time::Duration::from_millis(60));
@@ -458,26 +471,12 @@ fn test_limit_clipping_low_bound_order() {
     assert_eq!(rec.drvls, 1, "DRVLS Low");
 }
 
-#[test]
-fn test_sync_pre_process_actions_and_reset() {
-    use epics_base_rs::server::record::Record;
-
-    let mut rec = ThrottleRecord::default();
-    rec.sync = 1; // Process
-
-    // pre_process_actions() returns ReadDbLink for SINP→VAL
-    // and resets sync to 0.
-    let actions = rec.pre_process_actions();
-    assert_eq!(actions.len(), 1, "Should have one ReadDbLink action");
-    assert_eq!(
-        rec.sync, 0,
-        "sync should be reset after pre_process_actions"
-    );
-
-    // Calling again with sync=0 returns empty
-    let actions = rec.pre_process_actions();
-    assert!(actions.is_empty());
-}
+// SYNC (`valueSync`) and OV/SIV link classification are async, DB-backed
+// operations (C `dbGetLink`/`dbNameToAddr`); they are exercised end-to-end
+// through the framework in `tests/integration_tests.rs`, not as a
+// `process()`-only unit test. The old `pre_process_actions` SINP-read
+// mechanism was removed: SYNC must NOT process the record (only VAL is
+// pp(TRUE)), so the read moved into `special()`.
 
 // ============================================================
 // can_device_write
@@ -759,6 +758,11 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
     // self.dly > 0.0 now, so process() builds a Duration and arms the
     // delay timer. Must not panic.
     let outcome = rec.process().unwrap();
-    assert_eq!(rec.wait, 1, "a positive DLY arms the delay, WAIT set");
+    // The value was written on this immediate cycle; the timer is armed
+    // but nothing is queued, so WAIT is clear (C `valuePut`:575).
+    assert_eq!(
+        rec.wait, 0,
+        "a positive DLY arms the delay but the value is written -> WAIT clear"
+    );
     let _ = outcome;
 }

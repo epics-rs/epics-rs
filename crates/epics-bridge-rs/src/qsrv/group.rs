@@ -26,37 +26,98 @@ use crate::error::{BridgeError, BridgeResult};
 
 /// A single component in a field path: `name` with optional `[index]`.
 #[derive(Debug, Clone, PartialEq)]
-struct FieldNameComponent {
+pub(crate) struct FieldNameComponent {
     name: String,
     index: Option<u32>,
 }
 
-/// Parse a field path like `"a.b[0].c"` into components.
+/// Parse a field path like `"a.b[0].c"` into components, enforcing the pvxs
+/// `FieldName` constructor grammar (`ioc/fieldname.cpp:29-67`).
 ///
-/// Corresponds to C++ QSRV `FieldName` (fieldname.cpp:30-66).
-/// Empty components from trailing/leading/double dots are filtered out,
-/// matching pvxs validation (fieldname.cpp:35-36).
-fn parse_field_path(path: &str) -> Vec<FieldNameComponent> {
+/// This is the single source of truth for the group field-name grammar. pvxs
+/// splits the path on `.` with `std::getline` and **throws** — aborting that
+/// group's build — on a malformed path; the throw set is byte-faithful to
+/// `getline`/`strtol`:
+///   - empty input → no components (pvxs skips the split; no throw);
+///   - an empty leading or interior component (`.a`, `a..b`, `.`) is an error;
+///     a single terminal empty from a trailing `.` (`a.`) is dropped at EOF
+///     (`getline` fails on a zero-length extraction at end-of-stream) and is
+///     NOT an error;
+///   - a component is array-indexed only when it ENDS with `]`, in which case
+///     it must contain a `[` and a non-negative decimal subscript (`a[x]`,
+///     `a[1x]` are errors: the subscript is not a clean integer). A component
+///     with no trailing `]` (`a[`) is a plain literal name, bracket included.
+///
+/// The infallible [`parse_field_path`] wraps this for navigating names already
+/// validated at group-build time; `group_config::validate_field_name` calls it
+/// to reject a malformed member (a per-group skip, matching pvxs's per-group
+/// `try` at `groupconfigprocessor.cpp:431-446`).
+///
+/// Divergence note: this subscript grammar is intentionally STRICTER than pvxs
+/// and rejects three degenerate forms that pvxs's `strtol`
+/// (`fieldname.cpp:48-53`) accepts — we deliberately do NOT replicate the
+/// `strtol` accidents:
+///   - an empty subscript `a[]` — `strtol("]")` performs no conversion, returns
+///     0, and leaves `endScan` on the `]`, so pvxs silently reads it as element
+///     0; `"".parse::<u32>()` errors here;
+///   - a whitespace/sign-padded subscript `a[ 5]` — `strtol` skips leading
+///     whitespace and an optional sign and reads 5; `" 5".parse::<u32>()`
+///     errors here;
+///   - a negative or `u32`-overflowing subscript (`a[-1]`, `a[99999999999]`) —
+///     `strtol` accepts it and only fails later at navigation.
+///
+/// Group array indices are non-negative and bounded, so none of these could
+/// navigate to a real element; rejecting them at build is stricter-but-safe and
+/// never touches a real config. All three are build-time-only divergences.
+pub(crate) fn parse_field_path_checked(path: &str) -> Result<Vec<FieldNameComponent>, String> {
     if path.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    path.split('.')
-        .filter(|s| !s.is_empty())
-        .map(|part| {
-            if let Some(bracket) = part.find('[') {
-                let name = part[..bracket].to_string();
-                let rest = &part[bracket + 1..];
-                let index = rest.strip_suffix(']').and_then(|s| s.parse::<u32>().ok());
-                FieldNameComponent { name, index }
-            } else {
-                FieldNameComponent {
-                    name: part.to_string(),
-                    index: None,
-                }
-            }
-        })
-        .collect()
+    // Replicate `while (getline(splitter, part, '.'))`: the terminal empty
+    // produced by a single trailing '.' is dropped at EOF and never reaches
+    // the empty-component check; every other empty is an error.
+    let raw: Vec<&str> = path.split('.').collect();
+    let count = if path.ends_with('.') {
+        raw.len() - 1
+    } else {
+        raw.len()
+    };
+
+    let mut components = Vec::with_capacity(count);
+    for part in &raw[..count] {
+        if part.is_empty() {
+            return Err(format!("Empty field component in: {path}"));
+        }
+        if let Some(part) = part.strip_suffix(']') {
+            // Ends with ']': pvxs treats it as an array reference and requires
+            // a '[' with an integer subscript in between.
+            let open = part
+                .rfind('[')
+                .ok_or_else(|| format!("Invalid field array sub-script in : {path}"))?;
+            let index: u32 = part[open + 1..]
+                .parse()
+                .map_err(|_| format!("Invalid field array sub-script in : {path}"))?;
+            components.push(FieldNameComponent {
+                name: part[..open].to_string(),
+                index: Some(index),
+            });
+        } else {
+            components.push(FieldNameComponent {
+                name: part.to_string(),
+                index: None,
+            });
+        }
+    }
+    Ok(components)
+}
+
+/// Parse a field path for navigation of a name already validated at
+/// group-build time. Delegates to the canonical [`parse_field_path_checked`];
+/// a name that somehow fails the grammar yields no components (navigation then
+/// reports not-found), never a silently-normalized different structure.
+fn parse_field_path(path: &str) -> Vec<FieldNameComponent> {
+    parse_field_path_checked(path).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -689,12 +750,28 @@ impl GroupChannel {
 
     /// Read all member values and compose into a single PvStructure.
     ///
-    /// Internal method. Both `Channel::get()` and `GroupMonitor::poll()`
-    /// (via the cached `group_channel`) call this. Performs an access
-    /// read check on entry — defensive: callers also check, but if a
-    /// new caller is added later this guarantees the policy still holds.
+    /// The MONITOR snapshot entry point. `GroupMonitor::seed()` (the INIT
+    /// frame) and `GroupMonitor::poll()` (each value event) call this via the
+    /// cached monitor `group_channel`; `Channel::get()` bypasses it and calls
+    /// `read_group_atomic` directly with the operation atomicity. The access
+    /// read check is performed by `read_group_atomic` on entry.
+    ///
+    /// A monitor ALWAYS composes its snapshot atomically, independent of the
+    /// group's `+atomic` setting. pvxs locks the fired field's entire
+    /// trigger-target record set (`DBManyLocker G(field.lock)`,
+    /// `groupsource.cpp:326`) for every value callback and stamps the value
+    /// `atomic=true` unconditionally (`:401-405`). So a monitor read forces the
+    /// atomic path even for a `+atomic:false` group: otherwise a multi-target
+    /// trigger (`*` or a named set) whose targets update concurrently would
+    /// sample its marked leaves at different instants (the sequential
+    /// per-member `read_group_atomic(false)` path) and ship a torn snapshot the
+    /// wire still advertises as atomic (`monitor_stamp` forces
+    /// `stamp_atomic=true`). Forcing the atomic read here keeps that stamp
+    /// truthful by construction. A `+atomic:false` group's non-atomic reads
+    /// remain reachable only through GET's `read_group_atomic(false)`.
     pub(crate) async fn read_group(&self) -> BridgeResult<PvStructure> {
-        self.read_group_atomic(self.def.atomic).await
+        self.read_group_atomic(self.monitor_stamp || self.def.atomic)
+            .await
     }
 
     /// Root structure ID advertised for this group's value and descriptor.
@@ -740,6 +817,26 @@ impl GroupChannel {
         // recursive-read deadlock. So the atomic path resolves every
         // member against the pre-acquired guards and never re-locks.
         if atomic {
+            // C-parity: pvxs's `onGet` takes `DBManyLocker G(group.value.lock)`
+            // — the SAME `DBManyLock` the atomic PUT holds
+            // (`groupsource.cpp:492` onGet vs `:621` onPutGroup). Take the
+            // `lock_records` advisory gate over every member record BEFORE the
+            // per-record read guards below, so this atomic GET is mutually
+            // exclusive with a concurrent atomic group PUT (which also takes
+            // `lock_records`, `group.rs:1460`) and with a plain single-record
+            // write (which takes the same per-record gate via `lock_record`,
+            // `field_io.rs:630`). Every writer takes the advisory gate before
+            // its `RwLock` write guard, so while this GET owns the gate set no
+            // writer can hold any member's write guard — the incremental
+            // read-guard acquisition in `lock_group_records_read` becomes
+            // uncontended and consistent. Without this gate that incremental
+            // acquisition left a window: a write-preferring writer could update
+            // a later-sorted member between this GET's read of an earlier one,
+            // yielding a torn snapshot (B updated, A stale) that defeats the
+            // `atomic` flag — the GET-side twin of the PUT-side BR-R15 gap.
+            let member_records = group_member_record_names(&self.db, &self.def.members).await;
+            let _many_guard = self.db.lock_records(&member_records).await;
+
             let guards = lock_group_records_read(&self.db, &self.def.members).await;
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
@@ -1345,6 +1442,34 @@ impl GroupChannel {
         // that spells a link field outside the list and false-rejects
         // non-link fields whose names collide with the heuristic.
         for m in &self.def.members {
+            // A Structure/Const member has no backing dbChannel — pvxs's
+            // prep pass gates each check on `field.value` being non-null
+            // (groupsource.cpp:597), so skip those members here.
+            if m.channel.is_empty() {
+                continue;
+            }
+            let (record_name, field_name) =
+                epics_base_rs::server::database::parse_pv_name(&m.channel);
+            // pvxs runs `IOCSource::doPreProcessing` (iocsource.cpp:365-369)
+            // on every channeled member in this prep pass
+            // (groupsource.cpp:599-602) — before any marked/putable
+            // filtering and in every process mode — rejecting the whole
+            // group PUT if a member's backing record is DISP-disabled or the
+            // bound field is read-only. An UNMARKED DISP=1 member still fails
+            // the operation, matching C. This runs before the link-class
+            // check to mirror C's per-field ordering (doPreProcessing, then
+            // the link throw). Same gate the single-record path enforces —
+            // the `Force`/`Inhibit` group routes go through `put_pv`, which
+            // does not itself gate DISP.
+            self.db
+                .check_external_put_preconditions(record_name, field_name)
+                .await
+                .map_err(|e| {
+                    BridgeError::PutRejected(format!(
+                        "group {} PUT: member '{}' field '{}': {}",
+                        self.def.name, m.field_name, m.channel, e
+                    ))
+                })?;
             if self.member_targets_link_field(m).await {
                 return Err(BridgeError::PutRejected(format!(
                     "group {} PUT: member '{}' targets link field '{}' \
@@ -1376,6 +1501,21 @@ impl GroupChannel {
         let mut member_grants: HashMap<String, super::provider::WriteGrant> = HashMap::new();
         for m in &ordered {
             if !member_is_active(m) {
+                continue;
+            }
+            // A `proc` member is a processing TRIGGER, not a value write:
+            // pvxs runs the write-ACF gate `doFieldPreProcessing`
+            // (`canWrite`, iocsource.cpp:382) only for a `changing` field —
+            // `marked && putable` with a `field.value`
+            // (groupsource.cpp:557,564) — and a proc member has no value
+            // field, so it is never `changing` and `canWrite` is never
+            // checked for it, while its record is still processed
+            // unconditionally (`doPostProcessing`, :568). Gating a proc
+            // trigger on write access is a category error (`dbProcess` is not
+            // a `dbPutField`); skip the per-member write-ACF check for proc,
+            // matching pvxs. Its DISP/read-only prep gate (`doPreProcessing`)
+            // still ran in the precondition pass above.
+            if m.mapping == FieldMapping::Proc {
                 continue;
             }
             if m.channel.is_empty() {
@@ -2400,7 +2540,27 @@ impl super::provider::PvaMonitor for GroupMonitor {
             };
 
             let group_channel = self.group_channel.as_ref()?;
-            let value = group_channel.read_group().await.ok()?;
+            let value = match group_channel.read_group().await {
+                Ok(v) => v,
+                Err(e) => {
+                    // pvxs wraps each group value/property refresh in a
+                    // try/catch that logs and returns from the callback
+                    // *without posting*, leaving the subscription alive
+                    // (`groupsource.cpp:350-352`). A per-event read or
+                    // conversion failure (a member record gone, a value
+                    // conversion error, a mid-stream ACL revocation on one
+                    // member) must therefore drop a single update — not map
+                    // to `None`, which the forward task reads as source-close
+                    // and turns into a spurious MONITOR FINISH that tears the
+                    // whole group subscription down.
+                    tracing::warn!(
+                        group = %self.def.name,
+                        error = %e,
+                        "qsrv group monitor: member read failed; skipping event, subscription kept open"
+                    );
+                    continue;
+                }
+            };
             // Resolve value-shape-dependent leaves against the concrete
             // composed value: an NTEnum member's value/alarm event marks
             // only `value.index`, never the property-only `value.choices`
@@ -3362,6 +3522,75 @@ mod tests {
         assert_eq!(comps[1].index, Some(2));
     }
 
+    // ---- Q1: field-name grammar mirrors the pvxs `FieldName` ctor throw set ----
+
+    /// An empty leading or interior component is an error (pvxs `getline`
+    /// yields an empty part → `throw "Empty field component"`,
+    /// fieldname.cpp:35-36). A single trailing '.' is dropped at EOF and is
+    /// NOT an error.
+    #[test]
+    fn parse_field_path_checked_empty_component() {
+        assert!(parse_field_path_checked(".a").is_err(), "leading dot");
+        assert!(
+            parse_field_path_checked("a..b").is_err(),
+            "interior double dot"
+        );
+        assert!(parse_field_path_checked(".").is_err(), "lone dot");
+        assert!(
+            parse_field_path_checked("a..").is_err(),
+            "interior empty before trailing"
+        );
+
+        // Trailing dot: `getline` fails the zero-length final extraction at
+        // EOF, so `a.` is just `a` — no error (fieldname.cpp getline loop).
+        let comps = parse_field_path_checked("a.").expect("trailing dot is dropped, not an error");
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].name, "a");
+    }
+
+    /// A component ending in ']' must carry a '[' and a non-negative decimal
+    /// subscript. NOTE: `value[]` and `value[-1]` are rejected here
+    /// INTENTIONALLY stricter than pvxs — its `strtol` (fieldname.cpp:48-53)
+    /// reads `value[]` as element 0 and accepts a negative/overflow index,
+    /// failing only later at navigation. We reject at build (see the divergence
+    /// note on `parse_field_path_checked`); this test pins the stricter Rust
+    /// behavior, it is NOT asserting a pvxs match. A non-']'-terminated
+    /// component is a literal name.
+    #[test]
+    fn parse_field_path_checked_bad_subscript() {
+        assert!(
+            parse_field_path_checked("value[x]").is_err(),
+            "non-integer subscript"
+        );
+        assert!(
+            parse_field_path_checked("value[]").is_err(),
+            "empty subscript — stricter than pvxs, which reads it as element 0"
+        );
+        assert!(
+            parse_field_path_checked("value[1x]").is_err(),
+            "trailing garbage"
+        );
+        assert!(
+            parse_field_path_checked("value[-1]").is_err(),
+            "negative subscript — stricter than pvxs, which strtol-accepts then fails at nav"
+        );
+
+        // `value[` does not end with ']' → pvxs keeps it as a literal field
+        // name (bracket included), no throw. The old parser renamed it to
+        // `value`; the canonical grammar preserves the literal.
+        let comps = parse_field_path_checked("value[").expect("no trailing ']' → literal name");
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].name, "value[");
+        assert_eq!(comps[0].index, None);
+    }
+
+    /// Empty path → no components, no error (pvxs skips the split for an empty
+    /// `fieldName`; the empty-name policy is enforced separately).
+    #[test]
+    fn parse_field_path_checked_empty_ok() {
+        assert_eq!(parse_field_path_checked("").unwrap(), Vec::new());
+    }
+
     // ---- BUG 4: atomic-group PUT serialization ----
 
     /// Build a two-member atomic group over `A:rec` / `B:rec`,
@@ -3867,6 +4096,60 @@ mod tests {
         );
     }
 
+    /// Regression (Q39): a per-event `read_group()` failure — a member
+    /// record removed mid-stream, a value-conversion error, or an ACL
+    /// revocation on one member — must drop that single update and leave
+    /// the subscription open. pvxs wraps each group value/property refresh
+    /// in a try/catch that logs and returns from the callback WITHOUT
+    /// posting (`groupsource.cpp:350-352`). Mapping the error to `None`
+    /// instead reads as source-close in the forward task and tears the
+    /// whole group monitor down with a spurious MONITOR FINISH.
+    #[tokio::test]
+    async fn q39_group_monitor_member_read_error_skips_event_keeps_open() {
+        use crate::qsrv::provider::PvaMonitor;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("Q39:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "Q39:GRP": {
+                "v": {"+type": "plain", "+channel": "Q39:rec.VAL"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let mut mon = GroupMonitor::new(db.clone(), def);
+        mon.start().await.expect("group monitor starts");
+
+        // Retain a keepalive sender so the fan-in channel stays open, then
+        // make the member unreadable: `read_group()` now fails with
+        // `RecordNotFound`.
+        let tx = mon.event_tx.clone().expect("keepalive sender present");
+        assert!(db.remove_record("Q39:rec").await, "member record removed");
+
+        // Inject a value event for the now-unreadable member.
+        tx.send(MemberEvent {
+            member_index: 0,
+            kind: MemberEventKind::Value,
+            mask: DbeMask::VALUE | DbeMask::ALARM,
+        })
+        .await
+        .expect("event queued on keepalive channel");
+
+        // poll() must consume the event, hit the read failure, log+skip,
+        // and PARK on the still-open channel — never return `None` (FINISH).
+        // A bounded poll therefore TIMES OUT; pre-fix it returned `None`
+        // (Some(None)) immediately.
+        let polled = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
+        assert!(
+            polled.is_err(),
+            "a member read error must skip the event and keep the \
+             subscription open (park), not FINISH — got {polled:?}"
+        );
+    }
+
     /// Regression: a group MONITOR's initial seed frame must carry the
     /// same `record._options` stamping (atomic = true, negotiated
     /// queueSize) as every subsequent update. pvxs delivers the first
@@ -4317,6 +4600,136 @@ mod tests {
         }
     }
 
+    /// Regression (Q50): the atomic group GET must hold the same
+    /// `DBManyLock`-equivalent gate set the atomic PUT holds — pvxs's
+    /// `onGet` takes `DBManyLocker G(group.value.lock)`
+    /// (`groupsource.cpp:492`), the identical lock its `onPutGroup` takes
+    /// (`:621`). Holding one member's gate externally must block the atomic
+    /// GET from entering its read loop, and the GET must complete once the
+    /// gate is released. Pre-fix the atomic GET took only per-record `RwLock`
+    /// read guards incrementally via `lock_group_records_read` and never
+    /// `lock_records`, so a concurrent writer could slip a later-sorted
+    /// member write between this GET's read of an earlier one — the torn
+    /// snapshot the `atomic` flag exists to prevent (GET-side twin of
+    /// `br_r15_atomic_put_blocks_on_member_record_gates`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q50_atomic_get_blocks_on_member_record_gates() {
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        // Hold one member record's gate. The atomic group GET must block
+        // trying to acquire the gate set via `lock_records`.
+        let held = db.lock_record("B:rec").await;
+
+        let get = tokio::spawn(async move { channel.read_group().await.unwrap() });
+
+        // Give the spawned GET real time to run: if it did not take
+        // `lock_records`, it would read both members and finish inside this
+        // window. Blocked on the held gate, it stays unfinished.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !get.is_finished(),
+            "atomic group GET must block while a member-record gate is held"
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(Duration::from_secs(5), get)
+            .await
+            .expect("atomic GET must complete once the member gate is free")
+            .expect("atomic GET task panicked");
+
+        // Both members read back their fixture values under one consistent
+        // snapshot.
+        match get_nested_field(&result, "a").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 0.0)
+            }
+            other => panic!("member a: expected Double(0.0), got {other:?}"),
+        }
+        match get_nested_field(&result, "b").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 0.0)
+            }
+            other => panic!("member b: expected Double(0.0), got {other:?}"),
+        }
+    }
+
+    /// Regression (Q38): a MONITOR over a `+atomic:false` group must still
+    /// compose its snapshot atomically — pvxs locks the fired field's whole
+    /// trigger-target set (`DBManyLocker G(field.lock)`, `groupsource.cpp:326`)
+    /// for every value callback and stamps `atomic=true` unconditionally
+    /// (`:401-405`), regardless of the group's `+atomic` setting. The monitor
+    /// `read_group()` therefore forces the atomic many-lock path even though
+    /// the group is non-atomic. Holding one member's gate externally must block
+    /// the monitor read from entering its loop; pre-fix the monitor took the
+    /// sequential `read_group_atomic(false)` path (no `lock_records`) and would
+    /// finish while a member gate was held, shipping a torn snapshot the wire
+    /// still stamps atomic. A plain non-atomic GET (no monitor stamp) still
+    /// takes the sequential path — asserted here as the contrast.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn q38_nonatomic_group_monitor_read_composes_atomically() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("A:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("B:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // A NON-atomic group.
+        let cfg = r#"{
+            "NONATOMIC:GRP": {
+                "+atomic": false,
+                "a": {"+type": "plain", "+channel": "A:rec.VAL", "+putorder": 0},
+                "b": {"+type": "plain", "+channel": "B:rec.VAL", "+putorder": 1}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        assert!(!def.atomic, "fixture group must be +atomic:false");
+
+        // Hold one member record's gate. A monitor-stamped read must block on
+        // `lock_records` despite the group being non-atomic.
+        let held = db.lock_record("B:rec").await;
+
+        let mon_channel = GroupChannel::new(db.clone(), def.clone()).with_monitor_stamp();
+        let mon = tokio::spawn(async move { mon_channel.read_group().await.unwrap() });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !mon.is_finished(),
+            "a +atomic:false MONITOR read must block while a member gate is held \
+             (it forces the atomic many-lock so its atomic=true stamp is truthful)"
+        );
+
+        // Contrast: a plain non-atomic GET (no monitor stamp) does NOT take the
+        // many-lock — it reads sequentially and completes with the gate held.
+        let get_channel = GroupChannel::new(db.clone(), def.clone());
+        let get = tokio::spawn(async move { get_channel.read_group().await.unwrap() });
+        let get_done = tokio::time::timeout(Duration::from_secs(5), get)
+            .await
+            .expect("non-atomic GET must finish without the many-lock")
+            .expect("non-atomic GET task panicked");
+        assert!(
+            get_nested_field(&get_done, "a").is_some(),
+            "non-atomic GET returns a snapshot without blocking"
+        );
+
+        // Release the gate; the monitor read now completes atomically.
+        drop(held);
+        let mon_snapshot = tokio::time::timeout(Duration::from_secs(5), mon)
+            .await
+            .expect("monitor read must complete once the member gate is free")
+            .expect("monitor read task panicked");
+        match get_nested_field(&mon_snapshot, "a").as_deref() {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => {
+                assert_eq!(*v, 0.0)
+            }
+            other => panic!("member a: expected Double(0.0), got {other:?}"),
+        }
+    }
+
     /// A partial group PUT must not access-check unmarked members. pvxs
     /// builds the per-field SecurityClient over the *changed* fields
     /// (groupsource.cpp:161,515,547-567), so an unwritable member that
@@ -4392,6 +4805,86 @@ mod tests {
         assert!(
             matches!(res, Err(BridgeError::PutRejected(_))),
             "full PUT including denied member b must be rejected, got {res:?}"
+        );
+    }
+
+    /// Regression (Q51): a group PUT must NOT enforce per-member write ACF on a
+    /// `proc` member. pvxs runs the write-ACF gate `doFieldPreProcessing`
+    /// (`canWrite`) only for a `changing` value field (groupsource.cpp:564); a
+    /// proc member is never `changing` (no `field.value`), so a client with
+    /// group-PUT rights but NO write permission on the proc member's backing
+    /// record still triggers processing and gets a normal reply
+    /// (`doPostProcessing`, :568). Pre-fix Rust resolved a `write_grant` for
+    /// the always-active proc member and a single denial failed the whole PUT.
+    #[tokio::test]
+    async fn q51_group_put_does_not_write_acf_check_proc_member() {
+        use super::super::provider::{AccessContext, AccessControl};
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        // Deny writes to the proc member's backing channel only.
+        struct DenyChannel(&'static str);
+        impl AccessControl for DenyChannel {
+            fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+                channel != self.0
+            }
+        }
+
+        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
+            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("VAL:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("HOOK:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "PROC:ACF:GRP": {
+                "+atomic": false,
+                "v":  {"+type":"plain","+channel":"VAL:rec.VAL","+putorder":0},
+                "go": {"+type":"proc","+channel":"HOOK:rec"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+
+        // The proc member's channel is write-denied; the value member is writable.
+        let access =
+            AccessContext::with_identity(Arc::new(DenyChannel("HOOK:rec")), "u".into(), "h".into());
+        let channel = GroupChannel::new(db.clone(), def).with_access(access);
+
+        assert_eq!(
+            init_flag(&db, "HOOK:rec").await,
+            0,
+            "proc target unprocessed at start"
+        );
+
+        // PUT marking the writable value member; the write-denied proc member
+        // must NOT block the PUT and must still be processed.
+        let mut put = PvStructure::new("structure");
+        put.fields
+            .push(("v".into(), PvField::Scalar(ScalarValue::Double(5.0))));
+        channel
+            .put_with_options(
+                &put,
+                super::super::channel::PutOptions::default(),
+                Some(false),
+            )
+            .await
+            .expect("group PUT must succeed: a write-denied proc member is not write-ACF checked");
+
+        assert_eq!(
+            init_flag(&db, "HOOK:rec").await,
+            1,
+            "the proc member's record was processed despite the write deny"
         );
     }
 }

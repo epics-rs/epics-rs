@@ -1,8 +1,12 @@
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
     FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record, link_field_type,
+};
+use epics_base_rs::server::records::link_status::{
+    LINK_CON, LINK_EXT_NC, LinkStatusGen, classify_link,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -16,6 +20,14 @@ const THROTTLE_DRVLS_CHOICES: &[&str] = &["Normal", "Low Limit", "High Limit"];
 const THROTTLE_STS_CHOICES: &[&str] = &["Unknown", "Error", "Success"];
 const THROTTLE_OV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 const THROTTLE_SYNC_CHOICES: &[&str] = &["Idle", "Process"];
+
+// `menu(throttleSTS)` indices (throttleRecord.dbd) — STS is set only by a
+// real link operation (`valuePut`/`valueSync`), never by the limit block.
+const THROTTLE_STS_ERR: i16 = 1; // throttleSTS_ERR
+const THROTTLE_STS_SUC: i16 = 2; // throttleSTS_SUC
+// `menu(throttleSYNC)` indices: 0=Idle, 1=Process (throttleRecord.dbd).
+const THROTTLE_SYNC_IDLE: i16 = 0; // throttleSYNC_IDLE
+const THROTTLE_SYNC_PROCESS: i16 = 1; // throttleSYNC_PROC
 
 /// Throttle record — rate-limits value changes to prevent device damage.
 ///
@@ -87,6 +99,19 @@ pub struct ThrottleRecord {
     /// queuing-during-delay cycle or a rejected out-of-range cycle does
     /// NOT fire FLNK.
     out_written: bool,
+    /// Async DB handle + this record's name, installed by the framework via
+    /// `set_async_context` when the record is registered. `None` until then
+    /// (e.g. a `process()`-only unit test that never registers). Drives the
+    /// two operations C performs off the synchronous `process()` path: the
+    /// `SYNC` SINP read (C `valueSync` → `dbGetLink`) and the OV/SIV
+    /// link-status classification (C `init_record`/`special` → `dbNameToAddr`).
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    /// Generation gate for OV/SIV link-status refreshes — only the latest
+    /// classification may publish, so an init-time snapshot finishing late
+    /// cannot clobber a newer `special()` re-point (mirrors sseq; C
+    /// re-validates OV/SIV on every OUT/SINP `special()`). Scoped to the
+    /// OV/SIV refresh only; the `SYNC` read is not gated (see `special`).
+    link_gen: LinkStatusGen,
 }
 
 impl Default for ThrottleRecord {
@@ -120,6 +145,8 @@ impl Default for ThrottleRecord {
             last_send_time: None,
             pending_value: None,
             out_written: false,
+            async_ctx: None,
+            link_gen: LinkStatusGen::default(),
         }
     }
 }
@@ -166,6 +193,87 @@ fn validate_dly(v: f64) -> CaResult<()> {
 }
 
 impl ThrottleRecord {
+    /// Classify the OUT and SINP links into OV/SIV and post the result,
+    /// mirroring C `init_record`/`special` link management
+    /// (throttleRecord.c:171-205, 339-374): CONSTANT→`Constant`, a PV on
+    /// this IOC→`Local PV`, else→`Ext PV NC`. epics-base-rs has no CA
+    /// client, so an external link never reaches `Ext PV OK` — C's
+    /// `checkLinkCallback` EXT transition (throttleRecord.c:660-740) is
+    /// unreachable here, the same limitation as sseq's connection re-poll.
+    /// Runs at record init (via `set_async_context`) and on every OUT/SINP
+    /// `special()`. A no-op when the record is not registered (no handle).
+    fn refresh_link_status(&self) {
+        let Some((name, handle)) = &self.async_ctx else {
+            return;
+        };
+        let name = name.clone();
+        let handle = handle.clone();
+        let out = self.out.clone();
+        let sinp = self.sinp.clone();
+        let link_gen = self.link_gen.clone();
+        // Stamp this refresh so a later re-point (an OUT/SINP `special()`)
+        // supersedes an init-time snapshot that finishes late.
+        let token = link_gen.next();
+        tokio::spawn(async move {
+            // Let `add_record` finish registering before the init post —
+            // this task may be spawned from `set_async_context`, which runs
+            // just before the record is inserted into the map.
+            tokio::task::yield_now().await;
+            let (ov, _) = classify_link(&handle, &out).await;
+            let (siv, _) = classify_link(&handle, &sinp).await;
+            if link_gen.is_current(token) {
+                let _ = handle
+                    .post_fields(
+                        &name,
+                        vec![
+                            ("OV".to_string(), EpicsValue::Short(ov)),
+                            ("SIV".to_string(), EpicsValue::Short(siv)),
+                        ],
+                    )
+                    .await;
+            }
+        });
+    }
+
+    /// C `valueSync` (throttleRecord.c:616-656): read SINP into VAL as
+    /// `DBR_DOUBLE` and post VAL/STS/SYNC — NO OUT write, NO process, NO
+    /// FLNK. A CONSTANT SINP (SIV=`Constant`) yields STS=Error with no read
+    /// (C's `plink->type == CONSTANT` else branch); a local read failure
+    /// also yields STS=Error. SYNC is reset to Idle on completion. Only
+    /// called for SIV ∈ {Local, Constant} (the `EXT_NC` skip is in
+    /// `special`). Not generation-gated: a rare double-SYNC resolves
+    /// last-scheduled-wins, benign because VAL is latest-value anyway.
+    fn spawn_value_sync(&self) {
+        let Some((name, handle)) = &self.async_ctx else {
+            return;
+        };
+        let name = name.clone();
+        let handle = handle.clone();
+        let sinp = self.sinp.clone();
+        let siv = self.siv;
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(3);
+            if siv == LINK_CON {
+                // C `valueSync`: a CONSTANT SINP is never read → STS=Error.
+                fields.push(("STS".to_string(), EpicsValue::Short(THROTTLE_STS_ERR)));
+            } else {
+                // SIV=Local: C `dbGetLink(SINP, DBR_DOUBLE, &sival)` — read
+                // the source coerced to double, regardless of its native type.
+                match handle.read_link_value(&sinp).await.and_then(|v| v.to_f64()) {
+                    Some(v) => {
+                        fields.push(("VAL".to_string(), EpicsValue::Double(v)));
+                        fields.push(("STS".to_string(), EpicsValue::Short(THROTTLE_STS_SUC)));
+                    }
+                    None => fields.push(("STS".to_string(), EpicsValue::Short(THROTTLE_STS_ERR))),
+                }
+            }
+            // C posts SYNC=Idle last (throttleRecord.c:651).
+            fields.push(("SYNC".to_string(), EpicsValue::Short(THROTTLE_SYNC_IDLE)));
+            let _ = handle.post_fields(&name, fields).await;
+        });
+    }
+
     /// Check drive limits and optionally clip the value.
     ///
     /// Mirrors the limit block of C `throttleRecord.c:242-283`. When
@@ -365,19 +473,6 @@ impl Record for ThrottleRecord {
         "throttle"
     }
 
-    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
-        // When SYNC=1, read SINP into VAL BEFORE process() runs.
-        // This matches C EPICS where dbGetLink is synchronous/immediate.
-        if self.sync == 1 {
-            self.sync = 0;
-            return vec![ProcessAction::ReadDbLink {
-                link_field: "SINP",
-                target_field: "VAL",
-            }];
-        }
-        Vec::new()
-    }
-
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `throttleRecord.c:231-312`. The control flow here mirrors C's
         // `process()`:
@@ -438,9 +533,18 @@ impl Record for ThrottleRecord {
                             value: EpicsValue::Double(self.sent),
                         });
                     }
+                    // C `valuePut` clears `prec->wait = FALSE` immediately
+                    // after the OUT write (throttleRecord.c:575) and only
+                    // THEN re-arms the timer (:592-593). WAIT means "an
+                    // un-written value is pending", not "a delay timer is
+                    // running": the just-drained value is now written, the
+                    // queue is empty (`pending_value` was taken), so WAIT
+                    // stays clear through the new cooldown. A value that
+                    // arrives during it re-sets WAIT in the queue branch
+                    // below.
                     if self.dly > 0.0 {
                         self.delay_active = true;
-                        self.wait = 1;
+                        self.wait = 0;
                         let delay = std::time::Duration::from_secs_f64(self.dly);
                         actions.push(ProcessAction::ReprocessAfter(delay));
                     }
@@ -491,8 +595,13 @@ impl Record for ThrottleRecord {
         // `wait_flag = 1` and returns; the running `delayFuncCb` will
         // call `valuePut()` and send whatever `prec->val` is when it
         // fires. The port stashes the latest limit-checked value (last
-        // value wins, as in C) so the drain re-process sends it. WAIT
-        // stays True; the in-flight ReprocessAfter is left to fire.
+        // value wins, as in C) so the drain re-process sends it. This is
+        // the ONE state where C leaves WAIT set: `process()` set
+        // `prec->wait = TRUE` (throttleRecord.c:287) and, with a delay in
+        // progress, `enterValue` does NOT call `valuePut` (:525), so
+        // nothing clears it — the value is now queued, un-written. WAIT=1
+        // therefore means exactly `pending_value.is_some()`; the
+        // in-flight ReprocessAfter is left to fire.
         if self.delay_active {
             self.pending_value = Some(self.val);
             self.wait = 1;
@@ -519,14 +628,18 @@ impl Record for ThrottleRecord {
         }
 
         // Arm the delay timer (C `callbackRequestDelayed`, lines 592-593)
-        // when DLY > 0. WAIT is True for the duration of the delay: C
-        // sets `prec->wait = TRUE` before enterValue, and although
-        // `valuePut` clears it after the OUT write, the freshly-armed
-        // timer means the operator-visible post-cycle state is Busy
-        // until the drain completes.
+        // when DLY > 0, and clear WAIT. C `process()` sets `prec->wait =
+        // TRUE` before `enterValue` (throttleRecord.c:287), but on this
+        // immediate path `valuePut` runs in the same cycle and clears
+        // `prec->wait = FALSE` right after the OUT write (:575) BEFORE
+        // re-arming the timer. C's WAIT means "an un-written value is
+        // pending", not "a delay timer is running": the value just
+        // written is no longer pending, so WAIT is clear through the
+        // cooldown even though the timer is armed. WAIT is re-set only
+        // when a value is queued during the delay (the branch above).
         if self.dly > 0.0 {
             self.delay_active = true;
-            self.wait = 1;
+            self.wait = 0;
             let delay = std::time::Duration::from_secs_f64(self.dly);
             actions.push(ProcessAction::ReprocessAfter(delay));
             return Ok(ProcessOutcome::complete_with(actions));
@@ -586,6 +699,25 @@ impl Record for ThrottleRecord {
                     self.drvls = 2; // throttleDRVLS_HIGH
                 } else {
                     self.drvls = 0; // throttleDRVLS_NORM
+                }
+            }
+            // C `special()` OUT/SINP case (throttleRecord.c:339-374,
+            // `SPC_MOD`): re-classify the changed link's validity menu
+            // (OV for OUT, SIV for SINP) — CONSTANT→`Constant`, a PV on
+            // this IOC→`Local PV`, else→`Ext PV NC`. The new link string the
+            // put just stored is classified off-thread (needs an async DB
+            // lookup, C `dbNameToAddr`); `refresh_link_status` re-does BOTH
+            // OV and SIV, which is harmless and keeps a single owner.
+            "OUT" | "SINP" => self.refresh_link_status(),
+            // C `special()` SYNC case (throttleRecord.c:376-389): a put of
+            // `SYNC=Process` triggers `valueSync` — read SINP into VAL and
+            // post (NO OUT write, NO process). C gates on `siv`: an
+            // unconnected external SINP (`EXT_NC`) is NOT synced (its
+            // `checkLink` can never connect here — no CA client), so SYNC
+            // is left in `Process`, matching C leaving it pending.
+            "SYNC" => {
+                if self.sync == THROTTLE_SYNC_PROCESS && self.siv != LINK_EXT_NC {
+                    self.spawn_value_sync();
                 }
             }
             _ => {}
@@ -782,6 +914,41 @@ impl Record for ThrottleRecord {
             self.out_written = false;
         }
         Ok(())
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+        // C `init_record` classifies the OUT/SINP links into OV/SIV and
+        // posts the initial status (throttleRecord.c:171-205). This is the
+        // framework's init-time async hook (the handle now exists), so
+        // classify here — the record's OUT/SINP db fields are already loaded.
+        self.refresh_link_status();
+    }
+
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        // OV/SIV (link-status classifier) and STS (the SYNC SINP read) are
+        // read-only to *clients* — the field_io `SPC_NOMOD` gate rejects a
+        // client put — but the trusted out-of-band post (`post_fields` →
+        // here) must land. Store them directly; the strict `put_field` arm
+        // still rejects a client write (same split sseq uses for its
+        // read-only DOLnV/LNKnV diagnostics). Every other field, including
+        // the writable VAL/SYNC the SYNC post also writes, falls through to
+        // `put_field`.
+        match (name, &value) {
+            ("OV", EpicsValue::Short(v)) => {
+                self.ov = *v;
+                Ok(())
+            }
+            ("SIV", EpicsValue::Short(v)) => {
+                self.siv = *v;
+                Ok(())
+            }
+            ("STS", EpicsValue::Short(v)) => {
+                self.sts = *v;
+                Ok(())
+            }
+            _ => self.put_field(name, value),
+        }
     }
 }
 

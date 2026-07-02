@@ -317,68 +317,350 @@ async fn test_poll_loop_lifecycle() {
     assert!(result.is_ok(), "poll loop should terminate after Shutdown");
 }
 
-/// BUG 5 regression: device-support `init()` must reseed the controller
-/// with the pass0-restored DVAL even when that restored value is exactly
-/// `0.0`. C `init_record` always syncs the controller to the restored
-/// position. An earlier Rust version gated the sync on `dval != 0.0`, so
-/// a genuine restored position of `0.0` was treated as "no restored
-/// value" and the controller was left at its stale position.
+/// R61: a zero idle poll interval is event-only, never a busy-spin.
+/// C `asynMotorController::asynMotorPoller` (asynMotorController.cpp:633-634)
+/// treats `idlePollPeriod_ == 0` as "block on the event, no timed poll". The
+/// Rust loop guards the `sleep(interval)` select arm on `!interval.is_zero()`,
+/// so with a settled (done, not-moving) motor StartPolling triggers exactly
+/// one poll and the loop then blocks on the command channel. Without the guard
+/// `sleep(Duration::ZERO)` would fire immediately on every iteration, spinning
+/// the CPU and flooding io_intr.
 #[tokio::test]
-async fn init_reseeds_controller_when_restored_dval_is_zero() {
-    // Controller (SimMotor) starts at a stale position of 5.0 — as if the
-    // hardware powered up somewhere other than the saved 0.0.
-    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
-    let mut setup = make_builder(motor.clone()).build();
+async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let device_state = motor_rs::device_state::new_shared_state();
+    let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
-    // Simulate autosave restoring a saved position of exactly 0.0 during
-    // pass0: a DVAL field write records `last_write = Some(Dval)`, which
-    // is the proper "a position was restored" signal.
-    setup
-        .record
-        .put_field("DVAL", EpicsValue::Double(0.0))
-        .unwrap();
-    assert!(
-        setup.record.was_position_restored(),
-        "DVAL write must register as a restored position"
+    // idle interval 0 == C idlePollPeriod_ == 0 (event-only); moving 5ms.
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        poll_cmd_rx,
+        io_intr_tx,
+        motor,
+        device_state.clone(),
+        Duration::from_millis(5),
+        Duration::ZERO,
+        0,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+
+    // Continuously drain io_intr so a (would-be) busy-spin is NOT throttled by
+    // channel backpressure — without draining, a spin stalls on the full
+    // channel and masks itself.
+    tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
+
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+
+    // Give any erroneous busy-spin a 100ms window to accumulate polls.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // seq starts at 1 (init), +1 for the single StartPolling poll → 2.
+    // A busy-spin would drive it into the hundreds/thousands.
+    let seq = device_state
+        .lock()
+        .unwrap()
+        .latest_status
+        .as_ref()
+        .map(|s| s.seq)
+        .unwrap_or(0);
+    assert_eq!(
+        seq, 2,
+        "zero idle interval must poll once on StartPolling then block (event-only), got seq {seq}"
     );
 
-    // init() must reseed the controller to the restored 0.0.
-    setup.device_support.init(&mut setup.record).unwrap();
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
 
-    // The SimMotor must have been driven to 0.0 by set_position.
-    let pos = {
-        let mut m = motor.lock().unwrap();
-        m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
+/// Idle change-detection: a stationary axis polled at a NON-zero idle interval
+/// must not re-post on every poll. C `asynMotorAxis::callParamCallbacks`
+/// (asynMotorAxis.cpp:316-322) fires the status callback — which drives the
+/// record's process() — only when `statusChanged_` is set; on an unchanging
+/// idle poll C posts nothing. A *forced* poll (StartPolling, the analogue of
+/// C `motorUpdateStatus_` forcing `statusChanged_=1`) still posts even when the
+/// status is identical, so STUP/GET_INFO acks and readback refreshes are never
+/// stranded.
+#[tokio::test]
+async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let device_state = motor_rs::device_state::new_shared_state();
+    let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(64);
+
+    // Non-zero idle interval so the timed arm fires repeatedly; moving 5ms.
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        poll_cmd_rx,
+        io_intr_tx,
+        motor,
+        device_state.clone(),
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        0,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+
+    // Drain io_intr so a (would-be) re-post spree is not throttled by the
+    // channel and is observable through the seq.
+    tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
+
+    let seq = |ds: &motor_rs::device_state::SharedDeviceState| {
+        ds.lock()
+            .unwrap()
+            .latest_status
+            .as_ref()
+            .map(|s| s.seq)
+            .unwrap_or(0)
     };
+
+    // StartPolling forces one post → seq 1→2.
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        seq(&device_state),
+        2,
+        "a stationary axis must not re-post on every idle poll (change-gated)"
+    );
+
+    // A second StartPolling is a FORCED poll → re-posts even though the status
+    // is byte-identical → seq 2→3.
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        seq(&device_state),
+        3,
+        "a forced poll must post even when status is unchanged (STUP/GET_INFO ack)"
+    );
+
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
+/// Held-jog resume must survive the idle-poll change-gate. The operator holds
+/// JOGF during a positional move; on a close-enough completion the jog resumes
+/// on a follow-up record pass (the Idle-arm `dispatch_latent_collection`). C
+/// strands this (special() arms MIP_JOG_REQ only at mip==MIP_DONE,
+/// motorRecord.cc:3045, so a button pressed during a move is never armed); Rust
+/// preserves the resume as a deliberate divergence. With the change-gate, a
+/// now-stationary axis no longer notifies on an unchanged poll, so the resume
+/// would strand unless `finalize_motion` requests one forced poll.
+///
+/// This test drives the record ONLY on `io_intr` — the production wiring —
+/// unlike the unit test `close_enough_defers_held_jog_to_next_idle_poll`, which
+/// calls `check_completion()` directly and so cannot observe a missing forced
+/// poll. Without the `finalize_motion` request_poll the settle poll is
+/// suppressed, no `io_intr` fires, and the axis stays Idle until the deadline.
+// current_thread is required: the synchronous drain below is race-free only
+// because the poll-loop task cannot run during it (no await). On a multi_thread
+// runtime the forced poll could fire concurrently mid-drain and be drained,
+// flaking the assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let mut setup = make_builder(motor).build();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    // Drive the record only when the poll loop fires io_intr (production wiring).
+    let mut io_intr_rx = setup
+        .device_support
+        .io_intr_receiver()
+        .expect("device support owns the io_intr receiver until iocInit wiring");
+    let poll_handle = tokio::spawn(setup.poll_loop.run());
+
+    // Startup pass.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    // Move at a moderate speed (≈40ms over several 5ms polls) so the loop
+    // traverses genuine moving-phase notifications before completion. Strand
+    // detection does NOT depend on this speed — the Phase-2 drain below is what
+    // prevents a buffered moving-phase io_intr from masking the strand, so a
+    // near-instant move detects it just as reliably. Lands within RDBD of the
+    // target (close-enough on arrival).
+    setup.record.vel.velo = 50.0;
+    setup.record.retry.rdbd = 0.5;
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(2.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    // Operator holds JOGF DURING the move (mip == MOVE, not DONE): MIP_JOG_REQ
+    // is never armed — exactly the case C strands.
+    setup.record.ctrl.jogf = true;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    // Phase 1: process io_intr until the move completes (finalize runs; the jog
+    // is NOT fired in the completion pass).
+    let mut completed = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), io_intr_rx.recv()).await {
+            Ok(Some(())) => {
+                setup.record.process().unwrap();
+                setup.device_support.write(&mut setup.record).unwrap();
+                if setup.record.stat.dmov && setup.record.stat.phase == MotionPhase::Idle {
+                    completed = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(completed, "the positional move must complete close-enough");
+
+    // Drain any moving-phase io_intr still buffered (the load-bearing step that
+    // stops a leftover notification from handing the resume a free pass). This
+    // runs synchronously, before the next await, so the forced poll the
+    // completion just requested (write → StartPolling, serviced by the poll-loop
+    // task only at the next await point) is NOT yet in the channel and is not
+    // drained — see the current_thread requirement on the test. After this, the
+    // only way a fresh io_intr arrives on the now-stationary, change-gated axis
+    // is that forced poll.
+    while io_intr_rx.try_recv().is_ok() {}
+
+    // Phase 2: the held jog must resume. Without the finalize_motion forced
+    // poll, no io_intr fires and the axis stays Idle until the deadline.
+    let mut resumed = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), io_intr_rx.recv()).await {
+            Ok(Some(())) => {
+                setup.record.process().unwrap();
+                setup.device_support.write(&mut setup.record).unwrap();
+                if setup.record.stat.phase == MotionPhase::Jog {
+                    resumed = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
     assert!(
-        pos.abs() < 1e-9,
-        "controller must be reseeded to restored DVAL 0.0, got {pos}"
+        resumed,
+        "held JOGF must resume via the real poll loop after a close-enough completion (phase={:?}, jogf={})",
+        setup.record.stat.phase, setup.record.ctrl.jogf
+    );
+
+    let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
+// Helper: read the SimMotor's current dial position.
+fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
+    let mut m = motor.lock().unwrap();
+    m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
+}
+
+/// R59 regression: device-support `init()` must NOT reseed the controller.
+/// The RSTM/loadpos(#231)/MRES(#196) restore decision is owned by
+/// `initial_readback` (C `devMotorAsyn.c::init_controller`), which fires on
+/// the Startup process and tests the controller's *actual current position*.
+/// A controller that kept its true absolute position across an IOC restart
+/// must not be clobbered by a stale autosaved DVAL: with the controller far
+/// from zero, RSTM=NearZero's `dval_non_zero_pos_near_zero` gate is false, so
+/// no reseed occurs and the record adopts the controller readback. (An
+/// earlier Rust `init()` reseeded unconditionally on any pass0 restore,
+/// before the first poll — the exact data loss RSTM prevents. C does NOT
+/// reseed here: a saved DVAL that the live controller contradicts, with the
+/// controller nowhere near zero, fails `initPos`.)
+#[tokio::test]
+async fn init_does_not_clobber_live_controller_position() {
+    // The controller (SimMotor) kept its true position 5.0 across the restart.
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
+    let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0; // dial == raw for a clean assertion
+    setup.record.conv.rstm = RestoreMode::NearZero;
+    setup.record.retry.rdbd = 0.05;
+
+    // Autosave restored a STALE DVAL (2.0) that disagrees with the hardware.
+    setup
+        .record
+        .put_field("DVAL", EpicsValue::Double(2.0))
+        .unwrap();
+    assert!(setup.record.was_position_restored());
+
+    // init() polls the controller (true 5.0) and reseeds nothing.
+    setup.device_support.init(&mut setup.record).unwrap();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "init() must not reseed — controller stays at its true 5.0"
+    );
+
+    // The Startup process applies the RSTM gate: the controller is far from
+    // zero, so NearZero does not restore — no SetPosition reaches the driver.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "RSTM=NearZero with a live controller far from zero must not reseed"
+    );
+    assert!(
+        (setup.record.pos.dval - 5.0).abs() < 1e-9,
+        "record adopts the controller readback (5.0), discarding the stale 2.0"
     );
 }
 
-/// BUG 5 companion: when NO position was restored during pass0, `init()`
-/// must NOT reseed the controller — it leaves the hardware position
-/// untouched. This proves the fix keys off the restore signal, not the
-/// DVAL value.
+/// R59 companion (positive path): when the controller lost its position
+/// across the restart (reads near zero) and a meaningful DVAL was restored,
+/// the RSTM=NearZero gate DOES reseed — and the SetPosition now reaches the
+/// driver through the Startup process → pending_actions → write path, not the
+/// deleted `init()` reseed.
+#[tokio::test]
+async fn startup_reseeds_controller_that_lost_position() {
+    // Controller powered up at 0.0 (lost its absolute position).
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(0.0)));
+    let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0;
+    setup.record.conv.rstm = RestoreMode::NearZero;
+    setup.record.retry.rdbd = 0.05;
+
+    // Autosave restored a meaningful DVAL the controller no longer holds.
+    setup
+        .record
+        .put_field("DVAL", EpicsValue::Double(5.0))
+        .unwrap();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    assert!(
+        read_motor_pos(&motor).abs() < 1e-9,
+        "init() does not reseed; controller still at 0.0"
+    );
+
+    // The Startup process restores: controller near zero + meaningful DVAL.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "RSTM=NearZero reseeds the lost controller to the autosaved 5.0"
+    );
+    assert!(
+        (setup.record.pos.dval - 5.0).abs() < 1e-9,
+        "record keeps the autosaved DVAL after the restore"
+    );
+}
+
+/// R59 companion: when NO position was restored during pass0, neither
+/// `init()` nor the Startup process reseeds — the controller keeps its
+/// hardware position and the record adopts the readback.
 #[tokio::test]
 async fn init_does_not_reseed_controller_when_nothing_restored() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
     let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0;
 
     // No put_field("DVAL", ...) — nothing was restored.
     assert!(!setup.record.was_position_restored());
 
     setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
 
-    // Controller position must be left at its stale 5.0 — init did not
-    // call set_position.
-    let pos = {
-        let mut m = motor.lock().unwrap();
-        m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
-    };
     assert!(
-        (pos - 5.0).abs() < 1e-9,
-        "controller must be untouched when nothing was restored, got {pos}"
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "controller untouched when nothing was restored"
     );
 }
 

@@ -23,6 +23,9 @@ pub enum MqttError {
     #[error("MQTT client error: {0}")]
     Client(String),
 
+    #[error("MQTT client not connected")]
+    NotConnected,
+
     #[error("publish channel closed")]
     PublishChannelClosed,
 }

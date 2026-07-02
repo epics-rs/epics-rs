@@ -10,7 +10,9 @@ use std::f64::consts::PI;
 use std::sync::LazyLock;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use epics_base_rs::server::record::{
+    FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 // ---------------------------------------------------------------------------
@@ -3074,6 +3076,47 @@ const TABLE_SET_CHOICES: &[&str] = &["Use", "Set"];
 const TABLE_GEOM_CHOICES: &[&str] = &["SRI", "GEOCARS", "NEWPORT", "PNC"];
 const TABLE_AUNIT_CHOICES: &[&str] = &["degrees", "ur"];
 
+/// Record-internal monitor posts that C `tableRecord.c` emits with a
+/// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
+/// six-element arrays plus `LVIO` with `monitor_mask = recGblResetAlarms |
+/// DBE_VALUE` (tableRecord.c:882-915), and `special()` posts
+/// `SET`/`SYNC`/`INIT`/`ZERO`/`READ`/`AEGU` with `DBE_VALUE`
+/// (tableRecord.c:659,663,667,671,675,679,690); `DBE_LOG` appears nowhere in
+/// the C record. Naming these fields makes the framework strip the LOG bit
+/// from their change-detected posts, so an archiver / `DBE_LOG` subscriber
+/// no longer sees a spurious archive event on every readback / limit /
+/// offset change — matching C. This is exactly the scaler SCAL-2 contract.
+/// Client puts are unaffected (the generic put path still posts `VALUE|LOG`,
+/// matching C's `dbPutField`); this governs only the record-internal change
+/// path. Field names follow the C arrays in `monitor()` order.
+const TABLE_VALUE_ONLY_FIELDS: &[&str] = &[
+    // ax — user drive / coordinates
+    "AX", "AY", "AZ", "X", "Y", "Z", // axrb — readback
+    "AXRB", "AYRB", "AZRB", "XRB", "YRB", "ZRB", // hlax — high limit
+    "HLAX", "HLAY", "HLAZ", "HLX", "HLY", "HLZ", // llax — low limit
+    "LLAX", "LLAY", "LLAZ", "LLX", "LLY", "LLZ", // m0x — motor drive
+    "M0X", "M0Y", "M1Y", "M2X", "M2Y", "M2Z", // e0x — encoder readback
+    "E0X", "E0Y", "E1Y", "E2X", "E2Y", "E2Z", // eax — encoder user coordinates
+    "EAX", "EAY", "EAZ", "EX", "EY", "EZ", // ax0 — user-coordinate offset
+    "AX0", "AY0", "AZ0", "X0", "Y0", "Z0", // axl — lab-frame angle/coordinate
+    "AXL", "AYL", "AZL", "XL", "YL", "ZL", // uhax — absolute high user limit
+    "UHAX", "UHAY", "UHAZ", "UHX", "UHY", "UHZ", // uhaxr — relative high user limit
+    "UHAXR", "UHAYR", "UHAZR", "UHXR", "UHYR", "UHZR",
+    // ulax — absolute low user limit
+    "ULAX", "ULAY", "ULAZ", "ULX", "ULY", "ULZ", // ulaxr — relative low user limit
+    "ULAXR", "ULAYR", "ULAZR", "ULXR", "ULYR", "ULZR",
+    // scalar limit-violation flag + special()-posted command/unit fields
+    "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET", "AEGU",
+];
+
+/// Angle-class fields for which C `tableRecord.c::get_units` reports the
+/// angular engineering units `aegu` (tableRecord.c:758-768); every other
+/// field reports the linear units `legu` (the default branch, :770).
+const TABLE_ANGULAR_UNIT_FIELDS: &[&str] = &[
+    "AX", "AY", "AZ", "AX0", "AY0", "AZ0", "AXL", "AYL", "AZL", "AXRB", "AYRB", "AZRB", "EAX",
+    "EAY", "EAZ", "HLAX", "HLAY", "HLAZ", "LLAX", "LLAY", "LLAZ", "YANG",
+];
+
 impl Record for TableRecord {
     fn record_type(&self) -> &'static str {
         "table"
@@ -3844,6 +3887,79 @@ impl Record for TableRecord {
         }
     }
 
+    /// C `tableRecord.c` posts every record-internal change with a literal
+    /// `DBE_VALUE` (no `DBE_LOG`); see [`TABLE_VALUE_ONLY_FIELDS`].
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        TABLE_VALUE_ONLY_FIELDS
+    }
+
+    /// C `tableRecord.c::special()` flips SET mode on an `SSET`/`SUSE` write
+    /// and posts `SET` with `DBE_VALUE` (tableRecord.c:658-663). Neither
+    /// `SSET` nor `SUSE` is `pp(TRUE)`, so no process cycle posts `SET`; the
+    /// framework posts it here as a side effect of the put. `SET` is named in
+    /// [`TABLE_VALUE_ONLY_FIELDS`], so the side-effect post carries
+    /// `DBE_VALUE` only — matching C's literal mask.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match put_field {
+            "SSET" | "SUSE" => &["SET"],
+            _ => &[],
+        }
+    }
+
+    /// Per-field metadata C `tableRecord.c` serves through its RSET callbacks:
+    /// `get_units` (angle-class fields → `aegu`, all others → `legu`;
+    /// tableRecord.c:758-772), `get_graphic_double` / `get_control_double`
+    /// (the six user coordinates AX,AY,AZ,X,Y,Z report disp & ctrl limits =
+    /// `(hlax[i], llax[i])`; :784-787, :801-804), and `get_precision`
+    /// (`VERS` → 2, every other record-specific field → the `PREC` field,
+    /// dbCommon → `recGblGetPrec`; :818-826). The framework has no record-level
+    /// metadata for
+    /// the `table` type, so without this hook a DBR_GR/CTRL/units request
+    /// returned no units and default (unset) limits.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        // C get_units: angle-class fields → aegu, every other field → legu.
+        let units = if TABLE_ANGULAR_UNIT_FIELDS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
+        {
+            self.aegu.clone()
+        } else {
+            self.legu.clone()
+        };
+        let mut ov = FieldMetadataOverride {
+            units: Some(units),
+            ..Default::default()
+        };
+
+        // C get_precision (tableRecord.c:818-826): VERS reports precision 2;
+        // every other record-specific field (fieldIndex >= tableRecordVAL)
+        // reports the record's PREC field; dbCommon fields (index < VAL) fall
+        // through to the framework's recGblGetPrec. `field_list()` holds exactly
+        // the record-specific fields (no dbCommon names), so membership is the
+        // `>= tableRecordVAL` boundary.
+        if field.eq_ignore_ascii_case("VERS") {
+            ov.precision = Some(2);
+        } else if self
+            .field_list()
+            .iter()
+            .any(|d| d.name.eq_ignore_ascii_case(field))
+        {
+            ov.precision = Some(self.prec);
+        }
+
+        // C get_graphic_double / get_control_double: the six user-coordinate
+        // fields (the first six after AX) report disp & ctrl limits drawn from
+        // the calculated user limits hlax[i] (upper) / llax[i] (lower).
+        const COORDS: [&str; 6] = ["AX", "AY", "AZ", "X", "Y", "Z"];
+        if let Some(i) = COORDS.iter().position(|c| c.eq_ignore_ascii_case(field)) {
+            let limits = (self.calc_hi_limit()[i], self.calc_lo_limit()[i]);
+            ov.disp_limits = Some(limits);
+            ov.ctrl_limits = Some(limits);
+        }
+
+        Some(ov)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.vers = VERSION;
@@ -4584,6 +4700,110 @@ mod tests {
     fn test_record_type() {
         let t = TableRecord::new();
         assert_eq!(t.record_type(), "table");
+    }
+
+    #[test]
+    fn test_value_only_change_fields_match_c_dbe_value_posts() {
+        let t = TableRecord::new();
+        let value_only = t.value_only_change_fields();
+
+        // C posts the 13 six-element arrays + LVIO + the six special()-posted
+        // command/unit fields with a literal DBE_VALUE (tableRecord.c:882-915,
+        // :659-690): 13*6 + 1 + 6 = 85 fields.
+        assert_eq!(value_only.len(), 85, "value-only field count");
+
+        // Representatives across every array group + the scalar/special set.
+        for f in [
+            "AX", "Z", "AXRB", "ZRB", "HLAX", "LLZ", "M1Y", "E1Y", "EAX", "EZ", "AX0", "Z0", "AXL",
+            "ZL", "UHAX", "UHZR", "ULAX", "ULZR", "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET",
+            "AEGU",
+        ] {
+            assert!(value_only.contains(&f), "{f} must be value-only");
+        }
+
+        // Every named field must be a real record field — guards against a
+        // typo silently failing to strip the LOG bit.
+        let names: Vec<&str> = t.field_list().iter().map(|fd| fd.name).collect();
+        for f in value_only {
+            assert!(
+                names.contains(f),
+                "value-only field {f} absent from field_list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sset_suse_post_set_as_side_effect() {
+        let t = TableRecord::new();
+
+        // C special() flips SET mode on SSET/SUSE and posts SET with
+        // DBE_VALUE; SSET/SUSE are not pp, so the SET monitor must come from
+        // the side-effect post, not a process cycle.
+        assert_eq!(t.monitor_side_effect_fields("SSET"), &["SET"]);
+        assert_eq!(t.monitor_side_effect_fields("SUSE"), &["SET"]);
+        // Unrelated puts trigger no side-effect post.
+        assert!(t.monitor_side_effect_fields("AX").is_empty());
+        assert!(t.monitor_side_effect_fields("SYNC").is_empty());
+
+        // SET is a value-only field, so the framework strips the LOG bit from
+        // the side-effect post — the SET monitor carries DBE_VALUE alone,
+        // matching C's literal db_post_events(set, DBE_VALUE).
+        assert!(t.value_only_change_fields().contains(&"SET"));
+    }
+
+    #[test]
+    fn test_field_metadata_override_units_limits_precision() {
+        let mut t = TableRecord::new();
+        t.aegu = "degrees".into();
+        t.legu = "mm".into();
+        t.prec = 4;
+        t.set_calc_hi_limit(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        t.set_calc_lo_limit(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
+        let deg: PvString = "degrees".into();
+        let mm: PvString = "mm".into();
+
+        // Angular coordinate AX (i=0): aegu units + (hlax[0], llax[0]) limits.
+        // AX is a record-specific field (>= tableRecordVAL), so C get_precision
+        // serves the PREC field (4 here), not VERS's fixed 2.
+        let ax = t.field_metadata_override("AX").unwrap();
+        assert_eq!(ax.units, Some(deg.clone()));
+        assert_eq!(ax.disp_limits, Some((1.0, -1.0)));
+        assert_eq!(ax.ctrl_limits, Some((1.0, -1.0)));
+        assert_eq!(ax.precision, Some(4));
+
+        // Linear coordinate X (i=3): legu units + (hlax[3], llax[3]) limits.
+        let x = t.field_metadata_override("X").unwrap();
+        assert_eq!(x.units, Some(mm.clone()));
+        assert_eq!(x.disp_limits, Some((4.0, -4.0)));
+        assert_eq!(x.ctrl_limits, Some((4.0, -4.0)));
+
+        // Angular non-coordinate field: aegu units, no limit override.
+        let axrb = t.field_metadata_override("AXRB").unwrap();
+        assert_eq!(axrb.units, Some(deg.clone()));
+        assert_eq!(axrb.disp_limits, None);
+        assert_eq!(axrb.ctrl_limits, None);
+
+        // Linear non-coordinate field: legu units.
+        let llz = t.field_metadata_override("LLZ").unwrap();
+        assert_eq!(llz.units, Some(mm.clone()));
+
+        // VERS: precision 2 (C get_precision special-case), legu units, no
+        // limits — VERS is NOT served the PREC field even though it is
+        // record-specific.
+        let vers = t.field_metadata_override("VERS").unwrap();
+        assert_eq!(vers.precision, Some(2));
+        assert_eq!(vers.units, Some(mm.clone()));
+        assert_eq!(vers.disp_limits, None);
+
+        // Linear coordinate X is also record-specific → PREC field, not VERS's 2.
+        assert_eq!(t.field_metadata_override("X").unwrap().precision, Some(4));
+
+        // dbCommon field (index < tableRecordVAL, not in field_list()): C falls
+        // through to recGblGetPrec, so the hook serves no precision override
+        // (units are still served, matching C get_units for all fields).
+        let phas = t.field_metadata_override("PHAS").unwrap();
+        assert_eq!(phas.precision, None);
+        assert_eq!(phas.units, Some(mm));
     }
 
     #[test]

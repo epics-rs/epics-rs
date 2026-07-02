@@ -155,6 +155,23 @@ pub struct PvaServerConfig {
     /// Interfaces to bind UDP responder on. When empty, bind 0.0.0.0.
     /// From `EPICS_PVAS_INTF_ADDR_LIST`.
     pub interfaces: Vec<std::net::IpAddr>,
+    /// PVX-82: deferred config error set by [`Self::with_env`] when
+    /// `EPICS_PVA[S]_INTF_ADDR_LIST` named interface(s) that all failed to
+    /// resolve. `PvaServer::start` refuses to bind in that case rather than
+    /// silently promoting the (now-empty) `interfaces` to the wildcard
+    /// `0.0.0.0`. `None` on any programmatically-built config — an empty
+    /// `interfaces` set directly by a caller is an intentional wildcard.
+    /// Public only because the config is built with struct-update syntax
+    /// across the crate boundary; it is not a user-facing knob.
+    pub intf_addr_error: Option<String>,
+    /// PVX-82 (IGNORE sibling): deferred config error set by
+    /// [`Self::with_env`] when `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s)
+    /// to block that all failed to resolve. `PvaServer::start` refuses to
+    /// start rather than running with a silently-empty blocklist (pvxs
+    /// hard-fails the same config — `config.cpp:172-174`, `required=true`).
+    /// `None` on any programmatically-built config. Public for the same
+    /// struct-update reason as [`Self::intf_addr_error`]; not a user knob.
+    pub ignore_addr_error: Option<String>,
     /// Emit `0xFD` / `0xFE` type-cache markers in INIT and RPC responses
     /// so repeated compound descriptors collapse to a 3-byte reference
     /// (saves 100-500 bytes per repeat for NTScalar / NTTable channels).
@@ -305,6 +322,8 @@ impl Default for PvaServerConfig {
             beacon_destinations: Vec::new(),
             auto_beacon: true,
             interfaces: Vec::new(),
+            intf_addr_error: None,
+            ignore_addr_error: None,
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
@@ -408,8 +427,15 @@ impl PvaServerConfig {
         if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {
             self.auto_beacon = v;
         }
-        if let Some(v) = env::server_intf_addr_list_opt() {
-            self.interfaces = v;
+        // PVX-82: a non-blank INTF list whose tokens all fail to resolve is
+        // a misconfiguration — record it so `PvaServer::start` refuses to
+        // bind rather than silently falling back to the wildcard. A blank /
+        // unset var leaves `interfaces` untouched (caller value preserved;
+        // empty ⟹ intentional wildcard at bind).
+        match env::server_intf_addr_list_checked() {
+            Ok(Some(v)) => self.interfaces = v,
+            Ok(None) => {}
+            Err(msg) => self.intf_addr_error = Some(msg),
         }
         if let Some(v) = env::send_timeout_secs_opt() {
             self.send_timeout = Duration::from_secs_f64(v);
@@ -428,8 +454,15 @@ impl PvaServerConfig {
             let scaled = (c * 4.0 / 3.0).max(2.0);
             self.idle_timeout = Duration::from_secs_f64(scaled);
         }
-        if let Some(v) = env::server_ignore_addr_list_opt() {
-            self.ignore_addrs = v;
+        // PVX-82 (IGNORE sibling): same all-unresolvable gate as INTF —
+        // a non-blank IGNORE list that resolves to nothing means the
+        // requested blocklist is silently empty; record it so
+        // `PvaServer::start` refuses rather than running unfiltered. A
+        // blank / unset var leaves a caller-supplied `ignore_addrs` intact.
+        match env::server_ignore_addr_list_checked() {
+            Ok(Some(v)) => self.ignore_addrs = v,
+            Ok(None) => {}
+            Err(msg) => self.ignore_addr_error = Some(msg),
         }
         self
     }
@@ -446,7 +479,30 @@ pub async fn run_pva_server<S>(source: Arc<S>, config: PvaServerConfig) -> PvaRe
 where
     S: ChannelSource + 'static,
 {
+    run_pva_server_reporting(source, config, |_| {}).await
+}
+
+/// Like [`run_pva_server`], but invokes `on_started` once with a cheap,
+/// shareable [`ServerReportHandle`] *after* the listeners are bound — so
+/// the actually-bound TCP/TLS ports (which may differ from the requested
+/// ones under the ephemeral-fallback path) are already known. The
+/// callback runs synchronously between `start()` and `wait()`, before any
+/// `.await`, so the handle is published the instant the server is live.
+///
+/// This is the seam the iocsh `pvxsr` command rides on: the native
+/// `PvaServer` is born here and consumed by `wait()`, so a shell command
+/// running inside the server has no other way to reach the report state.
+pub(crate) async fn run_pva_server_reporting<S, F>(
+    source: Arc<S>,
+    config: PvaServerConfig,
+    on_started: F,
+) -> PvaResult<()>
+where
+    S: ChannelSource + 'static,
+    F: FnOnce(ServerReportHandle),
+{
     let server = PvaServer::start(source, config)?;
+    on_started(server.report_handle());
     server.wait().await
 }
 
@@ -621,6 +677,20 @@ impl PvaServer {
         // does.
         let mut config = config;
         config.guid = guid;
+        // PVX-82: refuse to start when the env named interface(s) that all
+        // failed to resolve — binding the wildcard `0.0.0.0` here would
+        // silently listen on every interface instead of the requested
+        // restriction (pvxs hard-fails such a config: `config.cpp:172-174`).
+        if let Some(msg) = config.intf_addr_error.take() {
+            return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
+        }
+        // PVX-82 (IGNORE sibling): same refusal for an all-unresolvable
+        // blocklist — running with a silently-empty IGNORE list would let
+        // peers the operator meant to block through (pvxs `required=true`
+        // hard-fails this config at `config.cpp:172-174`).
+        if let Some(msg) = config.ignore_addr_error.take() {
+            return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
+        }
         // The live per-peer registry is created up-front so the
         // built-in server-info source can report connection counts.
         let peers = crate::server_native::peers::PeerRegistry::new();
@@ -1031,7 +1101,12 @@ impl PvaServer {
     /// so a subsequent report returns the deltas since this one. Channel
     /// membership and credentials are not reset.
     pub fn report_zeroed(&self, zero: bool) -> ServerReport {
-        ServerReport {
+        // Liveness from the owned JoinHandles (a `None` handle — taken by
+        // `run`/`wait` — reads as not-alive). `ServerReportHandle::report`
+        // resolves the same booleans from the cloned AbortHandles; both
+        // feed the single [`assemble_report`] builder so the struct shape
+        // can never drift between the two paths.
+        assemble_report(ReportFields {
             tcp_port: self.bound_tcp_port,
             udp_port: self.effective_config.udp_port,
             tls_port: self.bound_tls_port,
@@ -1053,8 +1128,36 @@ impl PvaServer {
                 .as_ref()
                 .map(|h| !h.is_finished())
                 .unwrap_or(false),
-            peers: self.peers.snapshot_zeroed(zero),
-            peer_count: self.peers.len(),
+            peers: &self.peers,
+            zero,
+        })
+    }
+
+    /// A cheap, cloneable handle that reproduces [`Self::report`] from
+    /// outside this server's owning task.
+    ///
+    /// It captures the shared peer registry (`Arc`), the bound
+    /// ports/config scalars, and the per-task `AbortHandle`s. Unlike a
+    /// `&PvaServer` it stays valid after `run`/`wait` have consumed the
+    /// `PvaServer` value — which is exactly the iocsh `pvxsr` situation:
+    /// the native server is created and `wait()`-consumed deep inside
+    /// [`run_pva_server`], two layers below the shell registration point,
+    /// so the report state is otherwise unreachable from the shell.
+    /// Liveness reads the same `AbortHandle`s that `Drop`/[`Self::stop`]
+    /// act on, equivalent to the JoinHandle `is_finished` that
+    /// [`Self::report_zeroed`] reads for the same tasks.
+    pub fn report_handle(&self) -> ServerReportHandle {
+        ServerReportHandle {
+            bound_tcp_port: self.bound_tcp_port,
+            udp_port: self.effective_config.udp_port,
+            bound_tls_port: self.bound_tls_port,
+            tls_enabled: self.effective_config.tls.is_some(),
+            ignore_addrs: self.effective_config.ignore_addrs.len(),
+            beacon_period_secs: self.effective_config.beacon_period.as_secs(),
+            peers: self.peers.clone(),
+            tcp_abort: self.tcp_abort.clone(),
+            udp_abort: self.udp_abort.clone(),
+            udp_v6_abort: self.udp_v6_abort.clone(),
         }
     }
 
@@ -1138,6 +1241,96 @@ pub struct ServerReport {
     pub peer_count: usize,
 }
 
+/// Resolved inputs to [`assemble_report`]. Liveness booleans are already
+/// computed by the caller (from JoinHandles in [`PvaServer::report_zeroed`],
+/// from AbortHandles in [`ServerReportHandle::report`]); everything else is
+/// read straight through.
+struct ReportFields<'a> {
+    tcp_port: u16,
+    udp_port: u16,
+    tls_port: u16,
+    tls_enabled: bool,
+    ignore_addrs: usize,
+    beacon_period_secs: u64,
+    udp_alive: bool,
+    udp_v6_alive: bool,
+    tcp_alive: bool,
+    peers: &'a crate::server_native::peers::PeerRegistry,
+    zero: bool,
+}
+
+/// The single owner of [`ServerReport`] construction. Both
+/// [`PvaServer::report_zeroed`] and [`ServerReportHandle::report`] route
+/// through here, so the snapshot/count pair and the struct's field set
+/// cannot drift between the two paths — a new `ServerReport` field is added
+/// in exactly one place.
+fn assemble_report(f: ReportFields<'_>) -> ServerReport {
+    ServerReport {
+        tcp_port: f.tcp_port,
+        udp_port: f.udp_port,
+        tls_port: f.tls_port,
+        tls_enabled: f.tls_enabled,
+        ignore_addrs: f.ignore_addrs,
+        beacon_period_secs: f.beacon_period_secs,
+        udp_alive: f.udp_alive,
+        udp_v6_alive: f.udp_v6_alive,
+        tcp_alive: f.tcp_alive,
+        peers: f.peers.snapshot_zeroed(f.zero),
+        peer_count: f.peers.len(),
+    }
+}
+
+/// Cheap, cloneable, `Send + Sync` handle to a running [`PvaServer`]'s
+/// diagnostics, produced by [`PvaServer::report_handle`].
+///
+/// Unlike a `&PvaServer` it survives the `run`/`wait` consumption of the
+/// server, so an in-process iocsh command (`pvxsr`) running inside the
+/// live server can snapshot the report even though the owning `PvaServer`
+/// value lives — and is `wait()`-consumed — inside [`run_pva_server`].
+#[derive(Clone)]
+pub struct ServerReportHandle {
+    bound_tcp_port: u16,
+    udp_port: u16,
+    bound_tls_port: u16,
+    tls_enabled: bool,
+    ignore_addrs: usize,
+    beacon_period_secs: u64,
+    peers: Arc<crate::server_native::peers::PeerRegistry>,
+    tcp_abort: tokio::task::AbortHandle,
+    udp_abort: tokio::task::AbortHandle,
+    udp_v6_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl ServerReportHandle {
+    /// Snapshot the same [`ServerReport`] as [`PvaServer::report`], read
+    /// through the shared registry and per-task `AbortHandle`s. Liveness
+    /// uses `AbortHandle::is_finished` — the task-completion signal
+    /// `Drop`/[`PvaServer::stop`] act on — which is equivalent to the
+    /// JoinHandle `is_finished` that [`PvaServer::report_zeroed`] reads
+    /// for the very same tasks. Counters are never zeroed through this
+    /// handle (`zero = false`); the resetting variant stays on
+    /// [`PvaServer::report_zeroed`], which owns the JoinHandles.
+    pub fn report(&self) -> ServerReport {
+        assemble_report(ReportFields {
+            tcp_port: self.bound_tcp_port,
+            udp_port: self.udp_port,
+            tls_port: self.bound_tls_port,
+            tls_enabled: self.tls_enabled,
+            ignore_addrs: self.ignore_addrs,
+            beacon_period_secs: self.beacon_period_secs,
+            udp_alive: !self.udp_abort.is_finished(),
+            udp_v6_alive: self
+                .udp_v6_abort
+                .as_ref()
+                .map(|a| !a.is_finished())
+                .unwrap_or(false),
+            tcp_alive: !self.tcp_abort.is_finished(),
+            peers: &self.peers,
+            zero: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tcp_fallback_tests {
     //! pvxs parity for multi-server-on-one-host: when the requested
@@ -1190,6 +1383,89 @@ mod tcp_fallback_tests {
 
         drop(server);
         drop(blocker);
+    }
+
+    /// `PvaServer::report_handle()` produces a detached handle whose
+    /// `report()` mirrors `PvaServer::report()` field-for-field on a live
+    /// server. This is the property the iocsh `pvxsr` command rides on:
+    /// the handle outlives the `PvaServer` value that `run`/`wait`
+    /// consume, so it must report the same thing the server would.
+    #[tokio::test]
+    async fn report_handle_mirrors_live_server_report() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config).expect("server must start");
+
+        let direct = server.report();
+        let via_handle = server.report_handle().report();
+
+        assert_eq!(via_handle.tcp_port, direct.tcp_port);
+        assert_eq!(via_handle.udp_port, direct.udp_port);
+        assert_eq!(via_handle.tls_port, direct.tls_port);
+        assert_eq!(via_handle.tls_enabled, direct.tls_enabled);
+        assert_eq!(via_handle.beacon_period_secs, direct.beacon_period_secs);
+        assert_eq!(via_handle.ignore_addrs, direct.ignore_addrs);
+        assert_eq!(via_handle.peer_count, direct.peer_count);
+        assert_eq!(via_handle.tcp_alive, direct.tcp_alive);
+        assert_eq!(via_handle.udp_alive, direct.udp_alive);
+        assert_eq!(via_handle.udp_v6_alive, direct.udp_v6_alive);
+        assert!(
+            via_handle.tcp_alive,
+            "tcp task must be live on a fresh server"
+        );
+
+        // A clone keeps answering after the PvaServer value is gone — the
+        // ports are immutable scalars captured at bind, and the call must
+        // not panic even though the backing tasks have been aborted.
+        let detached = server.report_handle();
+        drop(server);
+        let post = detached.report();
+        assert_eq!(
+            post.tcp_port, direct.tcp_port,
+            "handle ports stay fixed after the server value drops"
+        );
+    }
+
+    /// `run_pva_server_reporting` fires `on_started` with a usable
+    /// `ServerReportHandle` the instant the listeners bind — before
+    /// `wait()` — which is exactly how the wrapper publishes the handle to
+    /// the iocsh `pvxsr` command.
+    #[tokio::test]
+    async fn run_pva_server_reporting_publishes_handle_at_bind() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(run_pva_server_reporting(source, config, move |handle| {
+            let _ = tx.send(handle);
+        }));
+
+        let handle = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("handle must be published promptly")
+            .expect("callback must send the handle");
+        let report = handle.report();
+        assert!(report.tcp_alive, "server reports live right after bind");
+        assert_ne!(
+            report.tcp_port, 0,
+            "bound TCP port is concrete, not the sentinel"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     /// epics-base PR #205 IPv6 Stage 1 — `PvaServerConfig::bind_ip`
@@ -1536,6 +1812,63 @@ mod tcp_fallback_tests {
                 .expect("connect timed out");
         let _stream = connect.expect("loopback TCP connect must succeed");
         drop(server);
+    }
+
+    /// PVX-82: when `with_env` recorded that `EPICS_PVA[S]_INTF_ADDR_LIST`
+    /// named interface(s) that all failed to resolve, `PvaServer::start`
+    /// must refuse to bind rather than silently promoting the empty
+    /// `interfaces` to the wildcard `0.0.0.0`. Deterministic — no DNS, no
+    /// real bind (it errors before any listener is created).
+    #[test]
+    fn start_refuses_when_intf_addr_error_recorded() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            interfaces: Vec::new(),
+            intf_addr_error: Some(
+                "EPICS_PVA[S]_INTF_ADDR_LIST=\"bad.invalid\" named interface(s) \
+                 but none resolved"
+                    .to_string(),
+            ),
+            auto_beacon: false,
+            ..Default::default()
+        };
+        // `PvaServer` is not `Debug`, so match on the result rather than
+        // `expect_err` (which would require the `Ok` type to be `Debug`).
+        let result = PvaServer::start(source, config);
+        assert!(
+            matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
+            "an unresolved INTF list must fail server start with the resolution \
+             error, not bind 0.0.0.0"
+        );
+    }
+
+    /// PVX-82 (IGNORE sibling): when `with_env` recorded that
+    /// `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s) that all failed to
+    /// resolve, `PvaServer::start` must refuse rather than run with a
+    /// silently-empty blocklist. Same deterministic start-refusal as the
+    /// INTF case (errors before any listener is created).
+    #[test]
+    fn start_refuses_when_ignore_addr_error_recorded() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            ignore_addr_error: Some(
+                "EPICS_PVAS_IGNORE_ADDR_LIST=\"bad.invalid\" named peer(s) to \
+                 block but none resolved"
+                    .to_string(),
+            ),
+            auto_beacon: false,
+            ..Default::default()
+        };
+        let result = PvaServer::start(source, config);
+        assert!(
+            matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
+            "an unresolved IGNORE list must fail server start, not run with an \
+             empty blocklist"
+        );
     }
 }
 

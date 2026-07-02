@@ -9,6 +9,130 @@ intentional Rust-only behavior unless it breaks a libca/rsrv wire contract.
 
 ## Open Findings
 
+> **2026-07-01 server-backlog triage.** Every server-side (rsrv) finding
+> below was re-verified against *current* source and the C rsrv reference
+> (`modules/database/src/ioc/rsrv/`), opening each cited C line directly.
+> **All 17 server findings are ALREADY-FIXED**; the two that carry a
+> deliberate, benign divergence from C are dispositioned as intentional
+> keeps (not "still open"). The 22 client-side (libca) findings are
+> **deferred** — out of scope for this CA-server pass. The entries are left
+> in place for provenance; use this block for status.
+>
+> **Server — ALREADY-FIXED (current file:line):** R2-1 `tcp.rs:4893/4962`,
+> R2-8 `tcp.rs:5001`, R2-9 `tcp.rs:3192`+`PutNotifySlot`, R2-12
+> `tcp.rs:5108`, R2-20 `repeater.rs:180`, R2-23 `tcp.rs:4309`, R2-33
+> `tcp.rs:2128`/`udp.rs:499`/`tcp.rs:4460`, R2-34 `tcp.rs:2452/2491/2512`,
+> R2-35 `repeater.rs:233`, R2-36 `tcp.rs:3532/3688/3880`, R2-46
+> `tcp.rs:3114`, R2-47 `tcp.rs:1353`, R2-49 `udp.rs:714`, R2-51
+> `tcp.rs:4801`, R2-52 `tcp.rs:2006`.
+>
+> **Server — intentional divergence from C (do NOT re-flag):**
+> - **R2-50** — Rust refuses a duplicate `sub_id` on one connection with
+>   `CA_PROTO_ERROR`/`ECA_BADMONID` (`tcp.rs:3651-3662`). C `event_add_action`
+>   (`camessage.c:1762-1866`) installs *both* subscriptions with no dedup,
+>   emitting duplicate wire frames per event for the same client `sub_id` —
+>   a latent client-confusion bug we decline to copy. Not observable for a
+>   conformant client (never sends a duplicate `sub_id`).
+> - **R2-55** — CREATE_CHAN minor-version write is upgrade-only
+>   (`tcp.rs:2042-2055`). C `claim_ciu_action` (`camessage.c:1196`) writes it
+>   unconditionally then rejects the channel if the result is `< 4.4`. A
+>   conformant libca client carries its true version in CREATE_CHAN
+>   `m_available` (== the VERSION `m_count` it handshook), so upgrade-only is
+>   *identical* to C's write for real clients; the two differ only for a
+>   non-conformant peer sending a lower `m_available` than its handshake,
+>   where C downgrades-then-rejects and we keep the negotiated version. We
+>   deliberately do not copy C's downgrade+reject (commit `9e79bb15`).
+>
+> **Client — deferred (out of CA-server scope this pass):** R2-17, R2-18,
+> R2-19, R2-21, R2-25, R2-26, R2-27, R2-28, R2-29, R2-30, R2-31, R2-32,
+> R2-37, R2-38, R2-39, R2-40, R2-41, R2-45, R2-57, R2-59, R2-62, R2-63.
+
+> **2026-07-01 client-backlog triage (Round 4).** The 22 client-side
+> (libca) findings deferred above were re-verified against current
+> `src/client/` + the libca reference (`modules/ca/src/client/`), opening
+> each cited C line directly. **20 of 22 are ALREADY-FIXED**; one real
+> bug was fixed this round; one is a deferred structural divergence
+> pending sign-off.
+>
+> **FIXED this round:** R2-26 (`f37a0be8`) — UDP SEARCH replies now
+> resolve unconditionally. C `searchRespAction` never gates resolution on
+> the datagram sequence number; the seq (`lastReceivedSeqNo`) feeds only
+> libca's RTT estimate and immediate-resend timer optimisation
+> (`searchTimer.cpp:336-340`), never whether the channel is found. The
+> finding's "accepts stale sequenced replies" half is C-correct (C
+> resolves those too). Removed the resolution gate + the received-seq
+> machinery whose sole purpose was that gate; `state.pending` membership
+> is the resolve-once guard. Regression tests added.
+>
+> **ALREADY-FIXED (current file:line):** R2-17 `transport.rs:1792`, R2-18
+> `mod.rs:1030`, R2-19 `mod.rs:2423`, R2-21 `channel.rs:16`, R2-25
+> `mod.rs:3805`, R2-27 `transport.rs:1653`, R2-28 `transport.rs:757`,
+> R2-29 `transport.rs:1873`, R2-30 `search.rs:1583`, R2-31 `mod.rs:1734`,
+> R2-32 `mod.rs:2373`, R2-37 `subscription.rs:536`, R2-38 `mod.rs:4051`,
+> R2-39 `mod.rs:4135`, R2-41 `transport.rs:1866`, R2-45 `transport.rs:1407`,
+> R2-57 `mod.rs:4537`, R2-59 `mod.rs:5061`, R2-62 `search.rs:173`, R2-63
+> `transport.rs:123`.
+>
+> **FIXED (2026-07-01, `2c6b1537`) — R2-40 send-stall keep-socket:**
+> - **R2-40** — on a send/write stall the Rust transport used to tear the
+>   circuit down (`TcpClosed`) and reconnect, where C `sendTimeoutNotify`→
+>   `unresponsiveCircuitNotify` (`tcpiiu.cpp:879-940`) marks the circuit
+>   unresponsive, arms an echo probe, and KEEPS the socket. The write loop
+>   now drives the flush with `writer.write(&batch[written..])` and carries
+>   `written` across stalls, so a `Pending`-cancelled `write` (0 bytes per
+>   the `AsyncWrite` contract) resumes from the exact offset with no byte
+>   re-sent — the reason the old code had to discard the stream is gone.
+>   On a send stall it emits `CircuitUnresponsive` and keeps the socket; a
+>   real socket error or 0-byte accept still closes. Recovery was unified
+>   to a single `Arc<AtomicBool>` shared by the send and receive watchdogs
+>   (mirroring C's one `tcpiiu::unresponsiveCircuit`): the read loop's
+>   data-arrival path emits the sole `CircuitResponsive` regardless of
+>   which watchdog first saw the stall (previously the recovery was gated
+>   on a read-loop-only flag, so a send-side stall could never clear). A
+>   forever-stalled write cannot leak — `ServerConnection::drop` aborts the
+>   write task when the receive echo watchdog closes a truly-dead circuit.
+>   Tests pin: send stall → `CircuitUnresponsive` + socket kept (not
+>   `TcpClosed`); resume sends each byte exactly once from the offset.
+>
+> **Review round (2026-07-01) — two follow-up fixes to convergence:**
+> - `a45e9391` — the adversarial review caught a regression the redesign
+>   itself introduced. The shared `AtomicBool`'s `swap` and its
+>   `event_tx.send` were two non-atomic statements, and the send watchdog
+>   (`write_loop`) and receive echo watchdog (`read_loop`) run on separate
+>   tasks sharing one event channel, so a `CircuitResponsive` could be
+>   enqueued ahead of a still-pending `CircuitUnresponsive` — wedging the
+>   channels Unresponsive with revoked access on a live circuit (the next
+>   data arrival can't re-clear a flag that is already false). Replaced the
+>   bare `AtomicBool` with `UnresponsiveGate` (`Mutex<bool>`) whose
+>   `mark_unresponsive`/`mark_responsive` guard the (test + emit) pair under
+>   one lock — exactly as C guards `unresponsiveCircuit` under the cac lock
+>   (`tcpiiu.cpp:861-940`) — so the two transition events can no longer be
+>   delivered out of order. (Before the redesign only `read_loop` emitted
+>   both, same-task-ordered, so the reorder is new to this fix.)
+> - `2e053adf` — the send watchdog was missing C's `receiveThreadIsBusy`
+>   guard: C `tcpSendWatchdog::expire` RESTARTS (does not `sendTimeoutNotify`)
+>   while the recv thread is mid-processing (`tcpSendWatchdog.cpp:48-50`,
+>   `_receiveThreadIsBusy` set/cleared at `tcpiiu.cpp:494/526`). Without it a
+>   send stall raised a spurious `ECA_UNRESPTMO` on in-flight IO of a
+>   live-inbound circuit. `UnresponsiveGate` gained a `recv_busy` flag
+>   (`read_loop` sets it across message processing, clears it while parked in
+>   `select!`); `write_loop`'s stall arm re-polls the same write (restart)
+>   instead of marking unresponsive while it is set. Boundary test pins both
+>   sides of the flag.
+>
+> **Minor residuals (benign, not re-filed):**
+> - R2-17: EVENT_ADD-via-`CA_PROTO_ERROR` is a `_=>{}` no-op; subscription
+>   errors normally arrive as EVENT_ADD status frames handled at
+>   `transport.rs:1655`.
+> - R2-39: circuit-recovery resubscribe skips subs whose wire
+>   `data_type`/`count` are still `None`; benign — active monitors have
+>   both set.
+> - R2-63: core sub-second/truncation bugs are fixed; the residual
+>   `EPICS_CA_CONN_TMO=0` → 30 s default (Rust) vs C keeping literal `0.0`
+>   is a degenerate-config edge left as-is. The doc's original C citation
+>   `if (status || connTMO <= 0.0)` was a misread — C (`cac.cpp:188-194`)
+>   resets `connTMO` only on a parse-failure `status`, never on `<=0.0`.
+
 ### R2-1: Access-rights loss emits the wrong monitor error frame
 
 Severity: Medium
@@ -1235,3 +1359,36 @@ isolated subnet no longer leaks beacons onto unrelated networks.
   flush-time strip/fill, send_to failure logging,
   UDP_FLUSH_THRESHOLD=1024). Full-workspace regression: 4584/4584
   pass, clippy clean, doctests pass.
+- 2026-07-01: Round 3 — server-backlog triage. Three opus panels
+  re-verified all 39 open findings against current source + the C rsrv
+  reference (each cited C line opened directly, not trusting doc
+  citations). Result: **0 still-real** on the server side — all 17
+  server (rsrv) findings ALREADY-FIXED by interim churn (the 2026-05-18
+  present-tense text was stale); the 22 client (libca) findings deferred
+  as out of scope for the CA-server pass. Two server findings carry a
+  deliberate benign divergence from C and were dispositioned as
+  intentional keeps: R2-50 (duplicate-`sub_id` refusal vs C's no-dedup
+  double-install) and R2-55 (CREATE_CHAN minor-version upgrade-only vs
+  C's unconditional-write-then-reject; comment clarified in `9e79bb15`).
+  An initial attempt to "match C" on R2-55 by making the write
+  unconditional was reverted after it regressed four deprecated-read
+  server tests: it copied C's downgrade without C's paired `CA_V44`
+  reject, and for conformant clients the upgrade-only write is already
+  identical to C. No source fix was owed; the server backlog is
+  converged. See the triage block at the head of `## Open Findings`.
+- 2026-07-01: Round 4 — client-backlog triage. Three opus panels
+  re-verified the 22 deferred client (libca) findings against current
+  `src/client/` + the libca reference (each cited C line opened
+  directly). Result: **20 of 22 ALREADY-FIXED** by interim churn; **1
+  real bug fixed** (R2-26, `f37a0be8` — UDP SEARCH replies resolve
+  unconditionally per C `searchRespAction`, whose seq number gates only
+  libca RTT/timer tuning, not resolution; removed the resolution gate +
+  the dead received-seq machinery, kept the wire-conformant sent
+  `dgram_seq`; two regression tests added); **1 deferred structural
+  divergence** (R2-40 — send-timeout tears the circuit down where C
+  keeps it + echo-probes; not patchable under Tokio's cancellable
+  `write_all`, needs a transport write-path redesign, flagged for user
+  sign-off). Three benign minor residuals (R2-17 EVENT_ADD-via-ERROR
+  no-op, R2-39 untyped-sub resend skip, R2-63 `EPICS_CA_CONN_TMO=0`
+  edge) recorded, not re-filed. See the Round-4 triage block at the head
+  of `## Open Findings`.

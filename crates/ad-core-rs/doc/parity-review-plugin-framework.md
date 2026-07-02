@@ -1,5 +1,24 @@
 # ad-core-rs Plugin Framework Review vs epics-modules/ADCore
 
+> **STATUS (2026-06-28): round-1 RAW review — SUPERSEDED, mostly fixed.**
+> Findings below are stated present-tense but are *not* the live open list.
+> They were triaged into the dispositioned **ADC-1..ADC-12** inventory in
+> `doc/c-parity-review-2026-06-15.md` (round 2) — all **Fixed / signoff /
+> N-A** — and closed via the ad-core-rs fix stream. **Spot-verified FIXED in
+> current source** (do not re-report): the CRITICAL **B1** reliable-send is now
+> drop-on-full `try_send` by default (`channel.rs:179`, C++ `trySend`), with
+> never-drop back-pressure demoted to an opt-in; **G1** DroppedArrays now
+> increments on a full-queue drop (`channel.rs:184`); **G7** the MaxByteRate
+> token-bucket Throttler is ported (`plugin/throttler.rs`); also G2 QueueFree
+> (807b07b6), G6 NDArrayAddr (3bf747fc), G8/ADC-5 NDDimensions (600adb66),
+> B5/ADC-4 throttle-not-dropped (a1cb7e0c), G5/R2 ProcessPlugin cache
+> (e1a4bbc4), G10 live attribute sources (b114c2df). The one genuine
+> **keep-Rust** item is **G4 NumThreads** multi-worker: the port runs a single
+> per-plugin tokio worker on purpose (array ordering is trivially correct), so
+> NumThreads/MaxThreads stay inert by design. Do NOT treat a present-tense
+> finding here as open without checking the ADC-N inventory AND current source.
+> Kept verbatim for audit provenance.
+
 Scope: `src/plugin/{mod,channel,runtime,wiring,params,file_base,file_controller}.rs`
 and `src/ioc/{mod,driver_context,helpers,plugin_manager}.rs` vs
 `ADApp/pluginSrc/{NDPluginDriver,NDPluginFile,throttler}.{cpp,h}`.

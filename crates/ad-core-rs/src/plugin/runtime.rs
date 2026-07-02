@@ -1479,7 +1479,7 @@ impl PortDriver for PluginPortDriver {
         Ok(())
     }
 
-    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
         let addr = user.addr;
         let s = String::from_utf8_lossy(data).into_owned();
@@ -1488,7 +1488,7 @@ impl PortDriver for PluginPortDriver {
         let _ = self
             .param_change_tx
             .send((reason, addr, ParamChangeValue::Octet(s)));
-        Ok(())
+        Ok(data.len())
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {

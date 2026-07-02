@@ -2,7 +2,9 @@ use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
 use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue};
 
 // swait (string wait) record from synApps calc module.
@@ -18,6 +20,19 @@ pub struct SwaitRecord {
     pub dopt: i16,
     pub dold: f64,
     pub oval: f64,
+    // OEVT ("Output Event") — C `swaitRecord.c` `pwait->oevt` (DBF_USHORT).
+    // When output fires and `oevt > 0`, `execOutput` posts the numeric
+    // software event (`post_event((int)oevt)`, swaitRecord.c:797); see
+    // [`Record::output_event`]. swait has no IVOA field, so the post is
+    // never suppressed by the framework Don't_drive veto.
+    pub oevt: u16,
+    // ODLY ("Output Execute Delay", seconds) — C `swaitRecord.c` `pwait->odly`
+    // (DBF_FLOAT). When output fires and `odly > 0`, `schedOutput`
+    // (swaitRecord.c:719) defers the OUT write + forward link + OEVT post by
+    // `odly` seconds via the watchdog, holding the record active (PACT=1); when
+    // `odly == 0` it calls `execOutput` immediately. `f32` mirrors the C
+    // `float` field so a CA client sees DBR_FLOAT (not DBR_DOUBLE).
+    pub odly: f32,
     pub out: String,
     pub prec: i16,
     // INxN: input link names; INxP: process passive flags (0/1)
@@ -27,6 +42,13 @@ pub struct SwaitRecord {
     pub num_vals: [f64; 12],
     prev_val: f64,
     cached_should_output: bool,
+    // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
+    // no DLYA database field, unlike scalcout). `output_wait` marks that the
+    // current `process()` call is the watchdog continuation re-entry; on it the
+    // captured `pending_output` decision is restored so the framework writes
+    // OUT + posts OEVT exactly once after the delay.
+    output_wait: bool,
+    pending_output: bool,
 }
 
 impl Default for SwaitRecord {
@@ -39,6 +61,8 @@ impl Default for SwaitRecord {
             dopt: 0,
             dold: 0.0,
             oval: 0.0,
+            oevt: 0,
+            odly: 0.0,
             out: String::new(),
             prec: 0,
             inp_names: Default::default(),
@@ -46,6 +70,8 @@ impl Default for SwaitRecord {
             num_vals: [0.0; 12],
             prev_val: 0.0,
             cached_should_output: true,
+            output_wait: false,
+            pending_output: false,
         }
     }
 }
@@ -138,6 +164,16 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
         name: "OVAL",
         dbf_type: DbFieldType::Double,
         read_only: true,
+    },
+    FieldDesc {
+        name: "OEVT",
+        dbf_type: DbFieldType::UShort,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ODLY",
+        dbf_type: DbFieldType::Float,
+        read_only: false,
     },
     // OUT and OUTN are intentionally absent: both route to RecordInstance::common.out
     // via put_common_field so that parsed_out is populated for output dispatch.
@@ -379,6 +415,21 @@ impl Record for SwaitRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // ODLY continuation: this is the watchdog re-process scheduled by a
+        // previous cycle (C `swaitRecord.c::process` `if (pact && outputWait)
+        // execOutput`, line 394). Do NOT re-evaluate CALC / OOPT — C runs
+        // `execOutput` directly. Restore the captured output decision so the
+        // framework writes the OUT link + posts OEVT this cycle, then clear the
+        // wait flag. Mirrors scalcout's `dlya == 1` branch (swait has no DLYA
+        // field — the wait state is the internal `output_wait` flag, as C uses
+        // `cbStruct.outputWait`).
+        if self.output_wait {
+            self.output_wait = false;
+            self.cached_should_output = self.pending_output;
+            self.pending_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
         self.prev_val = self.val;
 
         if let Some(ref compiled) = self.compiled_calc {
@@ -397,11 +448,61 @@ impl Record for SwaitRecord {
             self.oval = if self.dopt == 1 { self.dold } else { self.val };
         }
 
+        // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
+        // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
+        // link by ODLY seconds via the watchdog, holding the record active
+        // (C keeps PACT=1). The value side (VAL + changed inputs + alarm fields)
+        // is NOT deferred: C `process` calls `monitor()` (line 475) on THIS
+        // (delay-start) cycle, before returning async — only `execOutput`
+        // (delay-end) is delayed, and it posts no monitors. The delaying cycle
+        // captures the output decision and suppresses this cycle's OUT/OEVT
+        // (`cached_should_output = false`), then re-processes after the delay;
+        // the `output_wait` branch above emits the output exactly once.
+        if self.cached_should_output && self.odly > 0.0 {
+            self.pending_output = self.cached_should_output;
+            self.output_wait = true;
+            self.cached_should_output = false;
+            let delay = std::time::Duration::from_secs_f64(self.odly as f64);
+            // `CompleteDeferOutput`, NOT bare `AsyncPending`: swait posts the
+            // value side at the START of the delay (C `monitor()` at line 475,
+            // reached because `schedOutput` set `async=TRUE` but `process` falls
+            // through to `monitor()` before the `if(!async)` forward-link tail).
+            // The framework therefore runs its full monitor epilogue this cycle
+            // (VAL with MDEL/ADEL deadband + alarm mask, changed inputs) and
+            // defers only the OUT/OEVT/FLNK tail, holding PACT for the watchdog
+            // window via the `ReprocessAfter` continuation that releases it —
+            // matching C `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE
+            // WAITING ON THE WATCHDOG". A bare `AsyncPending` would have deferred
+            // the value side to delay-end too (the calcout/scalcout/acalcout
+            // shape, whose C `process` returns BEFORE `monitor()`); swait's C
+            // does not, so VAL must post now.
+            return Ok(ProcessOutcome {
+                result: RecordProcessResult::CompleteDeferOutput,
+                actions: vec![ProcessAction::ReprocessAfter(delay)],
+                device_did_compute: false,
+            });
+        }
+
         Ok(ProcessOutcome::complete())
     }
 
     fn should_output(&self) -> bool {
         self.cached_should_output
+    }
+
+    /// `OEVT` ("Output Event"): post the numeric output event when output
+    /// fires. C `swaitRecord.c` `execOutput` runs `if (pwait->oevt > 0)
+    /// post_event((int)pwait->oevt);` (swaitRecord.c:797) right after the OUT
+    /// write / forward link, on every cycle where output fires
+    /// (`cached_should_output`). swait has no IVOA field, so — like its C —
+    /// the post is never IVOA-suppressed. Stringified so the numeric event
+    /// matches a `SCAN="Event"` record's `EVNT`.
+    fn output_event(&self) -> Option<String> {
+        if self.cached_should_output && self.oevt > 0 {
+            Some(self.oevt.to_string())
+        } else {
+            None
+        }
     }
 
     fn val(&self) -> Option<EpicsValue> {
@@ -416,6 +517,8 @@ impl Record for SwaitRecord {
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLD" => Some(EpicsValue::Double(self.dold)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
+            "OEVT" => Some(EpicsValue::UShort(self.oevt)),
+            "ODLY" => Some(EpicsValue::Float(self.odly)),
             // OUTN is aliased to common.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => {
@@ -462,6 +565,18 @@ impl Record for SwaitRecord {
                 self.dold = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("DOLD".into()))?;
+            }
+            "OEVT" => {
+                self.oevt = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OEVT".into()))?
+                    as u16;
+            }
+            "ODLY" => {
+                self.odly = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?
+                    as f32;
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
             "PREC" => {

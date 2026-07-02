@@ -1,3 +1,4 @@
+pub mod acalcout;
 pub mod ai;
 pub mod alarm_filter;
 pub mod ao;
@@ -24,11 +25,13 @@ pub mod mbbi;
 pub mod mbbi_direct;
 pub mod mbbo;
 pub mod mbbo_direct;
+pub mod permissive;
 pub mod printf;
 pub mod scalcout;
 pub mod sel;
 pub mod seq;
 pub mod sseq;
+pub mod state;
 pub mod stringin;
 pub mod stringout;
 pub mod sub_record;

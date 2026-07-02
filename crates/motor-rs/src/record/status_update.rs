@@ -80,12 +80,35 @@ impl MotorRecord {
     /// Convert ProcessEffects to DeviceActions for the shared mailbox.
     pub(crate) fn effects_to_actions(&mut self, effects: &ProcessEffects) -> DeviceActions {
         let poll = if effects.request_poll {
-            PollDirective::Start
+            // An explicit poll request (move dispatch, LOAD_POS readback,
+            // retarget) wants a fresh status post — Refresh forces it through
+            // even if the polled status is unchanged.
+            PollDirective::Refresh
         } else if effects.status_refresh {
-            PollDirective::Start
+            // STUP / implicit GET_INFO / DELAY_ACK settle-resume. C's
+            // motorUpdateStatus_ forces statusChanged_=1 (asynMotorController
+            // .cpp:217-222) so the ack callback always fires and clears
+            // STUP=BUSY; Refresh is the analogue. A plain Start would dedup
+            // against the already-running poller and leave STUP stranded on a
+            // stationary axis whose status never changes.
+            PollDirective::Refresh
         } else if effects.commands.is_empty() && effects.schedule_delay.is_none() && self.stat.dmov
         {
-            PollDirective::Stop
+            // C asynMotorController::asynMotorPoller (asynMotorController.cpp:
+            // 615-696) is a while(1) that NEVER stops idle polling — it polls
+            // every idlePollPeriod_ when !anyMoving, so an external move / limit
+            // trip / encoder drift while the record is idle is still detected.
+            // The MIP_EXTERNAL detector (status_update.rs:239) and the idle-poll
+            // button resume (the Idle-arm dispatch_latent_collection) both
+            // depend on this poll. Keep the poller alive at the idle rate
+            // (effective_poll_interval returns idle_poll_interval once the
+            // completing poll cleared last_moving) instead of stopping it; Start
+            // is idempotent via the polling_active dedup while already polling,
+            // and resumes the poller after a settle delay (ScheduleDelay reset
+            // polling_active). The record intentionally never emits Stop — C has
+            // no record-driven poller stop; idle_poll_interval == 0 gives C's
+            // event-only idle mode (idlePollPeriod_ == 0) at the loop's timed arm.
+            PollDirective::Start
         } else {
             PollDirective::None
         };
@@ -112,8 +135,30 @@ impl MotorRecord {
         driver_done && no_pending
     }
 
-    /// Update readback positions from driver status.
+    /// Update readback positions from driver status. The runtime poll path
+    /// uses this (`initcall = false`).
+    ///
+    /// C `process_motor_info(pmr, initcall)` (motorRecord.cc:3650+) takes the
+    /// init flag explicitly; the URIP RDBL scaling is gated `else if
+    /// (urip==Yes && initcall==false)` (3682), so the init readback seeds RRBV
+    /// from the motor position rather than the external link. The init path
+    /// (`device_support::init` + `initial_readback`) therefore calls
+    /// `process_motor_info_initcall(.., true)`. (An earlier Rust version gated
+    /// URIP on `self.initialized`, but `determine_event` flips that true
+    /// *before* dispatching the Startup readback, so the gate never skipped
+    /// the call that actually seeds DVAL/VAL.)
     pub fn process_motor_info(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
+        self.process_motor_info_initcall(status, false);
+    }
+
+    /// `process_motor_info` with C's explicit `initcall`. `initcall = true`
+    /// suppresses the URIP RDBL readback scaling (the init readback adopts the
+    /// motor position, not the external readback link).
+    pub(crate) fn process_motor_info_initcall(
+        &mut self,
+        status: &asyn_rs::interfaces::motor::MotorStatus,
+        initcall: bool,
+    ) {
         // C 3671-3675: UEIP=Yes is demoted to No on any poll where the
         // driver reports no encoder. This — not the put handler — is
         // what vets a .db-loaded UEIP=Yes: dbLoadRecords writes field()
@@ -123,8 +168,13 @@ impl MotorRecord {
             self.conv.ueip = false;
         }
 
-        // Layer 1: update raw positions
-        self.pos.rmp = (status.position / self.conv.mres).round() as i64;
+        // Layer 1: update raw positions. C devMotorAsyn.c:452/459 rounds the
+        // raw motor and encoder counts with floor(x + 0.5) (half toward +inf),
+        // NOT NINT (half away from zero). They differ only at an exact .5 on a
+        // negative count (raw -2.5 -> C -2, Rust .round() -> -3). The other raw
+        // conversions in this file (rdif, rval, URIP rrbv) use C NINT
+        // (motorRecord.cc) == Rust .round(), so they must stay .round().
+        self.pos.rmp = (status.position / self.conv.mres + 0.5).floor() as i64;
 
         // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
         // independent of UEIP (C rounds the count the asyn layer already
@@ -133,7 +183,7 @@ impl MotorRecord {
         // it). MRES is only a fallback for an invalid runtime ERES.
         let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
         if eres_valid {
-            self.pos.rep = (status.encoder_position / self.conv.eres).round() as i64;
+            self.pos.rep = (status.encoder_position / self.conv.eres + 0.5).floor() as i64;
         } else {
             if self.conv.ueip {
                 tracing::warn!(
@@ -141,7 +191,7 @@ impl MotorRecord {
                     self.conv.eres
                 );
             }
-            self.pos.rep = (status.encoder_position / self.conv.mres).round() as i64;
+            self.pos.rep = (status.encoder_position / self.conv.mres + 0.5).floor() as i64;
         }
 
         // RRBV depends on UEIP
@@ -151,8 +201,9 @@ impl MotorRecord {
             self.pos.rmp
         };
 
-        // URIP path: use external readback link value with RRES conversion
-        if !self.conv.ueip && self.conv.urip && self.initialized {
+        // URIP path: use external readback link value with RRES conversion.
+        // C 3682: skipped on the init call (`initcall == false` required).
+        if !self.conv.ueip && self.conv.urip && !initcall {
             if let Some(rdbl_value) = self.conv.rdbl_value {
                 let rres = if self.conv.rres != 0.0 {
                     self.conv.rres
@@ -277,20 +328,27 @@ impl MotorRecord {
         if !status.vbas_supported {
             msta |= MstaFlags::VBAS_UNSUPPORTED;
         }
-        // Preserve record-managed bits. EA_PRESENT is NOT preserved:
-        // C overwrites pmr->msta wholesale from the driver each poll,
-        // and the UEIP demotion above depends on that bit being pure
-        // driver truth rather than a record-side latch.
-        if self.stat.msta.contains(MstaFlags::HOMED) || status.homed {
+        // RA_HOMED (bit 14) mirrors the driver status word like every
+        // other MSTA bit. C copies pmr->msta wholesale from the driver
+        // each poll (devMotorAsyn.c:467) and never record-manages
+        // RA_HOMED — motorRecord.cc writes it nowhere. A record-side
+        // sticky latch would report a permanently-homed axis after the
+        // driver de-asserts homed (re-home, controller reset, a
+        // SetPosition redefine the controller treats as un-homed).
+        if status.homed {
             msta |= MstaFlags::HOMED;
         }
+        let msta_changed = msta != self.stat.msta;
         self.stat.msta = msta;
 
-        // C monitor() (3541-3549): when the controller supports
-        // closed-loop gain (GAIN_SUPPORT), CNEN is a readback of the
-        // EA_POSITION (position-maintenance/torque) bit on every MSTA
-        // post — an externally toggled torque updates the field.
-        if msta.contains(MstaFlags::GAIN_SUPPORT) {
+        // C monitor() (3541-3549): when the controller supports closed-loop
+        // gain (GAIN_SUPPORT), CNEN is a readback of the EA_POSITION
+        // (position-maintenance/torque) bit — but the readback lives inside
+        // monitor()'s MARKED(M_MSTA) branch, so it refreshes only on a poll
+        // where MSTA actually changed, not every poll. Gating on msta_changed
+        // keeps a user-written CNEN that the driver has not yet reflected in
+        // EA_POSITION from being reverted a poll early.
+        if msta_changed && msta.contains(MstaFlags::GAIN_SUPPORT) {
             self.ctrl.cnen = msta.contains(MstaFlags::POSITION);
         }
 
@@ -372,7 +430,9 @@ impl MotorRecord {
         // Capture the autosaved target before the driver readback overwrites it.
         let autosaved_dval = self.pos.dval;
         let autosaved_rval = self.pos.rval;
-        self.process_motor_info(status);
+        // C init_record runs `process_motor_info(pmr, true)` — the init call
+        // skips URIP RDBL scaling and seeds the readback from motor position.
+        self.process_motor_info_initcall(status, true);
 
         // C: devMotorAsyn.c init_controller — RSTM restore decision.
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
@@ -449,6 +509,23 @@ impl MotorRecord {
         if status.moving {
             // At startup, the poll loop may not be active yet — request it.
             effects.request_poll = true;
+        }
+
+        // C init_record (motorRecord.cc:677-681): a CONSTANT .dol clears UDF
+        // at init (`pmr->udf = FALSE`) and seeds VAL from the constant. The
+        // motor never derives UDF from VAL otherwise — clears_udf() returns
+        // false so the framework's value_is_undefined() path is off — so this
+        // is the only init UDF clear for the common (no-DOL / literal-DOL)
+        // axis. A DB_LINK / CA DOL is left undefined until the closed-loop
+        // collection's first successful read clears it (1994-2005), exactly
+        // like C leaving udf TRUE for a non-CONSTANT .dol. An unset DOL has
+        // C link type CONSTANT (recGblInitConstantLink is a no-op leaving VAL
+        // at 0), so ParsedLink::None counts alongside a literal Constant.
+        if matches!(
+            parse_link_v2(&self.links.dol),
+            ParsedLink::None | ParsedLink::Constant(_)
+        ) {
+            self.internal.dol_udf = Some(false);
         }
 
         effects

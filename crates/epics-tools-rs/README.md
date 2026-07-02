@@ -37,10 +37,10 @@ epics-tools-rs = { version = "*", default-features = false, features = ["procser
 
 ```bash
 # Foreground, port 4051, supervising a softIoc
-procserv-rs -f -p 4051 -- softIoc -d my.db
+procserv-rs -f -P 4051 -- softIoc -d my.db
 
 # Daemonized with log/pid/info files
-procserv-rs -p 4051 \
+procserv-rs -P 4051 \
     --logfile /var/log/ioc.log \
     --pidfile /var/run/ioc.pid \
     --info-file /var/run/ioc.info \
@@ -48,7 +48,7 @@ procserv-rs -p 4051 \
     -- softIoc -d my.db
 
 # Bind to all interfaces (default is localhost only)
-procserv-rs -f -p 4051 --allow -- softIoc -d my.db
+procserv-rs -f -P 4051 --allow -- softIoc -d my.db
 
 # UNIX domain socket instead of TCP
 procserv-rs -f --unixpath /tmp/ioc.sock -- softIoc -d my.db
@@ -60,22 +60,34 @@ Everything after `--` is the child program and its argv.
 
 | Flag | Description | Default |
 |---|---|---|
-| `-p, --port <PORT>` | TCP listen port | — |
-| `--allow` | Bind 0.0.0.0 instead of 127.0.0.1 | off |
+| `-P, --port <PORT>` | TCP control port (note: uppercase `-P`) | — |
+| `--allow` | Bind the control port to 0.0.0.0 instead of 127.0.0.1 | off |
+| `-l, --logport <PORT>` | Read-only viewer/log TCP port | — |
+| `--restrict` | Restrict the log port to localhost | off |
 | `--unixpath <PATH>` | UNIX-domain socket path | — |
 | `-f, --foreground` | Do not daemonize | off |
-| `-L, --logfile <PATH>` | Log file | — |
-| `--pidfile <PATH>` | PID file | — |
-| `--info-file <PATH>` | `PROCSERV_INFO` info file | — |
+| `-d, --debug` | Keep child in foreground + debug-level logging (also `PROCSERV_DEBUG` env) | off |
+| `-q, --quiet` | Suppress the no-log-file warning when daemonizing | off |
+| `-L, --logfile <PATH>` | Log file (`-` logs to stdout) | — |
+| `-S, --logstamp[=FMT]` | Timestamp each log line (FMT attached with `=`) | off |
+| `-F, --timefmt <FMT>` | strftime for banner / start-time lines | `%c` |
+| `-p, --pidfile <PATH>` | PID file (note: lowercase `-p`) | — |
+| `-I, --info-file <PATH>` | `PROCSERV_INFO` info file | — |
 | `--holdoff <SEC>` | Hold-off between restarts | 15 |
 | `-w, --wait` | Do not start child until first console request | off |
-| `--chdir <DIR>` | `chdir` before exec'ing child | — |
-| `--name <NAME>` | Display name in banners | child basename |
-| `--max-restarts <N>` | Max restarts inside `--restart-window` | 10 |
+| `-N, --noautorestart` | Start with auto-restart disabled (server stays up) | off |
+| `-o, --oneshot` | Exit the supervisor when the child exits | off |
+| `-c, --chdir <DIR>` | `chdir` before exec'ing child | — |
+| `-n, --name <NAME>` | Display name in banners | command |
+| `-e, --exec <PATH>` | Executable to run instead of the command | command |
+| `--max-restarts <N>` | Max restarts inside `--restart-window` | unlimited |
 | `--restart-window <SEC>` | Sliding window for `--max-restarts` | 600 |
-| `--kill-char <BYTE>` | Force-kill key (Ctrl-X = 24, 0 disables) | 24 |
-| `--toggle-restart-char <BYTE>` | Toggle restart-mode key (Ctrl-T = 20) | 20 |
-| `--logout-char <BYTE>` | Per-client logout key (Ctrl-] = 29) | 29 |
+| `-C, --coresize <BYTES>` | Child `RLIMIT_CORE` soft limit | inherit |
+| `-K, --killsig <SIGNUM>` | Signal for the kill key / shutdown teardown | 9 (SIGKILL) |
+| `-i, --ignore <CHARS>` | Extra bytes to strip from child stdin (caret notation) | — |
+| `-k, --killcmd <CHAR>` | Kill key, caret notation (`^X`; empty disables) | `^X` |
+| `-T, --autorestartcmd <CHAR>` | Toggle restart-mode key (caret notation) | `^T` |
+| `-x, --logoutcmd <CHAR>` | Per-client logout key (caret notation; disabled by default) | none |
 
 ### Connecting to the console
 
@@ -98,7 +110,7 @@ in a party-line fashion. Built-in keys:
 `procserv-rs` uses the `tracing` ecosystem with an `EnvFilter`:
 
 ```bash
-RUST_LOG=debug procserv-rs -f -p 4051 -- softIoc -d my.db
+RUST_LOG=debug procserv-rs -f -P 4051 -- softIoc -d my.db
 RUST_LOG=epics_tools_rs::procserv=trace procserv-rs ...
 ```
 

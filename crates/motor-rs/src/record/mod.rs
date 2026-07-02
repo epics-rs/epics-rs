@@ -278,6 +278,13 @@ impl Record for MotorRecord {
                 ("RVAL".to_string(), EpicsValue::Int64(self.pos.rval)),
                 ("RBV".to_string(), EpicsValue::Double(self.pos.rbv)),
                 ("DRBV".to_string(), EpicsValue::Double(self.pos.drbv)),
+                // C do_work move block (motorRecord.cc:2248-2256) recomputes
+                // diff=dval-drbv + MARK(M_DIFF) and rdif=NINT(diff/mres) +
+                // MARK(M_RDIF) before too_small/LVIO, so monitor() posts the
+                // new full-distance following error on the move-start pass.
+                // `plan_absolute_move` already refreshed pos.diff/pos.rdif.
+                ("DIFF".to_string(), EpicsValue::Double(self.pos.diff)),
+                ("RDIF".to_string(), EpicsValue::Int64(self.pos.rdif)),
                 // C do_work marks M_MIP on every move dispatch and
                 // M_RCNT when the retry count resets (motorRecord.cc:
                 // 1929-1932), so the move-start monitor() pass posts
@@ -532,6 +539,36 @@ impl Record for MotorRecord {
         }
     }
 
+    /// C `special()` STUP after-write (motorRecord.cc:3084-3090): a STUP put
+    /// of any value other than ON is clamped to OFF and returns ERROR, which
+    /// suppresses the pp(TRUE) reprocess — only a `STUP == ON` put runs the
+    /// status-update process. `field_access` has already clamped `stup` to 0
+    /// for any non-ON put by the time this gate runs, so the post-clamp value
+    /// is the deterministic discriminator. Every other pp(TRUE) field
+    /// reprocesses normally (default membership test).
+    fn processes_after_put(&self, field: &str) -> bool {
+        if field.eq_ignore_ascii_case("STUP") {
+            return self.stat.stup == 1;
+        }
+        self.process_passive_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
+    }
+
+    /// C never derives the motor's UDF from VAL. `motorRecord.cc` touches
+    /// `udf` in exactly three places: init_record (677-681, CONSTANT .dol →
+    /// FALSE), the closed-loop DOL collection (1994-2005, DB_LINK read
+    /// fail → TRUE / success → FALSE), and alarm_sub (3372 consumes it).
+    /// The framework's default `clears_udf()` would instead recompute
+    /// `udf = value_is_undefined()` (VAL.is_nan()) every process pass — a
+    /// divergence that both fabricates UDF on a transient NaN VAL and, on a
+    /// no-DOL-read pass, clobbers the legitimate closed-loop DOL outcome.
+    /// Opt out so motor UDF is owned solely by the DOL channel
+    /// (`dol_udf` → check_alarms) and the init clear in `initial_readback`.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.
@@ -624,6 +661,29 @@ mod tests {
         // C motorRecord.cc:1509-1510: DMOV is the only FLNK gate.
         rec.stat.dmov = false;
         assert!(!rec.should_fire_forward_link());
+    }
+
+    // C special() STUP after-write (motorRecord.cc:3084-3090): only a
+    // STUP==ON put runs the pp(TRUE) reprocess; any other value is clamped to
+    // OFF and C returns ERROR so the record does not process. R24. Fresh
+    // records per case so the STUP-in-flight before-write veto (stup != OFF)
+    // does not reject the second put.
+    #[test]
+    fn test_stup_processes_after_put_only_when_on() {
+        // STUP == ON -> reprocess.
+        let mut on = MotorRecord::new();
+        on.put_field("STUP", EpicsValue::Short(1)).unwrap();
+        assert_eq!(on.stat.stup, 1);
+        assert!(on.processes_after_put("STUP"));
+
+        // STUP == BUSY -> clamped to OFF, no reprocess (C return ERROR).
+        let mut off = MotorRecord::new();
+        off.put_field("STUP", EpicsValue::Short(2)).unwrap();
+        assert_eq!(off.stat.stup, 0);
+        assert!(!off.processes_after_put("STUP"));
+
+        // A non-pp(TRUE) config field never reprocesses (default membership).
+        assert!(!off.processes_after_put("VELO"));
     }
 
     // C motorRecord.cc:1495 — every process pass fires the RLNK readback
@@ -858,6 +918,121 @@ mod tests {
         rec.set_resolved_input_links(&[]);
         rec.check_alarms(&mut common);
         assert!(common.udf, "a pass without a DOL read leaves udf alone");
+    }
+
+    // R61: a settled-idle record keeps the poller alive (Start), never Stop.
+    // C asynMotorController::asynMotorPoller (asynMotorController.cpp:615-696)
+    // is a while(1) that never stops idle polling, so the MIP_EXTERNAL detector
+    // and the idle-poll button resume keep firing. Pre-R61 the settled pass
+    // emitted PollDirective::Stop, stranding both end-to-end.
+    #[test]
+    fn settled_idle_keeps_poller_alive_not_stopped() {
+        let mut rec = MotorRecord::new();
+        rec.stat.dmov = true;
+        // No commands, no schedule_delay, no request_poll / status_refresh.
+        let effects = ProcessEffects::default();
+        let actions = rec.effects_to_actions(&effects);
+        assert_eq!(
+            actions.poll,
+            PollDirective::Start,
+            "a settled idle record must keep the poller alive, not stop it"
+        );
+    }
+
+    // An explicit refresh request (request_poll / status_refresh — STUP,
+    // implicit GET_INFO, settle-resume) must emit PollDirective::Refresh, the
+    // forced-post directive (C motorUpdateStatus_ forces statusChanged_=1), not
+    // the deduped keep-alive Start — otherwise STUP=BUSY strands on a stationary
+    // axis whose status never changes.
+    #[test]
+    fn refresh_request_forces_poll_directive() {
+        let mut rec = MotorRecord::new();
+        let status_refresh = ProcessEffects {
+            status_refresh: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            rec.effects_to_actions(&status_refresh).poll,
+            PollDirective::Refresh,
+            "status_refresh must force a poll"
+        );
+        let request_poll = ProcessEffects {
+            request_poll: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            rec.effects_to_actions(&request_poll).poll,
+            PollDirective::Refresh,
+            "request_poll must force a poll"
+        );
+    }
+
+    // R44: C never derives motor UDF from VAL — motorRecord.cc touches udf
+    // only at init_record (677-681), the closed-loop DOL collection
+    // (1994-2005), and alarm_sub (3372). clears_udf() opts out of the
+    // framework's value_is_undefined() per-cycle derivation.
+    #[test]
+    fn motor_opts_out_of_val_derived_udf() {
+        let rec = MotorRecord::new();
+        assert!(
+            !rec.clears_udf(),
+            "motor UDF must not be recomputed from VAL each process pass"
+        );
+    }
+
+    // C init_record (677-681): a CONSTANT .dol clears UDF at init. An unset
+    // DOL is CONSTANT, so the common (no-DOL) axis is defined after init.
+    #[test]
+    fn constant_dol_clears_udf_at_init() {
+        use epics_base_rs::server::record::CommonFields;
+        let mut rec = MotorRecord::new();
+        rec.links.dol = String::new(); // unset DOL == CONSTANT
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            position: 0.0,
+            encoder_position: 0.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        };
+        rec.initial_readback(&status);
+        assert_eq!(
+            rec.internal.dol_udf,
+            Some(false),
+            "init arms the UDF clear for a CONSTANT DOL"
+        );
+        let mut common = CommonFields::default(); // udf == true (dbCommon default)
+        rec.check_alarms(&mut common);
+        assert!(!common.udf, "CONSTANT DOL motor is defined after init");
+    }
+
+    // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for
+    // CONSTANT, 677-681); only the closed-loop collection's first successful
+    // read clears it (1994-2005).
+    #[test]
+    fn db_link_dol_leaves_udf_undefined_at_init() {
+        use epics_base_rs::server::record::CommonFields;
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1; // closed_loop
+        rec.links.dol = "setpoint_src.VAL".to_string(); // DB_LINK
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            position: 0.0,
+            encoder_position: 0.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        };
+        rec.initial_readback(&status);
+        assert_ne!(
+            rec.internal.dol_udf,
+            Some(false),
+            "a DB_LINK DOL is not cleared at init"
+        );
+        let mut common = CommonFields::default(); // udf == true
+        rec.check_alarms(&mut common);
+        assert!(
+            common.udf,
+            "DB_LINK DOL motor stays undefined until the first DOL read"
+        );
     }
 
     // C reads DOL only when dol.type == DB_LINK; a constant DOL is initialised

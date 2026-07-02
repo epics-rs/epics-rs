@@ -5,7 +5,15 @@ use crate::user::AsynUser;
 
 /// Motor axis status.
 /// Fields match the C asynMotorController MotorStatus structure.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` backs the poll loop's idle change-detection: the loop notifies
+/// the record only when a freshly polled status differs from the last one
+/// delivered, the analogue of C `asynMotorAxis::callParamCallbacks`
+/// (asynMotorAxis.cpp:316-322) firing the generic-pointer status callback only
+/// when `statusChanged_` is set. f64 `!=` matches C's field comparisons
+/// (`value != status_.position`), including the `NaN != NaN` always-changed
+/// case.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MotorStatus {
     /// Current position in user coordinates.
     pub position: f64,
@@ -95,10 +103,16 @@ pub enum PidGainKind {
 /// (time-to-velocity, sec) field into an EGU/sec² rate before calling.
 pub trait AsynMotor: Send + Sync {
     /// Move to an absolute position.
+    ///
+    /// `min_velocity` is the base/start velocity (motor record VBAS, EGU/sec):
+    /// canonical `asynMotorAxis::move(position, relative, minVelocity,
+    /// maxVelocity, acceleration)` carries it, and the motor record emits it as
+    /// `SET_VEL_BASE` ahead of the move (`devMotorAsyn.c` `motorVelBase`).
     fn move_absolute(
         &mut self,
         user: &AsynUser,
         position: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()>;
@@ -108,28 +122,47 @@ pub trait AsynMotor: Send + Sync {
         &mut self,
         user: &AsynUser,
         distance: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
         // Default: convert to absolute using current position from poll
         let status = self.poll(user)?;
-        self.move_absolute(user, status.position + distance, velocity, acceleration)
+        self.move_absolute(
+            user,
+            status.position + distance,
+            min_velocity,
+            velocity,
+            acceleration,
+        )
     }
 
     /// Move at a constant velocity (jog).
     /// Default implementation uses move_absolute to a very large target.
+    /// `min_velocity` is the base velocity (VBAS); canonical
+    /// `asynMotorAxis::moveVelocity(minVelocity, maxVelocity, acceleration)`.
     fn move_velocity(
         &mut self,
         user: &AsynUser,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
         let target = if velocity >= 0.0 { 1e9 } else { -1e9 };
-        self.move_absolute(user, target, velocity.abs(), acceleration)
+        self.move_absolute(user, target, min_velocity, velocity.abs(), acceleration)
     }
 
-    /// Start a homing sequence.
-    fn home(&mut self, user: &AsynUser, velocity: f64, forward: bool) -> AsynResult<()>;
+    /// Start a homing sequence. `min_velocity` is the base velocity (VBAS) and
+    /// `acceleration` the home ramp rate; canonical
+    /// `asynMotorAxis::home(minVelocity, maxVelocity, acceleration, forwards)`.
+    fn home(
+        &mut self,
+        user: &AsynUser,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+        forward: bool,
+    ) -> AsynResult<()>;
 
     /// Stop motion.
     fn stop(&mut self, user: &AsynUser, acceleration: f64) -> AsynResult<()>;
@@ -214,10 +247,11 @@ pub trait AsynMotor: Send + Sync {
         &mut self,
         user: &AsynUser,
         position: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.move_absolute(user, position, velocity, acceleration)
+        self.move_absolute(user, position, min_velocity, velocity, acceleration)
     }
 
     /// Enable or disable position-compare output (PCO) on this axis.

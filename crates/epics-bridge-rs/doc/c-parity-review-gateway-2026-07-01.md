@@ -51,7 +51,7 @@ divergence, often a documented-intentional redesign needing sign-off),
 `ca_gateway/{server,downstream,stats,beacon,master}.rs` vs
 `gateServer.cc`, `gateVc.cc` (downstream), `gateStat.cc`, `gateway.cc`.
 
-**GW-1** Upstream Active→Disconnect keeps downstream channels alive — **CONCERN** (documented-intentional; see GW-22)
+**GW-1** Upstream Active→Disconnect keeps downstream channels alive — **CONCERN** (documented-intentional; see GW-22) — **DEFERRED (user sign-off 2026-07-02; redesign accepted, see "Review closed")**
 - Rust: `ca_gateway/upstream.rs:1002-1015`
 - C ref: `gatePv.cc:597-610` (`gatePvData::death` deletes the `gateVcData`)
 - Impact: C destroys the VC → tears down the CAS channel → connected clients get ECA_DISCONN and re-search. Rust keeps the shadow channel and only posts an INVALID/`LINK_ALARM` last value. A client keying off connection-state (re-search, access-rights reset, provider failover) sees a live channel with a stale-but-alarmed value instead of a disconnect.
@@ -83,7 +83,7 @@ divergence, often a documented-intentional redesign needing sign-off),
 `ca_gateway/{upstream,cache,routing}.rs` vs `gatePv.cc`, `gateVc.cc`
 (upstream), `gateway.cc` (connect path).
 
-**GW-20** Cached-mode upstream monitor never torn down when the last downstream client leaves — **CONCERN**
+**GW-20** Cached-mode upstream monitor never torn down when the last downstream client leaves — **CONCERN** — **DEFERRED (user sign-off 2026-07-02; redesign accepted, see "Review closed")**
 - Rust: `cache.rs:162-167` (`remove_subscriber` does Active→Inactive only); `upstream.rs:1197-1200` (`release_monitor` no-op in cached mode); value/prop tasks run until eviction
 - C ref: `gateVc.cc:512-534` (`vcRemove`) → `gatePv.cc:424-461` `deactivate()` unmonitors value + property immediately on last-client-leaves
 - Impact: Rust keeps both upstream monitors running until `inactive_timeout` (2h default). Sustains upstream monitor traffic + cache churn for every PV any client ever touched, up to 2h after all clients leave — an unbounded upstream/CPU load C does not impose.
@@ -93,7 +93,7 @@ divergence, often a documented-intentional redesign needing sign-off),
 - C ref: `gateServer.cc:1442-1443` uses `inactiveTimeout()`; `disconnectTimeout()` is set/printed but never consulted in `inactiveDeadCleanup`
 - Impact: In C the `-disconnect_timeout` option has no eviction effect (dead code). Defaults match (both 2h), but an operator setting `-disconnect_timeout` ≠ `-inactive_timeout` gets non-C eviction timing.
 
-**GW-22** Upstream disconnect keeps downstream channels alive (LINK_ALARM) instead of C's VC-delete → ECA_DISCONN — **CONCERN** (documented-intentional; twin of GW-1)
+**GW-22** Upstream disconnect keeps downstream channels alive (LINK_ALARM) instead of C's VC-delete → ECA_DISCONN — **CONCERN** (documented-intentional; twin of GW-1) — **DEFERRED (user sign-off 2026-07-02; redesign accepted, see "Review closed")**
 - Rust: `upstream.rs:1002-1015` (set `Disconnect` + `post_alarm(3, LINK_ALARM)`, channels retained; reconnect Disconnect→Active)
 - C ref: `gatePv.cc:597-610` `death()` deletes the VC (clients see ECA_DISCONN, must re-search); reconnect `life()` → Inactive not Active
 - Impact: Client-visible connection-state differs. Marked intentional (`upstream.rs:996-1001`); flag for sign-off.
@@ -134,7 +134,7 @@ divergence, often a documented-intentional redesign needing sign-off),
 - Impact: Write path correctly ANDs local+upstream (`:1453`); read path uses local ACF only. When the upstream revokes read to the gateway's client, C reports read=false downstream; Rust keeps read=true and (cached) serves the last value. Asymmetric with write bridging — over-reports read rights (no fresh data flows, so CONCERN not DEFECT).
 - Fix: seed `upstream_read` from the same connect-time `channel.info()` snapshot, keep it live in the AR watcher (now tracks both bits, wakes downstream clients if either flips), and AND it into the read decision — symmetric with the write path. Test `br_gw40_upstream_read_denied_overrides_local_acf_allow`. Single read-decision owner, no sibling sites.
 
-**GW-41** Conditional ASG rules (CALC/INP) entirely non-functional — the whole `gateAsCa` subsystem is unported — **CONCERN**
+**GW-41** Conditional ASG rules (CALC/INP) entirely non-functional — the whole `gateAsCa` subsystem is unported — **CONCERN** — **DEFERRED (user sign-off 2026-07-02; fail-closed known gap, see "Review closed")**
 - Rust: `access.rs:103-109` (`Mode::Rules` with no INP resolver); `access.rs:117,147` call sync `check_access_*`, which in `epics-base-rs/src/server/access_security.rs:741-743` pass `calc_ok = |_| false` (fail-closed)
 - C ref: `gateAsCa.cc:139-233` opens CA channels + subscriptions on every ASG `INP` PV, feeds `asComputeAsg`; invoked from `gateAs.cc:716` on init + every `reInitialize`
 - Impact: A `RULE(...){CALC("A=1")}` with `INP(A)` that grants dynamically in C evaluates to **deny forever** in Rust. Fail-**closed** (can only deny, never over-grant), so CONCERN — but conditional-access ACFs are silently broken and can deny legitimate operators.
@@ -166,17 +166,17 @@ CONCERNs are deliberate redesign departures.
 - LOCK TEST: `crates/epics-bridge-rs/tests/pva_gateway.rs::gw60_slow_pipelined_downstream_converges_to_latest_under_overflow` drives the exact condition (slow pipelined consumer + fast 80-post burst → credit window closes → server `pending` squashes → source broadcast laps) and asserts the client converges to the FINAL post AND that coalescing happened (deliveries < posts). Would fail if the server squash regressed to drop-oldest.
 - RESIDUAL (narrow, = GW-64 only): the broadcast cap is a fixed 16. It matters ONLY for a client requesting `queueSize > 16` AND sustained overflow AND wanting full distinct-intermediate history (not just latest); pvxs default is 4 and latest-convergence holds regardless. Low severity; not fixed (a fan-out rewrite would duplicate the server's coalescing — fails the over-engineering self-test). Closable later with a one-line cap change (broadcast cap ≥ max negotiated `queueSize`) if a large-`queueSize` client ever needs it.
 
-**GW-61** Per-credential cache split breaks chancache's single-shared-upstream-monitor model — **CONCERN**
+**GW-61** Per-credential cache split breaks chancache's single-shared-upstream-monitor model — **CONCERN** — **DEFERRED (user sign-off 2026-07-02; redesign accepted, see "Review closed")**
 - Rust: `source.rs:584-622` (`upstream_cache_for` — every distinct `(account,method,host,authority)` gets its own `ChannelCache` → own upstream channel+monitor per PV; only anonymous share `self.cache`)
 - C ref: `chancache.h:151-173`, `server.cpp:62-92` — one `ChannelCache` per client provider; all downstream `GWChannel`s for a PV share one entry/one upstream monitor
 - Impact: The N-downstream ⇒ 1-upstream invariant no longer holds for credentialed deployments — upstream connection/monitor count scales with distinct downstream identities. Deliberate p4p.gw-style identity forwarding.
 
-**GW-62** Upstream disconnect fans out only to active monitors, not to downstream channel state; entry retained + auto-reconnected — **CONCERN**
+**GW-62** Upstream disconnect fans out only to active monitors, not to downstream channel state; entry retained + auto-reconnected — **CONCERN** — **DEFERRED (user sign-off 2026-07-02; redesign accepted, see "Review closed")**
 - Rust: `channel_cache.rs:470-485` (`signal_disconnect_boundary` → MONITOR FINISH on fan-out streams only) + `:1347-1363` (entry kept, loop reconnects)
 - C ref: `chancache.cpp:63-99` — `channelStateChange(DISCONNECTED)` erases the entry (`:78-83`) and fans DISCONNECTED to every interested `GWChannel` (`:90-98`) so the downstream channel goes DISCONNECTED
 - Impact: A downstream client observing connection-state sees no disconnect during an upstream outage; only in-flight monitors get FINISH; non-monitor channels never signalled. Transparent-reconnect redesign.
 
-**GW-63** Clean upstream `unlisten` (MONITOR FINISH) treated as transient + re-subscribed; C treats it as terminal — **CONCERN**
+**GW-63** Clean upstream `unlisten` (MONITOR FINISH) treated as transient + re-subscribed; C treats it as terminal — **CONCERN** — **DEFERRED (user sign-off 2026-07-02; redesign accepted, see "Review closed")**
 - Rust: `channel_cache.rs:1346-1393` (`handle.wait()` Ok = clean FINISH runs the same boundary-emit + backoff-resubscribe as an error; never stops)
 - C ref: `moncache.cpp:212-236` — `unlisten()` sets `startresult = ERROR("upstream unlisten()")` so all future `start()` fail; forwards unlisten, no reconnect
 - Impact: A genuinely-final upstream monitor is re-opened indefinitely (INIT→FINISH→resubscribe, backoff-bounded) instead of staying finished; downstream re-INITs repeatedly.
@@ -313,7 +313,30 @@ Thematic clusters:
   Locked with `gw60_slow_pipelined_downstream_converges_to_latest_under_overflow`.
   No fan-out rewrite (would duplicate the server layer). GW-64 residual (narrow,
   `queueSize > 16`) left open, low severity.
-- **GW-41** (`gateAsCa`) is a subsystem-sized port — confirm scope with the
-  user before starting.
-- **GW-1/GW-20/GW-22/GW-61/GW-62/GW-63** are redesign sign-off decisions,
-  not defects — surface as a group.
+- **GW-41** (`gateAsCa`) — **DEFERRED (user sign-off 2026-07-02).** The
+  conditional ASG rules (CALC/INP) stay unported and are documented as a known
+  fail-closed gap: they over-deny operators using conditional ACFs and never
+  over-grant. The port is a subsystem-sized change, reopened only on demand as
+  its own change.
+- **GW-1/GW-20/GW-22/GW-61/GW-62/GW-63** — **DEFERRED (user sign-off
+  2026-07-02).** The Rust keep-warm / transparent-reconnect model is accepted
+  as an intentional divergence and kept as-is; strict C-parity restoration
+  (tear-down + DISCONNECTED / terminal unlisten) is deferred. Not defects.
+
+### Review closed — 2026-07-02
+
+All defects fixed and verified: GW-23 (`70ebcfae`) and GW-40 (`1ed22d29`)
+FIXED; GW-60 and GW-80/81/82 closed as false positives. Workspace locked at
+close: `cargo clippy --workspace --all-targets -D warnings` clean and
+`cargo nextest run --workspace` 7420 passed / 0 failed.
+
+The two items that required a decision are both **DEFERRED + documented** by
+user sign-off (2026-07-02):
+
+- **GW-41** (`gateAsCa` conditional ASG rules) — deferred; documented as a
+  known fail-closed gap (over-denies, never over-grants).
+- **GW-1/GW-20/GW-22/GW-61/GW-62/GW-63** (keep-warm / transparent-reconnect) —
+  the Rust redesign is accepted and kept; C-parity restoration deferred.
+
+No further code action. Reopen GW-41 (the port) or the redesign group (parity
+restoration) only on an explicit request.

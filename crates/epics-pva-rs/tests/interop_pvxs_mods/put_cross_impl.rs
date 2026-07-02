@@ -72,10 +72,12 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
     });
     let start_len = buf.lock().unwrap().len();
 
-    // Rust server hosting two writable PVs (NTScalar default
-    // SharedPV has no on_put handler, so the inbound PUT lands
-    // directly in `current()`).
-    let str_pv = SharedPV::new();
+    // Rust server hosting two writable PVs. pvxs has no implicit-writable
+    // SharedPV, and neither does the Rust port: a plain SharedPV::new()
+    // rejects client PUTs with "PUT not supported by this PV". Use
+    // build_mailbox() so an inbound PUT stores the value and lands in
+    // current() — mirrors pvxs SharedPV::buildMailbox.
+    let str_pv = SharedPV::build_mailbox();
     str_pv
         .open(
             FieldDesc::Structure {
@@ -91,7 +93,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
             }),
         )
         .unwrap();
-    let int_pv = SharedPV::new();
+    let int_pv = SharedPV::build_mailbox();
     int_pv
         .open(
             FieldDesc::Structure {

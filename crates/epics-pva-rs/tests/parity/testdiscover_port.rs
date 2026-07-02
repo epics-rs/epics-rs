@@ -78,16 +78,28 @@ async fn pvxs_discover_emits_for_guid_change_same_server() {
         .expect("first")
         .expect("first");
 
-    // Different GUID from the same server: distinct (server, guid) pair,
-    // discover() fires again — even though BeaconTracker may throttle the
-    // reconnect-trigger path within the 5-min anomaly window.
+    // Same server, different GUID = the server was replaced (restart / new
+    // instance). pvxs reports this as the prior incarnation going offline and
+    // then the new one coming online: a Timeout for the OLD guid FOLLOWED BY
+    // an Online for the NEW guid (client.cpp:814-844, mirrored by the
+    // BeaconAction::Changed arm in search_engine.rs `emit_beacon_action`).
+    // Assert that exact ordered pair — the previous single-Online expectation
+    // ignored the Timeout pvxs emits first and tripped on it.
     engine.observe_beacon(server, [2u8; 12]).await;
-    let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
-        .expect("second timeout")
-        .expect("second channel closed");
-    match evt {
+        .expect("guid-change Timeout timed out")
+        .expect("channel closed before Timeout");
+    match first {
+        Discovered::Timeout { guid, .. } => assert_eq!(guid, [1u8; 12]),
+        other => panic!("expected Timeout for the old GUID first, got {other:?}"),
+    }
+    let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("guid-change Online timed out")
+        .expect("channel closed before Online");
+    match second {
         Discovered::Online { guid, .. } => assert_eq!(guid, [2u8; 12]),
-        Discovered::Timeout { .. } => panic!("unexpected Timeout"),
+        other => panic!("expected Online for the new GUID second, got {other:?}"),
     }
 }

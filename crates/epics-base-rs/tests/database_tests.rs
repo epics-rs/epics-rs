@@ -2182,31 +2182,60 @@ async fn test_phas_scan_order() {
     assert_eq!(names, vec!["REC_A", "REC_B", "REC_C"]);
 }
 
-#[tokio::test]
-async fn test_depth_limit() {
-    let db = PvDatabase::new();
-    for i in 0..20 {
-        db.add_record(&format!("CHAIN_{i}"), Box::new(AoRecord::new(0.0)))
+/// Run a deep FLNK-processing chain test on a thread with a large stack.
+///
+/// `process_record_with_links` polls the large `process_record_with_links_inner`
+/// future once per FLNK hop, up to `MAX_LINK_DEPTH` (16) frames deep. On
+/// linux-arm64 those frames are big enough that 16 of them overflow the default
+/// 2 MB test-thread stack (SIGABRT); x86_64 and macos-arm64 have smaller frames
+/// and fit. A 16 MB stack clears it. The future is built and awaited on the
+/// spawned thread, so it never crosses the thread boundary and needs no `Send`.
+fn run_deep_flnk_recursion<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn test_depth_limit() {
+    run_deep_flnk_recursion(|| async {
+        let db = PvDatabase::new();
+        for i in 0..20 {
+            db.add_record(&format!("CHAIN_{i}"), Box::new(AoRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        for i in 0..19 {
+            if let Some(rec) = db.get_record(&format!("CHAIN_{i}")).await {
+                let mut inst = rec.write().await;
+                inst.put_common_field(
+                    "FLNK",
+                    EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
+                )
+                .unwrap();
+            }
+        }
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("CHAIN_0", &mut visited, 0)
             .await
             .unwrap();
-    }
-    for i in 0..19 {
-        if let Some(rec) = db.get_record(&format!("CHAIN_{i}")).await {
-            let mut inst = rec.write().await;
-            inst.put_common_field(
-                "FLNK",
-                EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
-            )
-            .unwrap();
-        }
-    }
-
-    let mut visited = HashSet::new();
-    db.process_record_with_links("CHAIN_0", &mut visited, 0)
-        .await
-        .unwrap();
-    assert!(visited.len() <= 17);
-    assert!(visited.contains("CHAIN_0"));
+        assert!(visited.len() <= 17);
+        assert!(visited.contains("CHAIN_0"));
+    });
 }
 
 #[tokio::test]

@@ -1968,41 +1968,70 @@ async fn independent_records_no_interference() {
     assert_eq!(db.get_pv("iso_b").await.unwrap(), EpicsValue::Double(2.0));
 }
 
+/// Run a deep FLNK-processing chain test on a thread with a large stack.
+///
+/// `process_record_with_links` polls the large `process_record_with_links_inner`
+/// future once per FLNK hop, up to `MAX_LINK_DEPTH` (16) frames deep. On
+/// linux-arm64 those frames are big enough that 16 of them overflow the default
+/// 2 MB test-thread stack (SIGABRT); x86_64 and macos-arm64 have smaller frames
+/// and fit. A 16 MB stack clears it. The future is built and awaited on the
+/// spawned thread, so it never crosses the thread boundary and needs no `Send`.
+fn run_deep_flnk_recursion<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 /// C EPICS: maximum depth protection in process chains
-#[tokio::test]
-async fn process_chain_depth_limit() {
-    use epics_base_rs::server::database::PvDatabase;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+#[test]
+fn process_chain_depth_limit() {
+    run_deep_flnk_recursion(|| async {
+        use epics_base_rs::server::database::PvDatabase;
+        use std::collections::HashSet;
+        use std::sync::Arc;
 
-    let db = Arc::new(PvDatabase::new());
+        let db = Arc::new(PvDatabase::new());
 
-    // Create long chain: rec0 → rec1 → rec2 → ... → rec19
-    for i in 0..20 {
-        db.add_record(&format!("chain{i}"), Box::new(AoRecord::new(i as f64)))
-            .await
-            .unwrap();
-    }
-    for i in 0..19 {
-        if let Some(rec) = db.get_record(&format!("chain{i}")).await {
-            let mut inst = rec.write().await;
-            inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1).into()))
+        // Create long chain: rec0 → rec1 → rec2 → ... → rec19
+        for i in 0..20 {
+            db.add_record(&format!("chain{i}"), Box::new(AoRecord::new(i as f64)))
+                .await
                 .unwrap();
         }
-    }
+        for i in 0..19 {
+            if let Some(rec) = db.get_record(&format!("chain{i}")).await {
+                let mut inst = rec.write().await;
+                inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1).into()))
+                    .unwrap();
+            }
+        }
 
-    // Process chain0 — should follow FLNK chain without panic
-    let mut visited = HashSet::new();
-    let result = db
-        .process_record_with_links("chain0", &mut visited, 0)
-        .await;
-    assert!(result.is_ok(), "Long FLNK chain should not fail");
+        // Process chain0 — should follow FLNK chain without panic
+        let mut visited = HashSet::new();
+        let result = db
+            .process_record_with_links("chain0", &mut visited, 0)
+            .await;
+        assert!(result.is_ok(), "Long FLNK chain should not fail");
 
-    // All records should have been visited
-    assert!(
-        visited.len() >= 2,
-        "At least some records in chain should be visited"
-    );
+        // All records should have been visited
+        assert!(
+            visited.len() >= 2,
+            "At least some records in chain should be visited"
+        );
+    });
 }
 
 // ============================================================

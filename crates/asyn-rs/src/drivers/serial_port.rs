@@ -13,93 +13,11 @@ use crate::trace::TraceMask;
 use crate::user::AsynUser;
 use crate::{asyn_trace, asyn_trace_io};
 
-// --- Configuration types ---
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataBits {
-    Five,
-    Six,
-    Seven,
-    Eight,
-}
-
-impl Default for DataBits {
-    fn default() -> Self {
-        DataBits::Eight
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Parity {
-    None,
-    Odd,
-    Even,
-}
-
-impl Default for Parity {
-    fn default() -> Self {
-        Parity::None
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopBits {
-    One,
-    Two,
-}
-
-impl Default for StopBits {
-    fn default() -> Self {
-        StopBits::One
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlowControl {
-    None,
-    Hardware,
-    Software,
-}
-
-impl Default for FlowControl {
-    fn default() -> Self {
-        FlowControl::None
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SerialConfig {
-    pub device: String,
-    pub baud: u32,
-    pub data_bits: DataBits,
-    pub parity: Parity,
-    pub stop_bits: StopBits,
-    pub flow_control: FlowControl,
-}
+use super::serial_config::{
+    DataBits, FlowControl, Parity, SerialConfig, StopBits, parse_bool_option,
+};
 
 impl SerialConfig {
-    /// Parse a serial port specification string.
-    ///
-    /// Format: `"/dev/ttyUSB0"` — just the device path.
-    /// Baud and other settings default to 9600 8N1 no flow control.
-    pub fn parse(spec: &str) -> AsynResult<Self> {
-        let device = spec.trim().to_string();
-        if device.is_empty() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "empty serial device path".into(),
-            });
-        }
-        Ok(Self {
-            device,
-            baud: 9600,
-            data_bits: DataBits::default(),
-            parity: Parity::default(),
-            stop_bits: StopBits::default(),
-            flow_control: FlowControl::default(),
-        })
-    }
-
     /// Apply this configuration to a raw termios struct.
     ///
     /// Errors if `self.baud` is not settable on this platform. `baud_to_speed`
@@ -303,31 +221,6 @@ fn speed_to_baud(speed: libc::speed_t) -> u32 {
         #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         libc::B4000000 => 4000000,
         _ => 0,
-    }
-}
-
-/// Parse a boolean option value.
-///
-/// Accepted truthy values (case-insensitive): `y`, `yes`, `1`, `true`.
-/// Accepted falsy values (case-insensitive): `n`, `no`, `0`, `false`.
-/// Returns `Err` for unrecognized values.
-fn parse_bool_option(value: &str) -> AsynResult<bool> {
-    // C drvAsynSerialPort.c::setOption validates the boolean serial options
-    // (clocal/crtscts/ixon/ixoff/ixany, lines 410-504) strictly with
-    // epicsStrCaseCmp(val,"Y")/("N"): only "Y"/"N" (case-insensitive) are
-    // accepted; anything else returns asynError "Invalid <key> value."
-    // Match that strict accept-set instead of the looser y/yes/1/true
-    // coercion, so a typo errors rather than silently selecting the wrong
-    // setting (the same reason disconnectOnReadTimeout/noDelay are strict).
-    if value.eq_ignore_ascii_case("Y") {
-        Ok(true)
-    } else if value.eq_ignore_ascii_case("N") {
-        Ok(false)
-    } else {
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("invalid boolean value: '{value}' (expected Y or N)"),
-        })
     }
 }
 

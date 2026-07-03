@@ -354,6 +354,13 @@ pub struct Hdf5Writer {
     // options
     pub store_attributes: bool,
     pub store_performance: bool,
+    /// Whether to fsync on file close (durable). Default `true`; set
+    /// `AD_HDF5_FSYNC_ON_CLOSE=0` (or `false`/`no`/`off`) to skip the
+    /// close-time fsync on the standard (non-SWMR) write path, trading
+    /// durability for a faster close (`H5File::close_no_sync`, rust-hdf5
+    /// 0.3.2). SWMR is unaffected — its high-level writer exposes no
+    /// no-fsync close, and it streams/flushes incrementally regardless.
+    fsync_on_close: bool,
     pub total_runtime: f64,
     pub total_bytes: u64,
     /// Per-frame I/O timing rows for the `timestamp` performance dataset.
@@ -424,6 +431,7 @@ impl Hdf5Writer {
             swmr_cb_counter: 0,
             store_attributes: true,
             store_performance: false,
+            fsync_on_close: Self::env_fsync_on_close(),
             total_runtime: 0.0,
             total_bytes: 0,
             perf_rows: Vec::new(),
@@ -441,6 +449,25 @@ impl Hdf5Writer {
             ndattr_first_values: std::collections::HashMap::new(),
             ndattr_last_values: std::collections::HashMap::new(),
             ndattr_element_names: Vec::new(),
+        }
+    }
+
+    /// Read `AD_HDF5_FSYNC_ON_CLOSE` to decide the close-time fsync policy.
+    fn env_fsync_on_close() -> bool {
+        Self::parse_fsync_on_close_env(std::env::var("AD_HDF5_FSYNC_ON_CLOSE").ok().as_deref())
+    }
+
+    /// Pure parse of the `AD_HDF5_FSYNC_ON_CLOSE` value. `None` (unset) or any
+    /// value outside the falsey set keeps the durable default (`true`);
+    /// `0` / `false` / `no` / `off` (trimmed, case-insensitive) opts into the
+    /// no-fsync fast close on the standard write path.
+    fn parse_fsync_on_close_env(v: Option<&str>) -> bool {
+        match v {
+            Some(s) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            None => true,
         }
     }
 
@@ -3138,7 +3165,24 @@ impl NDFileWriter for Hdf5Writer {
                     }
                     _ => unreachable!("handle is Standard in this arm"),
                 }
-                self.handle = None;
+                // Finalize the file. Dropping the `H5File` finalizes durably
+                // (with fsync); when `AD_HDF5_FSYNC_ON_CLOSE` opts out, use the
+                // no-fsync fast close instead (rust-hdf5 0.3.2 `close_no_sync`).
+                // Detector dataset handles are released only after finalize,
+                // preserving the prior file-before-datasets drop order.
+                if let Some(Hdf5Handle::Standard { file, detectors }) = self.handle.take() {
+                    if self.fsync_on_close {
+                        drop(file);
+                    } else {
+                        file.close_no_sync().map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "HDF5 close_no_sync error: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    drop(detectors);
+                }
             }
             Some(Hdf5Handle::Swmr { .. }) => {
                 // The layout group tree, the nested dataset placement and the
@@ -3706,6 +3750,60 @@ mod tests {
         let read_arr = reader.read_file().unwrap();
         assert_eq!(read_arr.dims.len(), 3);
         assert_eq!(read_arr.dims[2].size, 1); // leading frame dim
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_parse_fsync_on_close_env() {
+        // Unset keeps the durable default.
+        assert!(Hdf5Writer::parse_fsync_on_close_env(None));
+        // The falsey set opts into the no-fsync fast close.
+        for v in ["0", "false", "no", "off", "FALSE", "Off", "  no  "] {
+            assert!(
+                !Hdf5Writer::parse_fsync_on_close_env(Some(v)),
+                "{v:?} should disable fsync-on-close"
+            );
+        }
+        // Anything else — including empty and truthy values — stays durable.
+        for v in ["", "1", "true", "yes", "on", "durable"] {
+            assert!(
+                Hdf5Writer::parse_fsync_on_close_env(Some(v)),
+                "{v:?} should keep fsync-on-close"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_fsync_close_writes_valid_file() {
+        // The no-fsync fast close (`H5File::close_no_sync`) must still finalize
+        // a complete, readable file — it only skips the durability fsync, not
+        // the header/superblock writes.
+        let path = temp_path("hdf5_no_fsync");
+        let mut writer = Hdf5Writer::new();
+        writer.fsync_on_close = false;
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for i in 0..16 {
+                v[i] = i as u8;
+            }
+        }
+
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(ds.shape(), vec![1, 4, 4]);
+        let data: Vec<u8> = ds.read_raw().unwrap();
+        assert_eq!(data[0], 0);
+        assert_eq!(data[15], 15);
+        drop(h5);
 
         std::fs::remove_file(&path).ok();
     }

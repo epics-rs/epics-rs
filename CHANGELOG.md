@@ -8,11 +8,11 @@ requirements move from `0.20.0` to `0.21.0` in lockstep.
 
 ### areaDetector plugins (ad-plugins-rs)
 
-- **rust-hdf5 `0.2.28` → `0.3.0`**, with the `parallel` feature enabled
+- **rust-hdf5 `0.2.28` → `0.3.1`**, with the `parallel` feature enabled
   (`rayon` + `deflate`) alongside the existing `threadsafe` and
   `all_filters`. The `parallel` feature parallelises HDF5
   compression/IO via `rayon` (pure Rust, no MPI), improving throughput on
-  the HDF5/NeXus file writers. The `0.3.0` feature set is otherwise
+  the HDF5/NeXus file writers. The `0.3.x` feature set is otherwise
   identical to `0.2.28`.
 
 ## v0.20.4 — 2026-07-02

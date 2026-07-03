@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.21.0 — 2026-07-03
+
+Minor release. The workspace version is bumped to `0.21.0` and the internal
+crate dependency requirements move from `0.20.0` to `0.21.0` in lockstep,
+alongside an HDF5 dependency bump and one additive HDF5 writer option.
+
+### areaDetector plugins (ad-plugins-rs)
+
+- **rust-hdf5 `0.2.28` → `0.3.2`**, with the `parallel` feature enabled
+  (`rayon` + `deflate`) alongside the existing `threadsafe` and
+  `all_filters`. The `parallel` feature parallelises HDF5
+  compression/IO via `rayon` (pure Rust, no MPI), improving throughput on
+  the HDF5/NeXus file writers. The `0.3.x` feature set is otherwise
+  identical to `0.2.28`.
+- **`AD_HDF5_FSYNC_ON_CLOSE` env var** — opt-in no-fsync fast close for the
+  HDF5 plugin's standard (non-SWMR) write path. Unset (or any value outside
+  `0`/`false`/`no`/`off`) keeps the durable default. Setting it falsey skips
+  the close-time fsync via rust-hdf5 0.3.2's `H5File::close_no_sync`, cutting
+  close latency (fsync of a large dataset dominates close — hundreds of ms)
+  at the cost of durability against power/OS crash until the OS flushes its
+  page cache. The file is still finalized (complete and readable) on close;
+  only the fsync is skipped. SWMR is unaffected. Process-global: it applies
+  to every HDF5 file the IOC writes.
+
 ## v0.20.4 — 2026-07-02
 
 Patch release: 511 commits on top of `v0.20.3`, one commit per finding

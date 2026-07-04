@@ -44,7 +44,6 @@ pub struct MotorRecord {
     pub pid: PidFields,
     pub disp: DisplayFields,
     pub timing: TimingFields,
-    pub pco: PcoFields,
     pub internal: InternalFields,
     /// Database-link / menu fields imported from the public C motorRecord.dbd
     /// surface (OUT/RDBL/DOL/OMSL/RLNK/STOO/DINP/RINP/POST).
@@ -83,7 +82,6 @@ impl Default for MotorRecord {
             pid: PidFields::default(),
             disp: DisplayFields::default(),
             timing: TimingFields::default(),
-            pco: PcoFields::default(),
             internal: InternalFields::default(),
             links: LinkFields::default(),
             alarm: AlarmFields::default(),

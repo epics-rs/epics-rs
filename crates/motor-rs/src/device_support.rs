@@ -162,21 +162,6 @@ impl MotorDeviceSupport {
                     );
                     motor.move_to_home(&user, *position, *min_velocity, *velocity, *acceleration)
                 }
-                MotorCommand::EnablePco { enable } => {
-                    tracing::info!("motor command: EnablePco({enable})");
-                    motor.enable_pco(&user, *enable)
-                }
-                MotorCommand::SetPcoConfig {
-                    start,
-                    end,
-                    increment,
-                    pulse_width_us,
-                } => {
-                    tracing::info!(
-                        "motor command: SetPcoConfig start={start} end={end} inc={increment} pw={pulse_width_us}"
-                    );
-                    motor.set_pco_config(&user, *start, *end, *increment, *pulse_width_us)
-                }
                 MotorCommand::SetPidGain { kind, gain } => {
                     tracing::info!("motor command: SetPidGain kind={kind:?} gain={gain}");
                     motor.set_pid_gain(&user, *kind, *gain)

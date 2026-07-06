@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::{
-    ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
+    ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome, CommandResult,
 };
 
 use crate::drivers::ip_port::DrvAsynIPPort;
@@ -66,6 +66,115 @@ fn arg_str(args: &[ArgValue], i: usize) -> Option<String> {
     }
 }
 
+/// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`):
+/// decode C-style escape sequences in `src` to raw bytes. The EOS iocsh
+/// commands escape-decode their `eos` argument through this so a literal
+/// `"\r\n"` typed in st.cmd becomes the two bytes CR LF — matching C
+/// `asynSetEos` (`asynShellCommands.c`), which calls the same function.
+///
+/// An unknown escape passes the escaped character through literally (C's
+/// `default:` arm). `\xXX` consumes up to two hex digits; a `\x` with no
+/// following hex digit emits nothing and the next character is reprocessed
+/// as ordinary input (C's `goto input`). A raw or `\0` NUL ends the scan.
+fn raw_from_escaped(src: &str) -> Vec<u8> {
+    let b = src.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        i += 1;
+        if c == 0 {
+            break;
+        }
+        if c != b'\\' {
+            out.push(c);
+            continue;
+        }
+        // Escape lead consumed; fetch the escaped character.
+        if i >= b.len() {
+            break;
+        }
+        let e = b[i];
+        i += 1;
+        if e == 0 {
+            break;
+        }
+        match e {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0C),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0B),
+            b'\\' => out.push(b'\\'),
+            b'\'' => out.push(b'\''),
+            b'"' => out.push(b'"'),
+            b'0' => out.push(0),
+            b'x' => {
+                // \xXX: up to two hex digits. Peek (do not consume) so that a
+                // non-hex character stays available to be reprocessed as
+                // ordinary input on the next iteration (C `goto input`).
+                let mut u: u32 = 0;
+                let mut n = 0;
+                while n < 2
+                    && i < b.len()
+                    && b[i] != 0
+                    && let Some(d) = (b[i] as char).to_digit(16)
+                {
+                    u = (u << 4) | d;
+                    i += 1;
+                    n += 1;
+                }
+                if n > 0 {
+                    out.push(u as u8);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Shared body of `asynOctetSetInputEos` / `asynOctetSetOutputEos`.
+///
+/// C parity: `asynShellCommands.c::asynSetEos` escape-decodes the `eos`
+/// argument and routes it to `pasynOctet->setInputEos`/`setOutputEos`. Here
+/// the EOS is port-wide (the interpose stack owns it), so the C `addr` is
+/// accepted for command-line compatibility but not routed — single-address
+/// octet ports (serial/IP/prologix) address 0. The driver enforces the
+/// 2-byte terminator limit and reports `illegal eoslen N`, so no length
+/// check is duplicated here (single owner of the limit).
+fn asyn_set_eos(
+    mgr: &Arc<PortManager>,
+    ctx: &CommandContext,
+    args: &[ArgValue],
+    set_input: bool,
+) -> CommandResult {
+    let cmd = if set_input {
+        "asynOctetSetInputEos"
+    } else {
+        "asynOctetSetOutputEos"
+    };
+    let port = arg_str(args, 0).ok_or_else(|| "portName required".to_string())?;
+    let _addr = arg_int(args, 1).unwrap_or(0);
+    let eos = raw_from_escaped(&arg_str(args, 2).unwrap_or_default());
+    match mgr.find_port_handle(&port) {
+        Ok(handle) => {
+            let res = if set_input {
+                handle.set_input_eos_blocking(&eos)
+            } else {
+                handle.set_output_eos_blocking(&eos)
+            };
+            if let Err(e) = res {
+                ctx.println(&format!("{cmd}: {e}"));
+            }
+        }
+        Err(e) => ctx.println(&format!("{cmd}: {e}")),
+    }
+    Ok(CommandOutcome::Continue)
+}
+
 /// `asynReport` body — walks every registered port (or the named one
 /// only) and calls `PortDriver::report(level)`. C asyn's `asynReport`
 /// loops through `pasynManager`'s port list and calls each driver's
@@ -111,11 +220,14 @@ pub fn register_asyn_commands_on_shell(
     shell.register(drv_asyn_prologix_port_configure_command(trace));
 }
 
-/// Build the six iocsh `CommandDef`s without binding them to a
-/// specific carrier. Both [`register_asyn_commands`] (IocApplication
-/// path) and [`register_asyn_commands_on_shell`] (direct IocShell
-/// path) delegate here so the C-parity command set stays in lock
-/// step across both entry points.
+/// Build the asyn iocsh `CommandDef`s without binding them to a specific
+/// carrier: `asynReport`, `asynSetOption`, `asynOctetSetInputEos`,
+/// `asynOctetSetOutputEos`, and the trace mutators (`asynSetTraceMask`,
+/// `asynSetTraceIOMask`, `asynSetTraceInfoMask`). Both
+/// [`register_asyn_commands`] (IocApplication path) and
+/// [`register_asyn_commands_on_shell`] (direct IocShell path) delegate
+/// here so the C-parity command set stays in lock step across both entry
+/// points.
 pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     let mut out = Vec::new();
 
@@ -193,6 +305,60 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     }
                 }
             },
+        ));
+    }
+
+    // asynOctetSetInputEos portName addr eos ------------------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynOctetSetInputEos",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "eos",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+            ],
+            "asynOctetSetInputEos portName addr eos - set the port input EOS (e.g. \"\\r\\n\")",
+            move |args: &[ArgValue], ctx: &CommandContext| asyn_set_eos(&mgr_r, ctx, args, true),
+        ));
+    }
+
+    // asynOctetSetOutputEos portName addr eos -----------------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynOctetSetOutputEos",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "eos",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+            ],
+            "asynOctetSetOutputEos portName addr eos - set the port output EOS (e.g. \"\\r\\n\")",
+            move |args: &[ArgValue], ctx: &CommandContext| asyn_set_eos(&mgr_r, ctx, args, false),
         ));
     }
 
@@ -749,7 +915,12 @@ mod tests {
 
         // Verify the handler is wired (closure captures mgr; lookup
         // succeeds) — we count one CommandDef per C-side function.
-        assert_eq!(cmds.len(), 6, "asynShellCommands.c registers 6 commands");
+        assert_eq!(
+            cmds.len(),
+            8,
+            "asyn iocsh command set: asynReport, asynSetOption, \
+             asynOctetSet{{Input,Output}}Eos, and the four trace mutators"
+        );
         assert!(set_trace_mask.args.len() == 3);
 
         // Verify announce fired.
@@ -763,17 +934,18 @@ mod tests {
         assert!(trace.is_enabled("trace_mask_port", TraceMask::WARNING));
     }
 
-    /// `build_asyn_commands` exposes exactly the six functions defined
-    /// in C `asynShellCommands.c` — guards against silent additions /
-    /// removals.
+    /// `build_asyn_commands` exposes the C `asynShellCommands.c` functions
+    /// asyn-rs ports — guards against silent additions / removals.
     #[test]
-    fn iocsh_registers_six_c_parity_commands() {
+    fn iocsh_registers_c_parity_commands() {
         let mgr = Arc::new(PortManager::new());
         let cmds = build_asyn_commands(mgr);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         for expected in [
             "asynReport",
             "asynSetOption",
+            "asynOctetSetInputEos",
+            "asynOctetSetOutputEos",
             "asynSetTraceMask",
             "asynSetTraceIOMask",
             "asynSetTraceInfoMask",
@@ -784,6 +956,119 @@ mod tests {
                 "iocsh registration must include {expected}"
             );
         }
+    }
+
+    /// `raw_from_escaped` decodes C-style escapes to raw bytes (parity with
+    /// EPICS `epicsStrnRawFromEscaped`), so `"\r\n"` becomes CR LF. The EOS
+    /// commands depend on this for st.cmd terminators.
+    #[test]
+    fn raw_from_escaped_decodes_c_escapes() {
+        assert_eq!(raw_from_escaped(r"\r\n"), vec![b'\r', b'\n']);
+        assert_eq!(raw_from_escaped(r"\t"), vec![b'\t']);
+        assert_eq!(raw_from_escaped(r"\\"), vec![b'\\']);
+        assert_eq!(raw_from_escaped("AB"), vec![b'A', b'B']);
+        // \xXX hex escape: two digits, then a single digit.
+        assert_eq!(raw_from_escaped(r"\x41"), vec![0x41]);
+        assert_eq!(raw_from_escaped(r"\x4"), vec![0x04]);
+        // Unknown escape → the escaped char passes through (C `default:`).
+        assert_eq!(raw_from_escaped(r"\z"), vec![b'z']);
+        // \0 → NUL byte.
+        assert_eq!(raw_from_escaped(r"\0"), vec![0]);
+        // Trailing lone backslash with no following char is dropped (C break).
+        assert_eq!(raw_from_escaped(r"a\"), vec![b'a']);
+        // \x with no hex digit emits nothing; the char is reprocessed as
+        // ordinary input (C `goto input`).
+        assert_eq!(raw_from_escaped(r"\xg"), vec![b'g']);
+        assert!(raw_from_escaped("").is_empty());
+    }
+
+    /// `asynOctetSetInputEos` / `asynOctetSetOutputEos` escape-decode their
+    /// argument and route the raw bytes to the driver's `set_input_eos` /
+    /// `set_output_eos` through the port actor. C parity:
+    /// `asynShellCommands.c::asynSetEos` → `pasynOctet->setInputEos`.
+    #[test]
+    fn iocsh_set_input_output_eos_routes_decoded_bytes_to_driver() {
+        #[derive(Clone, Default)]
+        struct Recorded {
+            input: Arc<Mutex<Option<Vec<u8>>>>,
+            output: Arc<Mutex<Option<Vec<u8>>>>,
+        }
+        struct RecordingDriver {
+            base: PortDriverBase,
+            rec: Recorded,
+        }
+        impl PortDriver for RecordingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+                *self.rec.input.lock().unwrap() = Some(eos.to_vec());
+                Ok(())
+            }
+            fn set_output_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+                *self.rec.output.lock().unwrap() = Some(eos.to_vec());
+                Ok(())
+            }
+        }
+
+        let rec = Recorded::default();
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port(RecordingDriver {
+            base: PortDriverBase::new("eos_port", 1, PortFlags::default()),
+            rec: rec.clone(),
+        })
+        .unwrap();
+
+        let ctx = make_ctx();
+        let cmds = build_asyn_commands(mgr.clone());
+
+        // asynOctetSetInputEos eos_port 0 "\r\n"
+        let set_in = cmds
+            .iter()
+            .find(|c| c.name == "asynOctetSetInputEos")
+            .expect("asynOctetSetInputEos must be registered");
+        let outcome = set_in
+            .handler
+            .call(
+                &[
+                    ArgValue::String("eos_port".to_string()),
+                    ArgValue::Int(0),
+                    ArgValue::String(r"\r\n".to_string()),
+                ],
+                &ctx,
+            )
+            .expect("handler returns Ok");
+        assert!(matches!(outcome, CommandOutcome::Continue));
+        assert_eq!(
+            rec.input.lock().unwrap().as_deref(),
+            Some(&[b'\r', b'\n'][..]),
+            "input EOS must reach the driver as decoded CR LF"
+        );
+
+        // asynOctetSetOutputEos eos_port 0 "\n"
+        let set_out = cmds
+            .iter()
+            .find(|c| c.name == "asynOctetSetOutputEos")
+            .expect("asynOctetSetOutputEos must be registered");
+        set_out
+            .handler
+            .call(
+                &[
+                    ArgValue::String("eos_port".to_string()),
+                    ArgValue::Int(0),
+                    ArgValue::String(r"\n".to_string()),
+                ],
+                &ctx,
+            )
+            .expect("handler returns Ok");
+        assert_eq!(
+            rec.output.lock().unwrap().as_deref(),
+            Some(&[b'\n'][..]),
+            "output EOS must reach the driver as decoded LF"
+        );
     }
 
     /// `Report` request op invokes the driver's `report(level)` on the

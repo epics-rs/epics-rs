@@ -241,8 +241,6 @@ pub enum CommandSource {
     Sync,
     Set,
     Cnen,
-    /// PCO_ENABLE write — pushes PCO config then enable/disable (PR #248).
-    PcoEnable,
 }
 
 /// Commands to send to the motor driver.
@@ -305,17 +303,6 @@ pub enum MotorCommand {
     ProfileExecute,
     ProfileAbort,
     ProfileReadback,
-    /// Enable or disable position-compare output (C: `05b25c1d`, PR #248).
-    EnablePco {
-        enable: bool,
-    },
-    /// Configure position-compare output (C: `05b25c1d`, PR #248).
-    SetPcoConfig {
-        start: f64,
-        end: f64,
-        increment: f64,
-        pulse_width_us: f64,
-    },
     /// Forward a closed-loop gain coefficient (C special pidcof,
     /// motorRecord.cc 3003-3026: GAIN_SUPPORT-gated, clamped 0.0–1.0
     /// before emission → SET_PGAIN/SET_IGAIN/SET_DGAIN).

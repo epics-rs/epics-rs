@@ -22,9 +22,9 @@ No C dependencies. Just `cargo build`.
 - UEIP readback
 - Acceleration as ACCL (time) or ACCS (EGU/sec²) selected by ACCU; driver-bound rate is EGU/sec²
 - RSTM restore mode (Never/Always/NearZero/Conditional) with MRES-mismatch interlock
-- SYNC trigger, RVEL actual velocity, position-compare output (PCO)
+- SYNC trigger, RVEL actual velocity
 - 64-bit raw fields (RVAL/RRBV/RMP/REP/RDIF) for high-resolution / long-travel axes
-- Device support via asyn motor interface (move, home, moveToHome, stop, profile, PCO)
+- Device support via asyn motor interface (move, home, moveToHome, stop, profile)
 - Builder pattern for easy motor setup
 - SimMotor for testing (time-based linear interpolation)
 
@@ -45,7 +45,7 @@ motor-rs/
       state_machine.rs  #   check_completion(), phase transitions
       field_access.rs   #   FIELDS table, get/put handlers
       status_update.rs  #   determine_event(), process_motor_info(), RSTM init
-    fields.rs           # Field groups: Position, Velocity, Limit, Control, PID, Pco, etc.
+    fields.rs           # Field groups: Position, Velocity, Limit, Control, PID, etc.
     flags.rs            # MipFlags, MstaFlags, MotionPhase, AccsUsed, RestoreMode
     coordinate.rs       # Dial ↔ user ↔ raw coordinate conversion (raw is i64)
     device_state.rs     # Shared mailbox between record, device support, poll loop

@@ -24,7 +24,7 @@ upstream: `epics-modules/motor` HEAD `f3d089ba` (2026-05-15)
 |---|---|---|
 | Sprint 1 | ACCS/ACCU, RSTM, RHLM/RLLM, SYNC | ✅ 구현 |
 | Sprint 2 | MIP_EXTERNAL, DLLM>DHLM LVIO, URIP error STOP, VAL+HOMF clear, jog driver-stop clear, LVIO jog reject, home soft-limit skip, ACCL@VELO==VBAS | ✅ 구현 |
-| Sprint 3 | motorActVelocity(RVEL), enablePCO+PCO PV, moveToHome, VBAS_UNSUPPORTED bit | ✅ 구현 |
+| Sprint 3 | motorActVelocity(RVEL), enablePCO+PCO PV, moveToHome, VBAS_UNSUPPORTED bit | ✅ 구현 — 단 PCO는 이후 제거(2026-07-04): 근거 PR #248이 unmerged로 확인(§6 정정 참조) |
 | Wire 모델 | driver-bound acceleration을 EGU/sec²로 통일 (C `accEGUfromVelo`) | ✅ 구현 |
 | RSTM 통합 | `initial_readback`의 RSTM restore 분기 + #196 MRES-mismatch 인터록 | ✅ 구현 |
 | §4 검증 | 4.2 RA_PROBLEM no auto-stop, 4.3 DLY+STOP "DELAY wins", 4.9 음수 BDST relative, 4.14 FLNK=DMOV transition, 4.16 RDBD validation | ✅ 검증/수정 |
@@ -59,6 +59,9 @@ motor-rs는 **2018년경(약 R6.11~R7.0) 시점의 motorRecord** 기능 집합�
 **핵심 누락 — base class API (P2):**
 - **motorActVelocity_** asyn parameter (`#314ef89a` 2026 / PR #238) — RVEL 분리
 - **Position Compare**: `enablePCO(bool)` + `PCO_*` 5개 파라미터 (`#05b25c1d` 2026 / PR #248)
+  — **정정 (2026-07-04): PR #248은 open/unmerged** (motor master에 미포함,
+  브랜치 `add_position_compare_output`에만 존재). 한때 base-API로 구현했으나
+  unmerged PR 추종이라 framework에서 제거, 드라이버 전용(iocsh)으로 강등.
 - **MIP_EXTERNAL** flag — 외부 시작 move 감지 (`#ea063f5f` 2008)
 - **moveToHome framework** (`#a6f64591` 2011 / `#5f421e9a`)
 

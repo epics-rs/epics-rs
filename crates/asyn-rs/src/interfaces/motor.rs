@@ -253,27 +253,11 @@ pub trait AsynMotor: Send + Sync {
     ) -> AsynResult<()> {
         self.move_absolute(user, position, min_velocity, velocity, acceleration)
     }
-
-    /// Enable or disable position-compare output (PCO) on this axis.
-    /// C: `05b25c1d` (PR #248) — adds `enablePCO(bool)` to asynMotorAxis.
-    /// Drivers that support PCO (Aerotech, Newport XPS, Galil, ACSMotion) override
-    /// this; the default is a no-op for axes without PCO hardware.
-    fn enable_pco(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
-        Ok(())
-    }
-
-    /// Configure position-compare output parameters. C: `05b25c1d` — five asyn
-    /// parameters PCO_START/END/INCREMENT/PULSE_WIDTH/ENABLE. The default does
-    /// nothing; PCO-capable drivers override and persist the configuration so
-    /// the next `enable_pco(true)` uses these values.
-    fn set_pco_config(
-        &mut self,
-        _user: &AsynUser,
-        _start: f64,
-        _end: f64,
-        _increment: f64,
-        _pulse_width_us: f64,
-    ) -> AsynResult<()> {
-        Ok(())
-    }
 }
+
+// Position-compare output (PCO) is intentionally NOT part of this trait: the C
+// change adding `enablePCO`/PCO params to the base asynMotorAxis class
+// (`05b25c1d`, motor PR #248) is an open, unmerged PR — not upstream API.
+// PCO-capable drivers (Aerotech, Newport XPS, Galil, ACSMotion) expose it
+// driver-privately (e.g. iocsh commands) until upstream actually merges a base
+// interface to mirror.

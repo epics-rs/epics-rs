@@ -58,16 +58,13 @@ impl MotorRecord {
         // through to the rest of do_work) unless the transition itself
         // resumed motion — that resume already targets the freshest DVAL,
         // so dispatching src as well would double-plan. For the
-        // housekeeping srcs (Sync/Set/Cnen/PcoEnable) the gate defers to
+        // housekeeping srcs (Sync/Set/Cnen) the gate defers to
         // the next pass instead: their arms map to C special()-time
         // actions that precede do_work, and a Go-resume must not swallow
         // or reorder them.
         if self.ctrl.spmg != self.internal.lspg && src != CommandSource::Spmg {
             match src {
-                CommandSource::Sync
-                | CommandSource::Set
-                | CommandSource::Cnen
-                | CommandSource::PcoEnable => {}
+                CommandSource::Sync | CommandSource::Set | CommandSource::Cnen => {}
                 _ => {
                     self.handle_spmg_change(&mut effects);
                     match self.ctrl.spmg {
@@ -104,8 +101,7 @@ impl MotorRecord {
             CommandSource::Spmg
             | CommandSource::Stop
             | CommandSource::Sync
-            | CommandSource::Cnen
-            | CommandSource::PcoEnable => {}
+            | CommandSource::Cnen => {}
             CommandSource::Set => {
                 // C 2237: stop_or_pause returns before the move block —
                 // a pending SET redefinition keeps its dval != ldvl
@@ -531,19 +527,6 @@ impl MotorRecord {
                 // dispatches. Runs regardless of GAIN_SUPPORT (the pp
                 // pass is unconditional in C).
                 self.dispatch_latent_collection(&mut effects, true);
-            }
-            CommandSource::PcoEnable => {
-                // C: 05b25c1d (PR #248) — push the latched PCO configuration
-                // first, then enable/disable so the driver uses fresh params.
-                effects.commands.push(MotorCommand::SetPcoConfig {
-                    start: self.pco.start,
-                    end: self.pco.end,
-                    increment: self.pco.increment,
-                    pulse_width_us: self.pco.pulse_width_us,
-                });
-                effects.commands.push(MotorCommand::EnablePco {
-                    enable: self.pco.enable,
-                });
             }
         }
 

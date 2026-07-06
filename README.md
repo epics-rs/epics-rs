@@ -40,21 +40,23 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.20.2** — the `v0.20.x` line completes a full C-parity
+**Current release: v0.22.0** — the `v0.20.x` line completes a full C-parity
 sweep of the motor record against `epics-modules/motor` and adds per-field
-DBE monitor event masks end to end (`v0.20.0`), then layers ~60 commits of
-C-parity regression fixes (one commit per finding) across base/db, CA, the
-native PVA protocol, the QSRV/bridge gateway, asyn, motor, and the std /
-scaler / optics modules (`v0.20.1`, `v0.20.2`). `v0.20.0` is a semver-minor
-bump for its breaking `MotorCommand` / `AsynMotor` additions; the `.1` and
-`.2` patches are non-breaking. See [`CHANGELOG.md`](./CHANGELOG.md) for the
-full audit trail.
+DBE monitor event masks end to end, then layers ~60 commits of C-parity
+regression fixes (one commit per finding) across base/db, CA, the native PVA
+protocol, the QSRV/bridge gateway, asyn, motor, and the std / scaler / optics
+modules. `v0.21.0` bumps the HDF5 stack (`rust-hdf5` 0.3.x, `parallel`
+feature) with an opt-in no-fsync fast-close for the HDF5 writer. `v0.22.0`
+removes the position-compare-output (PCO) motor surface — it had mirrored an
+*unmerged* upstream `motor` PR, so it is not yet base API to track (breaking)
+— and adds the `asynOctetSetInputEos` / `asynOctetSetOutputEos` iocsh
+commands. See [`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.20", features = ["ad"] }
+epics-rs = { version = "0.22", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -93,10 +95,10 @@ use epics_rs::asyn;        // port driver framework
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.20", features = ["motor", "ad"] }
+epics-rs = { version = "0.22", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.20", features = ["full"] }
+epics-rs = { version = "0.22", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -358,7 +360,7 @@ either way.
 ```toml
 [dependencies]
 # Client + server, both protocols (recommended for new projects):
-epics-rs = { version = "0.20", features = ["pva"] }   # ca enabled by default
+epics-rs = { version = "0.22", features = ["pva"] }   # ca enabled by default
 
 # Or per-protocol, no umbrella:
 epics-ca-rs  = "0.20"
@@ -973,7 +975,7 @@ Test coverage: protocol encoding, wire-format golden packets (CA + PVA), pvxs in
 
 [`examples/regression-ioc`](examples/regression-ioc/) boots a real in-process
 IOC — CA + PVA servers over one shared database — and asserts fixed behavior
-**over the wire**, pinning recurring bug-fix families from v0.15.x–v0.20.x
+**over the wire**, pinning recurring bug-fix families from v0.15.x–v0.22.x
 (processing-chain/FLNK, monitor-on-change, periodic SCAN, motor
 move-on-Passive-VAL, enum/`DBR_ENUM`, `DBF_MENU`, alarm severity, timestamp).
 

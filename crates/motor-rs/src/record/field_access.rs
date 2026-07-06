@@ -491,32 +491,6 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
-    // Position-compare output (C: 05b25c1d, PR #248)
-    FieldDesc {
-        name: "PCO_START",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PCO_END",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PCO_INC",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PCO_PW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PCO_ENABLE",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
     // Timing
     FieldDesc {
         name: "DLY",
@@ -777,12 +751,6 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "MDEL" => Some(EpicsValue::Double(rec.disp.mdel)),
         // SYNC is a write-only trigger; readback always 0.
         "SYNC" => Some(EpicsValue::Short(if rec.internal.sync { 1 } else { 0 })),
-        // Position-compare output
-        "PCO_START" => Some(EpicsValue::Double(rec.pco.start)),
-        "PCO_END" => Some(EpicsValue::Double(rec.pco.end)),
-        "PCO_INC" => Some(EpicsValue::Double(rec.pco.increment)),
-        "PCO_PW" => Some(EpicsValue::Double(rec.pco.pulse_width_us)),
-        "PCO_ENABLE" => Some(EpicsValue::Short(if rec.pco.enable { 1 } else { 0 })),
         // Timing
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
@@ -2029,44 +1997,6 @@ pub(crate) fn motor_put_field(
                     rec.internal.sync = true;
                     rec.last_write = Some(CommandSource::Sync);
                 }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        // Position-compare output config. C: 05b25c1d (PR #248).
-        // Config fields just store; PCO_ENABLE triggers SetPcoConfig+EnablePco.
-        "PCO_START" => match value {
-            EpicsValue::Double(v) => {
-                rec.pco.start = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "PCO_END" => match value {
-            EpicsValue::Double(v) => {
-                rec.pco.end = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "PCO_INC" => match value {
-            EpicsValue::Double(v) => {
-                rec.pco.increment = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "PCO_PW" => match value {
-            EpicsValue::Double(v) => {
-                rec.pco.pulse_width_us = v;
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "PCO_ENABLE" => match value {
-            EpicsValue::Short(v) => {
-                rec.pco.enable = v != 0;
-                rec.last_write = Some(CommandSource::PcoEnable);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

@@ -392,17 +392,6 @@ impl Default for TimingFields {
     }
 }
 
-/// Position-compare output fields. C: `05b25c1d` (PR #248) — exposed as
-/// asyn parameters PCO_START/END/INCREMENT/PULSE_WIDTH/ENABLE.
-#[derive(Debug, Clone, Default)]
-pub struct PcoFields {
-    pub start: f64,
-    pub end: f64,
-    pub increment: f64,
-    pub pulse_width_us: f64,
-    pub enable: bool,
-}
-
 /// Internal bookkeeping fields (not directly exposed as PVs).
 #[derive(Debug, Clone, Default)]
 pub struct InternalFields {

@@ -113,54 +113,17 @@ pub fn pp_fields_for(record_type: &str) -> &'static [&'static str] {
             "BA", "BB", "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16",
             "B17", "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
         ],
-        // motorRecord.dbd pp(TRUE) set (OFF through SYNC), plus five
-        // motor-rs extension fields (PCOF/ICOF/DCOF/JVEL/PCO_ENABLE)
-        // whose driver commands ride the process pass that follows the
-        // put — C sends those from special() without processing, but
-        // motor-rs has no put-time driver channel, so dropping their
-        // pass would strand the commands in the special_cmds buffer.
+        // motorRecord.dbd pp(TRUE) set (OFF through SYNC), plus four
+        // motor-rs extension fields (PCOF/ICOF/DCOF/JVEL) whose driver
+        // commands ride the process pass that follows the put — C sends
+        // those from special() without processing, but motor-rs has no
+        // put-time driver channel, so dropping their pass would strand
+        // the commands in the special_cmds buffer.
         "motor" => &[
-            "OFF",
-            "DIR",
-            "SREV",
-            "UREV",
-            "MRES",
-            "ERES",
-            "UEIP",
-            "URIP",
-            "HLM",
-            "LLM",
-            "DHLM",
-            "DLLM",
-            "HIHI",
-            "LOLO",
-            "HIGH",
-            "LOW",
-            "HHSV",
-            "LLSV",
-            "HSV",
-            "LSV",
-            "HLSV",
-            "SPMG",
-            "STOP",
-            "HOMF",
-            "HOMR",
-            "JOGF",
-            "JOGR",
-            "TWF",
-            "TWR",
-            "VAL",
-            "DVAL",
-            "RVAL",
-            "RLV",
-            "CNEN",
-            "STUP",
-            "SYNC",
-            "PCOF",
-            "ICOF",
-            "DCOF",
-            "JVEL",
-            "PCO_ENABLE",
+            "OFF", "DIR", "SREV", "UREV", "MRES", "ERES", "UEIP", "URIP", "HLM", "LLM", "DHLM",
+            "DLLM", "HIHI", "LOLO", "HIGH", "LOW", "HHSV", "LLSV", "HSV", "LSV", "HLSV", "SPMG",
+            "STOP", "HOMF", "HOMR", "JOGF", "JOGR", "TWF", "TWR", "VAL", "DVAL", "RVAL", "RLV",
+            "CNEN", "STUP", "SYNC", "PCOF", "ICOF", "DCOF", "JVEL",
         ],
         // permissiveRecord.dbd.pod: VAL, WFLG, LABL are pp(TRUE)
         // (OVAL/OFLG are SPC_NOMOD trackers).

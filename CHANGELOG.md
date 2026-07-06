@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.22.0 — 2026-07-06
+
+Minor release. The workspace version is bumped to `0.22.0` and the internal
+crate dependency requirements move from `0.21.0` to `0.22.0` in lockstep. The
+bump is owed by a **breaking** removal in the motor framework; it also adds two
+asyn octet iocsh commands.
+
+### motor (motor-rs, asyn-rs, epics-base-rs) — **BREAKING**
+
+- **Removed the position-compare-output (PCO) surface.** The PCO base API had
+  been ported as C parity with `epics-modules/motor` commit `05b25c1d`
+  (PR #248), which adds `enablePCO` / `PCO_*` params to the base
+  `asynMotorAxis` class. That commit lives only on the
+  `add_position_compare_output` branch — the PR is **open and not merged** to
+  `master`, and `master`'s `asynMotorAxis` has no PCO API. Tracking an unmerged
+  PR as if it were upstream base API was wrong. PCO-capable drivers (Aerotech,
+  Newport XPS, Galil, ACSMotion) expose PCO driver-privately (e.g. iocsh
+  commands) until upstream actually merges a base interface to mirror.
+
+  Removed surface:
+
+  - **asyn-rs**: `AsynMotor::enable_pco` / `set_pco_config` trait hooks (a
+    comment at the trait records why PCO is intentionally absent).
+  - **motor-rs**: `PcoFields`, `MotorRecord.pco`, `CommandSource::PcoEnable`,
+    `MotorCommand::EnablePco` / `SetPcoConfig`, the planner `PcoEnable` arm,
+    device-support dispatch, the `PCO_*` record fields (descriptions +
+    get/put), `SimMotor` PCO state, and the PCO tests.
+  - **epics-base-rs**: `PCO_ENABLE` from the motor `pp(TRUE)` extension list.
+
+  `PCOF` / `ICOF` / `DCOF` (PID coefficients) are unrelated and untouched.
+
+  This removes public API from asyn-rs (trait methods) and motor-rs
+  (fields / enums / record fields) shipped since `v0.18.0`, which is why the
+  release is a semver-minor bump rather than a `0.21.x` patch.
+
+### asyn (asyn-rs)
+
+- **`asynOctetSetInputEos` / `asynOctetSetOutputEos` iocsh commands** —
+  registered in `build_asyn_commands`, matching C `asynShellCommands.c`. Both
+  the `IocApplication` and direct-shell registration paths gain the commands.
+  The `eos` argument is escape-decoded via `raw_from_escaped` (a port of EPICS
+  `epicsStrnRawFromEscaped` in libcom `epicsString.c`), so a literal `"\r\n"`
+  typed in `st.cmd` becomes the two bytes CR LF. Routing reuses the existing
+  `PortHandle::set_{input,output}_eos_blocking` path, so the driver remains the
+  single owner of the 2-byte terminator limit. `addr` is accepted for CLI
+  parity but not routed (EOS is port-wide on single-address octet ports). The
+  `Get` variants are not included. Fills the long-standing gap where input /
+  output EOS could not be set from iocsh.
+
 ## v0.21.0 — 2026-07-03
 
 Minor release. The workspace version is bumped to `0.21.0` and the internal

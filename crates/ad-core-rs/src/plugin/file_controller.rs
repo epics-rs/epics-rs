@@ -390,6 +390,11 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     let r = self.file_base.process_array(array, &mut self.writer);
                     if r.is_ok() {
                         self.saved_frames += 1; // G10: count saved frame
+                        // C++ NDPluginFile::processCallbacks publishes
+                        // NDFileNumCaptured after every successful stream
+                        // write — without this an unbounded stream
+                        // (NumCapture=0) reports NumCaptured_RBV=0 forever.
+                        self.push_num_captured_update(&mut proc_result.param_updates);
                     }
                     let target = self.file_base.num_capture_target();
                     if r.is_ok() && target > 0 && self.file_base.num_captured() >= target {
@@ -402,7 +407,6 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         }
                         self.stop_capture(&mut proc_result.param_updates).ok();
                         self.push_full_file_name_update(&mut proc_result.param_updates);
-                        self.push_num_captured_update(&mut proc_result.param_updates);
                     }
                     r
                 } else {
@@ -1049,6 +1053,36 @@ mod tests {
         );
         assert_eq!(c.writer.writes, 0, "num_capture==0 never auto-flushes");
         assert!(c.capture_active, "still capturing");
+    }
+
+    #[test]
+    fn stream_mode_publishes_num_captured_per_frame() {
+        // C++ NDPluginFile::processCallbacks sets NDFileNumCaptured after
+        // every successful stream write. With NumCapture=0 (unbounded — the
+        // ophyd-async writer convention) the target-reached branch never
+        // runs, so a per-frame update is the only way NumCaptured_RBV moves.
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        c.params.num_captured = Some(42);
+        c.file_base.set_mode(NDFileMode::Stream);
+        c.file_base.set_num_capture(0);
+        let mut updates = Vec::new();
+        c.process_array(&array(1)); // latest_array for the eager open
+        c.start_capture(&mut updates).unwrap();
+        for (id, expected) in [(2, 1), (3, 2)] {
+            let r = c.process_array(&array(id));
+            let published = r.param_updates.iter().find_map(|u| match u {
+                ParamUpdate::Int32 {
+                    reason: 42, value, ..
+                } => Some(*value),
+                _ => None,
+            });
+            assert_eq!(
+                published,
+                Some(expected),
+                "frame {id}: NUM_CAPTURED update missing or wrong"
+            );
+        }
     }
 
     #[test]

@@ -3734,8 +3734,20 @@ async fn run_coordinator(
                             });
                             // epics-base `16877577` parity: surface native
                             // DBR type changes so consumers can react before
-                            // the next event flows.
-                            if native_changed {
+                            // the next event flows. Only a transition from a
+                            // *known* prior native type counts: on the first
+                            // connect `previous_native` is `None` — the type is
+                            // being discovered, not changed, and the `Connected`
+                            // event already carries it. Firing NativeTypeChanged
+                            // here too would make every first connect look like a
+                            // type change and push consumers into a redundant
+                            // metadata refetch (and, if their connect handler is
+                            // not idempotent, a duplicate initial value). The
+                            // `native_changed` flag itself is left as-is — it
+                            // still drives the auto-derived decoder reset in
+                            // `restore_for_channel`; only the consumer-facing
+                            // event is gated on a real prior type.
+                            if native_changed && previous_native.is_some() {
                                 if let Some(cur) = dbr_type {
                                     let _ = ch.conn_tx.send(ConnectionEvent::NativeTypeChanged {
                                         previous: previous_native,

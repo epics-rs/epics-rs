@@ -2188,3 +2188,86 @@ async fn server_read_sync_echoes_request_header() {
     assert_eq!(echo.available, 0xDEAD_BEEF, "m_available echoed");
     assert_eq!(echo.postsize, 0, "no payload");
 }
+
+// ---------------------------------------------------------------------------
+// NativeTypeChanged is a *transition* signal, not a *discovery* signal
+// ---------------------------------------------------------------------------
+
+/// On the very first connect a channel has no prior native DBR type, so the
+/// type is being discovered — the `Connected` event already carries it. The
+/// client must NOT also emit `NativeTypeChanged` here: doing so makes every
+/// first connect look like a type change and pushes consumers into a redundant
+/// metadata refetch (and, if their connect handler is not idempotent, a
+/// duplicate initial value). `NativeTypeChanged` is reserved for a genuine
+/// transition from a known prior type (an IOC redefining the record, or a
+/// reconnect to a differently-typed record).
+#[tokio::test]
+async fn first_connect_does_not_emit_native_type_changed() {
+    use std::time::Duration;
+
+    use epics_ca_rs::client::{CaClient, ConnectionEvent};
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("NTC:FIRST:PV", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _server_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Target the in-process server directly (no process-global env mutation),
+    // so this test needs no `#[serial]` and cannot race the env other tests set.
+    let client = CaClient::new().await.expect("client");
+    client.add_address(([127, 0, 0, 1], port).into());
+    let channel = client.create_channel("NTC:FIRST:PV");
+    // Subscribe to the event stream synchronously, before the async connect can
+    // complete: the connect involves a UDP search + TCP handshake (ms), this
+    // subscribe is µs, so `Connected` cannot slip past. The `saw_connected`
+    // assertion below fails loudly if it ever does, so a missed window can never
+    // masquerade as "no NativeTypeChanged".
+    let mut events = channel.connection_events();
+
+    channel
+        .wait_connected(Duration::from_secs(5))
+        .await
+        .expect("channel connects to the in-process server");
+
+    // Drain events up to and just past connect. `Connected` (and
+    // `AccessRightsChanged`) are expected; `NativeTypeChanged` is not. If the
+    // client wrongly emitted it, it lands right after `Connected` in the same
+    // burst, well within this idle window.
+    let mut saw_connected = false;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
+            Ok(Ok(ev)) => {
+                if matches!(ev, ConnectionEvent::Connected) {
+                    saw_connected = true;
+                }
+                assert!(
+                    !matches!(ev, ConnectionEvent::NativeTypeChanged { .. }),
+                    "first connect must not emit NativeTypeChanged: the native \
+                     type was discovered, not changed"
+                );
+            }
+            // Lagged or closed: no more meaningful events to inspect.
+            Ok(Err(_)) => break,
+            // Idle window elapsed with no further event — the burst is over.
+            Err(_) => break,
+        }
+    }
+
+    assert!(
+        saw_connected,
+        "expected a Connected event on first connect (else the event window was \
+         missed and the NativeTypeChanged check is meaningless)"
+    );
+}

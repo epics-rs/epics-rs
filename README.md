@@ -40,7 +40,7 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.22.0** — the `v0.20.x` line completes a full C-parity
+**Current release: v0.22.1** — the `v0.20.x` line completes a full C-parity
 sweep of the motor record against `epics-modules/motor` and adds per-field
 DBE monitor event masks end to end, then layers ~60 commits of C-parity
 regression fixes (one commit per finding) across base/db, CA, the native PVA
@@ -50,7 +50,10 @@ feature) with an opt-in no-fsync fast-close for the HDF5 writer. `v0.22.0`
 removes the position-compare-output (PCO) motor surface — it had mirrored an
 *unmerged* upstream `motor` PR, so it is not yet base API to track (breaking)
 — and adds the `asynOctetSetInputEos` / `asynOctetSetOutputEos` iocsh
-commands. See [`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
+commands. `v0.22.1` is a patch: the CA client no longer emits
+`NativeTypeChanged` on first connect (it is a reconnect-transition signal,
+not a discovery signal). See [`CHANGELOG.md`](./CHANGELOG.md) for the full
+audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 

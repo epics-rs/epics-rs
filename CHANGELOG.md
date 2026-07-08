@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.22.1 — 2026-07-08
+
+Patch release. The workspace version moves to `0.22.1`; the internal crate
+dependency requirements stay at `0.22.0` (caret `^0.22.0` resolves the new
+`0.22.1` crates). No public API change — a bug fix plus a docs edit.
+
+### CA client (epics-ca-rs)
+
+- **Do not emit `NativeTypeChanged` on first connect.** `NativeTypeChanged`
+  is a *transition* signal — a channel's native DBR type changing across
+  reconnects (an IOC redefining the record, or a reconnect to a
+  differently-typed record). On the first connect there is no prior type:
+  `previous_native` is `None`, so `(None, Some) => true` in the
+  `native_changed` match made every first connect emit `NativeTypeChanged`
+  even though the type was merely *discovered* — the `Connected` event
+  already carries it. For consumers that refetch CTRL metadata on
+  `NativeTypeChanged` (rsdm's CA plugin, PyDM-style layers) this fired a
+  redundant metadata round-trip on every connection, and where the connect
+  handler was not idempotent it re-emitted the initial value, leaking a
+  duplicate sample. The consumer-facing event is now gated on
+  `previous_native.is_some()`, restoring parity with epics-base `168775775`
+  (`camonitor`'s `onceConnected`-guarded type-change path — first connect
+  never triggers it). The `native_changed` flag is unchanged; it still
+  drives the auto-derived decoder reset in `restore_for_channel`.
+
+### docs
+
+- **README Motivation section de-personalized** — the first-person "As a
+  controls engineer … I needed" passage is rewritten into a neutral
+  project voice; substance and the concrete sim-detector example are
+  unchanged.
+
 ## v0.22.0 — 2026-07-06
 
 Minor release. The workspace version is bumped to `0.22.0` and the internal

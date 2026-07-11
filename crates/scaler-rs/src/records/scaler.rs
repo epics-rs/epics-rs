@@ -143,6 +143,19 @@ pub struct ScalerRecord {
     /// flag and the CNT-triggered `process()` emits the `WriteDbLink`
     /// and clears it.
     coutp_pending: bool,
+
+    /// The forward-link decision C makes *inside* `process()`.
+    ///
+    /// C `scalerRecord.c:470-481` calls `recGblFwdLink(pscal)` while
+    /// still in the middle of process — after `updateCounts()`, guarded
+    /// by `ss==IDLE && pcnt==0 && us==IDLE`, and **before** the
+    /// auto-count block (`:484-541`) re-arms and drives `ss` to WAITING
+    /// or COUNTING. The framework calls `should_fire_forward_link()`
+    /// only *after* `process()` returns, so re-reading `ss`/`us`/`pcnt`
+    /// there answers a different question than C asked. `process()` is
+    /// the single owner: it clears this flag on entry and sets it at
+    /// exactly C's `recGblFwdLink` line; the hook only reports it.
+    fire_fwd_link: bool,
 }
 
 impl ScalerRecord {
@@ -207,6 +220,7 @@ impl Default for ScalerRecord {
             done_flag: false,
             reqstart_old_pr1: 0,
             coutp_pending: false,
+            fire_fwd_link: false,
         }
     }
 }
@@ -625,6 +639,10 @@ impl Record for ScalerRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let prev_scaler_state = self.ss;
+        // C fires the forward link (or does not) exactly once per
+        // process() cycle; every path that leaves process() without
+        // reaching `scalerRecord.c:480` leaves the link unfired.
+        self.fire_fwd_link = false;
         let mut just_finished_user_count = false;
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
@@ -761,11 +779,15 @@ impl Record for ScalerRecord {
             });
         }
 
-        // VAL = T on completion
+        // C scalerRecord.c:470-481 — "done counting?": while ss==IDLE,
+        // VAL takes T if we just left COUNTING, and `recGblFwdLink()`
+        // fires. Both are decided HERE, before the auto-count block
+        // below re-arms `ss`.
         if self.ss == SCALER_STATE_IDLE && self.pcnt == 0 && self.us == USER_STATE_IDLE {
             if prev_scaler_state == SCALER_STATE_COUNTING {
                 self.val = self.t;
             }
+            self.fire_fwd_link = true;
         }
 
         // AutoCount — C scalerRecord.c:484-541.
@@ -896,7 +918,11 @@ impl Record for ScalerRecord {
     }
 
     fn should_fire_forward_link(&self) -> bool {
-        self.ss == SCALER_STATE_IDLE && self.us == USER_STATE_IDLE && self.pcnt == 0
+        // Report the decision `process()` captured at C's
+        // `recGblFwdLink` line; do NOT re-evaluate `ss`/`us`/`pcnt`
+        // here — under CONT=AutoCount the auto-count block has already
+        // moved `ss` to WAITING/COUNTING by the time the framework asks.
+        self.fire_fwd_link
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

@@ -1301,3 +1301,126 @@ fn test_special_cnt_stop_fires_coutp() {
         "special(CNT=0) must also fire the COUTP link"
     );
 }
+
+// ============================================================
+// Forward link (FLNK) — C scalerRecord.c:470-481
+// ============================================================
+
+/// C `scalerRecord.c:476-481` fires `recGblFwdLink` *inside* process,
+/// while `ss==IDLE && pcnt==0 && us==IDLE`, and only *then* runs the
+/// auto-count block (`:484-541`), which re-arms and drives `ss` to
+/// COUNTING. The FLNK therefore fires on every completed auto-count
+/// cycle even though the record leaves process() counting again.
+#[test]
+fn test_fwd_link_fires_on_completed_autocount_cycle() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1; // AutoCount
+    rec.dly1 = 0.0; // re-arm immediately
+    rec.tp1 = 1.0;
+    rec.ss = 2; // COUNTING (auto-count in progress)
+    rec.us = 0; // IDLE — not a user count
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    // Device support reports the auto-count cycle finished.
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 2, "auto-count immediately re-armed (COUNTING)");
+    assert!(
+        rec.should_fire_forward_link(),
+        "FLNK must fire for the completed auto-count cycle even though \
+         the auto-count block already re-armed ss to COUNTING"
+    );
+}
+
+/// Same cycle, but DLY1 > 0: the auto-count block parks in
+/// SCALER_STATE_WAITING instead of COUNTING. C's `recGblFwdLink` ran
+/// before that state change, so the link still fires.
+#[test]
+fn test_fwd_link_fires_on_completed_autocount_cycle_with_delay() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.dly1 = 5.0; // hold before re-arming
+    rec.tp1 = 1.0;
+    rec.ss = 2; // COUNTING
+    rec.us = 0;
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 1, "auto-count parked in WAITING");
+    assert!(
+        rec.should_fire_forward_link(),
+        "FLNK must fire even though the auto-count block moved ss to WAITING"
+    );
+}
+
+/// C `scalerRecord.c:470` — the `ss==IDLE` guard: a process cycle taken
+/// while the hardware is still counting fires nothing.
+#[test]
+fn test_fwd_link_does_not_fire_while_counting() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.ss = 2; // COUNTING, device support has NOT reported done
+    rec.us = 0;
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 2);
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no FLNK while the auto-count is still running"
+    );
+}
+
+/// OneShot behaviour is unchanged: the user count completes, the record
+/// ends IDLE/IDLE with PCNT=0, and C fires the forward link.
+#[test]
+fn test_fwd_link_fires_on_oneshot_completion() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 0; // OneShot
+    rec.ss = 2; // COUNTING
+    rec.us = 3; // USER_COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.s[0] = 10_000_000;
+
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 0);
+    assert_eq!(rec.us, 0);
+    assert_eq!(rec.pcnt, 0);
+    assert!(
+        rec.should_fire_forward_link(),
+        "OneShot completion still fires FLNK"
+    );
+}
+
+/// C `scalerRecord.c:470` — `us != IDLE` (a start request waiting out
+/// DLY) reaches no `recGblFwdLink`.
+#[test]
+fn test_fwd_link_does_not_fire_while_waiting_out_dly() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.dly = 100.0;
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    assert_eq!(rec.us, 1); // USER_STATE_WAITING
+
+    rec.process().unwrap();
+
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no FLNK on a cycle spent waiting out DLY"
+    );
+}

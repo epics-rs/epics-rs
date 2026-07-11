@@ -2045,6 +2045,13 @@ enum RawMonitorFrameKind {
     /// FINISH (`subcmd & 0x10`) carrying a success Status — clean end of
     /// stream.
     FinishOk,
+    /// FINISH carrying a success Status AND one last update after it
+    /// (`decode::monitor_finish_body`, pvxs `clientmon.cpp:504-511`). The
+    /// caller forwards `payload[body_start..]` — the same
+    /// `changed | value | overrun` shape a DATA body has — and then ends the
+    /// stream, matching pvxs queueing the update ahead of its `Finished()`
+    /// marker (`clientmon.cpp:692-707`).
+    FinishData { body_start: usize },
     /// A fatal condition: a truncated frame (shorter than `ioid +
     /// subcmd`), a FINISH whose required Status cannot be decoded, a
     /// FINISH carrying a non-success Status, a second INIT
@@ -2084,18 +2091,19 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
         )));
     }
     if subcmd & 0x10 != 0 {
-        // FINISH carries a required Status after the subcmd. A decode
-        // failure must NOT degrade to a clean end-of-stream — that would
-        // hide an upstream protocol error from a forwarding gateway.
-        let mut cur = std::io::Cursor::new(&payload[5..]);
-        return match crate::proto::Status::decode(&mut cur, order) {
-            Ok(st) if st.is_success() => RawMonitorFrameKind::FinishOk,
-            Ok(st) => RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
-                "MONITOR FINISH with non-success status: {st:?}"
-            ))),
-            Err(e) => RawMonitorFrameKind::Fatal(PvaError::Decode(format!(
-                "MONITOR FINISH status decode failed: {e}"
-            ))),
+        // FINISH carries a required Status after the subcmd, and MAY append a
+        // final update after it. Both questions are answered by the one owner
+        // of the FINISH rule so this loop and the typed decode cannot disagree
+        // about whether a body exists. A Status decode failure must NOT degrade
+        // to a clean end-of-stream — that would hide an upstream protocol error
+        // from a forwarding gateway.
+        return match crate::client_native::decode::monitor_finish_body(payload, order) {
+            Ok((st, _)) if !st.is_success() => RawMonitorFrameKind::Fatal(PvaError::Protocol(
+                format!("MONITOR FINISH with non-success status: {st:?}"),
+            )),
+            Ok((_, Some(body_start))) => RawMonitorFrameKind::FinishData { body_start },
+            Ok((_, None)) => RawMonitorFrameKind::FinishOk,
+            Err(e) => RawMonitorFrameKind::Fatal(PvaError::Decode(e)),
         };
     }
     // A server emits only DATA (0x00), INIT (0x08), and FINISH (0x10) on a
@@ -2535,9 +2543,16 @@ where
         // Status are fatal — never silently skipped (`continue`) nor
         // degraded to a clean end (`Ok(())`), which would hide upstream
         // protocol corruption from a forwarding gateway.
-        match classify_raw_monitor_frame(&frame.payload, order) {
-            // subcmd 0x00: DATA — fall through to body forwarding below.
-            RawMonitorFrameKind::Data => {}
+        // `body_start` is where this frame's `changed | value | overrun` body
+        // begins; `final_frame` marks the FINISH that ends the stream after it.
+        let (body_start, final_frame) = match classify_raw_monitor_frame(&frame.payload, order) {
+            // subcmd 0x00: DATA — body follows ioid+subcmd directly.
+            RawMonitorFrameKind::Data => (5, false),
+            // FINISH carrying a last update: relay the body, then end — pvxs
+            // queues the update before its `Finished()` marker
+            // (`clientmon.cpp:504-511,692-707`), so a downstream subscriber
+            // must see it rather than have it dropped with the frame.
+            RawMonitorFrameKind::FinishData { body_start } => (body_start, true),
             RawMonitorFrameKind::FinishOk => {
                 server.unregister_ioid(ioid);
                 // clear the handle's `active` tuple on FINISH so
@@ -2558,13 +2573,24 @@ where
                 }
                 return Err(MonitorEnd::Fatal(e));
             }
-        }
-        // Body = payload[5..] = changed | value | overrun (raw).
-        // Wrap in `Bytes` so the broadcast fan-out shares this
-        // allocation refcount-style.
-        let body = bytes::Bytes::copy_from_slice(&frame.payload[5..]);
+        };
+        // Body = changed | value | overrun (raw). Wrap in `Bytes` so the
+        // broadcast fan-out shares this allocation refcount-style.
+        let body = bytes::Bytes::copy_from_slice(&frame.payload[body_start..]);
         callback(&intro, body, order);
         events_since_ack += 1;
+        if final_frame {
+            // The relayed update was this stream's last; finish exactly as the
+            // status-only FINISH above does (no ACK — the op is over).
+            if let Some(s) = &state {
+                s.stats.lock().n_delivered += 1;
+            }
+            server.unregister_ioid(ioid);
+            if let Some(s) = &state {
+                s.active.lock().take();
+            }
+            return Ok(());
+        }
         if let Some(s) = &state {
             let mut st = s.stats.lock();
             st.n_delivered += 1;
@@ -3149,6 +3175,19 @@ where
                     }
                 }
                 // (d was destructured above when computing `value`.)
+                // A FINISH frame that carried a trailing update decodes as
+                // DATA with the final bit still set. pvxs queues that update
+                // and then appends the `Finished()` marker
+                // (`clientmon.cpp:504-511,701-707`): the subscriber sees the
+                // last value, then end-of-stream. Deliver-then-end here, with
+                // no ACK — the operation is over.
+                if d.subcmd & 0x10 != 0 {
+                    server.unregister_ioid(ioid);
+                    if let Some(s) = &state {
+                        s.active.lock().take();
+                    }
+                    return Ok(());
+                }
                 if flow.pipeline && events_since_ack >= flow.ack_at {
                     let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
                     if server.send_for_channel(sid, ack).await.is_err() {
@@ -6748,6 +6787,39 @@ mod tests {
 
     #[test]
     fn bfr11_finish_success_status_is_clean_end() {
+        let mut payload = vec![0u8, 0, 0, 0, 0x10];
+        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
+        assert!(matches!(
+            classify_raw_monitor_frame(&payload, ByteOrder::Little),
+            RawMonitorFrameKind::FinishOk
+        ));
+    }
+
+    /// R6-35: a FINISH frame whose Status is followed by more bytes carries one
+    /// last monitor update. pvxs decodes it (`clientmon.cpp:504-511`:
+    /// `else if(!final || !M.empty())`) and queues it before the `Finished()`
+    /// marker, so the raw-forwarding loop must relay that body downstream
+    /// instead of dropping the frame as a bare end-of-stream.
+    #[test]
+    fn finish_with_a_trailing_update_carries_a_body() {
+        let mut payload = vec![0u8, 0, 0, 0, 0x10];
+        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
+        let status_end = payload.len();
+        // changed | value | overrun — opaque to this loop, relayed verbatim.
+        payload.extend_from_slice(&[0x01, 0x02, 0x2a, 0x00]);
+        match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
+            RawMonitorFrameKind::FinishData { body_start } => {
+                assert_eq!(body_start, status_end);
+                assert_eq!(&payload[body_start..], &[0x01, 0x02, 0x2a, 0x00]);
+            }
+            other => panic!("FINISH with a trailing update must be FinishData, got {other:?}"),
+        }
+    }
+
+    /// The boundary either side of it: a FINISH with NOTHING after the Status is
+    /// still the plain end-of-stream, not a zero-length body.
+    #[test]
+    fn finish_with_no_trailing_bytes_stays_a_clean_end() {
         let mut payload = vec![0u8, 0, 0, 0, 0x10];
         crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
         assert!(matches!(

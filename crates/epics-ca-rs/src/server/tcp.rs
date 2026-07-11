@@ -4428,6 +4428,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let req_hdr = *hdr;
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
+                            let mut flow = super::monitor::MonitorFlow::new(flow_control);
                             loop {
                                 // Block on the queue front, then fold the
                                 // producer's coalesce overflow slot. When the
@@ -4444,20 +4445,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     break;
                                 };
                                 let coalesced = record_for_task.read().await.pop_coalesced(sub_id);
-                                let mut event = epics_base_rs::server::pv::coalesce_consume(
+                                let event = epics_base_rs::server::pv::coalesce_consume(
                                     &mut rx, queued, coalesced,
                                 );
-                                if flow_control.is_paused() {
-                                    let Some(coalesced) = flow_control
-                                        .coalesce_while_paused(&mut rx, event, || async {
-                                            record_for_task.read().await.pop_coalesced(sub_id)
-                                        })
-                                        .await
-                                    else {
-                                        break;
-                                    };
-                                    event = coalesced;
-                                }
+                                // EVENTS_OFF decision — see
+                                // `monitor::MonitorFlow`. The same owner as
+                                // `spawn_monitor_sender`, so a pause means the
+                                // same thing on both monitor paths.
+                                let Some(mut event) = flow
+                                    .admit(&mut rx, event, || async {
+                                        record_for_task.read().await.pop_coalesced(sub_id)
+                                    })
+                                    .await
+                                else {
+                                    break;
+                                };
                                 // One subscription update committed for
                                 // delivery this cycle (post-coalesce).
                                 // PCAS `subscriptionEventsPosted` parity —

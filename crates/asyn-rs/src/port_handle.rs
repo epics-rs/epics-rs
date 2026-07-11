@@ -817,6 +817,34 @@ impl PortHandle {
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
+    /// Async twins of the three port-state queries above. An `asynRecord`
+    /// exception callback runs on the *port actor thread* (the driver announces
+    /// the exception from inside its own op), so it cannot use the `_blocking`
+    /// forms — a round trip to the actor from the actor would deadlock. The
+    /// callback spawns the refresh onto the runtime instead and awaits these.
+    pub async fn is_enabled(&self) -> AsynResult<bool> {
+        let result = self
+            .submit_async(RequestOp::GetEnable, AsynUser::new(0))
+            .await?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Async twin of [`Self::is_auto_connect_blocking`].
+    pub async fn is_auto_connect(&self) -> AsynResult<bool> {
+        let result = self
+            .submit_async(RequestOp::GetAutoConnect, AsynUser::new(0))
+            .await?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Async twin of [`Self::is_connected_blocking`].
+    pub async fn is_connected(&self) -> AsynResult<bool> {
+        let result = self
+            .submit_async(RequestOp::GetConnected, AsynUser::new(0))
+            .await?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
     /// Connect the port's transport (blocking) — C `pasynCommon->connect`.
     pub fn connect_blocking(&self) -> AsynResult<()> {
         self.submit_blocking(RequestOp::Connect, AsynUser::new(0))?;

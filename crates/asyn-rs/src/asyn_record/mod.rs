@@ -373,17 +373,19 @@ pub struct AsynRecord {
     // completion re-entry.
     io_inflight: Option<IoInFlight>,
 
-    // Set by the trace exception callback (C `exceptCallback`,
-    // asynRecord.c:903-917) when an external `setTrace{Mask,IOMask,
-    // InfoMask}` fires; consumed by `process()`, which re-imports the
-    // live masks through `read_trace_state`. The async callback cannot
-    // mutate the record (it is owned by the record framework) or post
-    // monitors, so the refresh is deferred to the next process cycle.
-    trace_status_dirty: Arc<AtomicBool>,
-    // Owner handle for the registered trace exception callback so it can
+    // Set by the exception callback (C `exceptCallback`, asynRecord.c:903-917)
+    // when ANY asyn exception fires on the record's port — an external
+    // `setTrace{Mask,IOMask,InfoMask}`, a connect / disconnect, an enable or
+    // auto-connect change; consumed by `process()`, which re-runs the whole
+    // C `monitorStatus` refresh through [`AsynRecord::monitor_status`]. This is
+    // the fallback for a record with no database handle or no runtime: with
+    // both, the callback refreshes and posts immediately, out of band, as C
+    // does — it never sets this flag.
+    status_dirty: Arc<AtomicBool>,
+    // Owner handle for the registered exception callback so it can
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
-    trace_except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
+    except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
     // The record alarm `(stat, sevr)` raised by this process cycle's I/O —
     // the C `recGblSetSevr(pasynRec, …)` calls in `performIO`
     // (asynRecord.c:1380-1621) and the no-asynGpib-interface COMM alarm
@@ -478,8 +480,8 @@ impl Default for AsynRecord {
             resolved_reason: 0,
             async_ctx: None,
             io_inflight: None,
-            trace_status_dirty: Arc::new(AtomicBool::new(false)),
-            trace_except_cb: None,
+            status_dirty: Arc::new(AtomicBool::new(false)),
+            except_cb: None,
             io_alarm: None,
         }
     }
@@ -1117,6 +1119,30 @@ fn trace_readback_fields(
             "TINB3".to_string(),
             bit(info_mask, TraceInfoMask::THREAD.bits()),
         ),
+    ]
+}
+
+/// The port-state half of C `monitorStatus`: AUCT / CNCT / ENBL re-read from
+/// `pasynManager->isAutoConnect` / `isConnected` / `isEnabled`
+/// (asynRecord.c:1085-1099) and POST_IF_NEWed (:1125-1133). A failing query
+/// gives 0, exactly as C's `else` branches do.
+///
+/// Sibling of [`trace_readback_fields`]: together they are everything
+/// `exceptCallback` refreshes, and the same list the `process()`-path
+/// [`AsynRecord::monitor_status`] writes. Field DBF types match `get_field`
+/// (all three are `Short`).
+fn connect_readback_fields(
+    auto_connect: bool,
+    connected: bool,
+    enabled: bool,
+) -> Vec<(String, EpicsValue)> {
+    vec![
+        (
+            "AUCT".to_string(),
+            EpicsValue::Short(i16::from(auto_connect)),
+        ),
+        ("CNCT".to_string(), EpicsValue::Short(i16::from(connected))),
+        ("ENBL".to_string(), EpicsValue::Short(i16::from(enabled))),
     ]
 }
 
@@ -1780,28 +1806,40 @@ impl AsynRecord {
         self.update_info_bits_from_mask();
     }
 
-    /// Subscribe to the port's trace exceptions so a later external
-    /// `asynSetTrace{Mask,IOMask,InfoMask}` is reflected in the record's
-    /// readback fields.
+    /// Subscribe to the port's exceptions — C `exceptCallback`
+    /// (asynRecord.c:903-917).
     ///
-    /// C registers `exceptCallback` with `exceptionCallbackAdd` in
-    /// `connectDevice` (asynRecord.c:1269); the callback re-runs
-    /// `monitorStatus` (asynRecord.c:903-917,1066-1117) under `dbScanLock`,
-    /// which re-imports the trace masks and posts the changed fields
-    /// immediately, out of band — it does NOT wait for the next `process()`.
+    /// C registers it with `exceptionCallbackAdd` in `connectDevice`
+    /// (asynRecord.c:1269) and takes *every* `asynException`: the callback body
+    /// is an unconditional `monitorStatus(pasynRec)` under `dbScanLock`, with
+    /// the comment "There has been a change in connect or enable status". So a
+    /// port going down, an `asynSetAutoConnect`, an `asynEnable` — as much as an
+    /// `asynSetTraceMask` — re-imports the readback fields and posts the changed
+    /// ones immediately, out of band; none of them waits for the next
+    /// `process()`. The port subscribed only to the three Trace* exceptions and
+    /// refreshed only the trace masks, so CNCT/AUCT/ENBL sat stale until the
+    /// record happened to process again (and for a passive record with no scan,
+    /// indefinitely — a dead link still read "Connected").
     ///
     /// The Rust analogue posts through the merged PACT seam: when the record
     /// carries a database handle (`async_ctx`) and a runtime is available, the
-    /// callback recomputes the trace readback fields from the trace manager
-    /// and `post_fields`-es them now (the C `db_post_events` under
-    /// `dbScanLock`). Like C `POST_IF_NEW` (asynRecord.c:210-214) it keeps a
-    /// last-posted cache and posts only the fields whose value changed, so an
-    /// unrelated `setTrace*` does not re-post unchanged readback fields. With
-    /// no handle / runtime — e.g. a record connected outside a database — it
-    /// falls back to raising a dirty flag that `process()` drains through the
-    /// single `read_trace_state` owner.
-    fn register_trace_exception_callback(&mut self) {
-        self.clear_trace_exception_callback();
+    /// callback recomputes the readback fields — trace masks from the trace
+    /// manager, AUCT/CNCT/ENBL from the port — and `post_fields`-es them now
+    /// (the C `db_post_events` under `dbScanLock`). Like C `POST_IF_NEW`
+    /// (asynRecord.c:210-214) it keeps a last-posted cache and posts only the
+    /// fields whose value changed, so an unrelated exception does not re-post
+    /// unchanged readback fields. With no handle / runtime — e.g. a record
+    /// connected outside a database — it falls back to raising a dirty flag that
+    /// `process()` drains through the single [`Self::monitor_status`] owner.
+    ///
+    /// The port-state queries are async, deliberately. The exception is
+    /// announced from *inside* the driver, i.e. on the port actor's own thread
+    /// (`PortDriverBase::set_connected` → `announce_exception`), so an
+    /// `is_connected_blocking()` here would be the actor waiting on itself.
+    /// The refresh is spawned onto the runtime, where the queries queue behind
+    /// the op that raised the exception and are served when the actor loops.
+    fn register_exception_callback(&mut self) {
+        self.clear_exception_callback();
         let Some(ref entry) = self.port_entry else {
             return;
         };
@@ -1810,28 +1848,29 @@ impl AsynRecord {
         };
         let port = self.port.clone();
         let trace = entry.trace.clone();
-        let dirty = Arc::clone(&self.trace_status_dirty);
+        let handle = entry.handle.clone();
+        let dirty = Arc::clone(&self.status_dirty);
         // The immediate out-of-band post needs both a database handle (to post
-        // through) and a runtime handle (the exception fires from a
-        // `setTrace*` caller's thread — iocsh or the port actor — which is not
-        // a tokio worker, so `tokio::spawn` would panic; an explicit `Handle`
+        // through) and a runtime handle (the exception fires from the thread
+        // that raised it — iocsh, or the port actor itself — which is not a
+        // tokio worker, so `tokio::spawn` would panic; an explicit `Handle`
         // submits to the runtime from any thread). Capture them once here,
         // where registration runs in the database's async init context.
         let immediate = match (
             self.async_ctx.clone(),
             tokio::runtime::Handle::try_current().ok(),
         ) {
-            (Some((name, db)), Some(handle)) => Some((name, db, handle)),
+            (Some((name, db)), Some(rt)) => Some((name, db, rt)),
             _ => None,
         };
-        // C `monitorStatus` posts a trace readback field only when it differs
-        // from the per-record remembered value (`POST_IF_NEW`,
-        // asynRecord.c:210-214,1102-1117). The base `post_fields` path posts
-        // unconditionally, so the out-of-band re-post keeps its own last-posted
-        // cache — the asynRecord `old` analogue — to avoid re-posting unchanged
-        // trace fields on every `setTrace*`. Seed it with the current values
-        // (the C `old` after the connect-path `monitorStatus`) so the first
-        // external change posts only the fields that actually changed.
+        // C `monitorStatus` posts a readback field only when it differs from the
+        // per-record remembered value (`POST_IF_NEW`, asynRecord.c:210-214,
+        // :1102-1133). The base `post_fields` path posts unconditionally, so the
+        // out-of-band re-post keeps its own last-posted cache — the asynRecord
+        // `old` analogue — to avoid re-posting unchanged fields on every
+        // exception. Seed it with the record's current values: `connect_device`
+        // registers this callback only after its own `monitor_status`, so those
+        // are the values C's `old` would hold at the same point.
         let last_posted: Arc<Mutex<HashMap<String, EpicsValue>>> = Arc::new(Mutex::new(
             trace_readback_fields(
                 trace.get_trace_mask(Some(&port)).bits(),
@@ -1839,66 +1878,73 @@ impl AsynRecord {
                 trace.get_trace_info_mask(Some(&port)).bits(),
             )
             .into_iter()
+            .chain(connect_readback_fields(
+                self.auct != 0,
+                self.cnct != 0,
+                self.enbl != 0,
+            ))
             .collect(),
         ));
         let id = mgr.add_callback(move |ev| {
-            // Only the trace masks `monitorStatus` recomputes matter here; the
-            // announce for a port-level `setTrace*` carries the port name
-            // (TraceManager::announce uses addr -1).
-            if ev.port_name != port
-                || !matches!(
-                    ev.exception,
-                    AsynException::TraceMask
-                        | AsynException::TraceIoMask
-                        | AsynException::TraceInfoMask
-                )
-            {
+            // C `exceptCallback` filters on nothing: its body is an
+            // unconditional `monitorStatus` (asynRecord.c:913), so every
+            // exception on the record's port refreshes every readback field.
+            // The subscription is per-port in C (the callback hangs off the
+            // record's `pasynUser`), which is what this name check reproduces.
+            if ev.port_name != port {
                 return;
             }
-            match &immediate {
-                Some((name, db, handle)) => {
-                    // Recompute the current trace readback fields and post them
-                    // out of band now — the C `exceptCallback` → `monitorStatus`
-                    // immediate re-post (asynRecord.c:1102-1117). Mirror C
-                    // `POST_IF_NEW` (asynRecord.c:210-214): post only the fields
-                    // whose value changed since the last out-of-band post and
-                    // remember the new values, so an unchanged trace field is
-                    // not re-posted.
-                    let changed: Vec<(String, EpicsValue)> = {
-                        let mut cache = last_posted.lock().unwrap();
-                        let mut changed = Vec::new();
-                        for (field, value) in trace_readback_fields(
-                            trace.get_trace_mask(Some(&port)).bits(),
-                            trace.get_trace_io_mask(Some(&port)).bits(),
-                            trace.get_trace_info_mask(Some(&port)).bits(),
-                        ) {
-                            if cache.get(&field) != Some(&value) {
-                                cache.insert(field.clone(), value.clone());
-                                changed.push((field, value));
-                            }
+            let Some((name, db, rt)) = immediate.clone() else {
+                dirty.store(true, Ordering::Release);
+                return;
+            };
+            let (port, trace, handle, last_posted) = (
+                port.clone(),
+                trace.clone(),
+                handle.clone(),
+                Arc::clone(&last_posted),
+            );
+            rt.spawn(async move {
+                // The C `monitorStatus` body: re-import the trace masks from the
+                // trace manager and re-read the port's auto-connect / connect /
+                // enable state (asynRecord.c:1066-1099), then POST_IF_NEW the
+                // fields that changed (:1102-1133). The port queries are async
+                // because this refresh can be driven from the actor thread — see
+                // the doc comment.
+                let auto = handle.is_auto_connect().await.unwrap_or(false);
+                let connected = handle.is_connected().await.unwrap_or(false);
+                let enabled = handle.is_enabled().await.unwrap_or(false);
+                let fields = trace_readback_fields(
+                    trace.get_trace_mask(Some(&port)).bits(),
+                    trace.get_trace_io_mask(Some(&port)).bits(),
+                    trace.get_trace_info_mask(Some(&port)).bits(),
+                )
+                .into_iter()
+                .chain(connect_readback_fields(auto, connected, enabled));
+                let changed: Vec<(String, EpicsValue)> = {
+                    let mut cache = last_posted.lock().unwrap();
+                    let mut changed = Vec::new();
+                    for (field, value) in fields {
+                        if cache.get(&field) != Some(&value) {
+                            cache.insert(field.clone(), value.clone());
+                            changed.push((field, value));
                         }
-                        changed
-                    };
-                    if changed.is_empty() {
-                        return;
                     }
-                    let (name, db) = (name.clone(), db.clone());
-                    handle.spawn(async move {
-                        let _ = db.post_fields(&name, changed).await;
-                    });
+                    changed
+                };
+                if changed.is_empty() {
+                    return;
                 }
-                None => {
-                    dirty.store(true, Ordering::Release);
-                }
-            }
+                let _ = db.post_fields(&name, changed).await;
+            });
         });
-        self.trace_except_cb = Some((mgr, id));
+        self.except_cb = Some((mgr, id));
     }
 
     /// Remove the trace exception subscription (C `exceptionCallbackRemove`,
     /// asynRecord.c:523,1154,1313). Idempotent.
-    fn clear_trace_exception_callback(&mut self) {
-        if let Some((mgr, id)) = self.trace_except_cb.take() {
+    fn clear_exception_callback(&mut self) {
+        if let Some((mgr, id)) = self.except_cb.take() {
             mgr.remove_callback(id);
         }
     }
@@ -2154,13 +2200,41 @@ impl AsynRecord {
         self.cnct = i32::from(connected);
     }
 
+    /// C `monitorStatus` (asynRecord.c:1042-1140) on the scan thread: re-import
+    /// the trace masks and re-read AUCT / CNCT / ENBL from the port, so every
+    /// readback field shows the port's current state.
+    ///
+    /// The single owner of that refresh. C runs it from `connectDevice`
+    /// (:1271,:1319), from every completed callback (:897), and from
+    /// `exceptCallback` (:913). Here the first two are this function; the
+    /// exception path cannot take `&mut self` (the record is owned by the
+    /// database), so it does the same work out of band through
+    /// [`Self::register_exception_callback`], falling back to `status_dirty` +
+    /// this function when the record has no database handle.
+    ///
+    /// A failing query lands as 0, exactly as C's `else` branches do
+    /// (:1087,:1092,:1097).
+    fn monitor_status(&mut self) {
+        self.read_trace_state();
+        let (enabled, auto) = match self.port_entry {
+            Some(ref entry) => (
+                entry.handle.is_enabled_blocking().unwrap_or(false),
+                entry.handle.is_auto_connect_blocking().unwrap_or(false),
+            ),
+            None => (false, false),
+        };
+        self.enbl = i32::from(enabled);
+        self.auct = i32::from(auto);
+        self.refresh_connected_state();
+    }
+
     /// Attempt to connect to the port specified in the PORT field.
     fn connect_device(&mut self) {
         if self.port.is_empty() {
             self.pcnct = 0;
             self.port_entry = None;
             self.refresh_connected_state();
-            self.clear_trace_exception_callback();
+            self.clear_exception_callback();
             return;
         }
 
@@ -2193,13 +2267,7 @@ impl AsynRecord {
                 self.optioniv = 1;
                 self.gpibiv = 0; // No GPIB hardware in Rust ports
 
-                // Read trace state from manager
                 self.port_entry = Some(entry.clone());
-                self.read_trace_state();
-                // C `connectDevice` adds `exceptCallback` here
-                // (asynRecord.c:1269) so later external trace changes
-                // refresh the readback fields.
-                self.register_trace_exception_callback();
 
                 // Read serial/IP options from driver
                 self.read_options_from_driver(&entry.handle);
@@ -2207,20 +2275,21 @@ impl AsynRecord {
                 // Attached to the port (C `connectDevice` sets PCNCT=1,
                 // asynRecord.c:1305).
                 self.pcnct = 1;
-                // C asynRecord.c connectDevice queries the port's actual
-                // enable / auto-connect / connect state into ENBL / AUCT /
-                // CNCT — it must not force them to 1, which would discard a
-                // user who configured ENBL=0 or a port registered
+                // C `connectDevice` ends in `monitorStatus` (asynRecord.c:1271,
+                // :1319): the trace masks and the port's actual enable /
+                // auto-connect / connect state are *queried* into TMSK…/ENBL /
+                // AUCT / CNCT. They must not be forced to 1, which would discard
+                // a user who configured ENBL=0 or a port registered
                 // noAutoConnect, and would claim a live wire on a port whose
-                // transport is down. Keep the current field value if the query
-                // fails.
-                if let Ok(enabled) = entry.handle.is_enabled_blocking() {
-                    self.enbl = i32::from(enabled);
-                }
-                if let Ok(auto) = entry.handle.is_auto_connect_blocking() {
-                    self.auct = i32::from(auto);
-                }
-                self.refresh_connected_state();
+                // transport is down.
+                self.monitor_status();
+                // C `connectDevice` adds `exceptCallback` (asynRecord.c:1269) so
+                // any later exception on the port — a trace change, a dropped
+                // link, an enable — refreshes the readback fields out of band.
+                // Registered after `monitor_status` so the callback's
+                // POST_IF_NEW cache is seeded with the values C's `old` holds at
+                // the same point.
+                self.register_exception_callback();
                 // Only clear errors if drv_user_create succeeded (don't mask the error)
                 if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
                     self.errs.clear();
@@ -2231,7 +2300,7 @@ impl AsynRecord {
                 self.pcnct = 0;
                 self.port_entry = None;
                 self.refresh_connected_state();
-                self.clear_trace_exception_callback();
+                self.clear_exception_callback();
             }
         }
     }
@@ -3098,7 +3167,7 @@ impl Record for AsynRecord {
                     self.connect_device();
                 } else {
                     self.port_entry = None;
-                    self.clear_trace_exception_callback();
+                    self.clear_exception_callback();
                     // Detached: `isConnected` has no device to report on, which
                     // is C's CNCT=0 (monitorStatus, :1091-1093).
                     self.refresh_connected_state();
@@ -3305,16 +3374,17 @@ impl Record for AsynRecord {
             return Ok(ProcessOutcome::complete());
         }
 
-        // Re-import the trace masks if an external `setTrace*` fired since the
-        // last cycle. C refreshes these readback fields from its
-        // `exceptCallback` immediately (asynRecord.c:903-917). When the record
-        // carries a database handle the subscription
-        // (`register_trace_exception_callback`) does the same — it posts the
-        // fields out of band — and never sets this flag. This dirty path is
-        // the fallback for a record with no handle / runtime, draining through
-        // the single `read_trace_state` owner.
-        if self.trace_status_dirty.swap(false, Ordering::AcqRel) {
-            self.read_trace_state();
+        // Re-run the C `monitorStatus` refresh if any exception fired on the
+        // port since the last cycle — an external `setTrace*`, a dropped link,
+        // an enable / auto-connect change. C refreshes these readback fields
+        // from its `exceptCallback` immediately (asynRecord.c:903-917). When the
+        // record carries a database handle the subscription
+        // (`register_exception_callback`) does the same — it refreshes and posts
+        // out of band — and never sets this flag. This dirty path is the
+        // fallback for a record with no handle / runtime, draining through the
+        // single `monitor_status` owner.
+        if self.status_dirty.swap(false, Ordering::AcqRel) {
+            self.monitor_status();
         }
 
         // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
@@ -3384,7 +3454,7 @@ impl Drop for AsynRecord {
         // (asynRecord.c:523,1154,1313); mirror that on teardown so a
         // dropped record leaves no dangling subscription in the
         // ExceptionManager callback list.
-        self.clear_trace_exception_callback();
+        self.clear_exception_callback();
     }
 }
 
@@ -6045,5 +6115,155 @@ mod tests {
             reposted.is_err(),
             "unchanged TMSK must not be re-posted on an IO-mask-only change, got {reposted:?}"
         );
+    }
+
+    /// R8-55: C `exceptCallback` (asynRecord.c:903-917) takes EVERY
+    /// `asynException` — its body is an unconditional `monitorStatus`, which
+    /// re-reads `isAutoConnect` / `isConnected` / `isEnabled` (:1085-1099) and
+    /// POST_IF_NEWs AUCT / CNCT / ENBL (:1125-1133). So a link that drops shows
+    /// up in CNCT immediately, with no `process()` in between — which matters
+    /// most for the passive record that never scans.
+    ///
+    /// The port subscribed the record to the three Trace* exceptions only and
+    /// refreshed only the trace masks, so a disconnected port kept reporting
+    /// CNCT="Connected" until something else processed the record.
+    ///
+    /// The disconnect is driven through the port actor, so the exception is
+    /// announced *on the actor thread* (`PortDriver::disconnect` →
+    /// `PortDriverBase::set_connected` → `announce_exception`). The refresh
+    /// therefore must not use the `_blocking` queries: this test deadlocks if it
+    /// does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_port_exception_refreshes_the_connect_state_immediately() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use epics_base_rs::server::database::PvDatabase;
+        use tokio::sync::mpsc;
+
+        struct PlainDriver(PortDriverBase);
+        impl PortDriver for PlainDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_except_connect_state";
+        // One exception manager, wired to BOTH the trace manager (so `setTrace*`
+        // announces) and the driver (so connect/enable/auto-connect announce) —
+        // the same wiring `PortManager::register_port` does.
+        let exceptions = Arc::new(ExceptionManager::new());
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(exceptions.clone());
+
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.exception_sink = Some(exceptions.clone());
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        super::registry::register_port(port_name, handle.clone(), trace.clone());
+
+        let db = PvDatabase::new();
+        let rec_name = "EXCEPT_CNCT_REC";
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1, "the port starts connected");
+        assert_eq!(rec.enbl, 1, "the port starts enabled");
+        db.add_record(rec_name, Box::new(rec)).await.unwrap();
+
+        // Drop the link from a non-runtime thread — the iocsh / driver case.
+        // The actor runs `disconnect`, which announces asynExceptionConnect from
+        // inside the driver, on the actor's own thread.
+        {
+            let h = handle.clone();
+            std::thread::spawn(move || h.disconnect_blocking().unwrap())
+                .join()
+                .unwrap();
+        }
+
+        let mut posted = false;
+        for _ in 0..2000 {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let got = inst.read().await.record.get_field("CNCT");
+            if got == Some(EpicsValue::Short(0)) {
+                posted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            posted,
+            "a disconnect must refresh CNCT immediately, with no process()"
+        );
+
+        // ENBL / AUCT are re-read by the same refresh and are unchanged, so
+        // POST_IF_NEW leaves them alone — the record still shows them true.
+        let inst = db.get_record(rec_name).await.unwrap();
+        let g = inst.read().await;
+        assert_eq!(g.record.get_field("ENBL"), Some(EpicsValue::Short(1)));
+        assert_eq!(g.record.get_field("AUCT"), Some(EpicsValue::Short(1)));
+    }
+
+    /// R8-55, the no-database fallback boundary: a record with no `async_ctx`
+    /// (connected outside a database, as in these unit tests) cannot post out of
+    /// band, so the exception raises `status_dirty` and the next `process()`
+    /// drains it through the single `monitor_status` owner. Before the fix the
+    /// flag was raised only by the three Trace* exceptions, so a disconnect
+    /// never reached CNCT at all — not even on the next process cycle.
+    #[test]
+    fn a_port_exception_refreshes_the_connect_state_on_the_next_process() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct PlainDriver(PortDriverBase);
+        impl PortDriver for PlainDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_except_connect_state_dirty";
+        let exceptions = Arc::new(ExceptionManager::new());
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(exceptions.clone());
+
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.exception_sink = Some(exceptions.clone());
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        register_port(port_name, handle.clone(), trace);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.tmod = TransferMode::NoIo as i32;
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+
+        handle.disconnect_blocking().unwrap();
+        // The exception has been announced; the record has no database handle,
+        // so the refresh is deferred to the next cycle.
+        rec.process().unwrap();
+        assert_eq!(
+            rec.cnct, 0,
+            "the dropped link reaches CNCT on the next scan"
+        );
+        assert_eq!(rec.enbl, 1, "ENBL is re-read and unchanged");
+        assert_eq!(rec.auct, 1, "AUCT is re-read and unchanged");
     }
 }

@@ -292,102 +292,14 @@ pub fn convert_rgb_layout(
     Ok(arr)
 }
 
-/// Convert NDArray data type with clamping.
+/// Convert NDArray element type using C cast semantics.
+///
+/// Thin alias for [`crate::convert::convert_type`] — C++ `convertType`
+/// (`NDArrayPool.cpp:378-388`), `*pDataOut++ = (dataTypeOut)(*pDataIn++)`.
+/// A C cast truncates to the low bits on narrowing (`(epicsUInt8)300 == 44`);
+/// it does **not** clamp, so this must not reintroduce a `clamp()`.
 pub fn convert_data_type(src: &NDArray, target_type: NDDataType) -> ADResult<NDArray> {
-    if src.data.data_type() == target_type {
-        return Ok(src.clone());
-    }
-
-    let n = src.data.len();
-    let out_data = match target_type {
-        NDDataType::UInt8 => {
-            let mut out = vec![0u8; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v.clamp(0.0, 255.0) as u8;
-            }
-            NDDataBuffer::U8(out)
-        }
-        NDDataType::UInt16 => {
-            let mut out = vec![0u16; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v.clamp(0.0, 65535.0) as u16;
-            }
-            NDDataBuffer::U16(out)
-        }
-        NDDataType::Int8 => {
-            let mut out = vec![0i8; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v.clamp(-128.0, 127.0) as i8;
-            }
-            NDDataBuffer::I8(out)
-        }
-        NDDataType::Int16 => {
-            let mut out = vec![0i16; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v.clamp(-32768.0, 32767.0) as i16;
-            }
-            NDDataBuffer::I16(out)
-        }
-        NDDataType::Int32 => {
-            let mut out = vec![0i32; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v as i32;
-            }
-            NDDataBuffer::I32(out)
-        }
-        NDDataType::UInt32 => {
-            let mut out = vec![0u32; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v.max(0.0) as u32;
-            }
-            NDDataBuffer::U32(out)
-        }
-        NDDataType::Int64 => {
-            let mut out = vec![0i64; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v as i64;
-            }
-            NDDataBuffer::I64(out)
-        }
-        NDDataType::UInt64 => {
-            let mut out = vec![0u64; n];
-            for i in 0..n {
-                let v = src.data.get_as_f64(i).unwrap_or(0.0);
-                out[i] = v.max(0.0) as u64;
-            }
-            NDDataBuffer::U64(out)
-        }
-        NDDataType::Float32 => {
-            let mut out = vec![0f32; n];
-            for i in 0..n {
-                out[i] = src.data.get_as_f64(i).unwrap_or(0.0) as f32;
-            }
-            NDDataBuffer::F32(out)
-        }
-        NDDataType::Float64 => {
-            let mut out = vec![0f64; n];
-            for i in 0..n {
-                out[i] = src.data.get_as_f64(i).unwrap_or(0.0);
-            }
-            NDDataBuffer::F64(out)
-        }
-    };
-
-    let mut arr = NDArray::new(src.dims.clone(), target_type);
-    arr.data = out_data;
-    arr.unique_id = src.unique_id;
-    arr.timestamp = src.timestamp;
-    arr.time_stamp = src.time_stamp;
-    arr.attributes = src.attributes.clone();
-    arr.codec = src.codec.clone();
-    Ok(arr)
+    crate::convert::convert_type(src, target_type)
 }
 
 /// Convert RGB1 to YUV444 using BT.601 coefficients.

@@ -11,6 +11,7 @@ pub mod attributes;
 pub mod codec;
 pub mod color;
 pub mod color_layout;
+pub mod convert;
 pub mod driver;
 pub mod error;
 pub mod ndarray;

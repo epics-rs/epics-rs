@@ -235,10 +235,10 @@ fn epics_parse_int32_base10(s: &str) -> Option<i32> {
 /// (RPRO/TPRO/BKPT) are deliberately omitted: they are recomputed every
 /// process, not `.db` init directives, so coercing a loaded value would be
 /// overwritten immediately.
-fn coerce_common_field_string(name: &str, value: EpicsValue) -> EpicsValue {
+fn coerce_common_field_string(name: &str, value: EpicsValue) -> CaResult<EpicsValue> {
     let s = match &value {
         EpicsValue::String(s) => s,
-        _ => return value,
+        _ => return Ok(value),
     };
     // Canonical DBF type per numeric/menu common field, chosen to match the
     // variant its `put_common_field` arm binds. `PINI`/`SCAN`/`SSCN` are absent
@@ -248,23 +248,24 @@ fn coerce_common_field_string(name: &str, value: EpicsValue) -> EpicsValue {
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
         | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
         "DISP" | "UDF" => DbFieldType::Char,
-        _ => return value,
+        _ => return Ok(value),
     };
     let text = s.as_str_lossy();
-    let text = text.trim();
     // A `DBF_MENU` common field resolves its label against THAT field's own
-    // menu (C `dbPutStringNum`: exact label, then numeric index) — the same
-    // rule the record-specific menu fields already follow in `coerce_write_value`
-    // / the db loader. The field-blind `EpicsValue::parse` table below cannot
-    // do this: the same label names different indices in different menus.
+    // menu through the one converter every menu-field string put uses
+    // (C `dbConvert.c::putStringMenu`: exact label, else an index below
+    // `nChoice`, else `S_db_badChoice`) — the same rule the record-specific
+    // menu fields follow in `coerce_write_value`. The failure PROPAGATES: the
+    // field-blind `EpicsValue::parse` fallback below must never see a menu
+    // field, or `caput REC.PRIO Bogus` lands as index 0 instead of failing.
     if let Some(choices) = super::menu_choices::shared_menu_choices(name) {
-        if let Some(resolved) = super::menu_choices::resolve_menu_field_string(choices, dbf, text) {
-            return resolved;
-        }
+        return super::menu_choices::resolve_menu_field_string(name, choices, dbf, &text);
     }
-    match EpicsValue::parse(dbf, text) {
-        Ok(parsed) => parsed,
-        Err(_) => value,
+    // Numeric (non-menu) common field: C's `dbPut` runs the string through
+    // `epicsParse*`, which tolerates whitespace around the digits.
+    match EpicsValue::parse(dbf, text.trim()) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => Ok(value),
     }
 }
 
@@ -1323,7 +1324,7 @@ impl RecordInstance {
         // typed arms below apply a `field(PHAS, "1")` / `field(PRIO, "HIGH")`
         // directive instead of silently dropping it at IOC load. String-typed
         // and already-typed values pass through unchanged.
-        let value = coerce_common_field_string(&name, value);
+        let value = coerce_common_field_string(&name, value)?;
         match name.as_str() {
             "SEVR" => {
                 if let EpicsValue::Short(v) = value {

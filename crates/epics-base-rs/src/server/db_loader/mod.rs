@@ -1111,12 +1111,12 @@ pub fn apply_fields(
                 .menu_field_choices(&upper_name)
                 .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
             {
-                crate::server::record::resolve_menu_field_string(choices, dbf_type, value_str)
-                    .ok_or_else(|| {
-                        CaError::InvalidValue(format!(
-                            "field {upper_name}: '{value_str}' is not a valid menu choice"
-                        ))
-                    })?
+                crate::server::record::resolve_menu_field_string_db_load(
+                    &upper_name,
+                    choices,
+                    dbf_type,
+                    value_str,
+                )?
             } else {
                 EpicsValue::parse(dbf_type, value_str).map_err(|e| {
                     CaError::InvalidValue(format!(

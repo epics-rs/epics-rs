@@ -41,6 +41,15 @@ pub enum CaError {
     #[error("illegal record field: {0}")]
     BadField(String),
 
+    /// C `S_db_badChoice` ("Illegal choice") — a `DBR_STRING` write to a
+    /// `DBF_MENU` field named neither an exact choice label nor an in-range
+    /// index (`dbConvert.c::putStringMenu:1216-1229`). C's converter returns
+    /// this from inside `dbPut`, *before* the value is stored
+    /// (`dbAccess.c:1362`), so the field keeps its old value, no monitor is
+    /// posted and the record is not processed.
+    #[error("illegal menu choice: {0}")]
+    BadChoice(String),
+
     #[error("put disabled (DISP=1) for field {0}")]
     PutDisabled(String),
 
@@ -123,6 +132,10 @@ impl CaError {
             // C rsrv answers any non-zero `db_put_field` status — including
             // `S_db_badField` — with ECA_PUTFAIL (`camessage.c::write_action`).
             CaError::BadField(_) => ECA_PUTFAIL,
+            // Likewise `S_db_badChoice` from the string→menu converter: the
+            // put-notify path maps any non-`notifyOK` status to ECA_PUTFAIL
+            // (`db_access.c::db_put_process:1041`, `camessage.c:1386`).
+            CaError::BadChoice(_) => ECA_PUTFAIL,
             // Disconnection / shutdown are surfaced as ECA_DISCONN so a
             // downstream client (e.g. caput on a CA gateway whose
             // upstream just dropped) sees the actionable

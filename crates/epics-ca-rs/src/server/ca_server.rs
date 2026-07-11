@@ -988,7 +988,6 @@ impl CaServer {
         // calling run() (which consumes self) and pulses it on
         // upstream PV discovery to fire a beacon immediately.
         let beacon_reset = self.beacon_reset.clone();
-        let beacon_reset_tcp = beacon_reset.clone();
 
         let conn_events = self.conn_events.clone();
         let acf_reload_tx = self.acf_reload_tx.clone();
@@ -1041,7 +1040,6 @@ impl CaServer {
                     acf,
                     acf_reload_tx,
                     tcp_tx,
-                    beacon_reset_tcp,
                     conn_events,
                     audit_for_tcp,
                     drain_for_tcp,
@@ -1060,7 +1058,6 @@ impl CaServer {
                     acf,
                     acf_reload_tx,
                     tcp_tx,
-                    beacon_reset_tcp,
                     conn_events,
                     audit_for_tcp,
                     drain_for_tcp,

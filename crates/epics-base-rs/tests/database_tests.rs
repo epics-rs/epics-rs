@@ -3880,6 +3880,93 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
     assert!(udf("PINI_NO").await, "PINI=NO is in no pass at all");
 }
 
+/// R6-6 — C `piniProcess` (`iocInit.c:608-627`) sweeps the database once per
+/// distinct `PHAS`, ascending, so PINI records process in phase order; within a
+/// phase the order is database load order (`doRecordPini` under
+/// `iterateRecords`). The port processed them in `HashMap` iteration order and
+/// never read `PHAS` at all.
+///
+/// The probe: every PINI record drives a shared `SINK` through an OUT link, so
+/// `SINK` ends up holding the value of whichever record processed **last** —
+/// which under ascending-PHAS order is the highest-PHAS one. The records are
+/// added in descending phase order so that load order alone gives the wrong
+/// answer.
+#[tokio::test]
+async fn test_pini_records_process_in_ascending_phas_order() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    db.add_record("PHAS_SINK", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    for (name, val, phas) in [
+        ("PHAS_C", 30.0, 30i16),
+        ("PHAS_A", 10.0, 10),
+        ("PHAS_B", 20.0, 20),
+    ] {
+        db.add_record(name, Box::new(AoRecord::new(val)))
+            .await
+            .unwrap();
+        let rec = db.get_record(name).await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+            .unwrap();
+        inst.put_common_field("PHAS", EpicsValue::Short(phas))
+            .unwrap();
+        inst.put_common_field("OUT", EpicsValue::String("PHAS_SINK".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    db.pini_process(PiniMode::Yes).await;
+
+    match db.get_pv("PHAS_SINK").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 30.0).abs() < 1e-10,
+            "PINI must process in ascending PHAS order (PHAS_C last); SINK={v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
+/// R6-6 — the sweep re-reads `PHAS` on every pass, which is why C re-scans
+/// rather than sorting once: "PHAS fields can be changed at runtime, so we have
+/// to look for the lowest value of PHAS each time" (`iocInit.c:614-619`). A
+/// record moved out of the phase currently being processed must still be picked
+/// up by the pass for its new phase, not dropped.
+#[tokio::test]
+async fn test_pini_sweep_covers_every_phase_present() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    // Phases far apart and not contiguous — the sweep must find each next
+    // lowest PHAS rather than stepping one at a time or stopping at the first.
+    for (name, phas) in [
+        ("SWEEP_MIN", i16::MIN),
+        ("SWEEP_ZERO", 0),
+        ("SWEEP_MAX", i16::MAX),
+    ] {
+        db.add_record(name, Box::new(AoRecord::new(1.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record(name).await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+            .unwrap();
+        inst.put_common_field("PHAS", EpicsValue::Short(phas))
+            .unwrap();
+    }
+
+    db.pini_process(PiniMode::Yes).await;
+
+    for name in ["SWEEP_MIN", "SWEEP_ZERO", "SWEEP_MAX"] {
+        assert!(
+            !db.get_record(name).await.unwrap().read().await.common.udf,
+            "{name} must be processed by the pass for its own phase"
+        );
+    }
+}
+
 /// R6-5 — a `caput REC.PINI RUN` must store RUN, and an out-of-menu string must
 /// be rejected rather than silently landing on NO. The pre-fix bool accepted
 /// only `"YES"`/`"1"`/`"true"` and mapped everything else — including the four

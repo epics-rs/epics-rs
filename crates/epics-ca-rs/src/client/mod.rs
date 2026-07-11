@@ -4274,14 +4274,25 @@ fn disconnect_channels(
         write: false,
     };
 
+    // Step 1 — `disconnectAllIO` (`nciu.cpp:168`), and it comes FIRST:
+    // every pending get/put IO of the channel fails with ECA_DISCONN and
+    // the subscriptions park the same status, all of it *before* the
+    // connection callback runs (`nciu.cpp:168-170` — disconnectAllIO, then
+    // disconnectNotify). libca hands the user the per-IO failures before it
+    // says "the channel is down", so a handler that reacts to the
+    // connection event never observes an IO of the dead channel still
+    // pending.
+    subscriptions.mark_disconnected(&affected);
+    let affected_set: HashSet<u32> = affected.iter().copied().collect();
+    drain_waiters_for_cids(&affected_set, in_flight);
+
     for cid in &affected {
         let Some(ch) = channels.get_mut(cid) else {
             continue;
         };
-        // C `nciu::setServerAddressUnknown` (`nciu.cpp:183-195`) clears
-        // both permits as the channel leaves the circuit — *before* any
-        // callback runs, so a handler that reads the rights sees
-        // no-rights.
+        // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:183-195`)
+        // clears both permits as the channel leaves the circuit, before any
+        // callback runs, so a handler that reads the rights sees no-rights.
         ch.state = kind.terminal_state();
         ch.access_rights = NO_RIGHTS;
         match kind {
@@ -4295,8 +4306,9 @@ fn disconnect_channels(
                 }
             }
         }
-        // C `disconnectNotify` then `accessRightsNotify(noRights)`
-        // (`nciu.cpp:170-177`) — in that order.
+        // Steps 3 and 4 — C `disconnectNotify` then
+        // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
+        // order.
         let _ = ch.conn_tx.send(kind.connection_event());
         let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
             read: false,
@@ -4304,13 +4316,6 @@ fn disconnect_channels(
         });
         per_channel(ch);
     }
-
-    // C `disconnectAllIO` (`nciu.cpp:168`): every pending get/put IO of
-    // the channel fails with ECA_DISCONN and the subscriptions park the
-    // same status.
-    subscriptions.mark_disconnected(&affected);
-    let affected_set: HashSet<u32> = affected.iter().copied().collect();
-    drain_waiters_for_cids(&affected_set, in_flight);
 
     affected
 }
@@ -6137,6 +6142,81 @@ mod disconnect_transition_tests {
                     write: false
                 },
             ]
+        );
+    }
+
+    /// R8-20: the IO failures must be delivered BEFORE the connection
+    /// event. C `nciu::unresponsiveCircuitNotify` (`nciu.cpp:168-170`) calls
+    /// `disconnectAllIO` and only then `disconnectNotify`, so an application
+    /// reacting to "channel down" never finds an IO of that channel still
+    /// pending.
+    ///
+    /// Observing the order: both consumers park on their channels before the
+    /// transition runs, and the transition runs on the `block_on` future of a
+    /// `current_thread` runtime — so the two wakes land on the scheduler's
+    /// injection queue in send order and the tasks run in that order. The
+    /// recorded sequence is therefore the send sequence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_20_io_failures_are_delivered_before_the_disconnect_event() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        let (rtx, rrx) = oneshot::channel();
+        in_flight.reads.insert(
+            1,
+            types::ReadWaiter::OneShot {
+                cid: 42,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx,
+            },
+        );
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let io_order = order.clone();
+        let io_task = tokio::spawn(async move {
+            let got = rrx.await.expect("read waiter must be woken");
+            assert!(matches!(got, Err(CaError::Disconnected)));
+            io_order.lock().unwrap().push("io");
+        });
+        let conn_order = order.clone();
+        let conn_task = tokio::spawn(async move {
+            let ev = conn_rx.recv().await.expect("connection event");
+            assert_eq!(ev, ConnectionEvent::Disconnected);
+            conn_order.lock().unwrap().push("conn");
+        });
+
+        // Let both consumers park on their awaits.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "nothing may be delivered before the transition runs"
+        );
+
+        disconnect_channels(
+            &mut channels,
+            &mut subscriptions,
+            &in_flight,
+            &snapshots,
+            DisconnectKind::CircuitGone,
+            |ch| ch.cid == 42,
+            |_| {},
+        );
+
+        io_task.await.unwrap();
+        conn_task.await.unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["io", "conn"],
+            "C fails the channel's pending IOs (disconnectAllIO) before it \
+             signals the disconnect (disconnectNotify)"
         );
     }
 

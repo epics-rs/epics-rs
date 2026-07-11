@@ -222,15 +222,35 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let a = pop1(&mut stack)?;
                     stack.push(a.map(|x| !c_int(x) as f64));
                 }
-                CoreOp::Shl => {
+                // `<<`/`>>` are ONE arm in C (`aCalcPerform.c:1416-1459`) and
+                // the LEFT operand's type picks the whole meaning:
+                //   scalar left  -> a bit shift by the `(int)` count (:1421-1427)
+                //   array  left  -> a POSITIONAL move of the elements, NOT a
+                //                   bitwise anything (:1428-1458)
+                // The count is collapsed to a double either way (`toDouble(ps1)`,
+                // :1420 — an array count becomes its `a[0]`, `to_double` :121).
+                CoreOp::Shl | CoreOp::Shr => {
+                    let left_shift = matches!(core, CoreOp::Shl);
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (c_int(x) << (c_int(y) & 31)) as f64)?);
-                }
-                CoreOp::Shr => {
-                    let b = pop1(&mut stack)?;
-                    let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (c_int(x) >> (c_int(y) & 31)) as f64)?);
+                    let count = b.as_f64()?;
+                    match a {
+                        ArrayStackValue::Double(x) => {
+                            let n = c_int(count) & 31;
+                            let v = if left_shift {
+                                c_int(x) << n
+                            } else {
+                                c_int(x) >> n
+                            };
+                            stack.push(ArrayStackValue::Double(v as f64));
+                        }
+                        ArrayStackValue::Array(mut arr) => {
+                            // C negates the count for `<<` (:1431) — a left
+                            // shift moves elements DOWN in index.
+                            shift_elements(&mut arr, if left_shift { -count } else { count });
+                            stack.push(ArrayStackValue::Array(arr));
+                        }
+                    }
                 }
                 // `>>>` (RIGHT_SHIFT_LOGIC) is a BASE opcode; aCalcPostfix has
                 // no such element, so no aCalc expression can contain one and
@@ -684,6 +704,77 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         .last()
         .cloned()
         .unwrap_or(ArrayStackValue::Double(0.0)))
+}
+
+/// C `myNINT` (`aCalcPerform.c:50`): `(int)(a >= 0 ? a+0.5 : a-0.5)` — a
+/// truncating cast, so it rounds half away from zero.
+fn my_nint(a: f64) -> i32 {
+    (if a >= 0.0 { a + 0.5 } else { a - 0.5 }) as i32
+}
+
+/// C `SMALL` (`aCalcPerform.c:56`).
+const SMALL: f64 = 1e-9;
+
+/// The ARRAY form of aCalc's `<<`/`>>` (`aCalcPerform.c:1428-1458`): move the
+/// elements by `e` positions (`e` is already negated by the caller for `<<`),
+/// zero-filling the vacated end, and — because `e` is a DOUBLE — linearly
+/// interpolate the fractional remainder. `e > 0` moves elements toward higher
+/// indices.
+///
+/// The interpolation is done in place, and C reads neighbours that the same
+/// pass has already overwritten (the `+=` walks the array in one direction and
+/// looks back the way it came for the extrapolated end point), so this walks in
+/// exactly C's order rather than reading from a saved copy.
+fn shift_elements(a: &mut [f64], e: f64) {
+    let n = a.len();
+    if n == 0 {
+        return;
+    }
+    let j = my_nint(e);
+    if j > 0 {
+        let j = j as usize;
+        if j >= n {
+            a.fill(0.0);
+        } else {
+            for i in (j..n).rev() {
+                a[i] = a[i - j];
+            }
+            a[..j].fill(0.0);
+        }
+    } else if j < 0 {
+        let k = j.unsigned_abs() as usize;
+        if k >= n {
+            a.fill(0.0);
+        } else {
+            for i in 0..(n - k) {
+                a[i] = a[i + k];
+            }
+            a[(n - k)..].fill(0.0);
+        }
+    }
+
+    let d = (e - f64::from(j)).abs();
+    if d <= SMALL {
+        return;
+    }
+    // A single element has no neighbour to interpolate against; C would index
+    // a[-1]/a[1] out of its own array here, so there is no behaviour to match.
+    if n < 2 {
+        return;
+    }
+    if e < f64::from(j) {
+        for i in 0..n - 1 {
+            a[i] += d * (a[i + 1] - a[i]);
+        }
+        // C `:1449` extrapolates the last point from the ALREADY-updated a[n-2].
+        a[n - 1] += d * (a[n - 1] - a[n - 2]);
+    } else {
+        for i in (1..n).rev() {
+            a[i] += d * (a[i - 1] - a[i]);
+        }
+        // C `:1455`, mirror image: a[1] here has already been updated.
+        a[0] += d * (a[0] - a[1]);
+    }
 }
 
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {

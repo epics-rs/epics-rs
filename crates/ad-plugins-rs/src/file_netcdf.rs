@@ -94,6 +94,13 @@ fn attr_data_type_string(value: &NDAttrValue) -> &'static str {
 pub struct NetcdfWriter {
     current_path: Option<PathBuf>,
     frames: Vec<FrameData>,
+    /// C's `openMode & NDFileModeMultiple` (NDFileNetCDF.cpp:118) — the sole
+    /// input to the numArrays dimension. NDPluginFile passes the Multiple bit
+    /// for Capture and Stream and withholds it for Single (NDPluginFile.cpp:245,
+    /// :281, :335), so it is fixed when the file is opened and cannot be
+    /// re-derived later from how many frames happened to arrive: a Capture file
+    /// that captured exactly one frame is still NC_UNLIMITED.
+    open_multiple: bool,
 }
 
 impl NetcdfWriter {
@@ -101,6 +108,7 @@ impl NetcdfWriter {
         Self {
             current_path: None,
             frames: Vec::new(),
+            open_multiple: false,
         }
     }
 }
@@ -469,9 +477,14 @@ fn define_data_set(
 }
 
 impl NDFileWriter for NetcdfWriter {
-    fn open_file(&mut self, path: &Path, _mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
         self.current_path = Some(path.to_path_buf());
         self.frames.clear();
+        // C: NDPluginFile opens Single with `NDFileModeWrite` and Capture/Stream
+        // with `NDFileModeWrite | NDFileModeMultiple` (NDPluginFile.cpp:245, :281,
+        // :335) — this writer reports supportsMultipleArrays, so those two modes
+        // always carry the Multiple bit.
+        self.open_multiple = mode != NDFileMode::Single;
         Ok(())
     }
 
@@ -534,7 +547,9 @@ impl NDFileWriter for NetcdfWriter {
         };
 
         let first = &self.frames[0];
-        let multi = self.frames.len() > 1;
+        // C keys the numArrays dimension on the *open mode*, never on how many
+        // frames the file ended up holding (NDFileNetCDF.cpp:117-119).
+        let multi = self.open_multiple;
         let (ds, attr_var_names) = define_data_set(first, self.frames.len(), multi)?;
 
         // Write
@@ -943,6 +958,68 @@ mod tests {
             panic!("expected U8 data");
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_num_arrays_dim_keyed_on_open_mode_not_frame_count() {
+        // R8-73. C picks the numArrays dimension from the open mode alone —
+        // `if (openMode & NDFileModeMultiple) dim0 = NC_UNLIMITED`
+        // (NDFileNetCDF.cpp:117-119) — and NDPluginFile passes that bit for
+        // Capture and Stream but not Single (NDPluginFile.cpp:245, :281, :335).
+        // A Capture/Stream file that ends up holding exactly ONE frame is
+        // therefore still NC_UNLIMITED; deriving it from `frames.len() > 1` made
+        // it a fixed dim of 1, a header divergence.
+        let frame = || NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        let num_arrays_is_unlimited = |path: &PathBuf| -> bool {
+            let reader = FileReader::open(path).unwrap();
+            reader
+                .data_set()
+                .get_dim(DIM_UNLIMITED)
+                .expect("numArrays dimension")
+                .is_unlimited()
+        };
+
+        // One frame, Capture mode → NC_UNLIMITED (this is the R8-73 case).
+        let path = temp_path("nc_mode_capture_one");
+        let mut writer = NetcdfWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Capture, &frame())
+            .unwrap();
+        writer.write_file(&frame()).unwrap();
+        writer.close_file().unwrap();
+        assert!(
+            num_arrays_is_unlimited(&path),
+            "Capture with 1 frame must still be NC_UNLIMITED"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // One frame, Stream mode → NC_UNLIMITED.
+        let path = temp_path("nc_mode_stream_one");
+        let mut writer = NetcdfWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Stream, &frame())
+            .unwrap();
+        writer.write_file(&frame()).unwrap();
+        writer.close_file().unwrap();
+        assert!(
+            num_arrays_is_unlimited(&path),
+            "Stream with 1 frame must still be NC_UNLIMITED"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // One frame, Single mode → fixed dim of 1 (C's `dim0 = 1`).
+        let path = temp_path("nc_mode_single_one");
+        let mut writer = NetcdfWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Single, &frame())
+            .unwrap();
+        writer.write_file(&frame()).unwrap();
+        writer.close_file().unwrap();
+        assert!(
+            !num_arrays_is_unlimited(&path),
+            "Single must be a fixed numArrays dimension"
+        );
         std::fs::remove_file(&path).ok();
     }
 

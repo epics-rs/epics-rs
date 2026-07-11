@@ -1164,6 +1164,39 @@ fn test_tweak_forward() {
 }
 
 #[test]
+fn test_tweak_folds_val_with_the_user_direction_hard_limit_active() {
+    // C motorRecord.cc:2167-2181: the tweak fold is unconditional — `val += twv
+    // * dir` with no hls/lls test — so a TWF struck against the active high
+    // limit still lands in VAL (and DVAL), exactly like the direct VAL write it
+    // is shorthand for. The port gated the fold on the hard limit and consumed
+    // the button silently, leaving VAL at its old value.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.ctrl.twv = 5.0;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.limits.hls = true; // + direction switch active; soft target still legal
+
+    rec.ctrl.twf = true;
+    let _ = rec.plan_motion(CommandSource::Twf);
+
+    assert_eq!(
+        rec.pos.val, 15.0,
+        "C folds VAL regardless of the limit switch"
+    );
+    assert_eq!(rec.pos.dval, 15.0, "the fold cascades VAL -> DVAL");
+    assert!(!rec.ctrl.twf, "the button releases either way");
+
+    // Reverse tweak away from the struck high limit is unaffected.
+    rec.ctrl.twr = true;
+    let _ = rec.plan_motion(CommandSource::Twr);
+    assert_eq!(rec.pos.val, 10.0);
+}
+
+#[test]
 fn test_tweak_in_set_mode_redefines_coordinates_without_moving() {
     // C: a tweak that changes VAL in SET mode redefines coordinates (the
     // VAL-change path), it does not move the motor.

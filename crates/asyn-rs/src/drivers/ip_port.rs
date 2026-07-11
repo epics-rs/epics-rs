@@ -112,7 +112,7 @@ impl IpPortConfig {
         }
 
         // Parse protocol suffix (case-insensitive)
-        let (addr_part, proto) = parse_protocol_suffix(spec);
+        let (addr_part, proto) = split_protocol(spec)?;
         let addr_part = addr_part.trim();
 
         // Parse host:port[:localPort], supporting IPv6 brackets
@@ -129,29 +129,70 @@ impl IpPortConfig {
     }
 }
 
-/// Parse the protocol suffix from the end of a spec string.
-/// Returns (remaining_addr_part, protocol).
+/// Split the trailing protocol token off the address part.
+/// Returns `(addr_part, protocol)`.
 ///
-/// Order matters: longest suffix first ("UDP*&" before "UDP*"
-/// before "UDP", and "TCP&" before "TCP") because we use
-/// `ends_with` and the first match wins.
-fn parse_protocol_suffix(spec: &str) -> (&str, IpProtocol) {
-    let upper = spec.to_ascii_uppercase();
+/// C `drvAsynIPPort.c:348-350`: the protocol begins at the first blank
+/// (`strchr(cp, ' ')`) and `sscanf(blank+1, "%5s", protocol)` takes the first
+/// whitespace-delimited run, truncated to five characters (`char protocol[6]`);
+/// whatever follows that run is ignored. With no blank at all, `protocol[0]` is
+/// `'\0'` and C defaults to `SOCK_STREAM` (:355-357).
+///
+/// The token is then classified *exhaustively* — see [`protocol_from_token`].
+/// A whitelist of recognized suffixes is not enough: an unrecognized token has
+/// to be rejected as a protocol, not silently left glued to the port number.
+fn split_protocol(spec: &str) -> AsynResult<(&str, IpProtocol)> {
+    let Some(blank) = spec.find(' ') else {
+        return Ok((spec, IpProtocol::Tcp));
+    };
+    let (addr_part, rest) = spec.split_at(blank);
+    let token: String = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(5)
+        .collect();
+    Ok((addr_part, protocol_from_token(&token)?))
+}
 
-    for (suffix, proto) in [
-        (" UDP*&", IpProtocol::UdpBroadcastReusePort),
-        (" UDP&", IpProtocol::UdpReusePort),
-        (" UDP*", IpProtocol::UdpBroadcast),
-        (" TCP&", IpProtocol::TcpReusePort),
-        (" HTTP", IpProtocol::Http),
-        (" TCP", IpProtocol::Tcp),
-        (" UDP", IpProtocol::Udp),
-    ] {
-        if upper.ends_with(suffix) {
-            return (&spec[..spec.len() - suffix.len()], proto);
-        }
+/// Classify one protocol token, C `drvAsynIPPort.c:355-390` (`epicsStrCaseCmp`,
+/// so case-insensitive). Every token C accepts maps to a variant; every token C
+/// rejects is rejected here with C's message.
+fn protocol_from_token(token: &str) -> AsynResult<IpProtocol> {
+    match token.to_ascii_lowercase().as_str() {
+        "" | "tcp" => Ok(IpProtocol::Tcp),
+        "tcp&" => Ok(IpProtocol::TcpReusePort),
+        "http" => Ok(IpProtocol::Http),
+        "udp" => Ok(IpProtocol::Udp),
+        "udp&" => Ok(IpProtocol::UdpReusePort),
+        "udp*" => Ok(IpProtocol::UdpBroadcast),
+        "udp*&" => Ok(IpProtocol::UdpBroadcastReusePort),
+        // C (:364-367) accepts `com`, sets `isCom`, and on that basis installs
+        // `asynInterposeCOM` (:1061) — the 856-line RFC 2217 telnet
+        // COM-port-option negotiator (`asynInterposeCom.c`) that carries
+        // baud/parity/stop-bits/flow-control to a terminal server and decodes
+        // its modem/line-state notifications. asyn-rs has not ported that layer.
+        //
+        // Connecting `host:port COM` as a plain TCP stream would be wrong on the
+        // wire in both directions: the device never receives its serial-line
+        // negotiation, and the server's IAC/subnegotiation bytes would be
+        // delivered to the record as device data. So the configuration is
+        // refused outright rather than silently degraded — an IOC that asked for
+        // COM must not come up talking raw TCP.
+        "com" => Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "COM interpose not supported: 'host:port COM' requires the RFC 2217 \
+                      asynInterposeCOM layer, which asyn-rs has not ported"
+                .into(),
+        }),
+        // C prints the token as `sscanf` read it — original case, truncated to
+        // five characters (:389).
+        _ => Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("Unknown protocol \"{token}\"."),
+        }),
     }
-    (spec, IpProtocol::Tcp)
 }
 
 /// Parse `host:port[:localPort]` with IPv6 bracket support.
@@ -237,25 +278,35 @@ enum IpIoInner {
 }
 
 /// Write all data with retry on WouldBlock/Interrupted, enforcing a deadline.
+/// Write `data` to the stream, retrying short writes until the deadline.
+///
+/// Returns the bytes the peer accepted. C parity
+/// (`drvAsynIPPort.c::writeRaw`, like `drvAsynSerialPort.c:849`): a write that
+/// stalls part-way reports `*nbytesTransfered` **together with** its
+/// `asynTimeout`/`asynError` status, so a failure here carries the accepted
+/// count in [`AsynError::with_partial_write`] rather than dropping it — that
+/// count is what `asynRecord` publishes as NAWT (asynRecord.c:1547).
 fn write_with_retry(
     stream: &mut impl Write,
     data: &[u8],
     deadline: std::time::Instant,
-) -> AsynResult<()> {
+) -> AsynResult<usize> {
     let mut offset = 0;
     while offset < data.len() {
         if std::time::Instant::now() > deadline {
             return Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "write timeout".into(),
-            });
+            }
+            .with_partial_write(offset));
         }
         match stream.write(&data[offset..]) {
             Ok(0) => {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "write returned 0 bytes".into(),
-                });
+                }
+                .with_partial_write(offset));
             }
             Ok(n) => offset += n,
             Err(ref e)
@@ -264,10 +315,10 @@ fn write_with_retry(
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => return Err(AsynError::Io(e)),
+            Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
         }
     }
-    Ok(())
+    Ok(offset)
 }
 
 struct IpIoState {
@@ -391,24 +442,28 @@ impl OctetNext for IpIoState {
         // through. socket_poll_timeout is a no-op for any positive timeout, so
         // this only affects the `timeout == 0` case.
         let deadline = std::time::Instant::now() + socket_poll_timeout(user.timeout);
+        // C writeRaw reports what the socket took (`*nbytesTransfered`) on
+        // success and on failure alike; return the real count rather than
+        // assuming the whole buffer went out.
         match inner {
             IpIoInner::Tcp(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)?;
+                write_with_retry(stream, data, deadline)
             }
             IpIoInner::Udp(socket, peer) => {
                 socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
-                // remote on the unconnected socket.
-                socket.send_to(data, *peer)?;
+                // remote on the unconnected socket. A datagram is all-or-
+                // nothing, so a failed sendto transferred zero bytes and needs
+                // no partial-write carrier.
+                Ok(socket.send_to(data, *peer)?)
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)?;
+                write_with_retry(stream, data, deadline)
             }
         }
-        Ok(data.len())
     }
 
     /// Base-layer flush — C parity with `drvAsynIPPort.c::flushIt`,
@@ -541,20 +596,6 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
     } else {
         AsynError::Io(e)
     }
-}
-
-/// A transport error meaning the socket is broken and the connection must
-/// be torn down (vs a timeout / would-block, which leaves it intact). C
-/// parity: `drvAsynIPPort.c` calls `closeConnection` on any real
-/// `recv`/`send` error but returns `asynTimeout` with the socket intact on
-/// a poll/timeout expiry.
-fn is_fatal_transport_error(e: &AsynError) -> bool {
-    // Classify by the carried status, not by the variant: a read that timed
-    // out or dropped *after* delivering partial bytes arrives as
-    // `AsynError::PartialRead` (C `asynInterposeEos.c:242-253` returns the
-    // status together with the bytes), and a variant match would have read
-    // that as non-fatal and left a dead socket reporting `connected`.
-    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
 }
 
 /// Map an `AsynUser` timeout to the socket-level receive/send timeout,
@@ -691,7 +732,7 @@ impl DrvAsynIPPort {
                 let should_disconnect = (self.disconnect_on_read_timeout
                     && is_timeout
                     && user.timeout > Duration::ZERO)
-                    || is_fatal_transport_error(&e);
+                    || e.is_fatal_transport();
                 if should_disconnect && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
@@ -1059,7 +1100,7 @@ impl PortDriver for DrvAsynIPPort {
                 // fatal error; without the symmetric write-side teardown a
                 // wedged socket reports `connected` forever and never
                 // self-heals.
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -1477,17 +1518,27 @@ mod tests {
         // DRV-5/DRV-31 family: a broken-socket error tears the connection
         // down; a timeout leaves it intact (the actor reconnects on the
         // next request only when `connected` flips to false).
-        assert!(is_fatal_transport_error(&AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "EOF".into(),
-        }));
-        assert!(is_fatal_transport_error(&AsynError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst")
-        )));
-        assert!(!is_fatal_transport_error(&AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }));
+        assert!(
+            AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "EOF".into(),
+            }
+            .is_fatal_transport()
+        );
+        assert!(
+            AsynError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "rst"
+            ))
+            .is_fatal_transport()
+        );
+        assert!(
+            !AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }
+            .is_fatal_transport()
+        );
     }
 
     #[test]
@@ -1924,14 +1975,14 @@ mod tests {
                 other => panic!("{kind:?} must map to a non-fatal Timeout, got {other:?}"),
             }
             assert!(
-                !is_fatal_transport_error(&classify_read_error(Error::from(kind))),
+                !classify_read_error(Error::from(kind)).is_fatal_transport(),
                 "{kind:?} must not be a fatal transport error"
             );
         }
         // A genuine transport failure stays fatal (Io) → teardown.
         let reset = classify_read_error(Error::from(ErrorKind::ConnectionReset));
         assert!(matches!(reset, AsynError::Io(_)));
-        assert!(is_fatal_transport_error(&reset));
+        assert!(reset.is_fatal_transport());
     }
 
     #[test]
@@ -2266,6 +2317,55 @@ mod tests {
             IpPortConfig::parse("h:1 Udp*&").unwrap().protocol,
             IpProtocol::UdpBroadcastReusePort
         );
+    }
+
+    /// R8-50: `host:port COM` is a protocol C accepts (drvAsynIPPort.c:364-367
+    /// sets `isCom`, :1061 installs `asynInterposeCOM`). asyn-rs has not ported
+    /// the RFC 2217 layer, and the suffix whitelist used to leave the token
+    /// glued to the port number — so the IOC got "invalid port number: '5000
+    /// COM'", a message that names the wrong thing. Refuse the configuration
+    /// with the real reason instead. Connecting as plain TCP is not an option:
+    /// C negotiates the serial line over the wire, so a raw stream is a
+    /// different conversation with the terminal server.
+    #[test]
+    fn com_protocol_is_refused_by_name_not_misreported_as_a_bad_port() {
+        for spec in ["1.2.3.4:5000 COM", "1.2.3.4:5000 com", "host:23 Com"] {
+            let err = IpPortConfig::parse(spec).unwrap_err();
+            let msg = err.message();
+            assert!(
+                msg.contains("COM interpose not supported"),
+                "{spec}: expected the COM diagnostic, got {msg:?}"
+            );
+            assert!(
+                !msg.contains("invalid port"),
+                "{spec}: must not blame the port number, got {msg:?}"
+            );
+        }
+    }
+
+    /// R8-50: the token classification is exhaustive, so an unknown protocol is
+    /// C's `Unknown protocol "%s".` (drvAsynIPPort.c:389) rather than a
+    /// port-number complaint — and it is never silently accepted as TCP.
+    #[test]
+    fn unknown_protocol_token_is_rejected_by_name() {
+        let err = IpPortConfig::parse("1.2.3.4:5000 SCTP").unwrap_err();
+        assert_eq!(err.message(), "Unknown protocol \"SCTP\".");
+        // C's `%5s` into `char protocol[6]` truncates the token to five
+        // characters before the comparison, and the message prints what it
+        // matched against.
+        let err = IpPortConfig::parse("1.2.3.4:5000 tcpsocket").unwrap_err();
+        assert_eq!(err.message(), "Unknown protocol \"tcpso\".");
+    }
+
+    /// R8-50: C reads exactly one token (`sscanf(blank+1, "%5s", protocol)`) and
+    /// ignores whatever follows it, so a spec with trailing words still selects
+    /// the first protocol rather than failing on the address.
+    #[test]
+    fn only_the_first_token_after_the_blank_is_the_protocol() {
+        let cfg = IpPortConfig::parse("1.2.3.4:5000 UDP extra junk").unwrap();
+        assert_eq!(cfg.host, "1.2.3.4");
+        assert_eq!(cfg.port, 5000);
+        assert_eq!(cfg.protocol, IpProtocol::Udp);
     }
 
     // --- Unix socket integration test ---

@@ -142,6 +142,12 @@ pub enum PortCommand {
     SetOutputEos {
         eos: Vec<u8>,
     },
+    /// Query whether the port's transport is connected — C
+    /// `pasynManager->isConnected`. Appended last: the variant order is the
+    /// wire encoding.
+    GetConnected,
+    /// Install the echo interpose — C `asynInterposeEcho(portName, addr)`.
+    PushEchoInterpose,
 }
 
 #[cfg(test)]
@@ -206,6 +212,8 @@ mod tests {
                 key: "baud".into(),
                 value: "9600".into(),
             },
+            PortCommand::GetConnected,
+            PortCommand::PushEchoInterpose,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

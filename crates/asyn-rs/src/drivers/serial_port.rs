@@ -358,73 +358,80 @@ impl OctetNext for SerialIoState {
         // a slowly-draining peer could keep a multi-chunk write alive for up to
         // timeout x iterations.
         let deadline = Instant::now() + user.timeout;
-        let result = (|| -> AsynResult<usize> {
-            let mut total = 0usize;
-            while total < data.len() {
-                let poll_ms =
-                    duration_to_poll_ms(deadline.saturating_duration_since(Instant::now()));
-                let mut pfd = libc::pollfd {
-                    fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-
-                let ret = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
-                if ret < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(AsynError::Io(err));
-                }
-                if ret == 0 {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        message: "serial write timeout".into(),
-                    });
-                }
-
-                let n = unsafe {
-                    libc::write(
-                        fd,
-                        data[total..].as_ptr() as *const libc::c_void,
-                        data.len() - total,
-                    )
-                };
-                if n < 0 {
-                    // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted
-                        || err.kind() == std::io::ErrorKind::WouldBlock
-                    {
-                        continue;
-                    }
-                    return Err(AsynError::Io(err));
-                }
-                total += n as usize;
-                self.n_written += n as u64; // C parity: tty->nWritten += thisWrite
-
-                // C parity (drvAsynSerialPort.c:827): after each write, if the
-                // total deadline has passed stop with asynTimeout even though
-                // some bytes went out. A non-blocking poll that finds free space
-                // (e.g. a slow peer that drains a little each gap) would
-                // otherwise let the write keep going past the deadline, since
-                // `poll(0)` returns POLLOUT instead of timing out. (timeout==0
-                // collapses to a single write attempt then bail, matching
-                // writeIt's `writeTimeout==0`.)
-                if total < data.len() && Instant::now() >= deadline {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        message: "serial write timeout".into(),
-                    });
-                }
+        // C parity (drvAsynSerialPort.c:849): `*nbytesTransfered = numchars -
+        // nleft` runs on the way out of the loop for *every* break — timeout
+        // and fatal errno alike — so the caller always learns how much of its
+        // message the device took. `total` therefore lives outside the loop
+        // and rides out on the error via `with_partial_write`.
+        let mut total = 0usize;
+        let result: AsynResult<()> = loop {
+            if total >= data.len() {
+                break Ok(());
             }
-            Ok(total)
-        })();
+            let poll_ms = duration_to_poll_ms(deadline.saturating_duration_since(Instant::now()));
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+
+            let ret = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break Err(AsynError::Io(err));
+            }
+            if ret == 0 {
+                break Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "serial write timeout".into(),
+                });
+            }
+
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    data[total..].as_ptr() as *const libc::c_void,
+                    data.len() - total,
+                )
+            };
+            if n < 0 {
+                // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    continue;
+                }
+                break Err(AsynError::Io(err));
+            }
+            total += n as usize;
+            self.n_written += n as u64; // C parity: tty->nWritten += thisWrite
+
+            // C parity (drvAsynSerialPort.c:827): after each write, if the
+            // total deadline has passed stop with asynTimeout even though
+            // some bytes went out. A non-blocking poll that finds free space
+            // (e.g. a slow peer that drains a little each gap) would
+            // otherwise let the write keep going past the deadline, since
+            // `poll(0)` returns POLLOUT instead of timing out. (timeout==0
+            // collapses to a single write attempt then bail, matching
+            // writeIt's `writeTimeout==0`.)
+            if total < data.len() && Instant::now() >= deadline {
+                break Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "serial write timeout".into(),
+                });
+            }
+        };
 
         // Restore blocking mode on every exit path (success, timeout, error).
         unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags) };
-        result
+        match result {
+            Ok(()) => Ok(total),
+            Err(e) => Err(e.with_partial_write(total)),
+        }
     }
 
     fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
@@ -516,24 +523,6 @@ fn seed_termios(config: &SerialConfig) -> AsynResult<libc::termios> {
     t.c_cc[libc::VSTOP] = 0x13; // ^S
     config.apply_to_termios(&mut t)?;
     Ok(t)
-}
-
-/// A transport error meaning the serial line is broken and the connection
-/// must be torn down (vs a timeout, which leaves it open). C parity:
-/// `drvAsynSerialPort.c` calls `closeConnection` on a real read/write error
-/// or EOF but returns `asynTimeout` with the fd intact on a poll timeout.
-/// Mirrors the same predicate in `ip_port.rs` (both transports share the
-/// `closeConnection`-on-fatal-error contract).
-///
-/// Classify by the carried status, not by the variant: reads and writes are
-/// dispatched through the interpose chain, and `configure` installs the EOS
-/// interpose by default, which wraps a lower-layer failure — including the
-/// hangup this predicate exists to catch — as `AsynError::PartialRead`
-/// (eos.rs:199-207, mirroring C `asynInterposeEos.c:242-253`, which returns
-/// the lower-layer status unchanged). A variant match reads such a hangup as
-/// non-fatal and leaves a dead fd reporting `connected`.
-fn is_fatal_transport_error(e: &AsynError) -> bool {
-    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
 }
 
 impl DrvAsynSerialPort {
@@ -832,7 +821,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // read error / EOF so the actor's auto-reconnect re-opens the
                 // device. EINTR/EAGAIN are already retried inside
                 // SerialIoState::read, so an error reaching here is fatal.
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -873,7 +862,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // C parity: closeConnection on a fatal write error so the
                 // next request reconnects (symmetric with read; matches
                 // ip_port DRV-5).
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -1970,7 +1959,7 @@ mod tests {
         let mut buf = [0u8; 32];
         let err = drv.read_octet(&user, &mut buf).unwrap_err();
         assert!(
-            is_fatal_transport_error(&err),
+            err.is_fatal_transport(),
             "expected a fatal transport error, got {err:?}"
         );
         assert!(
@@ -2005,7 +1994,7 @@ mod tests {
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let err = drv.write_octet(&mut user, b"hello world").unwrap_err();
         assert!(
-            is_fatal_transport_error(&err),
+            err.is_fatal_transport(),
             "expected a fatal transport error, got {err:?}"
         );
         assert!(
@@ -2034,7 +2023,7 @@ mod tests {
             eom_reason: EomReason::empty(),
         });
         assert!(
-            is_fatal_transport_error(&wrapped_hangup),
+            wrapped_hangup.is_fatal_transport(),
             "a hangup wrapped by the EOS interpose is still fatal"
         );
 
@@ -2049,8 +2038,27 @@ mod tests {
             eom_reason: EomReason::empty(),
         });
         assert!(
-            !is_fatal_transport_error(&wrapped_timeout),
+            !wrapped_timeout.is_fatal_transport(),
             "a partial-line timeout leaves the fd intact (C returns asynTimeout)"
+        );
+
+        // R8-48 boundary — the case the status-only rule still missed: a real
+        // errno (`Io`, not a status variant) is what a mid-line hangup actually
+        // looks like, and the carrier used to flatten it to a bare
+        // status=Error. Both partial carriers must let the errno through.
+        let wrapped_errno =
+            AsynError::Io(std::io::Error::other("EIO")).with_partial_read(PartialOctetRead {
+                data: b"AB".to_vec(),
+                eom_reason: EomReason::empty(),
+            });
+        assert!(
+            wrapped_errno.is_fatal_transport(),
+            "an errno behind the read carrier is still fatal"
+        );
+        let half_written = AsynError::Io(std::io::Error::other("EIO")).with_partial_write(2);
+        assert!(
+            half_written.is_fatal_transport(),
+            "an errno behind the write carrier is still fatal"
         );
     }
 
@@ -2597,13 +2605,25 @@ mod tests {
         drv.disconnect(&AsynUser::default()).ok();
         let _ = reader.join();
 
-        match res {
-            Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                ..
-            }) => {}
+        let err = match res {
+            Err(e) => e,
             other => panic!("expected total-deadline Timeout, got {other:?}"),
-        }
+        };
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        // R8-48: C `writeIt` publishes `*nbytesTransfered = numchars - nleft`
+        // on the timeout break (drvAsynSerialPort.c:849) — the bytes the port
+        // already took ride out *with* the timeout instead of being dropped.
+        // This write drained part of the payload into the pty before the
+        // deadline, so the count must be a real partial: neither 0 nor the
+        // whole payload.
+        let sent = err
+            .partial_write()
+            .expect("a timed-out serial write must report what it transferred");
+        assert!(
+            sent > 0 && sent < payload.len(),
+            "expected a partial count in 1..{}, got {sent}",
+            payload.len()
+        );
         assert!(
             elapsed < Duration::from_millis(900),
             "total write time must be bounded by ~the timeout, took {elapsed:?}"

@@ -132,6 +132,15 @@ const ASYN_FMT_HYBRID: i32 = 1;
 /// suppresses escape translation (`asynRecord.c:1496-1502`).
 const ASYN_FMT_BINARY: i32 = 2;
 
+/// Capacity of the `AINP` input string, in bytes — `sizeof(pasynRec->ainp)`.
+/// `AINP` is a `DBF_STRING` (`asynRecord.dbd:261`), i.e. EPICS
+/// `MAX_STRING_SIZE` = 40 including the NUL terminator. C `performOctetIO`
+/// sizes the ASCII read by exactly this (`asynRecord.c:1505-1506`
+/// `inlen = sizeof(pasynRec->ainp)`) and keys the ASCII overflow on it
+/// (`:1602-1608`), independent of `IMAX` — only Hybrid and Binary read into the
+/// `IMAX`-sized `BINP` buffer.
+const AINP_SIZE: usize = 40;
+
 /// Decode a C-style backslash-escaped string into the raw bytes the
 /// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
 /// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
@@ -504,12 +513,14 @@ struct IoPlan {
     f64out: f64,
     // Read inputs.
     octet_buf_size: usize,
-    // Full input-buffer capacity (IMAX). `octet_buf_size` is the per-request
-    // read length (`min(NRRD, IMAX)` or IMAX); overflow is keyed on the full
-    // capacity so an NRRD-limited short read never reads as overflow — C
-    // `performOctetIO` checks `nbytes >= inlen` where `inlen == sizeof(ainp)`
-    // / IMAX, independent of NRRD (asynRecord.c:1602/1609).
-    imax: usize,
+    // C `performOctetIO`'s `inlen` (asynRecord.c:1503-1511): the capacity of the
+    // IFMT-selected input buffer — `sizeof(ainp)` (= AINP_SIZE) for ASCII, IMAX
+    // for Hybrid/Binary, which read into BINP. It is both the default read
+    // length and the overflow threshold (`:1602-1620`); `octet_buf_size` is the
+    // per-request read length (`min(NRRD, inlen)` or `inlen`), so an
+    // NRRD-limited short read can never reach `in_len` and never reads as
+    // overflow — the same reason C's check is independent of NRRD.
+    in_len: usize,
     ifmt: i32,
 }
 
@@ -571,6 +582,50 @@ fn flush_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason).with_addr(plan.addr)
 }
 
+/// One phase of a `performIO` cycle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IoPhase {
+    Flush,
+    Write,
+    Read,
+}
+
+/// The phases one `performIO` cycle runs, in C's execution order — the single
+/// owner of "which phases, and when" for both the synchronous
+/// [`AsynRecord::perform_io`] and the off-thread [`run_io_plan`], so the two
+/// cannot drift apart.
+///
+/// C `performOctetIO` (asynRecord.c:1518-1558):
+///
+/// 1. **Flush, before the write**, for `TMOD == Flush` *and* `TMOD ==
+///    Write_Read` (`:1518-1520`). Write/Read is the default TMOD, and this is
+///    the whole point of the flush: drop bytes left in the driver from a
+///    previous transaction so they cannot be prepended to the fresh response.
+///    Running it after the read — or only for `TMOD == Flush` — leaves exactly
+///    the stale-byte framing error the flush exists to prevent.
+/// 2. Write, for `Write` / `Write_Read` (`:1524`).
+/// 3. Read, for `Read` / `Write_Read` (`:1557`).
+///
+/// The flush is octet-only: it lives inside `performOctetIO`, and the register
+/// handlers (`performInt32IO` :1370-1395, `performUInt32DigitalIO` :1405-1433,
+/// `performFloat64IO` :1442-1467) have no flush branch — a `TMOD=Flush` cycle on
+/// a register interface does nothing in C.
+fn io_phases(plan: &IoPlan) -> Vec<IoPhase> {
+    let mut phases = Vec::with_capacity(3);
+    if plan.iface == InterfaceType::Octet
+        && matches!(plan.tmod, TransferMode::Flush | TransferMode::WriteRead)
+    {
+        phases.push(IoPhase::Flush);
+    }
+    if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
+        phases.push(IoPhase::Write);
+    }
+    if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
+        phases.push(IoPhase::Read);
+    }
+    phases
+}
+
 /// Build the write-phase `RequestOp` for an interface. C `performOctetIO`
 /// (asynRecord.c:1528-1546) suppresses the driver's output EOS for a binary
 /// write; `OctetWriteBinary` brackets that save/clear/restore in the actor.
@@ -624,29 +679,42 @@ fn io_read_op(plan: &IoPlan) -> RequestOp {
 /// branch (asynRecord.c:1524-1556 octet, :1442-1453 register). A write
 /// failure reports `ERRS` but, like C, does not skip the read phase.
 fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
-    match res {
-        Ok(_) => {
-            if plan.iface == InterfaceType::Octet {
-                out.nawt = Some(plan.octet_out_len as i32);
-            }
-        }
-        Err(e) => {
+    if plan.iface != InterfaceType::Octet {
+        // C performInt32IO/performUInt32DigitalIO/performFloat64IO write error
+        // -> reportError + recGblSetSevr(WRITE_ALARM, MAJOR)
+        // (asynRecord.c:1377-1381 / 1413-1417 / 1449-1453). These handlers have
+        // no byte count, so they never touch NAWT.
+        if let Err(e) = res {
             out.errs = Some(format!("write: {e}"));
-            if plan.iface == InterfaceType::Octet {
-                // C performOctetIO assigns `nawt = nbytesTransfered`
-                // unconditionally (asynRecord.c:1547) — before the error check
-                // at :1551. A failed write moved no bytes, so land NAWT=0
-                // rather than leaving the prior write's count. The octet write
-                // branch (:1551-1555) raises NO record severity — only a
-                // reportError — so unlike register writes it sets no alarm.
-                out.nawt = Some(0);
-            } else {
-                // C performInt32IO/performUInt32DigitalIO/performFloat64IO
-                // write error -> recGblSetSevr(WRITE_ALARM, MAJOR)
-                // (asynRecord.c:1380/1416/1452).
-                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
-            }
+            raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
         }
+        return;
+    }
+
+    // C performOctetIO write branch (asynRecord.c:1524-1556). `nbytesTransfered`
+    // is what the *device* took: C seeds it to 0 (:1526), the octet chain writes
+    // it out on success and on failure alike, and the record commits it —
+    // `nawt = nbytesTransfered` (:1547) runs *before* the status test at :1551.
+    // So both arms report a real count: the reply's `nbytes` on success, and the
+    // failure's `PartialWrite` carrier on error (absent => the layer moved
+    // nothing, which is exactly C's untouched seed of 0).
+    let (nawt, err) = match res {
+        Ok(result) => (result.nbytes, None),
+        Err(e) => (e.partial_write().unwrap_or(0), Some(e)),
+    };
+    out.nawt = Some(nawt as i32);
+
+    // C :1551-1555 — "Something is wrong if we couldn't write everything": the
+    // diagnostic fires on a failing status *or* a short write that reported
+    // success, and lands in ERRS via reportError (:2028-2048). The octet write
+    // branch raises NO record severity — only the message — so unlike the
+    // register writes above it sets no alarm.
+    if err.is_some() || nawt != plan.octet_out_len {
+        let detail = match &err {
+            Some(e) => e.to_string(),
+            None => format!("wrote {} of {} chars", nawt, plan.octet_out_len),
+        };
+        out.errs = Some(format!("Write error, nout={nawt}, {detail}"));
     }
 }
 
@@ -687,23 +755,22 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
 
             out.eomr = Some(eom as i32);
             // NORD is the raw transfer count (C `nord = nbytesTransfered`,
-            // asynRecord.c:1627) — independent of the AINP overflow
+            // asynRecord.c:1627) — independent of the overflow
             // NUL-truncation below and of UTF-8-lossy expansion.
             out.nord = Some(data.len() as i32);
-            // C performOctetIO flags an ASCII/Hybrid read that filled
-            // the whole input buffer with no terminator as a MINOR
-            // READ alarm and NUL-truncates the buffer
-            // (asynRecord.c:1602-1615). The buffer-full-without-EOS
-            // condition is exactly asyn's `ASYN_EOM_CNT` set with
-            // neither END nor EOS; pairing it with `len >= IMAX` keeps
-            // an NRRD-limited short read from reading as overflow.
-            // Binary uses `>` (C says "should not happen") so it never
-            // flags — restrict to ASCII/Hybrid.
-            let overflow = plan.ifmt != ASYN_FMT_BINARY
-                && plan.imax > 0
-                && data.len() >= plan.imax
-                && (eom & EomReason::CNT.bits()) != 0
-                && (eom & (EomReason::END.bits() | EomReason::EOS.bits())) == 0;
+            // C performOctetIO's overflow tests (asynRecord.c:1602-1621) are
+            // plain length compares against the IFMT-selected buffer capacity
+            // `inlen`, with no end-of-message condition: a read that filled the
+            // buffer is an overflow even when the driver reported EOS/END. Each
+            // raises a MINOR READ alarm; ASCII and Hybrid also NUL-terminate the
+            // buffer at its last byte. An NRRD-limited read can never reach
+            // `in_len` (it is capped by it), so it cannot false-positive.
+            // Binary compares with `>` ("should not happen") — so it never fires
+            // in practice, since the driver cannot return more than requested.
+            let overflow = match plan.ifmt {
+                ASYN_FMT_BINARY => data.len() > plan.in_len,
+                _ => plan.in_len > 0 && data.len() >= plan.in_len,
+            };
             // C stores the device bytes into the single IFMT-selected
             // field (ASCII -> AINP, Binary/Hybrid -> BINP,
             // asynRecord.c:1503-1509) and posts TINP (escaped) for
@@ -715,12 +782,19 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 // final byte so the string leaves room for the
                 // conceptual terminator.
                 let bytes = if overflow {
-                    &data[..plan.imax - 1]
+                    &data[..plan.in_len - 1]
                 } else {
                     &data[..]
                 };
                 out.ainp = Some(String::from_utf8_lossy(bytes).to_string());
             } else {
+                let mut data = data;
+                // Hybrid overflow: C writes the NUL into the BINP buffer itself
+                // (`inptr[imax - 1] = '\0'`, :1615). Binary is left untouched
+                // (:1616-1621 reports but does not terminate).
+                if overflow && plan.ifmt == ASYN_FMT_HYBRID {
+                    data[plan.in_len - 1] = 0;
+                }
                 out.binp = Some(data);
             }
             if overflow {
@@ -773,7 +847,28 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
     }
 }
 
-/// Run `performIO`'s write/read/flush phases off the scan thread against the
+/// Record one phase's result into the outcome — the phase→recorder mapping,
+/// shared by the synchronous and off-thread runners so a phase cannot be handled
+/// differently on the two paths. As in C `performIO`, a failed phase reports but
+/// does not skip the phases after it.
+fn record_phase_result(
+    plan: &IoPlan,
+    out: &mut IoOutcome,
+    phase: IoPhase,
+    res: AsynResult<RequestResult>,
+) {
+    match phase {
+        IoPhase::Flush => {
+            if let Err(e) = res {
+                out.errs = Some(format!("flush: {e}"));
+            }
+        }
+        IoPhase::Write => record_write_result(plan, out, res),
+        IoPhase::Read => record_read_result(plan, out, res),
+    }
+}
+
+/// Run `performIO`'s flush/write/read phases off the scan thread against the
 /// port actor, threading the shared `CancelToken` so an `AQR`/`cancelRequest`
 /// (asynManager.c:1630) aborts a still-queued phase. Mirrors the synchronous
 /// [`AsynRecord::perform_io`] phase order; both feed
@@ -790,42 +885,29 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
         return out;
     }
 
-    // Write phase.
-    if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
-        let res = handle
-            .submit_cancellable(io_write_op(&plan), io_user(&plan), cancel.clone())
-            .await;
+    for phase in io_phases(&plan) {
+        let res = match phase {
+            IoPhase::Flush => {
+                handle
+                    .submit_cancellable(RequestOp::Flush, flush_user(&plan), cancel.clone())
+                    .await
+            }
+            IoPhase::Write => {
+                handle
+                    .submit_cancellable(io_write_op(&plan), io_user(&plan), cancel.clone())
+                    .await
+            }
+            IoPhase::Read => {
+                handle
+                    .submit_cancellable(io_read_op(&plan), io_user(&plan), cancel.clone())
+                    .await
+            }
+        };
         if cancel.is_cancelled() {
             out.errs = Some(CANCELED_MSG.to_string());
             return out;
         }
-        record_write_result(&plan, &mut out, res);
-    }
-
-    // Read phase.
-    if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
-        let res = handle
-            .submit_cancellable(io_read_op(&plan), io_user(&plan), cancel.clone())
-            .await;
-        if cancel.is_cancelled() {
-            out.errs = Some(CANCELED_MSG.to_string());
-            return out;
-        }
-        record_read_result(&plan, &mut out, res);
-    }
-
-    // Flush phase.
-    if matches!(plan.tmod, TransferMode::Flush) {
-        let res = handle
-            .submit_cancellable(RequestOp::Flush, flush_user(&plan), cancel.clone())
-            .await;
-        if cancel.is_cancelled() {
-            out.errs = Some(CANCELED_MSG.to_string());
-            return out;
-        }
-        if let Err(e) = res {
-            out.errs = Some(format!("flush: {e}"));
-        }
+        record_phase_result(&plan, &mut out, phase, res);
     }
 
     out
@@ -1776,12 +1858,32 @@ impl AsynRecord {
         }
     }
 
+    /// Refresh CNCT from the port's *transport* state — the single owner of
+    /// that field's value.
+    ///
+    /// C parity: CNCT is a readback, not a latch. `monitorStatus`
+    /// (asynRecord.c:1089-1093) assigns it from `pasynManager->isConnected` on
+    /// every cycle, and `isConnected` fails (→ CNCT=0) when the record is bound
+    /// to no port. It says nothing about whether *this record* found its port —
+    /// that is PCNCT (asynRecord.c:519-527, `connectDevice` /
+    /// `pasynManager->disconnect`). Driving CNCT anywhere else is what gave the
+    /// field two meanings: `connect_device` used to latch `cnct = 1` on a
+    /// successful *attach*, so a registered-but-unconnected port (noAutoConnect,
+    /// or a link that dropped) reported "Connected" on a dead wire.
+    fn refresh_connected_state(&mut self) {
+        let connected = match self.port_entry {
+            Some(ref entry) => entry.handle.is_connected_blocking().unwrap_or(false),
+            None => false,
+        };
+        self.cnct = i32::from(connected);
+    }
+
     /// Attempt to connect to the port specified in the PORT field.
     fn connect_device(&mut self) {
         if self.port.is_empty() {
             self.pcnct = 0;
-            self.cnct = 0;
             self.port_entry = None;
+            self.refresh_connected_state();
             self.clear_trace_exception_callback();
             return;
         }
@@ -1826,20 +1928,23 @@ impl AsynRecord {
                 // Read serial/IP options from driver
                 self.read_options_from_driver(&entry.handle);
 
-                // Mark connected
+                // Attached to the port (C `connectDevice` sets PCNCT=1,
+                // asynRecord.c:1305).
                 self.pcnct = 1;
-                self.cnct = 1;
                 // C asynRecord.c connectDevice queries the port's actual
-                // enable / auto-connect state into ENBL / AUCT — it must
-                // not force them to 1, which would discard a user who
-                // configured ENBL=0 or a port registered noAutoConnect.
-                // Keep the current field value if the query fails.
+                // enable / auto-connect / connect state into ENBL / AUCT /
+                // CNCT — it must not force them to 1, which would discard a
+                // user who configured ENBL=0 or a port registered
+                // noAutoConnect, and would claim a live wire on a port whose
+                // transport is down. Keep the current field value if the query
+                // fails.
                 if let Ok(enabled) = entry.handle.is_enabled_blocking() {
                     self.enbl = i32::from(enabled);
                 }
                 if let Ok(auto) = entry.handle.is_auto_connect_blocking() {
                     self.auct = i32::from(auto);
                 }
+                self.refresh_connected_state();
                 // Only clear errors if drv_user_create succeeded (don't mask the error)
                 if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
                     self.errs.clear();
@@ -1848,8 +1953,8 @@ impl AsynRecord {
             None => {
                 self.errs = format!("port '{}' not found", self.port);
                 self.pcnct = 0;
-                self.cnct = 0;
                 self.port_entry = None;
+                self.refresh_connected_state();
                 self.clear_trace_exception_callback();
             }
         }
@@ -1893,14 +1998,27 @@ impl AsynRecord {
     fn build_io_plan(&self) -> IoPlan {
         let octet_out = self.octet_output_buffer();
         let octet_out_len = octet_out.len();
-        // Clamp against negative IMAX/NRRD — both are settable Long fields;
-        // a negative value sign-extends to a huge usize and would request a
+        // C `performOctetIO` (asynRecord.c:1503-1517): the input buffer is
+        // chosen by IFMT — ASCII reads into the fixed 40-byte AINP string
+        // (`inlen = sizeof(ainp)`), Hybrid and Binary into the IMAX-sized BINP
+        // buffer — and the read length is NRRD clamped to that capacity, or the
+        // whole capacity when NRRD is 0. IMAX must NOT size an ASCII read: with
+        // the default IMAX=80 that would let a terminator-less response consume
+        // 80 bytes with no overflow alarm, where C stops at 40, raises
+        // READ/MINOR and leaves the rest in the driver.
+        //
+        // Clamp against negative IMAX/NRRD — both are settable Long fields; a
+        // negative value sign-extends to a huge usize and would request a
         // multi-GB buffer.
-        let imax = self.imax.max(0) as usize;
-        let octet_buf_size = if self.nrrd > 0 {
-            (self.nrrd as usize).min(imax)
+        let in_len = if self.ifmt == ASYN_FMT_ASCII {
+            AINP_SIZE
         } else {
-            imax
+            self.imax.max(0) as usize
+        };
+        let octet_buf_size = if self.nrrd > 0 {
+            (self.nrrd as usize).min(in_len)
+        } else {
+            in_len
         };
         // C `asynRecord.c` sets `pasynUser->timeout = precord->tmot` before
         // every transfer; a non-positive `tmot` falls back to the 1 s default.
@@ -1923,7 +2041,7 @@ impl AsynRecord {
             ui32mask: self.ui32mask,
             f64out: self.f64out,
             octet_buf_size,
-            imax,
+            in_len,
             ifmt: self.ifmt,
         }
     }
@@ -1989,25 +2107,19 @@ impl AsynRecord {
         let plan = self.build_io_plan();
         let mut out = IoOutcome::default();
 
-        if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
-            let res = entry
-                .handle
-                .submit_blocking(io_write_op(&plan), io_user(&plan));
-            record_write_result(&plan, &mut out, res);
-        }
-        if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
-            let res = entry
-                .handle
-                .submit_blocking(io_read_op(&plan), io_user(&plan));
-            record_read_result(&plan, &mut out, res);
-        }
-        if matches!(plan.tmod, TransferMode::Flush) {
-            if let Err(e) = entry
-                .handle
-                .submit_blocking(RequestOp::Flush, flush_user(&plan))
-            {
-                out.errs = Some(format!("flush: {e}"));
-            }
+        for phase in io_phases(&plan) {
+            let res = match phase {
+                IoPhase::Flush => entry
+                    .handle
+                    .submit_blocking(RequestOp::Flush, flush_user(&plan)),
+                IoPhase::Write => entry
+                    .handle
+                    .submit_blocking(io_write_op(&plan), io_user(&plan)),
+                IoPhase::Read => entry
+                    .handle
+                    .submit_blocking(io_read_op(&plan), io_user(&plan)),
+            };
+            record_phase_result(&plan, &mut out, phase, res);
         }
 
         self.apply_io_outcome(out);
@@ -2600,23 +2712,73 @@ impl Record for AsynRecord {
                 }
             }
 
-            // Connection management
+            // CNCT — connect / disconnect the port's *transport*. C
+            // `asynCallbackSpecial::callbackConnect` (asynRecord.c:537-539,
+            // 857-889): read `pasynManager->isConnected`, and only then call
+            // `pasynCommon->connect` (CNCT=1 on a disconnected port) or
+            // `pasynCommon->disconnect` (CNCT=0 on a connected one). The
+            // isConnected gate is C's, not defensive padding: connecting an
+            // already-connected port is an error in the drivers
+            // (drvAsynIPPort.c `connectIt`: "already connected"), and CNCT is
+            // written by monitorStatus on every cycle, so a re-put of the value
+            // the record just read back must not re-drive the wire.
+            //
+            // This is NOT the record↔port attachment — that is PCNCT below.
+            // CNCT used to be a duplicate of it (attach on 1, detach on 0),
+            // which left the driver's transport untouched: a CNCT=0 put
+            // orphaned the record while the socket stayed open, and CNCT=1
+            // could not bring a dropped link back up.
             "CNCT" => {
-                if self.cnct != 0 {
-                    self.connect_device();
-                } else {
-                    self.pcnct = 0;
-                    self.port_entry = None;
-                    self.clear_trace_exception_callback();
+                let want = self.cnct != 0;
+                match self.port_entry {
+                    Some(ref entry) => {
+                        let handle = entry.handle.clone();
+                        match handle.is_connected_blocking() {
+                            Ok(is_connected) => {
+                                let res = match (want, is_connected) {
+                                    (true, false) => Some(("connect", handle.connect_blocking())),
+                                    (false, true) => {
+                                        Some(("disconnect", handle.disconnect_blocking()))
+                                    }
+                                    // Already in the requested state: C issues
+                                    // no driver call at all.
+                                    _ => None,
+                                };
+                                if let Some((what, Err(e))) = res {
+                                    self.errs =
+                                        format!("asynCallbackSpecial callbackConnect {what}: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                self.errs = format!("asynCallbackSpecial isConnected error: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        self.errs = "asynCallbackSpecial isConnected error".to_string();
+                    }
                 }
+                // C monitorStatus re-reads CNCT from isConnected right after
+                // (asynRecord.c:1089-1093), so a refused or failed request
+                // snaps the field back to the wire's real state instead of
+                // leaving the operator's value latched.
+                self.refresh_connected_state();
             }
+
+            // PCNCT — attach / detach *this record* to the port. C
+            // asynRecord.c:519-527: `connectDevice` on 1;
+            // `exceptionCallbackRemove` + `pasynManager->disconnect` +
+            // `cancelIOInterruptScan` on 0. The driver's transport is not
+            // touched either way.
             "PCNCT" => {
                 if self.pcnct != 0 {
                     self.connect_device();
                 } else {
-                    self.cnct = 0;
                     self.port_entry = None;
                     self.clear_trace_exception_callback();
+                    // Detached: `isConnected` has no device to report on, which
+                    // is C's CNCT=0 (monitorStatus, :1091-1093).
+                    self.refresh_connected_state();
                 }
             }
 
@@ -3722,6 +3884,249 @@ mod tests {
         assert_eq!(bin.nord, 3);
     }
 
+    /// R8-51: CNCT drives the *driver's transport*, PCNCT the record↔port
+    /// attachment. C `special` routes a CNCT put to `asynCallbackSpecial`
+    /// (asynRecord.c:537-539), whose `callbackConnect` (:857-889) reads
+    /// `pasynManager->isConnected` and then calls `pasynCommon->connect` or
+    /// `->disconnect` — while PCNCT (:519-527) only runs `connectDevice` /
+    /// `pasynManager->disconnect`, never touching the wire. And CNCT is a
+    /// *readback*: `monitorStatus` (:1089-1093) assigns it from `isConnected`.
+    ///
+    /// Before the fix CNCT was a duplicate of PCNCT: a CNCT=0 put detached the
+    /// record and left the socket open, CNCT=1 could not raise a dropped link,
+    /// and `connect_device` latched CNCT=1 on a mere attach — so a
+    /// registered-but-disconnected port reported a live wire.
+    #[test]
+    fn cnct_drives_the_transport_and_pcnct_the_attachment() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        /// Counts the transport calls C would make through `pasynCommon`.
+        struct CountingDriver {
+            base: PortDriverBase,
+            connects: Arc<AtomicUsize>,
+            disconnects: Arc<AtomicUsize>,
+        }
+        impl PortDriver for CountingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn disconnect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+                self.disconnects.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(false);
+                Ok(())
+            }
+        }
+
+        let port_name = "test_cnct_transport";
+        let connects = Arc::new(AtomicUsize::new(0));
+        let disconnects = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(CountingDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                connects: connects.clone(),
+                disconnects: disconnects.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        // The actor auto-connected the port at startup; CNCT reads that back
+        // rather than latching on the attach.
+        assert_eq!(rec.cnct, 1, "CNCT is the port's transport state");
+        assert_eq!(rec.pcnct, 1, "PCNCT is the attachment");
+        let base_connects = connects.load(Ordering::SeqCst);
+
+        // CNCT=0 → pasynCommon->disconnect. The record stays attached.
+        rec.cnct = 0;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            disconnects.load(Ordering::SeqCst),
+            1,
+            "CNCT=0 must disconnect the driver's transport"
+        );
+        assert_eq!(rec.cnct, 0, "readback follows the wire");
+        assert_eq!(
+            rec.pcnct, 1,
+            "CNCT must not detach the record (that is PCNCT)"
+        );
+        assert!(
+            rec.port_entry.is_some(),
+            "CNCT must not drop the port binding"
+        );
+
+        // CNCT=1 on a disconnected port → pasynCommon->connect.
+        rec.cnct = 1;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            base_connects + 1,
+            "CNCT=1 must connect the driver's transport"
+        );
+        assert_eq!(rec.cnct, 1);
+
+        // C's isConnected gate: re-putting the state the port is already in
+        // issues no driver call at all (asynRecord.c:865-882).
+        rec.cnct = 1;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            base_connects + 1,
+            "an already-connected port must not be re-connected"
+        );
+
+        // PCNCT=0 detaches the record and leaves the transport alone.
+        let disconnects_before = disconnects.load(Ordering::SeqCst);
+        rec.pcnct = 0;
+        rec.special("PCNCT", true).unwrap();
+        assert!(rec.port_entry.is_none(), "PCNCT=0 detaches the record");
+        assert_eq!(
+            disconnects.load(Ordering::SeqCst),
+            disconnects_before,
+            "PCNCT must not touch the driver's transport"
+        );
+        assert_eq!(
+            rec.cnct, 0,
+            "detached: isConnected has no device to report on (C :1091)"
+        );
+    }
+
+    /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`
+    /// (asynRecord.c:1524-1556) seeds `nbytesTransfered = 0`, hands it to the
+    /// octet chain — which fills it in on success and on failure alike
+    /// (`drvAsynSerialPort.c:849` writes `numchars - nleft` on the timeout
+    /// break) — and commits it with `nawt = nbytesTransfered` (:1547) *before*
+    /// testing the status (:1551). The short-write diagnostic then fires
+    /// whenever the status failed **or** fewer bytes went out than were asked
+    /// for, landing "Write error, nout=%d, %s" in ERRS via reportError.
+    ///
+    /// Before the fix, the Ok arm published the *planned* length (ignoring the
+    /// reply's real count), the Err arm hard-coded 0, and a success-status
+    /// short write raised nothing at all.
+    #[test]
+    fn octet_write_reports_the_transferred_count_on_both_arms() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+        use tokio::sync::mpsc;
+
+        /// A port that takes `accept` bytes of every write and then reports
+        /// `outcome` — the shape of a device whose buffer filled mid-command.
+        struct ShortWriteDriver {
+            base: PortDriverBase,
+            accept: usize,
+            fail: bool,
+        }
+        impl PortDriver for ShortWriteDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                _data: &[u8],
+            ) -> crate::error::AsynResult<usize> {
+                if self.fail {
+                    Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "serial write timeout".into(),
+                    }
+                    .with_partial_write(self.accept))
+                } else {
+                    Ok(self.accept)
+                }
+            }
+        }
+
+        fn writer(port_name: &'static str, accept: usize, fail: bool) -> AsynRecord {
+            let interrupts = Arc::new(InterruptManager::new(256));
+            let (tx, rx) = mpsc::channel(256);
+            let actor = PortActor::new(
+                Box::new(ShortWriteDriver {
+                    base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                    accept,
+                    fail,
+                }),
+                rx,
+            );
+            std::thread::spawn(move || actor.run());
+            let handle = PortHandle::new(tx, port_name.into(), interrupts);
+            register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device();
+            rec.iface = 0; // asynOctet
+            rec.tmod = TransferMode::Write as i32;
+            rec.ofmt = ASYN_FMT_ASCII;
+            rec.aout = "hello".to_string(); // nwrite = 5
+            rec.nawt = 99; // stale count from a previous cycle
+            rec
+        }
+
+        // Failing write that moved bytes first: NAWT is the count the device
+        // took, not 0, and ERRS carries C's nout diagnostic.
+        let mut partial = writer("test_short_write_err", 3, true);
+        partial.process().unwrap();
+        assert_eq!(partial.nawt, 3, "NAWT = nbytesTransfered (C :1547)");
+        assert!(
+            partial.errs.starts_with("Write error, nout=3,"),
+            "C :1552 reportError text, got {:?}",
+            partial.errs
+        );
+        // C's octet write branch reports but raises NO severity (:1551-1555) —
+        // unlike the register writes, which recGblSetSevr(WRITE_ALARM, MAJOR).
+        let mut c = CommonFields::default();
+        partial.check_alarms(&mut c);
+        assert_eq!(
+            c.nsev,
+            AlarmSeverity::NoAlarm,
+            "octet write error raises no record severity"
+        );
+
+        // Short write that reported *success*: C still fires the diagnostic
+        // (`nbytesTransfered != nwrite`), and NAWT is the driver's real count,
+        // not the planned length.
+        let mut short_ok = writer("test_short_write_ok", 2, false);
+        short_ok.process().unwrap();
+        assert_eq!(short_ok.nawt, 2, "NAWT comes from the reply, not from OPTR");
+        assert!(
+            short_ok.errs.starts_with("Write error, nout=2,"),
+            "C :1551 fires on a short write even with asynSuccess, got {:?}",
+            short_ok.errs
+        );
+
+        // Whole message accepted: NAWT = nwrite and no diagnostic.
+        let mut full = writer("test_full_write", 5, false);
+        full.process().unwrap();
+        assert_eq!(full.nawt, 5);
+        assert!(full.errs.is_empty(), "a complete write reports nothing");
+    }
+
     /// C `performIO` raises a record alarm severity for every I/O failure via
     /// `recGblSetSevr` (asynRecord.c:1380-1621): octet/register read error ->
     /// READ/MAJOR, register write error -> WRITE/MAJOR, while the octet *write*
@@ -3849,80 +4254,314 @@ mod tests {
         assert_eq!(c.nsev, AlarmSeverity::Major, "int32 write err -> MAJOR");
     }
 
-    /// C `performOctetIO` flags an ASCII/Hybrid read that fills the input
-    /// buffer with no terminator as READ/MINOR and NUL-truncates the buffer
-    /// (asynRecord.c:1602-1615). asyn keys this on `ASYN_EOM_CNT` set without
-    /// END/EOS and a transfer that reaches IMAX.
-    #[test]
-    fn octet_overflow_raises_minor_and_truncates() {
+    /// A port whose driver hands back `min(fill, buf.len())` `Z` bytes with the
+    /// given end-of-message reason, and records the buffer size the record asked
+    /// for. The requested size IS C's `nread` (asynRecord.c:1512-1517), so it
+    /// pins which capacity — `sizeof(ainp)` or IMAX — sized the read.
+    fn spawn_fill_port(
+        port_name: &'static str,
+        fill: usize,
+        eom: crate::interpose::EomReason,
+    ) -> Arc<Mutex<Option<usize>>> {
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
-        use epics_base_rs::server::recgbl::alarm_status;
-        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
         use tokio::sync::mpsc;
 
-        const IMAX: usize = 4;
-
-        struct OverflowDriver(PortDriverBase);
-        impl PortDriver for OverflowDriver {
+        struct FillDriver {
+            base: PortDriverBase,
+            fill: usize,
+            eom: EomReason,
+            requested: Arc<Mutex<Option<usize>>>,
+        }
+        impl PortDriver for FillDriver {
             fn base(&self) -> &PortDriverBase {
-                &self.0
+                &self.base
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.0
+                &mut self.base
             }
             fn io_read_octet_eom(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
             ) -> crate::error::AsynResult<(usize, EomReason)> {
-                // Fill the whole buffer; CNT only (count reached, no EOS/END).
-                let n = IMAX.min(buf.len());
+                *self.requested.lock().unwrap() = Some(buf.len());
+                let n = self.fill.min(buf.len());
                 for b in buf[..n].iter_mut() {
                     *b = b'Z';
                 }
-                Ok((n, EomReason::CNT))
+                Ok((n, self.eom))
             }
         }
 
-        let port_name = "test_io_alarm_overflow";
+        let requested = Arc::new(Mutex::new(None));
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(
-            Box::new(OverflowDriver(PortDriverBase::new(
-                port_name,
-                1,
-                PortFlags::default(),
-            ))),
+            Box::new(FillDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                fill,
+                eom,
+                requested: requested.clone(),
+            }),
             rx,
         );
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
         register_port(port_name, handle, Arc::new(TraceManager::new()));
+        requested
+    }
 
+    fn read_rec(port_name: &str, ifmt: i32, imax: i32, nrrd: i32) -> AsynRecord {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.connect_device();
         rec.iface = 0;
         rec.tmod = TransferMode::Read as i32;
-        rec.imax = IMAX as i32;
-        rec.ifmt = ASYN_FMT_ASCII;
-        rec.process().unwrap();
+        rec.ifmt = ifmt;
+        rec.imax = imax;
+        rec.nrrd = nrrd;
+        rec
+    }
 
-        assert_eq!(rec.errs, "", "overflow is not an error, only a MINOR alarm");
-        assert_eq!(rec.nord, IMAX as i32, "NORD is the raw transfer count");
-        assert_eq!(
-            rec.ainp, "ZZZ",
-            "ASCII overflow NUL-truncates AINP at the buffer end (IMAX-1 chars)"
-        );
-
+    fn read_alarm(rec: &mut AsynRecord) -> (u16, epics_base_rs::server::record::AlarmSeverity) {
+        use epics_base_rs::server::record::CommonFields;
         let mut c = CommonFields::default();
         rec.check_alarms(&mut c);
-        assert_eq!(c.nsta, alarm_status::READ_ALARM, "overflow -> READ");
-        assert_eq!(c.nsev, AlarmSeverity::Minor, "overflow -> MINOR");
+        (c.nsta, c.nsev)
+    }
+
+    /// A port whose driver appends each octet phase it is asked to run to a
+    /// shared log, so a test can assert the phase ORDER of one `performIO`
+    /// cycle.
+    fn spawn_phase_log_port(port_name: &'static str) -> Arc<Mutex<Vec<&'static str>>> {
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        struct PhaseLogDriver {
+            base: PortDriverBase,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl PortDriver for PhaseLogDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_flush(&mut self, _user: &mut AsynUser) -> crate::error::AsynResult<()> {
+                self.log.lock().unwrap().push("flush");
+                Ok(())
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                data: &[u8],
+            ) -> crate::error::AsynResult<usize> {
+                self.log.lock().unwrap().push("write");
+                Ok(data.len())
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                self.log.lock().unwrap().push("read");
+                let resp = b"OK";
+                let n = resp.len().min(buf.len());
+                buf[..n].copy_from_slice(&resp[..n]);
+                Ok((n, EomReason::EOS))
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(PhaseLogDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                log: log.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        log
+    }
+
+    /// R8-47: C flushes the input BEFORE the write, for `TMOD == Flush` *and*
+    /// `TMOD == Write_Read` (asynRecord.c:1518-1523) — Write/Read being the
+    /// default TMOD. Without it, bytes left in the driver by a previous
+    /// transaction are prepended to the fresh response.
+    #[test]
+    fn write_read_flushes_the_input_before_the_write() {
+        let port = "test_tmod_writeread_flush";
+        let log = spawn_phase_log_port(port);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port.to_string();
+        rec.connect_device();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.tmod = TransferMode::WriteRead as i32;
+        rec.ofmt = ASYN_FMT_ASCII;
+        rec.ifmt = ASYN_FMT_ASCII;
+        rec.aout = "CMD".to_string();
+        rec.process().unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["flush", "write", "read"],
+            "Write/Read must flush the input before the write"
+        );
+        assert_eq!(rec.ainp, "OK");
+    }
+
+    /// The phase plan is one owner for both runners; pin every TMOD × interface
+    /// combination it decides. C: the flush lives inside `performOctetIO`
+    /// (asynRecord.c:1518), so a register interface has no flush phase at all —
+    /// `performInt32IO` (:1370-1395) only branches on Write / Read.
+    #[test]
+    fn io_phase_plan_matches_c_perform_io() {
+        let plan = |tmod: TransferMode, iface: InterfaceType| -> Vec<IoPhase> {
+            let mut rec = AsynRecord::default();
+            rec.tmod = tmod as i32;
+            rec.iface = iface as i32;
+            io_phases(&rec.build_io_plan())
+        };
+        use InterfaceType::{Int32, Octet};
+        use IoPhase::{Flush, Read, Write};
+
+        assert_eq!(plan(TransferMode::WriteRead, Octet), [Flush, Write, Read]);
+        assert_eq!(plan(TransferMode::Write, Octet), [Write]);
+        assert_eq!(plan(TransferMode::Read, Octet), [Read]);
+        assert_eq!(plan(TransferMode::Flush, Octet), [Flush]);
+        assert_eq!(plan(TransferMode::NoIo, Octet), []);
+
+        // Register interfaces: no flush phase in C, in any TMOD.
+        assert_eq!(plan(TransferMode::WriteRead, Int32), [Write, Read]);
+        assert_eq!(plan(TransferMode::Flush, Int32), []);
+    }
+
+    /// R8-46: C sizes an ASCII read by `sizeof(pasynRec->ainp)` = 40, NOT by
+    /// IMAX (asynRecord.c:1503-1506), and keys the ASCII overflow on the same 40
+    /// (`:1602-1608`). With the default IMAX=80 a terminator-less response must
+    /// stop at 40 bytes, land 39 chars in AINP, raise READ/MINOR, and leave the
+    /// rest of the response in the driver.
+    #[test]
+    fn ascii_read_is_sized_by_ainp_size_not_imax() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_inlen_is_ainp";
+        let requested = spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.process().unwrap();
+
+        assert_eq!(
+            *requested.lock().unwrap(),
+            Some(AINP_SIZE),
+            "the ASCII read length is sizeof(ainp), not IMAX"
+        );
+        assert_eq!(rec.nord, AINP_SIZE as i32, "NORD is the raw transfer count");
+        assert_eq!(rec.ainp.len(), AINP_SIZE - 1, "AINP NUL-truncated at 40");
+        assert_eq!(rec.errs, "", "overflow is not an error, only a MINOR alarm");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
+    }
+
+    /// The ASCII overflow boundary is `>=`: 39 bytes fit, 40 overflow.
+    #[test]
+    fn ascii_read_below_ainp_size_is_not_overflow() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_inlen_under";
+        spawn_fill_port(port, AINP_SIZE - 1, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.process().unwrap();
+
+        assert_eq!(rec.nord, (AINP_SIZE - 1) as i32);
+        assert_eq!(rec.ainp.len(), AINP_SIZE - 1, "all 39 bytes land in AINP");
+        assert_eq!(read_alarm(&mut rec).1, AlarmSeverity::NoAlarm);
+    }
+
+    /// C's overflow test is a plain length compare (`nbytesTransfered >=
+    /// sizeof(ainp)`, asynRecord.c:1602) — a full buffer overflows even when the
+    /// driver reported an EOS/END end-of-message, so no eomReason may gate it.
+    #[test]
+    fn ascii_overflow_fires_even_when_the_read_ended_on_eos() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_overflow_eos";
+        spawn_fill_port(port, 100, EomReason::EOS);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.process().unwrap();
+
+        assert_eq!(rec.nord, AINP_SIZE as i32);
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
+    }
+
+    /// An NRRD-limited read is capped below the buffer capacity, so it can never
+    /// reach the overflow threshold (C clamps NRRD to `inlen` and compares the
+    /// transfer against `inlen`, asynRecord.c:1513/1602).
+    #[test]
+    fn nrrd_limited_ascii_read_is_never_overflow() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_nrrd_short";
+        let requested = spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 20);
+        rec.process().unwrap();
+
+        assert_eq!(*requested.lock().unwrap(), Some(20), "NRRD sizes the read");
+        assert_eq!(rec.nord, 20);
+        assert_eq!(rec.ainp.len(), 20, "no truncation below the threshold");
+        assert_eq!(read_alarm(&mut rec).1, AlarmSeverity::NoAlarm);
+    }
+
+    /// Hybrid is the mode that IS sized by IMAX (it reads into BINP,
+    /// asynRecord.c:1507-1510) and whose overflow NULs the buffer's last byte
+    /// (`inptr[imax - 1] = '\0'`, :1615).
+    #[test]
+    fn hybrid_read_is_sized_by_imax_and_nuls_the_buffer_end_on_overflow() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_hybrid_inlen_is_imax";
+        let requested = spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_HYBRID, 4, 0);
+        rec.process().unwrap();
+
+        assert_eq!(
+            *requested.lock().unwrap(),
+            Some(4),
+            "IMAX sizes a Hybrid read"
+        );
+        assert_eq!(rec.nord, 4);
+        assert_eq!(rec.binp, vec![b'Z', b'Z', b'Z', 0], "BINP NUL at IMAX-1");
+        assert_eq!(rec.ainp, "", "Hybrid must not touch AINP");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
     }
 
     /// C `gpibUniversalCmd`/`gpibAddressedCmd` raise COMM/MAJOR when the port

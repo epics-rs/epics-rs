@@ -83,6 +83,8 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::GetBoundsInt64 => Self::GetBoundsInt64,
             RequestOp::GetEnable => Self::GetEnable,
             RequestOp::GetAutoConnect => Self::GetAutoConnect,
+            RequestOp::GetConnected => Self::GetConnected,
+            RequestOp::PushEchoInterpose => Self::PushEchoInterpose,
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
             RequestOp::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
@@ -183,6 +185,8 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::GetBoundsInt64 => Self::GetBoundsInt64,
             PortCommand::GetEnable => Self::GetEnable,
             PortCommand::GetAutoConnect => Self::GetAutoConnect,
+            PortCommand::GetConnected => Self::GetConnected,
+            PortCommand::PushEchoInterpose => Self::PushEchoInterpose,
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
             PortCommand::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {

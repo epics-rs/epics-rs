@@ -1290,9 +1290,11 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.s = rec.vel.velo / urev_abs;
                     }
+                    // C: 7291b556 — recalc ACCL/ACCS based on ACCU. Also
+                    // special()-only: a load must leave the accel pair raw
+                    // (see `motor_sync_speed_at_init`).
+                    apply_accu_cascade(rec);
                 }
-                // C: 7291b556 — recalc ACCL/ACCS based on ACCU
-                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1309,9 +1311,7 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.sbas = rec.vel.vbas / urev_abs;
                     }
-                }
-                apply_accu_cascade(rec);
-                if rec.internal.init_invariants_synced {
+                    apply_accu_cascade(rec);
                     // C motorRecord.cc:3121-3127: a VBAS raised above VMAX
                     // drags VMAX (and SMAX) up with it.
                     if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
@@ -1358,9 +1358,9 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.velo = rec.vel.s * urev_abs;
                     }
+                    // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
+                    apply_accu_cascade(rec);
                 }
-                // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
-                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1377,10 +1377,8 @@ pub(crate) fn motor_put_field(
                     if urev_abs > 0.0 {
                         rec.vel.vbas = rec.vel.sbas * urev_abs;
                     }
-                }
-                // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
-                apply_accu_cascade(rec);
-                if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
+                    apply_accu_cascade(rec);
                     // C motorRecord.cc:3121-3127 (shared VBAS/SBAS tail).
                     if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
                         rec.vel.vmax = rec.vel.vbas;
@@ -1417,22 +1415,20 @@ pub(crate) fn motor_put_field(
         },
         "ACCL" => match value {
             EpicsValue::Double(v) => {
+                rec.vel.accl = v;
                 // C special() motorRecordACCL (motorRecord.cc:2735-2742): floor
                 // ACCL to 0.1 if <= 0, then updateACCSfromACCL. ACCU is NOT
                 // touched — 63bfe5d0 made ACCU a user/autosave control and
                 // dropped the 36177f7b auto-switch from the accel helpers.
-                rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
-                // C updateACCSfromACCL (motorRecord.cc:512-521): numerator is
-                // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
-                // the full velo and still recomputes ACCS.
-                let vbas = rec.effective_vbas();
-                let numerator = if rec.vel.velo > vbas {
-                    rec.vel.velo - vbas
-                } else {
-                    rec.vel.velo
-                };
-                if rec.vel.accl > 0.0 {
-                    rec.vel.accs = numerator / rec.vel.accl;
+                // special() never runs during dbLoadRecords, so a load stores
+                // the field() value raw and leaves ACCS alone —
+                // `motor_sync_speed_at_init` reconciles the pair, keying on
+                // "did the .db set ACCS" exactly as C does.
+                if rec.internal.init_invariants_synced {
+                    if rec.vel.accl <= 0.0 {
+                        rec.vel.accl = 0.1;
+                    }
+                    update_accs_from_accl(rec);
                 }
                 Ok(())
             }
@@ -1445,23 +1441,13 @@ pub(crate) fn motor_put_field(
                 // from ACCL (updateACCSfromACCL, accs = velo/accl — NOT a
                 // literal 1.0), then recomputes ACCL from ACCS
                 // (updateACCLfromACCS). ACCU is NOT touched (63bfe5d0 dropped
-                // the 36177f7b auto-switch).
+                // the 36177f7b auto-switch). Runtime-only, as for ACCL.
                 rec.vel.accs = v;
-                // C numerator is (velo - vbas) only while velo > vbas; at
-                // velo <= vbas C uses the full velo.
-                let vbas = rec.effective_vbas();
-                let numerator = if rec.vel.velo > vbas {
-                    rec.vel.velo - vbas
-                } else {
-                    rec.vel.velo
-                };
-                // updateACCSfromACCL: sanitize a non-positive ACCS from ACCL.
-                if rec.vel.accs <= 0.0 && rec.vel.accl > 0.0 {
-                    rec.vel.accs = numerator / rec.vel.accl;
-                }
-                // updateACCLfromACCS: keep ACCL consistent with ACCS.
-                if rec.vel.accs > 0.0 {
-                    rec.vel.accl = numerator / rec.vel.accs;
+                if rec.internal.init_invariants_synced {
+                    if rec.vel.accs <= 0.0 {
+                        update_accs_from_accl(rec);
+                    }
+                    update_accl_from_accs(rec);
                 }
                 Ok(())
             }
@@ -2095,29 +2081,47 @@ fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult
     }
 }
 
-/// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
-/// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
-fn apply_accu_cascade(rec: &mut MotorRecord) {
-    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): the accel-rate
-    // numerator is (velo - vbas) only while velo > vbas; at velo <= vbas C
-    // uses the full velo, and recomputes/posts the slave field in BOTH cases.
+/// The acceleration-rate numerator every ACCL↔ACCS conversion divides by its
+/// partner: `(velo - vbas)` while `velo > vbas`, else the full `velo`. C repeats
+/// this ternary in `updateACCLfromACCS` / `updateACCSfromACCL` /
+/// `updateACCL_ACCSfromVELO` (motorRecord.cc:499-546); one owner here so the
+/// three cannot drift.
+fn accel_numerator(rec: &MotorRecord) -> f64 {
     let vbas = rec.effective_vbas();
-    let numerator = if rec.vel.velo > vbas {
+    if rec.vel.velo > vbas {
         rec.vel.velo - vbas
     } else {
         rec.vel.velo
-    };
+    }
+}
+
+/// C `updateACCLfromACCS` (motorRecord.cc:499-510): ACCS is the master, ACCL
+/// follows. A non-positive ACCS leaves ACCL alone (C's `accs > 0.0` guard).
+fn update_accl_from_accs(rec: &mut MotorRecord) {
+    if rec.vel.accs > 0.0 {
+        rec.vel.accl = accel_numerator(rec) / rec.vel.accs;
+    }
+}
+
+/// C `updateACCSfromACCL` (motorRecord.cc:512-521): ACCL is the master, ACCS
+/// follows. The `accl > 0.0` guard is Rust-side: C divides unconditionally, and
+/// every C caller has already floored ACCL to 0.1 — the guard keeps a raw
+/// `field(ACCL,"0")` load from producing an infinite ACCS before the init floor
+/// runs, and is unreachable on the runtime paths.
+fn update_accs_from_accl(rec: &mut MotorRecord) {
+    if rec.vel.accl > 0.0 {
+        rec.vel.accs = accel_numerator(rec) / rec.vel.accl;
+    }
+}
+
+/// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
+/// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
+fn apply_accu_cascade(rec: &mut MotorRecord) {
+    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): recomputes/posts the
+    // ACCU-named slave field in both the velo > vbas and velo <= vbas cases.
     match rec.vel.accu {
-        AccsUsed::Accl => {
-            if rec.vel.accl > 0.0 {
-                rec.vel.accs = numerator / rec.vel.accl;
-            }
-        }
-        AccsUsed::Accs => {
-            if rec.vel.accs > 0.0 {
-                rec.vel.accl = numerator / rec.vel.accs;
-            }
-        }
+        AccsUsed::Accl => update_accs_from_accl(rec),
+        AccsUsed::Accs => update_accl_from_accs(rec),
     }
 }
 
@@ -2281,11 +2285,23 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
             rec.vel.sbak = rec.vel.bvel / urev_abs;
         }
     }
-    // ACCS <-> ACCL. C keys on ACCS > 0 — its dbd default is 0, so nonzero
-    // means the .db set it (motorRecord.cc:4033-4047). The Rust default
-    // ACCS is derived (nonzero), so the master is whichever field ACCU
-    // names; the .db loading ACCS or ACCU flips it to Accs.
-    apply_accu_cascade(rec);
+    // ACCS <-> ACCL, C check_speed_and_resolution (motorRecord.cc:4033-4047).
+    // The key is `accs > 0.0` — the loaded ACCS value — NOT ACCU: ACCS's dbd
+    // default is 0.0 (as is `VelocityFields::default`), the accel cross-calcs
+    // are special()-only and so never fire during dbLoadRecords, and therefore
+    // a nonzero ACCS here can only mean the .db wrote `field(ACCS,…)`. It then
+    // wins and ACCL is derived from it; otherwise ACCL is the master (floored
+    // to 0.1 first, C:4041-4045) and ACCS is derived. ACCU stays a pure
+    // user/autosave control (63bfe5d0) — it selects the master only for the
+    // *runtime* VELO/VBAS cascade (`apply_accu_cascade`), not at init.
+    if rec.vel.accs > 0.0 {
+        update_accl_from_accs(rec);
+    } else {
+        if rec.vel.accl == 0.0 {
+            rec.vel.accl = 0.1;
+        }
+        update_accs_from_accl(rec);
+    }
 
     // C motorRecord.cc:4054-4067 — jog/home velocity sanity checks, after
     // the speed pairs and accelerations settle. A zero field means "not

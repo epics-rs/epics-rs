@@ -51,11 +51,15 @@ impl OctetInterpose for DelayInterpose {
         // C asynInterposeDelay.c:41-50 writeIt: write one char, then
         // epicsThreadSleep(delay) — AFTER every char, including the last
         // and including a single-char write. On a write error it breaks
-        // before sleeping (here `?` propagates before the sleep).
+        // before sleeping and publishes what it managed to send
+        // (`*nbytesTransfered = transfered`, :52), so the count rides out on
+        // the error instead of being dropped by `?`.
         let mut total = 0;
         for byte in data.iter() {
-            let n = next.write(user, std::slice::from_ref(byte))?;
-            total += n;
+            match next.write(user, std::slice::from_ref(byte)) {
+                Ok(n) => total += n,
+                Err(e) => return Err(e.with_partial_write(total)),
+            }
             std::thread::sleep(self.delay);
         }
         Ok(total)

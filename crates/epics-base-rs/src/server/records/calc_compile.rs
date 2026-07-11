@@ -86,3 +86,29 @@ pub(crate) fn postfix(record: &str, field: &str, expr: &str) -> CalcCompile {
         Err(e) => CalcCompile::failed(record, field, expr, &e),
     }
 }
+
+/// C `sCalcPostfix()` (`sCalcPostfix.c:410-434`) — the string engine behind
+/// scalcout. An empty expression is a valid empty program, status 0
+/// (`sCalcPostfix.c:432-434`), unlike base `postfix()`.
+pub(crate) fn scalc_postfix(record: &str, field: &str, expr: &str) -> CalcCompile {
+    if expr.is_empty() {
+        return CalcCompile::ok(None);
+    }
+    match crate::calc::scalc_compile(expr) {
+        Ok(program) => CalcCompile::ok(Some(program)),
+        Err(e) => CalcCompile::failed(record, field, expr, &e),
+    }
+}
+
+/// C `aCalcPostfix()` (`aCalcPostfix.c:410-441`) — the array engine behind
+/// acalcout. An empty expression is a valid empty program, status 0
+/// (`aCalcPostfix.c:439-441`).
+pub(crate) fn acalc_postfix(record: &str, field: &str, expr: &str) -> CalcCompile {
+    if expr.is_empty() {
+        return CalcCompile::ok(None);
+    }
+    match crate::calc::acalc_compile(expr) {
+        Ok(program) => CalcCompile::ok(Some(program)),
+        Err(e) => CalcCompile::failed(record, field, expr, &e),
+    }
+}

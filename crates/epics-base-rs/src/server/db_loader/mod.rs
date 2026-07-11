@@ -1367,6 +1367,9 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        // C compiles CALC in special(SPC_CALC), never in the field write —
+        // dbPut always runs both, so drive the same pair here.
+        rec.special("CALC", true).unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.process().unwrap();
@@ -1384,6 +1387,7 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
 
@@ -1404,8 +1408,12 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        // C compiles CALC in special(SPC_CALC), never in the field write —
+        // dbPut always runs both, so drive the same pair here.
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("A*B".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();

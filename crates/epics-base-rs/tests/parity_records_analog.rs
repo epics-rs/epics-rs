@@ -64,6 +64,7 @@ fn h1_int64out_clamps_val_to_drive_window() {
 fn m1_calcout_odly_defers_output_via_reprocess() {
     let mut r = CalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(42.0)).unwrap();
     r.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
     // OOPT=0 (Every Time): output should fire.
@@ -104,6 +105,7 @@ fn m1_calcout_odly_defers_output_via_reprocess() {
 fn m1_calcout_no_odly_outputs_synchronously() {
     let mut r = CalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     // ODLY default 0: output is synchronous, no delay.
     let outcome = r.process().unwrap();
@@ -124,6 +126,7 @@ fn m1_calcout_no_odly_outputs_synchronously() {
 fn m1b_scalcout_odly_defers_output_via_reprocess() {
     let mut r = ScalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(42.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("sink.VAL".into()))
         .unwrap();
@@ -169,6 +172,7 @@ fn m1b_scalcout_odly_defers_output_via_reprocess() {
 fn m1b_scalcout_no_odly_outputs_synchronously() {
     let mut r = ScalcoutRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("sink.VAL".into()))
         .unwrap();
@@ -195,6 +199,7 @@ fn m1b_scalcout_no_odly_outputs_synchronously() {
 fn m1c_swait_odly_defers_output_via_reprocess() {
     let mut r = SwaitRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(42.0)).unwrap();
     r.put_field("ODLY", EpicsValue::Float(0.05)).unwrap();
     // OOPT=0 (Every Time): output should fire.
@@ -233,6 +238,7 @@ fn m1c_swait_odly_defers_output_via_reprocess() {
 fn m1c_swait_no_odly_outputs_synchronously() {
     let mut r = SwaitRecord::default();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(7.0)).unwrap();
     // ODLY default 0: output is synchronous, no delay.
     let outcome = r.process().unwrap();
@@ -376,6 +382,7 @@ fn l3_ai_linear_linr_no_bpt_alarm() {
 fn s1_scalcout_invalid_calc_raises_calc_alarm() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(5.0)).unwrap();
     r.process().unwrap();
     assert_eq!(
@@ -387,6 +394,7 @@ fn s1_scalcout_invalid_calc_raises_calc_alarm() {
     // value-stack-underflow state: a bare binary operator with no
     // operands fails at eval time.
     r.put_field("CALC", EpicsValue::String("+".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.process().unwrap();
     assert_eq!(
         r.get_field("CALC_ALARM"),
@@ -399,9 +407,11 @@ fn s1_scalcout_invalid_calc_raises_calc_alarm() {
 fn s2_scalcout_invalid_ocal_raises_calc_alarm() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(1.0)).unwrap();
     r.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
     r.put_field("OCAL", EpicsValue::String("+".into())).unwrap();
+    r.special("OCAL", true).unwrap();
     r.process().unwrap();
     assert_eq!(
         r.get_field("CALC_ALARM"),
@@ -416,6 +426,7 @@ fn s2_scalcout_invalid_ocal_raises_calc_alarm() {
 fn s3_scalcout_emits_out_link_when_output_due() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(11.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("target.VAL".into()))
         .unwrap();
@@ -432,6 +443,7 @@ fn s3_scalcout_emits_out_link_when_output_due() {
 fn s3_scalcout_suppresses_out_link_when_oopt_not_met() {
     let mut r = ScalcoutRecord::new();
     r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(0.0)).unwrap();
     r.put_field("OUT", EpicsValue::String("target.VAL".into()))
         .unwrap();

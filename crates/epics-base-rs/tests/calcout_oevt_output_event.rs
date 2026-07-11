@@ -97,7 +97,8 @@ async fn calcout_oevt_posts_string_event_on_output() {
     add_event_sibling(&db, "SIB", "e1", count.clone()).await;
 
     let mut c = CalcoutRecord::default();
-    c.put_field("CALC", EpicsValue::String("1".into())).unwrap(); // VAL=1, finite
+    c.put_field("CALC", EpicsValue::String("1".into())).unwrap();
+    c.special("CALC", true).unwrap(); // VAL=1, finite
     c.put_field("OEVT", EpicsValue::String("e1".into()))
         .unwrap();
     // oopt default 0 = Every_Time → output is due. No OUT link configured.
@@ -127,7 +128,8 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
 
     let mut c = CalcoutRecord::default();
     c.put_field("CALC", EpicsValue::String("0/0".into()))
-        .unwrap(); // NaN → UDF → INVALID
+        .unwrap();
+    c.special("CALC", true).unwrap(); // NaN → UDF → INVALID
     c.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't_drive
     c.put_field("OEVT", EpicsValue::String("e2".into()))
         .unwrap();
@@ -173,6 +175,7 @@ async fn scalcout_oevt_posts_numeric_event_on_output() {
 
     let mut s = ScalcoutRecord::default();
     s.put_field("CALC", EpicsValue::String("1".into())).unwrap();
+    s.special("CALC", true).unwrap();
     s.put_field("OEVT", EpicsValue::UShort(5)).unwrap();
     s.oopt = 0; // Every_Time → output is due.
     db.add_record("S_OEVT", Box::new(s)).await.unwrap();
@@ -199,6 +202,7 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
 
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("1".into())).unwrap();
+    a.special("CALC", true).unwrap();
     a.put_field("OEVT", EpicsValue::UShort(7)).unwrap();
     a.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("A_OEVT", Box::new(a)).await.unwrap();
@@ -228,6 +232,7 @@ async fn swait_oevt_posts_numeric_event_on_output() {
 
     let mut w = SwaitRecord::default();
     w.put_field("CALC", EpicsValue::String("1".into())).unwrap();
+    w.special("CALC", true).unwrap();
     w.put_field("OEVT", EpicsValue::UShort(3)).unwrap();
     w.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("W_OEVT", Box::new(w)).await.unwrap();

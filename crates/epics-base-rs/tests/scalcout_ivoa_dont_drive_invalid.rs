@@ -37,11 +37,13 @@ async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
     // INVALID source the in-record veto did NOT cover.
     sc.put_field("CALC", EpicsValue::String("0/0".into()))
         .unwrap();
+    sc.special("CALC", true).unwrap();
     // DOPT=Use_OVAL with a clean OCAL so OVAL=5 is a defined value, decoupling
     // the suppression check from the NaN VAL.
     sc.put_field("DOPT", EpicsValue::Short(1)).unwrap();
     sc.put_field("OCAL", EpicsValue::String("5".into()))
         .unwrap();
+    sc.special("OCAL", true).unwrap();
     sc.oopt = 0; // Every_Time → output is due.
     sc.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't_drive_outputs
     sc.put_field("OUT", EpicsValue::String("SC_TGT".into()))

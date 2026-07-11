@@ -477,6 +477,30 @@ Impact: an oversized string silently truncates where libca errors.
 Severity: Low (REPORTED by fixer-B, adjacent to R6-25 but child-side)
 Impact: a child that relies on dying from SIGPIPE (classic pipeline behaviour) keeps running under procserv-rs.
 
+### Fix wave 4 (2026-07-12): fixer-surfaced items — merged into review/parity-r6, verified by main (workspace clippy -D warnings clean, nextest 7563/7563 passed first run)
+
+- R6-9: FIXED 21c01fe5 — unknown-field put errors via `unknown_field_error` (S_db_noMod vs S_dbLib_fieldNotFound split per C); OUTN gated to swait.
+- R6-10: FIXED 8c9adf60 — multi-element array into scalar clamps nRequest and writes element 0 (dbAccess.c:1359), applied in the R6-7 owner `dbput_request`; parallel `set_val` coercion collapsed into it; dbChannel `$`-view exempt.
+- R6-30: FIXED 39df41d1 — beacon-ramp reset removed from TCP accept/disconnect; `beacon_reset` parameter deleted so the TCP path cannot reach the ramp by construction; beacon-count e2e test (23 pre-fix → ≤4).
+- R6-71: FIXED fbcd670a — SVAL token: lexer → CoreOp::FetchSval → postfix (string-typed per sCalcPostfix.c:452) → prev_sval seeded sval/CALC, osv/OCAL; numeric+array evaluators reject the opcode; swait untouched (C swait is numeric calcPerform, no SVAL field).
+- R6-74: NOT-REAL 7862be76 — remaining to_bytes consumers are server-side DBR_STRING replies whose C counterpart `getStringString` (dbConvert.c:132-154) also truncates to 39+NUL; client put paths already guarded at all 9 sites (R6-29). Boundary test (39/40/45) pins the contract; two stale doc comments corrected.
+- R6-22 residual: FIXED 9e7376c1 — repeater registration alternates osiLocalAddr/loopback across retries (udpiiu.cpp:476-519) via cached `osi_local_addr()`.
+- R6-51: FIXED 6c53f1ae — prologix read error stages accumulated bytes in `read_carry` (C keeps bufCount advanced, drvPrologixGPIB.c:250,301-303); one owner `stage_read_carry()`.
+- R6-72: FIXED bef5d9f5 — `OverlayDef.color` is `[i32;3]` (C int channels, NDPluginOverlay.h:38-40); real truncation owner was the param path's `.clamp(0,255) as u8`. PUBLIC API note: `[u8;3]` literal constructors still compile; a `[u8;3]` variable does not.
+- R6-73: FIXED 4cfef8db — density f64 (C reads `extern double matdensity[]`; the struct's own float field feeds no computation); kev/mu stay f32 (genuinely float in C).
+- R6-75: FIXED 09fa2e14 — child gets C's exact signal environment: SIG_DFL dispositions PLUS C's blocked {SIGPIPE, SIGTERM, SIGHUP} mask (procServ.cc:490-494 leak preserved across execve). Finding's impact statement corrected: C's child does NOT die from SIGPIPE either. OPERATIONAL: a procserv-rs child cannot be killed with SIGTERM/SIGHUP — same as C; default killSig=SIGKILL and `--killsig 2` both work; supervisor shutdown follows killSig + unconditional SIGKILL. Accepted as parity; flag if the mask-leak half should be dropped.
+
+### R6-76: procServ parent never sets `SIGXFSZ = SIG_IGN`
+Severity: Low (REPORTED by fixer-G, same family as R6-75, parent-side)
+C reference: `procServ.cc:502-503` — parent ignores SIGXFSZ; child inherits it ignored.
+Impact: supervisor and child keep SIG_DFL and die on a file-size-limit write where C survives.
+
+### R6-77: shared calc tokenizer accepts string-only tokens in numeric CALC; C postfix() rejects at compile
+Severity: Low (REPORTED by fixer-F; pre-existing, exposed by R6-71)
+Rust: one tokenizer across calc/sCalc/aCalc — SVAL, string literals, and sCalc string functions compile inside a numeric calc/calcout CALC and fail at eval with CalcError::Internal.
+C reference: `postfix()` rejects them at compile time (CLCV != 0).
+Impact: a bad CALC surfaces at first process instead of at load; current behaviour pinned by `numeric_calc_rejects_sval`. Related note: port's swait evaluates via the string engine where C swait uses numeric calcPerform, so swait accepts strings C rejects.
+
 ## Open Findings — surfaced during fix wave 1 (reported by fixers, pending independent verify)
 
 ### R6-51: prologix read error drops bytes accumulated in `acc`; C retains them for the next call
@@ -558,3 +582,10 @@ Impact: `caput -a` of a multi-element array to a scalar fails on the port, succe
   under notes). 3 new findings (R6-30, R6-74, R6-75) + R6-22 residual recorded OPEN.
   All 42 round-6 findings are now closed; remaining OPEN: R6-9, R6-10, R6-30, R6-51,
   R6-71..75 (9 items, all fixer-surfaced) + 4 deferred-by-sign-off carryovers.
+- Fix wave 4 (2026-07-12): all 10 fixer-surfaced items closed — 9 FIXED, R6-74
+  NOT-REAL (C also truncates on those paths; pinned by test). Merged and verified
+  by main: workspace clippy clean, nextest 7563/7563 first-run clean. 2 new LOW
+  findings recorded OPEN (R6-76 SIGXFSZ, R6-77 tokenizer compile-split). R6-75
+  ports C's blocked-signal-mask leak — operational consequence documented above,
+  awaiting veto if unwanted. Round-6 fix phase COMPLETE: 41 FIXED + 1 partial +
+  2 NOT-REAL across 5 waves. Next: R7 re-audit.

@@ -280,14 +280,19 @@ pub struct CaLink {
     pub pv: String,
     pub monitor_switch: MonitorSwitch,
     /// Link-processing policy carried by this link's parsed modifier,
-    /// exactly as [`DbLink::policy`] does. A `CA`/`ca://` link can carry
-    /// `CP`/`CPP` (`"OTHER:PV CP CA"`, `"ca://OTHER:PV CPP"`); the dbCa
+    /// exactly as [`DbLink::policy`] does. When it is `CP`/`CPP`, the dbCa
     /// equivalent (`calink`) must subscribe a monitor and process the
     /// link-holder on every remote change (C `dbCa.c:993-994`
-    /// `CA_DBPROCESS`). Pre-fix this was dropped at parse time, so a
-    /// cross-IOC `CP`/`CPP` link silently never processed its holder.
-    /// `cp_passive_only()`
-    /// reads it identically to the local DB path.
+    /// `CA_DBPROCESS`); `cp_passive_only()` reads it identically to the local
+    /// DB path.
+    ///
+    /// A `CP`/`CPP` `CaLink` arises from the `ca://` scheme
+    /// (`"ca://OTHER:PV CPP"`) or from `classify_cp_link` re-routing a
+    /// `CP`/`CPP` link whose target is not a local record. It does **not**
+    /// arise from a plaintext ` CA` modifier: `CA` is a process *class* in C's
+    /// single `else if` chain (`dbStaticLib.c:2369-2373`), mutually exclusive
+    /// with `CP`/`CPP` and matched *before* `CP`, so `"OTHER:PV CP CA"` is
+    /// `pvlOptCA` alone — a plain CA link whose holder never processes.
     pub policy: LinkProcessPolicy,
 }
 
@@ -730,90 +735,102 @@ fn try_parse_hw_link(s: &str) -> Option<ParsedLink> {
     None
 }
 
-/// Strip trailing link-attribute modifiers (`PP`/`NPP`/`CP`/`CPP`/`CA`/
-/// `MS`/`NMS`/`MSI`/`MSS`) from a link string. Returns the remaining
-/// `record.field` text plus the parsed process policy, maximize-severity
-/// switch, and whether a bare ` CA` modifier forced a CA link. Modifiers
-/// may appear in any order (`"REC.FIELD NPP NMS"`, `"REC CP"`, …).
+/// The **one** process-class modifier a link carries.
 ///
-/// shared by the legacy plain-text path *and* the `ca://`
-/// scheme path so `ca://PV MS` parses the `MS` modifier instead of
-/// folding it into the PV name. The bare ` CA` modifier forces a
-/// `pv_link` to a CA link (C `dbStaticLib.c:2372`); it may co-occur with
-/// `PP`/`MS`-style modifiers, so `force_ca` is recorded while `policy`
-/// and `ms` continue to capture the rest.
-fn strip_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
-    // C `dbParseLink` (`dbStaticLib.c:2252,2369-2371`): the modifier set
-    // is `memset`-zeroed first, then `pvlOptPP` is set *only* on an
-    // explicit ` PP` token (` NPP` clears it back to 0). A modifier-less
-    // link is therefore NPP — for an INPUT link this means `dbDbGetValue`
-    // (`dbDbLink.c:175`) does NOT process the passive source on read, and
-    // for an OUTPUT link `dbDbPutValue` (`dbDbLink.c:387`) does NOT
-    // process the target. Default `NoProcess`; the explicit ` PP` arm
-    // below promotes it to `ProcessPassive`.
-    let mut policy = LinkProcessPolicy::NoProcess;
-    let mut ms = MonitorSwitch::NoMaximize;
-    let mut force_ca = false;
-    let mut link_part = s;
-    loop {
-        let trimmed = link_part.trim_end();
-        if let Some(rest) = trimmed.strip_suffix(" NMS") {
-            ms = MonitorSwitch::NoMaximize;
-            link_part = rest;
-            continue;
+/// C `dbParseLink` (`dbStaticLib.c:2369-2373`) resolves the process class with
+/// a single `else if` chain that **assigns** (never OR-s) exactly one bit:
+///
+/// ```c
+/// if      (strstr(pstr, "NPP")) pinfo->modifiers = 0;
+/// else if (strstr(pstr, "CPP")) pinfo->modifiers = pvlOptCPP;
+/// else if (strstr(pstr, "PP"))  pinfo->modifiers = pvlOptPP;
+/// else if (strstr(pstr, "CA"))  pinfo->modifiers = pvlOptCA;
+/// else if (strstr(pstr, "CP"))  pinfo->modifiers = pvlOptCP;
+/// ```
+///
+/// So the classes are mutually exclusive and the *chain order* — not the token
+/// order in the string — decides which one wins. `"REC CP NPP"` is NPP,
+/// `"OTHER:PV CP CA"` is CA (a plain CA link that never processes its holder),
+/// and `"REC PP CA"` is PP (a **local DB** link, because `dbAccess.c:1104`
+/// routes to `dbDbInitLink` when none of `CA|CP|CPP` is set).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ProcessClass {
+    /// `NPP`, and the modifier-less default: C `memset`s the modifier set to
+    /// zero (`dbStaticLib.c:2252`) and only an explicit token sets a bit.
+    #[default]
+    Npp,
+    Cpp,
+    Pp,
+    Ca,
+    Cp,
+}
+
+impl ProcessClass {
+    /// `(policy, force_ca)` — how this class lands in the port's link model.
+    /// Only `pvlOptCA` makes the link an *external* CA channel; `CP`/`CPP`
+    /// keep the local-DB shape and are routed by `classify_cp_link`.
+    fn resolve(self) -> (LinkProcessPolicy, bool) {
+        match self {
+            Self::Npp => (LinkProcessPolicy::NoProcess, false),
+            Self::Cpp => (LinkProcessPolicy::ChannelProcessPassive, false),
+            Self::Pp => (LinkProcessPolicy::ProcessPassive, false),
+            Self::Ca => (LinkProcessPolicy::NoProcess, true),
+            Self::Cp => (LinkProcessPolicy::ChannelProcess, false),
         }
-        if let Some(rest) = trimmed.strip_suffix(" MSI") {
-            ms = MonitorSwitch::MaximizeIfInvalid;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" MSS") {
-            ms = MonitorSwitch::MaximizeStatus;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" MS") {
-            ms = MonitorSwitch::Maximize;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" NPP") {
-            policy = LinkProcessPolicy::NoProcess;
-            link_part = rest;
-            continue;
-        }
-        // CPP before CP: a ` CPP` suffix must not be misread as ` CP`
-        // leaving a stray `P`. (` CP` never matches a `...CPP` tail, but
-        // keep the order explicit.) C distinguishes the two — CP processes
-        // the link-holder unconditionally, CPP only when it is Passive.
-        if let Some(rest) = trimmed.strip_suffix(" CPP") {
-            policy = LinkProcessPolicy::ChannelProcessPassive;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" CP") {
-            policy = LinkProcessPolicy::ChannelProcess;
-            link_part = rest;
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_suffix(" PP") {
-            policy = LinkProcessPolicy::ProcessPassive;
-            link_part = rest;
-            continue;
-        }
-        // Bare ` CA` modifier — forces the link to be a CA link.
-        // C `dbStaticLib.c:2372`. Stripped here so a combination such
-        // as `REC.FIELD CA MS` leaves `link_part == "REC.FIELD"` and
-        // both `force_ca` and `ms` are recorded.
-        if let Some(rest) = trimmed.strip_suffix(" CA") {
-            force_ca = true;
-            link_part = rest;
-            continue;
-        }
-        link_part = trimmed;
-        break;
     }
-    (link_part, policy, ms, force_ca)
+}
+
+/// Split a link string into its target and its modifiers, mirroring C
+/// `dbParseLink` (`dbStaticLib.c:2359-2379`).
+///
+/// C isolates the target at the **first space** (`strchr(pstr, ' ')`; tabs do
+/// not separate) and then searches the *whole* remainder with `strstr` — the
+/// modifiers are not positional suffixes and need no space between them
+/// (C's own comment: `"QQCPPXMSITT"` is `pvlOptCPP|pvlOptMSI`). The process
+/// class is resolved by [`ProcessClass`]'s fixed precedence; the
+/// maximize-severity switch is a second, independent `else if` chain
+/// (`:2375-2378`) in the order `NMS, MSI, MSS, MS`, longest match first.
+///
+/// Returns `(target, policy, monitor_switch, force_ca)`. Shared by the
+/// plain-text path and the `ca://` scheme path so `ca://PV MS` parses its `MS`
+/// instead of folding it into the PV name.
+fn split_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
+    let Some((target, mods)) = s.split_once(' ') else {
+        // No space ⇒ no modifier text at all ⇒ modifiers stay zeroed (NPP).
+        let (policy, force_ca) = ProcessClass::default().resolve();
+        return (s, policy, MonitorSwitch::NoMaximize, force_ca);
+    };
+
+    // Process class — one assignment, longest match first.
+    let class = if mods.contains("NPP") {
+        ProcessClass::Npp
+    } else if mods.contains("CPP") {
+        ProcessClass::Cpp
+    } else if mods.contains("PP") {
+        ProcessClass::Pp
+    } else if mods.contains("CA") {
+        ProcessClass::Ca
+    } else if mods.contains("CP") {
+        ProcessClass::Cp
+    } else {
+        ProcessClass::Npp
+    };
+
+    // Maximize-severity switch — independent chain, longest match first.
+    let ms = if mods.contains("NMS") {
+        MonitorSwitch::NoMaximize
+    } else if mods.contains("MSI") {
+        MonitorSwitch::MaximizeIfInvalid
+    } else if mods.contains("MSS") {
+        MonitorSwitch::MaximizeStatus
+    } else if mods.contains("MS") {
+        MonitorSwitch::Maximize
+    } else {
+        MonitorSwitch::NoMaximize
+    };
+
+    let (policy, force_ca) = class.resolve();
+    (target, policy, ms, force_ca)
 }
 
 /// Parse a link string into a ParsedLink (v2 — distinguishes constants from DB links).
@@ -840,7 +857,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
     // alarm gate is applied at the record-processing boundary.
     if let Some(rest) = s.strip_prefix("ca://") {
-        let (pv, policy, ms, _force_ca) = strip_link_modifiers(rest);
+        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest);
         return ParsedLink::Ca(CaLink {
             pv: pv.to_string(),
             monitor_switch: ms,
@@ -854,26 +871,39 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         return ParsedLink::Pva(rest.to_string());
     }
 
-    // Strip trailing link attributes: PP, NPP, CP, CPP, CA, MS, NMS,
-    // MSS, MSI (any order) — see [`strip_link_modifiers`].
-    let (link_part, policy, ms, force_ca) = strip_link_modifiers(s);
+    // Quoted string constant. Resolved BEFORE the modifier split because a
+    // quoted constant may legitimately contain a space (`"hello world"`), and
+    // the split isolates the target at the first one. C reaches the modifier
+    // scan only after its own constant tests (`dbStaticLib.c:2346-2356`).
+    //
+    // C parity (3b484f5): an empty quoted string `""` is equivalent to an
+    // unset link — dbConstLoadScalar/Array reject `""` the same as NULL with
+    // S_db_badField. Treat it as None here so callers don't see a meaningless
+    // empty Constant.
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        if inner.is_empty() {
+            return ParsedLink::None;
+        }
+        return ParsedLink::Constant(inner.to_string());
+    }
 
-    // A bare ` CA` modifier forces the link to be a CA link. C
-    // `dbParseLink` only reaches the modifier scan after the
-    // constant test (`dbStaticLib.c:2347`) has already failed — a
-    // string carrying a ` CA` suffix never parses as a bare double,
-    // so a CA-forced link is always a `PV_LINK`. Honour that here:
-    // once ` CA` was stripped, classify as `ParsedLink::Ca` with the
-    // remaining `link_part` (the `record.field` PV name) verbatim,
-    // never as a Constant or local Db link.
+    // Isolate the target from its modifiers — see [`split_link_modifiers`].
+    let (link_part, policy, ms, force_ca) = split_link_modifiers(s);
+
+    // A `CA` modifier forces the link to be a CA link (C
+    // `dbStaticLib.c:2372` — `pinfo->modifiers = pvlOptCA`, and
+    // `dbAccess.c:1104` routes a link with any of `CA|CP|CPP` away from
+    // `dbDbInitLink`). `dbParseLink` reaches the modifier scan only after the
+    // constant test (`:2347`) has failed, so a CA-forced link is always a
+    // `PV_LINK` — never a Constant or local Db link.
     if force_ca {
-        // a bare ` CA`-forced link carries the same
-        // maximize-severity policy as any other link — store the parsed
-        // `ms` so e.g. `REC.VAL CA MS` keeps its `MS` gate instead of
-        // discarding it. It also carries the CP/CPP process policy
-        // (`REC.VAL CP CA`): store it so the calink resolver processes
-        // the holder on a remote change instead of dropping the CP
-        // intent.
+        // `CA` is a *process class*, so it is mutually exclusive with
+        // `CP`/`CPP` and the class chain has already resolved the policy to
+        // `NoProcess`: `"OTHER:PV CP CA"` matches "CA" before "CP" in C and
+        // yields `pvlOptCA` alone — a plain CA link that never processes its
+        // holder. The maximize-severity switch is a *separate* chain and does
+        // ride along (`REC.VAL CA MS` keeps its MS gate).
         return ParsedLink::Ca(CaLink {
             pv: link_part.to_string(),
             monitor_switch: ms,
@@ -884,19 +914,6 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // Numeric constant
     if link_part.parse::<f64>().is_ok() {
         return ParsedLink::Constant(link_part.to_string());
-    }
-
-    // Quoted string constant.
-    // C parity (3b484f5): an empty quoted string `""` is equivalent to an
-    // unset link — dbConstLoadScalar/Array reject `""` the same as NULL with
-    // S_db_badField. Treat it as None here so callers don't see a meaningless
-    // empty Constant.
-    if link_part.starts_with('"') && link_part.ends_with('"') && link_part.len() >= 2 {
-        let inner = &link_part[1..link_part.len() - 1];
-        if inner.is_empty() {
-            return ParsedLink::None;
-        }
-        return ParsedLink::Constant(inner.to_string());
     }
 
     // DB link: split record from field exactly as C `dbNameToAddr`
@@ -1308,30 +1325,15 @@ mod json_link_tests {
     }
 
     #[test]
-    fn ca_modifier_combined_with_pp_ms() {
-        // `CA` may co-occur with PP/MS-style modifiers in
-        // any order. The PV name is stripped clean, AND the `MS`-class
-        // modifier is now CARRIED in the CaLink (pre-fix it was
-        // discarded, reducing both forms to a bare `Ca("REC.VAL")`).
+    fn ca_modifier_combined_with_ms() {
+        // The MS-class switch is an INDEPENDENT chain (`dbStaticLib.c:2375`),
+        // so it rides along with the CA process class in any token order.
         assert_eq!(
             parse_link_v2("REC.VAL CA MS"),
             ParsedLink::Ca(CaLink {
                 pv: "REC.VAL".to_string(),
                 monitor_switch: MonitorSwitch::Maximize,
                 policy: LinkProcessPolicy::NoProcess,
-            })
-        );
-        // `PP CA` now CARRIES the `PP` process policy (pre-fix the
-        // force-CA branch discarded it, reducing this to a bare
-        // `CaLink::new`); no MS-class modifier → NoMaximize. `PP` is not
-        // CP/CPP, so `cp_passive_only() == None` and this link is never
-        // registered as an external CP holder.
-        assert_eq!(
-            parse_link_v2("REC.VAL PP CA"),
-            ParsedLink::Ca(CaLink {
-                pv: "REC.VAL".to_string(),
-                monitor_switch: MonitorSwitch::NoMaximize,
-                policy: LinkProcessPolicy::ProcessPassive,
             })
         );
         // `CA NMS` carries the explicit NoMaximize switch.
@@ -1344,6 +1346,109 @@ mod json_link_tests {
             })
         );
         assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
+    }
+
+    // R6-3 — the process class is ONE `else if` chain over the whole modifier
+    // string (`dbStaticLib.c:2369-2373`), in the order NPP, CPP, PP, CA, CP,
+    // ASSIGNING exactly one bit. The chain order decides, not the token order:
+    // the pre-fix parser stripped ordered suffixes (last one wins) and let a
+    // ` CA` flag coexist with a CP/PP policy.
+    #[test]
+    fn process_class_precedence_is_chain_order_not_token_order() {
+        // "REC CP NPP" → NPP wins (modifiers = 0): no CP subscription. The
+        // pre-fix suffix loop stripped " NPP" then " CP" and ended at CP,
+        // registering the holder in the CP trigger registry.
+        assert_eq!(
+            parse_link_v2("REC CP NPP"),
+            ParsedLink::Db(DbLink {
+                record: "REC".to_string(),
+                field: "VAL".to_string(),
+                policy: LinkProcessPolicy::NoProcess,
+                monitor_switch: MonitorSwitch::NoMaximize,
+            })
+        );
+        // "OTHER:PV CP CA" → CA is matched BEFORE CP, so it is pvlOptCA alone:
+        // a plain CA link whose holder never processes. Pre-fix this was a Ca
+        // link with policy=ChannelProcess, reprocessing the holder on every
+        // remote monitor update.
+        assert_eq!(
+            parse_link_v2("OTHER:PV CP CA"),
+            ParsedLink::Ca(CaLink {
+                pv: "OTHER:PV".to_string(),
+                monitor_switch: MonitorSwitch::NoMaximize,
+                policy: LinkProcessPolicy::NoProcess,
+            })
+        );
+        // "REC PP CA" → PP is matched BEFORE CA, so no CA|CP|CPP bit is set
+        // and dbAccess.c:1104 routes to dbDbInitLink: a LOCAL DB link with PP.
+        // Pre-fix this became an external CA channel.
+        assert_eq!(
+            parse_link_v2("REC PP CA"),
+            ParsedLink::Db(DbLink {
+                record: "REC".to_string(),
+                field: "VAL".to_string(),
+                policy: LinkProcessPolicy::ProcessPassive,
+                monitor_switch: MonitorSwitch::NoMaximize,
+            })
+        );
+        // CPP is matched before PP, and CP only after CA.
+        assert!(matches!(
+            parse_link_v2("REC CPP"),
+            ParsedLink::Db(DbLink {
+                policy: LinkProcessPolicy::ChannelProcessPassive,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_link_v2("REC CP"),
+            ParsedLink::Db(DbLink {
+                policy: LinkProcessPolicy::ChannelProcess,
+                ..
+            })
+        ));
+        // Exactly one class: a modifier-less link is NPP.
+        assert!(matches!(
+            parse_link_v2("REC"),
+            ParsedLink::Db(DbLink {
+                policy: LinkProcessPolicy::NoProcess,
+                ..
+            })
+        ));
+    }
+
+    // C searches the modifier text with `strstr`, so the tokens need no space
+    // between them — its own comment pins `"QQCPPXMSITT"` as CPP|MSI. The
+    // pre-fix suffix loop required a leading space and an exact tail match, so
+    // it saw no modifiers at all here.
+    #[test]
+    fn modifiers_are_substring_matched_not_space_delimited() {
+        assert_eq!(
+            parse_link_v2("REC QQCPPXMSITT"),
+            ParsedLink::Db(DbLink {
+                record: "REC".to_string(),
+                field: "VAL".to_string(),
+                policy: LinkProcessPolicy::ChannelProcessPassive,
+                monitor_switch: MonitorSwitch::MaximizeIfInvalid,
+            })
+        );
+    }
+
+    // The MS chain is longest-match-first too: NMS, MSI, MSS, MS.
+    #[test]
+    fn maximize_switch_precedence() {
+        for (link, expect) in [
+            ("REC NMS", MonitorSwitch::NoMaximize),
+            ("REC MSI", MonitorSwitch::MaximizeIfInvalid),
+            ("REC MSS", MonitorSwitch::MaximizeStatus),
+            ("REC MS", MonitorSwitch::Maximize),
+            // NMS is matched first even though the string also contains "MS".
+            ("REC MS NMS", MonitorSwitch::NoMaximize),
+        ] {
+            match parse_link_v2(link) {
+                ParsedLink::Db(db) => assert_eq!(db.monitor_switch, expect, "link {link}"),
+                other => panic!("link {link}: expected Db, got {other:?}"),
+            }
+        }
     }
 
     #[test]

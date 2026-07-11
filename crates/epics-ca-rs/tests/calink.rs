@@ -211,7 +211,12 @@ async fn ca_cp_holder_processes_on_remote_change() {
     pin_env(port);
     let db = PvDatabase::new();
 
-    // Passive ai holder with a bare ` CP CA` INP link to the remote PV.
+    // Passive ai holder with a bare ` CP` INP link to the remote PV. `CP` is
+    // the whole modifier: C's process-class chain (`dbStaticLib.c:2369-2373`)
+    // assigns exactly one bit and matches `CA` *before* `CP`, so spelling this
+    // `"... CP CA"` would yield `pvlOptCA` alone — a plain CA link whose
+    // holder never processes. A bare `CP` is what makes the link a dbCa link
+    // with `CA_DBPROCESS` (`dbCa.c:993-994`).
     // ai's default SCAN is Passive — assert it so the "never self-scans,
     // so the link is never opened lazily" precondition is explicit.
     db.add_record("CALINK:CP:HOLDER", Box::new(AiRecord::new(0.0)))
@@ -220,7 +225,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     {
         let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
         let mut inst = rec.write().await;
-        inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP CA".into()))
+        inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
             .unwrap();
         inst.common.udf = false;
         assert_eq!(
@@ -586,7 +591,7 @@ fn ca_modifier_link_classifies_as_ca() {
 /// and VAL stayed at its initial 0.0; the pure-CA `run_ca_ioc` runner never
 /// installed calink at all. This test fails on either of those.
 ///
-/// The holder record and its bare ` CP CA` INP link are loaded via
+/// The holder record and its bare ` CP` INP link are loaded via
 /// `dbLoadRecords` from an st.cmd — the real iocInit path, where INP is set
 /// before `setup_cp_links` runs. A custom protocol runner (in place of
 /// `run_ca_ioc`) observes the warmed VAL and returns `Ok(())`, so `run`
@@ -608,15 +613,19 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
 
     pin_env(port);
 
-    // The Passive `ai` holder's INP is a bare ` CP CA` link to the remote
-    // PV; PINI=NO so it never self-processes — only the iocInit CP warm can
-    // open its monitor and drive the first process.
+    // The Passive `ai` holder's INP is a bare ` CP` link to the remote PV.
+    // `CP` is the whole modifier: C's process-class chain matches `CA` before
+    // `CP` and assigns exactly one bit, so `"... CP CA"` would be `pvlOptCA`
+    // alone — a plain CA link whose holder never processes
+    // (`dbStaticLib.c:2369-2373`). PINI=NO so the holder never self-processes;
+    // only the iocInit CP warm can open its monitor and drive the first
+    // process.
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("seam.db");
     std::fs::write(
         &db_path,
         "record(ai, \"CALINK:SEAM:HOLDER\") {\n\
-         \tfield(INP, \"CALINK:SEAM:SRC CP CA\")\n\
+         \tfield(INP, \"CALINK:SEAM:SRC CP\")\n\
          \tfield(PINI, \"NO\")\n\
          \tfield(SCAN, \"Passive\")\n\
          }\n",

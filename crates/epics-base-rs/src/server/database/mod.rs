@@ -198,7 +198,7 @@ struct PvDatabaseInner {
     /// [`CpTarget`]).
     cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
     /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
-    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP CA"`)
+    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
     /// → holder edges to process when that remote PV changes. The local
     /// [`Self::cp_links`] index is keyed by a local source RECORD that
     /// processes here; a cross-IOC source never processes locally, so its

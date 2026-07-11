@@ -1697,7 +1697,7 @@ impl PvDatabase {
 
     /// Register an EXTERNAL CP/CPP link: when the remote PV `external_pv`
     /// (a cross-IOC CA/PVA source, e.g. `OTHER:PV` from
-    /// `INP="OTHER:PV CP CA"`) changes, process `target_record`.
+    /// `INP="OTHER:PV CP"`) changes, process `target_record`.
     ///
     /// Twin of [`Self::register_cp_link`] for cross-IOC sources. The key is
     /// the **scheme-stripped external PV name** — it is not a local record,
@@ -1771,9 +1771,11 @@ impl PvDatabase {
     /// A link with no CP/CPP policy (`cp_passive_only() == None`), and
     /// every non-`Db`/`Ca` variant, is ignored.
     ///
-    /// `Ca`: an external `ca://OTHER CP` / `OTHER CP CA` holder always
-    /// drives the cross-IOC path — C `dbCa.c` `eventCallback` adds
-    /// `CA_DBPROCESS` for every CP link (`dbCa.c:993-994`).
+    /// `Ca`: an external `ca://OTHER CP` holder always drives the cross-IOC
+    /// path — C `dbCa.c` `eventCallback` adds `CA_DBPROCESS` for every CP link
+    /// (`dbCa.c:993-994`). Note `OTHER CP CA` is NOT such a link: `CA` and `CP`
+    /// are mutually exclusive process classes and `CA` is matched first
+    /// (`dbStaticLib.c:2369-2373`), so it is a plain CA link with no CP policy.
     ///
     /// `Db`: C `dbInitLink` (`dbLink.c:118-130`) makes any link carrying a
     /// `CP`/`CPP`/`CA` option a CA link, and `dbDbInitLink` keeps it local

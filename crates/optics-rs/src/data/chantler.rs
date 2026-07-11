@@ -13,7 +13,14 @@ pub struct FilterMaterial {
     /// Element symbol (e.g. "Cu").
     pub name: &'static str,
     /// Bulk density in g/cm^3.
-    pub density: f32,
+    ///
+    /// `double` in C, not `float`: the absorption/transmission maths reads the
+    /// separate `extern double matdensity[]` array (`chantler.h:7`,
+    /// `chantler.c:8`) — `absLen = 1/(matdensity[i]*mu)` in `pf4.st:644` and
+    /// `filterDrive.st:299` — never the `float density` field of C's
+    /// `filterMaterial` struct, which no computation reads. `kev`/`mu` below
+    /// stay `f32` because those *are* `float` in C's struct (`chantler.h:13-14`).
+    pub density: f64,
     /// Photon energies in keV (sorted ascending).
     pub kev: &'static [f32],
     /// Mass-attenuation coefficients mu/rho in cm^2/g.
@@ -1248,7 +1255,7 @@ pub fn interpolate_mu(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
 /// Returns `exp(-mu/rho * rho * thickness)`, or `None` if the energy is out of range.
 pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) -> Option<f64> {
     let mu = interpolate_mu(mat, energy_kev)?;
-    let rho = mat.density as f64;
+    let rho = mat.density;
     Some((-mu * rho * thickness_cm).exp())
 }
 
@@ -1277,8 +1284,8 @@ pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> f64 
     let y1 = table_cell(mat.mu, j + 1);
     let frac = (energy_kev - x0) / (x1 - x0);
     let mu = y0 + frac * (y1 - y0);
-    // C pf4.st:644-645 — absLen = 1/(density*mu), cm -> microns.
-    (1.0 / (mat.density as f64 * mu)) * 1.0e4
+    // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
+    (1.0 / (mat.density * mu)) * 1.0e4
 }
 
 #[cfg(test)]
@@ -1299,6 +1306,52 @@ mod tests {
         assert!(find_material("Cu").is_some());
         assert!(find_material("cu").is_none());
         assert!(find_material("CU").is_none());
+    }
+
+    // R6-73: density is C's `double matdensity[]` (chantler.c:8), so every
+    // tabulated value must be the exact double literal — an `f32` field widened
+    // back to `f64` carries the single-precision rounding into
+    // `1/(matdensity[i]*mu)` (pf4.st:644, filterDrive.st:299).
+    #[test]
+    fn test_r6_73_density_is_the_exact_c_double() {
+        // Values whose f32 image is *not* the double: the boundary of the bug.
+        for (name, c_double) in [
+            ("Be", 1.848_f64),
+            ("Mo", 10.22_f64),
+            ("Zn", 7.133_f64),
+            ("Ta", 16.65_f64),
+            ("Au", 19.32_f64),
+        ] {
+            let mat = find_material(name).unwrap();
+            assert_eq!(mat.density, c_double, "{name} density");
+            assert_ne!(
+                c_double, c_double as f32 as f64,
+                "{name} is a poor witness: f32 round-trips exactly"
+            );
+        }
+        // Spot-check two more against C's matdensity[] literals.
+        assert_eq!(find_material("Cr").unwrap().density, 7.18_f64);
+        assert_eq!(find_material("Pb").unwrap().density, 11.35_f64);
+    }
+
+    // R6-73: the absorption length must not carry f32 density rounding. With a
+    // `f32` density, Mo's 1/(rho*mu) differed in the 8th significant digit.
+    #[test]
+    fn test_r6_73_absorption_length_uses_double_density() {
+        let mo = find_material("Mo").unwrap();
+        let mu = {
+            let j = first_energy_above(mo.kev, 20.0);
+            let x0 = table_cell(mo.kev, j);
+            let x1 = table_cell(mo.kev, j + 1);
+            let y0 = table_cell(mo.mu, j);
+            let y1 = table_cell(mo.mu, j + 1);
+            y0 + ((20.0 - x0) / (x1 - x0)) * (y1 - y0)
+        };
+        let expected = (1.0 / (10.22_f64 * mu)) * 1.0e4;
+        assert_eq!(other_absorption_length_um(mo, 20.0), expected);
+        // The pre-fix value (f32 density widened) is a *different* double.
+        let f32_density = (1.0 / (10.22_f32 as f64 * mu)) * 1.0e4;
+        assert_ne!(expected, f32_density);
     }
 
     #[test]
@@ -1346,8 +1399,9 @@ mod tests {
     }
 
     /// Relative agreement with a value produced by the C function itself.
-    /// The tables are `float` in both languages; only `matdensity` is `double`
-    /// in C against `f32` here, so the last few digits can differ.
+    /// The `keV`/`mu` tables are `float` in both languages and `matdensity` is
+    /// `double` in both (R6-73), so only the last bits of the float tables can
+    /// differ.
     fn assert_close(actual: f64, expected: f64, what: &str) {
         let rel = (actual - expected).abs() / expected.abs().max(1e-30);
         assert!(rel < 1e-6, "{what}: got {actual}, C gives {expected}");

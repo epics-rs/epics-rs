@@ -905,6 +905,13 @@ impl PortDriverBase {
     /// mask for the `UInt32Digital` interface (a record's `@asynMask` gates on it,
     /// `asynPortDriver.cpp:720`); pass `0` for the other interfaces, whose
     /// subscribers carry no mask filter.
+    ///
+    /// `aux_status` is the device I/O status this fire carries (C
+    /// `pInterrupt->pasynUser->auxStatus`, set on every callback the poller
+    /// emits — `drvModbusAsyn.cpp:1697/1738/1774/1810/1880/1915`). A driver whose
+    /// last acquisition failed still fires its interrupt lists, with the failing
+    /// status, so I/O-Intr records go to READ/INVALID instead of freezing on the
+    /// last good value; pass [`AsynStatus::Success`] on a clean acquisition.
     pub fn notify_interface_value(
         &self,
         reason: usize,
@@ -912,6 +919,7 @@ impl PortDriverBase {
         iface: InterfaceType,
         value: ParamValue,
         uint32_changed_mask: u32,
+        aux_status: AsynStatus,
     ) {
         let ts = self.current_timestamp();
         self.interrupts.notify(InterruptValue {
@@ -920,10 +928,7 @@ impl PortDriverBase {
             value,
             timestamp: ts,
             uint32_changed_mask,
-            // A successful per-interface decode (the caller fires only after the
-            // raw read succeeded); a transport failure aborts the poll before
-            // any fire, matching C's `if (ioStatus_) ... return` in readPoller.
-            aux_status: AsynStatus::Success,
+            aux_status,
             alarm_status: 0,
             alarm_severity: 0,
             iface: Some(iface),

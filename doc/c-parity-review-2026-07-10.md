@@ -546,6 +546,152 @@ Impact: `caput -a` of a multi-element array to a scalar fails on the port, succe
 - Flaky under load (not root-caused): `epics-pva-rs::stability` `pva_fr_8_pause_holds_latest_then_resume_delivers` and `array_concurrent_subop_replies_error_not_silent` each failed once in runs launched right after a rebuild, pass in isolation and on a quiet machine (fixer-A report); both passed in main's post-merge workspace runs. Same pattern after the wave-3 merge: `regression-ioc::motor d_motor_moves_again_on_second_caput` and `regression-ioc::families o_seeded_record_suppresses_duplicate_post` failed once in the first post-rebuild workspace run, then passed in isolation AND in a second full workspace run (7541/7541). Also pre-existing per fixer-B: `epics-ca-rs protocol_tests::mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer` (UDP-burst timing, fails on the unmodified tree too).
 - Observation (fixer-B, pre-existing): `epics-tools-rs listener.rs:154,236` log "listener accepted" at bind time with the listener's own address — reads as a spurious client connection.
 
+## Round 7 — re-audit (2026-07-12): fix verification + fresh findings
+
+Same 5 auditor panels (opus, read-only), same category blocks (R7-1..15 / 16..30 /
+31..45 / 46..60 / 61..75). Mandate: (a) independently verify every R6 fix commit
+against the C reference at HEAD, (b) fresh negative-space hunt on surfaces the
+fixes touched or R6 did not reach.
+
+### Fix verification result
+
+Every R6 fix commit was independently verified against the C/C++ reference by the
+re-audit panels — **no wrong or incomplete fix found**, with one exception filed as
+a finding: R6-48's `PartialRead` variant is built correctly inside the interpose
+but the bytes are still discarded at the actor dispatch (filed as R7-46, a
+fix-completeness finding). Per-panel "Audited clean" evidence is in the round
+report (`.caucus/sessions/01KX5QMAM71PJZFNWG0SFREHPX/rounds/01KX90HK1EGW864MNKCNPFDHJY.md`).
+
+### Category A — epics-base-rs database engine (R7-1..R7-2)
+
+### R7-1: `caput REC.PROC` bypasses the DISP put-disable gate that C enforces first
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/database/field_io.rs:762-823` — the `if field == "PROC"` intercept in `put_record_field_from_ca_inner` processes and **returns** before the DISP gate at `:826`; comment at `:757` says "regardless of DISP". No earlier DISP check in `:703-762`.
+C reference: `modules/database/src/ioc/db/dbAccess.c:1256` — `dbPutField` returns `S_db_putDisabled` when `precord->disp && paddr->pfield != &precord->disp` **before** dbPut and the PROC-driven dbProcess (`:1265-1277`). PROC's pfield ≠ &disp, so DISP blocks it.
+Impact: `caput REC.PROC 1` on a `DISP=1` record force-processes on the port; C returns S_db_putDisabled and does not process (WRITE_NOTIFY carries the error). The QSRV boundary (`field_io.rs:214-217`) *does* block PROC under DISP, so the two external-put boundaries disagree.
+
+### R7-2: client put to a pp field / .PROC on an async-active record never sets RPRO; C's deferred reprocess is lost
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/database/field_io.rs:1082-1190` (should_process path) and `:762-807` (PROC path) call `process_record_with_links_already_locked` unconditionally; the re-entrant PACT branch (`processing.rs:1038-1065`) bumps lcnt / raises SCAN_ALARM but never sets `common.rpro`. The `tg.common.rpro = true` sets at `processing.rs:3225,4220` are the DB-link target path only.
+C reference: `dbAccess.c:1269-1273` — `dbPutField` on `precord->pact` sets `rpro = TRUE` and skips dbProcess; `recGblFwdLink` (`recGbl.c:288-302`) sees RPRO on async completion and queues `scanOnce`.
+Impact: two rapid caputs to a Passive async output (asyn/motor ao/longout): C writes both values to the device (second via RPRO reprocess); the port writes only the first — the second lands in VAL but never reaches hardware and schedules no reprocess.
+
+### Category B — epics-ca-rs + epics-tools-rs (R7-16..R7-19)
+
+### R7-16: server default access-security host identity uses peer IP; C trusts the client-claimed hostname by default
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/server/tcp.rs:1350` (hostname defaults to peer IP) and `:1964-1966` — CA_PROTO_HOST_NAME overwrites `state.hostname` only when `EPICS_CAS_USE_HOST_NAMES=YES` (default NO), so ACF/HAG matching runs against the peer IP.
+C reference: `camessage.c:839-869` — `host_name_action` stores the client-supplied name **unconditionally** in the default path; only when `asCheckClientIP` (global, default **0**, `asLibRoutines.c:34`) is set does it keep the IP. `asLibRoutines.c:1223` matches HAGs against that hostname. `EPICS_CAS_USE_HOST_NAMES` does not exist in epics-base.
+Impact: a `HOST(node)` HAG rule that grants WRITE in C grants nothing in Rust on identical `.acf`; CA_PROTO_ACCESS_RIGHTS and caput enforcement differ. Three docs (`doc/09-libca-parity.md:159`, `doc/04-server.md:119`, `doc/08-environment.md:178`) falsely assert this "matches C rsrv default".
+
+### R7-17: procServ kill-key on a dead child omits the unconditional "@@@ Got a kill command" broadcast
+Severity: Low
+Rust: `crates/epics-tools-rs/src/procserv/menu.rs:65-68` — `Action::evaluate` returns a single action per byte; dead child + kill char returns `RestartChild` early, never reaching `KillChild` (`:87-91`), so the supervisor broadcast never fires.
+C reference: `procServ/clientFactory.cc:207-213,236-240` — restart-on-dead block AND a separate non-`else` kill-char block that always runs `SendToAll("\n@@@ Got a kill command\n")` + signal.
+Impact: monitoring clients scripting against console markers see the marker in C but not in Rust when `^X` is pressed while the child is down. The single-action-per-byte abstraction structurally cannot express "restart AND broadcast".
+
+### R7-18: server tears down the circuit on an oversize inbound request; C replies ECA_TOLARGE, drains, keeps serving
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/server/tcp.rs:1549-1554` — after ECA_TOLARGE for `ext_post > max_payload_size()`, `break 'client_loop Err(...)` closes the connection; the comment claims "matches C dispatcher … + drop" — false.
+C reference: `camessage.c:2472-2489` — TCP clients get `send_err(ECA_TOLARGE)`, then `recvBytesToDrain` skips the oversize body (drain at `:2375-2383`) and the circuit continues.
+Impact: one oversize array caput destroys every channel/subscription on the Rust circuit; C keeps them all alive. Server-side sibling of R6-21 (client fix not mirrored).
+
+### R7-19: client imposes a hardcoded 5-second TCP connect ceiling; C uses a blocking connect
+Severity: Low
+Rust: `crates/epics-ca-rs/src/client/transport.rs:878-892` — `tokio::time::timeout(5s, TcpStream::connect)`, abandons on expiry.
+C reference: `tcpiiu.cpp:606-661` — blocking `::connect()` bounded by the OS TCP timeout; transient name-service failure sleeps EPICS_CA_CONN_TMO (30 s default) and retries.
+Impact: slow-but-live servers (SYN-lossy path, 5–30 s handshake) reachable from C are unreachable from Rust.
+
+### Category C — epics-bridge-rs QSRV source layer (R7-31..R7-33)
+
+Shared structural root: the three QSRV **source-layer** `logRemote` sites in pvxs
+(`groupsource.cpp:560`, `singlesource.cpp:129`, `iocsource.cpp:447`) have no Rust
+counterpart — the source→wire boundary passes only values/masks and cannot inject
+an IOID-tagged CMD_MESSAGE. One fix (thread a diagnostic sink from the source
+option-parse sites to the op's `chan_tx`) closes all three.
+
+### R7-31: QSRV group PUT drops a marked-but-not-putable member silently, omitting pvxs's "no putorder" CMD_MESSAGE
+Severity: Low
+Rust: `crates/epics-bridge-rs/src/qsrv/group.rs:1399-1403` — `filter_map` drops `put_order == None` members before iteration; no diagnostic.
+C reference: `ioc/groupsource.cpp:556-561` — on `marked && !putable`, `notify.logRemote(Warn, "<field>: no putorder, ignore write")` → CMD_MESSAGE frame (`serverconn.cpp:146-160`).
+Impact: write outcome identical, but the Warning wire frame naming the ignored field is absent.
+
+### R7-32: QSRV single-record MONITOR DBE string selecting an empty mask silently falls back, omitting pvxs's "selects empty mask" CMD_MESSAGE
+Severity: Low
+Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:179-189` — unrecognized `record._options.DBE` string (e.g. "LOG", lowercase "value") folds to VALUE|ALARM via `dbe_value_class_mask(0)` with no diagnostic.
+C reference: `ioc/singlesource.cpp:122-130` — warns `<name>="<mask>" selects empty mask` before the same fallback.
+Impact: identical fallback mask, missing Warning frame.
+
+### R7-33: QSRV GET/PUT `record._options.process` with an unsupported value silently maps to passive, omitting pvxs's "Ignoring unsupported" CMD_MESSAGE
+Severity: Low
+Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:243-248` — `"passive"` and any unrecognized value both collapse into `None → Passive` with no diagnostic.
+C reference: `ioc/iocsource.cpp:426-447` — explicit `"passive"` → Unset silently; genuinely unsupported values warn via logRemote.
+Impact: same default applied, missing Warning frame; also loses the "passive"-vs-unsupported distinction.
+
+### Category D — asyn-rs (R7-46..R7-49)
+
+### R7-46: EOS-interpose partial bytes are retained in the error but never delivered to any record — the `?` at the actor dispatch discards them
+Severity: Medium (fix-completeness of R6-48)
+Rust: `crates/asyn-rs/src/port_actor.rs:459,485,515` — `self.driver.io_read_octet_eom(user, &mut buf)?` propagates `Err(PartialRead{..})` before `octet_read_eom` is built; `adapter.rs:2235-2240` maps to an alarm only (no value, NORD untouched); `sync_io.rs:103-113` returns the bare Err. `AsynError::partial_read()` has zero production consumers.
+C reference: `asynRecord.c:1592,1627` — `eomr`/`nord` assigned regardless of status; `asynInterposeEos.c:242-253` and `devAsynOctet.c:703` leave the caller's count populated.
+Impact: a device emitting partial "abc" then going quiet yields on C `AINP="abc"`, NORD=3, EOMR=0 with READ_ALARM; on the port a timeout alarm, no value, NORD unchanged. R6-48's own stated contract ("caller gets the timeout AND the bytes") is unmet past the interpose.
+
+### R7-47: `disconnectOnReadTimeout` never fires on any EOS-equipped IP port — `is_timeout` matches by variant, not `e.status()`
+Severity: Medium
+Rust: `crates/asyn-rs/src/drivers/ip_port.rs:667-673` — `matches!(e, AsynError::Status { status: Timeout, .. })`; the EOS interpose wraps every lower-layer error (incl. zero-byte timeout) as `PartialRead{status:Timeout}` (`interpose/eos.rs:199-207`), so `is_timeout` is always false and `should_disconnect` (`:685-688`) drops the term. Default `drvAsynIPPortConfigure` installs the EOS interpose (`iocsh.rs:636`). Sibling of the R6-48 `is_fatal_transport_error` conversion (`:551-557`) that was done.
+C reference: `drvAsynIPPort.c:798-806` — the disconnect test runs inside the driver's readRaw, below the interpose, on the raw recv timeout.
+Impact: `asynSetOption port 0 disconnectOnReadTimeout Y` is inert on every default IP port — no teardown, no reconnect; C drops and re-establishes.
+
+### R7-48: serial `clocal` is not persisted and is force-enabled at every connect; disconnected readback hard-codes `N` where C reports `Y`
+Severity: Medium
+Rust: `crates/asyn-rs/src/drivers/serial_port.rs:970-981` — clocal set_option mutates live termios only when connected, stores nothing (`SerialConfig` has no clocal field, unlike crtscts→flow_control at `:993-998`); `build_configured_termios` re-sets `CREAD|CLOCAL` every connect (`:609`); `get_option("clocal")` returns hard-coded "N" when disconnected (`:1130`).
+C reference: `drvAsynSerialPort.c:1077` (CLOCAL default on in the cached termios), `:410-419` setOption mutates the cache unconditionally, `:105-130` applyOptions re-pushes the cache on connect, `:169-170` getOption reads the cache (returns Y even disconnected).
+Impact: `clocal N` while disconnected is silently dropped; one set while connected reverts at the next auto-reconnect — modem-control mode cannot be held. Readback diverges (N vs Y).
+
+### R7-49: serial `ixon`/`ixoff`/`ixany` are not persisted and are wiped on reconnect by the flow-control-driven `c_iflag` rewrite
+Severity: Low
+Rust: `crates/asyn-rs/src/drivers/serial_port.rs:1000-1035` — set_option mutates live termios only when connected, caches nothing; `apply_to_termios` (`:69-79`) rewrites IXON|IXOFF|IXANY purely from `flow_control` at connect; get_option hard-codes "N" while disconnected (`:1160,:1173,:1185`).
+C reference: `drvAsynSerialPort.c:445-501` setOption mutates the cached c_iflag unconditionally; `:182-200` getOption reads the cache; settings survive reconnect via applyOptions.
+Impact: per-flag software flow control cannot be configured as C permits; values set while disconnected are lost with no error.
+
+### Category E — synApps modules + AD (R7-61..R7-66)
+
+### R7-61: scaler forward link (FLNK) never fires when CONT=AutoCount
+Severity: High
+Rust: `crates/scaler-rs/src/records/scaler.rs:898-900` — `should_fire_forward_link()` requires `ss == IDLE`, evaluated by the framework *after* `process()` (`processing.rs:2791`); the auto-count block (`scaler.rs:772-812`) has already flipped `ss` to WAITING (`:783`) or COUNTING (`:800,:811`) before returning.
+C reference: `scalerRecord.c:470-481` — `recGblFwdLink` is called *inside* process(), guarded `ss==IDLE && pcnt==0 && us==IDLE`, **before** the auto-count block (`:484-541`) re-arms.
+Impact: with CONT=AutoCount every forward-linked record silently never processes on the port; C fires FLNK on every completed auto-count cycle. OneShot unaffected.
+
+### R7-62: NDPluginROI bin-sum / narrowing conversion saturates where C wraps modulo the output type
+Severity: Medium
+Rust: `crates/ad-plugins-rs/src/roi.rs:409-437` — `extract!` accumulates in f64 and stores with `as $T` (saturating); narrowing conversions route through `ad_core_rs::color::convert_data_type`, which clamps (`color.rs:307-331`).
+C reference: `NDArrayPool.cpp:465` — `*pDOut += (dataTypeOut)*pDIn;` accumulates in the output type, wrapping modulo (C truncating cast); non-scale ROI path uses this directly (`NDPluginROI.cpp:174`); only EnableScale converts to Float64 first (`:166`).
+Impact: UInt8 image, 3×3 bin, all pixels 100, EnableScale=0: C = 900%256 = 132; Rust = 255. Same family for narrowing converts (300→UInt8: C 44, Rust 255).
+
+### R7-63: modbus scalar write stages the value into the register cache; C leaves the cache untouched
+Severity: Low
+Rust: `crates/modbus-rs/src/ioc.rs:742-747` — `flush_write` copies just-written registers into `self.engine.data_mut()` on every relative-mode write; scalar write_int32/64/float64/uint32_digital all route through it.
+C reference: `drvModbusAsyn.cpp:760-776` — scalar writeInt32 converts into a local buffer and never writes `data_`; only array writes stage (`:1402,:1232`); scalar reads (`:541,:550`) serve last-polled/init values.
+Impact: a read record served from a write port's cache returns the just-written value on the port, stale polled/init value on C. No wire divergence.
+
+### R7-64: epid bumpless-transfer seed of `.I`/`.OVAL` is applied before the MDT gate; C applies it after
+Severity: Low
+Rust: `crates/std-rs/src/records/epid.rs:750-767` — `pre_process_actions` emits `ReadDbLink{OUTL→I|OVAL}` on the FBON OFF→ON edge, executed before `do_pid`; the MDT gate (`epid_soft.rs:79-81`) then early-returns without committing fbop, so the seed lands and posts on a sub-MDT cycle and re-seeds next cycle.
+C reference: `devEpidSoft.c:125` — `if (dt<mdt) return(1);` **before** the OUTL seed at `:150-158`; sub-MDT cycles never read OUTL, monitor posts nothing.
+Impact: on a sub-MDT edge cycle the CA-visible .I/.OVAL takes the readback early and fires spurious monitors; converges to the same final value.
+
+### R7-65: scaler sub-millisecond auto-count path never copies gates into the direction registers
+Severity: Low
+Rust: `crates/scaler-rs/src/device_support/scaler_asyn.rs:343-352` — the `TP1 < 1 ms` run_autocount branch writes presets but never `scaler.d[i] = scaler.g[i]`; the record's auto-count block has no copy either.
+C reference: `scalerRecord.c:525-528` — `pdir[i]=pgate[i]` for all channels in the tp1<1e-3 branch.
+Impact: D{n} keeps stale values on sub-ms TP1 auto-count; CA-readable value only (C does not post it).
+
+### R7-66: scaler REQSTART direction copy runs over all 64 channels instead of NCH
+Severity: Low
+Rust: `crates/scaler-rs/src/records/scaler.rs:709-711` — `for i in 0..MAX_SCALER_CHANNELS`.
+C reference: `scalerRecord.c:413-414` — `for (i=0; i<pscal->nch; i++)`.
+Impact: inactive-channel D{n} (n ≥ nch) overwritten with G{n} on count start; cosmetic readback divergence.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -589,3 +735,16 @@ Impact: `caput -a` of a multi-element array to a scalar fails on the port, succe
   ports C's blocked-signal-mask leak — operational consequence documented above,
   awaiting veto if unwanted. Round-6 fix phase COMPLETE: 41 FIXED + 1 partial +
   2 NOT-REAL across 5 waves. Next: R7 re-audit.
+- Round 7 (2026-07-12): same 5 auditor panels (opus, read-only), dual mandate
+  (verify all R6 fixes + fresh hunt). Fix verification: every R6 fix confirmed
+  correct against the C reference; the one completeness gap is filed as R7-46
+  (R6-48's PartialRead bytes still discarded at the actor dispatch). 19 NEW
+  findings: High 1 / Medium 8 / Low 10 — A: 2 (0H/2M), B: 4 (0H/2M/2L),
+  C: 3 (0H/0M/3L, one shared structural root: missing source-layer logRemote
+  sink), D: 4 (0H/3M/1L), E: 6 (1H/1M/4L). Themes: put-path gate ordering
+  (R7-1/2 — DISP and RPRO both checked after the port's early intercepts where
+  C checks before); asyn option persistence (R7-48/49 — set_option mutates live
+  termios instead of the cached config C re-applies on connect); scaler
+  process-exit vs in-process decision timing (R7-61/65/66). Still OPEN from R6:
+  R6-76 (SIGXFSZ), R6-77 (tokenizer compile-split) + 4 deferred-by-sign-off
+  carryovers. Fix wave 5 next.

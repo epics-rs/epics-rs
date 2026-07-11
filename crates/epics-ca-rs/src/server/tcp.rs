@@ -213,7 +213,7 @@ pub enum ServerConnectionEvent {
 
 use super::LongStringMode;
 use crate::protocol::*;
-use crate::server::monitor::{FlowControlGate, spawn_monitor_sender};
+use crate::server::monitor::spawn_monitor_sender;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
@@ -483,7 +483,10 @@ struct ClientState {
     /// an already-rejected message still to arrive. They are discarded
     /// on arrival rather than parsed as headers.
     recv_bytes_to_drain: usize,
-    flow_control: Arc<FlowControlGate>,
+    /// C `client->evuser` (`rsrv/server.h`): this circuit's event user — the
+    /// owner of `flowCtrlMode` (EVENTS_OFF/EVENTS_ON) and of the event queue
+    /// every subscription on this circuit posts into (`db_init_events`).
+    event_user: Arc<epics_base_rs::server::event_queue::EventUser>,
     /// One-shot flag — set when channels.len() crosses 90% of the
     /// per-client cap. Prevents log spam on every subsequent
     /// CREATE_CHAN once the warning has fired.
@@ -626,7 +629,7 @@ impl ClientState {
             tcp_port,
             client_minor_version: 0,
             recv_bytes_to_drain: 0,
-            flow_control: Arc::new(FlowControlGate::default()),
+            event_user: Arc::new(epics_base_rs::server::event_queue::EventUser::new()),
             channel_limit_warned: false,
             peer: String::new(),
             audit: None,
@@ -4037,7 +4040,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             {
                 match &entry.target {
                     ChannelTarget::SimplePv(pv) => {
-                        let rx_opt = pv.add_subscriber(sub_id, native_type, mask).await;
+                        let rx_opt = pv
+                            .add_subscriber_on(&state.event_user, sub_id, native_type, mask)
+                            .await;
                         let Some(rx) = rx_opt else {
                             // per-PV subscriber cap reached.
                             // Previously dropped silently
@@ -4204,12 +4209,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         }
 
                         let task = spawn_monitor_sender(
-                            pv.clone(),
                             sub_id,
                             requested_type,
                             requested_count,
                             writer.clone(),
-                            state.flow_control.clone(),
                             rx,
                             denied.clone(),
                             long_string_mode,
@@ -4244,8 +4247,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                     ChannelTarget::RecordField { record, field } => {
                         let mut instance = record.write().await;
-                        let Some(rx) = instance.add_subscriber(field, sub_id, native_type, mask)
-                        else {
+                        let Some(rx) = instance.add_subscriber_on(
+                            &state.event_user,
+                            field,
+                            sub_id,
+                            native_type,
+                            mask,
+                        ) else {
                             // record-field subscriber cap reached.
                             // Symmetric with the SimplePv path; send
                             // ECA_ALLOCMEM so the client surfaces the
@@ -4415,7 +4423,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         }
 
                         let writer_clone = writer.clone();
-                        let flow_control = state.flow_control.clone();
                         let record_for_task = record.clone();
                         let denied = Arc::new(AtomicBool::new(access_denied));
                         let denied_for_task = denied.clone();
@@ -4427,37 +4434,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let client_minor = state.client_minor_version;
                         let req_hdr = *hdr;
                         let task = epics_base_rs::runtime::task::spawn(async move {
-                            let mut rx = rx;
-                            let mut flow = super::monitor::MonitorFlow::new(flow_control);
+                            let mut reader = rx;
                             loop {
-                                // Block on the queue front, then fold the
-                                // producer's coalesce overflow slot. When the
-                                // mpsc filled while we were busy the newest
-                                // value is parked in the slot;
-                                // `coalesce_consume` delivers it AND drains
-                                // the now-stale queue tail, so delivery never
-                                // steps from the newest value back to an older
-                                // queued one. A set slot implies the queue was
-                                // full, so the front `recv()` returns
-                                // immediately — no added latency, no
-                                // newest-then-old replay of the stale backlog.
-                                let Some(queued) = rx.recv().await else {
-                                    break;
-                                };
-                                let coalesced = record_for_task.read().await.pop_coalesced(sub_id);
-                                let event = epics_base_rs::server::pv::coalesce_consume(
-                                    &mut rx, queued, coalesced,
-                                );
-                                // EVENTS_OFF decision — see
-                                // `monitor::MonitorFlow`. The same owner as
-                                // `spawn_monitor_sender`, so a pause means the
-                                // same thing on both monitor paths.
-                                let Some(mut event) = flow
-                                    .admit(&mut rx, event, || async {
-                                        record_for_task.read().await.pop_coalesced(sub_id)
-                                    })
-                                    .await
-                                else {
+                                // C `event_read` on this circuit's queue — the
+                                // same single owner `spawn_monitor_sender` uses,
+                                // so a pause means the same thing on both monitor
+                                // paths: suspend only while `flowCtrlMode &&
+                                // nDuplicates == 0`, otherwise drain. A post that
+                                // arrived while the ring was short of room
+                                // replaced this monitor's LAST queued entry in
+                                // place, so the earlier distinct entries are
+                                // still queued and each goes out as its own
+                                // frame.
+                                let Some(mut event) = reader.recv().await else {
                                     break;
                                 };
                                 // One subscription update committed for
@@ -4797,10 +4786,14 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         }
 
         CA_PROTO_EVENTS_OFF | CA_PROTO_EVENTS_ON => {
+            // C `db_event_flow_ctrl_mode_on/off` on this circuit's event user
+            // (`camessage.c:1745-1757`). Under EVENTS_OFF each post replaces the
+            // monitor's last queued entry in place and readers suspend once the
+            // queue holds no duplicates — the queue owns both rules.
             if hdr.cmmd == CA_PROTO_EVENTS_OFF {
-                state.flow_control.pause();
+                state.event_user.flow_ctrl_on();
             } else {
-                state.flow_control.resume();
+                state.event_user.flow_ctrl_off();
             }
         }
 

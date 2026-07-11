@@ -3,9 +3,8 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::runtime::sync::mpsc;
-
 use crate::error::{CaError, CaResult};
+use crate::server::event_queue::{EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, Subscriber};
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo};
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -2802,14 +2801,11 @@ impl RecordInstance {
                         let Some(event) = filtered else {
                             continue;
                         };
-                        if sub.tx.try_send(event.clone()).is_err() {
-                            // route the coalesce overwrite through
-                            // the single owner so a record-field monitor
-                            // value lost to a slow consumer is counted in
-                            // `dropped_monitor_events()`, exactly like a
-                            // `ProcessVariable` overflow.
-                            sub.coalesce_overflow(event);
-                        }
+                        // C `db_queue_event_log`: append, or replace this
+                        // monitor's last queued entry in place when the queue
+                        // is in flow control or nearly full. The queue owns
+                        // that decision and counts the displaced value.
+                        sub.post(event);
                     }
                 }
             }
@@ -2875,13 +2871,8 @@ impl RecordInstance {
                         let Some(event) = filtered else {
                             continue;
                         };
-                        if sub.tx.try_send(event.clone()).is_err() {
-                            // same single coalesce-overflow owner
-                            // as the snapshot path — record-field loss to
-                            // a slow consumer must be counted, not silently
-                            // overwritten.
-                            sub.coalesce_overflow(event);
-                        }
+                        // Same single post owner as the snapshot path.
+                        sub.post(event);
                     }
                 }
             }
@@ -2901,18 +2892,35 @@ impl RecordInstance {
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
-    ) -> Option<mpsc::Receiver<MonitorEvent>> {
+    ) -> Option<EventReader> {
+        self.add_subscriber_on(&EventUser::new(), field, sid, data_type, mask)
+    }
+
+    /// Add a field subscriber whose events queue on `user`'s event queue —
+    /// C `db_add_event` with the circuit's `event_user` as context. Every
+    /// subscription on one CA circuit shares that queue and therefore its
+    /// `nDuplicates`, so a duplicate queued for one of them releases the
+    /// EVENTS_OFF drain for all of them (`dbEvent.c:947`). In-process consumers
+    /// use [`Self::add_subscriber`], which gives each its own `event_user`.
+    pub fn add_subscriber_on(
+        &mut self,
+        user: &EventUser,
+        field: &str,
+        sid: u32,
+        data_type: DbFieldType,
+        mask: u16,
+    ) -> Option<EventReader> {
         let cap = crate::server::pv::max_subscribers_per_pv();
         let field_str = field.to_string();
         let bucket = self.subscribers.entry(field_str.clone()).or_default();
-        // Reap dead Senders before
+        // Reap rows whose consumer is gone before
         // counting against the cap. A record field whose value
         // never changes (e.g. a quasi-static catalog field) never
         // triggers `notify_field_with_origin`'s retain-filter, so
         // a long-lived subscribe-disconnect storm could pin the
-        // bucket at `cap` worth of closed Senders and lock out
+        // bucket at `cap` worth of dead rows and lock out
         // genuine new subscribers.
-        bucket.retain(|s| !s.tx.is_closed());
+        bucket.retain(|s| !s.is_closed());
         if bucket.len() >= cap {
             tracing::warn!(
                 record = %self.name,
@@ -2923,13 +2931,12 @@ impl RecordInstance {
             );
             return None;
         }
-        let (tx, rx) = mpsc::channel(64);
+        let (sink, reader) = crate::server::event_queue::attach(user, sid);
         bucket.push(Subscriber {
             sid,
             data_type,
             mask,
-            tx,
-            coalesced: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sink,
             filters: crate::server::database::filters::FilterChain::new(),
             active: true,
         });
@@ -2941,7 +2948,7 @@ impl RecordInstance {
                 self.last_posted.insert(field_str, val);
             }
         }
-        Some(rx)
+        Some(reader)
     }
 
     /// Attach a filter to the most recently added subscriber for
@@ -2972,48 +2979,27 @@ impl RecordInstance {
 
     /// Pause / resume one subscriber's event flow at the source
     /// (`db_event_disable` / `db_event_enable`). `active == false`
-    /// suppresses every subsequent post to this subscriber AND drops any
-    /// pending coalesced overflow, so a resumed monitor restarts from the
-    /// source-side edge rather than replaying a value captured while it
-    /// was paused. No-op if no subscriber has this `sid`. The caller holds
-    /// the record write lock, so this is exclusive with the read-locked
-    /// post paths that consult `Subscriber::active`.
+    /// suppresses every subsequent post to this subscriber, so the record stops
+    /// doing per-event work for it. Entries already queued stay queued and are
+    /// still delivered, exactly as in C: `db_event_disable` only unlinks the
+    /// subscription from the record's monitor list (`dbEvent.c:521-533`) and
+    /// never reaches into the event queue. No-op if no subscriber has this
+    /// `sid`. The caller holds the record write lock, so this is exclusive with
+    /// the read-locked post paths that consult `Subscriber::active`.
     pub fn set_subscriber_active(&mut self, sid: u32, active: bool) {
         for subs in self.subscribers.values_mut() {
             for sub in subs.iter_mut() {
                 if sub.sid == sid {
                     sub.active = active;
-                    if !active && let Ok(mut slot) = sub.coalesced.lock() {
-                        *slot = None;
-                    }
                 }
             }
         }
     }
 
-    /// Take any pending coalesced overflow event for `sid` across all
-    /// fields. Drops-oldest semantics: if the per-subscriber mpsc filled
-    /// while the consumer was slow, the newest event was stashed in the
-    /// coalesce slot and is returned here.
-    pub fn pop_coalesced(&self, sid: u32) -> Option<MonitorEvent> {
-        for subs in self.subscribers.values() {
-            for sub in subs {
-                if sub.sid == sid {
-                    if let Ok(mut slot) = sub.coalesced.lock() {
-                        if let Some(ev) = slot.take() {
-                            return Some(ev);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Clean up closed subscriber channels.
+    /// Clean up subscriber rows whose consumer is gone.
     pub fn cleanup_subscribers(&mut self) {
         for subs in self.subscribers.values_mut() {
-            subs.retain(|s| !s.tx.is_closed());
+            subs.retain(|s| !s.is_closed());
         }
     }
 }
@@ -3080,23 +3066,25 @@ mod metadata_cache_tests {
         RecordInstance::new("TEMP".to_string(), rec)
     }
 
-    /// a record-field monitor whose bounded queue is full and
-    /// whose coalesce slot already holds an unobserved value must count
-    /// the displaced value in the shared `dropped_monitor_events()`
-    /// counter — the same accounting a `ProcessVariable` overflow uses.
-    /// Before the fix the record-field path overwrote the slot without
-    /// counting, hiding slow-consumer loss on the path most CA/PVA
-    /// database monitors use. The counter is process-global, so the
-    /// assertion is a strict monotonic increase (robust under parallel
-    /// tests); the revert-verify runs this test in isolation.
+    /// a record-field monitor whose event queue has run short of room
+    /// replaces its last queued entry in place (C `db_queue_event_log`,
+    /// `dbEvent.c:812-820`), and the displaced value — which the consumer never
+    /// observed — must be counted in the shared `dropped_monitor_events()`
+    /// counter (C `nreplace`), the same accounting a `ProcessVariable` post
+    /// uses. Before the fix the record-field path overwrote its coalesce slot
+    /// without counting, hiding slow-consumer loss on the path most CA/PVA
+    /// database monitors use. The counter is process-global, so the assertion is
+    /// a strict monotonic increase (robust under parallel tests); the
+    /// revert-verify runs this test in isolation.
     #[test]
     fn bfr10_record_field_overflow_counts_dropped_event() {
+        use crate::server::event_queue::{event_que_size, events_per_que};
         use crate::server::pv::dropped_monitor_events;
         use crate::server::recgbl::EventMask;
         let mut inst = ai_instance();
-        // Keep `rx` alive (do NOT drain) so the bounded 64-deep queue
-        // fills, then the coalesce slot, before overflow replacement.
-        let _rx = inst
+        // Keep the reader alive and do NOT drain, so the ring fills to the
+        // replace threshold and later posts displace the tail entry.
+        let _reader = inst
             .add_subscriber(
                 "VAL",
                 1,
@@ -3105,17 +3093,15 @@ mod metadata_cache_tests {
             )
             .expect("subscriber added");
         let before = dropped_monitor_events();
-        // 64 sends fill the queue; the 65th fills the (empty) coalesce
-        // slot; each send after that overwrites an UNOBSERVED slot value
-        // and must be counted as a dropped monitor event.
-        for _ in 0..70 {
+        let posts = event_que_size() - events_per_que() + 10;
+        for _ in 0..posts {
             inst.notify_field_with_origin("VAL", EventMask::VALUE, 0);
         }
         let after = dropped_monitor_events();
         assert!(
             after > before,
-            "record-field overflow onto an occupied coalesce slot must \
-             record a dropped monitor event (before={before}, after={after})"
+            "a post that replaces an unobserved queued entry must record a \
+             dropped monitor event (before={before}, after={after})"
         );
     }
 

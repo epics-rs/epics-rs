@@ -1795,24 +1795,23 @@ mod tests {
         assert_eq!(got, Some(5.0));
     }
 
-    /// Record-backed consumer half of the source-coalesced stale-tail rule.
+    /// R8-22 (record-field path): a record monitor whose event queue runs short
+    /// of room during a burst must receive its EARLIER DISTINCT queued updates
+    /// and then a tail entry carrying the latest value. C `db_queue_event_log`
+    /// replaces only `*pLastLog` (`dbEvent.c:812-820`); the earlier entries stay
+    /// queued and each is delivered by `event_read`.
     ///
-    /// `DbSubscription::next_event` shares the `coalesce_consume` ordering
-    /// rule with `PvSubscription`: a record-field monitor whose bounded
-    /// queue overflows mid-burst must converge on the newest value and
-    /// never step back to an older queued one. Each non-pp `VAL` put posts
-    /// exactly one DBE_VALUE monitor with the put value and does NOT
-    /// reprocess (see `ca_put_to_non_pp_val_posts_monitor`), so 80 distinct
-    /// puts produce a strictly increasing 1..=80 stream; with no consumer
-    /// draining, 1..=64 fill the queue and the newest (80) lands in the
-    /// coalesce slot.
+    /// Each non-pp `VAL` put posts exactly one DBE_VALUE monitor with the put
+    /// value and does NOT reprocess (see `ca_put_to_non_pp_val_posts_monitor`),
+    /// so N distinct puts produce a strictly increasing 1..=N stream.
     ///
-    /// Before the fix `next_event` returned the coalesced `80` and then
-    /// replayed the stale tail `1..=64` (`80, 1, 2, ...`) — value time
-    /// going backwards.
+    /// Before the fix the producer parked the newest value in a side coalesce
+    /// slot and `next_event`, finding it set, discarded the whole queued backlog
+    /// — the burst came out as one event instead of {1..=appended-1, N}.
     #[tokio::test]
-    async fn r0604_db_overflow_never_delivers_newest_then_old() {
+    async fn r8_22_db_burst_keeps_earlier_distinct_updates() {
         use crate::server::database::db_access::DbSubscription;
+        use crate::server::event_queue::{event_que_size, events_per_que};
         use crate::server::records::calc::CalcRecord;
 
         let db = PvDatabase::new();
@@ -1823,7 +1822,11 @@ mod tests {
             .await
             .expect("subscribe to CALC1.VAL");
 
-        for i in 1..=80u32 {
+        // With no consumer draining, the first `appended` puts take ring entries
+        // and every later put replaces the tail entry in place.
+        let appended = event_que_size() - events_per_que();
+        let burst = appended + 40;
+        for i in 1..=burst {
             db.put_record_field_from_ca("CALC1", "VAL", EpicsValue::Double(i as f64))
                 .await
                 .expect("CA put to CALC1.VAL must succeed");
@@ -1837,19 +1840,13 @@ mod tests {
         {
             seq.push(v);
         }
-        assert!(!seq.is_empty(), "consumer must observe at least one value");
-        for w in seq.windows(2) {
-            assert!(
-                w[0] <= w[1],
-                "record monitor delivery stepped backward {} -> {} (sequence {seq:?})",
-                w[0],
-                w[1],
-            );
-        }
+        let want: Vec<f64> = (1..appended)
+            .map(|i| i as f64)
+            .chain(std::iter::once(burst as f64))
+            .collect();
         assert_eq!(
-            *seq.last().unwrap(),
-            80.0,
-            "record consumer must converge on the newest produced value (sequence {seq:?})"
+            seq, want,
+            "record burst delivery must be {{earlier distinct backlog…, coalesced tail}}"
         );
     }
 }

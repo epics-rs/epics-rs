@@ -62,6 +62,20 @@ impl EosInterpose {
         }
     }
 
+    /// Single owner of the link-scoped input state: the read-ahead buffer
+    /// (`in_buf_head` / `in_buf_tail`) and the partial-EOS match position
+    /// (`eos_in_match`). Every site that must forget bytes belonging to a
+    /// past link or a past terminator routes through here — `flush`
+    /// (C `flushIt`, asynInterposeEos.c:262-264) and `connection_changed`
+    /// (C `eosInExceptionHandler`, asynInterposeEos.c:146-150) clear all
+    /// three; `set_input_eos` clears only the match position, because C
+    /// leaves `inBuf` alone on a terminator change.
+    fn reset_link_state(&mut self) {
+        self.in_buf_head = 0;
+        self.in_buf_tail = 0;
+        self.eos_in_match = 0;
+    }
+
     pub fn get_input_eos(&self) -> &[u8] {
         &self.config.input_eos
     }
@@ -226,9 +240,7 @@ impl OctetInterpose for EosInterpose {
     }
 
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
-        self.in_buf_head = 0;
-        self.in_buf_tail = 0;
-        self.eos_in_match = 0;
+        self.reset_link_state();
         next.flush(user)
     }
 
@@ -241,6 +253,17 @@ impl OctetInterpose for EosInterpose {
 
     fn set_output_eos(&mut self, eos: &[u8]) {
         self.config.output_eos = eos.to_vec();
+    }
+
+    /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151): on
+    /// `asynExceptionConnect` the interpose drops its read-ahead buffer and
+    /// its partial-EOS match position. Without it the first read on a
+    /// re-established link is served from up to `INPUT_BUFFER_SIZE` bytes of
+    /// the *previous* connection's traffic, and an `eos_in_match == 1` left
+    /// over from a 2-byte terminator that straddled the drop makes the first
+    /// byte of the new session complete a spurious EOS match.
+    fn connection_changed(&mut self) {
+        self.reset_link_state();
     }
 }
 
@@ -432,6 +455,84 @@ mod tests {
             b"CD\n",
             "cleared EOS must still drain buffered read-ahead bytes"
         );
+    }
+
+    /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151) drops the
+    /// read-ahead buffer on `asynExceptionConnect`. Boundary: bytes of the
+    /// *old* link are still buffered when the link changes — the first read
+    /// on the new link must come from the new link, not from `in_buf`.
+    #[test]
+    fn connection_change_drops_stale_read_ahead() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        });
+        // One lower read grabs "OLD1\nOLD2\n"; the first read returns "OLD1"
+        // and leaves "OLD2\n" stranded in in_buf.
+        let mut old_link = MockOctetBase::new(b"OLD1\nOLD2\n");
+        let user = AsynUser::default();
+        let mut buf = [0u8; 32];
+
+        let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"OLD1");
+        assert_ne!(
+            interpose.in_buf_tail, interpose.in_buf_head,
+            "precondition: OLD2\\n is buffered read-ahead"
+        );
+
+        // The link drops and comes back (either edge fires C's
+        // asynExceptionConnect).
+        interpose.connection_changed();
+        assert_eq!(interpose.in_buf_head, 0);
+        assert_eq!(interpose.in_buf_tail, 0);
+
+        let mut new_link = MockOctetBase::new(b"NEW1\n");
+        let r = interpose.read(&user, &mut buf, &mut new_link).unwrap();
+        assert_eq!(
+            &buf[..r.nbytes_transferred],
+            b"NEW1",
+            "first read after reconnect must not serve the previous link's bytes"
+        );
+    }
+
+    /// The other half of C's reset: `eosInMatch`. Boundary: a 2-byte
+    /// terminator straddles the drop, leaving `eos_in_match == 1`. Without
+    /// the reset the first byte of the new session that happens to equal the
+    /// terminator's *second* byte completes a spurious EOS match, truncating
+    /// the first response and reporting EOS one byte early.
+    #[test]
+    fn connection_change_clears_partial_eos_match() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\r', b'\n'],
+            output_eos: vec![],
+        });
+        let user = AsynUser::default();
+
+        // Old link ends mid-terminator: "AB\r" leaves eos_in_match == 1.
+        let mut old_link = MockOctetBase::new(b"AB\r");
+        let mut buf = [0u8; 32];
+        let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"AB\r");
+        assert_eq!(
+            interpose.eos_in_match, 1,
+            "precondition: the trailing \\r left a partial match"
+        );
+
+        interpose.connection_changed();
+        assert_eq!(interpose.eos_in_match, 0);
+
+        // New session's first byte is '\n' — the terminator's second byte.
+        // With a stale match it would complete the EOS and return 0 bytes;
+        // after the reset it is ordinary data.
+        let mut new_link = MockOctetBase::new(b"\nHELLO\r\n");
+        let mut buf2 = [0u8; 32];
+        let r = interpose.read(&user, &mut buf2, &mut new_link).unwrap();
+        assert_eq!(
+            &buf2[..r.nbytes_transferred],
+            b"\nHELLO",
+            "a stale partial match must not eat the new session's first byte"
+        );
+        assert!(r.eom_reason.contains(EomReason::EOS));
     }
 
     #[test]

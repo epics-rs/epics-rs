@@ -218,12 +218,34 @@ impl PortDriverBase {
             // throttle measures from the moment the link dropped.
             self.last_connect_disconnect = Some(Instant::now());
         }
+        // The interpose stack is a subscriber of this transition, exactly as
+        // in C: `asynInterposeEos` registers an exception callback
+        // (asynInterposeEos.c:110) and drops its read-ahead buffer +
+        // partial-EOS match on `asynExceptionConnect`
+        // (asynInterposeEos.c:142-151). Both C edges — `exceptionConnect`
+        // (asynManager.c:2158) and `exceptionDisconnect` (asynManager.c:2185)
+        // — raise that same exception, so both edges reset here. Driving the
+        // hook from this owner (rather than from an out-of-band subscriber)
+        // keeps it impossible to change `connected` without the stack
+        // hearing about it: `interpose_octet` and `connected` live in the
+        // same struct behind the same lock.
+        self.interpose_octet.connection_changed();
         self.announce_exception(AsynException::Connect, -1);
         true
     }
 
     /// Per-address variant — for multi-device ports. Same edge
     /// guarantee as [`Self::set_connected`].
+    ///
+    /// Deliberately does *not* reset the interpose stack. In C each
+    /// interpose is installed on one (port, addr) pair and registers its
+    /// exception callback on that address's `dpCommon`, so a device-level
+    /// connect exception only resets *that* device's interpose
+    /// (asynManager.c:611-625 fans out per-`dpCommon`). `interpose_octet`
+    /// here is port-scoped, so clearing it from a per-device transition
+    /// would discard read-ahead belonging to the port's other addresses.
+    /// The port-level transition owner [`Self::set_connected`] carries the
+    /// reset.
     pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
         let was = self.device_state(addr).connected;
         if was == connected {
@@ -1973,6 +1995,62 @@ mod tests {
             .unwrap();
         assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
         assert!(!r2.eom_reason.contains(EomReason::EOS));
+    }
+
+    /// R6-46 owner path: `set_connected` is the single transition owner, so
+    /// every driver that reconnects through it (serial, IP, prologix …) gets
+    /// the interpose reset for free. C wires this as an exception callback
+    /// (`asynInterposeEos.c:110,142-151`); here the owner drives the stack
+    /// directly. Boundaries: both edges reset (C's `asynExceptionConnect`
+    /// fires from `exceptionConnect` AND `exceptionDisconnect`), and a
+    /// no-op call (same state) must not.
+    #[test]
+    fn set_connected_resets_interpose_link_state() {
+        use crate::interpose::{OctetInterpose, OctetNext, OctetReadResult};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingInterpose(Arc<AtomicUsize>);
+        impl OctetInterpose for CountingInterpose {
+            fn read(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<OctetReadResult> {
+                next.read(user, buf)
+            }
+            fn write(
+                &mut self,
+                user: &mut AsynUser,
+                data: &[u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<usize> {
+                next.write(user, data)
+            }
+            fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
+                next.flush(user)
+            }
+            fn connection_changed(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("reset_test", 1, PortFlags::default());
+        base.push_octet_interpose(Box::new(CountingInterpose(resets.clone())));
+
+        // Port starts connected. Disconnect edge → reset (C exceptionDisconnect).
+        assert!(base.set_connected(false));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // Redundant call, no state change → no fan-out, no reset.
+        assert!(!base.set_connected(false));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // Reconnect edge → reset again (C exceptionConnect).
+        assert!(base.set_connected(true));
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
     }
 
     #[test]

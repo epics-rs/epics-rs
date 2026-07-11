@@ -81,6 +81,20 @@ pub trait OctetInterpose: Send + Sync {
 
     /// Notify the layer of an output end-of-string change. Default no-op.
     fn set_output_eos(&mut self, _eos: &[u8]) {}
+
+    /// Drop every piece of state scoped to the *current* link, because the
+    /// port's connection state just changed (connected → disconnected or
+    /// back). Default no-op: a layer whose state is pure configuration
+    /// (`delay`, `flush`, `echo`) survives a reconnect unchanged.
+    ///
+    /// C parity: `asynInterposeEos.c:110` registers `eosInExceptionHandler`
+    /// via `exceptionCallbackAdd`, and `:142-151` clears `inBufHead`,
+    /// `inBufTail` and `eosInMatch` on `asynExceptionConnect` — which
+    /// `exceptionConnect` (asynManager.c:2158) *and* `exceptionDisconnect`
+    /// (asynManager.c:2185) both fire, so the reset happens on either edge.
+    /// [`crate::port::PortDriverBase::set_connected`] is the Rust owner of
+    /// that transition and drives this hook for the whole stack.
+    fn connection_changed(&mut self) {}
 }
 
 /// A stack of octet interpose layers.
@@ -120,6 +134,18 @@ impl OctetInterposeStack {
     pub fn set_output_eos(&mut self, eos: &[u8]) {
         for layer in &mut self.layers {
             layer.set_output_eos(eos);
+        }
+    }
+
+    /// Tell every layer the port's connection state changed, so any
+    /// link-scoped state (read-ahead buffers, partial-terminator match
+    /// position) is dropped before the new link delivers its first byte.
+    /// Mirrors C's per-interpose `asynExceptionConnect` handlers
+    /// (`asynInterposeEos.c:142-151`); the only caller is the transition
+    /// owner [`crate::port::PortDriverBase::set_connected`].
+    pub fn connection_changed(&mut self) {
+        for layer in &mut self.layers {
+            layer.connection_changed();
         }
     }
 

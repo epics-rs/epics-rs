@@ -1412,7 +1412,7 @@ impl RecordInstance {
                 if old_scan != new_scan {
                     let phas = self.common.phas;
                     self.record.on_put(&name);
-                    let _ = self.record.special(&name, true);
+                    self.record.special(&name, true)?;
                     return Ok(CommonFieldPutResult::ScanChanged {
                         old_scan,
                         new_scan,
@@ -1499,7 +1499,7 @@ impl RecordInstance {
                     // to fire after the link has actually moved. The
                     // earlier `validate_put` + `special(name, false)`
                     // pair only covered the before-side.
-                    let _ = self.record.special(&name, true);
+                    self.record.special(&name, true)?;
                 }
             }
             "DTYP" => {
@@ -1580,7 +1580,7 @@ impl RecordInstance {
                     if old_phas != v && self.common.scan != ScanType::Passive {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
-                        let _ = self.record.special(&name, true);
+                        self.record.special(&name, true)?;
                         return Ok(CommonFieldPutResult::PhasChanged {
                             scan,
                             old_phas,
@@ -1754,7 +1754,11 @@ impl RecordInstance {
             _ => return Err(self.unknown_field_error(name)),
         }
         self.record.on_put(&name);
-        let _ = self.record.special(&name, true);
+        // C `dbPut` (dbAccess.c:1399-1405) returns the after-put
+        // `dbPutSpecial(paddr, 1)` status to the caller — the stored value
+        // stays, but the monitor post and the process are skipped and the
+        // client sees the failure. Never drop it.
+        self.record.special(&name, true)?;
         Ok(CommonFieldPutResult::NoChange)
     }
 

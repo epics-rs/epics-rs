@@ -32,6 +32,15 @@ pub enum CaError {
     #[error("invalid value: {0}")]
     InvalidValue(String),
 
+    /// C `S_db_badField` ("Illegal RECORD FIELD") — a record's `special()`
+    /// refused the value that `dbPut` had already stored, e.g.
+    /// `calcRecord.c:146-151` returning it for an uncompilable `CALC`. The
+    /// value stays written, the field's monitor is not posted, the record is
+    /// not processed, and the status propagates to the client (rsrv
+    /// `write_action` → `ECA_PUTFAIL`).
+    #[error("illegal record field: {0}")]
+    BadField(String),
+
     #[error("put disabled (DISP=1) for field {0}")]
     PutDisabled(String),
 
@@ -111,6 +120,9 @@ impl CaError {
             CaError::UnsupportedType(_) => ECA_BADTYPE,
             CaError::InvalidValue(_) => ECA_BADTYPE,
             CaError::FieldNotFound(_) => ECA_PUTFAIL,
+            // C rsrv answers any non-zero `db_put_field` status — including
+            // `S_db_badField` — with ECA_PUTFAIL (`camessage.c::write_action`).
+            CaError::BadField(_) => ECA_PUTFAIL,
             // Disconnection / shutdown are surfaced as ECA_DISCONN so a
             // downstream client (e.g. caput on a CA gateway whose
             // upstream just dropped) sees the actionable

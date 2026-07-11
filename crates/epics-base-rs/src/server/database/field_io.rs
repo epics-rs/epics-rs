@@ -308,7 +308,14 @@ impl PvDatabase {
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
-                            let _ = instance.record.special(&field, true);
+                            // C `dbPut` (dbAccess.c:1399-1405) keeps the value
+                            // it already stored but RETURNS the after-put
+                            // `dbPutSpecial(paddr, 1)` status, skipping the
+                            // field's monitor post and (in `dbPutField`) the
+                            // `pp(TRUE)` process. `calcRecord::special` uses
+                            // that to refuse an uncompilable CALC with
+                            // S_db_badField, so the status must not be dropped.
+                            instance.record.special(&field, true)?;
                             CommonFieldPutResult::NoChange
                         }
                         Err(CaError::FieldNotFound(_)) => {
@@ -521,7 +528,11 @@ impl PvDatabase {
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
-                            let _ = instance.record.special(&field, true);
+                            // C returns the after-put special() status from
+                            // `dbPut` (dbAccess.c:1399-1405) — before the UDF
+                            // clear and the monitor post below, both of which
+                            // `goto done` skips on a non-zero status.
+                            instance.record.special(&field, true)?;
                             // Clear UDF/UDF_ALARM on primary field write
                             if field == instance.record.primary_field() {
                                 instance.common.udf = false;
@@ -950,7 +961,13 @@ impl PvDatabase {
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
-                            let _ = instance.record.special(&field, true);
+                            // C returns the after-put special() status from
+                            // `dbPut` (dbAccess.c:1399-1405); `if (status)
+                            // goto done` then skips both the UDF clear below
+                            // and the field's monitor post, and `dbPutField`
+                            // skips the process. Propagating the error here
+                            // reproduces all three.
+                            instance.record.special(&field, true)?;
                             // C `dbAccess.c::dbPut:1410-1411` clears
                             // `precord->udf = FALSE` synchronously when the
                             // put target is the record-type's primary value

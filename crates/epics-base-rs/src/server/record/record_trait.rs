@@ -217,6 +217,24 @@ pub enum RecordProcessResult {
     /// is the continuation that releases the held PACT (same by-construction
     /// invariant as the `AsyncPendingNotify` ODLY defer).
     CompleteDeferOutput,
+    /// Completed synchronously (PACT cleared), and the framework runs the ALARM
+    /// epilogue ONLY: the UDF update, `check_alarms`, `recGblResetAlarms`
+    /// (committing SEVR/STAT/AMSG and posting those fields with their C masks)
+    /// and the timestamp. The VALUE side is skipped entirely — no `monitor()`
+    /// value posts (so the last-posted trackers stay put and the next publishing
+    /// cycle re-detects the change, exactly as C leaves `LA..LP` un-updated), no
+    /// OUT / OEVT write, no process actions, no forward link.
+    ///
+    /// C parity `transformRecord.c:554-560`: an INVALID input severity with
+    /// `IVLA == transformIVLA_DO_NOTHING` makes `process()` run
+    /// `recGblGetTimeStamp` + `checkAlarms` + `recGblResetAlarms`, clear `pact`
+    /// and `return` — skipping the calc loop, all 16 OUTx `dbPutLink` writes,
+    /// `monitor()` and `recGblFwdLink()`.
+    ///
+    /// Distinct from [`RecordProcessResult::CompleteNoEmit`], which skips the
+    /// alarm commit and the timestamp too (C `compressRecord.c:365` returns
+    /// before `checkAlarms`).
+    CompleteAlarmOnly,
 }
 
 /// Complete outcome of a record's process() call.
@@ -259,6 +277,16 @@ impl ProcessOutcome {
     pub fn complete_no_emit() -> Self {
         Self {
             result: RecordProcessResult::CompleteNoEmit,
+            actions: Vec::new(),
+            device_did_compute: false,
+        }
+    }
+
+    /// Completed synchronously with the alarm epilogue only — no value posts,
+    /// no output, no forward link. See `RecordProcessResult::CompleteAlarmOnly`.
+    pub fn complete_alarm_only() -> Self {
+        Self {
+            result: RecordProcessResult::CompleteAlarmOnly,
             actions: Vec::new(),
             device_did_compute: false,
         }
@@ -321,6 +349,15 @@ pub struct ProcessContext {
     pub udf: bool,
     /// `dbCommon.udfs` — alarm severity raised for a UDF record.
     pub udfs: crate::server::record::AlarmSeverity,
+    /// `dbCommon.nsev` — the *pending* (new) alarm severity this cycle has
+    /// accumulated so far, BEFORE the record body runs. C `dbGetLink` folds an
+    /// `MS`-class input link's severity into `nsev` at fetch time, so a record
+    /// body that branches on the input severity reads it here — e.g.
+    /// `transformRecord.c:554` `if ((ptran->nsev >= INVALID_ALARM) && (ptran->ivla
+    /// == transformIVLA_DO_NOTHING))`. The framework folds every input-link alarm
+    /// into `common.nsev` before building this snapshot, so `nsev` is the single
+    /// source of truth; the record never re-derives it from the links.
+    pub nsev: crate::server::record::AlarmSeverity,
     /// `dbCommon.phas` — phase. Used by device support for format
     /// selection (`devTimeOfDay.c:122`).
     pub phas: i16,

@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{
+    AlarmSeverity, FieldDesc, ProcessAction, ProcessContext, ProcessOutcome, Record,
+};
 use crate::types::{DbFieldType, EpicsValue};
 
 use crate::calc::NumericInputs;
@@ -14,7 +16,6 @@ const NUM_CHANNELS: usize = 16; // A-P
 /// then writes outputs via OUTA-OUTP links.
 pub struct TransformRecord {
     pub vals: [f64; NUM_CHANNELS],
-    pub prev_vals: [f64; NUM_CHANNELS],
     pub calcs: [String; NUM_CHANNELS],
     compiled: [Option<CompiledExpr>; NUM_CHANNELS],
     pub inp_links: [String; NUM_CHANNELS],
@@ -28,13 +29,18 @@ pub struct TransformRecord {
     /// cycle ("don't overwrite a fresh put"). Set by `put_field` for the
     /// `A..P` value fields, cleared at the start of `process()`.
     fresh_put: [bool; NUM_CHANNELS],
+    /// This cycle's pending input-link severity (`dbCommon.nsev`), pushed by
+    /// the framework through [`Record::set_process_context`] before
+    /// `process()` runs — C folds an MS-class link's severity into `nsev`
+    /// inside `dbGetLink`, i.e. before the record body reads it
+    /// (`transformRecord.c:554`).
+    nsev: AlarmSeverity,
 }
 
 impl Default for TransformRecord {
     fn default() -> Self {
         Self {
             vals: [0.0; NUM_CHANNELS],
-            prev_vals: [0.0; NUM_CHANNELS],
             calcs: Default::default(),
             compiled: Default::default(),
             inp_links: Default::default(),
@@ -43,6 +49,7 @@ impl Default for TransformRecord {
             ivla: 0,
             prec: 0,
             fresh_put: [false; NUM_CHANNELS],
+            nsev: AlarmSeverity::NoAlarm,
         }
     }
 }
@@ -464,8 +471,31 @@ impl Record for TransformRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // Save previous values
-        self.prev_vals = self.vals;
+        // IVLA="Do Nothing" + an INVALID input severity: C
+        // `transformRecord.c:554-560` abandons the WHOLE cycle —
+        //
+        //   if ((ptran->nsev >= INVALID_ALARM) && (ptran->ivla == transformIVLA_DO_NOTHING)) {
+        //       recGblGetTimeStamp(ptran); checkAlarms(ptran);
+        //       recGblResetAlarms(ptran); ptran->pact = FALSE; return (0);
+        //   }
+        //
+        // — no calc for ANY channel, none of the 16 OUTx `dbPutLink` writes,
+        // no `monitor()`, no `recGblFwdLink()`. Only the timestamp and the
+        // alarm commit run, which is exactly `CompleteAlarmOnly`. The input
+        // links have already been read into A..P by this point in C (the fetch
+        // loop precedes this test), and the framework's multi-input apply is
+        // likewise already done, so the channels carry the fresh input values;
+        // they are simply not published, calculated on, or driven out.
+        //
+        // `nsev` is the framework's pending severity for THIS cycle, folded
+        // from the MS-class input links before `process()` — the same cell C
+        // reads. IVLA is NOT a per-channel calc-failure policy: C never
+        // restores a channel's previous value on a calc error (see the eval
+        // arm below), so the port's old per-channel value-restore was invented
+        // behaviour and is gone.
+        if self.nsev >= AlarmSeverity::Invalid && self.ivla == 1 {
+            return Ok(ProcessOutcome::complete_alarm_only());
+        }
 
         // Snapshot and clear the fresh-put flags for this cycle.
         let fresh_put = std::mem::take(&mut self.fresh_put);
@@ -507,14 +537,13 @@ impl Record for TransformRecord {
                         self.vals[i] = result;
                     }
                     Err(_) => {
-                        // IVLA=Do_Nothing applies the no-op PER FAILING
-                        // CHANNEL (synApps semantics), not globally:
-                        // restore only this channel's value and continue
-                        // with the rest.
-                        if self.ivla == 1 {
-                            self.vals[i] = self.prev_vals[i];
-                        }
-                        // IVLA=Ignore error — leave value, continue.
+                        // C `transformRecord.c:593-596`: a failing
+                        // `sCalcPerform` leaves `*pval` untouched and raises
+                        // CALC_ALARM/INVALID + `udf = TRUE`; the loop
+                        // continues with the next channel. IVLA plays no part
+                        // here — it gates the whole cycle on the INPUT
+                        // severity (see the top of `process`), never a single
+                        // channel's calc result.
                     }
                 }
             }
@@ -660,6 +689,13 @@ impl Record for TransformRecord {
             }
         }
         Ok(())
+    }
+
+    /// Adopt the framework's per-cycle `dbCommon` snapshot. `nsev` — this
+    /// cycle's pending severity, already carrying every MS-class input link's
+    /// alarm — is what C `transformRecord.c:554` tests against `IVLA`.
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.nsev = ctx.nsev;
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {

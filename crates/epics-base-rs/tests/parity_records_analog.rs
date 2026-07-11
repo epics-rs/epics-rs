@@ -579,22 +579,23 @@ fn s5_transform_fresh_put_survives_one_cycle() {
     );
 }
 
-// ─── S6: transform IVLA=Do_Nothing is per-channel ────────────────────
+// ─── S6: a broken CLCx is skipped, siblings still calculate ──────────
 //
-// S6's divergence (a global abort on one channel's *eval* error) is only
-// reachable when a compiled calc fails at eval time. The numeric calc
-// compiler's end-of-expression depth check rejects every stack-imbalanced
-// expression at *compile* time, so a string-configured CLCx cannot
-// produce a runtime eval error — the per-channel-vs-global difference is
-// not observable from a `.db`-driven record. The fix is kept as the
-// C-correct structure (restore the failing channel only, continue with
-// the rest); this test exercises the reachable broken-calc path (a
-// compile failure) and confirms it does not abort sibling channels.
+// C `transformRecord.c:589-597`: the calc loop's `postfix_ok` gate
+// (`*pclcbuf && (*prpcbuf != BAD_EXPRESSION)`) skips a channel whose CLCx
+// failed to compile, and the loop continues with the next channel — a broken
+// expression on one channel never touches its siblings.
+//
+// IVLA is NOT involved: it gates the WHOLE cycle on the record's INPUT
+// severity (`nsev >= INVALID_ALARM`, transformRecord.c:554 — covered by
+// `tests/transform_ivla_do_nothing.rs`), and C has no per-channel value-restore
+// on a calc error whatsoever. IVLA is left at Do_Nothing here to pin exactly
+// that: with no INVALID input link it must have no effect at all.
 
 #[test]
 fn s6_transform_broken_calc_does_not_abort_sibling_channels() {
     let mut r = TransformRecord::new();
-    r.put_field("IVLA", EpicsValue::Short(1)).unwrap(); // Do Nothing
+    r.put_field("IVLA", EpicsValue::Short(1)).unwrap(); // Do Nothing — inert here
     r.put_field("B", EpicsValue::Double(2.0)).unwrap();
     // CLCA is syntactically broken (fails to compile); CLCC is valid.
     r.put_field("CLCA", EpicsValue::String("+".into())).unwrap();
@@ -604,7 +605,8 @@ fn s6_transform_broken_calc_does_not_abort_sibling_channels() {
     assert_eq!(
         r.get_field("A"),
         Some(EpicsValue::Double(0.0)),
-        "broken CLCA leaves channel A at its prior value"
+        "an uncompilable CLCA is never evaluated (C `postfix_ok` gate), so \
+         channel A keeps its prior value"
     );
     assert_eq!(
         r.get_field("C"),

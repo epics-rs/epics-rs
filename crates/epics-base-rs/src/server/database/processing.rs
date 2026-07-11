@@ -308,6 +308,51 @@ fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u
     )
 }
 
+/// The alarm-field events `recGblResetAlarms` posts (recGbl.c:201-220), each
+/// with its own per-field mask:
+///
+/// * `SEVR` — `DBE_VALUE`, ONLY when `prev_sevr != new_sevr`.
+/// * `STAT`/`AMSG` — `stat_mask` = `DBE_ALARM` (on sevr- or amsg-change) |
+///   `DBE_VALUE` (on stat-change).
+/// * `ACKS` — `DBE_VALUE`, only when `stat_mask != 0` and `recGblResetAlarms`
+///   raised it.
+///
+/// The single owner of these masks: every process cycle that commits alarms —
+/// the full value-publication epilogue and the `CompleteAlarmOnly` cycle that
+/// skips it (transform IVLA="Do Nothing") — posts through this, so the two
+/// cannot drift.
+fn alarm_field_posts(
+    common: &crate::server::record::CommonFields,
+    alarm_result: &crate::server::recgbl::AlarmResetResult,
+) -> Vec<(&'static str, crate::server::recgbl::EventMask)> {
+    use crate::server::recgbl::EventMask;
+
+    let sevr_changed = common.sevr != alarm_result.prev_sevr;
+    let stat_changed = common.stat != alarm_result.prev_stat;
+    let stat_mask = {
+        let mut m = EventMask::NONE;
+        if sevr_changed || alarm_result.amsg_changed {
+            m |= EventMask::ALARM;
+        }
+        if stat_changed {
+            m |= EventMask::VALUE;
+        }
+        m
+    };
+    let mut posts: Vec<(&'static str, EventMask)> = Vec::new();
+    if sevr_changed {
+        posts.push(("SEVR", EventMask::VALUE));
+    }
+    if !stat_mask.is_empty() {
+        posts.push(("STAT", stat_mask));
+        posts.push(("AMSG", stat_mask));
+    }
+    if alarm_result.acks_changed && !stat_mask.is_empty() {
+        posts.push(("ACKS", EventMask::VALUE));
+    }
+    posts
+}
+
 /// The source record's put-propagation context for the forward-link tail.
 /// C `processTarget` (dbDbLink.c:460-474) carries `psrc->putf` and
 /// `psrc->ppn` to each target as a unit — the PUTF bit and the put-notify
@@ -1747,7 +1792,7 @@ impl PvDatabase {
             alarm_posts,
             result_is_defer_output,
             sim_skip_out,
-        ) = {
+        ) = 'epilogue: {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -1986,10 +2031,37 @@ impl PvDatabase {
                 );
             }
 
-            // Push framework-owned common state (UDF/PHAS/TSE/TSEL) so
+            // MS-class alarm propagation from input links. Mirrors C
+            // `recGblInheritSevrMsg` (recGbl.c::260):
+            //
+            // * NMS  — do nothing.
+            // * MS   — DEST gets `LINK_ALARM` (NOT the source stat),
+            //          max-raised sevr, NO amsg propagation.
+            // * MSI  — same as MS, but only when source.sevr == INVALID.
+            // * MSS  — DEST gets source stat, max-raised sevr, source amsg
+            //          (PR d0cf47c is the only branch that propagates msg).
+            //
+            // Folded BEFORE the record body, not after: C raises the link
+            // severity inside `dbGetLink` (recGbl.c `recGblInheritSevr` is
+            // called from the link's `getValue`), i.e. during the record's
+            // input-fetch phase, so the body already sees it in `prec->nsev`.
+            // `transformRecord.c:554` branches on exactly that
+            // (`nsev >= INVALID_ALARM && ivla == DO_NOTHING`), and
+            // `ProcessContext::nsev` below is that same `common.nsev` — one
+            // owner, no second severity accumulator for records to consult.
+            // Folding it here also gives C's tie-break: with equal severities
+            // the link's LINK_ALARM lands first and `rec_gbl_set_sevr`'s
+            // strict-greater test keeps it, exactly as in C where `dbGetLink`
+            // precedes the record's own `recGblSetSevr` calls.
+            for (ms, alarm) in &link_alarms {
+                super::links::inherit_sevr_msg(&mut instance.common, *ms, alarm);
+            }
+
+            // Push framework-owned common state (UDF/UDFS/NSEV/PHAS/TSE/TSEL) so
             // the record's process() can see it — C records read
             // `dbCommon` directly (`epidRecord.c:195` checks
-            // `pepid->udf`, `timestampRecord.c:90` checks `tse`).
+            // `pepid->udf`, `timestampRecord.c:90` checks `tse`,
+            // `transformRecord.c:554` checks `ptran->nsev`).
             {
                 let ctx = instance.common.process_context();
                 instance.record.set_process_context(&ctx);
@@ -2021,6 +2093,12 @@ impl PvDatabase {
             // the OUT/OEVT/FLNK tail (swait ODLY — see `CompleteDeferOutput`).
             let result_is_defer_output =
                 process_result == crate::server::record::RecordProcessResult::CompleteDeferOutput;
+            // Alarm-epilogue-only cycle (C `transformRecord.c:554-560`): the
+            // alarm/timestamp commit below runs, the value side does not. See
+            // `RecordProcessResult::CompleteAlarmOnly` and the `'epilogue`
+            // break after `apply_timestamp`.
+            let result_is_alarm_only =
+                process_result == crate::server::record::RecordProcessResult::CompleteAlarmOnly;
 
             if process_result == crate::server::record::RecordProcessResult::AsyncPending {
                 // C `dbProcess` contract: when device support / record body
@@ -2204,25 +2282,11 @@ impl PvDatabase {
                     .store(false, std::sync::atomic::Ordering::Release);
             }
 
-            // MS-class alarm propagation from input links. Mirrors C
-            // `recGblInheritSevrMsg` (recGbl.c::260):
-            //
-            // * NMS  — do nothing.
-            // * MS   — DEST gets `LINK_ALARM` (NOT the source stat),
-            //          max-raised sevr, NO amsg propagation.
-            // * MSI  — same as MS, but only when source.sevr == INVALID.
-            // * MSS  — DEST gets source stat, max-raised sevr, source amsg
-            //          (PR d0cf47c is the only branch that propagates msg).
-            //
-            // Previous version treated Maximize and MaximizeStatus
-            // identically, propagating source stat + amsg through both
-            // — that matches MSS but is wrong for MS (and MSI), which
-            // C says should always surface as LINK_ALARM with no msg.
-            // The per-mode switch is shared with the DB OUT-link write
-            // path via `inherit_sevr_msg` so the two sides cannot drift.
-            for (ms, alarm) in &link_alarms {
-                super::links::inherit_sevr_msg(&mut instance.common, *ms, alarm);
-            }
+            // NOTE: the MS-class input-link alarm propagation
+            // (`inherit_sevr_msg`) already ran BEFORE the record body — see the
+            // fold site above `set_process_context`. C raises it inside
+            // `dbGetLink`, so the body must be able to read the resulting
+            // `nsev` (transform IVLA="Do Nothing").
 
             // UDF update — C parity (aiRecord.c:285, calcRecord.c
             // checkAlarms, int64inRecord.c:144): clear UDF only when
@@ -2372,6 +2436,31 @@ impl PvDatabase {
             // above — keyed on `value_is_undefined()` so a NaN result
             // keeps UDF true and UDF_ALARM is raised this cycle. Do
             // NOT clear UDF unconditionally here.
+
+            // C `transformRecord.c:554-560` — the record body asked for the
+            // ALARM epilogue only (IVLA="Do Nothing" on an INVALID input):
+            // `recGblGetTimeStamp` + `checkAlarms` + `recGblResetAlarms` have
+            // now run, and C `return`s here. Everything below is C's
+            // `monitor()` + output + `recGblFwdLink()` — none of it happens on
+            // that cycle. The SEVR/STAT/AMSG/ACKS posts `recGblResetAlarms`
+            // itself makes are the only events the cycle emits; VAL and the
+            // value fields are NOT posted and their last-posted trackers stay
+            // put (C leaves `LA..LP` un-updated), so the next publishing cycle
+            // re-detects the change.
+            if result_is_alarm_only {
+                let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
+                break 'epilogue (
+                    crate::server::record::ProcessSnapshot {
+                        changed_fields: Vec::new(),
+                    },
+                    None,
+                    None,
+                    Vec::new(),
+                    alarm_posts,
+                    false,
+                    true,
+                );
+            }
 
             // IVOA check for output records with INVALID alarm. Gate on the
             // real (pre-SIMM) severity `real_sev` snapshotted above — C decides
@@ -2740,45 +2829,12 @@ impl PvDatabase {
                     changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
                 }
             }
-            // C `recGblResetAlarms` (recGbl.c:201-220) posts each
-            // alarm field with its own per-field mask:
-            //   * SEVR — DBE_VALUE, ONLY when `prev_sevr != new_sevr`.
-            //   * STAT/AMSG — `stat_mask` = DBE_ALARM (on sevr- or
-            //     amsg-change) | DBE_VALUE (on stat-change).
-            //   * ACKS — DBE_VALUE when `stat_mask != 0`.
-            // The pre-fix port pushed SEVR + STAT together on any
-            // `alarm_changed`, over-posting SEVR on a stat-only
-            // transition and collapsing the per-field mask into one
-            // record-wide mask. Posting these via `notify_field` with
-            // their individual masks restores C's granularity.
-            let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;
-            let stat_changed = instance.common.stat != alarm_result.prev_stat;
-            let stat_mask = {
-                let mut m = EventMask::NONE;
-                if sevr_changed || alarm_result.amsg_changed {
-                    m |= EventMask::ALARM;
-                }
-                if stat_changed {
-                    m |= EventMask::VALUE;
-                }
-                m
-            };
-            // Defer the SEVR/STAT/AMSG/ACKS posts to dedicated
-            // `notify_field` calls (collected here, fired after the
-            // snapshot notify below) so each gets its exact C mask.
-            let mut alarm_posts: Vec<(&'static str, EventMask)> = Vec::new();
-            if sevr_changed {
-                alarm_posts.push(("SEVR", EventMask::VALUE));
-            }
-            if !stat_mask.is_empty() {
-                alarm_posts.push(("STAT", stat_mask));
-                alarm_posts.push(("AMSG", stat_mask));
-            }
-            // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only
-            // when `stat_mask != 0` AND recGblResetAlarms raised it.
-            if alarm_result.acks_changed && !stat_mask.is_empty() {
-                alarm_posts.push(("ACKS", EventMask::VALUE));
-            }
+            // The SEVR/STAT/AMSG/ACKS posts `recGblResetAlarms` makes, each
+            // with its own C mask — see `alarm_field_posts`. Deferred to
+            // dedicated `notify_field` calls fired after the snapshot notify
+            // below. The `CompleteAlarmOnly` break above uses the same helper,
+            // so the alarm-post masks have a single owner.
+            let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
             // UDF rides along whenever any monitored post fired this
             // cycle, carrying the union of the cycle's posted classes.
             let cycle_mask = changed_fields

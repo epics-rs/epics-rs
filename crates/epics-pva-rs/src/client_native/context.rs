@@ -24,7 +24,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 
 use crate::error::{PvaError, PvaResult};
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
@@ -953,7 +953,7 @@ impl PvaClient {
         pv_name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> crate::client_native::operation::PvaOperation<(FieldDesc, PvField)> {
+    ) -> crate::client_native::operation::PvaOperation<RpcReply> {
         let client = self.clone();
         let name = pv_name.to_string();
         crate::client_native::operation::PvaOperation::spawn(async move {
@@ -1858,7 +1858,7 @@ impl PvaClient {
         pv_name: &str,
         request_desc: &FieldDesc,
         request_value: &PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
+    ) -> PvaResult<RpcReply> {
         let ch = self.channel(pv_name).await?;
         // The RPC INIT pvRequest and the RPC DATA argument are distinct
         // wire values: pvxs `clientget.cpp:348-352` serializes the
@@ -1896,7 +1896,7 @@ impl PvaClient {
         pv_request_value: &PvField,
         arg_desc: &FieldDesc,
         arg_value: &PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
+    ) -> PvaResult<RpcReply> {
         let ch = self.channel(pv_name).await?;
         op_rpc(
             &ch,
@@ -1919,7 +1919,7 @@ impl PvaClient {
     /// (the only shape [`Self::pvrpc`] can express) is distinguishable
     /// from it. The INIT pvRequest is the empty pvRequest pvxs sends by
     /// default for a parameterless RPC.
-    pub async fn pvrpc_null(&self, pv_name: &str) -> PvaResult<(FieldDesc, PvField)> {
+    pub async fn pvrpc_null(&self, pv_name: &str) -> PvaResult<RpcReply> {
         let ch = self.channel(pv_name).await?;
         let (req_desc, req_value) = empty_pv_request();
         op_rpc(&ch, &req_desc, &req_value, RpcArg::Null, self.inner.timeout).await
@@ -1936,7 +1936,7 @@ impl PvaClient {
         server: SocketAddr,
         request_desc: &FieldDesc,
         request_value: &PvField,
-    ) -> PvaResult<(FieldDesc, PvField)> {
+    ) -> PvaResult<RpcReply> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
         // See [`Self::pvrpc`]: default empty pvRequest at INIT, the
         // caller's value as the DATA argument (no INIT/DATA conflation).
@@ -1956,11 +1956,7 @@ impl PvaClient {
 
     /// Like [`Self::pvrpc_null`] but pins the operation to a specific
     /// server, bypassing UDP search (mirrors [`Self::pvrpc_from`]).
-    pub async fn pvrpc_from_null(
-        &self,
-        pv_name: &str,
-        server: SocketAddr,
-    ) -> PvaResult<(FieldDesc, PvField)> {
+    pub async fn pvrpc_from_null(&self, pv_name: &str, server: SocketAddr) -> PvaResult<RpcReply> {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
         let (req_desc, req_value) = empty_pv_request();
         op_rpc(&ch, &req_desc, &req_value, RpcArg::Null, self.inner.timeout).await

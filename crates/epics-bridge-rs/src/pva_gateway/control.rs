@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::access_security::{AccessGate, AccessSecurityConfig, AsgAslResolver};
 use epics_pva_rs::nt::NTScalar;
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource, OpError};
 use tokio::sync::{RwLock, mpsc};
@@ -546,7 +546,7 @@ impl ChannelSource for ControlSource {
         name: &str,
         _request_desc: FieldDesc,
         _request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         if self.is_control(name) {
             // No ctx — no credentials to check. Refusing a mutation for
             // lack of authentication is an authorization decision (Denied).
@@ -572,7 +572,7 @@ impl ChannelSource for ControlSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         let name = checked.pv_name().to_string();
         if !self.is_control(&name) {
             // Diagnostic PVs and unknown names fall back to the
@@ -623,6 +623,7 @@ impl ChannelSource for ControlSource {
         // failure), so map them into the Failed bucket.
         self.run_control_rpc(&name, &request_value)
             .await
+            .map(RpcReply::from)
             .map_err(OpError::failed)
     }
 
@@ -808,7 +809,9 @@ mod tests {
                 ctx("ops", "ca"),
             )
             .await
-            .expect("drop reply");
+            .expect("drop reply")
+            .into_value()
+            .expect("value reply");
         assert_eq!(
             reply_value(&reply),
             1,
@@ -824,7 +827,9 @@ mod tests {
                 ctx("ops", "ca"),
             )
             .await
-            .expect("flush reply");
+            .expect("flush reply")
+            .into_value()
+            .expect("value reply");
         assert_eq!(
             reply_value(&reply),
             1,
@@ -1004,7 +1009,9 @@ mod tests {
                 ctx("ops", "ca"),
             )
             .await
-            .expect("authorised operator flush must succeed");
+            .expect("authorised operator flush must succeed")
+            .into_value()
+            .expect("value reply");
         assert!(matches!(desc, FieldDesc::Structure { .. }));
         // Empty cache → 0 removed.
         assert_eq!(reply_value(&reply), 0);
@@ -1063,7 +1070,9 @@ mod tests {
                 ctx("ops", "ca"),
             )
             .await
-            .expect("drop of an absent entry still returns a reply");
+            .expect("drop of an absent entry still returns a reply")
+            .into_value()
+            .expect("value reply");
         // Not present → dropped=false → value 0.
         assert_eq!(reply_value(&reply), 0);
         assert!(reply_message(&reply).contains("was not present"));
@@ -1111,7 +1120,9 @@ mod tests {
                 ctx("ops", "ca"),
             )
             .await
-            .expect("reload of a valid ACF must succeed");
+            .expect("reload of a valid ACF must succeed")
+            .into_value()
+            .expect("value reply");
         assert!(reply_message(&reply).contains("reloaded ACF policy"));
         let _ = std::fs::remove_file(&path);
     }

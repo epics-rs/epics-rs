@@ -2,6 +2,7 @@
 //! descriptors. Wire encoding/decoding lives in [`encode`].
 
 mod field;
+mod rpc_reply;
 mod scalar;
 mod shared_array;
 mod structure;
@@ -12,6 +13,7 @@ mod value_check;
 pub mod encode;
 
 pub use field::{FieldDesc, Member, TypeDef};
+pub use rpc_reply::RpcReply;
 pub use scalar::{ScalarType, ScalarValue};
 pub use shared_array::SharedArray;
 pub use structure::{PvField, PvStructure, UnionItem, VariantValue};

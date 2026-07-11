@@ -24,7 +24,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use epics_pva_rs::pvdata::{FieldDesc, PvField};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
     ChannelSource, DynSource, OpError, OpErrorKind, RawMonitorEvent, WatermarkEvent,
@@ -253,7 +253,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _name: &str,
         _request_desc: FieldDesc,
         _request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         Err(OpError::denied("read-only mode: RPC rejected"))
     }
     async fn rpc_checked(
@@ -262,7 +262,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _request_desc: FieldDesc,
         _request_value: PvField,
         _ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         Err(OpError::denied("read-only mode: RPC rejected"))
     }
     // ChannelArray: forward the read-class sub-ops (INIT descriptor probe,
@@ -799,7 +799,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         if !self.config.allowed(name) {
             return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
         }
@@ -811,7 +811,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         if !self.config.allowed(checked.pv_name()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
@@ -1629,7 +1629,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         let result = self.inner.rpc(name, request_desc, request_value).await;
         if self.audit_rpc {
             let outcome: Result<(), OpError> = match &result {
@@ -1651,7 +1651,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();

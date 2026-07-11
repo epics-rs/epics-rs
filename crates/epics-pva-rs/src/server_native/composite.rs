@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::source::{
     AccessChecked, ChannelInvalidator, ChannelSource, DynSource, OpError, RawMonitorEvent,
@@ -529,7 +529,7 @@ impl ChannelSource for CompositeSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -774,7 +774,7 @@ impl ChannelSource for CompositeSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {

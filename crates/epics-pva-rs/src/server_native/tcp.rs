@@ -30,9 +30,9 @@ use crate::proto::{
 };
 use crate::pvdata::encode::{
     EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
-    decode_type_desc_cached, encode_pv_field, encode_type_desc, encode_type_desc_cached,
+    encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
@@ -2856,10 +2856,6 @@ fn parse_client_credentials(
         authority: String::new(),
         roles: Vec::new(),
     };
-    let pos = cur.position();
-    let peek = cur
-        .get_u8()
-        .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc peek: {e}")))?;
     // A leading `0xFF` is the pvxs "null type" tag: the auth Value carries
     // no `user`/`host` fields. pvxs `serverconn.cpp:223-231` only sets
     // method/account inside the `auth["user"]` callback, so a null body
@@ -2868,16 +2864,16 @@ fn parse_client_credentials(
     // a null-auth "ca" handshake as `method="ca", account=""` and skipped
     // the shared ca-requires-user rule below — fall through with an empty
     // account so both the null and empty-structure paths take one rule.
-    if peek != 0xFF {
-        // Rewind and decode the real descriptor.
-        cur.set_position(pos);
-        // Route through the connection-scope decode cache so a client that
-        // advertises its auth structure with a `0xFD <slot>` define here can
-        // later reference it by `0xFE <slot>` from a pvRequest/EXEC body, and
-        // vice versa — pvxs shares one connection `rxRegistry` (conn.h:23)
-        // across every inbound decode, including CONNECTION_VALIDATION.
-        let desc = decode_type_desc_cached(&mut cur, order, decode_cache)
+    //
+    // Routed through the connection-scope decode cache so a client that
+    // advertises its auth structure with a `0xFD <slot>` define here can
+    // later reference it by `0xFE <slot>` from a pvRequest/EXEC body, and
+    // vice versa — pvxs shares one connection `rxRegistry` (conn.h:23)
+    // across every inbound decode, including CONNECTION_VALIDATION.
+    let auth_desc =
+        crate::pvdata::encode::decode_type_desc_cached_opt(&mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth desc: {e}")))?;
+    if let Some(desc) = auth_desc {
         let value = decode_pv_field_cached(&desc, &mut cur, order, decode_cache)
             .map_err(|e| PvaError::Decode(format!("CONN_VALIDATION auth value: {e}")))?;
         if let PvField::Structure(s) = value {
@@ -3973,6 +3969,50 @@ fn decode_init_pv_request_value(
     Ok(if exhausted { None } else { Some(value) })
 }
 
+/// Decode an INIT pvRequest (`type + full value`) — the single owner of the
+/// INIT pvRequest wire shape for every op kind (GET / PUT / MONITOR / RPC /
+/// PUT_GET / PROCESS / ARRAY).
+///
+/// pvxs `from_wire_type_value` (`dataencode.cpp:747-753`):
+///
+/// ```c
+/// from_wire_type(buf, ctxt, val);
+/// if(buf.good() && val)
+///     from_wire_full(buf, ctxt, val);
+/// ```
+///
+/// A NULL (`0xFF`) type code is legal here and is NOT a wire fault: it leaves
+/// the descriptor list empty with the buffer still good (`dataencode.cpp:
+/// 79-80`), `from_wire_type` yields an invalid `Value` (`:737-744`), and the
+/// `if(... && val)` guard skips the value body. The INIT then passes
+/// `serverget.cpp:366-376` / `servermon.cpp:491-503`, which check only
+/// `!M.good()`, and the invalid pvRequest becomes the all-fields wildcard in
+/// `request2mask` (`pvrequest.cpp:53-55`). It is the exact byte pvxs's own
+/// `to_wire(Buf&, const FieldDesc*)` writes for a null descriptor
+/// (`dataencode.cpp:29-33`).
+///
+/// Rejecting it (as `decode_type_desc_cached` does, by design) tore down the
+/// whole TCP circuit — killing every other channel and operation multiplexed
+/// on it — where pvxs replies with a normal INIT success.
+///
+/// A present-but-malformed descriptor, or a non-null descriptor whose value
+/// body is truncated, is still the `!M.good()` fault the callers turn into a
+/// connection reset.
+fn decode_init_pv_request(
+    cur: &mut std::io::Cursor<&[u8]>,
+    order: ByteOrder,
+    decode_cache: &mut TypeCache,
+) -> Result<(Option<FieldDesc>, Option<PvField>), String> {
+    let Some(req_desc) =
+        crate::pvdata::encode::decode_type_desc_cached_opt(cur, order, decode_cache)
+            .map_err(|e| format!("invalid pvRequest descriptor: {e}"))?
+    else {
+        return Ok((None, None));
+    };
+    let req_value = decode_init_pv_request_value(cur, &req_desc, order, decode_cache)?;
+    Ok((Some(req_desc), req_value))
+}
+
 /// Decode an RPC EXEC argument body (`type + full value`), keeping the
 /// "parameterless" case structurally distinct from the "malformed"
 /// case.
@@ -4015,18 +4055,17 @@ fn decode_rpc_exec_arg(
     if cur.position() as usize >= cur.get_ref().len() {
         return Ok((FieldDesc::Variant, PvField::Null));
     }
-    // NULL (0xFF) type code: parameterless RPC (pvxs interop). Peek so
-    // we can consume exactly the one byte without depending on
-    // `decode_type_desc`'s error-vs-consume behaviour for 0xFF.
-    if cur.get_ref()[cur.position() as usize] == 0xFF {
-        cur.set_position(cur.position() + 1);
+    // NULL (0xFF) type code: parameterless RPC (pvxs interop). Routed through
+    // `decode_type_desc_cached_opt`, the single owner of the NULL-type rule,
+    // rather than a local peek.
+    let Some(desc) = crate::pvdata::encode::decode_type_desc_cached_opt(cur, order, decode_cache)
+        .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?
+    else {
         return Ok((FieldDesc::Variant, PvField::Null));
-    }
-    // Present, non-null descriptor: decode type + full value or fail
-    // fatally — a present-but-undecodable body is a protocol error, not
-    // a parameterless call.
-    let desc = decode_type_desc_cached(cur, order, decode_cache)
-        .map_err(|e| format!("invalid RPC argument descriptor: {e}"))?;
+    };
+    // Present, non-null descriptor: decode the full value or fail fatally —
+    // a present-but-undecodable body is a protocol error, not a
+    // parameterless call.
     let value = decode_pv_field_cached(&desc, cur, order, decode_cache)
         .map_err(|e| format!("invalid RPC argument value: {e}"))?;
     Ok((desc, value))
@@ -4219,21 +4258,11 @@ async fn handle_put_get(
         // A peer wire-decode fault of the INIT pvRequest type/value is
         // connection-fatal (pvxs `serverget.cpp:371-375` bev.reset()), not
         // a per-op Status — the empty-mask case below stays op-level.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "PUT_GET INIT pvRequest descriptor: {e}"
-                )));
-            }
-        };
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        let (req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!(
-                        "PUT_GET INIT pvRequest value: {e}"
-                    )));
+                    return Err(PvaError::Decode(format!("PUT_GET INIT pvRequest: {e}")));
                 }
             };
         // ChannelPutGet negotiates TWO field selections at INIT: the
@@ -4246,7 +4275,8 @@ async fn handle_put_get(
         // fallback collapses both to the common `field` selection
         // (modules/pvAccess/testApp/remote/testServer.cpp), so the common NT
         // round trip is unchanged. An empty selection is an INIT error.
-        let (put_mask, get_mask) = match crate::pv_request::put_get_masks(&intro, &req_desc) {
+        let (put_mask, get_mask) = match crate::pv_request::put_get_masks(&intro, req_desc.as_ref())
+        {
             Ok(masks) => masks,
             Err(e) => {
                 send_chan_op_error(
@@ -4646,7 +4676,7 @@ async fn handle_process(
         };
         // route the PROCESS INIT pvRequest through the SAME
         // structured boundary as the generic GET/PUT/MONITOR INIT path
-        // (`decode_init_pv_request_value`). PROCESS transfers no value,
+        // (`decode_init_pv_request`). PROCESS transfers no value,
         // but the create-time pvRequest carries `record._options` a
         // provider can interpret (and a gateway must forward through
         // `createChannelProcess(..., pvRequest)`, pva2pva
@@ -4662,23 +4692,13 @@ async fn handle_process(
         // descriptor or value is connection-fatal (the read loop closes
         // the circuit, no op reply), uniform with the generic INIT path.
         // A non-null descriptor that needs value bytes but ends before them
-        // is the same fault (see `decode_init_pv_request_value`); only the
-        // all-empty-structs default selector legitimately has a 0-byte body.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "PROCESS INIT pvRequest descriptor: {e}"
-                )));
-            }
-        };
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        // is the same fault; only the all-empty-structs default selector
+        // (and the NULL `0xFF` descriptor) legitimately has a 0-byte body.
+        let (_req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!(
-                        "PROCESS INIT pvRequest value: {e}"
-                    )));
+                    return Err(PvaError::Decode(format!("PROCESS INIT pvRequest: {e}")));
                 }
             };
         let mask = BitSet::all_set(intro.total_bits());
@@ -4948,20 +4968,13 @@ async fn handle_channel_array(
         // descriptor, or a non-null descriptor that needs value bytes but
         // ends before them, is a connection-fatal peer wire fault (pvxs
         // `from_wire_type_value`); only the all-empty-structs default
-        // selector legitimately has a 0-byte value body.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!(
-                    "ARRAY INIT pvRequest descriptor: {e}"
-                )));
-            }
-        };
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        // selector (and the NULL `0xFF` descriptor) legitimately has a
+        // 0-byte value body.
+        let (_req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!("ARRAY INIT pvRequest value: {e}")));
+                    return Err(PvaError::Decode(format!("ARRAY INIT pvRequest: {e}")));
                 }
             };
         let ctx = crate::server_native::source::ChannelContext {
@@ -6156,46 +6169,60 @@ async fn handle_op(
         // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
         // signalled as a remote *op* error (`serverget.cpp:407-413`),
         // so that stays an op-level Status reply.
-        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
-            }
-        };
-        // VALUE body: read per pvxs `from_wire_full`. The Rust client's
+        //
+        // The VALUE body is read per pvxs `from_wire_full`. The Rust client's
         // default selectors (and RPC INIT) send a descriptor whose
         // sub-structures are all empty (`pv_request::build`), so the value
         // body is legitimately 0 bytes and decodes fine — no "absent body"
         // exception is needed. A non-null descriptor that needs value bytes
         // but ends before them is the same `!M.good()` bev.reset() wire
-        // fault as the descriptor above, so it is likewise connection-fatal.
-        let req_value =
-            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+        // fault as a malformed descriptor, so it is likewise connection-fatal.
+        // A NULL (`0xFF`) descriptor is NOT a fault — see
+        // `decode_init_pv_request`.
+        let (req_desc, req_value) =
+            match decode_init_pv_request(&mut cur, inbound_order, decode_cache) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
+                    return Err(PvaError::Decode(format!("INIT pvRequest: {e}")));
                 }
             };
-        let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
-            Ok(m) => m,
-            Err(e) => {
-                // The only variant today is `EmptyMask`: pvRequest
-                // selected no field that exists in the value
-                // descriptor (e.g. `field(noSuch)`). pvxs treats
-                // this as an INIT-level error
-                // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
-                // fell back to all-fields, leaking fields the client
-                // didn't request.
-                send_chan_op_error(
-                    &chan_tx,
-                    kind,
-                    ioid,
-                    subcmd,
-                    &format!("invalid pvRequest mask: {e}"),
-                    order,
-                )
-                .await?;
-                return Ok(());
+        // An RPC is never masked. pvxs `serverget.cpp:402` connects it with a
+        // default-constructed (falsy) prototype — `ctrl->connect(Value())` —
+        // so `ServerGPRConnect::connect`'s `if(prototype)` arm
+        // (`serverget.cpp:198-201`) never runs and `request2mask()` is not
+        // invoked for CMD_RPC at all. The reply is written whole
+        // (`to_wire(R, desc(value)) + to_wire_full(R, value)`,
+        // `serverget.cpp:105-109`), never through `pvMask`, so the op carries
+        // no selection mask. Running `request_to_mask` here rejected every
+        // RPC whose pvRequest named a field (`RPCBuilder::pvRequest("field(
+        // value)")`, or a gateway forwarding a downstream pvRequest) with
+        // `EmptyMask` — the RPC prototype is `FieldDesc::Variant`, which
+        // matches no named selector — where pvxs answers `Status{}` and runs
+        // the call.
+        let mask = if kind == OpKind::Rpc {
+            crate::proto::BitSet::new()
+        } else {
+            match crate::pv_request::request_to_mask(&intro, req_desc.as_ref()) {
+                Ok(m) => m,
+                Err(e) => {
+                    // The only variant today is `EmptyMask`: pvRequest
+                    // selected no field that exists in the value
+                    // descriptor (e.g. `field(noSuch)`). pvxs treats
+                    // this as an INIT-level error
+                    // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
+                    // fell back to all-fields, leaking fields the client
+                    // didn't request.
+                    send_chan_op_error(
+                        &chan_tx,
+                        kind,
+                        ioid,
+                        subcmd,
+                        &format!("invalid pvRequest mask: {e}"),
+                        order,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         };
 
@@ -7285,7 +7312,22 @@ async fn handle_op(
                 // `ServerGPR::doReply` cleans up a last_request RPC only after
                 // success and otherwise returns it to Idle (serverget.cpp:86-116).
                 let replied_ok = match result {
-                    Ok((resp_desc, resp_value)) => {
+                    // pvxs `serverget.cpp:105-109`:
+                    //     auto type = Value::Helper::desc(value);
+                    //     to_wire(R, type);
+                    //     if(value) to_wire_full(R, value);
+                    // — the descriptor is ALWAYS written, the value body only
+                    // when the reply carries one. `ExecOp::reply()` (the
+                    // no-argument overload, `srvcommon.h:108`) replies with a
+                    // default-constructed `Value`, so `desc()` is `nullptr`
+                    // and `to_wire(Buf&, const FieldDesc*)` writes the single
+                    // `0xFF` NULL type code (`dataencode.cpp:29-33`).
+                    Ok(RpcReply::Empty) => {
+                        Status::ok().write_into(order, &mut payload);
+                        payload.put_u8(crate::pvdata::encode::TAG_NULL);
+                        true
+                    }
+                    Ok(RpcReply::Value(resp_desc, resp_value)) => {
                         Status::ok().write_into(order, &mut payload);
                         // Spawned task cannot hold &mut EncodeTypeCache; use inline
                         // encode_type_desc (no cache) for RPC responses.
@@ -9220,6 +9262,131 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "an empty-selector GET INIT must emit an op reply"
+        );
+    }
+
+    /// A NULL (`0xFF`) pvRequest type descriptor at INIT is legal and means
+    /// "no pvRequest": pvxs `from_wire(buf, descs, cache)` returns on
+    /// `TypeCode::Null` with the buffer still GOOD (`dataencode.cpp:79-80`),
+    /// `from_wire_type` yields an invalid `Value` (`:737-744`),
+    /// `from_wire_type_value` skips the absent value body (`:747-753`), and
+    /// the INIT passes `serverget.cpp:366-376` / `servermon.cpp:491-503`
+    /// (which check only `!M.good()`). `request2mask` then takes
+    /// `else if(!fields.valid()) foundrequested = true;`
+    /// (`pvrequest.cpp:53-55`) and the empty mask becomes the all-fields
+    /// wildcard (`:63-68`). It is the exact byte pvxs's own
+    /// `to_wire(Buf&, const FieldDesc*)` writes for a null descriptor
+    /// (`dataencode.cpp:29-33`).
+    ///
+    /// Rust rejected it as a decode error, which the read loop treats as
+    /// connection-fatal — tearing down every other channel and operation
+    /// multiplexed on that circuit.
+    #[tokio::test]
+    async fn init_null_pvrequest_descriptor_is_wildcard_not_fatal() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        /// Returns `(fatal, registered, mask)` for a one-byte `0xFF`
+        /// pvRequest INIT of `kind`.
+        async fn run(kind: OpKind, ioid: u32) -> (bool, bool, Option<BitSet>) {
+            let order = ByteOrder::Little;
+            let sid: u32 = 1;
+            let intro = three_field_intro();
+            let pv = SharedPV::new();
+            pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+            let shared = SharedSource::new();
+            shared.add("dut", pv);
+            let source: DynSource = Arc::new(shared);
+
+            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: "dut".into(),
+                    cid: 0,
+                    sid,
+                    introspection: Some(intro),
+                    source,
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                    open_cred: ClientCredentials::anonymous(),
+                    ops: HashMap::new(),
+                },
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let config = PvaServerConfig::default();
+            let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+            let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+            let cred = ClientCredentials::anonymous();
+
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.put_u8(0x08); // INIT
+            payload.put_u8(crate::pvdata::encode::TAG_NULL); // the whole pvRequest
+            let cmd = match kind {
+                OpKind::Monitor => Command::Monitor,
+                OpKind::Rpc => Command::Rpc,
+                OpKind::Put => Command::Put,
+                _ => Command::Get,
+            };
+            let frame = synth_frame(cmd, order, payload);
+            let fatal = handle_op(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                &fixed_out_order(order),
+                kind,
+                &config,
+                &mut encode_cache,
+                &mut TypeCache::new(),
+                peer,
+                &cred,
+                &discard_mon_fin(),
+                &discard_exec_fin(),
+            )
+            .await
+            .is_err();
+            let op = channels.get(&sid).unwrap().ops.get(&ioid);
+            (fatal, op.is_some(), op.map(|o| o.mask.clone()))
+        }
+
+        // The wildcard mask pvxs's `request2mask` produces for an invalid
+        // pvRequest: every bit of the value descriptor.
+        let wildcard = BitSet::all_set(three_field_intro().total_bits());
+
+        for (kind, ioid) in [
+            (OpKind::Get, 830),
+            (OpKind::Put, 831),
+            (OpKind::Monitor, 832),
+        ] {
+            let (fatal, registered, mask) = run(kind, ioid).await;
+            assert!(
+                !fatal,
+                "{kind:?} INIT with a NULL pvRequest must not be a wire fault"
+            );
+            assert!(
+                registered,
+                "{kind:?} INIT with a NULL pvRequest must register the IOID"
+            );
+            assert_eq!(
+                mask.expect("op state"),
+                wildcard,
+                "{kind:?} INIT with a NULL pvRequest must serve the all-fields wildcard"
+            );
+        }
+
+        // RPC builds no mask at all (pvxs serverget.cpp:402), so only assert
+        // that it is accepted and registered.
+        let (fatal, registered, _) = run(OpKind::Rpc, 833).await;
+        assert!(
+            !fatal,
+            "RPC INIT with a NULL pvRequest must not be a wire fault"
+        );
+        assert!(
+            registered,
+            "RPC INIT with a NULL pvRequest must register the IOID"
         );
     }
 

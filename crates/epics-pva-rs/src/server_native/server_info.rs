@@ -45,7 +45,9 @@ use std::sync::Arc;
 use epics_base_rs::types::PvString;
 
 use crate::nt::NTScalar;
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue, TypedScalarArray,
+};
 
 use super::source::{ChannelSource, OpError};
 
@@ -304,7 +306,7 @@ impl ChannelSource for ServerInfoSource {
         name: &str,
         _request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let this = self.clone();
         let name = name.to_string();
         async move {
@@ -316,7 +318,7 @@ impl ChannelSource for ServerInfoSource {
             // `pvcall server help=true` returns a help string rather than
             // failing for a missing `op`.
             if Self::has_help(&request_value) {
-                return Ok(Self::help_response());
+                return Ok(Self::help_response().into());
             }
             let op = Self::extract_op(&request_value)
                 .ok_or_else(|| OpError::failed("missing 'op' query argument"))?;
@@ -325,9 +327,9 @@ impl ChannelSource for ServerInfoSource {
                     let mut names = (this.channel_lister)().await;
                     names.sort();
                     names.dedup();
-                    Ok((Self::channels_descriptor(), Self::channels_value(names)))
+                    Ok((Self::channels_descriptor(), Self::channels_value(names)).into())
                 }
-                "info" => Ok((Self::info_descriptor(), Self::info_value())),
+                "info" => Ok((Self::info_descriptor(), Self::info_value()).into()),
                 other => Err(OpError::failed(format!(
                     "unknown op '{other}' (expected 'channels' or 'info')"
                 ))),
@@ -402,7 +404,12 @@ mod tests {
             "m:pv".into(),
         ]);
         let (desc, value) = nturi_op("channels");
-        let (resp_desc, resp_value) = src.rpc("server", desc, value).await.expect("rpc ok");
+        let (resp_desc, resp_value) = src
+            .rpc("server", desc, value)
+            .await
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
         // Descriptor is a full NTScalarArray<string>: pvxs replies with
         // `nt::NTScalar{TypeCode::StringA}.create()` (serversource.cpp:55-80),
         // whose `epics:nt/NTScalarArray:1.0` ID promises value + alarm +
@@ -451,7 +458,12 @@ mod tests {
         // (serversource.cpp:19-22). No guid/peerCount/channelCount.
         let src = source_with(vec!["one".into(), "two".into()]);
         let (desc, value) = nturi_op("info");
-        let (_, resp) = src.rpc("server", desc, value).await.expect("rpc ok");
+        let (_, resp) = src
+            .rpc("server", desc, value)
+            .await
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
         let s = match resp {
             PvField::Structure(s) => s,
             other => panic!("unexpected info wrapper: {other:?}"),
@@ -498,7 +510,9 @@ mod tests {
         let (desc, resp) = src
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
-            .expect("help rpc ok");
+            .expect("help rpc ok")
+            .into_value()
+            .expect("value reply");
         match &desc {
             FieldDesc::Structure { struct_id, fields } => {
                 assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
@@ -587,7 +601,9 @@ mod tests {
         let (_, resp) = src
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
-            .expect("flat-struct rpc ok");
+            .expect("flat-struct rpc ok")
+            .into_value()
+            .expect("value reply");
         match resp {
             PvField::Structure(s) => match s.get_field("value") {
                 Some(PvField::ScalarArrayTyped(TypedScalarArray::String(a))) => {
@@ -621,7 +637,9 @@ mod tests {
         let (_, resp) = src
             .rpc("server", FieldDesc::Variant, PvField::Structure(root))
             .await
-            .expect("rpc ok");
+            .expect("rpc ok")
+            .into_value()
+            .expect("value reply");
         // A help reply is an NTScalar<string>; the channel list is a
         // string array. Asserting we got the array proves query.op won
         // over the root-level help.

@@ -355,6 +355,11 @@ const TAG_BOUNDED_STRING: u8 = 0x83;
 const TAG_STRUCTURE_ARRAY: u8 = 0x88;
 const TAG_UNION_ARRAY: u8 = 0x89;
 const TAG_VARIANT_ARRAY: u8 = 0x8A;
+/// pvxs `TypeCode::Null` — the type code of an absent (invalid) `Value`.
+/// `to_wire(Buf&, const FieldDesc*)` emits it for a null descriptor
+/// (`dataencode.cpp:29-33`) and `from_wire` accepts it, leaving the
+/// descriptor list empty and the buffer good (`dataencode.cpp:79-80`).
+pub const TAG_NULL: u8 = 0xFF;
 
 // ── FieldDesc encode ─────────────────────────────────────────────────────
 
@@ -680,14 +685,47 @@ fn decode_type_desc_at_depth(
 /// 0xFE: read a u16 key, return the cached descriptor by clone. If the
 /// slot is empty an error is returned.
 ///
-/// 0xFF: NULL — handled by callers (we reject here as caller-context
-/// dependent).
+/// 0xFF: NULL — rejected here, because a bare descriptor decode has no
+/// value to be absent. Callers that decode a pvxs `Value` (a descriptor
+/// that may legitimately be null) use [`decode_type_desc_cached_opt`].
 pub fn decode_type_desc_cached(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<FieldDesc, DecodeError> {
     decode_type_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)
+}
+
+/// Decode a type descriptor that may be the NULL (`0xFF`) type code, the
+/// single owner of pvxs's "absent Value" rule.
+///
+/// This is pvxs `from_wire_type` (`dataencode.cpp:729-745`): `from_wire(buf,
+/// descs, cache)` short-circuits on `TypeCode::Null` (`:79-80`) leaving
+/// `descs` empty and **the buffer still good**, and `from_wire_type` then
+/// yields `val = Value()` — an invalid/absent Value, not a wire fault. It is
+/// the byte pvxs's own `to_wire(Buf&, const FieldDesc*)` emits for a null
+/// descriptor (`dataencode.cpp:29-33`).
+///
+/// `Ok(None)` is that absent Value. Every other tag decodes exactly as
+/// [`decode_type_desc_cached`], including `0xFD`/`0xFE` cache markers.
+///
+/// Callers that then read the value body must skip it when this returns
+/// `None` — pvxs's `from_wire_type_value` guards it with
+/// `if(buf.good() && val)` (`dataencode.cpp:747-753`).
+pub fn decode_type_desc_cached_opt(
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<Option<FieldDesc>, DecodeError> {
+    // Peek: a `0xFF` is consumed and reported as the absent Value; anything
+    // else (including EOF) falls through to the normal decoder so its error
+    // reporting is unchanged.
+    let pos = cur.position();
+    if cur.get_u8()? == TAG_NULL {
+        return Ok(None);
+    }
+    cur.set_position(pos);
+    decode_type_desc_cached(cur, order, cache).map(Some)
 }
 
 /// Variant of [`decode_type_desc_cached`] that selects the
@@ -2584,6 +2622,44 @@ mod tests {
     use super::*;
     use crate::pvdata::{UnionItem, VariantValue};
 
+    /// `decode_type_desc_cached_opt` is pvxs `from_wire_type`
+    /// (`dataencode.cpp:729-745`): the NULL (`0xFF`) type code consumes
+    /// exactly one byte and yields the absent `Value` (`Ok(None)`) with the
+    /// buffer still good — it is not a fault. Every other tag, including the
+    /// `0xFD`/`0xFE` cache markers, decodes as usual. The strict
+    /// `decode_type_desc_cached` still rejects `0xFF`.
+    #[test]
+    fn decode_type_desc_opt_accepts_the_null_type_code() {
+        let order = ByteOrder::Little;
+        let mut cache = TypeCache::new();
+
+        // `0xFF` alone, followed by a trailing byte that must survive.
+        let bytes = [TAG_NULL, 0x42];
+        let mut cur = Cursor::new(&bytes[..]);
+        assert_eq!(
+            decode_type_desc_cached_opt(&mut cur, order, &mut cache).expect("null is not a fault"),
+            None
+        );
+        assert_eq!(cur.position(), 1, "the NULL type code consumes one byte");
+
+        // The strict decoder still rejects it — a bare descriptor has no
+        // value that could be absent.
+        let mut cur = Cursor::new(&bytes[..]);
+        assert!(decode_type_desc_cached(&mut cur, order, &mut cache).is_err());
+
+        // A non-null descriptor decodes identically through both entry points
+        // and leaves the cursor in the same place.
+        let desc = FieldDesc::Scalar(ScalarType::Int);
+        let mut buf = Vec::new();
+        encode_type_desc(&desc, order, &mut buf);
+        let mut cur = Cursor::new(buf.as_slice());
+        assert_eq!(
+            decode_type_desc_cached_opt(&mut cur, order, &mut cache).expect("scalar decodes"),
+            Some(desc)
+        );
+        assert_eq!(cur.position() as usize, buf.len());
+    }
+
     /// a bare descriptor-sensitive value encoded against an
     /// `any` (FieldDesc::Variant) must NOT advertise a degraded schema;
     /// the encoder emits a null `any` (0xFF) instead.
@@ -3804,7 +3880,7 @@ mod tests {
         // request_to_mask names alarm (bit 2) + alarm.status (bit 4); the
         // root wildcard (bit 0) is set; severity (bit 3) and value
         // (bit 1) are NOT selected.
-        let mask = request_to_mask(&desc, &req).unwrap();
+        let mask = request_to_mask(&desc, Some(&req)).unwrap();
         assert_eq!(mask.iter().collect::<Vec<_>>(), vec![0, 2, 4]);
 
         // Canonicalization keeps the named `alarm` structure bit as the
@@ -3947,7 +4023,7 @@ mod tests {
             )],
         };
 
-        let mask = request_to_mask(&value_desc, &req).unwrap();
+        let mask = request_to_mask(&value_desc, Some(&req)).unwrap();
         assert_eq!(
             mask.iter().collect::<Vec<_>>(),
             vec![0, 2, 4, 6, 7, 8, 9],

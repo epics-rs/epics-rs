@@ -86,7 +86,9 @@ async fn rpc_channels_lists_hosted_pvs() {
     )
     .await
     .expect("op=channels rpc timed out")
-    .expect("op=channels rpc failed");
+    .expect("op=channels rpc failed")
+    .into_value()
+    .expect("value reply");
 
     let names = match resp {
         PvField::Structure(s) => match s.get_field("value") {
@@ -134,7 +136,9 @@ async fn rpc_info_returns_server_identity() {
     )
     .await
     .expect("op=info rpc timed out")
-    .expect("op=info rpc failed");
+    .expect("op=info rpc failed")
+    .into_value()
+    .expect("value reply");
 
     let s = match resp {
         PvField::Structure(s) => s,
@@ -235,7 +239,9 @@ async fn builtin_server_source_shadows_default_order_user_server_pv() {
     )
     .await
     .expect("op=info rpc timed out")
-    .expect("built-in __server must answer op=info, shadowing the user PV");
+    .expect("built-in __server must answer op=info, shadowing the user PV")
+    .into_value()
+    .expect("value reply");
     match resp {
         PvField::Structure(s) => {
             assert!(

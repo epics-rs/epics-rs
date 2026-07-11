@@ -135,6 +135,17 @@ impl DrvAsynPrologixPort {
         self.state.lock().unwrap().read_carry.clear();
     }
 
+    /// Stage bytes for the next `read_octet` to serve before it talks to the
+    /// bridge again — the Rust equivalent of C leaving `pdpvt->bufCount > 0`
+    /// (`drvPrologixGPIB.c:250`, `if (pdpvt->bufCount == 0)` gates the whole
+    /// `++read` block). Single owner for every write to `read_carry`; the only
+    /// other mutation is [`clear_read_carry`], which is C's `bufCount = 0`.
+    ///
+    /// [`clear_read_carry`]: Self::clear_read_carry
+    fn stage_read_carry(&self, bytes: Vec<u8>) {
+        self.state.lock().unwrap().read_carry = bytes;
+    }
+
     /// Construct a new Prologix driver. Mirrors C asyn
     /// `prologixGPIBConfigure(portName, host, priority, noAutoConnect)`.
     /// `host` may be `"hostname"` (default port 1234 appended) or
@@ -572,7 +583,25 @@ impl PortDriver for DrvAsynPrologixPort {
                     status: AsynStatus::Timeout,
                     ..
                 }) if at_eot => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // C `prologixRead` (drvPrologixGPIB.c:297-303): a failed
+                    // chunk read `return status` *without* touching
+                    // `pdpvt->bufCount`, which line 303 has already advanced
+                    // over every chunk that did arrive. Those bytes stay in
+                    // `pdpvt->buf`, and because the accumulate block is gated on
+                    // `bufCount == 0` (:250) the next `prologixRead` skips the
+                    // bridge entirely and delivers them. The retention is
+                    // deliberate: the resize-failure path two lines up (:288-290)
+                    // *does* reset `bufCount = 0` before returning.
+                    //
+                    // The bytes are staged verbatim — C's `bufCount--` that drops
+                    // the EOT marker (:330-331) is below the loop and never runs
+                    // on this path, so a marker already in `acc` is served as data.
+                    if !acc.is_empty() {
+                        self.stage_read_carry(acc);
+                    }
+                    return Err(e);
+                }
             }
         }
         // Strip the trailing terminator: the EOT marker in EOI mode (it's
@@ -590,7 +619,8 @@ impl PortDriver for DrvAsynPrologixPort {
         if n < remaining {
             // Caller's buffer was too small — stash the remainder so the
             // next read_octet returns it instead of dropping device data.
-            self.state.lock().unwrap().read_carry = acc.split_off(n);
+            // (C keeps the whole reply in `buf` and advances `bufIndex`, :347.)
+            self.stage_read_carry(acc.split_off(n));
         }
         let eom = read_eom(remaining, buf.len(), eos.is_some());
         Ok((n, eom))
@@ -1196,6 +1226,99 @@ mod tests {
         );
         assert!(!eom.contains(EomReason::END));
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+    }
+
+    /// R6-51: a read that fails part-way through the reply must KEEP the bytes
+    /// that did arrive. C `prologixRead` returns the chunk-read status
+    /// (drvPrologixGPIB.c:301-302) with `pdpvt->bufCount` still counting every
+    /// chunk it appended (:303); the next call's `bufCount == 0` gate (:250)
+    /// then fails, so it skips the bridge and delivers those bytes. The
+    /// deliberateness shows two lines up: the resize-failure path (:288-290)
+    /// *does* zero `bufCount` before returning.
+    #[test]
+    fn read_error_retains_partial_bytes_for_the_next_call() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut version_sent = false;
+            let mut read_replied = false;
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        if !version_sent && acc.windows(6).any(|w| w == b"++ver\n") {
+                            stream.write_all(b"Prologix Test 1.0\r\n").unwrap();
+                            version_sent = true;
+                        }
+                        // Answer the first `++read 10\n` with a reply that never
+                        // reaches its eos byte, then go silent: the driver's next
+                        // chunk read times out mid-message.
+                        if !read_replied && acc.windows(10).any(|w| w == b"++read 10\n") {
+                            stream.write_all(b"PARTI").unwrap();
+                            read_replied = true;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(acc);
+        });
+
+        let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
+        drv.set_eos(Some(b'\n')).unwrap();
+
+        // Short timeout: the reply is incomplete, so the read errors out.
+        let user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(Duration::from_millis(300));
+        let mut buf = [0u8; 64];
+        let err = drv
+            .io_read_octet_eom(&user, &mut buf)
+            .expect_err("incomplete reply must fail the read");
+        assert!(
+            matches!(
+                err,
+                AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    ..
+                }
+            ),
+            "expected a timeout, got {err:?}"
+        );
+
+        // The five bytes that did arrive are staged, not dropped.
+        assert_eq!(
+            drv.state.lock().unwrap().read_carry,
+            b"PARTI".to_vec(),
+            "R6-51: bytes read before the error must survive it"
+        );
+
+        // The next call serves them without going back to the bridge — C's
+        // `bufCount != 0` short-circuit.
+        let (n, _eom) = drv
+            .io_read_octet_eom(&user, &mut buf)
+            .expect("staged bytes are served from the carry");
+        assert_eq!(&buf[..n], b"PARTI");
+
+        drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
+        let captured = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reads = captured
+            .windows(10)
+            .filter(|w| *w == b"++read 10\n")
+            .count();
+        assert_eq!(
+            reads, 1,
+            "the second read_octet must not issue another ++read"
+        );
     }
 
     /// Special chars in the user payload get the `\033` escape on

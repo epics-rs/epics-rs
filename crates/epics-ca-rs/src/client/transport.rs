@@ -549,7 +549,7 @@ fn process_command(
             // client/mod.rs for the same boundary in the fast path.
             if count >= 0xFFFF {
                 if hdr.set_payload_size(0, count, peer_minor).is_err() {
-                    dispatch_read_error(in_flight, ioid, epics_base_rs::error::CaError::TooLarge);
+                    dispatch_read_error(in_flight, ioid, epics_base_rs::error::CaError::BadCount);
                     return;
                 }
             } else {
@@ -585,7 +585,7 @@ fn process_command(
             {
                 // No IOID on a fire-and-forget WRITE, so there is no
                 // waiter to fail — libca's `ca_array_put` would have
-                // returned ECA_TOLARGE to the caller synchronously
+                // returned ECA_BADCOUNT to the caller synchronously
                 // (`comQueSend.cpp:313`). The channel-side gate does
                 // that; reaching here means the request slipped past
                 // it, so drop the frame rather than emit a header the
@@ -593,7 +593,7 @@ fn process_command(
                 eprintln!(
                     "CA: {server_addr}: dropping WRITE for sid {sid}: \
                      extended header needed but peer speaks CA minor \
-                     {peer_minor} (< 9) — ECA_TOLARGE"
+                     {peer_minor} (< 9) — ECA_BADCOUNT"
                 );
                 return;
             }
@@ -631,7 +631,7 @@ fn process_command(
                 .is_err()
             {
                 if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
-                    let _ = reply_tx.send(Err(epics_base_rs::error::CaError::TooLarge));
+                    let _ = reply_tx.send(Err(epics_base_rs::error::CaError::BadCount));
                 }
                 return;
             }
@@ -668,7 +668,7 @@ fn process_command(
                     eprintln!(
                         "CA: {server_addr}: dropping EVENT_ADD for sid {sid}: \
                          extended header needed but peer speaks CA minor \
-                         {peer_minor} (< 9) — ECA_TOLARGE"
+                         {peer_minor} (< 9) — ECA_BADCOUNT"
                     );
                     return;
                 }
@@ -715,7 +715,7 @@ fn process_command(
                 eprintln!(
                     "CA: {server_addr}: dropping EVENT_CANCEL for sid {sid}: \
                      extended header needed but peer speaks CA minor \
-                     {peer_minor} (< 9) — ECA_TOLARGE"
+                     {peer_minor} (< 9) — ECA_BADCOUNT"
                 );
                 return;
             }

@@ -1674,11 +1674,14 @@ impl CaChannel {
         // `m_count` — which a strict peer interprets as an extended
         // marker with missing annex bytes. `set_payload_size` refuses
         // the extended form for a pre-V49 peer (`comQueSend.cpp:299`
-        // `throw cacChannel::outOfBounds()`), which surfaces as
-        // ECA_TOLARGE without a byte reaching the wire.
+        // `throw cacChannel::outOfBounds()` → ECA_BADCOUNT,
+        // `oldChannelNotify.cpp:309`) without a byte reaching the wire.
+        // In practice the caller's element bound (ECA_TOLARGE,
+        // `tcpiiu.cpp:1470`) fires first on a pre-V49 circuit: MAX_TCP
+        // caps the count far below 0xffff.
         if count >= 0xFFFF {
             hdr.set_payload_size(0, count, peer_minor)
-                .map_err(|_| CaError::TooLarge)?;
+                .map_err(|_| CaError::BadCount)?;
         } else {
             hdr.count = count as u16;
         }
@@ -1721,10 +1724,11 @@ impl CaChannel {
         }
         // A payload or count that needs the extended header cannot be
         // sent to a pre-V49 peer — libca throws `cacChannel::outOfBounds`
-        // out of `comQueSend::insertRequestHeader` (`comQueSend.cpp:299`)
-        // and the put fails locally with ECA_TOLARGE.
+        // out of `comQueSend::insertRequestHeader` (`comQueSend.cpp:313`)
+        // and the put fails locally with ECA_BADCOUNT
+        // (`oldChannelNotify.cpp:378`).
         hdr.set_payload_size(padded.len(), count, peer_minor)
-            .map_err(|_| CaError::TooLarge)?;
+            .map_err(|_| CaError::BadCount)?;
 
         let mut frame = hdr.to_bytes_extended();
         frame.extend_from_slice(&padded);
@@ -1750,12 +1754,18 @@ impl CaChannel {
                  nciu::read ECA_NORDACCESS); ioid {ioid}"
             )));
         }
-        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1476`) substitutes the
-        // channel's native element count for a zero (autosize) request when
-        // the peer predates CA_V413 — those servers have no zero-count
-        // autosize contract and would read `m_count == 0` as "no elements".
-        let count =
-            crate::protocol::read_notify_wire_count(count, snap.element_count, snap.server_minor);
+        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
+        // requested element count against what the circuit can carry
+        // (ECA_TOLARGE past it), then substitutes the channel's native count
+        // for a zero (autosize) request when the peer predates CA_V413 —
+        // those servers have no zero-count autosize contract and would read
+        // `m_count == 0` as "no elements".
+        let count = crate::protocol::read_notify_wire_count(
+            count,
+            snap.element_count,
+            data_type,
+            snap.server_minor,
+        )?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_read_notify_frame(
                 snap.sid,
@@ -1798,6 +1808,12 @@ impl CaChannel {
                  nciu::write ECA_NOWTACCESS); ioid {ioid}"
             )));
         }
+        // C `comQueSend::insertRequestWithPayLoad` (`comQueSend.cpp:352-364`)
+        // bounds an array put against the peer's message-body limit and throws
+        // `cacChannel::outOfBounds` (→ ECA_BADCOUNT) past it, before a byte is
+        // queued. Gate here, ahead of the direct-writer / coordinator split, so
+        // neither path can put an unframeable request on the wire.
+        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
@@ -1842,6 +1858,10 @@ impl CaChannel {
                     .into(),
             ));
         }
+        // Same pre-queue element bound as `send_write_notify_fast`
+        // (`comQueSend.cpp:352-364`) — a fire-and-forget put is bounded by
+        // libca too; `ca_array_put` returns ECA_BADCOUNT synchronously.
+        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
@@ -1967,10 +1987,23 @@ impl CaChannel {
                 // Refill the reusable Sender slot. The dispatcher takes
                 // this on response without removing the DashMap entry.
                 *cached.slot.lock() = Some(reply_tx);
+                let count = match crate::protocol::read_notify_wire_count(
+                    cached.element_count,
+                    cached.element_count,
+                    cached.data_type,
+                    snap.server_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&cached.ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let frame = match Self::build_read_notify_frame(
                     cached.sid,
                     cached.data_type,
-                    cached.element_count,
+                    count,
                     cached.ioid,
                     snap.server_minor,
                 ) {
@@ -2001,10 +2034,23 @@ impl CaChannel {
                         reply_tx,
                     },
                 );
+                let count = match crate::protocol::read_notify_wire_count(
+                    snap.element_count,
+                    snap.element_count,
+                    snap.native_type as u16,
+                    snap.server_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let frame = match Self::build_read_notify_frame(
                     snap.sid,
                     snap.native_type as u16,
-                    snap.element_count,
+                    count,
                     ioid,
                     snap.server_minor,
                 ) {
@@ -3326,14 +3372,32 @@ async fn run_coordinator(
                             });
 
                             if connected {
+                                let data_type =
+                                    data_type.expect("connected channel has native type");
+                                // C `tcpiiu::subscriptionRequest`
+                                // (`tcpiiu.cpp:1572-1585`): resolve the wire
+                                // count, then bound it against what the circuit
+                                // can carry. Past the bound the subscription is
+                                // never installed and `ca_create_subscription`
+                                // returns ECA_TOLARGE.
+                                let wire_count = crate::protocol::subscription_wire_count(
+                                    count.expect("connected channel has element count"),
+                                    ch.element_count,
+                                    data_type,
+                                    peer_minor,
+                                );
+                                let wire_count = match wire_count {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        subscriptions.remove(subid);
+                                        let _ = reply.send(Err(e));
+                                        continue;
+                                    }
+                                };
                                 let _ = transport_tx.send(TransportCommand::Subscribe {
                                     sid: ch.sid,
-                                    data_type: data_type.expect("connected channel has native type"),
-                                    count: crate::protocol::subscription_wire_count(
-                                        count.expect("connected channel has element count"),
-                                        ch.element_count,
-                                        peer_minor,
-                                    ),
+                                    data_type,
+                                    count: wire_count,
                                     subid,
                                     mask,
                                     server_addr,
@@ -3366,7 +3430,7 @@ async fn run_coordinator(
                                             sid: ch.sid,
                                             subid,
                                             data_type,
-                                            count: crate::protocol::subscription_wire_count(
+                                            count: crate::protocol::subscription_cancel_wire_count(
                                                 rec.count.unwrap_or(0),
                                                 ch.element_count,
                                                 peer_minor,
@@ -3397,11 +3461,12 @@ async fn run_coordinator(
                                                 sid: ch.sid,
                                                 subid,
                                                 data_type,
-                                                count: crate::protocol::subscription_wire_count(
-                                                    rec.count.unwrap_or(0),
-                                                    ch.element_count,
-                                                    peer_minor,
-                                                ),
+                                                count:
+                                                    crate::protocol::subscription_cancel_wire_count(
+                                                        rec.count.unwrap_or(0),
+                                                        ch.element_count,
+                                                        peer_minor,
+                                                    ),
                                                 server_addr,
                                                 priority: ch.priority,
                                             });
@@ -4128,19 +4193,34 @@ async fn run_coordinator(
                                                     .get(&(addr, ch.priority))
                                                     .copied()
                                                     .unwrap_or(0);
-                                                let _ =
-                                                    transport_tx.send(TransportCommand::ReadNotify {
-                                                        sid: ch.sid,
-                                                        data_type,
-                                                        count: crate::protocol::read_notify_wire_count(
-                                                            rec.count.unwrap_or(0),
-                                                            ch.element_count,
-                                                            peer_minor,
-                                                        ),
-                                                        ioid: in_flight.alloc_ioid(),
-                                                        server_addr: addr,
-                                                        priority: ch.priority,
-                                                    });
+                                                match crate::protocol::read_notify_wire_count(
+                                                    rec.count.unwrap_or(0),
+                                                    ch.element_count,
+                                                    data_type,
+                                                    peer_minor,
+                                                ) {
+                                                    Ok(count) => {
+                                                        let _ = transport_tx.send(
+                                                            TransportCommand::ReadNotify {
+                                                                sid: ch.sid,
+                                                                data_type,
+                                                                count,
+                                                                ioid: in_flight.alloc_ioid(),
+                                                                server_addr: addr,
+                                                                priority: ch.priority,
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            pv = %ch.pv_name,
+                                                            error = %e,
+                                                            "skipping post-recovery re-read: \
+                                                             request exceeds what this circuit \
+                                                             can carry"
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }

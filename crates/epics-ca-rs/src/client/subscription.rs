@@ -587,18 +587,37 @@ impl SubscriptionRegistry {
                 let count = *rec
                     .count
                     .get_or_insert(resolve_subscription_count(rec.req_count, element_count));
+                // The cached `rec.count` is C's `netSubscription::count` (the
+                // user's cap); the wire count is derived from it per request
+                // via `getCount(allow_zero = CA_V413(minor))`
+                // (`netIO.h:241-251`) and then bounded against what the
+                // circuit can carry (`tcpiiu.cpp:1574-1585`).
+                let wire_count = match crate::protocol::subscription_wire_count(
+                    count,
+                    element_count,
+                    data_type,
+                    peer_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // C `nciu::resubscribe` (`nciu.cpp:535-541`) catches
+                        // the throw, logs "CAC: failed to send subscription
+                        // request during channel connect", and leaves the
+                        // subscription uninstalled — the channel still
+                        // connects.
+                        tracing::error!(
+                            subid = rec.subid,
+                            error = %e,
+                            "failed to send subscription request during channel connect"
+                        );
+                        rec.needs_restore = true;
+                        continue;
+                    }
+                };
                 let _ = transport_tx.send(TransportCommand::Subscribe {
                     sid: new_sid,
                     data_type,
-                    // The cached `rec.count` is C's `netSubscription::count`
-                    // (the user's cap); the wire count is derived from it per
-                    // request via `getCount(allow_zero = CA_V413(minor))`
-                    // (`netIO.h:241-251`).
-                    count: crate::protocol::subscription_wire_count(
-                        count,
-                        element_count,
-                        peer_minor,
-                    ),
+                    count: wire_count,
                     subid: rec.subid,
                     mask: rec.mask,
                     server_addr,

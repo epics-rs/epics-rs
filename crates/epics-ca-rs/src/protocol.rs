@@ -330,60 +330,155 @@ pub const fn ca_v413(minor: u16) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtendedHeaderUnsupported;
 
-/// C's pre-V49 element bound: the largest element count that still fits a
-/// request/reply body a 16-byte-header-only peer can frame.
+/// C `dbr_size[dataType]` and `dbr_value_size[dataType]` (`db_access.h`) for a
+/// CA *request* data type. A DBR code encodes its own native carrier, so a
+/// request needs no channel context to size: `dbr_size[t]` is the body of a
+/// one-element transfer (metadata + one value) and `dbr_value_size[t]` is one
+/// value. Out-of-range codes are C `INVALID_DB_REQ` → `cacChannel::badType`
+/// → `ECA_BADTYPE`.
+fn dbr_request_sizes(dbr_type: u16) -> CaResult<(u64, u64)> {
+    use epics_base_rs::types::{DbFieldType, dbr_buffer_size};
+    // The four non-array DBR codes have no `value[]` array, so the generic
+    // `native = dbr_type % 7` decomposition does not apply; their table
+    // entries are taken straight from `db_access.h`.
+    let (dbr_size, value_size) = match dbr_type {
+        0..=34 => {
+            let native = DbFieldType::from_u16(dbr_type % 7)
+                .map_err(|_| CaError::UnsupportedType(dbr_type))?;
+            (dbr_buffer_size(dbr_type, native, 1), native.element_size())
+        }
+        // DBR_PUT_ACKT / DBR_PUT_ACKS: a bare `dbr_put_ackt_t` (u16).
+        35 | 36 => (2, 2),
+        // DBR_STSACK_STRING: status/severity/ackt/acks + one 40-byte string.
+        37 => (48, 40),
+        // DBR_CLASS_NAME: one 40-byte string, no metadata.
+        38 => (40, 40),
+        _ => return Err(CaError::UnsupportedType(dbr_type)),
+    };
+    Ok((dbr_size as u64, value_size.max(1) as u64))
+}
+
+/// Largest element count libca will *request* from a peer at `peer_minor`.
 ///
-/// `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1465-1471`) and
-/// `tcpiiu::subscriptionRequest` (`tcpiiu.cpp:1576-1584`) cap against
-/// `maxBytes = 0xfffffff0` on a V49 circuit and `MAX_TCP` on a pre-V49 one,
-/// then compute `maxElem = (maxBytes - dbr_size[type]) / dbr_value_size[type]`
-/// and reject `nElem > maxElem` with `msgBodyCacheTooSmall` → `ECA_TOLARGE`.
-///
-/// `meta_size` is C `dbr_size[dataType]` (the DBR header for the type) and
-/// `element_size` is C `dbr_value_size[dataType]`.
-pub fn max_request_elements(meta_size: usize, element_size: usize, peer_minor: u16) -> u64 {
+/// C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1473`) and
+/// `tcpiiu::subscriptionRequest` (`tcpiiu.cpp:1574-1585`):
+/// ```text
+/// maxBytes = CA_V49(minor) ? 0xfffffff0 : MAX_TCP;
+/// maxElem  = (maxBytes - dbr_size[type]) / dbr_value_size[type];
+/// if (nElem > maxElem) throw cacChannel::msgBodyCacheTooSmall();  // ECA_TOLARGE
+/// ```
+/// `MAX_TCP` is 16 KiB (`caProto.h:67`), so on a pre-V49 circuit this bound is
+/// what actually fires — long before the 0xffff header gate could.
+fn max_read_elements(dbr_size: u64, value_size: u64, peer_minor: u16) -> u64 {
     let max_bytes: u64 = if ca_v49(peer_minor) {
         0xffff_fff0
     } else {
         MAX_TCP as u64
     };
-    let element_size = element_size.max(1) as u64;
-    max_bytes.saturating_sub(meta_size as u64) / element_size
+    max_bytes.saturating_sub(dbr_size) / value_size
 }
 
-/// Wire element count for a `CA_PROTO_READ_NOTIFY` framed for `peer_minor`.
+/// Wire element count for a `CA_PROTO_READ_NOTIFY` framed for `peer_minor`,
+/// or `ECA_TOLARGE` when the request exceeds what the circuit can carry.
 ///
-/// C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1476`):
-/// `if (nElem == 0 && !CA_V413(minorProtocolVersion)) nElem = chan.getcount();`
+/// Mirrors C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1455-1484`) in its
+/// order: the element bound is checked against the count the CALLER asked
+/// for, and only then is a zero substituted for a pre-V413 peer —
+/// `if (nElem == 0 && !CA_V413(minor)) nElem = chan.getcount();`
+/// (`tcpiiu.cpp:1476`). A zero request therefore always clears the bound,
+/// even when the substituted native count would not; C frames it anyway, and
+/// so do we.
 ///
-/// Zero means "send whatever the record currently holds" (autosize), a
-/// contract introduced in CA V4.13 (`caProto.h:48`, "Allow zero length in
-/// requests") and implemented server-side at `rsrv/camessage.c:507`. A peer
-/// below V413 has no such code and would resolve `m_count == 0` to a
-/// zero-element transfer, so libca substitutes the channel's native count.
-pub fn read_notify_wire_count(requested: u32, native: u32, peer_minor: u16) -> u32 {
-    if requested == 0 && !ca_v413(peer_minor) {
+/// The zero itself means "send whatever the record currently holds"
+/// (autosize), a contract introduced in CA V4.13 (`caProto.h:48`, "Allow zero
+/// length in requests"). A peer below V413 has no such code and would resolve
+/// `m_count == 0` to a zero-element transfer, hence the substitution.
+pub fn read_notify_wire_count(
+    requested: u32,
+    native: u32,
+    dbr_type: u16,
+    peer_minor: u16,
+) -> CaResult<u32> {
+    let (dbr_size, value_size) = dbr_request_sizes(dbr_type)?;
+    if requested as u64 > max_read_elements(dbr_size, value_size, peer_minor) {
+        return Err(CaError::TooLarge);
+    }
+    Ok(if requested == 0 && !ca_v413(peer_minor) {
         native
     } else {
         requested
-    }
+    })
 }
 
-/// Wire element count for a `CA_PROTO_EVENT_ADD` framed for `peer_minor`.
-///
-/// C `tcpiiu::subscriptionRequest` (`tcpiiu.cpp:1573`) calls
-/// `subscr.getCount(guard, CA_V413(minorProtocolVersion))`, and
-/// `netSubscription::getCount` (`netIO.h:241-251`) is:
+/// C `netSubscription::getCount` (`netIO.h:241-251`) — the cached
+/// `netSubscription::count` is the USER's cap; the wire count is re-derived
+/// from it per request:
 /// `if ((count == 0 && !allow_zero) || count > nativeCount) return nativeCount;`
 ///
-/// So a subscription differs from a read in one extra respect: an
-/// over-large cap also collapses to the native count, on every peer version.
-pub fn subscription_wire_count(requested: u32, native: u32, peer_minor: u16) -> u32 {
+/// This is the whole of `tcpiiu::subscriptionCancelRequest`'s count logic
+/// (`tcpiiu.cpp:1659`): a cancel re-resolves like an add, but has no element
+/// bound — it carries no body.
+pub fn subscription_cancel_wire_count(requested: u32, native: u32, peer_minor: u16) -> u32 {
     if (requested == 0 && !ca_v413(peer_minor)) || requested > native {
         native
     } else {
         requested
     }
+}
+
+/// Wire element count for a `CA_PROTO_EVENT_ADD` framed for `peer_minor`, or
+/// `ECA_TOLARGE` when it exceeds what the circuit can carry.
+///
+/// Mirrors C `tcpiiu::subscriptionRequest` (`tcpiiu.cpp:1558-1585`), whose
+/// order is the reverse of the read path's: `getCount` runs FIRST and the
+/// element bound is applied to the RESOLVED count. So an autosize
+/// subscription against a pre-V49 peer whose native count overflows `MAX_TCP`
+/// is rejected here, where the same request as a read would be framed.
+pub fn subscription_wire_count(
+    requested: u32,
+    native: u32,
+    dbr_type: u16,
+    peer_minor: u16,
+) -> CaResult<u32> {
+    let (dbr_size, value_size) = dbr_request_sizes(dbr_type)?;
+    let count = subscription_cancel_wire_count(requested, native, peer_minor);
+    if count as u64 > max_read_elements(dbr_size, value_size, peer_minor) {
+        return Err(CaError::TooLarge);
+    }
+    Ok(count)
+}
+
+/// C `comQueSend::insertRequestWithPayLoad`'s array bound
+/// (`comQueSend.cpp:352-364`) — the put path's equivalent of
+/// [`max_read_elements`], with three differences that are C's, not ours:
+/// ```text
+/// maxBytes = v49Ok ? 0xffffffff : MAX_TCP - sizeof(caHdr);
+/// maxElem  = (maxBytes - sizeof(dbr_double_t) - dbr_size[type])
+///                / dbr_value_size[type];
+/// if (nElem >= maxElem) throw cacChannel::outOfBounds();   // ECA_BADCOUNT
+/// ```
+/// — the header is subtracted, a `dbr_double_t` of slack is subtracted, the
+/// comparison is `>=` not `>`, and the failure is `ECA_BADCOUNT` rather than
+/// `ECA_TOLARGE`. The bound applies only to the array branch: `nElem == 1`
+/// takes the scalar path (`comQueSend.cpp:330-352`), which has no bound.
+pub fn check_write_element_count(count: u32, dbr_type: u16, peer_minor: u16) -> CaResult<()> {
+    if count == 1 {
+        return Ok(());
+    }
+    let (dbr_size, value_size) = dbr_request_sizes(dbr_type)?;
+    let max_bytes: u64 = if ca_v49(peer_minor) {
+        0xffff_ffff
+    } else {
+        (MAX_TCP - 16) as u64
+    };
+    let max_elem = max_bytes
+        .saturating_sub(8) // sizeof(dbr_double_t)
+        .saturating_sub(dbr_size)
+        / value_size;
+    if count as u64 >= max_elem {
+        return Err(CaError::BadCount);
+    }
+    Ok(())
 }
 
 /// 16-byte CA message header (big-endian), with optional extended fields.
@@ -607,37 +702,125 @@ pub fn pad_string(s: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    // DBR_TIME_DOUBLE (20): C `dbr_time_double` is status(2) + severity(2) +
+    // stamp(8) + RISC pad(4) + value(8), so `dbr_size[20]` = 24 and
+    // `dbr_value_size[20]` = 8.
+    const T_DOUBLE: u16 = 20;
+    const T_DOUBLE_DBR_SIZE: u32 = 24;
+
     /// A zero (autosize) read is only legal from CA_V413 on
     /// (`caProto.h:48`). C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1476`)
     /// substitutes the channel's native count below that; at and above it
     /// the zero travels to the wire so the server sizes the reply itself.
     #[test]
     fn read_notify_zero_count_substitutes_native_below_v413() {
-        assert_eq!(read_notify_wire_count(0, 42, 12), 42);
-        assert_eq!(read_notify_wire_count(0, 42, 13), 0);
-        // The V413 boundary is the only gate: a non-zero request is never
+        let wire = |req, native, minor| read_notify_wire_count(req, native, T_DOUBLE, minor);
+        assert_eq!(wire(0, 42, 12).unwrap(), 42);
+        assert_eq!(wire(0, 42, 13).unwrap(), 0);
+        // The V413 boundary is the only rewrite: a non-zero request is never
         // rewritten by `readNotifyRequest`, not even one above the native
         // count (the server clamps that itself).
-        assert_eq!(read_notify_wire_count(7, 42, 12), 7);
-        assert_eq!(read_notify_wire_count(99, 42, 13), 99);
+        assert_eq!(wire(7, 42, 12).unwrap(), 7);
+        assert_eq!(wire(99, 42, 13).unwrap(), 99);
         // CA_MINIMUM_SUPPORTED_VERSION peers get the substitution too.
-        assert_eq!(read_notify_wire_count(0, 1, 4), 1);
+        assert_eq!(wire(0, 1, 4).unwrap(), 1);
     }
 
     /// `netSubscription::getCount` (`netIO.h:241-251`) adds a second
     /// collapse a read does not have: a cap above the native count also
-    /// resolves to the native count, on every peer version.
+    /// resolves to the native count, on every peer version. The cancel
+    /// resolver is that function alone (`tcpiiu.cpp:1659`).
     #[test]
     fn subscription_wire_count_applies_both_getcount_collapses() {
+        let wire = |req, native, minor| subscription_wire_count(req, native, T_DOUBLE, minor);
         // zero-count collapse, gated on CA_V413
-        assert_eq!(subscription_wire_count(0, 42, 12), 42);
-        assert_eq!(subscription_wire_count(0, 42, 13), 0);
+        assert_eq!(wire(0, 42, 12).unwrap(), 42);
+        assert_eq!(wire(0, 42, 13).unwrap(), 0);
         // over-large cap collapse, ungated
-        assert_eq!(subscription_wire_count(99, 42, 12), 42);
-        assert_eq!(subscription_wire_count(99, 42, 13), 42);
+        assert_eq!(wire(99, 42, 12).unwrap(), 42);
+        assert_eq!(wire(99, 42, 13).unwrap(), 42);
         // a cap at or below the native count travels verbatim
-        assert_eq!(subscription_wire_count(42, 42, 13), 42);
-        assert_eq!(subscription_wire_count(7, 42, 12), 7);
+        assert_eq!(wire(42, 42, 13).unwrap(), 42);
+        assert_eq!(wire(7, 42, 12).unwrap(), 7);
+        // the cancel path resolves identically, but has no element bound
+        assert_eq!(subscription_cancel_wire_count(0, 42, 12), 42);
+        assert_eq!(subscription_cancel_wire_count(0, 42, 13), 0);
+        assert_eq!(subscription_cancel_wire_count(99, 42, 13), 42);
+    }
+
+    /// `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1473`): a pre-V49 circuit
+    /// caps the request at `(MAX_TCP - dbr_size[t]) / dbr_value_size[t]` and
+    /// raises `msgBodyCacheTooSmall` → ECA_TOLARGE past it. For
+    /// DBR_TIME_DOUBLE that is `(16384 - 24) / 8` = 2045.
+    #[test]
+    fn read_bound_is_max_tcp_on_a_pre_v49_circuit() {
+        const MAX_ELEM: u32 = (16384 - T_DOUBLE_DBR_SIZE) / 8; // 2045
+        assert!(read_notify_wire_count(MAX_ELEM, MAX_ELEM, T_DOUBLE, 8).is_ok());
+        assert!(matches!(
+            read_notify_wire_count(MAX_ELEM + 1, MAX_ELEM + 1, T_DOUBLE, 8),
+            Err(CaError::TooLarge)
+        ));
+        // A V49 circuit has effectively no bound: same request is framed.
+        assert_eq!(
+            read_notify_wire_count(MAX_ELEM + 1, MAX_ELEM + 1, T_DOUBLE, 13).unwrap(),
+            MAX_ELEM + 1
+        );
+    }
+
+    /// The read bound is applied to the count the CALLER asked for, BEFORE the
+    /// pre-V413 zero substitution (`tcpiiu.cpp:1470` then `:1476`). So a zero
+    /// request always clears the bound and C frames the substituted native
+    /// count even when that count is over it. Quirk preserved deliberately.
+    #[test]
+    fn read_bound_precedes_the_zero_substitution() {
+        // Minor 8 is pre-V49 (so MAX_TCP bounds the request) and therefore
+        // also pre-V413 (so the zero is substituted).
+        let native = (16384 - T_DOUBLE_DBR_SIZE) / 8 + 500; // past the pre-V49 bound
+        assert_eq!(
+            read_notify_wire_count(0, native, T_DOUBLE, 8).unwrap(),
+            native
+        );
+        // Ask for the same count explicitly and it is rejected.
+        assert!(matches!(
+            read_notify_wire_count(native, native, T_DOUBLE, 8),
+            Err(CaError::TooLarge)
+        ));
+    }
+
+    /// `tcpiiu::subscriptionRequest` runs `getCount` FIRST and bounds the
+    /// RESOLVED count (`tcpiiu.cpp:1572-1585`) — the reverse of the read
+    /// path — so an autosize subscription to a pre-V49 peer whose native
+    /// count overflows MAX_TCP is rejected where the same read is framed.
+    #[test]
+    fn subscription_bound_follows_the_zero_substitution() {
+        let native = (16384 - T_DOUBLE_DBR_SIZE) / 8 + 500;
+        assert!(matches!(
+            subscription_wire_count(0, native, T_DOUBLE, 8),
+            Err(CaError::TooLarge)
+        ));
+        // V413 peer: the zero is not substituted, so nothing to bound.
+        assert_eq!(subscription_wire_count(0, native, T_DOUBLE, 13).unwrap(), 0);
+    }
+
+    /// `comQueSend::insertRequestWithPayLoad` (`comQueSend.cpp:352-364`):
+    /// `maxElem = (MAX_TCP - sizeof(caHdr) - sizeof(dbr_double_t) -
+    /// dbr_size[t]) / dbr_value_size[t]`, rejected at `>=` (not `>`) with
+    /// `outOfBounds` → ECA_BADCOUNT. For DBR_DOUBLE (6) that is
+    /// `(16384 - 16 - 8 - 8) / 8` = 2044.
+    #[test]
+    fn write_bound_is_max_tcp_minus_header_on_a_pre_v49_circuit() {
+        const DBR_DOUBLE: u16 = 6;
+        const MAX_ELEM: u32 = (16384 - 16 - 8 - 8) / 8; // 2044
+        assert!(check_write_element_count(MAX_ELEM - 1, DBR_DOUBLE, 8).is_ok());
+        // C's comparison is `>=`, so maxElem itself is already rejected.
+        assert!(matches!(
+            check_write_element_count(MAX_ELEM, DBR_DOUBLE, 8),
+            Err(CaError::BadCount)
+        ));
+        // A scalar put takes C's `nElem == 1` branch, which has no bound.
+        assert!(check_write_element_count(1, DBR_DOUBLE, 8).is_ok());
+        // A V49 circuit frames the same array.
+        assert!(check_write_element_count(MAX_ELEM, DBR_DOUBLE, 13).is_ok());
     }
 
     #[test]

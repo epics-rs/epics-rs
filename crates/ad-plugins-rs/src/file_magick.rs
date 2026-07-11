@@ -78,18 +78,32 @@ impl MagickWriter {
         self.compress_type = MagickCompression::from_index(idx);
     }
 
-    fn color_mode(array: &NDArray) -> NDColorMode {
-        array
-            .attributes
-            .get("ColorMode")
-            .and_then(|attr| attr.value.as_i64())
-            .map(|v| NDColorMode::from_i32(v as i32))
-            .unwrap_or_else(|| match array.dims.as_slice() {
-                [a, _, _] if a.size == 3 => NDColorMode::RGB1,
-                [_, b, _] if b.size == 3 => NDColorMode::RGB2,
-                [_, _, c] if c.size == 3 => NDColorMode::RGB3,
-                _ => NDColorMode::Mono,
-            })
+    /// C's `openFile` structure chain (NDFileMagick.cpp:71-95).
+    ///
+    /// The ColorMode *attribute* is the only source of truth, defaulting to Mono
+    /// when it is absent — C `this->colorMode = NDColorModeMono;` (:41) overwritten
+    /// only by the attribute (:44-45); `info().color_mode` is that rule's single
+    /// owner. Each 3-D branch then requires the attribute to name the layout, so a
+    /// 3-D array with no ColorMode attribute matches nothing and C returns
+    /// asynError (:90-95). Inferring the layout from the dimensions instead made
+    /// such an array look like RGB1 and write a file.
+    ///
+    /// C takes the mode from the branch it took, not from the attribute: the 2-D
+    /// branch is grayscale whatever the attribute says (:71-75). And unlike
+    /// NDFileTIFF (:180) there is no ndims == 1 branch — a 1-D array is an error.
+    fn color_mode(array: &NDArray) -> ADResult<NDColorMode> {
+        let attr_mode = array.info().color_mode;
+        Ok(match array.dims.as_slice() {
+            [_, _] => NDColorMode::Mono,
+            [c, _, _] if c.size == 3 && attr_mode == NDColorMode::RGB1 => NDColorMode::RGB1,
+            [_, c, _] if c.size == 3 && attr_mode == NDColorMode::RGB2 => NDColorMode::RGB2,
+            [_, _, c] if c.size == 3 && attr_mode == NDColorMode::RGB3 => NDColorMode::RGB3,
+            _ => {
+                return Err(ADError::InvalidDimensions(
+                    "unsupported array structure".into(),
+                ));
+            }
+        })
     }
 
     /// Convert NDArray to DynamicImage for encoding.
@@ -132,7 +146,7 @@ impl MagickWriter {
         let info = array.info();
         let width = info.x_size as u32;
         let height = info.y_size as u32;
-        let color = Self::color_mode(array);
+        let color = Self::color_mode(array)?;
         let is_rgb = matches!(
             color,
             NDColorMode::RGB1 | NDColorMode::RGB2 | NDColorMode::RGB3
@@ -498,6 +512,56 @@ mod tests {
     fn temp_path(ext: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("adcore_test_magick_{n}.{ext}"))
+    }
+
+    /// R8-75, Magick writer: same defect as the cited TIFF site. C sets
+    /// `this->colorMode = NDColorModeMono` (NDFileMagick.cpp:41) and overwrites it
+    /// only from the attribute (:44-45); each 3-D branch requires the attribute
+    /// (:76, :81, :86), so a 3-D array without ColorMode returns asynError
+    /// (:90-95). The port inferred RGB1 from the dims.
+    #[test]
+    fn test_r8_75_3d_without_colormode_attribute_is_an_error() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+
+        let rgb1_dims = || {
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ]
+        };
+
+        let arr = NDArray::new(rgb1_dims(), NDDataType::UInt8);
+        let path = temp_path("png");
+        let mut writer = MagickWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        let err = writer.write_file(&arr).unwrap_err();
+        assert!(
+            matches!(err, ADError::InvalidDimensions(_)),
+            "3-D without ColorMode must be rejected, got {err:?}"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // Positive control: WITH ColorMode=RGB1 the same array writes.
+        let mut arr = NDArray::new(rgb1_dims(), NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+        let path = temp_path("png");
+        let mut writer = MagickWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        writer
+            .write_file(&arr)
+            .expect("3-D WITH ColorMode=RGB1 must still write");
+        assert!(path.exists());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

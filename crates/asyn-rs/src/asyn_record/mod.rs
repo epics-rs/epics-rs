@@ -582,6 +582,50 @@ fn flush_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason).with_addr(plan.addr)
 }
 
+/// One phase of a `performIO` cycle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IoPhase {
+    Flush,
+    Write,
+    Read,
+}
+
+/// The phases one `performIO` cycle runs, in C's execution order — the single
+/// owner of "which phases, and when" for both the synchronous
+/// [`AsynRecord::perform_io`] and the off-thread [`run_io_plan`], so the two
+/// cannot drift apart.
+///
+/// C `performOctetIO` (asynRecord.c:1518-1558):
+///
+/// 1. **Flush, before the write**, for `TMOD == Flush` *and* `TMOD ==
+///    Write_Read` (`:1518-1520`). Write/Read is the default TMOD, and this is
+///    the whole point of the flush: drop bytes left in the driver from a
+///    previous transaction so they cannot be prepended to the fresh response.
+///    Running it after the read — or only for `TMOD == Flush` — leaves exactly
+///    the stale-byte framing error the flush exists to prevent.
+/// 2. Write, for `Write` / `Write_Read` (`:1524`).
+/// 3. Read, for `Read` / `Write_Read` (`:1557`).
+///
+/// The flush is octet-only: it lives inside `performOctetIO`, and the register
+/// handlers (`performInt32IO` :1370-1395, `performUInt32DigitalIO` :1405-1433,
+/// `performFloat64IO` :1442-1467) have no flush branch — a `TMOD=Flush` cycle on
+/// a register interface does nothing in C.
+fn io_phases(plan: &IoPlan) -> Vec<IoPhase> {
+    let mut phases = Vec::with_capacity(3);
+    if plan.iface == InterfaceType::Octet
+        && matches!(plan.tmod, TransferMode::Flush | TransferMode::WriteRead)
+    {
+        phases.push(IoPhase::Flush);
+    }
+    if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
+        phases.push(IoPhase::Write);
+    }
+    if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
+        phases.push(IoPhase::Read);
+    }
+    phases
+}
+
 /// Build the write-phase `RequestOp` for an interface. C `performOctetIO`
 /// (asynRecord.c:1528-1546) suppresses the driver's output EOS for a binary
 /// write; `OctetWriteBinary` brackets that save/clear/restore in the actor.
@@ -790,7 +834,28 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
     }
 }
 
-/// Run `performIO`'s write/read/flush phases off the scan thread against the
+/// Record one phase's result into the outcome — the phase→recorder mapping,
+/// shared by the synchronous and off-thread runners so a phase cannot be handled
+/// differently on the two paths. As in C `performIO`, a failed phase reports but
+/// does not skip the phases after it.
+fn record_phase_result(
+    plan: &IoPlan,
+    out: &mut IoOutcome,
+    phase: IoPhase,
+    res: AsynResult<RequestResult>,
+) {
+    match phase {
+        IoPhase::Flush => {
+            if let Err(e) = res {
+                out.errs = Some(format!("flush: {e}"));
+            }
+        }
+        IoPhase::Write => record_write_result(plan, out, res),
+        IoPhase::Read => record_read_result(plan, out, res),
+    }
+}
+
+/// Run `performIO`'s flush/write/read phases off the scan thread against the
 /// port actor, threading the shared `CancelToken` so an `AQR`/`cancelRequest`
 /// (asynManager.c:1630) aborts a still-queued phase. Mirrors the synchronous
 /// [`AsynRecord::perform_io`] phase order; both feed
@@ -807,42 +872,29 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
         return out;
     }
 
-    // Write phase.
-    if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
-        let res = handle
-            .submit_cancellable(io_write_op(&plan), io_user(&plan), cancel.clone())
-            .await;
+    for phase in io_phases(&plan) {
+        let res = match phase {
+            IoPhase::Flush => {
+                handle
+                    .submit_cancellable(RequestOp::Flush, flush_user(&plan), cancel.clone())
+                    .await
+            }
+            IoPhase::Write => {
+                handle
+                    .submit_cancellable(io_write_op(&plan), io_user(&plan), cancel.clone())
+                    .await
+            }
+            IoPhase::Read => {
+                handle
+                    .submit_cancellable(io_read_op(&plan), io_user(&plan), cancel.clone())
+                    .await
+            }
+        };
         if cancel.is_cancelled() {
             out.errs = Some(CANCELED_MSG.to_string());
             return out;
         }
-        record_write_result(&plan, &mut out, res);
-    }
-
-    // Read phase.
-    if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
-        let res = handle
-            .submit_cancellable(io_read_op(&plan), io_user(&plan), cancel.clone())
-            .await;
-        if cancel.is_cancelled() {
-            out.errs = Some(CANCELED_MSG.to_string());
-            return out;
-        }
-        record_read_result(&plan, &mut out, res);
-    }
-
-    // Flush phase.
-    if matches!(plan.tmod, TransferMode::Flush) {
-        let res = handle
-            .submit_cancellable(RequestOp::Flush, flush_user(&plan), cancel.clone())
-            .await;
-        if cancel.is_cancelled() {
-            out.errs = Some(CANCELED_MSG.to_string());
-            return out;
-        }
-        if let Err(e) = res {
-            out.errs = Some(format!("flush: {e}"));
-        }
+        record_phase_result(&plan, &mut out, phase, res);
     }
 
     out
@@ -2019,25 +2071,19 @@ impl AsynRecord {
         let plan = self.build_io_plan();
         let mut out = IoOutcome::default();
 
-        if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
-            let res = entry
-                .handle
-                .submit_blocking(io_write_op(&plan), io_user(&plan));
-            record_write_result(&plan, &mut out, res);
-        }
-        if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
-            let res = entry
-                .handle
-                .submit_blocking(io_read_op(&plan), io_user(&plan));
-            record_read_result(&plan, &mut out, res);
-        }
-        if matches!(plan.tmod, TransferMode::Flush) {
-            if let Err(e) = entry
-                .handle
-                .submit_blocking(RequestOp::Flush, flush_user(&plan))
-            {
-                out.errs = Some(format!("flush: {e}"));
-            }
+        for phase in io_phases(&plan) {
+            let res = match phase {
+                IoPhase::Flush => entry
+                    .handle
+                    .submit_blocking(RequestOp::Flush, flush_user(&plan)),
+                IoPhase::Write => entry
+                    .handle
+                    .submit_blocking(io_write_op(&plan), io_user(&plan)),
+                IoPhase::Read => entry
+                    .handle
+                    .submit_blocking(io_read_op(&plan), io_user(&plan)),
+            };
+            record_phase_result(&plan, &mut out, phase, res);
         }
 
         self.apply_io_outcome(out);
@@ -3957,6 +4003,122 @@ mod tests {
         let mut c = CommonFields::default();
         rec.check_alarms(&mut c);
         (c.nsta, c.nsev)
+    }
+
+    /// A port whose driver appends each octet phase it is asked to run to a
+    /// shared log, so a test can assert the phase ORDER of one `performIO`
+    /// cycle.
+    fn spawn_phase_log_port(port_name: &'static str) -> Arc<Mutex<Vec<&'static str>>> {
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        struct PhaseLogDriver {
+            base: PortDriverBase,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl PortDriver for PhaseLogDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_flush(&mut self, _user: &mut AsynUser) -> crate::error::AsynResult<()> {
+                self.log.lock().unwrap().push("flush");
+                Ok(())
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                data: &[u8],
+            ) -> crate::error::AsynResult<usize> {
+                self.log.lock().unwrap().push("write");
+                Ok(data.len())
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                self.log.lock().unwrap().push("read");
+                let resp = b"OK";
+                let n = resp.len().min(buf.len());
+                buf[..n].copy_from_slice(&resp[..n]);
+                Ok((n, EomReason::EOS))
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(PhaseLogDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                log: log.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        log
+    }
+
+    /// R8-47: C flushes the input BEFORE the write, for `TMOD == Flush` *and*
+    /// `TMOD == Write_Read` (asynRecord.c:1518-1523) — Write/Read being the
+    /// default TMOD. Without it, bytes left in the driver by a previous
+    /// transaction are prepended to the fresh response.
+    #[test]
+    fn write_read_flushes_the_input_before_the_write() {
+        let port = "test_tmod_writeread_flush";
+        let log = spawn_phase_log_port(port);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port.to_string();
+        rec.connect_device();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.tmod = TransferMode::WriteRead as i32;
+        rec.ofmt = ASYN_FMT_ASCII;
+        rec.ifmt = ASYN_FMT_ASCII;
+        rec.aout = "CMD".to_string();
+        rec.process().unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["flush", "write", "read"],
+            "Write/Read must flush the input before the write"
+        );
+        assert_eq!(rec.ainp, "OK");
+    }
+
+    /// The phase plan is one owner for both runners; pin every TMOD × interface
+    /// combination it decides. C: the flush lives inside `performOctetIO`
+    /// (asynRecord.c:1518), so a register interface has no flush phase at all —
+    /// `performInt32IO` (:1370-1395) only branches on Write / Read.
+    #[test]
+    fn io_phase_plan_matches_c_perform_io() {
+        let plan = |tmod: TransferMode, iface: InterfaceType| -> Vec<IoPhase> {
+            let mut rec = AsynRecord::default();
+            rec.tmod = tmod as i32;
+            rec.iface = iface as i32;
+            io_phases(&rec.build_io_plan())
+        };
+        use InterfaceType::{Int32, Octet};
+        use IoPhase::{Flush, Read, Write};
+
+        assert_eq!(plan(TransferMode::WriteRead, Octet), [Flush, Write, Read]);
+        assert_eq!(plan(TransferMode::Write, Octet), [Write]);
+        assert_eq!(plan(TransferMode::Read, Octet), [Read]);
+        assert_eq!(plan(TransferMode::Flush, Octet), [Flush]);
+        assert_eq!(plan(TransferMode::NoIo, Octet), []);
+
+        // Register interfaces: no flush phase in C, in any TMOD.
+        assert_eq!(plan(TransferMode::WriteRead, Int32), [Write, Read]);
+        assert_eq!(plan(TransferMode::Flush, Int32), []);
     }
 
     /// R8-46: C sizes an ASCII read by `sizeof(pasynRec->ainp)` = 40, NOT by

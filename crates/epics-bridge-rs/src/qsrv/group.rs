@@ -1369,7 +1369,10 @@ impl GroupChannel {
         log: &RemoteLog,
     ) -> BridgeResult<()> {
         if !self.access.can_write(&self.def.name) {
-            return Err(BridgeError::PutRejected(format!(
+            // Group-level ACF gate (the per-member gate below mirrors pvxs's
+            // per-field SecurityClient). Both are write-ACF denials, so both
+            // carry pvxs's `doFieldPreProcessing` text (iocsource.cpp:385).
+            return Err(super::put_status::put_not_permitted(&format!(
                 "write denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
             )));
@@ -1486,19 +1489,10 @@ impl GroupChannel {
             // the link throw). Same gate the single-record path enforces —
             // the `Force`/`Inhibit` group routes go through `put_pv`, which
             // does not itself gate DISP.
-            self.db
-                .check_external_put_preconditions(record_name, field_name)
-                .await
-                .map_err(|e| {
-                    BridgeError::PutRejected(format!(
-                        "group {} PUT: member '{}' field '{}': {}",
-                        self.def.name, m.field_name, m.channel, e
-                    ))
-                })?;
+            super::put_status::check_preconditions(&self.db, record_name, field_name).await?;
             if self.member_targets_link_field(m).await {
-                return Err(BridgeError::PutRejected(format!(
-                    "group {} PUT: member '{}' targets link field '{}' \
-                     (pvxs groupsource.cpp:603-606 rejects link-class field writes)",
+                return Err(super::put_status::links_not_supported(&format!(
+                    "group {} PUT: member '{}' targets link field '{}'",
                     self.def.name, m.field_name, m.channel
                 )));
             }
@@ -1551,10 +1545,9 @@ impl GroupChannel {
             }
             let grant = self.access.write_grant(&m.channel);
             if !grant.allowed {
-                return Err(BridgeError::PutRejected(format!(
+                return Err(super::put_status::put_not_permitted(&format!(
                     "group {} PUT: member '{}' field '{}' write denied for \
-                     user='{}' host='{}' (per-member ACF, pvxs \
-                     groupsource.cpp:161)",
+                     user='{}' host='{}' (per-member ACF)",
                     self.def.name, m.field_name, m.channel, self.access.user, self.access.host
                 )));
             }
@@ -1776,8 +1769,8 @@ impl GroupChannel {
                 !m.field_name.is_empty() && get_nested_field(value, &m.field_name).is_some()
             });
             if client_supplied_field {
-                return Err(BridgeError::PutRejected(format!(
-                    "group {} PUT: No fields changed",
+                return Err(super::put_status::no_fields_changed(&format!(
+                    "group {} PUT",
                     self.def.name
                 )));
             }
@@ -3830,6 +3823,123 @@ mod tests {
             .put(&value_ok)
             .await
             .expect("a scalar-only group PUT must succeed");
+    }
+
+    /// Every group PUT rejection must put pvxs's bare contract text on the
+    /// wire: `"Links not supported for put"` (groupsource.cpp:605),
+    /// `"No fields changed"` (:658), `"Put not permitted"`
+    /// (iocsource.cpp:385) and `"Unable to put value: …"` (:366-368). pvxs
+    /// throws those strings and forwards `e.what()` verbatim; it never names
+    /// the group, the member, the user/host — and never cites its own source
+    /// files. Pre-fix the port emitted `group X PUT: member 'm' targets link
+    /// field 'R.FLNK' (pvxs groupsource.cpp:603-606 …)` and friends, plus a
+    /// `"put rejected: "` Display prefix, all of which reached the client.
+    #[tokio::test]
+    async fn group_put_rejection_messages_are_pvxs_contract_text() {
+        use super::super::provider::{AccessContext, AccessControl};
+        use super::super::put_status::wire_message;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        struct DenyChannel(&'static str);
+        impl AccessControl for DenyChannel {
+            fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
+                channel != self.0
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MSG:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        let group_of = |cfg: &str| {
+            let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+            defs.pop().unwrap()
+        };
+
+        // "Links not supported for put"
+        let link = GroupChannel::new(
+            db.clone(),
+            group_of(
+                r#"{ "MSG:LNK": {
+                    "v":   {"+type": "plain", "+channel": "MSG:rec.VAL", "+putorder": 0},
+                    "fwd": {"+type": "plain", "+channel": "MSG:rec.FLNK", "+putorder": 1}
+                } }"#,
+            ),
+        );
+        let mut v = PvStructure::new("structure");
+        v.set("v", PvField::Scalar(ScalarValue::Double(2.0)));
+        let err = link.put(&v).await.expect_err("link member must reject");
+        assert_eq!(wire_message(&err), "Links not supported for put");
+
+        // "No fields changed" — a member without `+putorder` is not putable,
+        // so a PUT that supplies only it writes nothing.
+        let nochange = GroupChannel::new(
+            db.clone(),
+            group_of(
+                r#"{ "MSG:NOP": {
+                    "v": {"+type": "plain", "+channel": "MSG:rec.VAL"}
+                } }"#,
+            ),
+        );
+        let err = nochange
+            .put(&v)
+            .await
+            .expect_err("a marked but unputable member must reject");
+        assert_eq!(wire_message(&err), "No fields changed");
+
+        let putable = r#"{ "MSG:GRP": {
+            "v": {"+type": "plain", "+channel": "MSG:rec.VAL", "+putorder": 0}
+        } }"#;
+
+        // "Put not permitted" — per-member ACF denial (the group PV itself is
+        // writable, the member's backing channel is not).
+        let member_denied = GroupChannel::new(db.clone(), group_of(putable)).with_access(
+            AccessContext::with_identity(
+                Arc::new(DenyChannel("MSG:rec.VAL")),
+                "alice".into(),
+                "host1".into(),
+            ),
+        );
+        let err = member_denied
+            .put(&v)
+            .await
+            .expect_err("per-member ACF must reject");
+        assert_eq!(wire_message(&err), "Put not permitted");
+
+        // "Put not permitted" — group-level ACF denial.
+        let group_denied = GroupChannel::new(db.clone(), group_of(putable)).with_access(
+            AccessContext::with_identity(
+                Arc::new(DenyChannel("MSG:GRP")),
+                "alice".into(),
+                "host1".into(),
+            ),
+        );
+        let err = group_denied
+            .put(&v)
+            .await
+            .expect_err("group-level ACF must reject");
+        assert_eq!(wire_message(&err), "Put not permitted");
+
+        // "Unable to put value: Field Disabled: S_db_putDisabled" — the
+        // member's backing record is DISP-disabled (doPreProcessing).
+        db.get_record("MSG:rec")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .common
+            .disp = true;
+        let disabled = GroupChannel::new(db.clone(), group_of(putable));
+        let err = disabled
+            .put(&v)
+            .await
+            .expect_err("DISP=1 member must reject");
+        assert_eq!(
+            wire_message(&err),
+            "Unable to put value: Field Disabled: S_db_putDisabled"
+        );
     }
 
     /// A QSRV group scalar member must derive its NT shape and DBF type

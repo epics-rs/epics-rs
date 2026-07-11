@@ -877,13 +877,15 @@ impl SharedPV {
         }
     }
 
-    /// Dispatch an RPC request. Falls back to "RPC not supported" when
-    /// no [`Self::on_rpc`] handler has been installed.
+    /// Dispatch an RPC request. With no [`Self::on_rpc`] handler installed,
+    /// pvxs never sets `chan->onRPC`, and an RPC EXEC on that channel is
+    /// answered with the fixed text [`super::source::RPC_NOT_IMPLEMENTED`]
+    /// (serverget.cpp:482-486).
     pub fn rpc(&self, request_desc: FieldDesc, request_value: PvField) -> Result<RpcReply, String> {
         let on_rpc = self.inner.lock().on_rpc.clone();
         match on_rpc {
             Some(f) => f(self, request_desc, request_value),
-            None => Err("RPC not supported by this SharedPV".into()),
+            None => Err(super::source::RPC_NOT_IMPLEMENTED.into()),
         }
     }
 
@@ -905,7 +907,7 @@ impl SharedPV {
     /// Async RPC dispatch. Tries the async handler first
     /// (registered via [`Self::on_rpc_async`]); falls back to the
     /// sync `on_rpc` handler when only that one is set; finally
-    /// returns "not supported" when neither is installed. The
+    /// returns pvxs's "RPC Not Implemented" when neither is installed. The
     /// `#[pva_service]` framework uses this so user async methods
     /// run on the calling task's runtime, no `block_in_place`.
     pub async fn rpc_async(
@@ -922,7 +924,7 @@ impl SharedPV {
         }
         match sync {
             Some(f) => f(self, request_desc, request_value),
-            None => Err("RPC not supported by this SharedPV".into()),
+            None => Err(super::source::RPC_NOT_IMPLEMENTED.into()),
         }
     }
 

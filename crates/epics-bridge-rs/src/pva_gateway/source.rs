@@ -1442,7 +1442,7 @@ impl ChannelSource for GatewayChannelSource {
     }
 
     /// Forward an RPC request through the upstream client. The default
-    /// trait impl returns "RPC not supported", which is a major p2pApp
+    /// trait impl returns "RPC Not Implemented", which is a major p2pApp
     /// parity gap (review §1). With this override, RPC requests pass
     /// through transparently — `pvrpc` reuses the cached channel
     /// connection-pool entry so we don't pay a fresh search per call.

@@ -154,11 +154,17 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
         _ => return None,
     };
 
-    // Numeric-as-string: `"5"` resolves through the same value-class
-    // mask as the integer form.
-    if let Ok(n) = raw.trim().parse::<u32>() {
-        return Some(dbe_value_class_mask((n & 0xFFFF) as u16));
-    }
+    // A String-typed DBE is NEVER parsed numerically. pvxs switches on the
+    // field's *kind* (singlesource.cpp:117-140): `Kind::String` runs the
+    // substring scan below and nothing else, while only `Kind::Integer` /
+    // `Kind::Real` reach `fld.as<uint8_t>()`. So `DBE="1"` selects no bit,
+    // draws the empty-mask warning, and falls back to VALUE|ALARM — it does
+    // NOT mean DBE_VALUE. (This is unlike `queueSize`/`block`/`atomic`, which
+    // pvxs reads with `as<T>()` regardless of kind; `Value::as` does
+    // `parseTo<int64_t>` on string storage, data.cpp:442-449, so their
+    // numeric-string parse is correct.) The port used to parse the string
+    // first, so `DBE="1"` selected VALUE-only where pvxs gives VALUE|ALARM,
+    // and the warning never fired.
 
     // String DBE: pvxs does "sloppy" substring matching for only VALUE,
     // ARCHIVE, and ALARM (singlesource.cpp:122-127). `LOG` is NOT a
@@ -702,11 +708,8 @@ impl BridgeChannel {
         // `put_record_field_from_ca`, but the `Force`/`Inhibit` routes go
         // through `put_pv` (the internal `dbPut` analogue, which by design
         // does not gate DISP), so the gate must run at this boundary for
-        // all three process modes.
-        self.db
-            .check_external_put_preconditions(&self.record_name, &self.field)
-            .await
-            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+        // all three process modes. `put_status` owns the wire text.
+        super::put_status::check_preconditions(&self.db, &self.record_name, &self.field).await?;
 
         // One access evaluation yields both the allow/deny decision and
         // the matched rule's TRAPWRITE flag (`WriteGrant`). The grant is
@@ -714,7 +717,9 @@ impl BridgeChannel {
         // routes through it and never re-derives the trap flag.
         let grant = self.access.write_grant(&self.pv_name);
         if !grant.allowed {
-            return Err(BridgeError::PutRejected(format!(
+            // pvxs `doFieldPreProcessing` (iocsource.cpp:385) — the wire
+            // carries "Put not permitted"; identity goes to the log.
+            return Err(super::put_status::put_not_permitted(&format!(
                 "write denied for {} (user='{}' host='{}')",
                 self.pv_name, self.access.user, self.access.host
             )));
@@ -1370,14 +1375,38 @@ mod tests {
         assert_eq!(mask, EventMask::VALUE.bits());
     }
 
-    /// numeric-string DBE goes through the same value-class mask as
-    /// the integer form (`"8"` = PROPERTY → VALUE|ALARM fallback).
+    /// A String-typed DBE is never parsed numerically. pvxs switches on the
+    /// field's kind (singlesource.cpp:117-140): `Kind::String` does the
+    /// substring scan and nothing else — only `Kind::Integer`/`Kind::Real`
+    /// reach `fld.as<uint8_t>()`. So `"1"` does NOT mean DBE_VALUE: it
+    /// matches no token, selects an empty mask, draws the warning, and falls
+    /// back to VALUE|ALARM. The port used to parse it, giving VALUE-only and
+    /// no warning. Boundary cases: `"1"`/`"2"` (would have been a strict
+    /// subset of the fallback), `"7"` (would have equalled it silently),
+    /// `"8"` (PROPERTY-only), `"0"`.
     #[test]
-    fn dbe_numeric_string_uses_value_class_mask() {
+    fn dbe_numeric_string_is_not_parsed_numerically() {
         use epics_base_rs::server::recgbl::EventMask;
-        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("8".into())));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
-        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for raw in ["0", "1", "2", "7", "8", " 5 "] {
+            let log = RemoteLog::default();
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::String(raw.into())));
+            let mask = dbe_mask_from_pv_request(&req, &log).expect("must parse");
+            assert_eq!(
+                mask, fallback,
+                "a numeric string selects no event class, so DBE={raw:?} falls back to VALUE|ALARM"
+            );
+            let logged = log.take();
+            assert_eq!(
+                logged.len(),
+                1,
+                "an empty-mask selection owes the client one warning, DBE={raw:?}: {logged:?}"
+            );
+            assert_eq!(
+                logged[0].message,
+                format!("record._options.DBE=\"{raw}\" selects empty mask")
+            );
+        }
     }
 
     /// missing DBE option resolves to None so the monitor
@@ -1753,6 +1782,80 @@ mod tests {
             v,
             Some(EpicsValue::Double(42.0)),
             "the barrier must release only after the deferred OUT drove TGT2.VAL=42, got {v:?}"
+        );
+    }
+
+    /// A rejected single-record QSRV PUT must carry pvxs's bare contract
+    /// text on the wire (the `BridgeError::PutRejected` message becomes the
+    /// `Status.message` via `OpError::failed`). pvxs throws
+    /// `"Unable to put value: Field Disabled: S_db_putDisabled"` /
+    /// `"…: Modifications not allowed: S_db_noMod"` (iocsource.cpp:366-368)
+    /// and `"Put not permitted"` (:385) — no record name, no user/host, no
+    /// source citation. Boundary: SPC_ATTRIBUTE is tested *before* `disp` in
+    /// C, so a read-only field on a DISP=1 record reports noMod.
+    #[tokio::test]
+    async fn put_rejection_messages_are_pvxs_contract_text() {
+        use crate::qsrv::provider::{AccessContext, AccessControl};
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        struct DenyWrites;
+        impl AccessControl for DenyWrites {
+            fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+                false
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PS:ai", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.0))));
+
+        // write-ACF denial → "Put not permitted"
+        let denied = BridgeChannel::new(db.clone(), "PS:ai")
+            .await
+            .unwrap()
+            .with_access(AccessContext::with_identity(
+                Arc::new(DenyWrites),
+                "alice".into(),
+                "host1".into(),
+            ));
+        let err = denied.put(&put).await.expect_err("write must be denied");
+        assert_eq!(
+            super::super::put_status::wire_message(&err),
+            "Put not permitted",
+            "ACF denial must not leak PV name / user / host onto the wire"
+        );
+
+        // DISP=1 → "Unable to put value: Field Disabled: S_db_putDisabled"
+        db.get_record("PS:ai")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .common
+            .disp = true;
+        let ch = BridgeChannel::new(db.clone(), "PS:ai").await.unwrap();
+        let err = ch.put(&put).await.expect_err("DISP=1 must reject the put");
+        assert_eq!(
+            super::super::put_status::wire_message(&err),
+            "Unable to put value: Field Disabled: S_db_putDisabled"
+        );
+
+        // Read-only (SPC_NOMOD) field on the SAME DISP=1 record → noMod wins,
+        // because C tests `special == SPC_ATTRIBUTE` first.
+        let ro = BridgeChannel::new(db.clone(), "PS:ai.AFVL").await.unwrap();
+        let err = ro
+            .put(&put)
+            .await
+            .expect_err("a read-only field must reject the put");
+        assert_eq!(
+            super::super::put_status::wire_message(&err),
+            "Unable to put value: Modifications not allowed: S_db_noMod",
+            "SPC_ATTRIBUTE is tested before disp (iocsource.cpp:365-369)"
         );
     }
 }

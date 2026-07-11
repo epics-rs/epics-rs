@@ -1424,3 +1424,50 @@ fn test_fwd_link_does_not_fire_while_waiting_out_dly() {
         "no FLNK on a cycle spent waiting out DLY"
     );
 }
+
+// ============================================================
+// R7-66: REQSTART gate -> direction copy is bounded by NCH
+// ============================================================
+
+/// C `scalerRecord.c:413-414` (REQSTART):
+///   for (i=0; i<pscal->nch; i++) { pdir[i] = pgate[i]; ... }
+/// The copy stops at NCH. `D` fields for channels the hardware does not
+/// have are user-writable scratch (`special()` sets D on a PR put) and C
+/// never touches them at count start.
+#[test]
+fn test_count_start_copies_gates_to_directions_only_up_to_nch() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    // A 4-channel card.
+    rec.nch = 4;
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.pr[0] = 10_000_000;
+    rec.pr[2] = 500;
+
+    // Channels the card does not have: gate clear, direction set by the user.
+    rec.d[4] = 1;
+    rec.d[10] = 1;
+    rec.d[MAX_SCALER_CHANNELS - 1] = 1;
+
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "counting");
+
+    // Active channels took their gate value.
+    assert_eq!(&rec.d[0..4], &[1, 0, 1, 0], "D1..D4 copied from G1..G4");
+    // Beyond NCH, C leaves D alone.
+    assert_eq!(rec.d[4], 1, "D5 is beyond NCH and must not be cleared");
+    assert_eq!(rec.d[10], 1, "D11 is beyond NCH and must not be cleared");
+    assert_eq!(
+        rec.d[MAX_SCALER_CHANNELS - 1],
+        1,
+        "D64 is beyond NCH and must not be cleared"
+    );
+}

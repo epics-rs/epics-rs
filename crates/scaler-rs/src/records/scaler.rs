@@ -285,6 +285,18 @@ impl ScalerRecord {
         }
     }
 
+    /// C's gate → direction copy, the single owner of `d[]`'s count-start value.
+    ///
+    /// C `scalerRecord.c:413-414` (REQSTART) and `:525-526` (auto-count re-arm)
+    /// both run `for (i=0; i<pscal->nch; i++) pdir[i] = pgate[i];` — the bound is
+    /// `nch`, not the physical array size, so `D` fields above the configured
+    /// channel count keep whatever the user last put there.
+    fn copy_gates_to_directions(&mut self) {
+        for i in 0..self.active_channels() {
+            self.d[i] = self.g[i];
+        }
+    }
+
     /// Saturating `f64 -> u32` cast for clock-tick counts so a large
     /// `tp * freq` cannot wrap. `ticks` already has rounding/truncation
     /// applied by the caller.
@@ -723,10 +735,8 @@ impl Record for ScalerRecord {
                         self.pr[0] = expected_pr1;
                     }
 
-                    // Set directions from gates
-                    for i in 0..MAX_SCALER_CHANNELS {
-                        self.d[i] = self.g[i];
-                    }
+                    // Set directions from gates (C `scalerRecord.c:413-414`)
+                    self.copy_gates_to_directions();
 
                     // Queue reset → write_presets → arm via DeviceCommands
                     actions.extend(self.build_start_actions());

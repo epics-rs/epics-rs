@@ -74,30 +74,58 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
     }
 }
 
-/// Coerce a numeric or boolean PVA scalar DBE option to its
-/// `uint8_t`-equivalent value, mirroring pvxs's `fld.as<uint8_t>()`
-/// (singlesource.cpp:134). pvxs's `Value::as<uint8_t>()` routes real,
-/// signed, unsigned, and bool storage through one `copyOutScalar()` path
-/// that narrows to `uint8_t` (data.cpp:402-435), so every numeric scalar
-/// variant must map the same way — not only `Int`/`Long`. The narrowing
-/// `as u8` reproduces C's `(uint8_t)` truncation (DBE bits live in the low
-/// nibble, so the high bits pvxs discards are irrelevant). `String` is
-/// parsed separately by the substring path and so yields `None` here.
-fn dbe_scalar_as_u8(sv: &ScalarValue) -> Option<u8> {
-    Some(match sv {
-        ScalarValue::Boolean(b) => *b as u8,
-        ScalarValue::Byte(n) => *n as u8,
-        ScalarValue::Short(n) => *n as u8,
-        ScalarValue::Int(n) => *n as u8,
-        ScalarValue::Long(n) => *n as u8,
-        ScalarValue::UByte(n) => *n,
-        ScalarValue::UShort(n) => *n as u8,
-        ScalarValue::UInt(n) => *n as u8,
-        ScalarValue::ULong(n) => *n as u8,
-        ScalarValue::Float(n) => *n as u8,
-        ScalarValue::Double(n) => *n as u8,
-        ScalarValue::String(_) => return None,
-    })
+/// Which arm of pvxs's `record._options.DBE` switch a field lands in.
+///
+/// pvxs dispatches DBE on the field's *kind* — `fld.type().kind()`
+/// (singlesource.cpp:118), the class nibble of the type code, `code & 0xe0`
+/// (data.h:141-147, 197) — not on its concrete scalar type. Exactly two arms
+/// of that switch read a value:
+///
+/// * `Kind::String` → the sloppy substring scan (`:119-133`);
+/// * `Kind::Integer` / `Kind::Real` → `dbe = fld.as<uint8_t>()` (`:134-137`).
+///
+/// EVERY other kind — `Kind::Bool` included — hits `default: break` (`:138-139`)
+/// with `dbe` still 0, so the value-class mask leaves nothing and the
+/// `DBE_VALUE | DBE_ALARM` fallback applies (`:141-144`). `Value::as<uint8_t>()`
+/// *could* convert bool storage (data.cpp:428-435) — pvxs simply never calls it
+/// for a bool.
+///
+/// Modelling that switch as one exhaustive match is what stops a kind from
+/// leaking into the numeric arm. Two already have: the string kind (fixed in
+/// R7-34) and then `Boolean` (R9-31) — `DBE=true` mapped to `true as u8` = 1 =
+/// DBE_VALUE, so the client negotiated a VALUE-only subscription and never saw
+/// the alarm-only transitions pvxs delivers. A new `ScalarValue` variant now
+/// forces a decision here instead of silently taking the numeric path.
+enum DbeKind<'a> {
+    /// `Kind::String`.
+    Text(std::borrow::Cow<'a, str>),
+    /// `Kind::Integer` / `Kind::Real`. The narrowing `as u8` reproduces C's
+    /// `(uint8_t)` truncation in `copyOutScalar` (data.cpp:402-416); DBE bits
+    /// live in the low nibble, so the high bits pvxs discards are irrelevant.
+    Numeric(u8),
+    /// pvxs's `default: break` — this kind selects no DBE bit at all.
+    Unselected,
+}
+
+fn dbe_kind(sv: &ScalarValue) -> DbeKind<'_> {
+    match sv {
+        // Kind::String
+        ScalarValue::String(s) => DbeKind::Text(s.as_str_lossy()),
+        // Kind::Integer
+        ScalarValue::Byte(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::Short(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::Int(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::Long(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::UByte(n) => DbeKind::Numeric(*n),
+        ScalarValue::UShort(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::UInt(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::ULong(n) => DbeKind::Numeric(*n as u8),
+        // Kind::Real
+        ScalarValue::Float(n) => DbeKind::Numeric(*n as u8),
+        ScalarValue::Double(n) => DbeKind::Numeric(*n as u8),
+        // Kind::Bool — pvxs's `default: break`, NOT the numeric arm.
+        ScalarValue::Boolean(_) => DbeKind::Unselected,
+    }
 }
 
 /// parse `record._options.DBE` from a MONITOR INIT pvRequest into the
@@ -133,25 +161,23 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
         })?;
 
     let dbe = options.get_field("DBE")?;
-    // Numeric DBE: pvxs reads it as `dbe = fld.as<uint8_t>()` then
-    // applies the value-class mask + fallback (singlesource.cpp:134-144).
-    // PROPERTY / out-of-class bits are stripped here so they cannot
-    // leak into the value subscription.
+    // Dispatch on the field's KIND, exactly as pvxs does
+    // (singlesource.cpp:118-140) — see [`DbeKind`]. Every arm converges on the
+    // single value-class mask + `VALUE|ALARM` fallback below
+    // (singlesource.cpp:141-144), so PROPERTY / out-of-class bits are stripped
+    // in one place and cannot leak into the value subscription.
     let raw = match dbe {
-        PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
-        // pvxs reads a numeric/bool DBE option as `fld.as<uint8_t>()`
-        // (singlesource.cpp:134) whenever the field kind is Integer or Real;
-        // `Value::as<uint8_t>()` coerces real, signed, unsigned, and bool
-        // storage through one `copyOutScalar()` path (data.cpp:402-435).
-        // Mirror that for every numeric scalar variant — not just Int/Long —
-        // so a `UInt`/`UByte`/`Short`/`Double`/`Boolean` DBE selects the
-        // requested value class instead of falling through to the default
-        // VALUE|ALARM mask.
-        PvField::Scalar(sv) => match dbe_scalar_as_u8(sv) {
-            Some(n) => return Some(dbe_value_class_mask(n as u16)),
-            None => return None,
+        PvField::Scalar(sv) => match dbe_kind(sv) {
+            DbeKind::Text(s) => s.into_owned(),
+            DbeKind::Numeric(n) => return Some(dbe_value_class_mask(n as u16)),
+            // Kind::Bool: pvxs leaves `dbe` at 0 and takes the fallback. This
+            // is NOT `None` (which the caller reads as "the option is absent")
+            // — the option is present, it just selects nothing.
+            DbeKind::Unselected => return Some(dbe_value_class_mask(0)),
         },
-        _ => return None,
+        // A non-scalar DBE (structure / union) is `Kind::Compound` in pvxs and
+        // hits the same `default: break` → 0 → VALUE|ALARM fallback.
+        _ => return Some(dbe_value_class_mask(0)),
     };
 
     // A String-typed DBE is NEVER parsed numerically. pvxs switches on the
@@ -1420,14 +1446,17 @@ mod tests {
     /// A numeric `record._options.DBE`
     /// option must select the requested value class regardless of which PVA
     /// numeric scalar type carries it. pvxs reads the field as
-    /// `fld.as<uint8_t>()` (singlesource.cpp:134), coercing every Integer/Real
-    /// (and bool) storage through one `copyOutScalar()` path
-    /// (data.cpp:402-435). Before the fix only `Int`/`Long` were handled and
-    /// every other numeric/bool scalar fell to `None`, so the monitor
-    /// silently used the default `VALUE|ALARM` (5) mask. Each value below
-    /// resolves to a class distinct from that default, proving the coercion
-    /// actually ran (pre-fix the function returns `None` and the
-    /// `unwrap`/panic below fires).
+    /// `fld.as<uint8_t>()` (singlesource.cpp:134-137) for the `Kind::Integer`
+    /// and `Kind::Real` arms of its kind switch, coercing every such storage
+    /// through one `copyOutScalar()` path (data.cpp:402-416). Before the fix
+    /// only `Int`/`Long` were handled and every other numeric scalar fell to
+    /// `None`, so the monitor silently used the default `VALUE|ALARM` (5)
+    /// mask. Each value below resolves to a class distinct from that default,
+    /// proving the coercion actually ran.
+    ///
+    /// `Boolean` is deliberately NOT in this list: it is `Kind::Bool`, which
+    /// pvxs's switch does not route to `as<uint8_t>()` at all — see
+    /// [`dbe_bool_is_unselected_and_falls_back`].
     #[test]
     fn dbe_numeric_coerces_every_scalar_variant() {
         use epics_base_rs::server::recgbl::EventMask;
@@ -1445,10 +1474,6 @@ mod tests {
                 PvField::Scalar(ScalarValue::Double(2.0)),
                 EventMask::LOG.bits(),
             ),
-            (
-                PvField::Scalar(ScalarValue::Boolean(true)),
-                EventMask::VALUE.bits(),
-            ),
         ];
         for (field, expected) in cases {
             let label = format!("{field:?}");
@@ -1458,6 +1483,37 @@ mod tests {
             assert_eq!(
                 mask, expected,
                 "DBE {label} resolved to the wrong value mask"
+            );
+        }
+    }
+
+    /// R9-31. A BOOLEAN `record._options.DBE` is `Kind::Bool`, which pvxs's
+    /// kind switch (singlesource.cpp:118-140) does not read: it falls to
+    /// `default: break` with `dbe` still 0, so `dbe &= 7` leaves 0 and the
+    /// `DBE_VALUE | DBE_ALARM` fallback fires (`:141-144`). `Value::as<uint8_t>()`
+    /// *can* convert bool storage (data.cpp:428-435) — pvxs just never calls it
+    /// for this kind.
+    ///
+    /// The port used to map `Boolean(b)` through the numeric arm as `b as u8`,
+    /// so `DBE=true` became mask 1 = DBE_VALUE: a VALUE-only subscription that
+    /// never delivers the alarm-only transitions pvxs sends. `DBE=false`
+    /// coincidentally agreed (0 → fallback), which is why only the `true`
+    /// boundary showed the defect. A prior version of
+    /// `dbe_numeric_coerces_every_scalar_variant` asserted the buggy
+    /// `Boolean(true) → VALUE`; that expectation was invented, not taken from
+    /// pvxs, and is corrected here.
+    #[test]
+    fn dbe_bool_is_unselected_and_falls_back() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for b in [true, false] {
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::Boolean(b)));
+            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+                .expect("a present DBE option always resolves to a mask");
+            assert_eq!(
+                mask, fallback,
+                "DBE={b} (Kind::Bool) must hit pvxs's `default: break` and fall back to \
+                 VALUE|ALARM, not select DBE_VALUE"
             );
         }
     }

@@ -122,37 +122,105 @@ enum MonitorPipelineRequest {
     Reject,
 }
 
+/// pvxs `Value::as(uint32_t&)` — i.e. `tryAs<uint32_t>` — applied to a scalar
+/// `record._options.ackAny` (`servermon.cpp:557`). This is the whole of the
+/// "plain integer" branch, and it is a conversion, not a type test: pvxs
+/// routes bool, every signed/unsigned integer, and BOTH reals through one
+/// `copyOutScalar()` that C-casts the storage to `uint64_t` (data.cpp:402-435),
+/// then narrows to the `uint32_t` out-param (data.h:636-647). So `ackAny` =
+/// `Double(4.0)` or `Boolean(true)` reaches `op->ackAt` just like `Int(4)`
+/// does.
+///
+/// The port used to hand-roll one arm per `ScalarValue` variant, with a
+/// `_ => {}` catch-all that silently dropped `Float`/`Double`/`Boolean`
+/// (leaving `ackAt` = 1, i.e. ACK every event, and never letting the
+/// `ackAt == 0 → queueSize/2` fallback fire) and `u32::try_from(..)
+/// .unwrap_or(1)` fallbacks that turned an out-of-range or negative integer
+/// into 1 instead of pvxs's wrap-then-clamp. One exhaustive match replaces
+/// both: every scalar storage class must now be classified explicitly.
+///
+/// Returns `None` only for `String` storage — pvxs converts that through
+/// `parseTo<uint64_t>` (data.cpp:451-453), and the caller owns the string
+/// form (including the `"N%"` percentage) so the two stay in pvxs's
+/// integer-first / string-second precedence.
+///
+/// Sign and range follow the C casts: a negative or oversized integer wraps
+/// (`uint64_t(int64_t(-1))` = `u64::MAX` → `0xFFFF_FFFF`), which the caller's
+/// `[1, queueSize]` clamp (`servermon.cpp:581`) then pins to `queueSize`. For
+/// reals, `uint64_t(double)` truncates toward zero; C++ leaves the negative /
+/// NaN / overflow cases undefined, so the port takes Rust's defined saturating
+/// cast (`-1.0` and `NaN` → 0 → the `queueSize/2` fallback) rather than
+/// reproducing an undefined result.
+fn ack_any_as_u32(sv: &crate::pvdata::ScalarValue) -> Option<u32> {
+    use crate::pvdata::ScalarValue;
+    Some(match sv {
+        // StoreType::Bool → `uint64_t(src)` (data.cpp:428-434).
+        ScalarValue::Boolean(b) => u32::from(*b),
+        // StoreType::Integer → `uint64_t(int64_t(src))`, wrapping.
+        ScalarValue::Byte(n) => *n as i64 as u64 as u32,
+        ScalarValue::Short(n) => *n as i64 as u64 as u32,
+        ScalarValue::Int(n) => *n as i64 as u64 as u32,
+        ScalarValue::Long(n) => *n as u64 as u32,
+        // StoreType::UInteger → `uint64_t(src)`, wrapping on narrow.
+        ScalarValue::UByte(n) => u32::from(*n),
+        ScalarValue::UShort(n) => u32::from(*n),
+        ScalarValue::UInt(n) => *n,
+        ScalarValue::ULong(n) => *n as u32,
+        // StoreType::Real → `uint64_t(double(src))`, truncating toward zero.
+        ScalarValue::Float(n) => *n as u64 as u32,
+        ScalarValue::Double(n) => *n as u64 as u32,
+        // StoreType::String → pvxs `parseTo<uint64_t>`; owned by the caller.
+        ScalarValue::String(_) => return None,
+    })
+}
+
 /// pvxs `servermon.cpp:554-581` — derive the pipeline ACK-refill
 /// threshold `ackAt` from `record._options.ackAny` and the negotiated
 /// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (typed
-/// builder scalar or a numeric string) or a percentage string
+/// builder scalar — of ANY numeric or bool type, see [`ack_any_as_u32`] — or
+/// a numeric string) or a percentage string
 /// (`"N%"`). An absent or unparseable value keeps the pvxs default of
 /// `1`; an explicit `0` becomes `queueSize / 2`; the result clamps to
 /// `[1, queueSize]`. `queue_size` MUST be `>= 1` (the caller only
 /// invokes this for an enabled pipeline, where `queueSize >= 2`).
 ///
 /// Returns the effective `ackAt` plus an optional pvxs
-/// `Level::Crit` [`MonitorOptionDiag`]. pvxs emits a Crit `logRemote`
-/// for exactly two cases (`servermon.cpp:557-573`), and leaves `ackAt`
-/// at its default in both:
-/// * a NON-scalar `ackAny` — `as<int>` and `as<string>` both fail →
-///   "Unable to parse …" (`:570-573`);
-/// * a `"N%"` percentage string whose numeric part fails to parse →
-///   "Unable to parse% …" (`:561-568`).
+/// `Level::Crit` [`MonitorOptionDiag`]. pvxs emits a Crit `logRemote` for a
+/// `"N%"` percentage string whose numeric part fails `parseTo<double>`
+/// (`:561-568`), leaving `ackAt` at its default.
 ///
 /// A plain scalar string that simply fails integer parse (e.g.
 /// `"garbage"`) is SILENTLY ignored by pvxs — `as<string>` succeeds, the
 /// value has no `%` suffix, so neither branch fires and no diagnostic is
 /// emitted (`:560-569`). This faithfully differs from the review doc's
 /// imprecise `ackAny=garbage` Crit example.
+///
+/// DIVERGENCE, deliberate and recorded: for a NON-scalar `ackAny` this port
+/// emits the `:570-573` "Unable to parse …" Crit and keeps serving. pvxs
+/// cannot actually reach that branch — `:556` runs `ackAny.as<std::string>()`
+/// *before* the `if/else if`, and that throws `NoConvert` on a non-scalar, so
+/// the exception escapes `handle_MONITOR` into the command-dispatch catch
+/// (`conn.cpp:277-282`), which logs and does `bev.reset()`: pvxs DROPS the
+/// circuit. The `:570-573` Crit is dead code. Matching that reset is a
+/// separate change from R9-32 (which is about the conversion below) and is
+/// filed as a finding candidate; this comment previously claimed pvxs takes
+/// the Crit path, which it does not.
 fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<MonitorOptionDiag>) {
     use crate::pvdata::ScalarValue;
     // pvxs `MonitorOp::ackAt` struct default.
     let mut ack_at: u32 = 1;
     let mut diag: Option<MonitorOptionDiag> = None;
     match ack_any {
-        Some(PvField::Scalar(sv)) => match sv {
-            ScalarValue::String(s) => {
+        // pvxs tries the PLAIN-INTEGER conversion first — `ackAny.as(ival)`,
+        // i.e. `tryAs<uint32_t>` (`servermon.cpp:557`) — and only falls to the
+        // string / percentage form when that conversion fails (`:560`). Keep
+        // that precedence: `ack_any_as_u32` is the whole of `tryAs<uint32_t>`
+        // for non-string storage, so real and bool `ackAny` values land in the
+        // integer branch, exactly as they do in pvxs.
+        Some(PvField::Scalar(sv)) => {
+            if let Some(n) = ack_any_as_u32(sv) {
+                ack_at = n;
+            } else if let ScalarValue::String(s) = sv {
                 let s = s.as_str_lossy();
                 if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
                     match pct.trim().parse::<f64>() {
@@ -185,19 +253,10 @@ fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<Monit
                 // pvxs leaves `ackAt` default with NO logRemote
                 // (`servermon.cpp:560-569` only logs the `%` branch).
             }
-            ScalarValue::Byte(i) => ack_at = u32::try_from(*i).unwrap_or(1),
-            ScalarValue::UByte(i) => ack_at = u32::from(*i),
-            ScalarValue::Short(i) => ack_at = u32::try_from(*i).unwrap_or(1),
-            ScalarValue::UShort(i) => ack_at = u32::from(*i),
-            ScalarValue::Int(i) => ack_at = u32::try_from(*i).unwrap_or(1),
-            ScalarValue::UInt(i) => ack_at = *i,
-            ScalarValue::Long(l) => ack_at = u32::try_from(*l).unwrap_or(1),
-            ScalarValue::ULong(l) => ack_at = u32::try_from(*l).unwrap_or(1),
-            _ => {}
-        },
+        }
         Some(other) => {
-            // pvxs `servermon.cpp:570-573`: a NON-scalar `ackAny` fails both
-            // `as<int>` and `as<string>` → Crit logRemote; `ackAt` default.
+            // See the DIVERGENCE note above: pvxs throws out of the handler
+            // here and resets the circuit; the port logs and serves on.
             diag = Some(MonitorOptionDiag {
                 level: MessageType::Fatal,
                 message: format!(
@@ -9547,6 +9606,56 @@ mod tests {
             q,
             "ackAny>queueSize → clamp to queueSize"
         );
+    }
+
+    /// R9-32. `ackAny.as(ival)` is `tryAs<uint32_t>` — a CONVERSION, not a type
+    /// test. pvxs pushes bool, every signed/unsigned integer, and both reals
+    /// through one `copyOutScalar()` that C-casts to `uint64_t`
+    /// (data.cpp:402-435), so a `Double(4.0)` or `Boolean(true)` ackAny reaches
+    /// the plain-integer branch (`servermon.cpp:557-558`) exactly like `Int(4)`.
+    ///
+    /// The port matched only the integer variants and swallowed the rest in a
+    /// `_ => {}` arm: `ackAt` stayed 1 (ACK every event) and the
+    /// `ackAt == 0 → queueSize/2` fallback could never fire for them. One case
+    /// per storage class, each landing on a value distinguishable from that
+    /// stuck default.
+    #[test]
+    fn ack_at_converts_every_scalar_storage_class() {
+        let q = 16u32;
+        let cases = [
+            // Real storage: `uint64_t(double)` truncates toward zero.
+            (PvField::Scalar(ScalarValue::Double(4.0)), 4u32),
+            (PvField::Scalar(ScalarValue::Double(4.9)), 4),
+            (PvField::Scalar(ScalarValue::Float(2.0)), 2),
+            // Bool storage: true → 1 (the pvxs default coincides, so the
+            // meaningful boundary is false → 0 → the queueSize/2 fallback).
+            (PvField::Scalar(ScalarValue::Boolean(true)), 1),
+            (PvField::Scalar(ScalarValue::Boolean(false)), q / 2),
+            // Real 0.0 hits the same `ackAt == 0` fallback.
+            (PvField::Scalar(ScalarValue::Double(0.0)), q / 2),
+            // Unsigned/other integer widths were already handled; pin them so
+            // the exhaustive match cannot regress one.
+            (PvField::Scalar(ScalarValue::UByte(3)), 3),
+            (PvField::Scalar(ScalarValue::ULong(3)), 3),
+            // Negative integer: pvxs wraps (`uint64_t(int64_t(-1))` → u64::MAX,
+            // narrowed to 0xFFFF_FFFF) and the `[1, limit]` clamp
+            // (servermon.cpp:581) pins it to the queue. The port used to
+            // `u32::try_from(-1).unwrap_or(1)` → 1.
+            (PvField::Scalar(ScalarValue::Int(-1)), q),
+        ];
+        for (ack_any, want) in cases {
+            let label = format!("{ack_any:?}");
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                ack_any,
+            );
+            assert_eq!(
+                parsed_opts(&req).ack_at,
+                want,
+                "ackAny={label} with queueSize={q}"
+            );
+        }
     }
 
     #[test]

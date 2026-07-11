@@ -52,6 +52,13 @@ impl MovingDotDetector {
         base.set_int32_param(ad.params.num_images, 0, 100)?;
 
         base.set_int32_param(ad.params.base.data_type, 0, 3)?; // UInt16
+        // The read/write geometry parameters belong to the concrete driver:
+        // `ADDriverBase` seeds only what C's ADDriver constructor seeds
+        // (ADDriver.cpp:180-191), because SizeX/SizeY/BinX/BinY carry
+        // PINI="YES" in ADBase.template and a driver-side seed would override
+        // the DB and autosave.
+        base.set_int32_param(ad.params.size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.size_y, 0, max_size_y)?;
         base.set_int32_param(ad.params.bin_x, 0, 1)?;
         base.set_int32_param(ad.params.bin_y, 0, 1)?;
 

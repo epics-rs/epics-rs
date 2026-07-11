@@ -71,15 +71,41 @@ fn dbput_request(
     field: &str,
     value: EpicsValue,
 ) -> PutRequest {
-    if value.is_empty_array() && !record.get_field(field).is_some_and(|v| v.is_array()) {
+    let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
+    if value.is_empty_array() && !dest_is_array {
         return PutRequest::EmptyIntoScalar;
     }
-    match record
+    let target = record
         .field_list()
         .iter()
         .find(|f| f.name.eq_ignore_ascii_case(field))
-        .map(|f| f.dbf_type)
-    {
+        .map(|f| f.dbf_type);
+
+    // C `dbPut` clamps the request to the destination's element count —
+    // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1359),
+    // then converts `nRequest` elements. A multi-element request into a
+    // one-element destination therefore writes element 0 and SUCCEEDS; the
+    // surplus elements are dropped, not an error. Reduce the array to its
+    // first element here, so the record's typed `put_field` arm — and every
+    // `put_common_field` arm — sees the scalar C would have written instead of
+    // rejecting the array with a `TypeMismatch`.
+    //
+    // One array shape is exempt: a `CharArray` into a `DBF_STRING` field is how
+    // this port carries the dbChannel `$` char-array view of a string field
+    // (`dbChannel.c:486-505` re-types it to `DBF_CHAR[field_size]`, i.e. an
+    // ARRAY destination in C — its element count is 40, not 1). The `$` flag
+    // lives on the CA channel and never reaches this layer, so the char view is
+    // recognised by its shape and left to `convert_to`, which decodes the bytes
+    // back into the string field.
+    let is_char_string_view = matches!(value, EpicsValue::CharArray(_))
+        && target == Some(crate::types::DbFieldType::String);
+    let value = if !dest_is_array && value.is_array() && !is_char_string_view {
+        value.first_element().unwrap_or(value)
+    } else {
+        value
+    };
+
+    match target {
         Some(target) if value.db_field_type() != target => {
             PutRequest::Write(coerce_write_value(record, field, target, value))
         }

@@ -3959,6 +3959,125 @@ async fn test_empty_array_into_array_field_is_a_silent_no_op() {
     );
 }
 
+/// R6-10 — `caput -a REC.VAL 3 1 2 3` (a multi-element array into a scalar
+/// field). C `dbPut` takes the `nRequest > 1` branch, clamps the request to the
+/// destination's element count (`if (no_elements < nRequest) nRequest =
+/// no_elements;`, `dbAccess.c:1359`) and converts that one element: element 0
+/// is written and the put SUCCEEDS. The port passed the array straight to the
+/// record's typed `put_field` arm, which rejected it with `TypeMismatch`, so
+/// the client saw a write failure.
+#[tokio::test]
+async fn r6_10_multi_element_array_into_scalar_writes_element_zero() {
+    let db = PvDatabase::new();
+    db.add_record("ARRPUT", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    let result = db
+        .put_record_field_from_ca(
+            "ARRPUT",
+            "VAL",
+            EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "C dbPut clamps nRequest to the scalar destination and succeeds: {result:?}"
+    );
+    match db.get_pv("ARRPUT.VAL").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 1.0).abs() < 1e-10,
+            "element 0 must be written (got {v}), the surplus elements dropped"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
+/// R6-10 boundary — the clamp is driven by the *destination*, not the request:
+/// the same multi-element array into an **array** field writes every element
+/// (C: `no_elements >= nRequest`, nothing is clamped away). Only a one-element
+/// destination reduces to element 0.
+#[tokio::test]
+async fn r6_10_multi_element_array_into_array_field_writes_all_elements() {
+    let db = PvDatabase::new();
+    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
+    wf.nelm = 4;
+    wf.ftvl = 10; // DBF_DOUBLE (waveform.rs:1443-1453 maps FTVL -> field type)
+    db.add_record("ARRWF", Box::new(wf)).await.unwrap();
+
+    db.put_record_field_from_ca("ARRWF", "VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+        .await
+        .expect("an array into an array field must succeed");
+    assert_eq!(
+        db.get_pv("ARRWF.VAL").await.unwrap(),
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+        "an array destination must NOT be clamped to element 0"
+    );
+}
+
+/// R6-10 boundary — a single-element array is still an array on the wire
+/// (`caput -a REC.VAL 1 7`); C's clamp leaves `nRequest = 1` and writes it.
+/// Between this and the zero-element case (R6-7, LINK/INVALID alarm, nothing
+/// written) sit the two edges of C's `nRequest` branch.
+#[tokio::test]
+async fn r6_10_single_element_array_into_scalar_writes_that_element() {
+    let db = PvDatabase::new();
+    db.add_record("ONEPUT", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    db.put_record_field_from_ca("ONEPUT", "VAL", EpicsValue::DoubleArray(vec![7.0]))
+        .await
+        .expect("a one-element array into a scalar must succeed");
+    match db.get_pv("ONEPUT.VAL").await.unwrap() {
+        EpicsValue::Double(v) => assert!((v - 7.0).abs() < 1e-10, "expected 7.0, got {v}"),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
+/// R6-10 sibling on the link-delivery side — the same array-into-scalar clamp.
+/// C's link layer requests exactly one element (`dbGetLink(..., nRequest =
+/// NULL)`), so `dbGet` converts the field at offset 0 and a waveform INP into
+/// an `ai.VAL` lands `wf[0]`. The port's `set_val` was a second, parallel
+/// coercion path that could not reduce the array, so the value was silently
+/// dropped and VAL kept its stale content. `set_val` now routes through
+/// `put_field_internal`, the single owner of internal-delivery coercion.
+#[tokio::test]
+async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
+    let db = PvDatabase::new();
+    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
+    wf.nelm = 4;
+    wf.ftvl = 10; // DBF_DOUBLE (waveform.rs:1443-1453 maps FTVL -> field type)
+    db.add_record("LNKWF", Box::new(wf)).await.unwrap();
+    db.put_pv("LNKWF.VAL", EpicsValue::DoubleArray(vec![7.0, 8.0, 9.0]))
+        .await
+        .unwrap();
+
+    db.add_record("LNKAI", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("LNKAI").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("LNKWF".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("LNKAI", &mut visited, 0)
+        .await
+        .unwrap();
+
+    match db.get_pv("LNKAI.VAL").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-10,
+            "an array source into a scalar VAL must deliver element 0 (got {v}; \
+             the pre-fix port dropped the value and left VAL at 0)"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
 /// R6-9 — a put to a field name no record type owns. C `dbNameToAddr`
 /// (`dbAccess.c:660-676`) resolves the field part with `dbFindFieldPart`, then
 /// falls back to `dbGetAttributePart`; a name that matches neither returns

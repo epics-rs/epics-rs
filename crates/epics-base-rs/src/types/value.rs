@@ -796,6 +796,33 @@ impl EpicsValue {
         )
     }
 
+    /// Element 0 of an array variant, as the matching **scalar** variant.
+    /// Returns `None` for a scalar variant (nothing to reduce) and for an
+    /// empty array (no element 0).
+    ///
+    /// This is C's `dbPut` clamp of a request into a one-element destination:
+    /// `if (no_elements < nRequest) nRequest = no_elements;` (`dbAccess.c:1359`)
+    /// followed by `dbPutConvertRoutine[...](paddr, pbuffer, nRequest = 1, ...)`,
+    /// which copies the first element only. The put succeeds — the surplus
+    /// elements are dropped, not an error.
+    pub fn first_element(&self) -> Option<EpicsValue> {
+        Some(match self {
+            Self::ShortArray(a) => Self::Short(*a.first()?),
+            Self::FloatArray(a) => Self::Float(*a.first()?),
+            Self::EnumArray(a) => Self::Enum(*a.first()?),
+            Self::DoubleArray(a) => Self::Double(*a.first()?),
+            Self::LongArray(a) => Self::Long(*a.first()?),
+            Self::Int64Array(a) => Self::Int64(*a.first()?),
+            Self::UInt64Array(a) => Self::UInt64(*a.first()?),
+            Self::UShortArray(a) => Self::UShort(*a.first()?),
+            Self::ULongArray(a) => Self::ULong(*a.first()?),
+            Self::UCharArray(a) => Self::UChar(*a.first()?),
+            Self::CharArray(a) => Self::Char(*a.first()?),
+            Self::StringArray(a) => Self::String(a.first()?.clone()),
+            _ => return None,
+        })
+    }
+
     /// Truncate an array value to at most `max` elements. Scalars are unchanged.
     pub fn truncate(&mut self, max: usize) {
         match self {

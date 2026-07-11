@@ -432,7 +432,25 @@ impl ScalerRecord {
     /// (`scalerRecord.c:514-522`). It is dispatched as a single
     /// `CMD_AUTOCOUNT` whose `handle_command` reproduces
     /// `scalerRecord.c:510-535`.
-    fn build_autocount_actions(&self) -> Vec<ProcessAction> {
+    ///
+    /// The `D` fields are the record's, not the driver's: C sets them here in
+    /// `process()` (`:525`), exactly as it does at REQSTART (`:413`), so the
+    /// copy stays with the record and only the preset writes are dispatched.
+    fn build_autocount_actions(&mut self) -> Vec<ProcessAction> {
+        // C `scalerRecord.c:524-528` — below a millisecond, auto-count falls
+        // back on the *user's* per-channel presets, so the gates decide which
+        // channels count and the directions follow them:
+        //     for (i=0; i<pscal->nch; i++) {
+        //         pdir[i] = pgate[i];
+        //         if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
+        //     }
+        // The copy is unconditional; only the preset write is gated. The
+        // `tp1 >= 1ms` branch (`:512-523`) programs channel 0 from `tp1*freq`
+        // "regardless of any presets the user may have set" (`:506-507`) and
+        // never touches `pdir`.
+        if self.tp1 < 1.0e-3 {
+            self.copy_gates_to_directions();
+        }
         let mut actions = vec![
             ProcessAction::DeviceCommand {
                 command: CMD_RESET,

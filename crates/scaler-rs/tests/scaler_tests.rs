@@ -1471,3 +1471,79 @@ fn test_count_start_copies_gates_to_directions_only_up_to_nch() {
         "D64 is beyond NCH and must not be cleared"
     );
 }
+
+// ============================================================
+// R7-65: auto-count sub-millisecond branch copies gates -> directions
+// ============================================================
+
+/// C `scalerRecord.c:524-528` — when `TP1 < 1 ms`, auto-count falls back on
+/// the user's per-channel presets, and the gate array is copied into the
+/// direction array first:
+///   for (i=0; i<pscal->nch; i++) {
+///       pdir[i] = pgate[i];
+///       if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
+///   }
+/// The copy is unconditional; only the preset write is gated on G.
+#[test]
+fn test_autocount_sub_ms_copies_gates_to_directions() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 4;
+    rec.tp1 = 0.0; // below 1 ms → user-preset branch
+    rec.cont = 1; // auto-count mode
+
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.pr[0] = 1000;
+    rec.pr[2] = 500;
+    // Stale directions from an earlier configuration.
+    rec.d[0] = 0;
+    rec.d[1] = 1;
+    rec.d[2] = 0;
+    rec.d[3] = 1;
+    // Beyond NCH: C's loop stops at nch, so these survive.
+    rec.d[10] = 1;
+
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count armed");
+
+    assert_eq!(
+        &rec.d[0..4],
+        &[1, 0, 1, 0],
+        "D1..D4 copied from G1..G4 on the sub-ms auto-count re-arm"
+    );
+    assert_eq!(rec.d[10], 1, "beyond NCH, D is untouched");
+}
+
+/// The other side of C's `tp1 >= 1.e-3` boundary (`scalerRecord.c:512-523`):
+/// that branch programs only channel 0 from `TP1*FREQ` "regardless of any
+/// presets the user may have set" and never assigns `pdir`. The directions
+/// must be left exactly as the user left them.
+#[test]
+fn test_autocount_timed_branch_does_not_touch_directions() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 4;
+    rec.tp1 = 1.0; // >= 1 ms → timed branch
+    rec.cont = 1;
+
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.d[0] = 0;
+    rec.d[1] = 1;
+    rec.d[2] = 0;
+    rec.d[3] = 1;
+
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count armed");
+
+    assert_eq!(
+        &rec.d[0..4],
+        &[0, 1, 0, 1],
+        "the timed auto-count branch leaves D alone"
+    );
+}

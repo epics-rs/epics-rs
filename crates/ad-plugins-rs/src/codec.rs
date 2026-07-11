@@ -1264,9 +1264,13 @@ impl NDPluginProcess for CodecProcessor {
                         Some(out) => CodecOutcome::Converted(out),
                         None => CodecOutcome::Failed("Failed to LZ4 decompress".into()),
                     },
+                    // C's decompressBSLZ4 reports "Failed to Blosc decompress"
+                    // (NDPluginCodec.cpp:601) — a copy-paste from decompressBlosc
+                    // (:431), but it is the text the CodecError PV shows for a
+                    // corrupt BSLZ4 frame, so it is the contract.
                     CodecName::BSLZ4 => match decompress_bslz4(array) {
                         Some(out) => CodecOutcome::Converted(out),
-                        None => CodecOutcome::Failed("Failed to BSLZ4 decompress".into()),
+                        None => CodecOutcome::Failed("Failed to Blosc decompress".into()),
                     },
                 }
             }
@@ -1884,6 +1888,53 @@ mod tests {
             compressed_size < original_size,
             "bslz4 compressed ({compressed_size}) should be < original ({original_size})"
         );
+    }
+
+    #[test]
+    fn test_r9_71_corrupt_bslz4_reports_cs_blosc_text() {
+        // R9-71. C's decompressBSLZ4 reports "Failed to Blosc decompress"
+        // (NDPluginCodec.cpp:601) — a copy-paste from decompressBlosc (:431), but
+        // it is what the CodecError PV shows for a corrupt BSLZ4 frame, so the
+        // port must emit it verbatim rather than the "corrected" BSLZ4 wording.
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(32), NDDimension::new(32)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 11) as u16;
+            }
+        }
+        let pool = NDArrayPool::new(10_000_000);
+
+        // A genuine BSLZ4 frame, then corrupt the compressed payload.
+        let mut compressed = compress_bslz4(&arr);
+        if let NDDataBuffer::U8(ref mut v) = compressed.data {
+            for b in v.iter_mut() {
+                *b = 0xFF;
+            }
+        }
+        assert!(
+            decompress_bslz4(&compressed).is_none(),
+            "the corrupted frame must fail to decompress"
+        );
+
+        let mut decomp = CodecProcessor::new(CodecMode::Decompress);
+        decomp.params.codec_error = Some(13);
+        let result = decomp.process_array(&compressed, &pool);
+        let text = result
+            .param_updates
+            .iter()
+            .find_map(|u| match u {
+                ParamUpdate::Octet {
+                    reason: 13, value, ..
+                } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("CodecError posted");
+        assert_eq!(text, "Failed to Blosc decompress");
     }
 
     #[test]

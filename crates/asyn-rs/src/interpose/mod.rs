@@ -12,6 +12,7 @@
 //! from outermost to innermost, finally reaching the base driver (which
 //! implements [`OctetNext`]).
 
+pub mod com;
 pub mod delay;
 pub mod echo;
 pub mod eos;

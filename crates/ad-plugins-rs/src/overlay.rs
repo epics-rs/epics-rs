@@ -57,7 +57,15 @@ pub enum DrawMode {
 pub struct OverlayDef {
     pub shape: OverlayShape,
     pub draw_mode: DrawMode,
-    pub color: [u8; 3], // RGB color; for Mono, color[1] (green) is used
+    /// RGB color; for Mono, `color[1]` (green) is used.
+    ///
+    /// `i32`, not `u8`: C's `NDOverlay_t` holds `int red/green/blue`
+    /// (NDPluginOverlay.h:38-40) fed from unclamped `asynParamInt32` params
+    /// (`getIntegerParam`, NDPluginOverlay.cpp:339-341), and `setPixel`
+    /// (:41-52) casts that `int` straight to the pixel type. A u8 channel
+    /// cannot express the overlay values 16- and 32-bit images need — a
+    /// full-scale marker on NDUInt16 is 65535.
+    pub color: [i32; 3],
     pub width_x: usize, // line thickness in X direction (0 or 1 = 1px)
     pub width_y: usize, // line thickness in Y direction (0 or 1 = 1px)
 }
@@ -175,11 +183,7 @@ macro_rules! draw_on_typed_buffer {
 
         for overlay in $overlays.iter() {
             // Mono uses pOverlay->green; RGB writes red/green/blue in turn.
-            let rgb: [i32; 3] = [
-                overlay.color[0] as i32,
-                overlay.color[1] as i32,
-                overlay.color[2] as i32,
-            ];
+            let rgb: [i32; 3] = overlay.color;
             let wx = overlay.width_x.max(1);
             let wy = overlay.width_y.max(1);
 
@@ -465,9 +469,11 @@ struct OverlaySlot {
     size_y: usize,
     width_x: usize,
     width_y: usize,
-    red: u8,
-    green: u8,
-    blue: u8,
+    // C `NDOverlay_t` (NDPluginOverlay.h:38-40): `int red/green/blue`, read
+    // from asynInt32 params with no range clamp.
+    red: i32,
+    green: i32,
+    blue: i32,
     display_text: String,
     timestamp_format: String,
     font: usize,
@@ -822,11 +828,16 @@ impl NDPluginProcess for OverlayProcessor {
         } else if Some(reason) == self.params.width_y {
             slot.width_y = params.value.as_i32().max(0) as usize;
         } else if Some(reason) == self.params.red {
-            slot.red = params.value.as_i32().clamp(0, 255) as u8;
+            // No clamp: C stores the raw epicsInt32 (setIntegerParam ->
+            // getIntegerParam into `int red`, NDPluginOverlay.cpp:339-341) and
+            // narrows only at the pixel write (`(epicsType)pOverlay->red`,
+            // :44). Clamping to 0..=255 here made every value above 255
+            // unreachable on 16-/32-bit images.
+            slot.red = params.value.as_i32();
         } else if Some(reason) == self.params.green {
-            slot.green = params.value.as_i32().clamp(0, 255) as u8;
+            slot.green = params.value.as_i32();
         } else if Some(reason) == self.params.blue {
-            slot.blue = params.value.as_i32().clamp(0, 255) as u8;
+            slot.blue = params.value.as_i32();
         } else if Some(reason) == self.params.display_text {
             if let ParamChangeValue::Octet(s) = &params.value {
                 slot.display_text = s.clone();
@@ -888,6 +899,80 @@ mod tests {
                 Some(OverlayShape::Ellipse { .. })
             ),
             "OVERLAY_SHAPE=3 must draw Ellipse (C NDOverlayEllipse)"
+        );
+    }
+
+    // R6-72: C's overlay color channels are `int` (NDPluginOverlay.h:38-40)
+    // written straight into the pixel by setPixel (:44, `(epicsType)red`), so a
+    // 16-bit image can carry a full-scale 65535 marker. The u8 channel could
+    // not express anything above 255.
+    #[test]
+    fn test_r6_72_color_above_255_reaches_a_16bit_pixel() {
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Rectangle {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 3,
+            },
+            draw_mode: DrawMode::Set,
+            // Mono takes the green channel (C setPixel:57).
+            color: [0, 65535, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+
+        let out = draw_overlays(&arr, &overlays);
+        let NDDataBuffer::U16(ref v) = out.data else {
+            panic!("expected U16 buffer");
+        };
+        assert_eq!(v[8 + 1], 65535, "full-scale 16-bit marker must survive");
+        assert_eq!(v[2 * 8 + 2], 0, "interior untouched");
+    }
+
+    // R6-72 boundary: 256 is the first value the old 0..=255 clamp destroyed.
+    #[test]
+    fn test_r6_72_param_write_above_255_is_not_clamped() {
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        let mut proc = OverlayProcessor::new(vec![]);
+        let mut base = PortDriverBase::new("R6_72", MAX_OVERLAYS + 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+
+        let red = proc.params.red.expect("OVERLAY_RED registered");
+        let green = proc.params.green.expect("OVERLAY_GREEN registered");
+        let blue = proc.params.blue.expect("OVERLAY_BLUE registered");
+        for (reason, value) in [(red, 256), (green, 65535), (blue, 4095)] {
+            proc.on_param_change(
+                reason,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason,
+                    addr: 0,
+                    value: ParamChangeValue::Int32(value),
+                },
+            );
+        }
+        proc.on_param_change(
+            proc.params.use_overlay.unwrap(),
+            &PluginParamSnapshot {
+                enable_callbacks: true,
+                reason: proc.params.use_overlay.unwrap(),
+                addr: 0,
+                value: ParamChangeValue::Int32(1),
+            },
+        );
+
+        let def = proc.slots[0].to_overlay_def().expect("overlay in use");
+        assert_eq!(
+            def.color,
+            [256, 65535, 4095],
+            "C stores the raw epicsInt32 and narrows only at the pixel write"
         );
     }
 

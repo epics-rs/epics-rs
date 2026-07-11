@@ -242,6 +242,59 @@ impl ChildHandle {
 /// function exits with this one status.
 const CHILD_LAUNCH_FAILURE_EXIT: i32 = 255;
 
+/// The three signals C's supervisor blocks in `main` and never unblocks —
+/// `sigprocmask(SIG_BLOCK, {SIGPIPE, SIGTERM, SIGHUP})` (`procServ.cc:490-494`,
+/// so `pselect` can unblock them atomically). The child branch of
+/// `processFactory.cc:196-215` restores neither the mask nor the dispositions
+/// before `execvp`, and POSIX preserves the signal mask across `execve` — so a
+/// C-launched child runs with exactly these three blocked.
+const C_CHILD_BLOCKED_SIGNALS: [Signal; 3] = [Signal::SIGPIPE, Signal::SIGTERM, Signal::SIGHUP];
+
+/// Give the child the signal environment a C procServ child gets, replacing the
+/// one it would otherwise inherit from the Rust supervisor (R6-75).
+///
+/// Two halves, both from C, and they only make sense together:
+///
+/// * **Dispositions → `SIG_DFL`.** C installs *handlers* for SIGPIPE/SIGTERM/
+///   SIGHUP (`OnSigPipe`/`OnSigTerm`/`OnSigHup`, `procServ.cc:496-501`), and
+///   `execve` resets handled signals to the default. The Rust supervisor instead
+///   sets `SIGPIPE = SIG_IGN` (`daemon.rs`, and the Rust runtime does it at
+///   startup regardless) — and an *ignored* disposition survives `execve`, so the
+///   child, its grandchildren, and everything below inherited a permanently
+///   ignored SIGPIPE that no C child has.
+/// * **Mask → the three blocked.** With the dispositions defaulted but the mask
+///   left empty, the child would *die* on a broken pipe — which no C child does
+///   either, because C leaks its `pselect` block mask into it. Copying only half
+///   of C's state would produce a child that matches neither.
+///
+/// Consequence, faithful to C: a child cannot be killed with SIGTERM or SIGHUP
+/// (blocked → pending, never delivered). C's default `killSig` is SIGKILL
+/// (`procServ.cc:71`) which is unblockable, and `--killsig 2` (SIGINT, the common
+/// site override) is not in the blocked set, so both real kill paths still work —
+/// exactly as they do, and don't, under C.
+///
+/// SIGINT/SIGQUIT are deliberately untouched: in foreground mode C sets them to
+/// `SIG_IGN` (`procServ.cc:504-508`) and an ignored disposition is inherited
+/// through `execvp`, which is already what the port's child sees.
+///
+/// Async-signal-safe (`sigaction`/`pthread_sigmask` only), as required between
+/// `fork` and `exec`. Failures are unreportable here and non-fatal — the child
+/// still execs, as it would in C, where none of these calls are checked either.
+fn restore_c_child_signal_environment() {
+    for sig in C_CHILD_BLOCKED_SIGNALS {
+        // SAFETY: disposition-only (SIG_DFL), no userspace handler installed;
+        // `sigaction` is async-signal-safe.
+        unsafe {
+            let _ = nix::sys::signal::signal(sig, nix::sys::signal::SigHandler::SigDfl);
+        }
+    }
+    let mut blocked = nix::sys::signal::SigSet::empty();
+    for sig in C_CHILD_BLOCKED_SIGNALS {
+        blocked.add(sig);
+    }
+    let _ = blocked.thread_block();
+}
+
 /// In-child path of `forkpty` — optional chdir, then `execvp` the
 /// target program. Never returns on success; on failure prints to
 /// stderr (which goes back through the PTY to the parent) and exits
@@ -252,6 +305,9 @@ const CHILD_LAUNCH_FAILURE_EXIT: i32 = 255;
 /// NOT call `setsid` here again — it would return `EPERM` because
 /// we're already a session leader.
 fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
+    // R6-75: hand the child C's signal environment, not the Rust runtime's.
+    restore_c_child_signal_environment();
+
     // Apply the core-dump rlimit before chdir/exec, matching C's order
     // (processFactory.cc:206-210): `getrlimit` to keep the hard limit,
     // set only the soft limit (`rlim_cur`) to `coreSize`. Best-effort —
@@ -476,6 +532,68 @@ mod tests {
             }
         }
         exit
+    }
+
+    /// R6-75: the exec'd child must see C's signal state, read back from the
+    /// kernel (`/proc/self/status`) rather than from our own bookkeeping.
+    ///
+    /// * `SigIgn` must NOT contain SIGPIPE. The Rust runtime ignores SIGPIPE and
+    ///   an ignored disposition survives `execve`, so without the fix every
+    ///   child — and every grandchild — inherited it. C's parent installs a
+    ///   *handler* (`procServ.cc:496-497`), which `execve` resets to SIG_DFL.
+    /// * `SigBlk` must contain SIGHUP, SIGPIPE and SIGTERM — C's `pselect` block
+    ///   mask (`procServ.cc:490-494`), never restored before `execvp`
+    ///   (`processFactory.cc:196-215`) and preserved across it by POSIX.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_signal_state_matches_a_c_procserv_child() {
+        // `cat` touches no signals of its own, so what it reports is exactly
+        // what execvp handed it.
+        let spec = ChildSpec {
+            program: PathBuf::from("/bin/cat"),
+            args: vec!["/proc/self/status".into()],
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: None,
+        };
+        let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
+        let text = String::from_utf8_lossy(&output);
+
+        let field = |name: &str| -> u64 {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} in /proc/self/status:\n{text}"));
+            let hex = line.split_whitespace().nth(1).expect("value");
+            u64::from_str_radix(hex, 16).expect("hex mask")
+        };
+        // /proc bit N-1 corresponds to signal N.
+        let bit = |signo: i32| 1_u64 << (signo - 1);
+
+        let ignored = field("SigIgn:");
+        assert_eq!(
+            ignored & bit(libc::SIGPIPE),
+            0,
+            "SIGPIPE must not reach the child ignored (SigIgn={ignored:#x})"
+        );
+
+        let blocked = field("SigBlk:");
+        for sig in [libc::SIGHUP, libc::SIGPIPE, libc::SIGTERM] {
+            assert_ne!(
+                blocked & bit(sig),
+                0,
+                "signal {sig} must be blocked as C's sigprocmask leaves it (SigBlk={blocked:#x})"
+            );
+        }
+        // SIGINT is not in C's block set — a `--killsig 2` must still land.
+        assert_eq!(
+            blocked & bit(libc::SIGINT),
+            0,
+            "SIGINT must stay deliverable (SigBlk={blocked:#x})"
+        );
     }
 
     /// A normal exit is classified `Exited(code)` carrying the real

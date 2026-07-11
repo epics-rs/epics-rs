@@ -3,6 +3,8 @@
 
 use epics_base_rs::types::{EpicsValue, PvString};
 
+use crate::client::{CaChannel, CaClient};
+
 /// Default CA CLI timeout in seconds when neither `-w` nor a usable
 /// `EPICS_CLI_TIMEOUT` env var is set.
 pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
@@ -56,6 +58,81 @@ pub fn timeout_duration(secs: f64) -> std::time::Duration {
         DEFAULT_CLI_TIMEOUT_SECS
     };
     std::time::Duration::from_secs_f64(s)
+}
+
+/// The C `connect_pvs` diagnostic for a connect timeout
+/// (`tool_lib.c:630-636`). It depends only on the *number* of PVs asked
+/// for, never on which of them failed: more than one PV collapses to
+/// "some PV(s)", a lone PV is named.
+pub fn connect_timeout_message(names: &[String]) -> String {
+    if names.len() > 1 {
+        "Channel connect timed out: some PV(s) not found.".to_string()
+    } else {
+        format!(
+            "Channel connect timed out: '{}' not found.",
+            names.first().map(String::as_str).unwrap_or("")
+        )
+    }
+}
+
+/// A failed [`connect_pvs`] barrier: carries the exact C diagnostic to
+/// print on stderr before the tool exits 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectPvsTimeout {
+    message: String,
+}
+
+impl std::fmt::Display for ConnectPvsTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConnectPvsTimeout {}
+
+/// C `tool_lib.c::connect_pvs` (`:623-641`) — the single all-channels
+/// barrier the synchronous CA tools put between channel creation and
+/// their data phase.
+///
+/// C creates every channel, then waits for ALL of them in ONE
+/// `ca_pend_io(caTimeout)`. On `ECA_TIMEOUT` it prints the diagnostic and
+/// returns 1, and the caller skips its whole get+print phase
+/// (`caget.c:553-556`, `cainfo.c:228-232`, `caput.c:406-410` all read
+/// `if (!result)` / `if (result) return result`). A partial connect
+/// therefore emits ZERO stdout value lines — not a per-PV interleaving of
+/// values and `*** not connected` markers. Owning that barrier here keeps
+/// the all-or-nothing contract in ONE place instead of re-deriving it in
+/// each binary.
+///
+/// The connect wait runs concurrently across channels, so the whole
+/// barrier fits in one `timeout` window, exactly like C's single
+/// `ca_pend_io`. C's other failure mode — `ca_create_channel` itself
+/// rejecting a name (`create_pvs`, `tool_lib.c:588-594`) — has no port
+/// analogue: [`CaClient::create_channel_with_priority`] is infallible and
+/// defers every failure to the connect wait.
+pub async fn connect_pvs(
+    client: &CaClient,
+    names: &[String],
+    priority: u8,
+    timeout: std::time::Duration,
+) -> Result<Vec<CaChannel>, ConnectPvsTimeout> {
+    let channels: Vec<CaChannel> = names
+        .iter()
+        .map(|name| client.create_channel_with_priority(name, priority))
+        .collect();
+    let all_connected =
+        futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
+            .await
+            .into_iter()
+            .all(|r| r.is_ok());
+
+    if all_connected {
+        Ok(channels)
+    } else {
+        Err(ConnectPvsTimeout {
+            message: connect_timeout_message(names),
+        })
+    }
 }
 
 /// Field width the C tools (`caget` / `camonitor` / `caput -l`) use

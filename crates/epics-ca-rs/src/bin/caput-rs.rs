@@ -2,9 +2,9 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
-use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
+use epics_ca_rs::{CaError, DbFieldType, EpicsValue, PvString};
 use std::time::SystemTime;
 
 fn format_server_timestamp(ts: WallTime) -> String {
@@ -193,12 +193,21 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    // -p selects the priority virtual circuit.
-    let ch = client.create_channel_with_priority(&pv_name, args.priority.unwrap_or(0));
-    if let Err(e) = ch.wait_connected(timeout).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+    // -p selects the priority virtual circuit. C `caput.c:406-410` runs the
+    // same `connect_pvs` barrier as caget/cainfo ("If the connection fails,
+    // we're done"): its ECA_TIMEOUT diagnostic names the single PV, and the
+    // put phase never starts.
+    let names = [pv_name.clone()];
+    let ch =
+        match epics_ca_rs::cli::connect_pvs(&client, &names, args.priority.unwrap_or(0), timeout)
+            .await
+        {
+            Ok(mut channels) => channels.remove(0),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
 
     // The channel's native field type drives how the value to WRITE is
     // encoded (C `ca_field_type`, caput.c:143) — it must stay the real
@@ -259,6 +268,14 @@ async fn main() {
             (false, None) => ch.get_with_timeout(timeout).await.map(|(_t, v)| (v, None)),
         }
     };
+    // The readback's element count: C sets `reqElems = nElems =
+    // ca_element_count(chid)` (`caput.c:142,154-155`) and hands that count to
+    // the zeroed buffer it prints on a read timeout.
+    let read_elems = ch.element_count().unwrap_or(1);
+    // An ENUM read back in its label form is a DBR_STRING readback, so its
+    // zeroed buffer is an empty string, not a 0 index.
+    let read_as_string = enum_dbr.is_some();
+
     // C caput.c:532-535 gates the pre-put "Old :" read+print on
     // `if (format != terse)`. Terse mode prints only the new value, so the
     // pre-put GET must NOT be issued: C never issues it, and a PV that is slow
@@ -269,13 +286,22 @@ async fn main() {
     let (old_value, old_snap) = if args.terse {
         (None, None)
     } else {
-        match read_display(ch.clone()).await {
-            Ok((v, s)) => (Some(v), s),
-            Err(CaError::Timeout) => {
+        match classify_readback(
+            read_display(ch.clone()).await,
+            native_type,
+            read_as_string,
+            read_elems,
+            long_mode,
+        ) {
+            Readback::Value(v, s) => (Some(v), s),
+            Readback::TimedOut(v, s) => {
+                // C caput.c:186-188 warns and keeps going; the `Old :` read's
+                // return value is DISCARDED at caput.c:535, so the PUT still
+                // runs and the zeroed buffer is what the `Old :` line shows.
                 eprintln!("Read operation timed out: PV data was not read.");
-                std::process::exit(1);
+                (Some(v), s)
             }
-            Err(e) => {
+            Readback::Disconnected(e) | Readback::Other(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -348,25 +374,29 @@ async fn main() {
     // back after the put, caput.c:583). Same readback type selection as the
     // `Old :` read above, so an ENUM `New :` value also echoes as the state
     // label. C returns this readback's status as caput's exit status
-    // (caput.c:589): a read TIMEOUT or a total DISCONNECT must fail the command
-    // (see `postput_read_fatal`), so we exit non-zero before printing rather
-    // than hiding the failure behind the submitted value. Other readback errors
-    // (e.g. read-access denied, which C exits 0 on) fall back to echoing the
-    // submitted value and exit 0, matching C's exit code.
+    // (caput.c:589), and inside `caget()` only `!nConn` yields a non-zero
+    // return (`caput.c:181`) — see [`Readback`]. A read TIMEOUT does NOT:
+    // C prints `New : <name> <zeroed value>` and exits 0.
     let echo_fallback = parsed_value.echo_fallback();
-    let (new_value, new_snap) = match read_display(ch.clone()).await {
-        Ok(pair) => pair,
-        Err(e) => match postput_read_fatal(&e) {
-            Some(FatalReadback::Timeout) => {
-                eprintln!("Read operation timed out: PV data was not read.");
-                std::process::exit(1);
-            }
-            Some(FatalReadback::Disconnect) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-            None => (echo_fallback.clone(), None),
-        },
+    let (new_value, new_snap) = match classify_readback(
+        read_display(ch.clone()).await,
+        native_type,
+        read_as_string,
+        read_elems,
+        long_mode,
+    ) {
+        Readback::Value(v, s) => (v, s),
+        Readback::TimedOut(v, s) => {
+            eprintln!("Read operation timed out: PV data was not read.");
+            (v, s)
+        }
+        Readback::Disconnected(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        // C prints a `*** ...` marker here and exits 0; the port echoes the
+        // submitted value instead, keeping C's exit code.
+        Readback::Other(_) => (echo_fallback.clone(), None),
     };
 
     let mut fmt = ValueFormat::default();
@@ -459,36 +489,114 @@ impl WriteValue {
     }
 }
 
-/// A post-put readback error that C `caput` propagates to a non-zero exit.
-#[derive(Debug, PartialEq, Eq)]
-enum FatalReadback {
-    /// `ca_pend_io` timed out — C `caget` prints the read-timeout message and
-    /// returns `ECA_TIMEOUT` (`caput.c:186-188`).
-    Timeout,
-    /// No channel connected for the readback — C `caget` returns `1` from its
-    /// `if (!nConn) return 1` guard (`caput.c:181`).
-    Disconnect,
+/// Unix seconds at the EPICS epoch (1990-01-01T00:00:00Z) — the instant a
+/// zeroed `epicsTimeStamp` denotes, which is what C prints for a timed-out
+/// readback under `-l` (see [`zero_readback`]).
+const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
+
+/// One `caput` readback — the `Old :` read (`caput.c:535`) and the `New :`
+/// read (`caput.c:583`) are the SAME C function, `caget()`
+/// (`caput.c:130-240`) — classified by C's contract.
+#[derive(Debug)]
+enum Readback {
+    /// The get completed: print this value.
+    Value(EpicsValue, Option<Snapshot>),
+    /// `ca_pend_io` timed out (`caput.c:186-188`): C warns on stderr and
+    /// falls through to the print loop with the ZEROED buffer. Exit stays 0.
+    TimedOut(EpicsValue, Option<Snapshot>),
+    /// No channel connected: C `caget()` returns 1 from `if (!nConn) return
+    /// 1` (`caput.c:181`) before printing anything, and caput propagates it
+    /// as the exit status (`caput.c:583,589`).
+    Disconnected(CaError),
+    /// Any other readback failure. C's `ca_array_get` failing *synchronously*
+    /// — most notably read-access-denied, which libca rejects client-side with
+    /// `ECA_NORDACCESS` before any I/O is outstanding — leaves `ca_pend_io` at
+    /// `ECA_NORMAL`; `caget()` prints a `*** ...` marker for the PV but still
+    /// returns 0 (`caput.c:200-206,239`), so C exits 0.
+    Other(CaError),
 }
 
-/// Classify a post-put readback error by C `caput`'s exit-status contract.
+/// The value C `caput` prints for a readback whose `ca_pend_io` timed out.
 ///
-/// C always issues `caget()` after the put and returns its result as the
-/// process exit status (`caput.c:583,589`). Inside `caget()` only two
-/// conditions make the status non-`ECA_NORMAL`: a `ca_pend_io` timeout
-/// (`caput.c:186-188`) and "no PV connected" (`caput.c:181`). A read whose
-/// `ca_array_get` fails *synchronously* — most notably read-access-denied,
-/// which libca rejects client-side with `ECA_NORDACCESS` before any I/O is
-/// outstanding — leaves `ca_pend_io` at `ECA_NORMAL`; `caget()` prints a
-/// `*** ...` marker for that PV but still returns success, so C exits `0`
-/// (`caput.c:200-206`). This classifier therefore marks ONLY `Timeout` and
-/// `Disconnected`/`Shutdown` as fatal; every other readback error is
-/// non-fatal (echo the submitted value, exit `0`), matching C's exit code.
-/// Returns `None` for the non-fatal case.
-fn postput_read_fatal(err: &CaError) -> Option<FatalReadback> {
-    match err {
-        CaError::Timeout => Some(FatalReadback::Timeout),
-        CaError::Disconnected | CaError::Shutdown => Some(FatalReadback::Disconnect),
-        _ => None,
+/// C `calloc`s the readback buffer BEFORE issuing the get (`caput.c:167`)
+/// and, on `ECA_TIMEOUT`, only warns on stderr (`caput.c:186-188`) — it
+/// neither frees the buffer nor marks the PV's status. The print loop
+/// therefore sees `status == ECA_NORMAL` and `value != 0` (`caput.c:201-209`)
+/// and renders the still-ZEROED buffer: a numeric field prints `0`, a string
+/// (or ENUM-as-label) field prints an empty value, an array prints its
+/// element count then that many zeros, and `-l` prints a zeroed
+/// `epicsTimeStamp` (the EPICS epoch) with NO_ALARM/NO_ALARM
+/// (`tool_lib.c::print_time_val_sts`). `caget()` then returns 0
+/// (`caput.c:239`).
+///
+/// Note the `*** no data available (timeout)` branch (`caput.c:207-208`) is
+/// DEAD in caput: it needs `value == 0`, which only the callback get path
+/// allocates lazily (`caget.c:130`), and caput's readback is always the
+/// synchronous `ca_array_get`.
+fn zero_readback(
+    native: DbFieldType,
+    as_string: bool,
+    count: u32,
+    long_mode: bool,
+) -> (EpicsValue, Option<Snapshot>) {
+    let n = count.max(1) as usize;
+    let scalar = n == 1;
+    let zeros = |scalar_v: EpicsValue, array_v: EpicsValue| {
+        if scalar { scalar_v } else { array_v }
+    };
+    let value = if as_string || native == DbFieldType::String {
+        zeros(
+            EpicsValue::String(PvString::from("")),
+            EpicsValue::StringArray(vec![PvString::from(""); n]),
+        )
+    } else {
+        match native {
+            DbFieldType::Short => zeros(EpicsValue::Short(0), EpicsValue::ShortArray(vec![0; n])),
+            DbFieldType::Float => {
+                zeros(EpicsValue::Float(0.0), EpicsValue::FloatArray(vec![0.0; n]))
+            }
+            DbFieldType::Enum => zeros(EpicsValue::Enum(0), EpicsValue::EnumArray(vec![0; n])),
+            DbFieldType::Char => zeros(EpicsValue::Char(0), EpicsValue::CharArray(vec![0; n])),
+            DbFieldType::Long => zeros(EpicsValue::Long(0), EpicsValue::LongArray(vec![0; n])),
+            // DbFieldType::Double, plus the internal-only widths (Int64,
+            // UInt64, UShort, ULong, UChar) that have no CA wire type: a CA
+            // server reports them promoted (DBR_DOUBLE / DBR_LONG / DBR_CHAR),
+            // so `native_field_type` never yields them here — and their zero
+            // renders as `0` in every one of those promotions anyway.
+            _ => zeros(
+                EpicsValue::Double(0.0),
+                EpicsValue::DoubleArray(vec![0.0; n]),
+            ),
+        }
+    };
+    let snap = long_mode.then(|| {
+        Snapshot::new(
+            value.clone(),
+            0,
+            0,
+            WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
+        )
+    });
+    (value, snap)
+}
+
+/// Single owner of C `caput`'s readback contract: map one get result onto
+/// [`Readback`], substituting the zeroed buffer C would print on timeout.
+fn classify_readback(
+    res: Result<(EpicsValue, Option<Snapshot>), CaError>,
+    native: DbFieldType,
+    as_string: bool,
+    count: u32,
+    long_mode: bool,
+) -> Readback {
+    match res {
+        Ok((value, snap)) => Readback::Value(value, snap),
+        Err(CaError::Timeout) => {
+            let (value, snap) = zero_readback(native, as_string, count, long_mode);
+            Readback::TimedOut(value, snap)
+        }
+        Err(e @ (CaError::Disconnected | CaError::Shutdown)) => Readback::Disconnected(e),
+        Err(e) => Readback::Other(e),
     }
 }
 
@@ -826,10 +934,11 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
-        raw_from_escaped_string,
+        Args, EPICS_EPOCH_UNIX_SECS, Readback, WriteValue, build_write_value, classify_readback,
+        raw_from_escaped, raw_from_escaped_string, zero_readback,
     };
     use clap::Parser;
+    use epics_base_rs::types::WallTime;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
@@ -883,52 +992,124 @@ mod tests {
         assert!(a.long_string && !a.array_mode, "-S alone → long string");
     }
 
-    /// The post-put readback
-    /// status must follow C `caput`'s exit-code contract — a read TIMEOUT and a
-    /// total DISCONNECT fail the command (C `caget` returns ECA_TIMEOUT /
-    /// `!nConn` returns 1, caput.c:181,186-188), while a synchronously-failed
-    /// read such as read-access-denied leaves `ca_pend_io` at ECA_NORMAL so
-    /// C exits 0 (caput.c:200-206). Boundary cases, one per classifier arm.
+    /// A readback timeout is NOT fatal in C. `ca_pend_io` returning
+    /// ECA_TIMEOUT only prints the stderr warning (`caput.c:186-188`); the
+    /// function keeps going, prints the (still zeroed) buffer and returns 0
+    /// (`caput.c:239`).
+    ///
+    /// This test previously asserted the opposite ("read timeout must fail
+    /// caput like C ca_pend_io ECA_TIMEOUT"), pinning a behaviour C does not
+    /// have — `caput.c:186-188` has no `return`.
     #[test]
-    fn postput_read_timeout_is_fatal() {
+    fn readback_timeout_is_not_fatal_and_yields_the_zeroed_buffer() {
+        let r = classify_readback(
+            Err(CaError::Timeout),
+            DbFieldType::Double,
+            /* as_string */ false,
+            /* count */ 1,
+            /* long_mode */ false,
+        );
+        match r {
+            Readback::TimedOut(v, snap) => {
+                assert_eq!(
+                    v,
+                    EpicsValue::Double(0.0),
+                    "C prints the calloc'd, never-filled buffer: a zeroed double"
+                );
+                assert!(snap.is_none(), "no -l → no timestamp/alarm line");
+            }
+            other => panic!("read timeout must classify as TimedOut, got {other:?}"),
+        }
+    }
+
+    /// The zeroed buffer takes the shape of the READBACK type, not of the
+    /// value that was written: a label-form ENUM readback is a DBR_STRING
+    /// get, so its zeroed buffer prints as an empty string, and an array
+    /// readback zeroes every element (C `dbr_size_n(dbrType, reqElems)`,
+    /// `caput.c:167`).
+    #[test]
+    fn zero_readback_takes_the_shape_of_the_readback_type() {
+        let (v, _) = zero_readback(DbFieldType::Enum, /* as_string */ true, 1, false);
         assert_eq!(
-            postput_read_fatal(&CaError::Timeout),
-            Some(FatalReadback::Timeout),
-            "read timeout must fail caput like C ca_pend_io ECA_TIMEOUT"
+            v,
+            EpicsValue::String(epics_ca_rs::PvString::from("")),
+            "ENUM read back as a label is a DBR_STRING get → zeroed string"
+        );
+
+        let (v, _) = zero_readback(DbFieldType::Enum, /* as_string */ false, 1, false);
+        assert_eq!(
+            v,
+            EpicsValue::Enum(0),
+            "`caput -n` reads the ENUM index → zeroed index"
+        );
+
+        let (v, _) = zero_readback(DbFieldType::Long, false, 3, false);
+        assert_eq!(
+            v,
+            EpicsValue::LongArray(vec![0, 0, 0]),
+            "an array readback zeroes ca_element_count elements"
         );
     }
 
+    /// Under `-l` C prints the zeroed `dbr_time_*` header too: the EPICS
+    /// epoch stamp (secPastEpoch == 0) and NO_ALARM / NO_ALARM.
     #[test]
-    fn postput_read_disconnect_is_fatal() {
+    fn zero_readback_long_mode_carries_the_epics_epoch_and_no_alarm() {
+        let (_, snap) = zero_readback(DbFieldType::Double, false, 1, /* long_mode */ true);
+        let snap = snap.expect("-l readback carries a timestamp/alarm line");
+        assert_eq!(snap.alarm.status, 0);
+        assert_eq!(snap.alarm.severity, 0);
+        assert_eq!(
+            snap.timestamp,
+            WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
+            "a zeroed epicsTimeStamp is the EPICS epoch, 1990-01-01T00:00:00Z"
+        );
+    }
+
+    /// Only `!nConn` (`caput.c:181`) makes C's readback return non-zero.
+    #[test]
+    fn readback_disconnect_is_fatal() {
         // Both disconnect and shutdown map to C's `!nConn` no-connection guard.
-        assert_eq!(
-            postput_read_fatal(&CaError::Disconnected),
-            Some(FatalReadback::Disconnect),
-            "disconnected readback must fail caput like C caget !nConn"
-        );
-        assert_eq!(
-            postput_read_fatal(&CaError::Shutdown),
-            Some(FatalReadback::Disconnect),
-            "client shutdown during readback must fail caput"
-        );
+        assert!(matches!(
+            classify_readback(
+                Err(CaError::Disconnected),
+                DbFieldType::Double,
+                false,
+                1,
+                false
+            ),
+            Readback::Disconnected(_)
+        ));
+        assert!(matches!(
+            classify_readback(Err(CaError::Shutdown), DbFieldType::Double, false, 1, false),
+            Readback::Disconnected(_)
+        ));
     }
 
     #[test]
-    fn postput_read_other_errors_are_nonfatal() {
+    fn readback_other_errors_are_nonfatal() {
         // Read-access-denied and other synchronous CA failures: C's caget still
-        // returns ECA_NORMAL (ca_pend_io never timed out) → caput exits 0. These
-        // must be non-fatal so we echo the submitted value and exit 0, NOT
-        // over-correct to non-zero (the finding's prescription was wrong here).
-        assert_eq!(
-            postput_read_fatal(&CaError::ServerError(0x178)), // ECA_NORDACCESS
-            None,
-            "read-access-denied exits 0 in C, must stay non-fatal"
-        );
-        assert_eq!(
-            postput_read_fatal(&CaError::Protocol("bad frame".into())),
-            None,
-            "other readback errors exit 0 in C, must stay non-fatal"
-        );
+        // returns ECA_NORMAL (ca_pend_io never timed out) → caput exits 0.
+        assert!(matches!(
+            classify_readback(
+                Err(CaError::ServerError(0x178)), // ECA_NORDACCESS
+                DbFieldType::Double,
+                false,
+                1,
+                false
+            ),
+            Readback::Other(_)
+        ));
+        assert!(matches!(
+            classify_readback(
+                Err(CaError::Protocol("bad frame".into())),
+                DbFieldType::Double,
+                false,
+                1,
+                false
+            ),
+            Readback::Other(_)
+        ));
     }
 
     #[test]

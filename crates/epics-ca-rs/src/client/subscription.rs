@@ -815,6 +815,67 @@ mod tests {
         assert_eq!(drained_type(&mut rx), (20, 0));
     }
 
+    /// `camonitor` parity for a native type change across reconnect
+    /// (`camonitor.c:143-180`): C compares `ppv->dbfType` against
+    /// `ca_field_type(chid)` in its CONN_UP handler, clears the old
+    /// subscription, and re-subscribes with the type re-derived through the
+    /// SAME substitution chain — so a PV that comes back as an ENUM is
+    /// monitored as `DBR_TIME_STRING` (state labels) and not as the numeric
+    /// type frozen at first connect.
+    ///
+    /// The port does that re-derivation here, in the ONE subscribe-time
+    /// owner: `ChannelCreated` computes `native_changed`
+    /// (`client/mod.rs:3721-3725`), passes it to `restore_for_channel`
+    /// (`:3832-3844`), which clears the auto-derived `data_type` and
+    /// re-derives via `subscription_readback_dbr` with the record's stored
+    /// `enum_readback`. The camonitor front-end therefore needs no
+    /// clear/re-subscribe of its own.
+    #[test]
+    fn label_readback_re_derives_to_dbr_time_string_when_the_pv_returns_as_enum() {
+        let mut reg = SubscriptionRegistry::new();
+        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        // `camonitor` without `-n`: ENUM fields are monitored as labels.
+        rec.enum_readback = crate::client::EnumReadback::Label;
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // First connect: native DBR_DOUBLE(6) → DBR_TIME_DOUBLE (6 + 14 = 20).
+        let (restored, failed) = reg.restore_for_channel(
+            100,
+            7,
+            6,
+            1,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
+        assert_eq!((restored, failed), (1, 0));
+        assert_eq!(drained_type(&mut rx), (20, 0));
+
+        // The IOC comes back with the record redefined as an ENUM(3).
+        reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
+        let (restored, failed) = reg.restore_for_channel(
+            100,
+            8,
+            3,
+            1,
+            true,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
+        assert_eq!((restored, failed), (1, 0));
+        // NOT the frozen 20, and NOT the native DBR_TIME_ENUM (17): the ENUM
+        // substitution re-applies, so the re-subscribe asks for
+        // DBR_TIME_STRING (14) and camonitor keeps printing state labels.
+        assert_eq!(
+            drained_type(&mut rx),
+            (epics_base_rs::types::DBR_TIME_STRING, 0),
+            "reconnect must re-derive the ENUM label substitution, not reuse the pre-change type"
+        );
+    }
+
     /// The cached `rec.count` is C's `netSubscription::count` (the user's
     /// cap); the WIRE count is re-resolved per request from the circuit's
     /// minor version (`subscr.getCount(guard, CA_V413(minor))`,

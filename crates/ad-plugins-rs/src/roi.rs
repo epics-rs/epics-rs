@@ -235,25 +235,27 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     // C `userDims = {xDim, yDim, colorDim}` (NDPluginROI.cpp:80-82): the ROI
     // axes are written into the ARRAY dimension slots the image info reports,
     // so the geometry is layout-independent.
+    let user_dims = info.user_dims();
     let mut dims_out: Vec<NDDimension> = src.dims.clone();
     for d in dims_out.iter_mut() {
         d.offset = 0;
         d.binning = 1;
         d.reverse = false;
     }
-    for (axis, (min, size, bin)) in [
-        (info.x_dim, (x_min, x_roi, bin_x)),
-        (info.y_dim, (y_min, y_roi, bin_y)),
-        (info.color_dim, (c_min, c_roi, bin_c)),
-    ] {
-        let d = dims_out.get_mut(axis)?;
+    for (roi_dim, (min, size, bin)) in [
+        (x_min, x_roi, bin_x),
+        (y_min, y_roi, bin_y),
+        (c_min, c_roi, bin_c),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let d = dims_out.get_mut(user_dims[roi_dim])?;
         d.offset = min;
         d.size = size;
         d.binning = bin;
+        d.reverse = config.dims[roi_dim].reverse;
     }
-    dims_out[info.x_dim].reverse = config.dims[0].reverse;
-    dims_out[info.y_dim].reverse = config.dims[1].reverse;
-    dims_out[info.color_dim].reverse = config.dims[2].reverse;
 
     let mut arr = convert_roi(src, &dims_out, config)?;
 
@@ -422,10 +424,20 @@ impl ROIProcessor {
 
 impl NDPluginProcess for ROIProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        // Report input array dimensions as MaxSize params
+        // C `NDPluginROI.cpp:105-131`: DimNMaxSize is the size of the axis ROI
+        // dim N *controls*, i.e. `pArray->dims[userDims[N]].size` with
+        // `userDims = {xDim, yDim, colorDim}` (`:80-82`) — the same logical
+        // mapping the ROI geometry itself uses. It is 0 for a dim beyond
+        // `pArray->ndims` (`:105-107` zero all three first, `:108/:117/:126`
+        // only override within ndims).
+        let user_dims = array.info().user_dims();
         let mut updates = Vec::new();
         for (i, dim_params) in self.params.dims.iter().enumerate() {
-            let dim_size = array.dims.get(i).map(|d| d.size as i32).unwrap_or(0);
+            let dim_size = if i < array.dims.len() {
+                array.dims[user_dims[i]].size as i32
+            } else {
+                0
+            };
             updates.push(ParamUpdate::int32(dim_params.max_size, dim_size));
         }
 
@@ -972,6 +984,100 @@ mod tests {
         assert_eq!(result.output_arrays.len(), 1);
         assert_eq!(result.output_arrays[0].dims[0].size, 2);
         assert_eq!(result.output_arrays[0].dims[1].size, 2);
+    }
+
+    #[test]
+    fn test_r9_67_max_size_uses_the_user_dims_mapping() {
+        // R9-67. C reports DimNMaxSize as `pArray->dims[userDims[N]].size` with
+        // `userDims = {xDim, yDim, colorDim}` (NDPluginROI.cpp:80-82, :111/:120/:129),
+        // i.e. the LOGICAL axis ROI dim N controls. The port indexed the physical
+        // dims slot N, so on an RGB1 array (`[color, x, y]`) Dim0MaxSize reported
+        // the colour axis (3) instead of the image width, and every DimNMaxSize
+        // was rotated one slot — the operator's ROI limits described the wrong axes.
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        // RGB1: dims = [color=3, x=8, y=5]; xDim=1, yDim=2, colorDim=0.
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(8),
+                NDDimension::new(5),
+            ],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+
+        let mut proc = ROIProcessor::new(ROIConfig::default());
+        let mut base = PortDriverBase::new("R9_67", 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+        let reasons = [
+            proc.params().dims[0].max_size,
+            proc.params().dims[1].max_size,
+            proc.params().dims[2].max_size,
+        ];
+
+        let pool = NDArrayPool::new(1_000_000);
+        let result = proc.process_array(&arr, &pool);
+        let max_size = |reason: usize| {
+            result
+                .param_updates
+                .iter()
+                .find_map(|u| match u {
+                    ParamUpdate::Int32 {
+                        reason: r, value, ..
+                    } if *r == reason => Some(*value),
+                    _ => None,
+                })
+                .expect("MaxSize update")
+        };
+
+        assert_eq!(
+            max_size(reasons[0]),
+            8,
+            "Dim0MaxSize is the X axis (dims[1])"
+        );
+        assert_eq!(
+            max_size(reasons[1]),
+            5,
+            "Dim1MaxSize is the Y axis (dims[2])"
+        );
+        assert_eq!(
+            max_size(reasons[2]),
+            3,
+            "Dim2MaxSize is the colour axis (dims[0])"
+        );
+
+        // Control: on a mono 2-D array userDims = {0, 1, 0} and the logical and
+        // physical indices coincide, so the readback is unchanged — and Dim2, past
+        // ndims, stays 0 (C zeroes all three at :105-107 and only overrides within
+        // ndims).
+        let arr2d = NDArray::new(
+            vec![NDDimension::new(6), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        let result = proc.process_array(&arr2d, &pool);
+        let max_size = |reason: usize| {
+            result
+                .param_updates
+                .iter()
+                .find_map(|u| match u {
+                    ParamUpdate::Int32 {
+                        reason: r, value, ..
+                    } if *r == reason => Some(*value),
+                    _ => None,
+                })
+                .expect("MaxSize update")
+        };
+        assert_eq!(max_size(reasons[0]), 6);
+        assert_eq!(max_size(reasons[1]), 4);
+        assert_eq!(max_size(reasons[2]), 0);
     }
 
     // --- Auto-size / dim-disable / autocenter tests ---

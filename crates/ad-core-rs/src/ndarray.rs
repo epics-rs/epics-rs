@@ -304,6 +304,22 @@ pub struct NDArrayInfo {
     pub color_mode: crate::color::NDColorMode,
 }
 
+impl NDArrayInfo {
+    /// C++ `userDims = {xDim, yDim, colorDim}` (`NDPluginROI.cpp:80-82`,
+    /// `NDPluginTransform.cpp:492-494`): the map from a *logical* image axis
+    /// (`0` = X, `1` = Y, `2` = color) to the *physical* [`NDArray::dims`] slot
+    /// that carries it.
+    ///
+    /// Any plugin whose user-facing Dim0/Dim1/Dim2 mean X/Y/color must reach
+    /// `dims` through this map and never with the logical index itself: the two
+    /// only coincide for Mono/Bayer/YUV and RGB3 layouts. For RGB1 the array is
+    /// `[color, x, y]`, so the X axis lives in `dims[1]` — indexing `dims[0]`
+    /// for "Dim0" hands back the color axis.
+    pub fn user_dims(&self) -> [usize; 3] {
+        [self.x_dim, self.y_dim, self.color_dim]
+    }
+}
+
 /// N-dimensional array with typed data buffer.
 #[derive(Debug, Clone)]
 pub struct NDArray {

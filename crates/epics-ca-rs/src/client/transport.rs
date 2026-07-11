@@ -1225,8 +1225,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     last_rx_at: super::types::ServerLastRxAt,
     unresponsive: std::sync::Arc<UnresponsiveGate>,
 ) {
-    // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used
-    // both on idle expiry and on the first leg of an echo timeout.
+    // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used on idle
+    // expiry, and again on echo timeout (C `unresponsiveCircuitNotify`
+    // re-arms `echoRequestPending`, `tcpiiu.cpp:908`).
     fn send_echo(
         write_tx: &mpsc::UnboundedSender<Vec<u8>>,
         server_minor_version: u16,
@@ -1268,13 +1269,16 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // healthy-beacon watchdog refreshes so the deadline expires on
     // its own schedule. Cleared on any data arrival from the server.
     let mut beacon_anomaly = false;
-    // Escalation counter for the echo probe: `false` on the first echo
-    // timeout (mark unresponsive + send a second probe), `true` on the
-    // second (declare the circuit dead). Distinct from the shared
-    // `unresponsive` flag, which is the circuit-level state — also set by
-    // the send watchdog in `write_loop` — and guards the one-shot
-    // `CircuitUnresponsive`/`CircuitResponsive` events.
-    let mut probe_escalated = false;
+    // C `tcpRecvWatchdog`'s timer armed/cancelled state. `expire` returns
+    // `noRestart` once the echo probe times out (`tcpRecvWatchdog.cpp:81`)
+    // and `unresponsiveCircuitNotify` cancels the timer outright
+    // (`tcpiiu.cpp:915-921`), so the watchdog stops firing on an
+    // already-unresponsive circuit; the socket stays open and any byte from
+    // the server re-arms it. Distinct from the shared `unresponsive` flag,
+    // which is the circuit-level state — also set by the send watchdog in
+    // `write_loop` — and guards the one-shot `CircuitUnresponsive` /
+    // `CircuitResponsive` events.
+    let mut watchdog_armed = true;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
     // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
@@ -1379,8 +1383,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 }
                 continue;
             }
-            // Watchdog deadline expired.
-            _ = &mut sleep => {
+            // Watchdog deadline expired. Disabled while the watchdog is
+            // cancelled (C: unresponsive circuit, timer not restarted).
+            _ = &mut sleep, if watchdog_armed => {
                 // libca Issue #190: detect suspend wake. If wall-clock
                 // skipped far more than expected for this sleep, the
                 // tokio reactor was paused (laptop suspend / VM stop).
@@ -1392,30 +1397,33 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     .unwrap_or(Duration::ZERO);
                 let suspend_wake = wall_skip >= suspend_threshold;
                 if echo_pending {
-                    if !probe_escalated {
-                        // First echo timeout: perform the one-shot
-                        // unresponsive transition (shared with the send
-                        // watchdog via the gate — emit only on the winning
-                        // transition), then send a second probe before
-                        // declaring death.
-                        unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
-                        probe_escalated = true;
-                        if send_echo(&write_tx, server_minor_version).is_err() {
-                            let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
-                            return;
-                        }
-                        let probe = if suspend_wake {
-                            SUSPEND_PROBE_TIMEOUT
-                        } else {
-                            echo_timeout
-                        };
-                        deadline = tokio::time::Instant::now() + probe;
-                        sleep.as_mut().reset(deadline);
-                        continue;
+                    // Echo timeout. C `tcpRecvWatchdog::expire` with
+                    // `probeResponsePending` set calls `receiveTimeoutNotify`
+                    // and returns `noRestart` (`tcpRecvWatchdog.cpp:54-81`).
+                    // That routes to `tcpiiu::unresponsiveCircuitNotify`
+                    // (`tcpiiu.cpp:890-941`), which marks the circuit
+                    // unresponsive, re-arms `echoRequestPending` so one more
+                    // probe departs on the send thread, cancels BOTH
+                    // watchdogs, raises `ECA_UNRESPTMO` — and KEEPS the
+                    // socket. The circuit is torn down only on a genuine
+                    // socket error (`tcpiiu.cpp:586-601`), i.e. the
+                    // `Ok(0) | Err(_)` read arm below.
+                    //
+                    // So: perform the one-shot unresponsive transition
+                    // (shared with the send watchdog via the gate — only the
+                    // winning transition emits), emit the trailing probe, and
+                    // DISARM the watchdog. The data-arrival path below is the
+                    // recovery: it re-arms the deadline and emits the sole
+                    // `CircuitResponsive`. A server that goes quiet for
+                    // minutes and comes back keeps its circuit, its channels
+                    // and its subscriptions, with no re-search.
+                    unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
+                    if send_echo(&write_tx, server_minor_version).is_err() {
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
+                        return;
                     }
-                    // Second echo timeout — truly dead.
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
-                    return;
+                    watchdog_armed = false;
+                    continue;
                 }
                 // Idle expired — send echo heartbeat. The deadline
                 // path itself doesn't read `beacon_anomaly`; the
@@ -1466,8 +1474,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // watchdog rather than marking this live circuit unresponsive.
         unresponsive.set_recv_busy(true);
         echo_pending = false;
-        probe_escalated = false;
         beacon_anomaly = false;
+        // Re-arm the watchdog (C `messageArrivalNotify` restarts the timer;
+        // an unresponsive circuit's cancelled timer comes back here).
+        watchdog_armed = true;
         deadline = tokio::time::Instant::now() + idle_timeout;
         sleep.as_mut().reset(deadline);
         // Phase D: bump the per-server "last RX" stamp before any
@@ -2503,6 +2513,161 @@ mod malformed_header_close_tests {
 
         // Clean EOF resolves the loop.
         drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod recv_watchdog_tests {
+    //! R6-16: an echo-probe timeout on the receive watchdog must mark the
+    //! circuit unresponsive and KEEP the socket. C `tcpRecvWatchdog::expire`
+    //! returns `noRestart` after `receiveTimeoutNotify`
+    //! (`tcpRecvWatchdog.cpp:54-81`); `tcpiiu::unresponsiveCircuitNotify`
+    //! (`tcpiiu.cpp:899-941`) cancels both watchdogs, re-arms one more echo,
+    //! raises `ECA_UNRESPTMO`, and never touches the socket. Only a genuine
+    //! socket error tears the circuit down (`tcpiiu.cpp:586-601`).
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Idle expiry → echo probe → echo timeout must emit exactly one
+    /// `CircuitUnresponsive`, a second echo, and NO `TcpClosed` — not even
+    /// after many further echo-timeout windows elapse. Pre-fix the loop
+    /// closed on the second echo timeout.
+    #[tokio::test(start_paused = true)]
+    async fn r6_16_echo_timeout_marks_unresponsive_and_keeps_socket() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let unresponsive = Arc::new(UnresponsiveGate::new());
+        // A silent-but-open peer: the duplex never yields a byte, and we hold
+        // `client_io` so the read never hits EOF.
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            super::super::types::InFlightOps::new(),
+            last_rx_at,
+            Arc::clone(&unresponsive),
+        ));
+
+        let idle = Duration::from_secs(echo_idle_secs());
+        let echo = Duration::from_secs(ECHO_TIMEOUT_SECS);
+
+        // Idle expiry: first echo probe departs, circuit still responsive.
+        tokio::time::sleep(idle + Duration::from_millis(100)).await;
+        let first = write_rx.try_recv().expect("idle expiry must send an echo");
+        assert_eq!(
+            CaHeader::from_bytes(&first).unwrap().cmmd,
+            CA_PROTO_READ_SYNC,
+            "idle expiry must emit the liveness probe (no VERSION frame was fed \
+             in, so `server_minor_version` is 0 and `send_echo` picks the \
+             pre-v4.3 CA_PROTO_READ_SYNC form)"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no event before the echo actually times out"
+        );
+
+        // Echo timeout: unresponsive + one trailing probe (C re-arms
+        // `echoRequestPending` inside `unresponsiveCircuitNotify`).
+        tokio::time::sleep(echo + Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(TransportEvent::CircuitUnresponsive { .. })
+            ),
+            "echo timeout must emit CircuitUnresponsive"
+        );
+        assert!(
+            write_rx.try_recv().is_ok(),
+            "unresponsiveCircuitNotify must re-arm one more echo request"
+        );
+
+        // The watchdog is now cancelled. Let ten more echo windows elapse:
+        // no further probes, no further events, and above all no TcpClosed.
+        tokio::time::sleep(echo * 10).await;
+        assert!(
+            write_rx.try_recv().is_err(),
+            "a cancelled watchdog must not keep probing"
+        );
+        match event_rx.try_recv() {
+            Err(_) => {}
+            Ok(_) => panic!("unresponsive circuit must be kept, not torn down"),
+        }
+        assert!(
+            !loop_handle.is_finished(),
+            "read_loop must stay alive on an unresponsive circuit"
+        );
+
+        // Recovery: a byte from the server re-arms the watchdog and emits the
+        // sole CircuitResponsive.
+        let mut client = client_io;
+        client
+            .write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .await
+            .expect("write echo reply");
+        client.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(TransportEvent::CircuitResponsive { .. })
+            ),
+            "a byte from the server must recover the circuit"
+        );
+
+        // Re-armed: the next idle window probes again.
+        tokio::time::sleep(idle + Duration::from_millis(100)).await;
+        assert!(
+            write_rx.try_recv().is_ok(),
+            "the watchdog must be re-armed after recovery"
+        );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+
+    /// A genuine socket error (peer closes → EOF) is still the one thing that
+    /// tears the circuit down (C `tcpiiu.cpp:586-601`).
+    #[tokio::test(start_paused = true)]
+    async fn r6_16_socket_eof_still_closes() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            super::super::types::InFlightOps::new(),
+            last_rx_at,
+            Arc::new(UnresponsiveGate::new()),
+        ));
+
+        drop(client_io);
+        let closed = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("EOF must close promptly");
+        assert!(
+            matches!(closed, Some(TransportEvent::TcpClosed { .. })),
+            "a real socket error must still emit TcpClosed"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 }

@@ -2463,13 +2463,19 @@ impl RecordInstance {
                         Some(prev) => prev != &val,
                         None => true,
                     };
-                    if value_masked.contains(&field.as_str()) {
+                    if let Some(gate) = crate::server::record::value_gate(value_masked, field) {
                         // C posts this secondary value field with VAL's own
-                        // monitor_mask, nested in `if (monitor_mask)` (ai
-                        // RVAL, aiRecord.c:460-465): only when VAL is posted
-                        // this cycle (deadband_mask non-empty) and the field
-                        // changed — never a forced DBE_VALUE|DBE_LOG.
-                        if changed && !deadband_mask.is_empty() {
+                        // monitor_mask, from inside the guard around the VAL
+                        // post — gated per `ValuePostGate` (ai RVAL re-tests
+                        // its own value, aiRecord.c:462; timestamp RVAL does
+                        // not, timestampRecord.c:160).
+                        let post = match gate {
+                            crate::server::record::ValuePostGate::OnChange => {
+                                changed && !deadband_mask.is_empty()
+                            }
+                            crate::server::record::ValuePostGate::WithValue => include_val,
+                        };
+                        if post {
                             sub_updates.push((field.clone(), val, deadband_mask));
                         }
                     } else if changed {

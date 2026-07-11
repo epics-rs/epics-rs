@@ -50,7 +50,12 @@ impl AttrChannel {
         }
         match self.name.as_str() {
             "NDArrayUniqueId" => Some(array.unique_id as f64),
-            "NDArrayTimeStamp" => Some(array.timestamp.as_f64()),
+            // C `attrValue = pArray->timeStamp` (NDPluginAttribute.cpp:63) — the
+            // standalone `double timeStamp`, NOT a value derived from `epicsTS`.
+            // A driver with a hardware clock sets the two independently, and C
+            // exposes each through its own channel name: `NDArrayTimeStamp` is
+            // the double, `NDArrayEpicsTS*` are the epicsTS fields (`:64-67`).
+            "NDArrayTimeStamp" => Some(array.time_stamp),
             "NDArrayEpicsTSSec" => Some(array.timestamp.sec as f64),
             "NDArrayEpicsTSnSec" => Some(array.timestamp.nsec as f64),
             _ => array
@@ -334,17 +339,53 @@ mod tests {
 
     #[test]
     fn test_special_attr_timestamp() {
+        // C `NDPluginAttribute.cpp:63`: the NDArrayTimeStamp channel reads
+        // `pArray->timeStamp`. A driver that derives it from epicsTS (the
+        // `updateTimeStamps` path) sees the two agree.
         let mut proc = AttributeProcessor::new("NDArrayTimeStamp", 8);
         let pool = NDArrayPool::new(1_000_000);
 
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.update_time_stamps(ad_core_rs::timestamp::EpicsTimestamp {
+            sec: 100,
+            nsec: 500_000_000,
+        });
+
+        proc.process_array(&arr, &pool);
+        assert!((proc.value() - 100.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_special_attr_timestamp_is_the_standalone_double() {
+        // R8-66: `timeStamp` is an independent double, not a view of epicsTS —
+        // a driver with a hardware clock sets it on its own (the AD norm). The
+        // NDArrayTimeStamp channel must read THAT value (C
+        // NDPluginAttribute.cpp:63), while the NDArrayEpicsTS* channels keep
+        // reading epicsTS (`:64-67`). The port read epicsTS for all three.
+        let pool = NDArrayPool::new(1_000_000);
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
             sec: 100,
             nsec: 500_000_000,
         };
+        // Hardware time base, deliberately unrelated to epicsTS.
+        arr.time_stamp = 7.25;
 
-        proc.process_array(&arr, &pool);
-        assert!((proc.value() - 100.5).abs() < 1e-9);
+        let mut ts = AttributeProcessor::new("NDArrayTimeStamp", 8);
+        ts.process_array(&arr, &pool);
+        assert!(
+            (ts.value() - 7.25).abs() < 1e-9,
+            "NDArrayTimeStamp reads pArray->timeStamp, got {}",
+            ts.value()
+        );
+
+        let mut sec = AttributeProcessor::new("NDArrayEpicsTSSec", 8);
+        sec.process_array(&arr, &pool);
+        assert!((sec.value() - 100.0).abs() < 1e-9);
+
+        let mut nsec = AttributeProcessor::new("NDArrayEpicsTSnSec", 8);
+        nsec.process_array(&arr, &pool);
+        assert!((nsec.value() - 500_000_000.0).abs() < 1e-9);
     }
 
     #[test]

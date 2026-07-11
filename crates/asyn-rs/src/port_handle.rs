@@ -122,6 +122,18 @@ impl PortHandle {
         &self.port_name
     }
 
+    /// Whether the port actor is gone — its receiver has been dropped, so no
+    /// further request can ever complete.
+    ///
+    /// A driver's background task (a periodic poller) uses this as its
+    /// shutdown signal: the C analogue is the `modbusExiting_` /
+    /// `pasynManager->shutdown` flag a driver thread tests to leave its loop
+    /// (`drvModbusAsyn.cpp:1637`). It is the *only* condition that ends such a
+    /// loop — a failing request is a device error, not a shutdown.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Access the interrupt manager for subscribing to interrupt callbacks.
     pub fn interrupts(&self) -> &Arc<InterruptManager> {
         &self.interrupts

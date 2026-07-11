@@ -31,7 +31,9 @@ pub mod ioc;
 pub mod protocol;
 
 pub use datatype::ModbusDataType;
-pub use driver::{IoStatistics, ModbusConfig, ModbusEngine, ModbusFunctionCode, OctetTransport};
+pub use driver::{
+    IoStatistics, ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
+};
 pub use error::{ExceptionCode, ModbusError, ModbusResult};
 pub use interpose::{LinkType, ModbusFramer, UnwrappedResponse};
 pub use protocol::{FunctionCode, MbapHeader, RequestPdu, ResponsePdu};

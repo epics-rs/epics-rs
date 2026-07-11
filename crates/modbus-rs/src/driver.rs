@@ -266,6 +266,33 @@ impl IoStatistics {
     }
 }
 
+/// What one successful `doModbusIO` cycle delivered.
+///
+/// C `doModbusIO` writes the response words straight into the caller's `data`
+/// buffer and reports only a status, so "success" and "the buffer now holds new
+/// words" are separate facts: exception 05 (Acknowledge — *the command was
+/// accepted and will take a long time*) is mapped to `asynSuccess` and
+/// `goto done` **past** the data copy (drvModbusAsyn.cpp:2231-2237), leaving the
+/// buffer exactly as it was. Returning a `Vec` collapses the two, and an empty
+/// `Vec` then means both "a write function returns no data" and "the read
+/// succeeded but delivered nothing" — which is what let an Acknowledge reach
+/// `copy_from_slice` with a length of 0 and panic the port.
+///
+/// This type keeps them apart: a caller must decide what to do with
+/// [`Acknowledged`](Self::Acknowledged) before it can touch any words, and the
+/// only correct answer — C's — is to leave its buffer alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModbusIoResponse {
+    /// The slave answered normally. For a read function the vector holds exactly
+    /// the requested word count (every [`ModbusEngine::parse_response`] read arm
+    /// enforces it); for a write function it is empty.
+    Data(Vec<u16>),
+    /// The slave answered with exception 05 (Acknowledge). C counts this as
+    /// success and copies nothing, so the caller's data buffer keeps its
+    /// previous contents and its records keep their previous values.
+    Acknowledged,
+}
+
 /// A byte-stream transport — the underlying `asyn-rs` octet port the framed
 /// Modbus messages travel over. One `write_frame` is followed by one or more
 /// `read_frame` calls per request.
@@ -488,8 +515,9 @@ impl ModbusEngine {
     /// Run one full Modbus write/read cycle: build the request, frame it,
     /// transmit, receive, unwrap, and parse. Updates I/O statistics.
     ///
-    /// Returns the words read (empty for write functions). Port of
-    /// `doModbusIO`.
+    /// Returns what the slave delivered — the words read (empty for a write
+    /// function), or [`ModbusIoResponse::Acknowledged`] when it answered
+    /// exception 05, which is a *success with no data*. Port of `doModbusIO`.
     pub fn do_modbus_io(
         &mut self,
         transport: &mut dyn OctetTransport,
@@ -497,7 +525,7 @@ impl ModbusEngine {
         start: u16,
         data: &[u16],
         len: usize,
-    ) -> ModbusResult<Vec<u16>> {
+    ) -> ModbusResult<ModbusIoResponse> {
         let pdu = self.build_request(function, start, data, len)?;
         let framed = self.framer.frame_request(pdu.as_bytes())?;
         let expected_txid = self.framer.last_transaction_id();
@@ -531,11 +559,13 @@ impl ModbusEngine {
         // is not a transport error: C `goto done` past the OK switch without
         // touching readOK_/writeOK_/IOErrors_ (drvModbusAsyn.cpp:2229-2246).
         // Exception 5 ("Acknowledge" — the command will take a long time)
-        // returns asynSuccess with no data; any other exception returns
-        // asynError. Either way no counter moves.
+        // returns asynSuccess *with the data buffer untouched*; any other
+        // exception returns asynError. Either way no counter moves.
         let resp = match ResponsePdu::parse(&response_pdu) {
             Ok(resp) => resp,
-            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => return Ok(Vec::new()),
+            Err(ModbusError::Exception(ExceptionCode::Acknowledge)) => {
+                return Ok(ModbusIoResponse::Acknowledged);
+            }
             Err(e) => return Err(e),
         };
 
@@ -553,6 +583,7 @@ impl ModbusEngine {
             self.stats.write_ok += 1;
         }
         self.parse_response(function, len, &resp)
+            .map(ModbusIoResponse::Data)
     }
 
     /// Transmit `framed` and receive the matching response PDU. For TCP the
@@ -651,8 +682,18 @@ impl ModbusEngine {
         }
         let start = self.config.start_address.max(0) as u16;
         let len = self.config.length;
-        let words = self.do_modbus_io(transport, self.config.function, start, &[], len)?;
-        self.data.copy_from_slice(&words);
+        // `len == self.data.len()` (both are `config.length`, which
+        // `ModbusConfig::validate` requires to be non-zero) and every read arm of
+        // `parse_response` returns exactly `len` words, so the copy cannot
+        // mismatch. An Acknowledge (exception 05) delivers no words at all: C
+        // skips the copy and leaves the buffer holding the previous poll's data
+        // (drvModbusAsyn.cpp:2231-2237), so the callbacks fan the previous values
+        // out unchanged — `changed` then falls out as false on its own.
+        if let ModbusIoResponse::Data(words) =
+            self.do_modbus_io(transport, self.config.function, start, &[], len)?
+        {
+            self.data.copy_from_slice(&words);
+        }
         let changed = self.data != self.prev_data;
         self.prev_data.copy_from_slice(&self.data);
         Ok(changed)
@@ -675,6 +716,13 @@ impl ModbusEngine {
     /// write port's `readOnceFunction`. `count` is the per-record length,
     /// clamped to `config.length` so it can never exceed the scratch buffer
     /// or the protocol read limit established by [`ModbusConfig::validate`].
+    ///
+    /// The words land in the engine's [`data`](Self::data) buffer before they are
+    /// returned, because that is C's receive buffer here too (`doModbusIO(...,
+    /// offset, data_, len)` followed by a decode of `data_[0]`). It is what makes
+    /// exception 05 behave as C does: the copy is skipped, so the record is
+    /// served the buffer's previous contents with a success status rather than an
+    /// empty read.
     pub fn read_absolute(
         &mut self,
         transport: &mut dyn OctetTransport,
@@ -686,8 +734,15 @@ impl ModbusEngine {
             return Err(ModbusError::InvalidFunction(0));
         }
         self.check_offset(addr)?;
+        // `config.length >= 1` (validate), so `len <= data.len()` and both slices
+        // below are in range.
         let len = count.min(self.config.length).max(1);
-        self.do_modbus_io(transport, function, addr as u16, &[], len)
+        if let ModbusIoResponse::Data(words) =
+            self.do_modbus_io(transport, function, addr as u16, &[], len)?
+        {
+            self.data[..len].copy_from_slice(&words);
+        }
+        Ok(self.data[..len].to_vec())
     }
 
     /// Issue one individual Modbus write of `data` at the absolute wire
@@ -718,6 +773,17 @@ impl ModbusEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unwrap the data words of an I/O the test expects to be a normal
+    /// response. An `Acknowledged` here would be a silent behaviour change, so
+    /// it panics rather than degrading to an empty slice — the collapse this
+    /// type exists to prevent.
+    fn words_of(response: ModbusIoResponse) -> Vec<u16> {
+        match response {
+            ModbusIoResponse::Data(words) => words,
+            ModbusIoResponse::Acknowledged => panic!("expected data, got exception-05 Acknowledge"),
+        }
+    }
 
     /// A mock transport: records initial writes and retransmits separately,
     /// and replays a queue of canned responses.
@@ -996,15 +1062,17 @@ mod tests {
         let resp_pdu = [0x01u8, 0x03, 0x06, 0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
 
-        let words = engine
-            .do_modbus_io(
-                &mut transport,
-                ModbusFunctionCode::ReadHoldingRegisters,
-                0,
-                &[],
-                3,
-            )
-            .unwrap();
+        let words = words_of(
+            engine
+                .do_modbus_io(
+                    &mut transport,
+                    ModbusFunctionCode::ReadHoldingRegisters,
+                    0,
+                    &[],
+                    3,
+                )
+                .unwrap(),
+        );
         assert_eq!(words, vec![10, 20, 30]);
         assert_eq!(engine.stats.read_ok, 1);
         assert_eq!(engine.stats.io_errors, 0);
@@ -1021,9 +1089,11 @@ mod tests {
         let resp_pdu = [0x01u8, 0x01, 0x02, 0x03, 0x02];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
 
-        let bits = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReadCoils, 0, &[], 10)
-            .unwrap();
+        let bits = words_of(
+            engine
+                .do_modbus_io(&mut transport, ModbusFunctionCode::ReadCoils, 0, &[], 10)
+                .unwrap(),
+        );
         assert_eq!(bits, vec![1, 1, 0, 0, 0, 0, 0, 0, 0, 1]);
     }
 
@@ -1038,15 +1108,17 @@ mod tests {
         let resp_pdu = [0x01u8, 0x06, 0x00, 0x00, 0xAB, 0xCD];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
 
-        let words = engine
-            .do_modbus_io(
-                &mut transport,
-                ModbusFunctionCode::WriteSingleRegister,
-                0,
-                &[0xABCD],
-                1,
-            )
-            .unwrap();
+        let words = words_of(
+            engine
+                .do_modbus_io(
+                    &mut transport,
+                    ModbusFunctionCode::WriteSingleRegister,
+                    0,
+                    &[0xABCD],
+                    1,
+                )
+                .unwrap(),
+        );
         assert!(words.is_empty());
         assert_eq!(engine.stats.write_ok, 1);
     }
@@ -1065,15 +1137,17 @@ mod tests {
             Ok(tcp_response(0, &resp_pdu)),
             Ok(tcp_response(1, &resp_pdu)),
         ]);
-        let words = engine
-            .do_modbus_io(
-                &mut transport,
-                ModbusFunctionCode::ReadHoldingRegisters,
-                0,
-                &[],
-                1,
-            )
-            .unwrap();
+        let words = words_of(
+            engine
+                .do_modbus_io(
+                    &mut transport,
+                    ModbusFunctionCode::ReadHoldingRegisters,
+                    0,
+                    &[],
+                    1,
+                )
+                .unwrap(),
+        );
         assert_eq!(words, vec![0x1234]);
     }
 
@@ -1095,15 +1169,17 @@ mod tests {
             Ok(vec![0xAA, 0xBB, 0xCC]),
             Ok(tcp_response(1, &resp_pdu)),
         ]);
-        let words = engine
-            .do_modbus_io(
-                &mut transport,
-                ModbusFunctionCode::ReadHoldingRegisters,
-                0,
-                &[],
-                1,
-            )
-            .unwrap();
+        let words = words_of(
+            engine
+                .do_modbus_io(
+                    &mut transport,
+                    ModbusFunctionCode::ReadHoldingRegisters,
+                    0,
+                    &[],
+                    1,
+                )
+                .unwrap(),
+        );
         assert_eq!(words, vec![0x1234]);
     }
 
@@ -1175,7 +1251,7 @@ mod tests {
         // slave 0x01, fcode 0x86 = exception, code 0x05 (Acknowledge).
         let resp_pdu = [0x01u8, 0x86, 0x05];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
-        let words = engine
+        let response = engine
             .do_modbus_io(
                 &mut transport,
                 ModbusFunctionCode::WriteSingleRegister,
@@ -1184,12 +1260,100 @@ mod tests {
                 1,
             )
             .unwrap();
-        assert!(words.is_empty());
+        // R8-70: exception 05 is success *with no data delivered*, a distinct
+        // outcome from "a write returns no words" — the caller must leave its
+        // buffer alone rather than copy an empty slice over it.
+        assert_eq!(response, ModbusIoResponse::Acknowledged);
         // C parity (drvModbusAsyn.cpp:2231-2238/2245): exception 5 sets
         // asynSuccess and `goto done` past the writeOK_/readOK_ switch — no OK
         // counter moves, and it is not a transport error so IOErrors_ stays 0.
         assert_eq!(engine.stats.write_ok, 0);
         assert_eq!(engine.stats.io_errors, 0);
+    }
+
+    /// R8-70: a *read* poll answered with exception 05 (Acknowledge) delivered an
+    /// empty word vector into `data.copy_from_slice(&words)` — a length mismatch,
+    /// which panics and takes the port's poller thread with it. C copies nothing
+    /// and reports success (drvModbusAsyn.cpp:2231-2237), leaving the register
+    /// buffer on the previous poll's data; the next callbacks fan those same
+    /// values out.
+    #[test]
+    fn poll_acknowledge_exception_keeps_the_previous_register_block() {
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 4),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        // Poll 1: a normal 4-register response. Poll 2: exception 05.
+        let good = [
+            0x01u8, 0x03, 0x08, 0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E, 0x00, 0x28,
+        ];
+        let ack = [0x01u8, 0x83, 0x05];
+        let mut transport =
+            MockTransport::new(vec![Ok(tcp_response(1, &good)), Ok(tcp_response(2, &ack))]);
+
+        assert!(
+            engine.poll(&mut transport).unwrap(),
+            "first poll changes data"
+        );
+        assert_eq!(engine.data(), &[10, 20, 30, 40]);
+
+        // Must not panic, must not zero the buffer, and reports no change.
+        let changed = engine
+            .poll(&mut transport)
+            .expect("exception 05 is a success, not an error");
+        assert!(
+            !changed,
+            "an Acknowledge copies nothing, so nothing changed"
+        );
+        assert_eq!(
+            engine.data(),
+            &[10, 20, 30, 40],
+            "the register block keeps the previous poll's data"
+        );
+        // Not a transport error and not a completed read: no counter moves.
+        assert_eq!(engine.stats.io_errors, 0);
+        assert_eq!(engine.stats.read_ok, 1);
+    }
+
+    /// R8-70 sibling: the absolute-mode per-record read is the same
+    /// `doModbusIO`-into-a-buffer shape (C passes `data_` as the destination,
+    /// drvModbusAsyn.cpp:675, and decodes `data_[0]`). An Acknowledge leaves that
+    /// buffer alone, so the record is served the previous contents — not an empty
+    /// read that decodes to nothing.
+    #[test]
+    fn read_absolute_acknowledge_exception_serves_the_previous_buffer() {
+        let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 4);
+        cfg.start_address = -1;
+        let mut engine = ModbusEngine::new(cfg, LinkType::Tcp).unwrap();
+        let good = [0x01u8, 0x03, 0x04, 0x11, 0x11, 0x22, 0x22];
+        let ack = [0x01u8, 0x83, 0x05];
+        let mut transport =
+            MockTransport::new(vec![Ok(tcp_response(1, &good)), Ok(tcp_response(2, &ack))]);
+
+        let words = engine
+            .read_absolute(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0x4000,
+                2,
+            )
+            .expect("first absolute read");
+        assert_eq!(words, vec![0x1111, 0x2222]);
+
+        let words = engine
+            .read_absolute(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0x4000,
+                2,
+            )
+            .expect("exception 05 is a success, not an error");
+        assert_eq!(
+            words,
+            vec![0x1111, 0x2222],
+            "an Acknowledge leaves the receive buffer on the previous read's words"
+        );
     }
 
     #[test]
@@ -1266,15 +1430,17 @@ mod tests {
         // fcode 0x03, byte_count 3 (odd), three data bytes. 3/2 == 1 == len.
         let resp_pdu = [0x01u8, 0x03, 0x03, 0x12, 0x34, 0x56];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
-        let words = engine
-            .do_modbus_io(
-                &mut transport,
-                ModbusFunctionCode::ReadHoldingRegisters,
-                0,
-                &[],
-                1,
-            )
-            .unwrap();
+        let words = words_of(
+            engine
+                .do_modbus_io(
+                    &mut transport,
+                    ModbusFunctionCode::ReadHoldingRegisters,
+                    0,
+                    &[],
+                    1,
+                )
+                .unwrap(),
+        );
         // One register decoded from the first two bytes; trailing 0x56 dropped.
         assert_eq!(words, vec![0x1234]);
         assert_eq!(engine.stats.io_errors, 0);
@@ -1323,9 +1489,11 @@ mod tests {
         // slave 0x01, fcode 0x11, byte_count 5, five identification bytes.
         let resp_pdu = [0x01u8, 0x11, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
         let mut transport = MockTransport::new(vec![Ok(tcp_response(1, &resp_pdu))]);
-        let words = engine
-            .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 5)
-            .unwrap();
+        let words = words_of(
+            engine
+                .do_modbus_io(&mut transport, ModbusFunctionCode::ReportSlaveId, 0, &[], 5)
+                .unwrap(),
+        );
         assert_eq!(words, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
     }
 

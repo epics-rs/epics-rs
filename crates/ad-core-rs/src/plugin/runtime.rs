@@ -906,7 +906,11 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                 ParamSetValue::Float64 {
                     reason: self.ndarray_params.timestamp_rbv,
                     addr: 0,
-                    value: report_arr.timestamp.as_f64(),
+                    // C `setDoubleParam(NDTimeStamp, pArray->timeStamp)`
+                    // (NDPluginDriver.cpp:217) — the standalone double, which a
+                    // driver may set from its own clock; NDEpicsTSSec/nSec below
+                    // carry epicsTS (`:218-219`).
+                    value: report_arr.time_stamp,
                 },
                 ParamSetValue::Int32 {
                     reason: self.ndarray_params.epics_ts_sec,
@@ -2396,6 +2400,57 @@ mod tests {
         // Verify port name
         assert_eq!(handle.port_name(), "TYPE_TEST");
         assert_eq!(handle.port_runtime().port_name(), "TYPE_TEST");
+    }
+
+    #[test]
+    fn test_ndtimestamp_param_is_the_standalone_double() {
+        // R8-66 family: C `setDoubleParam(NDTimeStamp, pArray->timeStamp)`
+        // (NDPluginDriver.cpp:217) publishes the array's standalone double —
+        // which a driver with a hardware clock sets independently of epicsTS —
+        // while NDEpicsTSSec/nSec carry epicsTS (`:218-219`). The plugin runtime
+        // published `timestamp.as_f64()` for all three, so NDTimeStamp_RBV
+        // reported the epicsTS-derived value.
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (ds, _rx) = ndarray_channel("DS_TS", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(ds);
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            "TS_PARAM",
+            PassthroughProcessor,
+            pool,
+            10,
+            output,
+            "",
+            test_wiring(),
+        );
+        enable_callbacks(&handle);
+        let port = handle.port_runtime().port_handle().clone();
+
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.timestamp = crate::timestamp::EpicsTimestamp {
+            sec: 1234,
+            nsec: 5678,
+        };
+        arr.time_stamp = 100.5; // hardware clock, unrelated to epicsTS
+        send_array(handle.array_sender(), Arc::new(arr));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert_eq!(
+            port.read_float64_blocking(handle.ndarray_params.timestamp_rbv, 0)
+                .unwrap(),
+            100.5,
+            "NDTimeStamp publishes pArray->timeStamp"
+        );
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.epics_ts_sec, 0)
+                .unwrap(),
+            1234
+        );
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.epics_ts_nsec, 0)
+                .unwrap(),
+            5678
+        );
     }
 
     #[test]

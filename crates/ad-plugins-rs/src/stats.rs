@@ -1122,7 +1122,9 @@ impl NDPluginProcess for StatsProcessor {
                     centroid.kurtosis_y,
                     centroid.eccentricity,
                     centroid.orientation,
-                    array.timestamp.as_f64(),
+                    // C `timeSeries[TSTimestamp] = pArray->timeStamp`
+                    // (NDPluginStats.cpp:577) — the standalone double.
+                    array.time_stamp,
                 ],
             };
             let _ = sender.try_send(ts_data);
@@ -1313,6 +1315,44 @@ pub fn create_stats_runtime(
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
+
+    #[test]
+    fn test_ts_timestamp_channel_is_the_standalone_double() {
+        // R8-66 family: C `timeSeries[TSTimestamp] = pArray->timeStamp`
+        // (NDPluginStats.cpp:577) — the standalone double a driver sets from its
+        // own clock, not a value derived from epicsTS. The port sent
+        // `timestamp.as_f64()`.
+        use crate::time_series::{NUM_STATS_TS_CHANNELS, STATS_TS_CHANNEL_NAMES};
+        use ad_core_rs::ndarray::NDArray;
+        use ad_core_rs::ndarray_pool::NDArrayPool;
+        use ad_core_rs::plugin::runtime::NDPluginProcess;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut processor = StatsProcessor::new();
+        processor.set_ts_sender(tx);
+
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.data = NDDataBuffer::U8(vec![1, 2, 3, 4]);
+        arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
+            sec: 100,
+            nsec: 500_000_000,
+        };
+        arr.time_stamp = 7.25; // hardware clock, unrelated to epicsTS
+
+        processor.process_array(&arr, &NDArrayPool::new(1_000_000));
+
+        let ts = rx.try_recv().expect("stats pushes a TS sample per frame");
+        assert_eq!(ts.values.len(), NUM_STATS_TS_CHANNELS);
+        let idx = STATS_TS_CHANNEL_NAMES
+            .iter()
+            .position(|n| *n == "TSTimestamp")
+            .unwrap();
+        assert!(
+            (ts.values[idx] - 7.25).abs() < 1e-9,
+            "TSTimestamp carries pArray->timeStamp, got {}",
+            ts.values[idx]
+        );
+    }
 
     #[test]
     fn test_compute_stats_u8() {

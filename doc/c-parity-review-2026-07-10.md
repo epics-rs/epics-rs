@@ -692,6 +692,64 @@ Rust: `crates/scaler-rs/src/records/scaler.rs:709-711` — `for i in 0..MAX_SCAL
 C reference: `scalerRecord.c:413-414` — `for (i=0; i<pscal->nch; i++)`.
 Impact: inactive-channel D{n} (n ≥ nch) overwritten with G{n} on count start; cosmetic readback divergence.
 
+### Fix wave 5 (2026-07-12): all 19 R7 findings + R6-76/77 — merged into review/parity-r6, verified by main (workspace fmt/clippy -D warnings clean; nextest 7614/7614 on re-run, first run 1 compile-load flake `server_read_sync_echoes_request_header` passing in isolation; doctests clean)
+
+Category A (epics-base-rs):
+- R7-1: FIXED 771e337f — `check_put_disabled` single gate owner crossed first on the CA/dbpf route; QSRV boundary calls the same owner. Widened: PACT/LCNT/PUTF are SPC_NOMOD rejected *inside* dbPut, so DISP wins on a disabled record (S_db_putDisabled, not S_db_noMod) — matched.
+- R7-2: FIXED f9d148ad — `put_driven_process` single owner of C's `if pact { rpro } else { putf; dbProcess }`, used by the PROC intercept and the pp-field route; PUTF now raised exactly where C raises it (was set pre-write and unwound on 3 error paths).
+- R6-77: FIXED 2b982997 — `postfix::compile` takes the target engine and enforces its grammar (C postfix vs sCalcPostfix vs aCalcPostfix); string tokens in numeric CALC are CalcError::Syntax at compile; swait moved to the numeric engine (swaitRecord.c:304,409). SIGN-OFF ITEM: the split also removes `>?`, `<?`, `NRNDM`, `AA..UU` from the numeric engine — genuinely absent from postfix.c's tables, so this is the C contract, but the port evaluated them correctly (working superset removed). Nothing in the workspace used them in a numeric CALC. Veto = one-line change in `opcode_in_grammar`.
+
+Category B (epics-ca-rs / epics-tools-rs):
+- R7-16: FIXED 7fd01fc8 — `HostIdentity::{Claimed,Pinned}` makes "HOST_NAME overwrites a pinned IP" unrepresentable; one flag `as_check_client_ip` (new `asCheckClientIP [0|1]` iocsh command) drives both connection identity and HAG storage form. Deleted `expand_hag_members`, `host_resolves_to_peer`, every `EPICS_CAS_USE_HOST_NAMES` read; 7 docs corrected. Widen adjudication: ca_gateway peer-IP matching is DISTINCT (gateServer.cc:1529 uses ipAddrToDottedIP — port matches its own C).
+- R7-17: FIXED 46831a71 — `Action::evaluate` returns `Vec<Action>` mirroring C's non-else if blocks; `RestartChild` deferred (as C's restartOnce zeroes _restartTime) so the same-byte kill block cannot signal the fresh child.
+- R7-18: FIXED 72ae650c — ECA_TOLARGE + drain + keep serving; widen found the sibling ECA_DEFUNCT drain discarding the whole buffer; both route through one owner `refuse_message`, the sole writer of `recv_bytes_to_drain`.
+- R7-19: FIXED e1eda6d3 — OS-bounded connect on client transport + name-server path; name-service retries sleep EPICS_CA_CONN_TMO (30 s default), replacing a 1→30 s backoff C does not have.
+- R6-76: FIXED 21401616 — `install_signal_handlers` is the documented single owner of parent signal dispositions; SIGXFSZ ignored in daemon + foreground; child.rs documents why it must not reset it.
+
+Category C (epics-pva-rs / epics-bridge-rs):
+- R7-31: FIXED 41fd8094 — shared sink: `ChannelContext::log` (RemoteLog) + `tcp.rs::flush_remote_log` single owner, drained after every IOID-carrying ChannelSource op before its reply frame (pvxs order); group PUT warns `<field>: no putorder, ignore write`.
+- R7-32: FIXED dd845c60 — `record._options.DBE="<mask>" selects empty mask` warning before the VALUE|ALARM fallback; empty string draws nothing (pvxs `!mask.empty()` guard).
+- R7-33: FIXED 4ff2f3b0 — pvxs three-way split restored (bool → Force/Inhibit, literal "passive" silent, else warn "Ignoring unsupported …" rendered through pvxs's tree formatter, trailing newline included). Anchor sweep: `atomic`/`block` are silent in pvxs too; `queueSize` warned by the native layer already. 9 e2e tests assert the actual CMD_MESSAGE frames.
+
+Category D (asyn-rs):
+- R7-46: FIXED 67cc5b27 — the error owns the transfer: `PartialOctetRead { data, eom_reason }`; asyn_record octet arm restructured to C's shape (one unconditional NORD/EOMR/TINP/AINP|BINP tail regardless of status); adapter stores value before mapping the alarm.
+- R7-47: FIXED 8b1b09e2 — classification by `e.status()` at all four variant-matching sites (`rg -U` re-sweep caught multi-line `matches!`): ip_port timeout, interpose/echo loss-of-comm, serial_port + serial_port_win32 is_fatal_transport_error.
+- R7-48: FIXED 0f42fcde — C's cached-termios owner (`tty->termios` model: seed once, set_option mutates cache unconditionally, one push tail with rollback, connect pushes, get_option reads cache); `build_configured_termios` and the config mirror deleted; CLOCAL no longer forced at connect (C forces CREAD only).
+- R7-49: FIXED 5479c2a2 — ixon/ixoff/ixany readbacks on the same cache; C's hard-coded 'N' is vxWorks-only. Win32 option paths adjudicated DISTINCT (C-Win32 deliberately has no cache). Win32 edit compile-verified via `cargo check --target x86_64-pc-windows-gnu`.
+
+Category E (scaler-rs / ad-core-rs / ad-plugins-rs / modbus-rs / std-rs):
+- R7-61: FIXED fda2c8c8 — process() is the single owner: clears `fire_fwd_link` on entry, sets it at exactly C's recGblFwdLink line, before auto-count re-arms; OneShot control tests unchanged.
+- R7-62: FIXED 59a3f779 — new `ad_core_rs::convert` single owner of C's truncating-cast kernels; three conversion sites (ndarray_pool, color, roi) delegate; ROI expresses the EnableScale Float64 detour explicitly; a pool test that codified the clamped 255 rewritten to C's 44.
+- R7-63: FIXED bc65895b — staging moved to `flush_write_staged`, called only by the three paths C stages from (write_int32_array, write_float64_array, write_octet).
+- R7-64: FIXED 979eb642 — OUTL readback staged into an internal cell, consumed by do_pid at C's line after the MDT/UDF gates; an e2e test that asserted the defect (CONSTANT INP so C's do_pid never runs) rebuilt with a real INP.
+- R7-65/66: FIXED a844db1b / 85d5880b — one owner `copy_gates_to_directions()` bounded by clamped NCH; REQSTART routed through it, sub-ms auto-count branch calls it (tp1 >= 1ms branch never touches pdir in C, pinned by control test); `d[i]=1` on PR put and direct D put adjudicated distinct (C does the same).
+
+### New OPEN findings surfaced during fix wave 5
+
+### R7-3: `LOG2` accepted by all three calc engines; present in none of C's three element tables
+Severity: Low (REPORTED by fixer-A3 while doing R6-77)
+Rust: calc lexer/engines accept `LOG2` everywhere.
+C reference: absent from postfix.c, sCalcPostfix.c, aCalcPostfix.c tables.
+Impact: a CALC using LOG2 loads on the port, CALC_ERR_SYNTAX (CLCV) in C. Port-wide extension, not cross-engine leakage — needs a keep-or-drop decision.
+
+### R7-34: numeric-string DBE (`"5"`) parsed into a mask; pvxs's String branch does substring matching only
+Severity: Low (REPORTED by fixer-C3, outside R7-32's diagnostics scope)
+Rust: `dbe_mask_from_pv_request` parses `"5"` numerically.
+C reference: `singlesource.cpp:118-131` — Kind::String does substring scan only, so `"5"` selects an empty mask, warns, and falls back to VALUE|ALARM.
+Impact: negotiated event mask differs for numeric-string DBE options.
+
+### R7-50: Win32 serial `get_option` returns fallback values while disconnected; C-Win32 returns asynError "disconnected:"
+Severity: Low (REPORTED by fixer-D3, distinct from the R7-48 cache family)
+Rust: `serial_port_win32.rs` — ixon/ixoff/clocal/crtscts return "N"/config when the handle is closed.
+C reference: `drvAsynSerialPortWin32.c:97-101` — getOption errors "disconnected:". (`ixany => "N"` is correct and matches C.)
+Impact: option readback on a disconnected Win32 port silently reports defaults instead of erroring.
+
+### Known residuals / notes (fix wave 5)
+- QSRV MONITOR DBE warning frame lands just *after* the INIT reply (pvxs raises it inside onSubscribe, *before* its connect() INIT reply); same ioid/level/text. Closing it needs a source hook at MONITOR INIT. Documented in code (fixer-C3).
+- Rust-only IPC transport (`protocol::ProtocolError`/`ReplyPayload::Error`) flattens a PartialRead and drops the bytes on a remote-port octet timeout. No C counterpart exists for this transport; closing it needs a wire-format change to carry (data, eom) in the error payload (fixer-D3).
+- Pre-existing `--all-features` compile failure in `epics-base-rs/tests/client_server.rs` reconfirmed on the clean tree by fixer-C3 (now 3 errors: run_tcp_listener arity + WallTime vs SystemTime), behind ca-server-tls-test.
+- Compile-load flake list grows by one: `epics-ca-rs::protocol_tests server_read_sync_echoes_request_header` (failed once in main's first post-merge workspace run, passed in isolation and in the clean re-run 7614/7614). Also `epics-ca-rs::channel_filters ca_fr_8_arr_on_scalar_channel_is_noop` observed once by fixer-A3 with the same pattern.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -748,3 +806,17 @@ Impact: inactive-channel D{n} (n ≥ nch) overwritten with G{n} on count start; 
   process-exit vs in-process decision timing (R7-61/65/66). Still OPEN from R6:
   R6-76 (SIGXFSZ), R6-77 (tokenizer compile-split) + 4 deferred-by-sign-off
   carryovers. Fix wave 5 next.
+- Fix wave 5 (2026-07-12): all 19 R7 findings + R6-76/77 FIXED across 5 worktree
+  fixers (one commit per finding), merged into review/parity-r6 and verified by
+  main — workspace fmt/clippy -D warnings clean, nextest 7614/7614 (one
+  compile-load flake on first run, logged), doctests clean. Structural owners
+  landed: `check_put_disabled`, `put_driven_process`, per-dialect
+  `postfix::compile`, `HostIdentity::{Claimed,Pinned}` + `as_check_client_ip`,
+  `refuse_message`, `ChannelContext::log`/`flush_remote_log`,
+  `PartialOctetRead` error-owns-the-transfer, cached-termios owner,
+  scaler `fire_fwd_link` in-process, `ad_core_rs::convert`,
+  `copy_gates_to_directions`. 3 new LOW findings recorded OPEN (R7-3 LOG2,
+  R7-34 numeric-string DBE, R7-50 win32 get_option disconnected) + 2 notes.
+  SIGN-OFF ITEMS pending user: R6-77's numeric-engine token removals
+  (`>?`/`<?`/`NRNDM`/`AA..UU` — C contract, veto possible), R6-75 blocked-mask
+  half (carried). Next: R8 re-audit.

@@ -1185,11 +1185,13 @@ pub const FILTER_MATERIALS: &[FilterMaterial] = &[
     },
 ];
 
-/// Look up a filter material by element symbol (case-insensitive).
+/// Look up a filter material by element symbol.
+///
+/// Case-sensitive: both C lookups compare with `strcmp`
+/// (`pf4.st:627`, `filterDrive.st:275`), so `"cu"` is not `"Cu"` and takes the
+/// material-not-found path.
 pub fn find_material(name: &str) -> Option<&'static FilterMaterial> {
-    FILTER_MATERIALS
-        .iter()
-        .find(|m| m.name.eq_ignore_ascii_case(name))
+    FILTER_MATERIALS.iter().find(|m| m.name == name)
 }
 
 /// Index of the first tabulated energy strictly above `energy_kev`.
@@ -1290,11 +1292,13 @@ mod tests {
         assert!((cu.density - 8.96).abs() < 0.01);
     }
 
+    // R6-63: C matches species names with strcmp (pf4.st:627,
+    // filterDrive.st:275), so a name differing only in case is "not found".
     #[test]
-    fn test_find_case_insensitive() {
-        assert!(find_material("cu").is_some());
-        assert!(find_material("CU").is_some());
+    fn test_r6_63_find_material_is_case_sensitive() {
         assert!(find_material("Cu").is_some());
+        assert!(find_material("cu").is_none());
+        assert!(find_material("CU").is_none());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use epics_base_rs::server::database::PvDatabase;
 
-use crate::data::chantler::{find_material, transmission};
+use crate::data::chantler::{find_material, other_absorption_length_um};
 use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 /// Number of filter combinations per bank (4 bits = 16).
@@ -218,20 +218,20 @@ pub fn calc_blade_transmission(
         MAT_AL => al_absorption_length_microns(energy_kev),
         MAT_TI => ti_absorption_length_microns(energy_kev),
         MAT_GLASS => glass_absorption_length_microns(energy_kev),
-        MAT_OTHER => {
-            // "Other" stays on the Chantler table. C computes
-            // exp(-t_mm*1000/absLen_microns) with absLen = 1e4/(rho*mu); that is
-            // algebraically exp(-mu*rho*t_cm), exactly what `transmission` returns
-            // for in-range energies (t_cm = t_mm * 0.1).
-            return match find_material(other_name) {
-                Some(mat) => transmission(mat, energy_kev, thickness_mm * 0.1).unwrap_or(1.0),
-                None => 1.0,
-            };
-        }
+        // "Other" reads the Chantler table through pf4's own
+        // `OtherAbsorptionLength` (pf4.st:622-646), which returns 0. for an
+        // unknown species (`:629-631`) and for an energy at or above the last
+        // tabulated node (`:637-639`). That 0 is not a "no data" sentinel C
+        // special-cases — it flows into the same exp() below.
+        MAT_OTHER => match find_material(other_name) {
+            Some(mat) => other_absorption_length_um(mat, energy_kev),
+            None => 0.0,
+        },
         _ => return 1.0,
     };
-    // C: xmit *= exp(-thickness_mm*1000 / absLen_microns). A zero absLen
-    // (Glass < 2 keV) yields exp(-inf) = 0; an infinite absLen (Ti < 1 keV)
+    // C: xmit *= exp(-thickness_mm*1000 / absLen_microns) (pf4.st:693-699). A
+    // zero absLen (Glass < 2 keV, or an unknown/out-of-range "Other") yields
+    // exp(-inf) = 0, i.e. a fully opaque blade; an infinite absLen (Ti < 1 keV)
     // yields exp(0) = 1 — both reproduce the C floating-point result.
     (-thickness_mm * 1000.0 / abs_len_microns).exp()
 }
@@ -871,6 +871,51 @@ mod tests {
         assert!(is_legal_other("Al"));
         assert!(!is_legal_other("Unobtainium"));
         assert!(!is_legal_other(""));
+    }
+
+    // R6-63: an "Other" blade whose absorption length comes back as C's 0.
+    // (unknown species, pf4.st:629-631; energy at/above the last tabulated node,
+    // :637-639) goes through the same exp(-t*1000/absLen) as every other
+    // material, so exp(-inf) = 0 — fully opaque, not fully transparent.
+    #[test]
+    fn test_r6_63_other_unknown_material_is_opaque() {
+        assert_eq!(
+            calc_blade_transmission(10.0, 1.0, MAT_OTHER, "Unobtainium"),
+            0.0
+        );
+        // C's strcmp is case-sensitive (pf4.st:627), so "cu" is unknown too.
+        assert_eq!(calc_blade_transmission(10.0, 1.0, MAT_OTHER, "cu"), 0.0);
+        assert!(!is_legal_other("cu"));
+    }
+
+    #[test]
+    fn test_r6_63_other_energy_above_the_table_is_opaque() {
+        // Cu's table ends at 432.95 keV; at or above the last node C's scan for
+        // `keV < keV[j]` never breaks, so absLen is 0 and the blade is opaque.
+        let cu = crate::data::chantler::find_material("Cu").unwrap();
+        let last = cu.kev[cu.kev.len() - 1] as f64;
+        assert_eq!(calc_blade_transmission(500.0, 1.0, MAT_OTHER, "Cu"), 0.0);
+        assert_eq!(calc_blade_transmission(last, 1.0, MAT_OTHER, "Cu"), 0.0);
+        // Just below the last node is still inside the table (the top bin), so
+        // the blade is not opaque — the boundary is the node itself.
+        assert!(calc_blade_transmission(last - 0.001, 1.0, MAT_OTHER, "Cu") > 0.0);
+    }
+
+    #[test]
+    fn test_r6_63_other_zero_thickness_stays_transparent() {
+        // C guards the multiply with `if (xOther1 > 0)` (pf4.st:696), so a blade
+        // of zero thickness contributes 1.0 even with a bad material name.
+        assert_eq!(
+            calc_blade_transmission(10.0, 0.0, MAT_OTHER, "Unobtainium"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_r6_63_other_in_range_matches_c_xmit() {
+        // C: absLen(Cu, 10 keV) = 5.28411457133 um -> exp(-1/5.28411457133).
+        let t = calc_blade_transmission(10.0, 0.001, MAT_OTHER, "Cu");
+        assert!((t - 0.827582511947).abs() < 1e-9, "Cu 1um at 10 keV: t={t}");
     }
 
     #[test]

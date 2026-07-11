@@ -502,9 +502,6 @@ enum CoordRequest {
     Unsubscribe {
         subid: u32,
     },
-    MonitorConsumed {
-        subid: u32,
-    },
     DropChannel {
         cid: u32,
     },
@@ -3005,12 +3002,7 @@ impl MonitorHandle {
             //    pre-pause backlog (3a) and pause-bypassing errors, so
             //    it is always readable regardless of pause state.
             match self.callback_rx.try_recv() {
-                Ok(msg) => {
-                    let _ = self
-                        .coord_tx
-                        .send(CoordRequest::MonitorConsumed { subid: self.subid });
-                    return Some(msg);
-                }
+                Ok(msg) => return Some(msg),
                 Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => {}
             }
@@ -3020,9 +3012,6 @@ impl MonitorHandle {
             //    not paused or buffered before the pause, and `None`
             //    for a value held during pause. Atomic against `resume`.
             //
-            //    No `MonitorConsumed` ack here: the slot is out of flow
-            //    control (invariant I1), so draining it must not
-            //    decrement the per-circuit outstanding count.
             if let Some(msg) = self.coalesce_slot.take_deliverable() {
                 return Some(msg);
             }
@@ -3034,14 +3023,7 @@ impl MonitorHandle {
             let notified = self.coalesce_slot.notified();
             tokio::pin!(notified);
             tokio::select! {
-                msg = self.callback_rx.recv() => {
-                    if msg.is_some() {
-                        let _ = self
-                            .coord_tx
-                            .send(CoordRequest::MonitorConsumed { subid: self.subid });
-                    }
-                    return msg;
-                }
+                msg = self.callback_rx.recv() => return msg,
                 _ = &mut notified => {
                     // Loop and recheck — slot/channel/pause state may
                     // have changed. Each subscription owns its slot, so
@@ -3124,68 +3106,17 @@ impl Drop for EventWatcher {
 
 // --- Coordinator ---
 
-const FLOW_CONTROL_OFF_THRESHOLD: usize = 10;
+/// Floor for the per-subscription bounded monitor channel. A queue this
+/// small coalesces almost everything into the slot; keep a little headroom
+/// so short bursts arrive as discrete updates.
+const MIN_MONITOR_QUEUE_SIZE: usize = 10;
 
 /// Resolve the per-subscription bounded-queue size from the optional
-/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256 and is clamped to at
-/// least [`FLOW_CONTROL_OFF_THRESHOLD`]: slot overflow is out of
-/// flow control (I1), so a queue smaller than the threshold could fill
-/// and coalesce forever without a lone subscription ever tripping
-/// `EVENTS_OFF`.
+/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256, floored at
+/// [`MIN_MONITOR_QUEUE_SIZE`].
 fn resolve_monitor_queue_size(env: Option<usize>) -> usize {
-    env.unwrap_or(256).max(FLOW_CONTROL_OFF_THRESHOLD)
+    env.unwrap_or(256).max(MIN_MONITOR_QUEUE_SIZE)
 }
-const FLOW_CONTROL_ON_THRESHOLD: usize = 5;
-
-#[derive(Default)]
-struct FlowControlState {
-    outstanding: usize,
-    active: bool,
-}
-
-fn flow_control_note_queued(
-    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
-    circuit: types::CircuitKey,
-    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
-) {
-    let (server_addr, priority) = circuit;
-    let state = flow_control.entry(circuit).or_default();
-    state.outstanding = state.outstanding.saturating_add(1);
-    if !state.active && state.outstanding >= FLOW_CONTROL_OFF_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        });
-        state.active = true;
-    }
-}
-
-fn flow_control_note_consumed(
-    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
-    circuit: types::CircuitKey,
-    count: usize,
-    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
-) {
-    if count == 0 {
-        return;
-    }
-    let (server_addr, priority) = circuit;
-    let Some(state) = flow_control.get_mut(&circuit) else {
-        return;
-    };
-    state.outstanding = state.outstanding.saturating_sub(count);
-    if state.active && state.outstanding <= FLOW_CONTROL_ON_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOn {
-            server_addr,
-            priority,
-        });
-        state.active = false;
-    }
-    if !state.active && state.outstanding == 0 {
-        flow_control.remove(&circuit);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_coordinator(
     mut coord_rx: mpsc::UnboundedReceiver<CoordRequest>,
@@ -3215,7 +3146,6 @@ async fn run_coordinator(
     // per-circuit flow control. EVENTS_OFF/ON is a per-tcpiiu
     // CA message, so the outstanding-event count and the on/off gate
     // are tracked per `(server_addr, priority)`.
-    let mut flow_control: HashMap<types::CircuitKey, FlowControlState> = HashMap::new();
     // Per-circuit CA minor protocol version, populated from
     // CA_PROTO_VERSION on TCP handshake. Powers `host_minor_protocol`.
     let mut server_minor_version: HashMap<types::CircuitKey, u16> = HashMap::new();
@@ -3334,7 +3264,6 @@ async fn run_coordinator(
                                 coalesce_slot,
                                 needs_restore: !connected,
                                 last_value: None,
-                                pending_deliveries: 0,
                                 nreplace: 0,
                             });
 
@@ -3372,24 +3301,7 @@ async fn run_coordinator(
                                 }
                             }
                         }
-                        if let Some(rec) = subscriptions.remove(subid) {
-                            flow_control_note_consumed(
-                                &mut flow_control,
-                                (rec.server_addr, rec.priority),
-                                rec.pending_deliveries,
-                                &transport_tx,
-                            );
-                        }
-                    }
-                    CoordRequest::MonitorConsumed { subid } => {
-                        if let Some(circuit) = subscriptions.mark_consumed(subid) {
-                            flow_control_note_consumed(
-                                &mut flow_control,
-                                circuit,
-                                1,
-                                &transport_tx,
-                            );
-                        }
+                        subscriptions.remove(subid);
                     }
                     CoordRequest::DropChannel { cid } => {
                         // Cancel all subscriptions for this channel
@@ -3411,14 +3323,7 @@ async fn run_coordinator(
                                     }
                                 }
                             }
-                            if let Some(rec) = subscriptions.remove(subid) {
-                                flow_control_note_consumed(
-                                    &mut flow_control,
-                                    (rec.server_addr, rec.priority),
-                                    rec.pending_deliveries,
-                                    &transport_tx,
-                                );
-                            }
+                            subscriptions.remove(subid);
                         }
 
                         // Clear channel on server + clean reverse index
@@ -3825,28 +3730,18 @@ async fn run_coordinator(
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued(circuit) => {
-                                // Only a bounded-channel write feeds flow
-                                // control (invariant I1) — the single gate
-                                // that bumps the per-circuit outstanding
-                                // count.
-                                flow_control_note_queued(
-                                    &mut flow_control,
-                                    circuit,
-                                    &transport_tx,
-                                );
-                            }
-                            MonitorDeliveryOutcome::Slotted(_circuit) => {
+                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Slotted => {
                                 // Coalesced into the slot (overflow or
-                                // pause-held). Out of flow control (I1) so
-                                // a client-side pause can't trip EVENTS_OFF
-                                // for sibling subscriptions. Diagnostic only.
+                                // pause-held). Diagnostic only — flow
+                                // control keys on socket occupancy in
+                                // `read_loop`, never on consumer backlog.
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped(_server_addr) => {
+                            MonitorDeliveryOutcome::Dropped => {
                                 // With the coalesce slot, this is reachable
                                 // only when the consumer channel is closed —
                                 // i.e. the application dropped the
@@ -3877,23 +3772,14 @@ async fn run_coordinator(
                         // exception-callback semantics.
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_error(subid, eca_status) {
-                            // Only a bounded-channel write feeds flow
-                            // control (invariant I1). An error parked in
-                            // the (out-of-band) error slot is `Slotted`.
-                            MonitorDeliveryOutcome::Queued(circuit) => {
-                                flow_control_note_queued(
-                                    &mut flow_control,
-                                    circuit,
-                                    &transport_tx,
-                                );
-                            }
-                            MonitorDeliveryOutcome::Slotted(_) => {
+                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Slotted => {
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped(_) => {
+                            MonitorDeliveryOutcome::Dropped => {
                                 diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
                                 metrics::counter!(
                                     "ca_client_monitor_error_drops_total"
@@ -3981,7 +3867,6 @@ async fn run_coordinator(
                             .unwrap_or(0);
                         tracing::warn!(server = %server_addr, priority, channels = n_affected, "TCP circuit closed");
                         metrics::counter!("ca_client_tcp_closed_total", "server" => server_addr.to_string()).increment(1);
-                        flow_control.remove(&circuit);
                         last_rx_at.remove(&circuit);
                         server_minor_version.remove(&circuit);
                         handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
@@ -4007,15 +3892,7 @@ async fn run_coordinator(
 
                                 let pv_name = ch.pv_name.to_string();
                                 let cids = vec![cid];
-                                let cleared = subscriptions.mark_disconnected(&cids);
-                                for (circuit, count) in cleared {
-                                    flow_control_note_consumed(
-                                        &mut flow_control,
-                                        circuit,
-                                        count,
-                                        &transport_tx,
-                                    );
-                                }
+                                subscriptions.mark_disconnected(&cids);
 
                                 // Drain blocked read/write waiters for this cid.
                                 let mut affected = HashSet::with_capacity(1);
@@ -4105,15 +3982,7 @@ async fn run_coordinator(
                             // outstanding count high — EVENTS_ON could
                             // stay stuck. Every disconnect path must
                             // decrement by the cleared delta.
-                            let cleared = subscriptions.mark_disconnected(&affected_cids);
-                            for (circuit, count) in cleared {
-                                flow_control_note_consumed(
-                                    &mut flow_control,
-                                    circuit,
-                                    count,
-                                    &transport_tx,
-                                );
-                            }
+                            subscriptions.mark_disconnected(&affected_cids);
                         }
                     }
                     TransportEvent::CircuitResponsive { server_addr, priority } => {
@@ -4264,7 +4133,7 @@ fn handle_disconnect(
     // Clean up stale server_channels entries so beacon anomaly
     // lookups don't reference disconnected channels.
     server_channels.remove(&circuit);
-    let _ = subscriptions.mark_disconnected(&affected_cids);
+    subscriptions.mark_disconnected(&affected_cids);
 
     // Fail pending read/write waiters for affected channels so callers
     // don't hang forever waiting for a response that will never arrive.
@@ -5716,25 +5585,19 @@ mod monitor_pause_tests {
         assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
     }
 
-    /// a configured queue smaller than FLOW_CONTROL_OFF_THRESHOLD is
+    /// a configured queue smaller than MIN_MONITOR_QUEUE_SIZE is
     /// clamped up so a lone subscription's full channel can still reach
     /// the threshold and trip EVENTS_OFF (slot overflow is out of flow
     /// control, so an unclamped small queue would coalesce forever).
     #[test]
-    fn monitor_queue_clamped_to_flow_control_threshold() {
+    fn monitor_queue_clamped_to_min_size() {
         // Below threshold → clamped up.
-        assert_eq!(
-            resolve_monitor_queue_size(Some(5)),
-            FLOW_CONTROL_OFF_THRESHOLD
-        );
-        assert_eq!(
-            resolve_monitor_queue_size(Some(9)),
-            FLOW_CONTROL_OFF_THRESHOLD
-        );
+        assert_eq!(resolve_monitor_queue_size(Some(5)), MIN_MONITOR_QUEUE_SIZE);
+        assert_eq!(resolve_monitor_queue_size(Some(9)), MIN_MONITOR_QUEUE_SIZE);
         // At/above threshold → unchanged.
         assert_eq!(
-            resolve_monitor_queue_size(Some(FLOW_CONTROL_OFF_THRESHOLD)),
-            FLOW_CONTROL_OFF_THRESHOLD
+            resolve_monitor_queue_size(Some(MIN_MONITOR_QUEUE_SIZE)),
+            MIN_MONITOR_QUEUE_SIZE
         );
         assert_eq!(resolve_monitor_queue_size(Some(1000)), 1000);
         // Unset → default 256 (well above the threshold).

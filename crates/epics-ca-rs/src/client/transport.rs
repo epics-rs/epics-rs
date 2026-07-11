@@ -107,6 +107,46 @@ fn max_accumulated() -> usize {
         .saturating_add(64 * 1024)
 }
 
+/// C `tcpiiu::bytesArePendingInOS()` — "are there unread bytes still sitting
+/// in the OS receive buffer right now?" (`tcpiiu.cpp:544`, an `ioctl(FIONREAD)`
+/// under `osiSock`). This is the sole input to libca's flow control
+/// (`tcpiiu.cpp:548-567`): it measures the *socket*, not any consumer-side
+/// backlog, which is why libca can never latch `EVENTS_OFF` on a slow reader.
+///
+/// Boxed rather than generic so `read_loop` keeps one shape across the
+/// plaintext, TLS and duplex-mock readers, each of which needs a different
+/// occupancy source (or none, in tests).
+type OsRecvQueueProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Occupancy probe over a live socket fd. Non-blocking `FIONREAD`; a failed
+/// ioctl reports "nothing pending", which is the safe answer — it can only
+/// clear flow control early, never latch it on.
+#[cfg(unix)]
+fn fd_recv_queue_probe(fd: std::os::fd::RawFd) -> OsRecvQueueProbe {
+    std::sync::Arc::new(move || {
+        let mut pending: libc::c_int = 0;
+        // SAFETY: `fd` belongs to the reader half owned by the `read_loop`
+        // that holds this closure, so it stays open for the closure's life.
+        // FIONREAD writes a single `c_int`.
+        let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) };
+        rc == 0 && pending > 0
+    })
+}
+
+#[cfg(not(unix))]
+fn fd_recv_queue_probe(_fd: std::os::raw::c_int) -> OsRecvQueueProbe {
+    // No FIONREAD equivalent wired up here: report the socket as always
+    // drained, which disables flow control rather than latching it on.
+    std::sync::Arc::new(|| false)
+}
+
+/// Probe for tests whose subject is not flow control: the socket always reads
+/// clean, so `read_loop` never asks for `EVENTS_OFF`.
+#[cfg(test)]
+fn drained_socket_probe() -> OsRecvQueueProbe {
+    std::sync::Arc::new(|| false)
+}
+
 /// Default echo interval (matches C EPICS CA_CONN_VERIFY_PERIOD).
 /// Overridden by EPICS_CA_CONN_TMO environment variable.
 ///
@@ -441,14 +481,6 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             server_addr,
             priority,
             ..
-        }
-        | TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        }
-        | TransportCommand::EventsOn {
-            server_addr,
-            priority,
         } => Some((*server_addr, *priority)),
         TransportCommand::BeaconArrivalNotify { .. } => None,
     }
@@ -678,32 +710,6 @@ fn process_command(
                 }
             }
         }
-        TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        } => {
-            let hdr = CaHeader::new(CA_PROTO_EVENTS_OFF);
-            send_frame(
-                connections,
-                server_writers,
-                (server_addr, priority),
-                hdr.to_bytes().to_vec(),
-                event_tx,
-            );
-        }
-        TransportCommand::EventsOn {
-            server_addr,
-            priority,
-        } => {
-            let hdr = CaHeader::new(CA_PROTO_EVENTS_ON);
-            send_frame(
-                connections,
-                server_writers,
-                (server_addr, priority),
-                hdr.to_bytes().to_vec(),
-                event_tx,
-            );
-        }
     }
 }
 
@@ -846,6 +852,18 @@ async fn connect_server(
         let _ = sock.set_tcp_keepalive(&keepalive);
     }
 
+    // C `tcpiiu::bytesArePendingInOS()` is an ioctl on the circuit's socket.
+    // Capture the fd before the stream is split (or wrapped in TLS): the
+    // reader half handed to `read_loop` keeps it open for exactly as long as
+    // the probe can be called.
+    #[cfg(unix)]
+    let bytes_pending_in_os = {
+        use std::os::fd::AsRawFd;
+        fd_recv_queue_probe(stream.as_raw_fd())
+    };
+    #[cfg(not(unix))]
+    let bytes_pending_in_os = fd_recv_queue_probe(0);
+
     let (write_tx, write_rx) = mpsc::unbounded_channel();
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // C `tcpiiu::unresponsiveCircuit` (`tcpiiu.cpp:899-940`): a single
@@ -938,6 +956,7 @@ async fn connect_server(
             in_flight.clone(),
             last_rx_at.clone(),
             unresponsive.clone(),
+            bytes_pending_in_os.clone(),
         ));
         (read_task, write_task)
     } else {
@@ -961,6 +980,7 @@ async fn connect_server(
             in_flight.clone(),
             last_rx_at.clone(),
             unresponsive.clone(),
+            bytes_pending_in_os.clone(),
         ));
         (read_task, write_task)
     };
@@ -987,6 +1007,7 @@ async fn connect_server(
             in_flight.clone(),
             last_rx_at.clone(),
             unresponsive.clone(),
+            bytes_pending_in_os.clone(),
         ));
         (read_task, write_task)
     };
@@ -1224,6 +1245,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
     unresponsive: std::sync::Arc<UnresponsiveGate>,
+    bytes_pending_in_os: OsRecvQueueProbe,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used on idle
     // expiry, and again on echo timeout (C `unresponsiveCircuitNotify`
@@ -1279,6 +1301,23 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // `write_loop` — and guards the one-shot `CircuitUnresponsive` /
     // `CircuitResponsive` events.
     let mut watchdog_armed = true;
+    // libca flow control (C `tcpRecvThread::run`, `tcpiiu.cpp:543-572`).
+    // `contig_recv_msg_count` counts consecutive receive frames that each
+    // left bytes still unread in the OS socket buffer; once it reaches
+    // `max_contiguous_frames()` the circuit is "busy" and we ask the server
+    // to stop sending monitors. The moment the socket reads clean the count
+    // resets and, if busy, flow control lifts immediately — C's comment:
+    // "if no bytes are pending then we must immediately switch off flow
+    // control w/o waiting for more data to arrive" (`tcpiiu.cpp:559-561`).
+    //
+    // C splits this across two flags — `busyStateDetected` (recv thread) and
+    // `flowControlActive` (send thread) — only because two threads observe
+    // it. Here one loop both detects the transition and queues the frame, so
+    // one flag carries the whole state and every edge emits exactly one
+    // request.
+    let max_contig_frames = crate::protocol::max_contiguous_frames();
+    let mut contig_recv_msg_count: usize = 0;
+    let mut flow_control_active = false;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
     // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
@@ -1492,11 +1531,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // guard (`tcpiiu.cpp:867`).
         unresponsive.mark_responsive(&event_tx, server_addr, priority);
 
-        // Automatic CA flow control is intentionally disabled here. The
-        // previous implementation counted TCP reads, which can overshoot badly
-        // on fragmented links and stall remote C IOCs with EVENTS_OFF. A
-        // correct implementation must count parsed monitor messages and resume
-        // based on downstream consumption, not socket read timing.
+        // Flow control is evaluated at the BOTTOM of this iteration, after the
+        // frame's messages have been processed — that is where C samples
+        // `bytesArePendingInOS()` (`tcpiiu.cpp:543-546`).
         accumulated.extend_from_slice(&buf[..n]);
 
         // Guard against unbounded buffer growth from malformed servers.
@@ -2061,6 +2098,45 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         if offset > 0 {
             accumulated.drain(..offset);
         }
+
+        // libca flow control, once per received frame, after the frame's
+        // messages have been processed (C `tcpiiu.cpp:543-572`).
+        //
+        // Key on the OS socket buffer, never on how far behind the
+        // application is. A consumer that stops polling its `MonitorHandle`
+        // must not be able to hold `EVENTS_OFF` down for every *other*
+        // subscription on the circuit — and it cannot, because the moment
+        // this socket reads clean, flow control lifts.
+        let want_flow_control = if bytes_pending_in_os() {
+            if !flow_control_active {
+                contig_recv_msg_count = contig_recv_msg_count.saturating_add(1);
+            }
+            contig_recv_msg_count >= max_contig_frames
+        } else {
+            // "if no bytes are pending then we must immediately switch off
+            // flow control w/o waiting for more data to arrive"
+            // (`tcpiiu.cpp:559-561`).
+            contig_recv_msg_count = 0;
+            false
+        };
+        if want_flow_control != flow_control_active {
+            let cmd = if want_flow_control {
+                CA_PROTO_EVENTS_OFF
+            } else {
+                CA_PROTO_EVENTS_ON
+            };
+            if write_tx
+                .send(CaHeader::new(cmd).to_bytes().to_vec())
+                .is_err()
+            {
+                let _ = event_tx.send(TransportEvent::TcpClosed {
+                    server_addr,
+                    priority,
+                });
+                return;
+            }
+            flow_control_active = want_flow_control;
+        }
     }
 }
 
@@ -2111,6 +2187,7 @@ mod read_loop_tests {
             crate::client::types::InFlightOps::new(),
             std::sync::Arc::new(dashmap::DashMap::new()),
             std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -2435,6 +2512,7 @@ mod malformed_header_close_tests {
             in_flight,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
         ));
 
         // 24-byte extended header: postsize=0xFFFF (extended marker),
@@ -2489,6 +2567,7 @@ mod malformed_header_close_tests {
             in_flight,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -2514,6 +2593,178 @@ mod malformed_header_close_tests {
         // Clean EOF resolves the loop.
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod flow_control_tests {
+    //! R6-17: CA flow control keys on OS socket-buffer occupancy, exactly like
+    //! C `tcpRecvThread::run` (`tcpiiu.cpp:543-572`). `busyStateDetected` is
+    //! set only after `maxContiguousFrames` consecutive receive frames each
+    //! left bytes pending in the OS, and is cleared the *first* time the
+    //! socket reads clean — "w/o waiting for more data to arrive". Consumer
+    //! backlog is not an input, so a stalled reader can never latch
+    //! `EVENTS_OFF` on for the circuit's other subscriptions.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Drive `read_loop` with a scriptable occupancy probe and collect the
+    /// flow-control frames it emits.
+    struct Harness {
+        client: tokio::io::DuplexStream,
+        writes: mpsc::UnboundedReceiver<Vec<u8>>,
+        busy: Arc<AtomicBool>,
+        _events: mpsc::UnboundedReceiver<TransportEvent>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn harness() -> Harness {
+        let (event_tx, _events) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, writes) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let probe: OsRecvQueueProbe = {
+            let busy = Arc::clone(&busy);
+            Arc::new(move || busy.load(Ordering::SeqCst))
+        };
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(read_loop(
+            server_io,
+            "127.0.0.1:5064".parse().unwrap(),
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            super::super::types::InFlightOps::new(),
+            last_rx_at,
+            Arc::new(UnresponsiveGate::new()),
+            probe,
+        ));
+        Harness {
+            client,
+            writes,
+            busy,
+            _events,
+            task,
+        }
+    }
+
+    /// Push one CA_PROTO_ECHO frame — a complete, harmless message — and wait
+    /// for `read_loop` to consume it, so each call drives exactly one receive
+    /// frame. Without the pause the duplex coalesces several frames into a
+    /// single `read()`, which is one frame for contiguous-count purposes.
+    async fn one_frame(h: &mut Harness) {
+        let frame = CaHeader::new(CA_PROTO_ECHO).to_bytes().to_vec();
+        h.client.write_all(&frame).await.expect("write");
+        h.client.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    /// Drain whatever the loop queued for the wire, as command codes.
+    async fn drain(h: &mut Harness) -> Vec<u16> {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut out = Vec::new();
+        while let Ok(frame) = h.writes.try_recv() {
+            out.push(CaHeader::from_bytes(&frame).expect("header").cmmd);
+        }
+        out
+    }
+
+    /// The trigger is `max_contiguous_frames()` CONSECUTIVE busy frames —
+    /// frame N-1 must not fire, frame N must. Then the very next drained read
+    /// must lift it, with no consumer having drained anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r6_17_events_off_at_the_contiguous_frame_boundary() {
+        let trigger = crate::protocol::max_contiguous_frames();
+        let mut h = harness();
+
+        // Frames 1..trigger-1 with bytes still pending: under the bound, so no
+        // flow control yet.
+        h.busy.store(true, Ordering::SeqCst);
+        for _ in 0..trigger - 1 {
+            one_frame(&mut h).await;
+        }
+        assert_eq!(
+            drain(&mut h).await,
+            Vec::<u16>::new(),
+            "{} contiguous busy frames is one short of the bound — no EVENTS_OFF",
+            trigger - 1
+        );
+
+        // Frame `trigger`: the bound is reached.
+        one_frame(&mut h).await;
+        assert_eq!(
+            drain(&mut h).await,
+            vec![CA_PROTO_EVENTS_OFF],
+            "the {trigger}th contiguous busy frame must trip EVENTS_OFF"
+        );
+
+        // Socket drains. No consumer did anything — libca lifts flow control
+        // on the socket alone, immediately, on the very next frame.
+        h.busy.store(false, Ordering::SeqCst);
+        one_frame(&mut h).await;
+        assert_eq!(
+            drain(&mut h).await,
+            vec![CA_PROTO_EVENTS_ON],
+            "a drained socket must lift EVENTS_OFF immediately, with no \
+             consumer-side drain"
+        );
+
+        h.task.abort();
+    }
+
+    /// A busy run BROKEN by one clean read resets the contiguous count to 0
+    /// (C `contigRecvMsgCount = 0u`), so the next busy run starts over from 1
+    /// rather than resuming near the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r6_17_a_clean_read_resets_the_contiguous_count() {
+        let trigger = crate::protocol::max_contiguous_frames();
+        let mut h = harness();
+
+        h.busy.store(true, Ordering::SeqCst);
+        for _ in 0..trigger - 1 {
+            one_frame(&mut h).await;
+        }
+        // One clean read breaks the run.
+        h.busy.store(false, Ordering::SeqCst);
+        one_frame(&mut h).await;
+        assert_eq!(drain(&mut h).await, Vec::<u16>::new());
+
+        // Back to busy: a fresh run of trigger-1 must still be under the bound.
+        h.busy.store(true, Ordering::SeqCst);
+        for _ in 0..trigger - 1 {
+            one_frame(&mut h).await;
+        }
+        assert_eq!(
+            drain(&mut h).await,
+            Vec::<u16>::new(),
+            "the clean read must have reset the count — the run restarts at 1"
+        );
+
+        h.task.abort();
+    }
+
+    /// C `cac.cpp:233-237`: the trigger scales with EPICS_CA_MAX_ARRAY_BYTES,
+    /// and at the C default one max-size array is exactly one receive buffer,
+    /// so it stays at `contiguousMsgCountWhichTriggersFlowControl` = 10.
+    #[test]
+    fn r6_17_max_contiguous_frames_scales_from_max_array_bytes() {
+        use crate::protocol::{COM_BUF_SIZE, MAX_TCP, max_contiguous_frames, max_recv_bytes_tcp};
+        assert_eq!(
+            MAX_TCP / COM_BUF_SIZE,
+            1,
+            "bufsPerArray is not > 1 at the C default"
+        );
+        assert!(max_recv_bytes_tcp() >= MAX_TCP, "C rounds up to MAX_TCP");
+        assert!(
+            max_contiguous_frames() >= 10,
+            "never below C's contiguousMsgCountWhichTriggersFlowControl"
+        );
     }
 }
 
@@ -2558,6 +2809,7 @@ mod recv_watchdog_tests {
             super::super::types::InFlightOps::new(),
             last_rx_at,
             Arc::clone(&unresponsive),
+            drained_socket_probe(),
         ));
 
         let idle = Duration::from_secs(echo_idle_secs());
@@ -2658,6 +2910,7 @@ mod recv_watchdog_tests {
             super::super::types::InFlightOps::new(),
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
         ));
 
         drop(client_io);

@@ -13,7 +13,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, decode_dbr};
 
-use super::types::{CircuitKey, TransportCommand};
+use super::types::TransportCommand;
 
 /// Producer routing decision for a value snapshot, computed
 /// atomically against the pause flag (see [`CoalesceSlot::route_value`]).
@@ -45,11 +45,11 @@ pub(crate) enum ValueRoute {
 ///
 /// # Invariants (each maintained by construction)
 ///
-/// - **I1 — flow control counts the channel only.** Every cell here is
-///   out of band: writing/reading it never touches `pending_deliveries`
-///   or the per-circuit `EVENTS_OFF` accounting. A client-side pause
-///   therefore cannot trip the wire-level flow control and freeze
-///   sibling subscriptions.
+/// - **I1 — the consumer is invisible to the wire.** No cell here, and no
+///   channel depth, feeds CA flow control. `EVENTS_OFF` / `EVENTS_ON` are
+///   decided in `transport::read_loop` from OS socket-buffer occupancy
+///   alone (C `tcpiiu.cpp:548-567`), so neither a client-side pause nor a
+///   consumer that stops polling can freeze sibling subscriptions.
 /// - **I2 — error priority.** `error` is its own cell; a value can never
 ///   overwrite or hide it, and `take_deliverable` yields it first.
 /// - **I3 — pause gating is structural, not conditional.** The sole
@@ -227,24 +227,20 @@ impl CoalesceSlot {
 }
 
 /// Outcome of `on_monitor_data` — the single signal that drives the
-/// coordinator's per-circuit flow control.
+/// coordinator's delivery metrics.
 ///
-/// Only `Queued` (a bounded-channel write) feeds flow control; every
-/// slot write is `Slotted` and is invisible to it (invariant I1). This
-/// is the single gate: the coordinator bumps outstanding on `Queued`
-/// and decrements on the matching channel-drain `MonitorConsumed`.
+/// None of these feed CA flow control (invariant I1) — that is decided
+/// from socket occupancy in `transport::read_loop`, never from how far
+/// behind the application is.
 pub(crate) enum MonitorDeliveryOutcome {
-    /// Written to the bounded channel — counts toward flow control.
-    /// the [`CircuitKey`] identifies the priority circuit so
-    /// the coordinator bumps the right per-circuit outstanding count.
-    Queued(CircuitKey),
+    /// Written to the bounded channel.
+    Queued,
     /// Buffered in the coalesce slot (overflow `ready`, during-pause
-    /// `gated`, or overflow error). Out of flow control — diagnostic
-    /// only.
-    Slotted(CircuitKey),
+    /// `gated`, or overflow error). Diagnostic only.
+    Slotted,
     /// Dropped because the consumer channel is closed (the application
     /// dropped its `MonitorHandle`). The only remaining drop case.
-    Dropped(CircuitKey),
+    Dropped,
     /// Filtered by client-side deadband (no action).
     Filtered,
     /// Subscription not found.
@@ -309,12 +305,6 @@ pub(crate) struct SubscriptionRecord {
     pub deadband: f64,
     /// Last delivered scalar value (for deadband filtering).
     pub last_value: Option<f64>,
-    /// Number of monitor updates in the bounded channel awaiting
-    /// consumption. Invariant I1: this counts ONLY channel items —
-    /// coalesce-slot entries (ready/gated/error) are out of band and
-    /// never bump it, so a client-side pause can't trip the per-circuit
-    /// `EVENTS_OFF`.
-    pub pending_deliveries: usize,
     /// Diagnostic counter — number of overflow-coalesce events for
     /// this subscription. Mirrors `dbEvent.c::pevent->nreplace`.
     pub nreplace: u64,
@@ -407,12 +397,7 @@ impl SubscriptionRegistry {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
-        let circuit = (rec.server_addr, rec.priority);
-        try_deliver_err(
-            rec,
-            epics_base_rs::error::CaError::ServerError(eca_status),
-            circuit,
-        )
+        try_deliver_err(rec, epics_base_rs::error::CaError::ServerError(eca_status))
     }
 
     pub fn on_monitor_data(
@@ -425,26 +410,24 @@ impl SubscriptionRegistry {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
-        let circuit = (rec.server_addr, rec.priority);
-
         let snapshot = if data_type <= 6 {
             let dbr_type = match DbFieldType::from_u16(data_type) {
                 Ok(t) => t,
                 Err(e) => {
-                    return try_deliver_err(rec, e, circuit);
+                    return try_deliver_err(rec, e);
                 }
             };
             match EpicsValue::from_bytes_array(dbr_type, data, count as usize) {
                 Ok(value) => Snapshot::new(value, 0, 0, SystemTime::now()),
                 Err(e) => {
-                    return try_deliver_err(rec, e, circuit);
+                    return try_deliver_err(rec, e);
                 }
             }
         } else {
             match decode_dbr(data_type, data, count as usize) {
                 Ok(s) => s,
                 Err(e) => {
-                    return try_deliver_err(rec, e, circuit);
+                    return try_deliver_err(rec, e);
                 }
             }
         };
@@ -469,13 +452,10 @@ impl SubscriptionRegistry {
             // either way the value is in the slot, not the channel.
             ValueRoute::Slotted => {
                 rec.nreplace = rec.nreplace.saturating_add(1);
-                MonitorDeliveryOutcome::Slotted(circuit)
+                MonitorDeliveryOutcome::Slotted
             }
             ValueRoute::TryChannel(snapshot) => match rec.callback_tx.try_send(Ok(*snapshot)) {
-                Ok(()) => {
-                    rec.pending_deliveries += 1;
-                    MonitorDeliveryOutcome::Queued(circuit)
-                }
+                Ok(()) => MonitorDeliveryOutcome::Queued,
                 Err(TrySendError::Full(rejected)) => {
                     // Bounded channel full — coalesce into the slot
                     // instead of the pre-fix silent drop (which lost
@@ -487,9 +467,9 @@ impl SubscriptionRegistry {
                     rec.nreplace = rec.nreplace.saturating_add(1);
                     let snap = rejected.expect("route_value only boxes Ok values");
                     rec.coalesce_slot.put_value(snap);
-                    MonitorDeliveryOutcome::Slotted(circuit)
+                    MonitorDeliveryOutcome::Slotted
                 }
-                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(circuit),
+                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped,
             },
         }
     }
@@ -505,42 +485,22 @@ impl SubscriptionRegistry {
     /// Pre-fix Rust silently flipped `needs_restore = true` and waited
     /// for reconnect, so a libca-style `MonitorHandle::recv()` saw
     /// nothing when the circuit died.
-    /// Returns a structured flow-control delta: per-circuit map of how
-    /// many bounded-channel items were "forgotten" (abandoned for
-    /// flow-control purposes) so the coordinator can decrement the
-    /// circuit's outstanding count. Every disconnect path MUST apply
-    /// this delta.
-    ///
-    /// The disconnect error goes ALWAYS into the error cell (never the
-    /// bounded channel), so it never bumps `pending` — this keeps the
-    /// flow-control owner single (channel send/recv only, I1) and the
-    /// returned delta unambiguous (no "did the error land in the
-    /// channel?" case to reconcile).
-    pub fn mark_disconnected(&mut self, cids: &[u32]) -> HashMap<CircuitKey, usize> {
+    /// The disconnect error goes ALWAYS into the error cell, never the
+    /// bounded channel: it is delivered with priority and bypasses pause,
+    /// and any items already in the channel stay there for the consumer to
+    /// drain.
+    pub fn mark_disconnected(&mut self, cids: &[u32]) {
         const ECA_DISCONN: u32 = 192; // protocol::ECA_DISCONN
-        let mut cleared = HashMap::new();
         for rec in self.subscriptions.values_mut() {
             if cids.contains(&rec.cid) {
                 rec.needs_restore = true;
-                // Forget the bounded-channel items for flow control:
-                // they stay in the channel for the consumer to drain
-                //, but draining them won't re-decrement
-                // outstanding because `pending` is now 0
-                // (`mark_consumed` returns `None`).
-                let old_pending = rec.pending_deliveries;
-                rec.pending_deliveries = 0;
                 // Drop stale value cells, then park ECA_DISCONN in the
-                // error cell. It is delivered with priority and bypasses
-                // pause; being out of band it leaves `pending` at 0.
+                // error cell.
                 rec.coalesce_slot.clear();
                 rec.coalesce_slot
                     .put_error(CaError::ServerError(ECA_DISCONN));
-                if old_pending > 0 {
-                    *cleared.entry((rec.server_addr, rec.priority)).or_insert(0) += old_pending;
-                }
             }
         }
-        cleared
     }
 
     /// Generate restore commands for subscriptions tied to the given cid,
@@ -666,15 +626,6 @@ impl SubscriptionRegistry {
         self.subscriptions.get(&subid)
     }
 
-    pub fn mark_consumed(&mut self, subid: u32) -> Option<CircuitKey> {
-        let rec = self.subscriptions.get_mut(&subid)?;
-        if rec.pending_deliveries == 0 {
-            return None;
-        }
-        rec.pending_deliveries -= 1;
-        Some((rec.server_addr, rec.priority))
-    }
-
     /// Get all subscriptions for a given cid
     pub fn for_cid(&self, cid: u32) -> Vec<u32> {
         self.subscriptions
@@ -687,32 +638,23 @@ impl SubscriptionRegistry {
 
 /// Deliver an error to the consumer. Errors bypass pause and use the
 /// dedicated error slot (I2): they go to the bounded channel when there
-/// is room (counts toward flow control), otherwise the sticky error
-/// slot (out of flow control, never overwritten by a value). The error
-/// slot does not displace a pending value — both can be queued and the
-/// consumer's `take_deliverable` delivers the error first.
-fn try_deliver_err(
-    rec: &mut SubscriptionRecord,
-    err: CaError,
-    circuit: CircuitKey,
-) -> MonitorDeliveryOutcome {
+/// is room, otherwise the sticky error slot, which a value can never
+/// overwrite. The error slot does not displace a pending value — both can
+/// be queued and the consumer's `take_deliverable` delivers the error first.
+fn try_deliver_err(rec: &mut SubscriptionRecord, err: CaError) -> MonitorDeliveryOutcome {
     match rec.callback_tx.try_send(Err(err)) {
-        Ok(()) => {
-            rec.pending_deliveries += 1;
-            MonitorDeliveryOutcome::Queued(circuit)
-        }
+        Ok(()) => MonitorDeliveryOutcome::Queued,
         Err(TrySendError::Full(rejected)) => {
-            // Channel full — park the error in its own slot. Out of
-            // flow control (I1); EVENTS_OFF already fired. Recover the
+            // Channel full — park the error in its own slot. Recover the
             // rejected error rather than cloning.
             let e = match rejected {
                 Err(e) => e,
                 Ok(_) => unreachable!("we just sent an Err"),
             };
             rec.coalesce_slot.put_error(e);
-            MonitorDeliveryOutcome::Slotted(circuit)
+            MonitorDeliveryOutcome::Slotted
         }
-        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(circuit),
+        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped,
     }
 }
 
@@ -750,7 +692,6 @@ mod tests {
             needs_restore: true,
             deadband: 0.0,
             last_value: None,
-            pending_deliveries: 0,
             nreplace: 0,
         };
         (rec, rx)
@@ -961,7 +902,6 @@ mod tests {
             needs_restore: false,
             deadband: 0.0,
             last_value: None,
-            pending_deliveries: 0,
             nreplace: 0,
         }
     }
@@ -991,15 +931,13 @@ mod tests {
             let outcome = post_long(&mut reg, *v);
             match (i, &outcome) {
                 // 1, 2 fill the channel.
-                (0..=1, MonitorDeliveryOutcome::Queued(_)) => {}
+                (0..=1, MonitorDeliveryOutcome::Queued) => {}
                 // 3, 4, 0 overflow into the slot (out of flow control).
-                (2..=4, MonitorDeliveryOutcome::Slotted(_)) => {}
+                (2..=4, MonitorDeliveryOutcome::Slotted) => {}
                 _ => panic!("unexpected outcome at i={i}"),
             }
         }
 
-        // Slot is out of flow control (I1): pending counts channel only.
-        assert_eq!(reg.get(1).expect("rec").pending_deliveries, 2);
         // C `dbEvent.c::nreplace` parity — 3 overflow events.
         assert_eq!(reg.get(1).expect("rec").nreplace, 3);
 
@@ -1041,15 +979,15 @@ mod tests {
 
         assert!(matches!(
             post_long(&mut reg, 1),
-            MonitorDeliveryOutcome::Queued(_)
+            MonitorDeliveryOutcome::Queued
         ));
         assert!(matches!(
             post_long(&mut reg, 2),
-            MonitorDeliveryOutcome::Queued(_)
+            MonitorDeliveryOutcome::Queued
         ));
         assert!(matches!(
             post_long(&mut reg, 3),
-            MonitorDeliveryOutcome::Slotted(_)
+            MonitorDeliveryOutcome::Slotted
         ));
 
         // Drain ONE channel item — channel now has a free cell, but the
@@ -1062,7 +1000,7 @@ mod tests {
         // A fresh value MUST go to the slot (replace 3→4), NOT the
         // now-free channel — else the consumer reads 4 before 3.
         assert!(
-            matches!(post_long(&mut reg, 4), MonitorDeliveryOutcome::Slotted(_)),
+            matches!(post_long(&mut reg, 4), MonitorDeliveryOutcome::Slotted),
             "slot-occupied invariant violated — value leaked into channel"
         );
 
@@ -1091,21 +1029,8 @@ mod tests {
         for v in [1, 2, 3] {
             post_long(&mut reg, v);
         }
-        assert_eq!(
-            reg.get(1).expect("rec").pending_deliveries,
-            2,
-            "channel only (I1)"
-        );
 
-        let cleared = reg.mark_disconnected(&[100]);
-        // Net cleared = old channel pending (2) - new pending (0; DISCONN
-        // went to the error slot because the channel was full) = 2.
-        assert_eq!(*cleared.get(&(addr(), 0)).expect("circuit key"), 2);
-        assert_eq!(
-            reg.get(1).expect("rec").pending_deliveries,
-            0,
-            "DISCONN parked in the error slot (out of flow control)",
-        );
+        reg.mark_disconnected(&[100]);
 
         // Channel still has pre-disconnect data. Drain it.
         let _v1 = rx.try_recv().expect("v1");
@@ -1240,28 +1165,17 @@ mod tests {
         );
     }
 
-    /// Boundary: `mark_disconnected` with `old_pending == 0` (no
-    /// channel items) yields no flow-control delta and never bumps
-    /// `pending` — the DISCONN goes to the error cell only, never the
+    /// Boundary: `mark_disconnected` on an idle subscription (nothing in the
+    /// bounded channel) parks the DISCONN in the error cell, never in the
     /// channel.
     #[test]
-    fn mark_disconnected_old_pending_zero_yields_no_delta() {
+    fn mark_disconnected_on_empty_channel_parks_error_in_cell() {
         let mut reg = SubscriptionRegistry::new();
         let (callback_tx, mut rx) = mpsc::channel::<CaResult<Snapshot>>(4);
         let coalesce_slot = CoalesceSlot::new();
         reg.add(slotted_record(coalesce_slot.clone(), callback_tx));
-        assert_eq!(reg.get(1).expect("rec").pending_deliveries, 0);
 
-        let cleared = reg.mark_disconnected(&[100]);
-        assert!(
-            cleared.is_empty(),
-            "no channel items → empty flow-control delta"
-        );
-        assert_eq!(
-            reg.get(1).expect("rec").pending_deliveries,
-            0,
-            "DISCONN parks in the error cell; pending never bumped",
-        );
+        reg.mark_disconnected(&[100]);
         assert!(rx.try_recv().is_err(), "DISCONN did NOT go to the channel");
         match coalesce_slot.take_raw().expect("DISCONN in error cell") {
             Err(CaError::ServerError(192)) => {}
@@ -1286,7 +1200,7 @@ mod tests {
         post_long(&mut reg, 2);
         assert!(matches!(
             reg.on_monitor_error(1, 192),
-            MonitorDeliveryOutcome::Slotted(_)
+            MonitorDeliveryOutcome::Slotted
         ));
 
         // Consumer drains ONE channel item — a cell frees up.
@@ -1299,7 +1213,7 @@ mod tests {
         // pending error — it coalesces into the slot.
         assert!(matches!(
             post_long(&mut reg, 3),
-            MonitorDeliveryOutcome::Slotted(_)
+            MonitorDeliveryOutcome::Slotted
         ));
 
         // Order: remaining channel item (2), then the error, then 3.

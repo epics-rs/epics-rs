@@ -19,30 +19,35 @@ subscription tied to that client.
 
 ### Client side: when do we send EVENTS_OFF?
 
-`client/mod.rs:813` defines:
+Keyed on **OS socket-buffer occupancy**, never on how far behind the
+application is — this is libca's rule verbatim (`tcpiiu.cpp:543-572`).
 
-```rust
-const FLOW_CONTROL_OFF_THRESHOLD: usize = 10;
-const FLOW_CONTROL_ON_THRESHOLD:  usize = 5;
+After each received frame is processed, `client/transport.rs::read_loop`
+asks the OS whether unread bytes are *still* sitting in the socket
+receive buffer (C `bytesArePendingInOS()`, an `ioctl(FIONREAD)`):
 
-struct FlowControlState {
-    outstanding: usize,
-    active:      bool,
-}
-```
+- **Bytes still pending** → increment `contig_recv_msg_count`. Once it
+  reaches `protocol::max_contiguous_frames()`, the circuit is busy: send
+  `EVENTS_OFF`.
+- **Socket read clean** → reset `contig_recv_msg_count` to 0 and, if
+  flow control is active, send `EVENTS_ON` *immediately*. C's comment:
+  "if no bytes are pending then we must immediately switch off flow
+  control w/o waiting for more data to arrive" (`tcpiiu.cpp:559-561`).
 
-Maintained per server address. `outstanding` increments when the
-coordinator forwards a `MonitorData` event to the application
-(`flow_control_note_queued`) and decrements when the user drains a
-`MonitorHandle` (`flow_control_note_consumed` via
-`CoordRequest::MonitorConsumed`).
+`max_contiguous_frames()` is C `cac.cpp:233-237`: the base trigger is
+`contiguousMsgCountWhichTriggersFlowControl` = 10 (`iocinf.h:62`), scaled
+by how many 16 KiB receive buffers one max-size array occupies, so a
+circuit configured for large waveforms tolerates proportionally more
+contiguous frames before tripping.
 
-When `outstanding >= 10` and not already paused → send `EVENTS_OFF`,
-mark `active = true`. When `outstanding <= 5` and currently paused →
-send `EVENTS_ON`, mark `active = false`.
+There is **no consumer-queue counter and no hysteresis**. libca has
+neither, and a counter keyed on consumer backlog would let one
+application that stops polling its `MonitorHandle` hold `EVENTS_OFF` down
+for every *other* subscription on the same circuit — a state libca cannot
+reach, because the moment the socket drains it emits `EVENTS_ON`.
 
-The hysteresis (10 / 5) prevents oscillation when the consumer is
-running near capacity.
+Per-subscription buffering (the bounded channel plus the coalesce slot,
+layer 2 below) is entirely separate and never reaches the wire.
 
 ### Server side: how do we honour it?
 

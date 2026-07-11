@@ -248,6 +248,64 @@ pub fn max_payload_size() -> usize {
 /// Compile-time constant for tests that need a fixed value.
 pub const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
+/// C `MAX_TCP` (`modules/ca/src/client/caProto.h:67`) — `1024 * 16u`,
+/// "so waveforms fit". The floor for `maxRecvBytesTCP` and the unit of
+/// libca's receive-side buffer sizing.
+pub const MAX_TCP: usize = 1024 * 16;
+
+/// C `comBufSize` (`modules/ca/src/client/comBuf.h:37`) — the size of one
+/// receive buffer, i.e. one "frame" for flow-control accounting.
+pub const COM_BUF_SIZE: usize = 0x4000;
+
+/// C `contiguousMsgCountWhichTriggersFlowControl`
+/// (`modules/ca/src/client/iocinf.h:62`).
+pub const CONTIGUOUS_FRAMES_TRIGGERING_FLOW_CONTROL: usize = 10;
+
+/// C `cac::maxRecvBytesTCP` (`modules/ca/src/client/cac.cpp:196-217`).
+///
+/// Defaults to [`MAX_TCP`]. `EPICS_CA_MAX_ARRAY_BYTES` raises it, but only
+/// after C adds room for the extended header (`sizeof(caHdr) + 2 *
+/// sizeof(ca_uint32_t)` = 24) so the operator gets the array size they
+/// asked for — and only if the result still reaches `MAX_TCP`; a smaller
+/// value is rounded up (C errlogs "was rounded up to %u" and leaves the
+/// default in place).
+///
+/// Distinct from [`max_payload_size`], which is this port's DoS bound and
+/// carries a deliberately larger default (see its docs).
+pub fn max_recv_bytes_tcp() -> usize {
+    /// `sizeof ( caHdr ) + 2 * sizeof ( ca_uint32_t )` (`cac.cpp:204`).
+    const HEADER_SIZE: usize = 16 + EXTENDED_EXTRA;
+    let Some(max_bytes) = epics_base_rs::runtime::env::get("EPICS_CA_MAX_ARRAY_BYTES")
+        .and_then(|s| s.parse::<usize>().ok())
+    else {
+        return MAX_TCP;
+    };
+    let max_bytes = max_bytes.saturating_add(HEADER_SIZE);
+    if max_bytes < MAX_TCP {
+        MAX_TCP
+    } else {
+        max_bytes
+    }
+}
+
+/// C `cac::maxContiguousFrames` (`modules/ca/src/client/cac.cpp:233-237`,
+/// read back at `cac.h:419`).
+///
+/// The number of consecutive receive frames that must each leave bytes
+/// still pending in the OS socket buffer before libca declares the circuit
+/// busy and asks the server for `CA_PROTO_EVENTS_OFF`. Scaled by how many
+/// receive buffers one max-size array occupies, so a circuit configured for
+/// large waveforms tolerates proportionally more contiguous frames before
+/// tripping.
+pub fn max_contiguous_frames() -> usize {
+    let bufs_per_array = max_recv_bytes_tcp() / COM_BUF_SIZE;
+    if bufs_per_array > 1 {
+        bufs_per_array * CONTIGUOUS_FRAMES_TRIGGERING_FLOW_CONTROL
+    } else {
+        CONTIGUOUS_FRAMES_TRIGGERING_FLOW_CONTROL
+    }
+}
+
 /// Extra bytes consumed by extended header fields.
 pub const EXTENDED_EXTRA: usize = 8;
 

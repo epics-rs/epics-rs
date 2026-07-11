@@ -63,8 +63,11 @@ the C ABI surface**. Details below.
 | Feature | libca / rsrv | epics-ca-rs |
 |---------|--------------|-------------|
 | EVENTS_OFF / EVENTS_ON | ✅ | ✅ |
-| Per-server outstanding-monitor counter | ✅ | ✅ (FlowControlState) |
-| Hysteresis thresholds | ✅ | ✅ (10 / 5) |
+| Flow control keyed on OS socket-buffer occupancy | ✅ `bytesArePendingInOS` | ✅ `read_loop` FIONREAD probe |
+| Contiguous-busy-frame trigger | ✅ `maxContiguousFrames` | ✅ `protocol::max_contiguous_frames()` |
+| Trigger scaled from `EPICS_CA_MAX_ARRAY_BYTES` | ✅ `cac.cpp:233-237` | ✅ |
+| Immediate `EVENTS_ON` the first time the socket reads clean | ✅ | ✅ |
+| Per-consumer outstanding-monitor counter / hysteresis | ❌ (libca has neither) | ❌ |
 | Server-side per-subscription event queue | ✅ ringbuffer | ✅ mpsc(64) + coalesce slot |
 | Server-side drop-oldest, keep-newest | ✅ | ✅ |
 | Client-side bounded subscription queue | ✅ (ca_event_queue) | ✅ mpsc(`EPICS_CA_MONITOR_QUEUE`) |

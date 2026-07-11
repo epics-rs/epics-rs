@@ -704,14 +704,6 @@ pub(crate) enum TransportCommand {
         server_addr: SocketAddr,
         anomaly: bool,
     },
-    EventsOff {
-        server_addr: SocketAddr,
-        priority: u8,
-    },
-    EventsOn {
-        server_addr: SocketAddr,
-        priority: u8,
-    },
 }
 
 pub(crate) enum TransportEvent {

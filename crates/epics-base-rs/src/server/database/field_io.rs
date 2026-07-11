@@ -36,6 +36,68 @@ fn coerce_write_value(
     value.convert_to(target)
 }
 
+/// What a `dbPut` of a given value means for a given field — the single owner
+/// of C `dbPut`'s value branch (`dbAccess.c:1345-1372`).
+enum PutRequest {
+    /// Write this value; already coerced to the field's native type.
+    Write(EpicsValue),
+    /// A zero-element request (`nRequest < 1`) into a **scalar** destination.
+    ///
+    /// C writes nothing, raises `LINK_ALARM`/`INVALID_ALARM` on the record, and
+    /// returns **success** — `status` stays 0, so the put is accepted and the
+    /// record's next `recGblResetAlarms` publishes the new alarm
+    /// (`dbAccess.c:1370-1372`, commit `12cfd418d`, whose subject is "fix dbPut
+    /// to *set* the target to INVALID/LINK alarm when writing empty arrays into
+    /// scalars" — not to reject the put).
+    EmptyIntoScalar,
+}
+
+/// Resolve a put into its C `dbPut` branch.
+///
+/// C picks the branch from the **destination's** element count
+/// (`dbAccess.c:1345` `no_elements > 1`): an array field clamps `nRequest` and
+/// converts — a zero-length request copies nothing and succeeds silently — while
+/// a scalar field with `nRequest < 1` takes the alarm branch. The test is on the
+/// request count and the destination, never on whether a type conversion happens
+/// to be needed.
+///
+/// [`FieldDesc`](crate::server::record::FieldDesc) carries no element count, so
+/// the destination's current value is the probe: an array-valued field reads
+/// back as an array variant. A field the record does not own (a `dbCommon`
+/// field, reached via `put_common_field`) reads back as `None` and is scalar,
+/// which is also what its `DBF_*` descriptor says in C.
+fn dbput_request(
+    record: &dyn crate::server::record::Record,
+    field: &str,
+    value: EpicsValue,
+) -> PutRequest {
+    if value.is_empty_array() && !record.get_field(field).is_some_and(|v| v.is_array()) {
+        return PutRequest::EmptyIntoScalar;
+    }
+    match record
+        .field_list()
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(field))
+        .map(|f| f.dbf_type)
+    {
+        Some(target) if value.db_field_type() != target => {
+            PutRequest::Write(coerce_write_value(record, field, target, value))
+        }
+        _ => PutRequest::Write(value),
+    }
+}
+
+/// Apply C's [`PutRequest::EmptyIntoScalar`] effect: the field is left
+/// untouched and the record is driven to `LINK_ALARM`/`INVALID_ALARM`
+/// (`dbAccess.c:1371` `recGblSetSevr(precord, LINK_ALARM, INVALID_ALARM)`).
+fn set_empty_request_alarm(instance: &mut crate::server::record::RecordInstance) {
+    crate::server::recgbl::rec_gbl_set_sevr(
+        &mut instance.common,
+        crate::server::recgbl::alarm_status::LINK_ALARM,
+        crate::server::record::AlarmSeverity::Invalid,
+    );
+}
+
 impl PvDatabase {
     /// Get a PV value synchronously from a blocking thread.
     ///
@@ -177,34 +239,7 @@ impl PvDatabase {
             };
             let mut instance = rec.write().await;
 
-            // Coerce value to field's native type
-            let value = {
-                let target_type = instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(&field))
-                    .map(|f| f.dbf_type);
-                if let Some(target) = target_type {
-                    if value.db_field_type() != target {
-                        // C EPICS dbPut (12cfd41): nRequest=0 into a scalar
-                        // field must NOT silently coerce. `convert_to` on an
-                        // empty array calls `to_f64().unwrap_or(0.0)` and
-                        // would produce a scalar zero — the same garbage-
-                        // value bug the C fix raised LINK_ALARM for.
-                        if value.is_empty_array() {
-                            return Err(CaError::InvalidValue(format!(
-                                "empty array cannot be coerced to scalar field {field}"
-                            )));
-                        }
-                        coerce_write_value(&*instance.record, &field, target, value)
-                    } else {
-                        value
-                    }
-                } else {
-                    value
-                }
-            };
+            let request = dbput_request(&*instance.record, &field, value);
 
             // Capture the pre-put value so the metadata-cache
             // invalidation (and the downstream `DBE_PROPERTY`
@@ -216,14 +251,25 @@ impl PvDatabase {
             // Does NOT post monitor events (use put_pv_and_post for that).
             // Does NOT clear UDF or trigger processing.
             use crate::server::record::CommonFieldPutResult;
-            let common_result = match instance.record.put_field(&field, value.clone()) {
-                Ok(()) => {
-                    instance.record.on_put(&field);
-                    let _ = instance.record.special(&field, true);
+            let common_result = match request {
+                // C `dbAccess.c:1370-1372` — accept, write nothing, alarm.
+                PutRequest::EmptyIntoScalar => {
+                    set_empty_request_alarm(&mut instance);
                     CommonFieldPutResult::NoChange
                 }
-                Err(CaError::FieldNotFound(_)) => instance.put_common_field(&field, value)?,
-                Err(e) => return Err(e),
+                PutRequest::Write(value) => {
+                    match instance.record.put_field(&field, value.clone()) {
+                        Ok(()) => {
+                            instance.record.on_put(&field);
+                            let _ = instance.record.special(&field, true);
+                            CommonFieldPutResult::NoChange
+                        }
+                        Err(CaError::FieldNotFound(_)) => {
+                            instance.put_common_field(&field, value)?
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             };
 
             // Invalidate metadata cache only if the metadata-class
@@ -402,31 +448,7 @@ impl PvDatabase {
 
             let mut instance = rec.write().await;
 
-            // Type coercion
-            let value = {
-                let target_type = instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(&field))
-                    .map(|f| f.dbf_type);
-                if let Some(target) = target_type {
-                    if value.db_field_type() != target {
-                        // C EPICS dbPut (12cfd41): empty-array → scalar
-                        // coercion would produce silent zero; reject.
-                        if value.is_empty_array() {
-                            return Err(CaError::InvalidValue(format!(
-                                "empty array cannot be coerced to scalar field {field}"
-                            )));
-                        }
-                        coerce_write_value(&*instance.record, &field, target, value)
-                    } else {
-                        value
-                    }
-                } else {
-                    value
-                }
-            };
+            let request = dbput_request(&*instance.record, &field, value);
 
             let old_value = instance.record.get_field(&field);
             let old_stat = instance.common.stat;
@@ -443,23 +465,34 @@ impl PvDatabase {
             };
 
             // Write value + special/on_put
-            match instance.record.put_field(&field, value.clone()) {
-                Ok(()) => {
-                    instance.record.on_put(&field);
-                    let _ = instance.record.special(&field, true);
-                    // Clear UDF/UDF_ALARM on primary field write
-                    if field == instance.record.primary_field() {
-                        instance.common.udf = false;
-                        if instance.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
-                            instance.common.stat = 0;
-                            instance.common.sevr = crate::server::record::AlarmSeverity::NoAlarm;
+            match request {
+                // C `dbAccess.c:1370-1372` — accept, write nothing, alarm. UDF
+                // is NOT cleared: C clears it at `:1409` only when the value
+                // field was actually written, and this branch wrote nothing.
+                PutRequest::EmptyIntoScalar => set_empty_request_alarm(&mut instance),
+                PutRequest::Write(value) => {
+                    match instance.record.put_field(&field, value.clone()) {
+                        Ok(()) => {
+                            instance.record.on_put(&field);
+                            let _ = instance.record.special(&field, true);
+                            // Clear UDF/UDF_ALARM on primary field write
+                            if field == instance.record.primary_field() {
+                                instance.common.udf = false;
+                                if instance.common.stat
+                                    == crate::server::recgbl::alarm_status::UDF_ALARM
+                                {
+                                    instance.common.stat = 0;
+                                    instance.common.sevr =
+                                        crate::server::record::AlarmSeverity::NoAlarm;
+                                }
+                            }
                         }
+                        Err(CaError::FieldNotFound(_)) => {
+                            instance.put_common_field(&field, value)?;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
-                Err(CaError::FieldNotFound(_)) => {
-                    instance.put_common_field(&field, value)?;
-                }
-                Err(e) => return Err(e),
             }
 
             // Invalidate metadata cache only if a metadata-class
@@ -777,31 +810,7 @@ impl PvDatabase {
             // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
             // This matches C EPICS db_put_field() which converts from the CA client's type
             // to the record field's native type.
-            let value = {
-                let target_type = instance
-                    .record
-                    .field_list()
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(&field))
-                    .map(|f| f.dbf_type);
-                if let Some(target) = target_type {
-                    if value.db_field_type() != target {
-                        // C EPICS dbPut (12cfd41): empty-array → scalar
-                        // coercion would produce silent zero; reject.
-                        if value.is_empty_array() {
-                            instance.common.putf = false;
-                            return Err(CaError::InvalidValue(format!(
-                                "empty array cannot be coerced to scalar field {field}"
-                            )));
-                        }
-                        coerce_write_value(&*instance.record, &field, target, value)
-                    } else {
-                        value
-                    }
-                } else {
-                    value
-                }
-            };
+            let request = dbput_request(&*instance.record, &field, value);
 
             // SPC_NOMOD: reject writes to read-only fields (C EPICS S_db_noMod)
             let is_read_only = instance
@@ -833,40 +842,59 @@ impl PvDatabase {
             // `ackt`/`acks` actually change.
             let ackt_before = instance.common.ackt;
             let acks_before = instance.common.acks;
-            let common_result = match instance.record.put_field(&field, value.clone()) {
-                Ok(()) => {
-                    instance.record.on_put(&field);
-                    let _ = instance.record.special(&field, true);
-                    // C `dbAccess.c::dbPut:1410-1411` clears
-                    // `precord->udf = FALSE` synchronously when the
-                    // put target is the record-type's primary value
-                    // field (`dbIsValueField`). The clear happens
-                    // BEFORE `dbProcess` runs, so any reader between
-                    // the put and the process-cycle's own clear sees
-                    // the new value with a consistent UDF=false.
-                    //
-                    // Rust's processing path also clears UDF via
-                    // `clears_udf()` in process/complete_async_record,
-                    // but that runs AFTER the put lock drops and the
-                    // process re-acquires — leaving a small window
-                    // where another reader can observe (new VAL,
-                    // udf=true). For async records the window spans
-                    // the entire device round trip. Clear here to
-                    // close the window. The same clear already exists
-                    // in `put_pv_and_post` (line 256-262); mirror it.
-                    if field == instance.record.primary_field() {
-                        instance.common.udf = false;
-                        if instance.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM {
-                            instance.common.stat = 0;
-                            instance.common.sevr = crate::server::record::AlarmSeverity::NoAlarm;
-                        }
-                    }
+            let common_result = match request {
+                // C `dbAccess.c:1370-1372` — a zero-element request into a
+                // scalar field: nothing is written, the record is driven to
+                // LINK/INVALID, and `dbPut` returns 0. The client's put
+                // SUCCEEDS; the record's process cycle below commits the alarm
+                // and posts it, which is how a C IOC surfaces `caput -a`
+                // of an empty array.
+                PutRequest::EmptyIntoScalar => {
+                    set_empty_request_alarm(&mut instance);
                     CommonFieldPutResult::NoChange
                 }
-                Err(CaError::FieldNotFound(_)) => instance.put_common_field(&field, value)?,
-                Err(e) => {
-                    instance.common.putf = false;
-                    return Err(e);
+                PutRequest::Write(value) => {
+                    match instance.record.put_field(&field, value.clone()) {
+                        Ok(()) => {
+                            instance.record.on_put(&field);
+                            let _ = instance.record.special(&field, true);
+                            // C `dbAccess.c::dbPut:1410-1411` clears
+                            // `precord->udf = FALSE` synchronously when the
+                            // put target is the record-type's primary value
+                            // field (`dbIsValueField`). The clear happens
+                            // BEFORE `dbProcess` runs, so any reader between
+                            // the put and the process-cycle's own clear sees
+                            // the new value with a consistent UDF=false.
+                            //
+                            // Rust's processing path also clears UDF via
+                            // `clears_udf()` in process/complete_async_record,
+                            // but that runs AFTER the put lock drops and the
+                            // process re-acquires — leaving a small window
+                            // where another reader can observe (new VAL,
+                            // udf=true). For async records the window spans
+                            // the entire device round trip. Clear here to
+                            // close the window. The same clear already exists
+                            // in `put_pv_and_post` (line 256-262); mirror it.
+                            if field == instance.record.primary_field() {
+                                instance.common.udf = false;
+                                if instance.common.stat
+                                    == crate::server::recgbl::alarm_status::UDF_ALARM
+                                {
+                                    instance.common.stat = 0;
+                                    instance.common.sevr =
+                                        crate::server::record::AlarmSeverity::NoAlarm;
+                                }
+                            }
+                            CommonFieldPutResult::NoChange
+                        }
+                        Err(CaError::FieldNotFound(_)) => {
+                            instance.put_common_field(&field, value)?
+                        }
+                        Err(e) => {
+                            instance.common.putf = false;
+                            return Err(e);
+                        }
+                    }
                 }
             };
 

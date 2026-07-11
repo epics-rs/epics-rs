@@ -3880,6 +3880,85 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
     assert!(udf("PINI_NO").await, "PINI=NO is in no pass at all");
 }
 
+/// R6-7 — `caput -a REC.VAL 0` (a zero-element array into a scalar field). C
+/// `dbPut` (`dbAccess.c:1370-1372`, commit `12cfd418d`) **accepts** the put,
+/// leaves the field unchanged and raises `LINK_ALARM`/`INVALID_ALARM` on the
+/// record; `status` stays 0, so `dbPut` returns success. The port rejected the
+/// put with an error, so the client saw a write failure and the record's alarm
+/// state was never touched.
+#[tokio::test]
+async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    db.add_record("EMPTYPUT", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+    // Process once so VAL is committed and UDF is clear — the baseline the
+    // empty put must not disturb.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("EMPTYPUT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let result = db
+        .put_record_field_from_ca("EMPTYPUT", "VAL", EpicsValue::DoubleArray(vec![]))
+        .await;
+    assert!(
+        result.is_ok(),
+        "C dbPut accepts a zero-element request; the client must not see an error: {result:?}"
+    );
+
+    // The field is untouched…
+    match db.get_pv("EMPTYPUT.VAL").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 5.0).abs() < 1e-10,
+            "the empty request must not overwrite VAL (silent zero was the bug 12cfd418d fixed)"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+    // …and the record is driven to LINK/INVALID, committed by the process cycle
+    // the CA put triggers.
+    let inst = db.get_record("EMPTYPUT").await.unwrap();
+    let inst = inst.read().await;
+    assert_eq!(inst.common.stat, alarm_status::LINK_ALARM);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+}
+
+/// R6-7 — the same zero-element request into an **array** field is an ordinary
+/// no-op success: C takes the `no_elements > 1` branch (`dbAccess.c:1345`),
+/// clamps `nRequest` to 0 and converts nothing — no alarm. Only the *scalar*
+/// destination alarms. This is the boundary the fix turns on.
+#[tokio::test]
+async fn test_empty_array_into_array_field_is_a_silent_no_op() {
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
+    wf.nelm = 4;
+    wf.ftvl = 6; // DOUBLE
+    db.add_record("EMPTYWF", Box::new(wf)).await.unwrap();
+
+    let result = db
+        .put_record_field_from_ca("EMPTYWF", "VAL", EpicsValue::DoubleArray(vec![]))
+        .await;
+    assert!(result.is_ok(), "empty array into a waveform must succeed");
+
+    let inst = db.get_record("EMPTYWF").await.unwrap();
+    let inst = inst.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "an array destination must NOT take the scalar empty-request alarm branch"
+    );
+    assert_ne!(
+        inst.common.nsta,
+        epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+        "no LINK_ALARM may even be pending on an array destination"
+    );
+}
+
 /// R6-6 — C `piniProcess` (`iocInit.c:608-627`) sweeps the database once per
 /// distinct `PHAS`, ascending, so PINI records process in phase order; within a
 /// phase the order is database load order (`doRecordPini` under

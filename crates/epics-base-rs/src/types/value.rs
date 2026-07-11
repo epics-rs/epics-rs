@@ -709,6 +709,29 @@ impl EpicsValue {
         }
     }
 
+    /// True iff this value is an array variant, whatever its length.
+    ///
+    /// The port's stand-in for C's `no_elements > 1` destination test
+    /// (`dbAccess.c:1345`): a record's array-valued field reads back as an
+    /// array variant, a scalar field as a scalar variant.
+    pub fn is_array(&self) -> bool {
+        matches!(
+            self,
+            Self::ShortArray(_)
+                | Self::FloatArray(_)
+                | Self::EnumArray(_)
+                | Self::DoubleArray(_)
+                | Self::LongArray(_)
+                | Self::Int64Array(_)
+                | Self::UInt64Array(_)
+                | Self::UShortArray(_)
+                | Self::ULongArray(_)
+                | Self::UCharArray(_)
+                | Self::CharArray(_)
+                | Self::StringArray(_)
+        )
+    }
+
     /// Get the element count for this value.
     pub fn count(&self) -> u32 {
         match self {

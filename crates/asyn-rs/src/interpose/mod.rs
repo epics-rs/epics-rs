@@ -44,6 +44,32 @@ pub struct OctetReadResult {
     pub eom_reason: EomReason,
 }
 
+/// The transfer an octet read completed *before* it failed — C's
+/// `*nbytesTransfered` / `*eomReason`, which `asynOctet::read` writes out
+/// even when it returns a failing `asynStatus`
+/// (`asynInterposeEos.c:242-253`).
+///
+/// This owns the bytes rather than pointing at the caller's buffer: it rides
+/// inside [`crate::error::AsynError::PartialRead`], so the data and the
+/// status are one value and a `?` on the read cannot deliver the failure
+/// while dropping the bytes. Every dispatch hop between the interpose and a
+/// record (`port_actor` → `PortHandle` → device support / `SyncIO`) hands the
+/// error on by value, so the transfer arrives with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialOctetRead {
+    /// The bytes transferred into the caller's buffer before the failure.
+    pub data: Vec<u8>,
+    /// The end-of-message reason accumulated up to the failure.
+    pub eom_reason: EomReason,
+}
+
+impl PartialOctetRead {
+    /// C's `*nbytesTransfered` for this failed read.
+    pub fn nbytes_transferred(&self) -> usize {
+        self.data.len()
+    }
+}
+
 /// "Next layer" interface — implemented by both the base driver adapter
 /// and by `InterposeChain` to allow recursive dispatch.
 pub trait OctetNext: Send + Sync {

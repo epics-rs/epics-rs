@@ -654,77 +654,85 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
 /// branch (asynRecord.c:1557-1631 octet, :1478-1527 register).
 fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
     match plan.iface {
-        InterfaceType::Octet => match res {
-            Ok(result) => {
-                out.eomr = Some(result.eom_reason as i32);
-                if let Some(data) = result.data {
-                    // NORD is the raw transfer count (C `nord = nbytesTransfered`,
-                    // asynRecord.c:1627) — independent of the AINP overflow
-                    // NUL-truncation below and of UTF-8-lossy expansion.
-                    out.nord = Some(data.len() as i32);
-                    // C performOctetIO flags an ASCII/Hybrid read that filled
-                    // the whole input buffer with no terminator as a MINOR
-                    // READ alarm and NUL-truncates the buffer
-                    // (asynRecord.c:1602-1615). The buffer-full-without-EOS
-                    // condition is exactly asyn's `ASYN_EOM_CNT` set with
-                    // neither END nor EOS; pairing it with `len >= IMAX` keeps
-                    // an NRRD-limited short read from reading as overflow.
-                    // Binary uses `>` (C says "should not happen") so it never
-                    // flags — restrict to ASCII/Hybrid.
-                    let eom = result.eom_reason;
-                    let overflow = plan.ifmt != ASYN_FMT_BINARY
-                        && plan.imax > 0
-                        && data.len() >= plan.imax
-                        && (eom & EomReason::CNT.bits()) != 0
-                        && (eom & (EomReason::END.bits() | EomReason::EOS.bits())) == 0;
-                    // C stores the device bytes into the single IFMT-selected
-                    // field (ASCII -> AINP, Binary/Hybrid -> BINP,
-                    // asynRecord.c:1503-1509) and posts TINP (escaped) for
-                    // every read mode.
-                    out.tinp = Some(crate::trace::format_io_data(&data, TraceIoMask::ESCAPE));
-                    if plan.ifmt == ASYN_FMT_ASCII {
-                        // On overflow C terminates AINP at the buffer end
-                        // (`inptr[sizeof(ainp)-1] = '\0'`, :1608) — drop the
-                        // final byte so the string leaves room for the
-                        // conceptual terminator.
-                        let bytes = if overflow {
-                            &data[..plan.imax - 1]
-                        } else {
-                            &data[..]
-                        };
-                        out.ainp = Some(String::from_utf8_lossy(bytes).to_string());
-                    } else {
-                        out.binp = Some(data);
-                    }
-                    if overflow {
-                        raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
-                    }
+        InterfaceType::Octet => {
+            // C performOctetIO reads into a buffer it memset to zero
+            // (asynRecord.c:1560) and then assigns EOMR / the IFMT-selected
+            // input field / NORD / TINP from `nbytesTransfered` **regardless
+            // of the returned status** (:1591-1629) — the error branch at
+            // :1583 reports the error and raises the alarm but does not skip
+            // the assignments. So a device that emits a partial line and then
+            // goes quiet lands AINP="abc", NORD=3 *and* a READ_ALARM.
+            //
+            // Rust splits the transfer from the status across `Result`, so
+            // recover the transfer from both arms first (an error that moved
+            // bytes carries them in `AsynError::PartialRead`; one that moved
+            // none reports a zero transfer, which is exactly C's memset
+            // buffer) and run the one assignment tail below. Register reads
+            // keep their stale-on-error fields, matching their C handlers
+            // which never memset.
+            let (data, eom, err) = match res {
+                Ok(result) => (
+                    result.data.unwrap_or_default(),
+                    result.eom_reason,
+                    None::<crate::error::AsynError>,
+                ),
+                Err(e) => {
+                    let (data, eom) = match e.partial_read() {
+                        Some(p) => (p.data.clone(), p.eom_reason.bits()),
+                        None => (Vec::new(), 0),
+                    };
+                    (data, eom, Some(e))
                 }
+            };
+
+            out.eomr = Some(eom as i32);
+            // NORD is the raw transfer count (C `nord = nbytesTransfered`,
+            // asynRecord.c:1627) — independent of the AINP overflow
+            // NUL-truncation below and of UTF-8-lossy expansion.
+            out.nord = Some(data.len() as i32);
+            // C performOctetIO flags an ASCII/Hybrid read that filled
+            // the whole input buffer with no terminator as a MINOR
+            // READ alarm and NUL-truncates the buffer
+            // (asynRecord.c:1602-1615). The buffer-full-without-EOS
+            // condition is exactly asyn's `ASYN_EOM_CNT` set with
+            // neither END nor EOS; pairing it with `len >= IMAX` keeps
+            // an NRRD-limited short read from reading as overflow.
+            // Binary uses `>` (C says "should not happen") so it never
+            // flags — restrict to ASCII/Hybrid.
+            let overflow = plan.ifmt != ASYN_FMT_BINARY
+                && plan.imax > 0
+                && data.len() >= plan.imax
+                && (eom & EomReason::CNT.bits()) != 0
+                && (eom & (EomReason::END.bits() | EomReason::EOS.bits())) == 0;
+            // C stores the device bytes into the single IFMT-selected
+            // field (ASCII -> AINP, Binary/Hybrid -> BINP,
+            // asynRecord.c:1503-1509) and posts TINP (escaped) for
+            // every read mode.
+            out.tinp = Some(crate::trace::format_io_data(&data, TraceIoMask::ESCAPE));
+            if plan.ifmt == ASYN_FMT_ASCII {
+                // On overflow C terminates AINP at the buffer end
+                // (`inptr[sizeof(ainp)-1] = '\0'`, :1608) — drop the
+                // final byte so the string leaves room for the
+                // conceptual terminator.
+                let bytes = if overflow {
+                    &data[..plan.imax - 1]
+                } else {
+                    &data[..]
+                };
+                out.ainp = Some(String::from_utf8_lossy(bytes).to_string());
+            } else {
+                out.binp = Some(data);
             }
-            Err(e) => {
+            if overflow {
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
+            }
+            if let Some(e) = err {
                 out.errs = Some(format!("read: {e}"));
                 // C performOctetIO read error -> recGblSetSevr(READ_ALARM,
                 // MAJOR) (asynRecord.c:1599).
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
-                // C performOctetIO `memset(inptr, 0, inlen)` (asynRecord.c:1560)
-                // before the read, then assigns EOMR/NORD/TINP from the (zero
-                // on error) transfer unconditionally (:1591/:1627/:1629) — the
-                // error branch at :1583 does not skip them. A failed asyn-rs
-                // read carries no bytes, so reflect a zero transfer: empty
-                // IFMT-selected input field (the buffer C memsets), NORD/EOMR=0,
-                // TINP="". This replaces the prior read's stale fields rather
-                // than leaving them. (Register reads stay stale here, matching
-                // their C handlers which never memset.)
-                out.eomr = Some(0);
-                out.nord = Some(0);
-                out.tinp = Some(String::new());
-                if plan.ifmt == ASYN_FMT_ASCII {
-                    out.ainp = Some(String::new());
-                } else {
-                    out.binp = Some(Vec::new());
-                }
             }
-        },
+        }
         InterfaceType::Int32 => match res {
             Ok(result) => match result.int_val {
                 Some(v) => out.i32inp = Some(v),
@@ -3611,6 +3619,107 @@ mod tests {
         writer.process().unwrap();
         assert!(!writer.errs.is_empty(), "write error must set ERRS");
         assert_eq!(writer.nawt, 0, "failed write must reset NAWT to 0");
+    }
+
+    /// R7-46: a device that emits a partial line and then goes quiet reaches
+    /// the record as `asynTimeout` **plus** the bytes it did send. C
+    /// `performOctetIO` assigns `eomr`/`nord`/`inptr`/`tinp` from
+    /// `nbytesTransfered` regardless of the read status (asynRecord.c:1591-1629
+    /// — the error branch at :1583 only reports + alarms), and the EOS
+    /// interpose publishes that count with the failing status
+    /// (asynInterposeEos.c:242-253). So AINP="abc", NORD=3, EOMR=0 land
+    /// together with READ_ALARM/MAJOR.
+    ///
+    /// Before the fix the transfer rode only in the driver's buffer and the
+    /// `?` at the actor dispatch dropped it: the record saw the alarm with
+    /// AINP="", NORD=0.
+    #[test]
+    fn octet_partial_read_delivers_bytes_with_the_timeout() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+        use tokio::sync::mpsc;
+
+        /// The EOS interpose's output for "device sent `abc`, then nothing
+        /// until the timeout": the bytes are in the caller's buffer AND on
+        /// the error (`asynInterposeEos.c:242-253`).
+        struct PartialThenTimeout(PortDriverBase);
+        impl PortDriver for PartialThenTimeout {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                buf[..3].copy_from_slice(b"abc");
+                buf[3] = 0;
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }
+                .with_partial_read(PartialOctetRead {
+                    data: b"abc".to_vec(),
+                    eom_reason: EomReason::empty(),
+                }))
+            }
+        }
+
+        let port_name = "test_octet_partial_read";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(PartialThenTimeout(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        rec.iface = 0; // asynOctet
+        rec.tmod = TransferMode::Read as i32;
+        rec.imax = 256;
+        rec.ifmt = ASYN_FMT_ASCII;
+        rec.process().unwrap();
+
+        assert_eq!(rec.ainp, "abc", "the partial line reaches AINP (C :1503)");
+        assert_eq!(rec.nord, 3, "NORD = nbytesTransfered (C :1627)");
+        assert_eq!(rec.eomr, 0, "no EOS matched, buffer never filled (C :1591)");
+        assert_eq!(rec.tinp, "abc", "TINP is posted for the failed read too");
+        assert!(!rec.errs.is_empty(), "the timeout still reports into ERRS");
+
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::READ_ALARM, "C :1599 recGblSetSevr");
+        assert_eq!(c.nsev, AlarmSeverity::Major, "READ_ALARM is MAJOR");
+
+        // Binary IFMT takes the same transfer through BINP.
+        let mut bin = AsynRecord::default();
+        bin.port = port_name.to_string();
+        bin.connect_device();
+        bin.iface = 0;
+        bin.tmod = TransferMode::Read as i32;
+        bin.imax = 256;
+        bin.ifmt = ASYN_FMT_BINARY;
+        bin.process().unwrap();
+        assert_eq!(bin.binp, b"abc".to_vec(), "partial bytes reach BINP too");
+        assert_eq!(bin.nord, 3);
     }
 
     /// C `performIO` raises a record alarm severity for every I/O failure via

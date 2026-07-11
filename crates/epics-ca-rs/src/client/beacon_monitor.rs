@@ -94,6 +94,34 @@ struct BeaconAction {
     watchdog: Option<bool>,
 }
 
+/// libca `bhe.cpp:268` — the running beacon period is an exponential
+/// moving average with a 0.125 smoothing factor:
+///
+/// ```text
+/// this->averagePeriod = currentPeriod * 0.125 + this->averagePeriod * 0.875;
+/// ```
+///
+/// The value is what the anomaly bands are measured against, so the
+/// factor is not free: a larger alpha lets the average chase the sample
+/// and shrinks the effective width of both bands (a run of stretched
+/// intervals stops reading as stretched after two or three of them).
+const BEACON_PERIOD_ALPHA: f64 = 0.125;
+
+/// Blend one inter-beacon interval into the running average.
+///
+/// `None` is libca's `averagePeriod = -DBL_MAX` sentinel: the 2nd
+/// beacon adopts the first measured interval outright (`bhe.cpp:199`)
+/// and only later samples are smoothed (`bhe.cpp:267-268`).
+fn update_average_period(average: Option<Duration>, current: Duration) -> Duration {
+    match average {
+        None => current,
+        Some(prev) => Duration::from_secs_f64(
+            current.as_secs_f64() * BEACON_PERIOD_ALPHA
+                + prev.as_secs_f64() * (1.0 - BEACON_PERIOD_ALPHA),
+        ),
+    }
+}
+
 /// libca `bhe::updatePeriod` (`bhe.cpp:226-262`) period classification,
 /// for a server whose running average is already established.
 ///
@@ -130,7 +158,7 @@ struct BeaconState {
     last_id: u32,
     last_seen: Instant,
     /// Estimated period between beacons (exponential moving average,
-    /// alpha = 0.25). `None` until the second beacon arrives — at
+    /// alpha = [`BEACON_PERIOD_ALPHA`]). `None` until the second beacon arrives — at
     /// which point we adopt the first observed inter-beacon
     /// interval as the initial estimate. Mirrors libca `bhe.cpp:51`
     /// where `averagePeriod = -DBL_MAX` is the "no estimate yet"
@@ -847,19 +875,11 @@ fn handle_beacon(
         // on the second beacon, after the `averagePeriod < 0.0`
         // sentinel guard). See `BeaconState::period_estimate` doc
         // for why a hardcoded 15 s placeholder caused a false
-        // PeriodCollapse cascade against ramp-up beacon emitters.
-        match entry.period_estimate {
-            None => {
-                entry.period_estimate = Some(actual_interval);
-            }
-            Some(prev) => {
-                let alpha = 0.25;
-                let new_estimate = Duration::from_secs_f64(
-                    prev.as_secs_f64() * (1.0 - alpha) + actual_interval.as_secs_f64() * alpha,
-                );
-                entry.period_estimate = Some(new_estimate);
-            }
-        }
+        // period-collapse cascade against ramp-up beacon emitters.
+        entry.period_estimate = Some(update_average_period(
+            entry.period_estimate,
+            actual_interval,
+        ));
     }
 
     // Search-engine wake-up: libca `cac::beaconNotify` (`cac.cpp:500`)
@@ -1114,6 +1134,58 @@ mod tests {
                 })
             ),
             "id-mismatch restart must fire IdMismatch anomaly even when interval < 50ms"
+        );
+    }
+
+    /// libca `bhe.cpp:267-268`: `averagePeriod = currentPeriod * 0.125
+    /// + averagePeriod * 0.875`. Pinned exactly — the smoothing factor
+    /// sets how fast the average chases a sample, and therefore how
+    /// long a stretched or collapsed cadence keeps reading as anomalous
+    /// against the bands in `classify_period`.
+    #[test]
+    fn running_average_uses_the_libca_smoothing_factor() {
+        // 2nd beacon: no average yet, so the sample is adopted
+        // outright (`bhe.cpp:199`), NOT smoothed against a seed.
+        assert_eq!(
+            update_average_period(None, Duration::from_secs(10)),
+            Duration::from_secs(10),
+            "the first measured interval defines the average"
+        );
+
+        // One sample of 10 s against a 2 s average:
+        //   10 * 0.125 + 2 * 0.875 = 3.0 s   (alpha = 0.25 gives 4.0 s)
+        assert_eq!(
+            update_average_period(Some(Duration::from_secs(2)), Duration::from_secs(10)),
+            Duration::from_secs_f64(3.0),
+            "0.125 smoothing: a single long sample moves the average by an eighth"
+        );
+
+        // Symmetric on the way down:
+        //   2 * 0.125 + 10 * 0.875 = 9.0 s
+        assert_eq!(
+            update_average_period(Some(Duration::from_secs(10)), Duration::from_secs(2)),
+            Duration::from_secs_f64(9.0),
+        );
+
+        // A constant cadence is a fixed point of the EMA at any alpha —
+        // this is what makes the steady-state band tests deterministic.
+        let steady = Duration::from_millis(1500);
+        assert_eq!(update_average_period(Some(steady), steady), steady);
+
+        // Band interaction: after ONE 3.5x sample, the average must
+        // still be far enough below the next same-length interval that
+        // a genuinely stretched cadence keeps flagging. With alpha
+        // 0.125 the average lands at 1.3125 s, so a second 3.5 s beacon
+        // is still 2.67x — inside the 1.25x anomaly band.
+        let avg = update_average_period(Some(Duration::from_secs(1)), Duration::from_millis(3500));
+        assert_eq!(
+            avg,
+            Duration::from_millis(1312) + Duration::from_micros(500)
+        );
+        assert_eq!(
+            classify_period(avg, Duration::from_millis(3500)).watchdog,
+            Some(true),
+            "a sustained stretched cadence must keep flagging the watchdog"
         );
     }
 

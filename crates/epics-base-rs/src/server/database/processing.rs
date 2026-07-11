@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
-use crate::server::record::{NotifyWaitSet, RecordInstance, ValuePostGate, value_gate};
+use crate::server::record::{
+    InputFetchPolicy, NotifyWaitSet, RecordInstance, ValuePostGate, value_gate,
+};
 use crate::types::EpicsValue;
 
 use super::{PvDatabase, apply_timestamp};
@@ -1681,9 +1683,17 @@ impl PvDatabase {
         // `select_input_links`), so the gate fails when the NVL link or the
         // selected input was configured but did not resolve this cycle.
         let sel_fetch_failed: bool;
+        // sub/aSub abort-on-first-failure gate: C `subRecord.c::fetch_values`
+        // (407-418) / `aSubRecord.c::fetch_values` (277-289) `return` on the
+        // first failed `dbGetLink`, and `process` (subRecord.c:146,
+        // aSubRecord.c:216) then skips `do_sub`. Armed here, consumed via
+        // `RecordInstance::suppress_subroutine_run` below.
+        let mut input_fetch_aborted = false;
         {
+            let input_fetch_policy;
             let link_info: Vec<(String, &'static str, String)> = {
                 let instance = rec.read().await;
+                input_fetch_policy = instance.record.input_fetch_policy();
                 // Restrict to the record's active inputs this cycle (sel
                 // `Specified` → only INP[SELN]); `None` = fetch every link.
                 let links = instance
@@ -1723,6 +1733,7 @@ impl PvDatabase {
                         self.process_passive_db_source(db, visited, depth).await;
                     }
                     let (value, alarm) = self.read_link_with_alarm(&parsed).await;
+                    let read_failed = value.is_none();
                     if let Some(value) = value {
                         results.push((val_field.clone(), value));
                         resolved_link_fields.push(link_field);
@@ -1750,6 +1761,19 @@ impl PvDatabase {
                             }
                             _ => {}
                         }
+                    }
+                    // C `subRecord.c::fetch_values` (407-418):
+                    // `if (dbGetLink(plink, ...)) return -1;` — the loop stops
+                    // dead at the first failing link. Every input behind it is
+                    // never read, so its value field keeps the previous cycle's
+                    // value (no monitor, no PP of that source, no link-alarm
+                    // inheritance), and the record body is skipped below. The
+                    // failed link's own alarm is already folded above: C's
+                    // `dbGetLink` raises the MS severity for the link it failed
+                    // on before returning.
+                    if read_failed && input_fetch_policy == InputFetchPolicy::AbortOnFirstFailure {
+                        input_fetch_aborted = true;
+                        break;
                     }
                 }
             }
@@ -2072,6 +2096,19 @@ impl PvDatabase {
             // instance and consumed by `run_registered_subroutine`.
             if let Some(ds) = &asub_dynamic {
                 apply_asub_dynamic_sub(&mut instance, ds);
+            }
+
+            // C `subRecord.c:145-146` / `aSubRecord.c:216-218`:
+            //     status = fetch_values(prec);
+            //     if (status == 0) status = do_sub(prec);
+            // A failed input link means the subroutine does not run this cycle
+            // — VAL (and aSub's VALA..VALU) freeze, and none of `do_sub`'s
+            // alarms (BAD_SUB / SOFT at BRSV) or its `udf = isnan(val)` update
+            // happen. Same one-shot flag the aSub bad-SNAM skip arms, consumed
+            // by the single owner `run_registered_subroutine`; OR-ed in so
+            // whichever reason fired first still suppresses the run.
+            if input_fetch_aborted {
+                instance.suppress_subroutine_run = true;
             }
 
             // Invoke the registered subroutine (sub/aSub SNAM) before the

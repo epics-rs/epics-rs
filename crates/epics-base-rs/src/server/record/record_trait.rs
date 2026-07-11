@@ -406,6 +406,35 @@ pub struct ProcessSnapshot {
     pub changed_fields: Vec<(String, EpicsValue, crate::server::recgbl::EventMask)>,
 }
 
+/// What C's `fetch_values()` does when one of the record's input links fails
+/// to read, and whether that failure gates the record body.
+///
+/// Every C record with an INPA..INPx block has a `fetch_values()` helper, but
+/// they do not share a failure shape, so the framework cannot pick one rule
+/// for all of them — each record declares its own via
+/// [`Record::input_fetch_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFetchPolicy {
+    /// Read every configured link; a failed read does not stop the loop.
+    /// C `calcRecord.c::fetch_values` (427-443) and
+    /// `transformRecord.c::process` (531-545) keep going after a failed
+    /// `dbGetLink`, so the inputs behind the failure still refresh.
+    ReadAll,
+    /// Stop at the FIRST failed link and skip the record body this cycle.
+    ///
+    /// C `subRecord.c::fetch_values` (407-418) `return -1`s on the first
+    /// failing `dbGetLink`, so the inputs behind it are never read and keep
+    /// their previous values; `subRecord.c::process` (145-146) then runs
+    /// `do_sub` only `if (status == 0)`, freezing VAL/UDF and raising none of
+    /// the subroutine's alarms. `aSubRecord.c` (277-289 fetch, 216-218
+    /// process) is the same shape.
+    ///
+    /// The framework consumes the gate through the single subroutine-skip
+    /// owner (`RecordInstance::suppress_subroutine_run`), which is what runs
+    /// the body for these two record types.
+    AbortOnFirstFailure,
+}
+
 /// Trait that all EPICS record types must implement.
 pub trait Record: Send + Sync + 'static {
     /// Return the record type name (e.g., "ai", "ao", "bi").
@@ -1136,6 +1165,13 @@ pub trait Record: Send + Sync + 'static {
         _selector: Option<u16>,
     ) -> Option<Vec<(&'static str, &'static str)>> {
         None
+    }
+
+    /// How C's `fetch_values()` for this record type reacts to a link read
+    /// that fails. Drives the framework's [`Self::multi_input_links`] fetch
+    /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::ReadAll
     }
 
     /// Return multi-output link field pairs: (link_field, value_field).

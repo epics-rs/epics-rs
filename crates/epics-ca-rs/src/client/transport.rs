@@ -87,26 +87,6 @@ type ClientTlsConfig = Arc<tokio_rustls::rustls::ClientConfig>;
 /// Timeout for echo response before declaring connection dead (matches C EPICS CA_ECHO_TIMEOUT).
 const ECHO_TIMEOUT_SECS: u64 = 5;
 
-/// Maximum accumulated TCP read buffer before disconnecting.
-///
-/// This MUST be >= the largest legal single frame, otherwise a valid
-/// large waveform (e.g. a 2 MB array, well under the 16 MB
-/// `max_payload_size()` default) sent by a server would push
-/// `accumulated` past the cap and the connection would be closed
-/// before the frame could be parsed — a permanent failure that
-/// survives reconnect (the server re-sends, the client closes again).
-///
-/// Largest legal frame = extended header (24 bytes) + `max_payload_size()`
-/// payload. A 64 KiB slack covers a partially-received next frame
-/// pipelined behind a full one in the same read burst. `max_payload_size()`
-/// honours `EPICS_CA_MAX_ARRAY_BYTES`, so the cap tracks operator overrides.
-/// Mirrors the server-side cap in `server/tcp.rs`.
-fn max_accumulated() -> usize {
-    crate::protocol::max_payload_size()
-        .saturating_add(24)
-        .saturating_add(64 * 1024)
-}
-
 /// C `tcpiiu::bytesArePendingInOS()` — "are there unread bytes still sitting
 /// in the OS receive buffer right now?" (`tcpiiu.cpp:544`, an `ioctl(FIONREAD)`
 /// under `osiSock`). This is the sole input to libca's flow control
@@ -1355,6 +1335,15 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
 
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
+    // C `tcpiiu::processIncoming`'s receive-side body limit and its
+    // ignore-don't-close policy (`tcpiiu.cpp:1207-1283`). `None` — the C
+    // default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`) — means the circuit accepts
+    // any payload the server announces; an operator who turns it off gets a
+    // limit, and over-limit responses are dropped one-by-one with a single
+    // log line. Neither case ever closes the circuit.
+    let recv_body_limit = crate::protocol::max_recv_body_bytes();
+    let mut bytes_to_drain: usize = 0;
+    let mut oversize_logged = false;
     let idle_timeout = Duration::from_secs(echo_idle_secs());
     let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
     let mut echo_pending = false;
@@ -1626,17 +1615,18 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // `bytesArePendingInOS()` (`tcpiiu.cpp:543-546`).
         accumulated.extend_from_slice(&buf[..n]);
 
-        // Guard against unbounded buffer growth from malformed servers.
-        let accum_cap = max_accumulated();
-        if accumulated.len() > accum_cap {
-            eprintln!(
-                "CA: {server_addr}: accumulated TCP buffer exceeded {accum_cap} bytes, closing"
-            );
-            let _ = event_tx.send(TransportEvent::TcpClosed {
-                server_addr,
-                priority,
-            });
-            return;
+        // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1276-1282`) drains an
+        // ignored oversize body across reads with `recvQue.removeBytes` and
+        // returns to await the rest. `bytes_to_drain` is that counter: while
+        // it is non-zero every byte read belongs to a message we already
+        // decided to ignore, so it is consumed before framing resumes.
+        if bytes_to_drain > 0 {
+            let take = bytes_to_drain.min(accumulated.len());
+            accumulated.drain(..take);
+            bytes_to_drain -= take;
+            if bytes_to_drain > 0 {
+                continue;
+            }
         }
 
         let mut offset = 0;
@@ -1644,13 +1634,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             let frame = &accumulated[offset..];
             // C `tcpiiu.cpp::processIncoming` distinguishes a *partial*
             // extended header (await more bytes) from a *definitively
-            // malformed* one (close the connection). `from_bytes_extended`
-            // returns `Err` for both, so a blanket `break` (await more)
-            // would spin: a malformed header is re-parsed on every read,
-            // never closing until the accumulation cap is hit. Detect the
-            // only legitimate "await more" case — an extended-form header
-            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present
-            // — and treat every other parse error as a hard close.
+            // malformed* one (close the connection). Detect the only
+            // legitimate "await more" case — an extended-form header
+            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present —
+            // and treat every other parse error as a hard close.
             let is_partial_extended_header =
                 frame.len() >= 4 && frame[2] == 0xFF && frame[3] == 0xFF && frame.len() < 24;
             let (hdr, hdr_size) = match CaHeader::from_bytes_extended(frame) {
@@ -1661,57 +1648,18 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     break;
                 }
                 Err(e) => {
-                    // C `libca/tcpiiu.cpp:1269-1284` logs ONCE
-                    // and skips an oversized message (`m_postsize >
-                    // curDataMax` with realloc failure) via
-                    // `recvQue.removeBytes` — circuit kept alive.
-                    // Pre-fix Rust always closed. Try to recover the
-                    // same way: re-read the announced postsize and
-                    // skip header + payload if the bytes are present.
-                    let base_post = u16::from_be_bytes([frame[2], frame[3]]) as usize;
-                    let skip = if base_post == 0xFFFF && frame.len() >= 24 {
-                        let ext_post =
-                            u32::from_be_bytes([frame[16], frame[17], frame[18], frame[19]])
-                                as usize;
-                        // Sanity cap to stop a corrupted ext_post from
-                        // forcing us to wait for gigabytes of "data";
-                        // if the announced size dwarfs the buffer cap
-                        // it's safer to close.
-                        if ext_post > max_payload_size() * 2 {
-                            None
-                        } else {
-                            Some(24 + ext_post)
-                        }
-                    } else if base_post == 0xFFFF {
-                        // Need annex bytes before we can recover.
-                        break;
-                    } else {
-                        Some(16 + base_post)
-                    };
-                    if let Some(skip_n) = skip {
-                        if accumulated.len() - offset >= skip_n {
-                            tracing::warn!(
-                                server = %server_addr,
-                                err = %e,
-                                skip = skip_n,
-                                "CA: oversized / unparseable TCP frame; skipping (libca tcpiiu:1269-1284 parity)"
-                            );
-                            metrics::counter!("ca_client_oversized_frame_skips_total").increment(1);
-                            offset += skip_n;
-                            continue;
-                        } else {
-                            // Wait for the rest of the bytes before
-                            // skipping.
-                            break;
-                        }
-                    } else {
-                        eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
-                        let _ = event_tx.send(TransportEvent::TcpClosed {
-                            server_addr,
-                            priority,
-                        });
-                        return;
-                    }
+                    // The parser carries no size policy (an oversize body is
+                    // a valid header — see `max_recv_body_bytes`, and the
+                    // ignore-don't-close handling below), so the only way to
+                    // land here is a header too short to parse, which the
+                    // loop condition and the partial-annex arm above have
+                    // already excluded. Treat it as a malformed peer.
+                    eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
+                    let _ = event_tx.send(TransportEvent::TcpClosed {
+                        server_addr,
+                        priority,
+                    });
+                    return;
                 }
             };
             let actual_post = hdr.actual_postsize();
@@ -1736,6 +1684,33 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 return;
             }
             let msg_len = hdr_size + actual_post;
+
+            // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1269-1283`): a body the
+            // circuit's cache cannot hold is IGNORED — logged once, drained
+            // with `recvQue.removeBytes`, circuit kept. Unreachable with C's
+            // default (`recv_body_limit == None`), which is the whole point:
+            // a C client reads a 33 MB waveform from a C IOC without
+            // complaint, so ours must too.
+            if recv_body_limit.is_some_and(|limit| actual_post > limit) {
+                if !oversize_logged {
+                    eprintln!(
+                        "CA: {server_addr}: response with payload size={actual_post} \
+                         > EPICS_CA_MAX_ARRAY_BYTES ignored"
+                    );
+                    oversize_logged = true;
+                }
+                let present = accumulated.len() - offset;
+                if msg_len <= present {
+                    offset += msg_len;
+                    continue;
+                }
+                // The body is still arriving: consume what is here and carry
+                // the remainder into the next reads (C keeps `curDataBytes`
+                // and returns true to await more).
+                bytes_to_drain = msg_len - present;
+                offset = accumulated.len();
+                break;
+            }
 
             if offset + msg_len > accumulated.len() {
                 break;
@@ -2512,39 +2487,149 @@ mod server_connection_drop_tests {
 }
 
 #[cfg(test)]
-mod framing_cap_tests {
-    //! BUG 2: the accumulation cap must be >= the largest legal frame,
-    //! otherwise a valid large waveform (under `max_payload_size()`)
-    //! closes the connection permanently.
-    use super::max_accumulated;
-    use crate::protocol::max_payload_size;
+mod recv_body_limit_tests {
+    //! R6-21: the receive path must accept any payload a C server can send.
+    //! C bounds the receive body with `EPICS_CA_AUTO_ARRAY_BYTES` (default
+    //! YES ⇒ NO bound, `cac.cpp:227-232`), not `EPICS_CA_MAX_ARRAY_BYTES`,
+    //! and an over-bound response is IGNORED, never fatal
+    //! (`tcpiiu.cpp:1269-1283`). The pre-fix Rust client closed the circuit
+    //! when the accumulated buffer passed a cap derived from
+    //! `EPICS_CA_MAX_ARRAY_BYTES` — permanently, since the server re-sends
+    //! the same waveform on reconnect.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
-    #[test]
-    fn accumulation_cap_admits_largest_legal_frame() {
-        // A legal frame is at most extended-header (24 bytes) +
-        // `max_payload_size()`. The cap must strictly exceed it so the
-        // full frame can sit in `accumulated` before being drained.
-        let largest_legal_frame = max_payload_size() + 24;
+    /// A frame announcing a body far larger than `max_payload_size()` must
+    /// NOT close the circuit: the loop waits for the body, exactly as C waits
+    /// for the bytes in `recvQue`. (Pre-fix: `TcpClosed` immediately, both
+    /// from the parser's "payload too large" and from the accumulation cap.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversize_body_announcement_does_not_close_the_circuit() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // Extended header announcing 3x max_payload_size() of body.
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        let huge = (crate::protocol::max_payload_size() * 3) as u32;
+        frame.extend_from_slice(&huge.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(frame.len(), 24);
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write header");
+        client.flush().await.expect("flush");
+
+        let early = tokio::time::timeout(Duration::from_millis(300), event_rx.recv()).await;
         assert!(
-            max_accumulated() >= largest_legal_frame,
-            "accumulation cap {} is smaller than the largest legal frame {} \
-             — a valid large waveform would be rejected (BUG 2)",
-            max_accumulated(),
-            largest_legal_frame
+            early.is_err(),
+            "an oversize payload must never close a CA circuit — C logs and \
+             ignores the message, and by default has no size limit at all"
         );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 
-    #[test]
-    fn accumulation_cap_admits_two_megabyte_waveform() {
-        // The concrete BUG 2 repro: a 2 MB array payload is legal under
-        // the 16 MB default and must NOT trip the cap.
-        let two_mb_frame = 2 * 1024 * 1024 + 24;
-        assert!(
-            max_accumulated() >= two_mb_frame,
-            "2 MB waveform frame ({two_mb_frame} bytes) exceeds the \
-             accumulation cap ({}) — permanent failure for arrays > 1 MB",
-            max_accumulated()
+    /// The end of the same story: a body PAST `max_payload_size()` is
+    /// delivered, and framing resumes on the frame that follows it. Uses a
+    /// 20 MiB payload — over the 16 MiB `max_payload_size()` default that the
+    /// pre-fix client turned into a hard close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_larger_than_max_payload_size_is_delivered() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // 20 MiB EVENT_ADD body for a subscription nobody is waiting on: the
+        // dispatcher drops it, but the framer must consume exactly
+        // 24 + 20 MiB bytes and carry on.
+        const BODY: usize = 20 * 1024 * 1024;
+        assert!(BODY > crate::protocol::max_payload_size() / 2);
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        frame.extend_from_slice(&(BODY as u32).to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.resize(24 + BODY, 0);
+
+        // Trailing VERSION frame: proves the framer resynchronised on the
+        // byte after the huge body rather than closing or desyncing.
+        let mut version = CaHeader::new(CA_PROTO_VERSION);
+        version.count = 13;
+        frame.extend_from_slice(&version.to_bytes());
+
+        let mut client = client_io;
+        tokio::spawn(async move {
+            let _ = client.write_all(&frame).await;
+            let _ = client.flush().await;
+            // Keep the write half alive until the loop has parsed.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+
+        let evt = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(TransportEvent::ServerVersion { minor_version, .. }) => {
+                        return Some(minor_version);
+                    }
+                    Some(TransportEvent::TcpClosed { .. }) => return None,
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("read_loop must parse past a 20 MiB body");
+        assert_eq!(
+            evt,
+            Some(13),
+            "the frame after a 20 MiB body must still be framed — a large \
+             array must not close or desync the circuit"
         );
+
+        loop_handle.abort();
     }
 }
 
@@ -2553,8 +2638,7 @@ mod malformed_header_close_tests {
     //! BUG 3: the client read loop must distinguish a *partial*
     //! extended header (await more bytes) from a *definitively
     //! malformed* one (close the connection). A blanket "await more"
-    //! spins forever re-parsing the same bad bytes until the
-    //! accumulation cap is hit.
+    //! spins forever re-parsing the same bad bytes.
     use super::*;
     use dashmap::DashMap;
     use std::sync::Arc;
@@ -2587,13 +2671,13 @@ mod malformed_header_close_tests {
         )
     }
 
-    /// A definitively malformed extended header (postsize=0xFFFF marking
-    /// extended form, extended postsize declared far beyond
-    /// `max_payload_size()`) must CLOSE the connection: `read_loop`
-    /// emits `TcpClosed` and returns. Pre-fix it `break`d to await more
-    /// bytes and re-parsed the same error on every read.
+    /// A definitively malformed header must CLOSE the connection, and after
+    /// R6-21 the definitive malformation is C's: a payload size that is not
+    /// 8-byte aligned (`tcpiiu.cpp:1202-1207`, "server sent missaligned
+    /// payload" ⇒ `return false` ⇒ circuit dropped). A merely *large*
+    /// postsize is NOT malformed — see `recv_body_limit_tests`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn malformed_extended_header_closes_connection() {
+    async fn misaligned_payload_closes_connection() {
         let (server_addr, mut event_rx, event_tx, write_tx, ba_rx, in_flight, last_rx_at) =
             loop_inputs();
         let (client_io, server_io) = tokio::io::duplex(256);
@@ -2612,19 +2696,10 @@ mod malformed_header_close_tests {
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
-        // 24-byte extended header: postsize=0xFFFF (extended marker),
-        // extended postsize set above the sanity cap (2x
-        // max_payload_size()) so the skip-and-continue recovery
-        // can't apply and the loop still closes the circuit.
-        // Values <= 2x max_payload_size() are now treated as
-        // recoverable (skip + continue) per libca tcpiiu:1269-1284.
+        // 16-byte header declaring a 12-byte payload: 12 & 0x7 != 0.
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-        hdr.postsize = 0xFFFF;
-        let mut frame = hdr.to_bytes().to_vec();
-        let bad_post = (crate::protocol::max_payload_size() * 3) as u32;
-        frame.extend_from_slice(&bad_post.to_be_bytes()); // extended postsize
-        frame.extend_from_slice(&0u32.to_be_bytes()); // extended count
-        assert_eq!(frame.len(), 24);
+        hdr.postsize = 12;
+        let frame = hdr.to_bytes().to_vec();
 
         let mut client = client_io;
         client.write_all(&frame).await.expect("write bad header");
@@ -2635,10 +2710,10 @@ mod malformed_header_close_tests {
         // only passes if the loop closes on its own.
         let closed = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
-            .expect("read_loop must close on a malformed header, not spin");
+            .expect("read_loop must close on a misaligned payload, not spin");
         assert!(
             matches!(closed, Some(TransportEvent::TcpClosed { .. })),
-            "malformed extended header must emit TcpClosed"
+            "misaligned payload must emit TcpClosed"
         );
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
         drop(client);

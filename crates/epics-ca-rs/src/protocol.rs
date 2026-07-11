@@ -239,6 +239,13 @@ pub const ECA_MESSAGE_TEXT: &[&str] = &[
 /// Strict-C-parity callers who want the 16 KB default can set
 /// `EPICS_CA_MAX_ARRAY_BYTES=16384` explicitly. The env-honour
 /// behaviour is unchanged.
+///
+/// **This is a SEND/serve-side bound only.** It plays no part in what a
+/// circuit will *receive*: libca's receive path is bounded by
+/// [`max_recv_body_bytes`], which is unbounded by default (C
+/// `EPICS_CA_AUTO_ARRAY_BYTES=YES`). Setting `EPICS_CA_MAX_ARRAY_BYTES` does
+/// not make a C *receiver* reject a large array, so it must not make ours
+/// either.
 pub fn max_payload_size() -> usize {
     epics_base_rs::runtime::env::get("EPICS_CA_MAX_ARRAY_BYTES")
         .and_then(|s| s.parse::<usize>().ok())
@@ -285,6 +292,38 @@ pub fn max_recv_bytes_tcp() -> usize {
         MAX_TCP
     } else {
         max_bytes
+    }
+}
+
+/// C `EPICS_CA_AUTO_ARRAY_BYTES` (`configure/CONFIG_ENV:37`, compiled default
+/// `YES` since 3.16).
+///
+/// C reads it with `envGetBoolConfigParam` (`envSubr.c:325-333`), which is
+/// literally `epicsStrCaseCmp(text, "yes") == 0` — so ONLY the word "yes"
+/// (any case) enables it. `EPICS_CA_AUTO_ARRAY_BYTES=1` disables it, quirk
+/// included. Unset resolves to the compiled default and is therefore `true`.
+pub fn auto_array_bytes() -> bool {
+    epics_base_rs::runtime::env::get_bool("EPICS_CA_AUTO_ARRAY_BYTES", true)
+}
+
+/// The receive-side body limit of a CA circuit — `None` means "no limit",
+/// which is C's DEFAULT.
+///
+/// `cac::cac` (`cac.cpp:223-232`) only builds `tcpLargeRecvBufFreeList` when
+/// `EPICS_CA_AUTO_ARRAY_BYTES` is off. With it on (the default),
+/// `tcpiiu::processIncoming` takes the `if (!tcpLargeRecvBufFreeList)` branch
+/// (`tcpiiu.cpp:1214-1225`) and `malloc`/`realloc`s the body cache to
+/// `((m_postsize-1)|0xfff)+1` — whatever the server announced, no cap.
+///
+/// With it off, the cache is capped at [`max_recv_bytes_tcp`] and an
+/// over-cap response is *ignored*, not fatal: C logs once and drains the
+/// body with `recvQue.removeBytes` (`tcpiiu.cpp:1269-1283`), keeping the
+/// circuit. A CA circuit is NEVER closed for an oversized payload.
+pub fn max_recv_body_bytes() -> Option<usize> {
+    if auto_array_bytes() {
+        None
+    } else {
+        Some(max_recv_bytes_tcp())
     }
 }
 
@@ -651,9 +690,14 @@ impl CaHeader {
             }
             let ext_post = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
             let ext_count = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
-            if ext_post as usize > max_payload_size() {
-                return Err(CaError::Protocol("payload too large".into()));
-            }
+            // NO size policy here. An `m_postsize` of 33 MB is a
+            // syntactically valid extended header, and libca's receiver
+            // accepts it by default (`EPICS_CA_AUTO_ARRAY_BYTES=YES` ⇒
+            // `tcpiiu.cpp:1214-1220` grows the body cache to fit). The bound
+            // — and what to do at it — belongs to whichever loop owns the
+            // receive buffer: the client applies [`max_recv_body_bytes`] and
+            // drains, the server applies its own `maxstk` check and replies
+            // ECA_TOLARGE (`camessage.c:2471-2489`, `server/tcp.rs`).
             hdr.extended_postsize = Some(ext_post);
             hdr.extended_count = Some(ext_count);
             consumed = 24;
@@ -898,6 +942,93 @@ mod tests {
         }
     }
 
+    /// The receive path's bound is `EPICS_CA_AUTO_ARRAY_BYTES`, not
+    /// `EPICS_CA_MAX_ARRAY_BYTES`. C's compiled default is YES
+    /// (`configure/CONFIG_ENV:37`) ⇒ `tcpLargeRecvBufFreeList` stays NULL
+    /// (`cac.cpp:227-232`) ⇒ `processIncoming` grows the body cache to fit
+    /// whatever arrives (`tcpiiu.cpp:1214-1220`). So a C client reads a 33 MB
+    /// waveform with `EPICS_CA_MAX_ARRAY_BYTES` unset — and with it SET, too.
+    ///
+    /// `envGetBoolConfigParam` is `epicsStrCaseCmp(text, "yes") == 0`
+    /// (`envSubr.c:331`), so anything that is not the word "yes" turns the
+    /// auto sizing OFF — including "1" and "true". Quirk replicated.
+    #[test]
+    #[serial_test::serial]
+    fn receive_body_limit_is_absent_unless_auto_array_bytes_is_disabled() {
+        let saved_auto = std::env::var("EPICS_CA_AUTO_ARRAY_BYTES").ok();
+        let saved_max = std::env::var("EPICS_CA_MAX_ARRAY_BYTES").ok();
+        // SAFETY: serial_test::serial; both vars are restored below.
+        unsafe {
+            std::env::remove_var("EPICS_CA_AUTO_ARRAY_BYTES");
+            std::env::remove_var("EPICS_CA_MAX_ARRAY_BYTES");
+        }
+
+        assert!(auto_array_bytes(), "unset ⇒ compiled default YES");
+        assert_eq!(
+            max_recv_body_bytes(),
+            None,
+            "C's default receive path has no cap at all"
+        );
+
+        // Setting the array-bytes cap must NOT introduce a receive bound:
+        // under AUTO=YES C ignores it on receive entirely.
+        unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "16384") };
+        assert_eq!(
+            max_recv_body_bytes(),
+            None,
+            "EPICS_CA_MAX_ARRAY_BYTES alone must not bound the receive path"
+        );
+
+        // Only "yes" (any case) keeps auto sizing on.
+        unsafe { std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", "YeS") };
+        assert!(auto_array_bytes());
+        assert_eq!(max_recv_body_bytes(), None);
+
+        // Anything else — including "1" — turns it off, and only then does
+        // the cap apply: `maxRecvBytesTCP` = 16384 + 24 (`cac.cpp:204`).
+        unsafe { std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", "1") };
+        assert!(!auto_array_bytes(), "C: only the word \"yes\" is true");
+        assert_eq!(max_recv_body_bytes(), Some(16384 + 24));
+
+        unsafe { std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", "NO") };
+        assert_eq!(max_recv_body_bytes(), Some(16384 + 24));
+
+        // A cap below MAX_TCP is rounded up to MAX_TCP (`cac.cpp:206-214`).
+        unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", "8") };
+        assert_eq!(max_recv_body_bytes(), Some(MAX_TCP));
+
+        // SAFETY: see above. Restore for subsequent serial tests.
+        unsafe {
+            match saved_auto {
+                Some(v) => std::env::set_var("EPICS_CA_AUTO_ARRAY_BYTES", v),
+                None => std::env::remove_var("EPICS_CA_AUTO_ARRAY_BYTES"),
+            }
+            match saved_max {
+                Some(v) => std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", v),
+                None => std::env::remove_var("EPICS_CA_MAX_ARRAY_BYTES"),
+            }
+        }
+    }
+
+    /// The header codec carries no size policy: an extended header announcing
+    /// a body far past `max_payload_size()` is syntactically valid and must
+    /// parse. Rejecting it here is what closed the circuit on a 33 MB
+    /// waveform; C's `tcpiiu` accepts the header and allocates the body.
+    #[test]
+    fn extended_header_with_a_huge_body_still_parses() {
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.postsize = 0xFFFF;
+        let mut bytes = hdr.to_bytes().to_vec();
+        let huge = (max_payload_size() * 3) as u32;
+        bytes.extend_from_slice(&huge.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+
+        let (parsed, consumed) =
+            CaHeader::from_bytes_extended(&bytes).expect("a large body is a valid header");
+        assert_eq!(consumed, 24);
+        assert_eq!(parsed.actual_postsize(), huge as usize);
+    }
+
     #[test]
     fn test_pad_string() {
         let padded = pad_string("TEST");
@@ -980,8 +1111,12 @@ mod tests {
         assert_eq!(hdr.actual_count(), 0xFFFF);
     }
 
+    /// A payload past `MAX_PAYLOAD_SIZE` is NOT a parse error: the codec has
+    /// no size policy (R6-21). The receive loop that owns the buffer applies
+    /// the bound — the client via [`max_recv_body_bytes`] (unbounded by C's
+    /// default), the server via its own `maxstk` check + ECA_TOLARGE reply.
     #[test]
-    fn test_extended_payload_too_large() {
+    fn test_extended_payload_past_max_payload_size_parses() {
         let mut buf = vec![0u8; 24];
         // Set postsize=0xFFFF, count=0
         buf[2] = 0xFF;
@@ -993,7 +1128,8 @@ mod tests {
         buf[16..20].copy_from_slice(&big.to_be_bytes());
         buf[20..24].copy_from_slice(&1u32.to_be_bytes());
 
-        let result = CaHeader::from_bytes_extended(&buf);
-        assert!(result.is_err());
+        let (hdr, consumed) = CaHeader::from_bytes_extended(&buf).expect("valid extended header");
+        assert_eq!(consumed, 24);
+        assert_eq!(hdr.actual_postsize(), big as usize);
     }
 }

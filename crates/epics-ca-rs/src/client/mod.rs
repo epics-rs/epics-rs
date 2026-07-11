@@ -1704,6 +1704,12 @@ impl CaChannel {
         }
     }
 
+    /// Thin alias for the crate's put-framing owner,
+    /// [`crate::protocol::build_put_frame`] (C
+    /// `comQueSend::insertRequestWithPayLoad`). The coordinator path in
+    /// `transport.rs` frames through the same function, so the wire
+    /// bytes cannot drift between the direct-writer and coordinator
+    /// routes.
     fn build_write_frame(
         cmd: u16,
         sid: u32,
@@ -1713,27 +1719,7 @@ impl CaChannel {
         payload: Vec<u8>,
         peer_minor: u16,
     ) -> CaResult<Vec<u8>> {
-        let padded_len = align8(payload.len());
-        let mut padded = payload;
-        padded.resize(padded_len, 0);
-
-        let mut hdr = CaHeader::new(cmd);
-        hdr.data_type = data_type;
-        hdr.cid = sid;
-        if let Some(ioid) = ioid {
-            hdr.available = ioid;
-        }
-        // A payload or count that needs the extended header cannot be
-        // sent to a pre-V49 peer — libca throws `cacChannel::outOfBounds`
-        // out of `comQueSend::insertRequestHeader` (`comQueSend.cpp:313`)
-        // and the put fails locally with ECA_BADCOUNT
-        // (`oldChannelNotify.cpp:378`).
-        hdr.set_payload_size(padded.len(), count, peer_minor)
-            .map_err(|_| CaError::BadCount)?;
-
-        let mut frame = hdr.to_bytes_extended();
-        frame.extend_from_slice(&padded);
-        Ok(frame)
+        crate::protocol::build_put_frame(cmd, sid, data_type, count, ioid, payload, peer_minor)
     }
 
     fn send_read_notify_fast(

@@ -520,6 +520,84 @@ pub fn check_write_element_count(count: u32, dbr_type: u16, peer_minor: u16) -> 
     Ok(())
 }
 
+/// `MAX_STRING_SIZE` (`db_access.h:34`) — the fixed width of a
+/// `DBR_STRING` element, and the bound C checks a scalar string put
+/// against (`comQueSend.cpp:335`).
+pub const MAX_STRING_SIZE: usize = 40;
+
+/// C `dbr_size[DBR_STRING]` is 40, but a *scalar* string put does not
+/// send 40 bytes: `comQueSend::insertRequestWithPayLoad`
+/// (`comQueSend.cpp:332-341`) frames only the NUL-terminated string.
+///
+/// ```text
+/// size        = strlen(pStr) + 1u;                 // includes the NUL
+/// if (size > MAX_STRING_SIZE) throw outOfBounds;   // -> ECA_BADCOUNT
+/// payloadSize = CA_MESSAGE_ALIGN(size);            // round up to 8
+/// pushString(pStr, size);                          // then zero padding
+/// ```
+///
+/// So `caput PV abc` puts an 8-byte body, not a 40-byte one. Every
+/// other shape — scalar non-string (`comQueSend.cpp:344-350`,
+/// `dbr_size[type]`) and any array including a string array
+/// (`comQueSend.cpp:366-376`, `dbr_size_n`) — is already the natural
+/// serialized length, so only this one case contracts.
+///
+/// A payload with no NUL inside `MAX_STRING_SIZE` is C's `size > 40`
+/// case: the string does not fit a `DBR_STRING` element, and C throws
+/// `cacChannel::outOfBounds` → `ECA_BADCOUNT` (`oldChannelNotify.cpp:378`)
+/// without a byte reaching the wire.
+fn scalar_string_put_len(payload: &[u8]) -> CaResult<usize> {
+    match payload.iter().take(MAX_STRING_SIZE).position(|&b| b == 0) {
+        Some(nul) => Ok(nul + 1),
+        // Shorter than an element and unterminated: `strlen` would run
+        // to the end of the buffer, so C frames len+1 bytes.
+        None if payload.len() < MAX_STRING_SIZE => Ok(payload.len() + 1),
+        None => Err(CaError::BadCount),
+    }
+}
+
+/// Build a client put frame (`CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY`).
+///
+/// The single owner of client put framing — C's `comQueSend::
+/// insertRequestWithPayLoad` (`comQueSend.cpp:318-383`). It decides the
+/// on-the-wire body length (see [`scalar_string_put_len`]), pads to the
+/// 8-byte message alignment C applies to every payload
+/// (`CA_MESSAGE_ALIGN`, `caProto.h:158`), and picks the 16- or 24-byte
+/// header form for the peer's protocol version.
+///
+/// `Err(CaError::BadCount)` means C would have thrown
+/// `cacChannel::outOfBounds` before queueing: an over-long scalar
+/// string, or a payload/count that needs the extended header on a
+/// pre-V49 circuit (`comQueSend.cpp:313`).
+pub fn build_put_frame(
+    cmd: u16,
+    sid: u32,
+    data_type: u16,
+    count: u32,
+    ioid: Option<u32>,
+    payload: Vec<u8>,
+    peer_minor: u16,
+) -> CaResult<Vec<u8>> {
+    let mut body = payload;
+    if count == 1 && data_type == epics_base_rs::types::DBR_STRING {
+        body.truncate(scalar_string_put_len(&body)?);
+    }
+    body.resize(align8(body.len()), 0);
+
+    let mut hdr = CaHeader::new(cmd);
+    hdr.data_type = data_type;
+    hdr.cid = sid;
+    if let Some(ioid) = ioid {
+        hdr.available = ioid;
+    }
+    hdr.set_payload_size(body.len(), count, peer_minor)
+        .map_err(|_| CaError::BadCount)?;
+
+    let mut frame = hdr.to_bytes_extended();
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
 /// 16-byte CA message header (big-endian), with optional extended fields.
 #[derive(Debug, Clone, Copy)]
 pub struct CaHeader {
@@ -865,6 +943,114 @@ mod tests {
         assert!(check_write_element_count(1, DBR_DOUBLE, 8).is_ok());
         // A V49 circuit frames the same array.
         assert!(check_write_element_count(MAX_ELEM, DBR_DOUBLE, 13).is_ok());
+    }
+
+    /// `comQueSend.cpp:332-341`: a scalar DBR_STRING put frames
+    /// `align8(strlen + 1)`, not the fixed 40-byte element. The body is
+    /// the NUL-terminated string plus zero padding to the 8-byte
+    /// message alignment.
+    #[test]
+    fn scalar_string_put_frames_align8_of_strlen_plus_nul() {
+        const DBR_STRING: u16 = 0;
+        // `EpicsValue::String("abc")` serializes as 40 NUL-padded bytes;
+        // C would frame 4 bytes ("abc\0") rounded up to 8.
+        let mut payload = vec![0u8; 40];
+        payload[..3].copy_from_slice(b"abc");
+        let frame =
+            build_put_frame(CA_PROTO_WRITE, 7, DBR_STRING, 1, None, payload, 13).expect("frames");
+        let (hdr, consumed) = CaHeader::from_bytes_extended(&frame).expect("parses");
+        assert_eq!(hdr.actual_postsize(), 8, "align8(strlen(\"abc\") + 1) == 8");
+        assert_eq!(frame.len() - consumed, 8, "body is 8 bytes, not 40");
+        assert_eq!(&frame[consumed..], b"abc\0\0\0\0\0");
+
+        // Boundary: 7 chars + NUL == 8 exactly (no padding), and 8
+        // chars + NUL == 9 rounds up to 16 — the first length that
+        // needs a second alignment unit.
+        for (s, want) in [(&b"abcdefg"[..], 8usize), (&b"abcdefgh"[..], 16)] {
+            let mut payload = vec![0u8; 40];
+            payload[..s.len()].copy_from_slice(s);
+            let frame = build_put_frame(CA_PROTO_WRITE, 7, DBR_STRING, 1, None, payload, 13)
+                .expect("frames");
+            let (hdr, consumed) = CaHeader::from_bytes_extended(&frame).expect("parses");
+            assert_eq!(hdr.actual_postsize(), want);
+            assert_eq!(frame.len() - consumed, want);
+        }
+
+        // The empty string is 1 byte (`"\0"`) → one alignment unit.
+        let frame = build_put_frame(CA_PROTO_WRITE, 7, DBR_STRING, 1, None, vec![0u8; 40], 13)
+            .expect("frames");
+        assert_eq!(
+            CaHeader::from_bytes_extended(&frame).unwrap().0.postsize,
+            8,
+            "an empty string still frames one 8-byte alignment unit"
+        );
+
+        // 39 chars + NUL == 40: the full element, already 8-aligned.
+        let payload = vec![b'x'; 39]
+            .into_iter()
+            .chain(std::iter::once(0u8))
+            .collect::<Vec<u8>>();
+        let frame =
+            build_put_frame(CA_PROTO_WRITE, 7, DBR_STRING, 1, None, payload, 13).expect("frames");
+        assert_eq!(
+            CaHeader::from_bytes_extended(&frame).unwrap().0.postsize,
+            40
+        );
+
+        // 40 non-NUL bytes: `strlen + 1 > MAX_STRING_SIZE`, so C throws
+        // `cacChannel::outOfBounds` → ECA_BADCOUNT and nothing is sent.
+        assert!(matches!(
+            build_put_frame(CA_PROTO_WRITE, 7, DBR_STRING, 1, None, vec![b'x'; 40], 13),
+            Err(CaError::BadCount)
+        ));
+    }
+
+    /// The contraction is scalar-string ONLY. Every other shape keeps
+    /// the serialized length C computes from `dbr_size` / `dbr_size_n`
+    /// (`comQueSend.cpp:344-350,366-376`), padded to the 8-byte message
+    /// alignment.
+    #[test]
+    fn only_the_scalar_string_put_contracts() {
+        const DBR_STRING: u16 = 0;
+        const DBR_DOUBLE: u16 = 6;
+
+        // A DBR_STRING *array* stays 40 bytes per element.
+        let frame = build_put_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            7,
+            DBR_STRING,
+            2,
+            Some(1),
+            vec![0u8; 80],
+            13,
+        )
+        .expect("frames");
+        assert_eq!(
+            CaHeader::from_bytes_extended(&frame).unwrap().0.postsize,
+            80,
+            "a string array is dbr_size_n = 40 * n, never contracted"
+        );
+
+        // A scalar DBR_DOUBLE is dbr_size[DBR_DOUBLE] = 8, already
+        // aligned — and its zero bytes must not be read as a NUL
+        // terminator.
+        let frame = build_put_frame(
+            CA_PROTO_WRITE,
+            7,
+            DBR_DOUBLE,
+            1,
+            None,
+            0.0f64.to_be_bytes().to_vec(),
+            13,
+        )
+        .expect("frames");
+        let (hdr, consumed) = CaHeader::from_bytes_extended(&frame).expect("parses");
+        assert_eq!(hdr.postsize, 8);
+        assert_eq!(
+            frame.len() - consumed,
+            8,
+            "a zero double still puts 8 bytes"
+        );
     }
 
     #[test]

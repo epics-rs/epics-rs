@@ -551,18 +551,19 @@ fn process_command(
             server_addr,
             priority,
         } => {
-            let padded_len = align8(payload.len());
-            let mut padded = payload;
-            padded.resize(padded_len, 0);
-
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
-            let mut hdr = CaHeader::new(CA_PROTO_WRITE);
-            hdr.data_type = data_type;
-            hdr.cid = sid;
-            if hdr
-                .set_payload_size(padded.len(), count, peer_minor)
-                .is_err()
-            {
+            // Same framing owner as the direct-writer path
+            // (`CaChannel::build_write_frame`): C
+            // `comQueSend::insertRequestWithPayLoad`.
+            let Ok(frame) = crate::protocol::build_put_frame(
+                CA_PROTO_WRITE,
+                sid,
+                data_type,
+                count,
+                None,
+                payload,
+                peer_minor,
+            ) else {
                 // No IOID on a fire-and-forget WRITE, so there is no
                 // waiter to fail — libca's `ca_array_put` would have
                 // returned ECA_BADCOUNT to the caller synchronously
@@ -572,14 +573,12 @@ fn process_command(
                 // peer cannot parse.
                 eprintln!(
                     "CA: {server_addr}: dropping WRITE for sid {sid}: \
-                     extended header needed but peer speaks CA minor \
-                     {peer_minor} (< 9) — ECA_BADCOUNT"
+                     libca would throw cacChannel::outOfBounds for this \
+                     payload against a peer speaking CA minor {peer_minor} \
+                     — ECA_BADCOUNT"
                 );
                 return;
-            }
-
-            let mut frame = hdr.to_bytes_extended();
-            frame.extend_from_slice(&padded);
+            };
             send_frame(
                 connections,
                 server_writers,
@@ -597,27 +596,21 @@ fn process_command(
             server_addr,
             priority,
         } => {
-            let padded_len = align8(payload.len());
-            let mut padded = payload;
-            padded.resize(padded_len, 0);
-
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
-            let mut hdr = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-            hdr.data_type = data_type;
-            hdr.cid = sid;
-            hdr.available = ioid;
-            if hdr
-                .set_payload_size(padded.len(), count, peer_minor)
-                .is_err()
-            {
+            let Ok(frame) = crate::protocol::build_put_frame(
+                CA_PROTO_WRITE_NOTIFY,
+                sid,
+                data_type,
+                count,
+                Some(ioid),
+                payload,
+                peer_minor,
+            ) else {
                 if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
                     let _ = reply_tx.send(Err(epics_base_rs::error::CaError::BadCount));
                 }
                 return;
-            }
-
-            let mut frame = hdr.to_bytes_extended();
-            frame.extend_from_slice(&padded);
+            };
             send_frame(
                 connections,
                 server_writers,

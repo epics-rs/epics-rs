@@ -195,15 +195,22 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
 ///   `Err(EmptyMask)` is returned.
 /// - The root bit (bit 0) is always set when at least one descendant is
 ///   selected.
+/// - `request_desc = None` is pvxs's *invalid* (absent) pvRequest `Value` —
+///   what a `0xFF` NULL type descriptor decodes to. `pvRequest["field"]` on
+///   an invalid Value is itself invalid, so `request2mask` takes the
+///   `else if(!fields.valid()) foundrequested = true;` arm
+///   (`pvrequest.cpp:53-55`) and falls through to the "empty mask is
+///   wildcard" branch (`:63-68`): every bit set.
 pub fn request_to_mask(
     value_desc: &crate::pvdata::FieldDesc,
-    request_desc: &crate::pvdata::FieldDesc,
+    request_desc: Option<&crate::pvdata::FieldDesc>,
 ) -> Result<crate::proto::BitSet, RequestMaskError> {
-    // The standard selector key is `field`. No `field` entry at all (e.g.
-    // the "empty pvRequest" the Rust client sends as a 6-byte 0xFD-cached
-    // empty struct) → wildcard: select the whole structure. pvxs
-    // `request2mask` `else if(!fields.valid()) foundrequested = true`.
-    match mask_for_named_selector(value_desc, request_desc, "field") {
+    // The standard selector key is `field`. An absent pvRequest, or one with
+    // no `field` entry at all (e.g. the "empty pvRequest" the Rust client
+    // sends as a 6-byte 0xFD-cached empty struct) → wildcard: select the
+    // whole structure. pvxs `request2mask`
+    // `else if(!fields.valid()) foundrequested = true`.
+    match request_desc.and_then(|rd| mask_for_named_selector(value_desc, rd, "field")) {
         Some(result) => result,
         None => Ok(select_all_bits(value_desc)),
     }
@@ -228,17 +235,15 @@ pub fn request_to_mask(
 /// NT round trip where the put and readback types coincide).
 pub fn put_get_masks(
     value_desc: &crate::pvdata::FieldDesc,
-    request_desc: &crate::pvdata::FieldDesc,
+    request_desc: Option<&crate::pvdata::FieldDesc>,
 ) -> Result<(crate::proto::BitSet, crate::proto::BitSet), RequestMaskError> {
-    let put_mask = match mask_for_named_selector(value_desc, request_desc, "putField") {
-        Some(result) => result?,
-        None => request_to_mask(value_desc, request_desc)?,
+    let leg = |selector: &str| match request_desc
+        .and_then(|rd| mask_for_named_selector(value_desc, rd, selector))
+    {
+        Some(result) => result,
+        None => request_to_mask(value_desc, request_desc),
     };
-    let get_mask = match mask_for_named_selector(value_desc, request_desc, "getField") {
-        Some(result) => result?,
-        None => request_to_mask(value_desc, request_desc)?,
-    };
-    Ok((put_mask, get_mask))
+    Ok((leg("putField")?, leg("getField")?))
 }
 
 /// Set every bit of `value_desc` (root + all descendants) — the wildcard
@@ -1747,7 +1752,7 @@ mod tests {
             ],
         };
         assert!(
-            request_to_mask(&ntenum, &req).is_ok(),
+            request_to_mask(&ntenum, Some(&req)).is_ok(),
             "request_to_mask must resolve a nested value.index path"
         );
     }
@@ -1781,7 +1786,7 @@ mod tests {
             fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))],
         };
         assert_eq!(
-            request_to_mask(&value, &req_field_scalar),
+            request_to_mask(&value, Some(&req_field_scalar)),
             Err(RequestMaskError::EmptyMask),
             "a non-structure `field` must error, not select all"
         );
@@ -1792,9 +1797,48 @@ mod tests {
             struct_id: String::new(),
             fields: Vec::new(),
         };
-        let mask = request_to_mask(&value, &req_no_field).expect("absent field → wildcard");
+        let mask = request_to_mask(&value, Some(&req_no_field)).expect("absent field → wildcard");
         for i in 0..value.total_bits() {
             assert!(mask.get(i), "wildcard must set bit {i}");
+        }
+    }
+
+    /// An ABSENT pvRequest — pvxs's invalid `Value`, what a NULL (`0xFF`)
+    /// type descriptor decodes to (`dataencode.cpp:737-744`) — is the
+    /// all-fields wildcard, not an error: `pvRequest["field"]` on an invalid
+    /// Value is itself invalid, so `request2mask` takes
+    /// `else if(!fields.valid()) foundrequested = true;`
+    /// (`pvrequest.cpp:53-55`) and the still-empty mask is widened by the
+    /// "empty mask is wildcard" branch (`:63-68`). Both mask entry points
+    /// must agree.
+    #[test]
+    fn absent_pvrequest_is_the_all_fields_wildcard() {
+        use crate::pvdata::ScalarType;
+
+        let value = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+
+        let mask = request_to_mask(&value, None).expect("an absent pvRequest is never an error");
+        for i in 0..value.total_bits() {
+            assert!(mask.get(i), "absent pvRequest must set every bit ({i})");
+        }
+
+        let (put_mask, get_mask) =
+            put_get_masks(&value, None).expect("an absent pvRequest is never an error");
+        for i in 0..value.total_bits() {
+            assert!(put_mask.get(i), "absent pvRequest put leg must set bit {i}");
+            assert!(get_mask.get(i), "absent pvRequest get leg must set bit {i}");
         }
     }
 
@@ -1842,7 +1886,7 @@ mod tests {
                 ),
             ],
         };
-        let (put_mask, get_mask) = put_get_masks(&value, &req).expect("distinct masks");
+        let (put_mask, get_mask) = put_get_masks(&value, Some(&req)).expect("distinct masks");
         // put-leg selects `value` (bit 1), not `aux` (bit 2).
         assert!(put_mask.get(0) && put_mask.get(1) && !put_mask.get(2));
         // get-leg selects `aux` (bit 2), not `value` (bit 1).
@@ -1882,7 +1926,7 @@ mod tests {
                 },
             )],
         };
-        let (put_mask, get_mask) = put_get_masks(&value, &req_field).expect("field fallback");
+        let (put_mask, get_mask) = put_get_masks(&value, Some(&req_field)).expect("field fallback");
         assert_eq!(
             put_mask, get_mask,
             "absent putField/getField → both legs use the `field` selection"
@@ -1894,7 +1938,8 @@ mod tests {
             struct_id: String::new(),
             fields: Vec::new(),
         };
-        let (put_mask, get_mask) = put_get_masks(&value, &req_empty).expect("empty → wildcard");
+        let (put_mask, get_mask) =
+            put_get_masks(&value, Some(&req_empty)).expect("empty → wildcard");
         for i in 0..value.total_bits() {
             assert!(put_mask.get(i) && get_mask.get(i), "wildcard bit {i}");
         }

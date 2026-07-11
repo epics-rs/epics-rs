@@ -3799,6 +3799,135 @@ async fn test_udf_cleared_by_process_with_links() {
     assert!(!rec.read().await.common.udf);
 }
 
+/// R6-5 — `PINI` is the 6-choice `menuPini` (`menuPini.dbd:11-18`), and C
+/// matches the menu index **exactly** (`iocInit.c:598`
+/// `if (precord->pini != pphase->pini) return;`). Each choice therefore selects
+/// a disjoint pass: `YES` runs at `initialProcess()`, `RUN` at
+/// `initHookAtIocRun`, `RUNNING` at `initHookAfterIocRunning`. A `PINI=RUN`
+/// record must not be dragged into the `YES` pass, and must not be dropped
+/// entirely (the pre-fix `bool` did both: `"RUN"` parsed to `false`).
+///
+/// UDF is the "did it process" probe — `process_record_with_links` clears it
+/// (see `test_udf_cleared_by_process_with_links`).
+#[tokio::test]
+async fn test_pini_passes_select_disjoint_menu_choices() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    for name in ["PINI_YES", "PINI_RUN", "PINI_RUNNING", "PINI_NO"] {
+        db.add_record(name, Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+    }
+    // Set each record's PINI the way a `.db` file / caput does — through the
+    // field put, by label — not by poking `common.pini`.
+    for (name, label) in [
+        ("PINI_YES", "YES"),
+        ("PINI_RUN", "RUN"),
+        ("PINI_RUNNING", "RUNNING"),
+        ("PINI_NO", "NO"),
+    ] {
+        let rec = db.get_record(name).await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String(label.into()))
+            .unwrap_or_else(|e| panic!("PINI={label} must be accepted: {e:?}"));
+    }
+    // The stored value is the menu index, so `caget REC.PINI` reports RUN as 2
+    // (the pre-fix bool reported 0 — indistinguishable from NO).
+    assert_eq!(
+        db.get_record("PINI_RUN")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .common
+            .pini,
+        PiniMode::Run
+    );
+
+    // Pass 1: initialProcess() — YES only.
+    db.pini_process(PiniMode::Yes).await;
+    let udf = |n: &'static str| {
+        let db = &db;
+        async move { db.get_record(n).await.unwrap().read().await.common.udf }
+    };
+    assert!(
+        !udf("PINI_YES").await,
+        "PINI=YES processes at initialProcess"
+    );
+    assert!(
+        udf("PINI_RUN").await,
+        "PINI=RUN must NOT run in the YES pass"
+    );
+    assert!(
+        udf("PINI_RUNNING").await,
+        "PINI=RUNNING must NOT run in the YES pass"
+    );
+    assert!(udf("PINI_NO").await, "PINI=NO never processes");
+
+    // Pass 2: initHookAtIocRun — RUN only.
+    db.pini_process(PiniMode::Run).await;
+    assert!(!udf("PINI_RUN").await, "PINI=RUN processes at iocRun");
+    assert!(udf("PINI_RUNNING").await, "PINI=RUNNING is a later pass");
+    assert!(udf("PINI_NO").await);
+
+    // Pass 3: initHookAfterIocRunning — RUNNING only.
+    db.pini_process(PiniMode::Running).await;
+    assert!(
+        !udf("PINI_RUNNING").await,
+        "PINI=RUNNING processes after iocRunning"
+    );
+    assert!(udf("PINI_NO").await, "PINI=NO is in no pass at all");
+}
+
+/// R6-5 — a `caput REC.PINI RUN` must store RUN, and an out-of-menu string must
+/// be rejected rather than silently landing on NO. The pre-fix bool accepted
+/// only `"YES"`/`"1"`/`"true"` and mapped everything else — including the four
+/// real menu choices — to `false`, so `caput REC.PINI RUN` *disabled* PINI.
+#[tokio::test]
+async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    db.add_record("PREC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("PREC").await.unwrap();
+    for (label, expect) in [
+        ("NO", PiniMode::No),
+        ("YES", PiniMode::Yes),
+        ("RUN", PiniMode::Run),
+        ("RUNNING", PiniMode::Running),
+        ("PAUSE", PiniMode::Pause),
+        ("PAUSED", PiniMode::Paused),
+    ] {
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String(label.into()))
+            .unwrap();
+        assert_eq!(inst.common.pini, expect, "PINI={label}");
+    }
+    // Numeric puts index the menu (DBR_ENUM write from a CA client).
+    {
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::Short(2)).unwrap();
+        assert_eq!(inst.common.pini, PiniMode::Run);
+    }
+    // A string outside the menu is an error, not a silent demotion to NO.
+    {
+        let mut inst = rec.write().await;
+        assert!(
+            inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
+                .is_err(),
+            "an out-of-menu PINI string must be rejected"
+        );
+        assert_eq!(
+            inst.common.pini,
+            PiniMode::Run,
+            "the rejected put must not change PINI"
+        );
+    }
+}
+
 /// An asyn int32 readback delivers its value via `apply_raw_readback`
 /// (sets VAL, requests skip-convert), then the record processes. C
 /// `devAsynInt32.c::processAo` sets `pr->udf = isnan(value)` *inside* the

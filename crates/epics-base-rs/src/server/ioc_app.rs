@@ -896,11 +896,8 @@ impl IocApplication {
         // could `caget` a PINI record's UDF/default value instead of
         // its processed value. C guarantees this cannot happen.
         {
-            let pini_records = db.pini_records().await;
-            for name in &pini_records {
-                let mut visited = std::collections::HashSet::new();
-                let _ = db.process_record_with_links(name, &mut visited, 0).await;
-            }
+            // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
+            db.pini_process(crate::server::record::PiniMode::Yes).await;
             // Publish completion so any scan scheduler started by the
             // protocol runner sees PINI as already done and its
             // non-owner branch does not block. The scheduler's owner
@@ -941,6 +938,11 @@ impl IocApplication {
         // iocRun begins. Scan tasks / CA links are started by the
         // protocol runner immediately after handoff.
         announce!(InitHookState::AtIocRun);
+        // C `piniProcessHook` (iocInit.c:629-646): the hook registered by
+        // `initialProcess()` runs `piniProcess(menuPiniRUN)` when
+        // `initHookAtIocRun` is announced. PINI=RUN records are processed
+        // here and NOT in the PINI=YES pass above.
+        db.pini_process(crate::server::record::PiniMode::Run).await;
         announce!(InitHookState::AfterDatabaseRunning);
         announce!(InitHookState::AfterCaServerRunning);
 
@@ -958,6 +960,10 @@ impl IocApplication {
             hook();
         }
         announce!(InitHookState::AfterIocRunning);
+        // C `piniProcessHook` at `initHookAfterIocRunning` (iocInit.c:637-639)
+        // — `piniProcess(menuPiniRUNNING)`.
+        db.pini_process(crate::server::record::PiniMode::Running)
+            .await;
 
         // Phase 2e: drain `afterIocRunning` queue (epics-base PR #558).
         // Each line is an iocsh command queued by the startup script;

@@ -1942,7 +1942,10 @@ async fn pini_flag() {
     }
     // `pini_records()` is the `piniProcess(menuPiniYES)` pass — it selects the
     // exact menu index, so only YES records are in it.
-    assert_eq!(db.pini_records().await, vec!["pini_rec".to_string()]);
+    assert_eq!(
+        db.pini_records(PiniMode::Yes).await,
+        vec!["pini_rec".to_string()]
+    );
 }
 
 // ============================================================

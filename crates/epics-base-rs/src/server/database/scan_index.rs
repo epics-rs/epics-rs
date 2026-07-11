@@ -1,4 +1,4 @@
-use crate::server::record::ScanType;
+use crate::server::record::{PiniMode, ScanType};
 
 use super::PvDatabase;
 
@@ -94,13 +94,14 @@ impl PvDatabase {
             .unwrap_or_default()
     }
 
-    /// Get all record names whose `PINI` selects the `initialProcess()` pass
-    /// (`menuPiniYES` — C `iocInit.c:656` `piniProcess(menuPiniYES)`).
+    /// Get all record names whose `PINI` is **exactly** `mode`.
     ///
-    /// C matches the menu index exactly (`iocInit.c:598`
-    /// `if (precord->pini != pphase->pini) return;`), so `RUN`/`RUNNING`/
-    /// `PAUSE`/`PAUSED` records are NOT in this pass — they belong to their
-    /// own lifecycle hook.
+    /// C matches the menu index with `!=` (`iocInit.c:598`
+    /// `if (precord->pini != pphase->pini) return;`), so each `menuPini`
+    /// choice selects a disjoint set of records driven by a *different* pass:
+    /// `YES` at `initialProcess()` (`iocInit.c:656`), `RUN`/`RUNNING`/`PAUSE`/
+    /// `PAUSED` from `piniProcessHook` (`iocInit.c:629-646`). A `PINI=RUN`
+    /// record must NOT be processed by the `YES` pass.
     ///
     /// Snapshot the records map under the outer
     /// read lock, then drop it before fanning out per-record reads.
@@ -109,7 +110,7 @@ impl PvDatabase {
     /// `add_record` (which now takes the registration_mutex →
     /// records.write()), startup could stall while every PINI
     /// record was inspected serially.
-    pub async fn pini_records(&self) -> Vec<String> {
+    pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
         let snapshot: Vec<_> = {
             let records = self.inner.records.read().await;
             records
@@ -120,11 +121,26 @@ impl PvDatabase {
         let mut result = Vec::new();
         for (name, rec) in snapshot {
             let instance = rec.read().await;
-            if instance.common.pini == crate::server::record::PiniMode::Yes {
+            if instance.common.pini == mode {
                 result.push(name);
             }
         }
         result
+    }
+
+    /// C `piniProcess` (`iocInit.c:608-627`) — process every record whose
+    /// `PINI` is exactly `mode`, each with its full link chain.
+    ///
+    /// The single owner of "run a PINI pass": `initialProcess()` calls it with
+    /// [`PiniMode::Yes`], and the `initHook` lifecycle calls it with
+    /// [`PiniMode::Run`] / [`PiniMode::Running`]. Every driver goes through
+    /// here, so the pass selection (and, per R6-6, the `PHAS` ordering) cannot
+    /// diverge between them.
+    pub async fn pini_process(&self, mode: PiniMode) {
+        for name in self.pini_records(mode).await {
+            let mut visited = std::collections::HashSet::new();
+            let _ = self.process_record_with_links(&name, &mut visited, 0).await;
+        }
     }
 
     /// Process all records with `SCAN=Event`, regardless of `EVNT`.

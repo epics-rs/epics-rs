@@ -154,6 +154,11 @@ pub(crate) fn spawn_monitor_sender<W>(
     denied: Arc<AtomicBool>,
     long_string_mode: LongStringMode,
     stats: Option<Arc<ServerStats>>,
+    // The EVENT_ADD request header (C `pevext->msg`) plus the client's
+    // negotiated minor version. Every delivery on this subscription is framed
+    // for THIS client: a pre-CA_V49 peer gets `ECA_16KARRAYCLIENT` rather than
+    // a 24-byte extended header it cannot parse (`caserverio.c:266-270`).
+    reply: super::tcp::ReplyContext,
 ) -> tokio::task::JoinHandle<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -205,6 +210,7 @@ where
                 &event,
                 &writer,
                 long_string_mode,
+                reply,
             )
             .await
             .is_err()
@@ -229,7 +235,9 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     event: &MonitorEvent,
     writer: &Arc<Mutex<BufWriter<W>>>,
     long_string_mode: LongStringMode,
+    reply: super::tcp::ReplyContext,
 ) -> std::io::Result<()> {
+    let (req_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // Apply the channel's long-string boundary conversion before
     // encoding (`$` → CHAR[40]+NUL, or a long-string record field →
     // scalar DBR_STRING). Clone only when a conversion actually runs
@@ -288,8 +296,18 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     padded.resize(align8(padded.len()), 0);
 
     let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-    // C client TCP parser requires 8-byte aligned postsize
-    hdr.set_payload_size(padded.len(), element_count);
+    // C client TCP parser requires 8-byte aligned postsize. C `read_reply`
+    // (`camessage.c:515-524`): when `cas_copy_in_header` refuses the frame
+    // because this client is pre-CA_V49, the update is answered with
+    // CA_PROTO_ERROR / ECA_16KARRAYCLIENT and the circuit is kept.
+    if hdr
+        .set_payload_size(padded.len(), element_count, client_minor)
+        .is_err()
+    {
+        let _ =
+            super::tcp::send_16k_array_client_err(writer, req_hdr, req_hdr.cid, client_minor).await;
+        return Ok(());
+    }
     hdr.data_type = data_type;
     hdr.cid = 1; // ECA_NORMAL status
     hdr.available = sub_id;
@@ -387,9 +405,20 @@ mod tests {
 
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every producer caller.
-        send_event(DBR_LONG, 0, 7, &event, &writer, LongStringMode::Plain)
-            .await
-            .expect("send_event must succeed");
+        send_event(
+            DBR_LONG,
+            0,
+            7,
+            &event,
+            &writer,
+            LongStringMode::Plain,
+            crate::server::tcp::ReplyContext {
+                req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .await
+        .expect("send_event must succeed");
 
         let guard = writer.lock().await;
         let batches = &guard.get_ref().batches;
@@ -494,6 +523,10 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 LongStringMode::Plain,
                 Some(stats.clone()),
+                crate::server::tcp::ReplyContext {
+                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+                    client_minor: crate::protocol::CA_MINOR_VERSION,
+                },
             );
 
             for (i, v) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
@@ -538,6 +571,10 @@ mod tests {
                 Arc::new(AtomicBool::new(true)), // read access denied
                 LongStringMode::Plain,
                 Some(stats.clone()),
+                crate::server::tcp::ReplyContext {
+                    req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
+                    client_minor: crate::protocol::CA_MINOR_VERSION,
+                },
             );
 
             pv.set(EpicsValue::Double(1.0)).await;

@@ -133,6 +133,16 @@ pub(crate) struct ChannelSnapshotPublic {
     pub server_addr: SocketAddr,
     pub access_rights: AccessRights,
     pub state: ChannelState,
+    /// Minor protocol version of the server owning this channel's
+    /// circuit, as announced by its `CA_PROTO_VERSION` frame. Every
+    /// request framed for this channel needs it: libca's
+    /// `comQueSend::insertRequestHeader` takes `bool v49Ok` from
+    /// `CA_V49 ( minorProtocolVersion )` and only emits the extended
+    /// (24-byte) header when the peer speaks V49 — otherwise it throws
+    /// `cacChannel::outOfBounds` (`comQueSend.cpp:285-363`).
+    /// 0 until the circuit's VERSION frame is seen, i.e. pre-V49 —
+    /// the same conservative starting point as C's `tcpiiu`.
+    pub server_minor: u16,
 }
 
 /// Shared snapshot registry. Coordinator publishes; CaChannel reads.
@@ -690,8 +700,9 @@ pub(crate) enum TransportCommand {
     /// receive watchdog. `anomaly = false` for healthy beacons (mirrors
     /// libca `tcpRecvWatchdog::beaconArrivalNotify` — pet the watchdog
     /// so a quiet circuit isn't probed unnecessarily). `anomaly = true`
-    /// when the monitor classified the beacon as a real restart signal
-    /// (`IdMismatch` / `PeriodCollapse`); the read loop only sets a
+    /// when the monitor classified the beacon as anomalous — a fresh
+    /// sequence (`IdMismatch`) or an off-band period (libca
+    /// `bhe.cpp:226-262`); the read loop only sets a
     /// flag (mirrors libca `beaconAnomalyNotify`) and lets the existing
     /// idle watchdog expire on its own schedule rather than firing an
     /// immediate echo probe — under load that immediate probe was the
@@ -703,14 +714,6 @@ pub(crate) enum TransportCommand {
     BeaconArrivalNotify {
         server_addr: SocketAddr,
         anomaly: bool,
-    },
-    EventsOff {
-        server_addr: SocketAddr,
-        priority: u8,
-    },
-    EventsOn {
-        server_addr: SocketAddr,
-        priority: u8,
     },
 }
 
@@ -799,7 +802,7 @@ pub(crate) enum TransportEvent {
     /// to the beacon monitor (libca `bhe.cpp` "new client connect"
     /// EMA reset) so a stale steady-state period estimate doesn't
     /// misclassify the server's `online_notify_task` ramp-up as a
-    /// `PeriodCollapse` cascade after reconnect. Emitted exactly once
+    /// short-period anomaly cascade after reconnect. Emitted exactly once
     /// per circuit, before any other event for that circuit.
     ServerConnected {
         server_addr: SocketAddr,

@@ -27,13 +27,28 @@ pub struct IncomingClient {
     pub readonly: bool,
 }
 
-/// Either a TCP or UNIX socket. Hides the platform difference from
-/// the supervisor.
-#[derive(Debug)]
+/// Either a TCP or UNIX socket, or — in foreground mode — the
+/// launching terminal. Hides the difference from the supervisor: C
+/// attaches fd 0 with the same `clientFactory` it uses for accepted
+/// sockets (`procServ.cc:568`), so all three take the same client path.
 pub enum ClientStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
+    #[cfg(unix)]
+    Console(crate::procserv::console::ConsoleStream),
+}
+
+impl std::fmt::Debug for ClientStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(s) => f.debug_tuple("Tcp").field(s).finish(),
+            #[cfg(unix)]
+            Self::Unix(s) => f.debug_tuple("Unix").field(s).finish(),
+            #[cfg(unix)]
+            Self::Console(_) => f.write_str("Console"),
+        }
+    }
 }
 
 /// Origin of the client. Used in the welcome banner + audit log.
@@ -42,6 +57,10 @@ pub enum ClientPeer {
     Tcp(SocketAddr),
     #[cfg(unix)]
     Unix(Option<std::path::PathBuf>),
+    /// The launching terminal, attached in foreground mode
+    /// (C `clientFactory(0)`, `procServ.cc:568`).
+    #[cfg(unix)]
+    Console,
 }
 
 /// Direction of the per-client mpsc — supervisor-to-client. The
@@ -141,6 +160,11 @@ pub fn spawn_client(
         }
         #[cfg(unix)]
         ClientStream::Unix(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
+        // The terminal gets the same read/write task pair — including the
+        // telnet parser, which C also runs on its fd-0 client
+        // (`clientFactory.cc:167` `telnet_init`).
+        #[cfg(unix)]
+        ClientStream::Console(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
     }
 
     (meta, out_tx)

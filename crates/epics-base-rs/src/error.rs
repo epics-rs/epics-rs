@@ -70,6 +70,25 @@ pub enum CaError {
     /// zeroed payload that travels with the frame.
     #[error("server reported ECA status {0:#06x}")]
     ServerError(u32),
+
+    /// Request cannot be framed for the peer: it needs the extended
+    /// (24-byte) CA header, and the peer's protocol version predates
+    /// CA_V49, or the element count exceeds what the peer can carry.
+    /// libca raises this locally — `comQueSend::insertRequestHeader`
+    /// throws `cacChannel::outOfBounds()` (`comQueSend.cpp:299,313`)
+    /// and `ca_array_get`/`ca_array_put` return `ECA_TOLARGE` — so no
+    /// byte reaches the wire.
+    #[error("request too large for the peer's CA protocol version (ECA_TOLARGE)")]
+    TooLarge,
+
+    /// Element count out of bounds for the request C would build. libca's
+    /// put path throws `cacChannel::outOfBounds()` for an array that cannot
+    /// fit the peer's message-body limit (`comQueSend.cpp:361`) or that
+    /// needs an extended header the peer cannot parse
+    /// (`comQueSend.cpp:313`); `oldChannelNotify.cpp:309,378,453` map that
+    /// to `ECA_BADCOUNT`. Raised locally — no byte reaches the wire.
+    #[error("element count out of bounds for this CA circuit (ECA_BADCOUNT)")]
+    BadCount,
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)
@@ -79,6 +98,8 @@ const ECA_PUTFAIL: u32 = 160; // defmsg(CA_K_WARNING, 20)
 const ECA_BADTYPE: u32 = 114; // defmsg(CA_K_ERROR, 14)
 const ECA_DISCONN: u32 = 192; // defmsg(CA_K_WARNING, 24)
 const ECA_PUTCBINPROG: u32 = 366; // defmsg(CA_K_ERROR, 45)
+const ECA_TOLARGE: u32 = 72; // defmsg(CA_K_WARNING, 9)
+const ECA_BADCOUNT: u32 = 176; // defmsg(CA_K_WARNING, 22)
 
 impl CaError {
     pub fn to_eca_status(&self) -> u32 {
@@ -103,6 +124,8 @@ impl CaError {
             CaError::WriteFailed(code) => *code,
             CaError::PutCallbackInProgress(_) => ECA_PUTCBINPROG,
             CaError::ServerError(code) => *code,
+            CaError::TooLarge => ECA_TOLARGE,
+            CaError::BadCount => ECA_BADCOUNT,
             _ => ECA_PUTFAIL,
         }
     }

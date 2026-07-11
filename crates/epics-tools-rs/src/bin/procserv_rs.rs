@@ -21,6 +21,7 @@ mod app {
     use epics_tools_rs::procserv::{
         ProcServ, ProcServConfig,
         config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
+        console,
         daemon::{DaemonParent, fork_and_go, install_signal_handlers},
         endpoint::{Endpoint, UnixEndpoint, parse_endpoint},
         listener::bind_endpoints,
@@ -591,9 +592,44 @@ mod app {
             }
         };
 
+        // C `procServ.cc:566-569`: in foreground mode the launching
+        // terminal becomes a client — UNLESS the log goes to stdout
+        // (`--logfile -`), where the child's output already lands on the
+        // terminal and a console client would double it.
+        let attach_console = foreground
+            && cfg
+                .logging
+                .log_path
+                .as_deref()
+                .is_none_or(|p| p.as_os_str() != "-");
+
         runtime.block_on(async move {
+            // The `TtyGuard` must outlive the session: dropping it restores
+            // the terminal's echo/canonical mode (C `ttySetCharNoEcho(false)`
+            // after the select loop, procServ.cc:684).
+            let (console, _tty_guard) = if attach_console {
+                match console::attach_console() {
+                    Ok((client, guard)) => (Some(client), Some(guard)),
+                    Err(e) => {
+                        // C never checks; a terminal we cannot attach is not
+                        // a reason to refuse to supervise the child — the
+                        // control port still works.
+                        tracing::error!(error = %e, "procserv-rs: unable to attach the console; continuing without it");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
             let server = match ProcServ::new(cfg) {
-                Ok(s) => s.with_prebound(prebound),
+                Ok(s) => {
+                    let s = s.with_prebound(prebound);
+                    match console {
+                        Some(c) => s.with_console(c),
+                        None => s,
+                    }
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "procserv-rs: build failed");
                     return ExitCode::FAILURE;
@@ -604,7 +640,7 @@ mod app {
             // and dropped inside `install_signal_handlers`, never aborting
             // the already-daemonized child. Matches C's unchecked sigaction
             // (procServ.cc:496-509).
-            let shutdown = install_signal_handlers().await;
+            let shutdown = install_signal_handlers(foreground).await;
 
             // Race the supervisor against the shutdown signal. The
             // supervisor's own `quit` keystroke also returns from

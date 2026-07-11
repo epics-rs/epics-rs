@@ -26,10 +26,12 @@ fn golden_ext_client_name_extended_postsize() {
     // carries `postsize=0xFFFF` + `count=0`; the annex carries the
     // real postsize (u32) followed by count (u32 = 0).
     let mut h = CaHeader::new(CA_PROTO_CLIENT_NAME);
-    h.set_payload_size(0, 0); // count=0 for CLIENT_NAME
+    h.set_payload_size(0, 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header"); // count=0 for CLIENT_NAME
     // Force the extended form by hand-setting actual_count to 0 and
     // postsize to the real size via set_payload_size.
-    h.set_payload_size(65_536, 0);
+    h.set_payload_size(65_536, 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     let bytes = h.to_bytes_extended();
 
     // Expect 24 bytes:
@@ -62,7 +64,8 @@ fn golden_ext_write_extended_count() {
     h.available = 0x0000_0042;
     // 200_000 elements × 8 bytes = 1_600_000 bytes. postsize > u16,
     // so both annex slots used.
-    h.set_payload_size(1_600_000, 200_000);
+    h.set_payload_size(1_600_000, 200_000, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     let bytes = h.to_bytes_extended();
     assert_eq!(bytes.len(), 24);
     // Bytes 0..16: base header with sentinels in postsize+count.

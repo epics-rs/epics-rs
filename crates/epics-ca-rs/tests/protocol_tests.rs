@@ -68,7 +68,8 @@ fn header_extended_roundtrip_via_to_bytes_extended() {
     hdr.data_type = 6;
     hdr.cid = 999;
     hdr.available = 888;
-    hdr.set_payload_size(200_000, 25_000);
+    hdr.set_payload_size(200_000, 25_000, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
 
     assert!(hdr.is_extended());
     let bytes = hdr.to_bytes_extended();
@@ -88,7 +89,8 @@ fn header_extended_roundtrip_via_to_bytes_extended() {
 #[test]
 fn header_normal_stays_normal_when_small() {
     let mut hdr = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
-    hdr.set_payload_size(500, 10);
+    hdr.set_payload_size(500, 10, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     assert!(!hdr.is_extended());
     assert_eq!(hdr.postsize, 500);
     assert_eq!(hdr.count, 10);
@@ -159,12 +161,14 @@ fn header_set_payload_boundary_at_0xfffe() {
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
 
     // 0xFFFE should still fit in normal form
-    hdr.set_payload_size(0xFFFE, 1);
+    hdr.set_payload_size(0xFFFE, 1, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     assert!(!hdr.is_extended());
     assert_eq!(hdr.postsize, 0xFFFE);
 
     // 0xFFFF triggers extended
-    hdr.set_payload_size(0xFFFF, 1);
+    hdr.set_payload_size(0xFFFF, 1, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     assert!(hdr.is_extended());
     assert_eq!(hdr.actual_postsize(), 0xFFFF);
 }
@@ -174,19 +178,22 @@ fn header_set_payload_count_boundary_at_0xffff() {
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
 
     // count = 0xFFFE fits in normal form
-    hdr.set_payload_size(100, 0xFFFE);
+    hdr.set_payload_size(100, 0xFFFE, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     assert!(!hdr.is_extended());
     assert_eq!(hdr.count, 0xFFFE);
 
     // count = 0xFFFF triggers extended (C `comQueSend.cpp:285` —
     // `nElem < 0xffff` is the normal threshold, so exact `0xFFFF`
     // requires extended form).
-    hdr.set_payload_size(100, 0xFFFF);
+    hdr.set_payload_size(100, 0xFFFF, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     assert!(hdr.is_extended());
     assert_eq!(hdr.actual_count(), 0xFFFF);
 
     // count = 0x10000 triggers extended
-    hdr.set_payload_size(100, 0x10000);
+    hdr.set_payload_size(100, 0x10000, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     assert!(hdr.is_extended());
     assert_eq!(hdr.actual_count(), 0x10000);
 }
@@ -863,7 +870,8 @@ async fn server_echo_round_trips_request_header_and_payload() {
     echo.count = 0; // padded post-write — set_payload_size below will adjust
     echo.cid = 0x1122_3344;
     echo.available = 0xAABB_CCDD;
-    echo.set_payload_size(8, 0);
+    echo.set_payload_size(8, 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     let payload: [u8; 8] = *b"PROBE!\0\0";
     let mut req = Vec::new();
     req.extend_from_slice(&echo.to_bytes());
@@ -1297,7 +1305,8 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
         while !body.len().is_multiple_of(8) {
             body.push(0);
         }
-        h.set_payload_size(body.len(), 0);
+        h.set_payload_size(body.len(), 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = Vec::new();
         frame.extend_from_slice(&h.to_bytes());
         frame.extend_from_slice(&body);
@@ -1312,7 +1321,13 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     while !create_body.len().is_multiple_of(8) {
         create_body.push(0);
     }
-    create.set_payload_size(create_body.len(), 0);
+    create
+        .set_payload_size(
+            create_body.len(),
+            0,
+            epics_ca_rs::protocol::CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the extended header");
     let mut frame = Vec::new();
     frame.extend_from_slice(&create.to_bytes());
     frame.extend_from_slice(&create_body);
@@ -1477,7 +1492,8 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
         while !body.len().is_multiple_of(8) {
             body.push(0);
         }
-        h.set_payload_size(body.len(), 0);
+        h.set_payload_size(body.len(), 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = Vec::new();
         frame.extend_from_slice(&h.to_bytes());
         frame.extend_from_slice(&body);
@@ -1495,7 +1511,13 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     while !create_body.len().is_multiple_of(8) {
         create_body.push(0);
     }
-    create.set_payload_size(create_body.len(), 0);
+    create
+        .set_payload_size(
+            create_body.len(),
+            0,
+            epics_ca_rs::protocol::CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the extended header");
     let mut frame = Vec::new();
     frame.extend_from_slice(&create.to_bytes());
     frame.extend_from_slice(&create_body);
@@ -1701,7 +1723,8 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
         while !body.len().is_multiple_of(8) {
             body.push(0);
         }
-        h.set_payload_size(body.len(), 0);
+        h.set_payload_size(body.len(), 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = Vec::new();
         frame.extend_from_slice(&h.to_bytes());
         frame.extend_from_slice(&body);
@@ -1719,7 +1742,9 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
         while !body.len().is_multiple_of(8) {
             body.push(0);
         }
-        create.set_payload_size(body.len(), 0);
+        create
+            .set_payload_size(body.len(), 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = Vec::new();
         frame.extend_from_slice(&create.to_bytes());
         frame.extend_from_slice(&body);
@@ -2029,7 +2054,8 @@ async fn server_read_notify_bad_type_closes_silently() {
         while !body.len().is_multiple_of(8) {
             body.push(0);
         }
-        h.set_payload_size(body.len(), 0);
+        h.set_payload_size(body.len(), 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = Vec::new();
         frame.extend_from_slice(&h.to_bytes());
         frame.extend_from_slice(&body);
@@ -2042,7 +2068,13 @@ async fn server_read_notify_bad_type_closes_silently() {
     while !create_body.len().is_multiple_of(8) {
         create_body.push(0);
     }
-    create.set_payload_size(create_body.len(), 0);
+    create
+        .set_payload_size(
+            create_body.len(),
+            0,
+            epics_ca_rs::protocol::CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the extended header");
     let mut frame = Vec::new();
     frame.extend_from_slice(&create.to_bytes());
     frame.extend_from_slice(&create_body);

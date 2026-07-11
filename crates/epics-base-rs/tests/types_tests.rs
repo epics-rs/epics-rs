@@ -278,7 +278,8 @@ fn test_golden_header_read_notify() {
     use epics_ca_rs::protocol::*;
     let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
     hdr.data_type = 20;
-    hdr.set_payload_size(24, 1);
+    hdr.set_payload_size(24, 1, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     hdr.cid = ECA_NORMAL;
     hdr.available = 42;
 

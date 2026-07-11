@@ -7,6 +7,8 @@
 pub mod child;
 pub mod client;
 pub mod config;
+#[cfg(unix)]
+pub mod console;
 pub mod daemon;
 pub mod endpoint;
 pub mod error;

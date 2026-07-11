@@ -669,16 +669,14 @@ async fn run_nameserver_connection(
         // payload exceeds 16-bit postsize (libca's
         // `insertRequestHeader` parity). See the matching note in
         // `client/transport.rs` connect path.
-        let user_payload = pad_string(&user);
-        let mut client = CaHeader::new(CA_PROTO_CLIENT_NAME);
-        client.set_payload_size(user_payload.len(), 0);
-        handshake.extend_from_slice(&client.to_bytes_extended());
-        handshake.extend_from_slice(&user_payload);
-        let host_payload = pad_string(&epics_base_rs::runtime::env::hostname());
-        let mut host = CaHeader::new(CA_PROTO_HOST_NAME);
-        host.set_payload_size(host_payload.len(), 0);
-        handshake.extend_from_slice(&host.to_bytes_extended());
-        handshake.extend_from_slice(&host_payload);
+        handshake.extend_from_slice(&super::transport::build_identity_frame(
+            CA_PROTO_CLIENT_NAME,
+            &user,
+        ));
+        handshake.extend_from_slice(&super::transport::build_identity_frame(
+            CA_PROTO_HOST_NAME,
+            &epics_base_rs::runtime::env::hostname(),
+        ));
         if writer.write_all(&handshake).await.is_err() {
             tokio::time::sleep(backoff).await;
             continue;
@@ -2403,7 +2401,8 @@ mod tests {
         hdr.data_type = server.port();
         hdr.cid = u32::from_be_bytes(ip.octets());
         hdr.available = cid;
-        hdr.set_payload_size(8, 1);
+        hdr.set_payload_size(8, 1, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut buf = hdr.to_bytes().to_vec();
         buf.extend_from_slice(&(CA_MINOR_VERSION).to_be_bytes());
         buf.extend_from_slice(&[0u8; 6]); // pad to 8-byte payload

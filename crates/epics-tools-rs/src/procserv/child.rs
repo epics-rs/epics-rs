@@ -230,10 +230,22 @@ impl ChildHandle {
     }
 }
 
+/// Exit status of a child that could not be launched.
+///
+/// C `processFactory.cc:211-221`: a failed `chdir` falls through the
+/// `else`, a failed `execvp` returns, and both land on the single
+/// `exit( -1 )` — wait status 255. procServ then broadcasts
+/// `@@@ Received a sigChild ... Normal exit status = 255`, which is the
+/// number wrappers, systemd units, and log scrapers key on for a launch
+/// failure. Shell conventions (126 = not executable, 127 = not found)
+/// are NOT what procServ reports, so every setup/exec failure in this
+/// function exits with this one status.
+const CHILD_LAUNCH_FAILURE_EXIT: i32 = 255;
+
 /// In-child path of `forkpty` — optional chdir, then `execvp` the
 /// target program. Never returns on success; on failure prints to
 /// stderr (which goes back through the PTY to the parent) and exits
-/// with status 126 / 127.
+/// with [`CHILD_LAUNCH_FAILURE_EXIT`].
 ///
 /// Note: `forkpty(3)` already calls `setsid()` internally and
 /// connects the slave fd as the controlling terminal, so we MUST
@@ -256,12 +268,12 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
             Ok(c) => c,
             Err(_) => {
                 eprintln!("procserv child: invalid chdir path");
-                std::process::exit(126);
+                std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
             }
         };
         if let Err(e) = chdir(c_cwd.as_c_str()) {
             eprintln!("procserv child: chdir to {} failed: {e}", cwd.display());
-            std::process::exit(126);
+            std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
         }
     }
 
@@ -273,7 +285,7 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
         Ok(c) => c,
         Err(_) => {
             eprintln!("procserv child: program name contains NUL");
-            std::process::exit(126);
+            std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
         }
     };
     // The binary actually exec'd: the `--exec` override if set, else the
@@ -283,7 +295,7 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
             Ok(c) => c,
             Err(_) => {
                 eprintln!("procserv child: exec path contains NUL");
-                std::process::exit(126);
+                std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
             }
         },
         None => arg0.clone(),
@@ -295,7 +307,7 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
             Ok(c) => argv.push(c),
             Err(_) => {
                 eprintln!("procserv child: argument contains NUL: {a:?}");
-                std::process::exit(126);
+                std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
             }
         }
     }
@@ -308,7 +320,7 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
                 "procserv child: execvp({}) failed: {e}",
                 spec.child_exec.as_ref().unwrap_or(&spec.program).display()
             );
-            std::process::exit(127);
+            std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
         }
     }
 }
@@ -616,6 +628,67 @@ mod tests {
         assert!(
             text.contains("ioc-display-name"),
             "child_exec should run /bin/sh with argv[0]=program; got {text:?}"
+        );
+    }
+
+    /// Every launch failure exits 255, not the shell conventions
+    /// (127 = not found, 126 = not executable). C `processFactory.cc:221`
+    /// reaches a single `exit(-1)` from both the failed-`chdir` and the
+    /// returned-`execvp` paths, and procServ broadcasts that number to
+    /// every client as `Normal exit status = 255`.
+    async fn launch_failure_status(spec: &ChildSpec) -> ChildExit {
+        let (_handle, mut rx) = ChildHandle::spawn(spec).expect("fork succeeds; the exec fails");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut exit = ChildExit::Unknown;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(ChildEvent::Exited { exit: e }) => { exit = e; break }
+                    Some(_) => {}
+                    None => break,
+                },
+                _ = sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        exit
+    }
+
+    /// `execvp` cannot find the binary — the common misconfiguration.
+    #[tokio::test]
+    async fn missing_child_binary_exits_255_not_127() {
+        let exit = launch_failure_status(&ChildSpec {
+            program: PathBuf::from("/nonexistent/procserv-rs-no-such-binary"),
+            args: Vec::new(),
+            cwd: None,
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: None,
+        })
+        .await;
+        assert_eq!(
+            exit,
+            ChildExit::Exited(255),
+            "a failed execvp must exit 255 (C processFactory.cc:221), not 127"
+        );
+    }
+
+    /// The `chdir` leg of the same `exit(-1)`: C prints "child could not
+    /// chdir", skips the `execvp`, and falls into the identical exit.
+    #[tokio::test]
+    async fn failed_chdir_exits_255_not_126() {
+        let exit = launch_failure_status(&ChildSpec {
+            program: PathBuf::from("/bin/echo"),
+            args: vec!["never runs".into()],
+            cwd: Some(PathBuf::from("/nonexistent/procserv-rs-no-such-dir")),
+            ignore_chars: Vec::new(),
+            core_size: None,
+            child_exec: None,
+        })
+        .await;
+        assert_eq!(
+            exit,
+            ChildExit::Exited(255),
+            "a failed chdir must exit 255 (C processFactory.cc:211-221), not 126"
         );
     }
 }

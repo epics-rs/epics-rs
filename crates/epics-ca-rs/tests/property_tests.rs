@@ -55,7 +55,8 @@ proptest! {
         let mut hdr = CaHeader::new(cmmd);
         hdr.cid = cid;
         hdr.available = available;
-        hdr.set_payload_size(ext_size as usize, ext_count);
+        hdr.set_payload_size(ext_size as usize, ext_count, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
         let bytes = hdr.to_bytes_extended();
         // Either it was forced extended, or set_payload_size kept it normal —
         // both branches must roundtrip.
@@ -72,7 +73,8 @@ proptest! {
     #[test]
     fn extended_iff_overflow(size in 0usize..=(MAX_PAYLOAD_SIZE), count in any::<u32>()) {
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
-        hdr.set_payload_size(size, count);
+        hdr.set_payload_size(size, count, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
         let needs_extended = size > 0xFFFE || count > 0xFFFF;
         prop_assert_eq!(hdr.is_extended(), needs_extended);
         prop_assert_eq!(hdr.actual_postsize(), size);
@@ -101,12 +103,13 @@ proptest! {
         let _ = CaHeader::from_bytes_extended(&bytes);
     }
 
-    /// Pathologically large `extended_postsize` values must be rejected
-    /// rather than triggering an allocation panic. We always pass a
-    /// 24-byte buffer (just enough for the extended fields) so the
-    /// parser sees the claimed size without any actual payload.
+    /// Pathologically large `extended_postsize` values must PARSE — they are
+    /// syntactically valid headers, and libca's receiver accepts them
+    /// (R6-21). What must never happen is a panic or an allocation keyed on
+    /// the claimed size: we pass a bare 24-byte buffer, so the parser sees
+    /// the claimed size without any actual payload and must not touch it.
     #[test]
-    fn extended_payload_too_large_rejected(
+    fn extended_payload_past_max_payload_size_parses(
         ext_size in (MAX_PAYLOAD_SIZE as u64 + 1)..=u32::MAX as u64,
         ext_count in any::<u32>(),
     ) {
@@ -116,7 +119,12 @@ proptest! {
         buf[6..8].copy_from_slice(&0u16.to_be_bytes());
         buf[16..20].copy_from_slice(&(ext_size as u32).to_be_bytes());
         buf[20..24].copy_from_slice(&ext_count.to_be_bytes());
-        prop_assert!(CaHeader::from_bytes_extended(&buf).is_err());
+        // R6-21: the codec carries no receive policy. libca parses this
+        // header and grows its body cache to fit (`tcpiiu.cpp:1214-1220`);
+        // rejecting it here is what closed the circuit on a large waveform.
+        let (hdr, consumed) = CaHeader::from_bytes_extended(&buf).unwrap();
+        prop_assert_eq!(consumed, 24);
+        prop_assert_eq!(hdr.actual_postsize(), ext_size as usize);
     }
 }
 

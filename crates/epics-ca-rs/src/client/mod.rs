@@ -502,9 +502,6 @@ enum CoordRequest {
     Unsubscribe {
         subid: u32,
     },
-    MonitorConsumed {
-        subid: u32,
-    },
     DropChannel {
         cid: u32,
     },
@@ -523,8 +520,9 @@ enum CoordRequest {
     /// Beacon arrival notification for the per-circuit receive
     /// watchdog. `anomaly = false` for healthy beacons (libca
     /// `beaconArrivalNotify` — refresh watchdog deadline);
-    /// `anomaly = true` for `IdMismatch` / `PeriodCollapse` (libca
-    /// `beaconAnomalyNotify` — set sticky flag, no immediate echo).
+    /// `anomaly = true` for `IdMismatch` and for the two libca period
+    /// bands (`LongPeriod` / `ShortPeriod`, `bhe.cpp:226-262`) — libca
+    /// `beaconAnomalyNotify`: set sticky flag, no immediate echo.
     /// `FirstSighting` deliberately does NOT generate this message:
     /// either we don't yet have a virtual circuit to the server, in
     /// which case the watchdog is irrelevant, or we do (we just
@@ -1660,7 +1658,13 @@ impl CaChannel {
             .map(|w| w.clone())
     }
 
-    fn build_read_notify_frame(sid: u32, data_type: u16, count: u32, ioid: u32) -> Vec<u8> {
+    fn build_read_notify_frame(
+        sid: u32,
+        data_type: u16,
+        count: u32,
+        ioid: u32,
+        peer_minor: u16,
+    ) -> CaResult<Vec<u8>> {
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
         hdr.data_type = data_type;
         hdr.cid = sid;
@@ -1669,13 +1673,20 @@ impl CaChannel {
         // `nElem >= 0xffff`, not just `> 0xffff`. Routing 0xFFFF
         // through the normal branch would wedge `count = 0xFFFF` into
         // `m_count` — which a strict peer interprets as an extended
-        // marker with missing annex bytes.
+        // marker with missing annex bytes. `set_payload_size` refuses
+        // the extended form for a pre-V49 peer (`comQueSend.cpp:299`
+        // `throw cacChannel::outOfBounds()` → ECA_BADCOUNT,
+        // `oldChannelNotify.cpp:309`) without a byte reaching the wire.
+        // In practice the caller's element bound (ECA_TOLARGE,
+        // `tcpiiu.cpp:1470`) fires first on a pre-V49 circuit: MAX_TCP
+        // caps the count far below 0xffff.
         if count >= 0xFFFF {
-            hdr.set_payload_size(0, count);
+            hdr.set_payload_size(0, count, peer_minor)
+                .map_err(|_| CaError::BadCount)?;
         } else {
             hdr.count = count as u16;
         }
-        hdr.to_bytes_extended()
+        Ok(hdr.to_bytes_extended())
     }
 
     fn decode_plain_read_reply(reply: ReadReply) -> CaResult<(DbFieldType, EpicsValue)> {
@@ -1693,6 +1704,12 @@ impl CaChannel {
         }
     }
 
+    /// Thin alias for the crate's put-framing owner,
+    /// [`crate::protocol::build_put_frame`] (C
+    /// `comQueSend::insertRequestWithPayLoad`). The coordinator path in
+    /// `transport.rs` frames through the same function, so the wire
+    /// bytes cannot drift between the direct-writer and coordinator
+    /// routes.
     fn build_write_frame(
         cmd: u16,
         sid: u32,
@@ -1700,22 +1717,9 @@ impl CaChannel {
         count: u32,
         ioid: Option<u32>,
         payload: Vec<u8>,
-    ) -> Vec<u8> {
-        let padded_len = align8(payload.len());
-        let mut padded = payload;
-        padded.resize(padded_len, 0);
-
-        let mut hdr = CaHeader::new(cmd);
-        hdr.data_type = data_type;
-        hdr.cid = sid;
-        if let Some(ioid) = ioid {
-            hdr.available = ioid;
-        }
-        hdr.set_payload_size(padded.len(), count);
-
-        let mut frame = hdr.to_bytes_extended();
-        frame.extend_from_slice(&padded);
-        frame
+        peer_minor: u16,
+    ) -> CaResult<Vec<u8>> {
+        crate::protocol::build_put_frame(cmd, sid, data_type, count, ioid, payload, peer_minor)
     }
 
     fn send_read_notify_fast(
@@ -1737,10 +1741,26 @@ impl CaChannel {
                  nciu::read ECA_NORDACCESS); ioid {ioid}"
             )));
         }
+        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
+        // requested element count against what the circuit can carry
+        // (ECA_TOLARGE past it), then substitutes the channel's native count
+        // for a zero (autosize) request when the peer predates CA_V413 —
+        // those servers have no zero-count autosize contract and would read
+        // `m_count == 0` as "no elements".
+        let count = crate::protocol::read_notify_wire_count(
+            count,
+            snap.element_count,
+            data_type,
+            snap.server_minor,
+        )?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_read_notify_frame(
-                snap.sid, data_type, count, ioid,
-            ));
+                snap.sid,
+                data_type,
+                count,
+                ioid,
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1775,6 +1795,12 @@ impl CaChannel {
                  nciu::write ECA_NOWTACCESS); ioid {ioid}"
             )));
         }
+        // C `comQueSend::insertRequestWithPayLoad` (`comQueSend.cpp:352-364`)
+        // bounds an array put against the peer's message-body limit and throws
+        // `cacChannel::outOfBounds` (→ ECA_BADCOUNT) past it, before a byte is
+        // queued. Gate here, ahead of the direct-writer / coordinator split, so
+        // neither path can put an unframeable request on the wire.
+        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
@@ -1783,7 +1809,8 @@ impl CaChannel {
                 count,
                 Some(ioid),
                 payload,
-            ));
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1818,6 +1845,10 @@ impl CaChannel {
                     .into(),
             ));
         }
+        // Same pre-queue element bound as `send_write_notify_fast`
+        // (`comQueSend.cpp:352-364`) — a fire-and-forget put is bounded by
+        // libca too; `ca_array_put` returns ECA_BADCOUNT synchronously.
+        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
@@ -1826,7 +1857,8 @@ impl CaChannel {
                 count,
                 None,
                 payload,
-            ));
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1942,12 +1974,36 @@ impl CaChannel {
                 // Refill the reusable Sender slot. The dispatcher takes
                 // this on response without removing the DashMap entry.
                 *cached.slot.lock() = Some(reply_tx);
-                let frame = Self::build_read_notify_frame(
+                let count = match crate::protocol::read_notify_wire_count(
+                    cached.element_count,
+                    cached.element_count,
+                    cached.data_type,
+                    snap.server_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&cached.ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
+                let frame = match Self::build_read_notify_frame(
                     cached.sid,
                     cached.data_type,
-                    cached.element_count,
+                    count,
                     cached.ioid,
-                );
+                    snap.server_minor,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Unframeable for this peer — drop the borrowed
+                        // warm entry so the next call starts cold, and
+                        // fail locally without touching the wire.
+                        ch.in_flight.reads.remove(&cached.ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let kind = PendingKind::Warm {
                     ioid: cached.ioid,
                     in_flight: ch.in_flight.clone(),
@@ -1965,12 +2021,33 @@ impl CaChannel {
                         reply_tx,
                     },
                 );
-                let frame = Self::build_read_notify_frame(
+                let count = match crate::protocol::read_notify_wire_count(
+                    snap.element_count,
+                    snap.element_count,
+                    snap.native_type as u16,
+                    snap.server_minor,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
+                let frame = match Self::build_read_notify_frame(
                     snap.sid,
                     snap.native_type as u16,
-                    snap.element_count,
+                    count,
                     ioid,
-                );
+                    snap.server_minor,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let kind = PendingKind::Cold {
                     ioid,
                     in_flight: ch.in_flight.clone(),
@@ -3005,12 +3082,7 @@ impl MonitorHandle {
             //    pre-pause backlog (3a) and pause-bypassing errors, so
             //    it is always readable regardless of pause state.
             match self.callback_rx.try_recv() {
-                Ok(msg) => {
-                    let _ = self
-                        .coord_tx
-                        .send(CoordRequest::MonitorConsumed { subid: self.subid });
-                    return Some(msg);
-                }
+                Ok(msg) => return Some(msg),
                 Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => {}
             }
@@ -3020,9 +3092,6 @@ impl MonitorHandle {
             //    not paused or buffered before the pause, and `None`
             //    for a value held during pause. Atomic against `resume`.
             //
-            //    No `MonitorConsumed` ack here: the slot is out of flow
-            //    control (invariant I1), so draining it must not
-            //    decrement the per-circuit outstanding count.
             if let Some(msg) = self.coalesce_slot.take_deliverable() {
                 return Some(msg);
             }
@@ -3034,14 +3103,7 @@ impl MonitorHandle {
             let notified = self.coalesce_slot.notified();
             tokio::pin!(notified);
             tokio::select! {
-                msg = self.callback_rx.recv() => {
-                    if msg.is_some() {
-                        let _ = self
-                            .coord_tx
-                            .send(CoordRequest::MonitorConsumed { subid: self.subid });
-                    }
-                    return msg;
-                }
+                msg = self.callback_rx.recv() => return msg,
                 _ = &mut notified => {
                     // Loop and recheck — slot/channel/pause state may
                     // have changed. Each subscription owns its slot, so
@@ -3124,68 +3186,17 @@ impl Drop for EventWatcher {
 
 // --- Coordinator ---
 
-const FLOW_CONTROL_OFF_THRESHOLD: usize = 10;
+/// Floor for the per-subscription bounded monitor channel. A queue this
+/// small coalesces almost everything into the slot; keep a little headroom
+/// so short bursts arrive as discrete updates.
+const MIN_MONITOR_QUEUE_SIZE: usize = 10;
 
 /// Resolve the per-subscription bounded-queue size from the optional
-/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256 and is clamped to at
-/// least [`FLOW_CONTROL_OFF_THRESHOLD`]: slot overflow is out of
-/// flow control (I1), so a queue smaller than the threshold could fill
-/// and coalesce forever without a lone subscription ever tripping
-/// `EVENTS_OFF`.
+/// `EPICS_CA_MONITOR_QUEUE` value. Defaults to 256, floored at
+/// [`MIN_MONITOR_QUEUE_SIZE`].
 fn resolve_monitor_queue_size(env: Option<usize>) -> usize {
-    env.unwrap_or(256).max(FLOW_CONTROL_OFF_THRESHOLD)
+    env.unwrap_or(256).max(MIN_MONITOR_QUEUE_SIZE)
 }
-const FLOW_CONTROL_ON_THRESHOLD: usize = 5;
-
-#[derive(Default)]
-struct FlowControlState {
-    outstanding: usize,
-    active: bool,
-}
-
-fn flow_control_note_queued(
-    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
-    circuit: types::CircuitKey,
-    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
-) {
-    let (server_addr, priority) = circuit;
-    let state = flow_control.entry(circuit).or_default();
-    state.outstanding = state.outstanding.saturating_add(1);
-    if !state.active && state.outstanding >= FLOW_CONTROL_OFF_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOff {
-            server_addr,
-            priority,
-        });
-        state.active = true;
-    }
-}
-
-fn flow_control_note_consumed(
-    flow_control: &mut HashMap<types::CircuitKey, FlowControlState>,
-    circuit: types::CircuitKey,
-    count: usize,
-    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
-) {
-    if count == 0 {
-        return;
-    }
-    let (server_addr, priority) = circuit;
-    let Some(state) = flow_control.get_mut(&circuit) else {
-        return;
-    };
-    state.outstanding = state.outstanding.saturating_sub(count);
-    if state.active && state.outstanding <= FLOW_CONTROL_ON_THRESHOLD {
-        let _ = transport_tx.send(TransportCommand::EventsOn {
-            server_addr,
-            priority,
-        });
-        state.active = false;
-    }
-    if !state.active && state.outstanding == 0 {
-        flow_control.remove(&circuit);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_coordinator(
     mut coord_rx: mpsc::UnboundedReceiver<CoordRequest>,
@@ -3215,7 +3226,6 @@ async fn run_coordinator(
     // per-circuit flow control. EVENTS_OFF/ON is a per-tcpiiu
     // CA message, so the outstanding-event count and the on/off gate
     // are tracked per `(server_addr, priority)`.
-    let mut flow_control: HashMap<types::CircuitKey, FlowControlState> = HashMap::new();
     // Per-circuit CA minor protocol version, populated from
     // CA_PROTO_VERSION on TCP handshake. Powers `host_minor_protocol`.
     let mut server_minor_version: HashMap<types::CircuitKey, u16> = HashMap::new();
@@ -3299,6 +3309,17 @@ async fn run_coordinator(
                             let count = ch
                                 .native_type
                                 .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));
+                            // C keeps the user's cap in `netSubscription::count`
+                            // and resolves the WIRE count per request via
+                            // `getCount(guard, CA_V413(minor))` (`netIO.h:241-251`)
+                            // — so the zero-count autosize contract is only used
+                            // with a peer that implements it.
+                            let peer_minor = ch
+                                .server_addr
+                                .and_then(|addr| {
+                                    server_minor_version.get(&(addr, ch.priority)).copied()
+                                })
+                                .unwrap_or(0);
 
                             // allocate the subid here, where the
                             // live subscription table lives, so the wrap
@@ -3334,15 +3355,36 @@ async fn run_coordinator(
                                 coalesce_slot,
                                 needs_restore: !connected,
                                 last_value: None,
-                                pending_deliveries: 0,
                                 nreplace: 0,
                             });
 
                             if connected {
+                                let data_type =
+                                    data_type.expect("connected channel has native type");
+                                // C `tcpiiu::subscriptionRequest`
+                                // (`tcpiiu.cpp:1572-1585`): resolve the wire
+                                // count, then bound it against what the circuit
+                                // can carry. Past the bound the subscription is
+                                // never installed and `ca_create_subscription`
+                                // returns ECA_TOLARGE.
+                                let wire_count = crate::protocol::subscription_wire_count(
+                                    count.expect("connected channel has element count"),
+                                    ch.element_count,
+                                    data_type,
+                                    peer_minor,
+                                );
+                                let wire_count = match wire_count {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        subscriptions.remove(subid);
+                                        let _ = reply.send(Err(e));
+                                        continue;
+                                    }
+                                };
                                 let _ = transport_tx.send(TransportCommand::Subscribe {
                                     sid: ch.sid,
-                                    data_type: data_type.expect("connected channel has native type"),
-                                    count: count.expect("connected channel has element count"),
+                                    data_type,
+                                    count: wire_count,
                                     subid,
                                     mask,
                                     server_addr,
@@ -3360,36 +3402,34 @@ async fn run_coordinator(
                             if let Some(ch) = channels.get(&cid) {
                                 if ch.state == ChannelState::Connected {
                                     if let Some(data_type) = rec.data_type {
+                                        let server_addr = ch.server_addr.unwrap();
+                                        // C `tcpiiu::subscriptionCancelRequest`
+                                        // (`tcpiiu.cpp:1659`) re-resolves the wire
+                                        // count through the same
+                                        // `getCount(CA_V413(minor))` gate the
+                                        // EVENT_ADD used, so the cancel echoes the
+                                        // count the server was given.
+                                        let peer_minor = server_minor_version
+                                            .get(&(server_addr, ch.priority))
+                                            .copied()
+                                            .unwrap_or(0);
                                         let _ = transport_tx.send(TransportCommand::Unsubscribe {
                                             sid: ch.sid,
                                             subid,
                                             data_type,
-                                            count: rec.count.unwrap_or(0),
-                                            server_addr: ch.server_addr.unwrap(),
+                                            count: crate::protocol::subscription_cancel_wire_count(
+                                                rec.count.unwrap_or(0),
+                                                ch.element_count,
+                                                peer_minor,
+                                            ),
+                                            server_addr,
                                             priority: ch.priority,
                                         });
                                     }
                                 }
                             }
                         }
-                        if let Some(rec) = subscriptions.remove(subid) {
-                            flow_control_note_consumed(
-                                &mut flow_control,
-                                (rec.server_addr, rec.priority),
-                                rec.pending_deliveries,
-                                &transport_tx,
-                            );
-                        }
-                    }
-                    CoordRequest::MonitorConsumed { subid } => {
-                        if let Some(circuit) = subscriptions.mark_consumed(subid) {
-                            flow_control_note_consumed(
-                                &mut flow_control,
-                                circuit,
-                                1,
-                                &transport_tx,
-                            );
-                        }
+                        subscriptions.remove(subid);
                     }
                     CoordRequest::DropChannel { cid } => {
                         // Cancel all subscriptions for this channel
@@ -3399,26 +3439,29 @@ async fn run_coordinator(
                                 if let Some(ch) = channels.get(&cid) {
                                     if ch.state == ChannelState::Connected {
                                         if let Some(data_type) = rec.data_type {
+                                            let server_addr = ch.server_addr.unwrap();
+                                            let peer_minor = server_minor_version
+                                                .get(&(server_addr, ch.priority))
+                                                .copied()
+                                                .unwrap_or(0);
                                             let _ = transport_tx.send(TransportCommand::Unsubscribe {
                                                 sid: ch.sid,
                                                 subid,
                                                 data_type,
-                                                count: rec.count.unwrap_or(0),
-                                                server_addr: ch.server_addr.unwrap(),
+                                                count:
+                                                    crate::protocol::subscription_cancel_wire_count(
+                                                        rec.count.unwrap_or(0),
+                                                        ch.element_count,
+                                                        peer_minor,
+                                                    ),
+                                                server_addr,
                                                 priority: ch.priority,
                                             });
                                         }
                                     }
                                 }
                             }
-                            if let Some(rec) = subscriptions.remove(subid) {
-                                flow_control_note_consumed(
-                                    &mut flow_control,
-                                    (rec.server_addr, rec.priority),
-                                    rec.pending_deliveries,
-                                    &transport_tx,
-                                );
-                            }
+                            subscriptions.remove(subid);
                         }
 
                         // Clear channel on server + clean reverse index
@@ -3518,20 +3561,30 @@ async fn run_coordinator(
                         // it as a warning every time a fresh CaClient
                         // hears its first beacon was misleading and
                         // would over-promote a benign condition.
-                        // Reserve the warn-level "IOC may have
-                        // restarted" message for real restart signals.
-                        let is_real_restart = matches!(
-                            kind,
-                            beacon_monitor::BeaconAnomalyKind::IdMismatch
-                                | beacon_monitor::BeaconAnomalyKind::PeriodCollapse
-                        );
-                        if is_real_restart {
+                        // Reserve the warn-level message for the
+                        // classifications libca counts as anomalies
+                        // (`cac.cpp:498` `beaconAnomalyCount++`).
+                        let anomaly_msg = match kind {
+                            beacon_monitor::BeaconAnomalyKind::FirstSighting => None,
+                            beacon_monitor::BeaconAnomalyKind::IdMismatch => {
+                                Some("beacon sequence restarted — IOC may have restarted")
+                            }
+                            beacon_monitor::BeaconAnomalyKind::ShortPeriod => Some(
+                                "beacon period collapsed below 0.80x of the running average \
+                                 — IOC may have restarted",
+                            ),
+                            beacon_monitor::BeaconAnomalyKind::LongPeriod => Some(
+                                "beacon period exceeded 3.25x of the running average \
+                                 — server was unreachable and is back",
+                            ),
+                        };
+                        if let Some(msg) = anomaly_msg {
                             diag.beacon_anomalies.fetch_add(1, Ordering::Relaxed);
                             diag.record(DiagEvent::BeaconAnomaly { server: server_addr });
                             tracing::warn!(
                                 server = %server_addr,
                                 ?kind,
-                                "beacon anomaly detected — IOC may have restarted"
+                                "{msg}"
                             );
                             metrics::counter!(
                                 "ca_client_beacon_anomalies_total",
@@ -3693,6 +3746,19 @@ async fn run_coordinator(
                                         server_addr,
                                         access_rights: access,
                                         state: ChannelState::Connected,
+                                        // The circuit's VERSION frame is parsed
+                                        // (and its ServerVersion event queued)
+                                        // before the CREATE_CHAN_RESP that
+                                        // produced this event, so the map is
+                                        // populated for any compliant server.
+                                        // A server that never sent VERSION is
+                                        // treated as pre-V49 — C's `tcpiiu`
+                                        // starts from the same conservative
+                                        // minor version.
+                                        server_minor: server_minor_version
+                                            .get(&(server_addr, priority))
+                                            .copied()
+                                            .unwrap_or(0),
                                     },
                                 );
                             } else {
@@ -3770,6 +3836,10 @@ async fn run_coordinator(
                                 element_count,
                                 native_changed,
                                 server_addr,
+                                server_minor_version
+                                    .get(&(server_addr, ch.priority))
+                                    .copied()
+                                    .unwrap_or(0),
                                 &transport_tx,
                             );
                             diag.connections.fetch_add(1, Ordering::Relaxed);
@@ -3825,28 +3895,18 @@ async fn run_coordinator(
                     TransportEvent::MonitorData { subid, data_type, count, data } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued(circuit) => {
-                                // Only a bounded-channel write feeds flow
-                                // control (invariant I1) — the single gate
-                                // that bumps the per-circuit outstanding
-                                // count.
-                                flow_control_note_queued(
-                                    &mut flow_control,
-                                    circuit,
-                                    &transport_tx,
-                                );
-                            }
-                            MonitorDeliveryOutcome::Slotted(_circuit) => {
+                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Slotted => {
                                 // Coalesced into the slot (overflow or
-                                // pause-held). Out of flow control (I1) so
-                                // a client-side pause can't trip EVENTS_OFF
-                                // for sibling subscriptions. Diagnostic only.
+                                // pause-held). Diagnostic only — flow
+                                // control keys on socket occupancy in
+                                // `read_loop`, never on consumer backlog.
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped(_server_addr) => {
+                            MonitorDeliveryOutcome::Dropped => {
                                 // With the coalesce slot, this is reachable
                                 // only when the consumer channel is closed —
                                 // i.e. the application dropped the
@@ -3877,23 +3937,14 @@ async fn run_coordinator(
                         // exception-callback semantics.
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_error(subid, eca_status) {
-                            // Only a bounded-channel write feeds flow
-                            // control (invariant I1). An error parked in
-                            // the (out-of-band) error slot is `Slotted`.
-                            MonitorDeliveryOutcome::Queued(circuit) => {
-                                flow_control_note_queued(
-                                    &mut flow_control,
-                                    circuit,
-                                    &transport_tx,
-                                );
-                            }
-                            MonitorDeliveryOutcome::Slotted(_) => {
+                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Slotted => {
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped(_) => {
+                            MonitorDeliveryOutcome::Dropped => {
                                 diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
                                 metrics::counter!(
                                     "ca_client_monitor_error_drops_total"
@@ -3981,7 +4032,6 @@ async fn run_coordinator(
                             .unwrap_or(0);
                         tracing::warn!(server = %server_addr, priority, channels = n_affected, "TCP circuit closed");
                         metrics::counter!("ca_client_tcp_closed_total", "server" => server_addr.to_string()).increment(1);
-                        flow_control.remove(&circuit);
                         last_rx_at.remove(&circuit);
                         server_minor_version.remove(&circuit);
                         handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
@@ -4007,15 +4057,7 @@ async fn run_coordinator(
 
                                 let pv_name = ch.pv_name.to_string();
                                 let cids = vec![cid];
-                                let cleared = subscriptions.mark_disconnected(&cids);
-                                for (circuit, count) in cleared {
-                                    flow_control_note_consumed(
-                                        &mut flow_control,
-                                        circuit,
-                                        count,
-                                        &transport_tx,
-                                    );
-                                }
+                                subscriptions.mark_disconnected(&cids);
 
                                 // Drain blocked read/write waiters for this cid.
                                 let mut affected = HashSet::with_capacity(1);
@@ -4105,15 +4147,7 @@ async fn run_coordinator(
                             // outstanding count high — EVENTS_ON could
                             // stay stuck. Every disconnect path must
                             // decrement by the cleared delta.
-                            let cleared = subscriptions.mark_disconnected(&affected_cids);
-                            for (circuit, count) in cleared {
-                                flow_control_note_consumed(
-                                    &mut flow_control,
-                                    circuit,
-                                    count,
-                                    &transport_tx,
-                                );
-                            }
+                            subscriptions.mark_disconnected(&affected_cids);
                         }
                     }
                     TransportEvent::CircuitResponsive { server_addr, priority } => {
@@ -4152,15 +4186,38 @@ async fn run_coordinator(
                                     {
                                         if let Some(ch) = channels.get(&cid) {
                                             if let Some(addr) = ch.server_addr {
-                                                let _ =
-                                                    transport_tx.send(TransportCommand::ReadNotify {
-                                                        sid: ch.sid,
-                                                        data_type,
-                                                        count: rec.count.unwrap_or(0),
-                                                        ioid: in_flight.alloc_ioid(),
-                                                        server_addr: addr,
-                                                        priority: ch.priority,
-                                                    });
+                                                let peer_minor = server_minor_version
+                                                    .get(&(addr, ch.priority))
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                match crate::protocol::read_notify_wire_count(
+                                                    rec.count.unwrap_or(0),
+                                                    ch.element_count,
+                                                    data_type,
+                                                    peer_minor,
+                                                ) {
+                                                    Ok(count) => {
+                                                        let _ = transport_tx.send(
+                                                            TransportCommand::ReadNotify {
+                                                                sid: ch.sid,
+                                                                data_type,
+                                                                count,
+                                                                ioid: in_flight.alloc_ioid(),
+                                                                server_addr: addr,
+                                                                priority: ch.priority,
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            pv = %ch.pv_name,
+                                                            error = %e,
+                                                            "skipping post-recovery re-read: \
+                                                             request exceeds what this circuit \
+                                                             can carry"
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -4183,7 +4240,7 @@ async fn run_coordinator(
                         // the live cadence. Without this, an archiver
                         // that reconnects to a server in the middle of
                         // its `online_notify_task` ramp-up would log a
-                        // PeriodCollapse cascade against its stale
+                        // short-period anomaly cascade against its stale
                         // steady-state estimate.
                         let _ = beacon_ctrl_tx.send(
                             beacon_monitor::BeaconControl::ResetServer { server_addr },
@@ -4264,7 +4321,7 @@ fn handle_disconnect(
     // Clean up stale server_channels entries so beacon anomaly
     // lookups don't reference disconnected channels.
     server_channels.remove(&circuit);
-    let _ = subscriptions.mark_disconnected(&affected_cids);
+    subscriptions.mark_disconnected(&affected_cids);
 
     // Fail pending read/write waiters for affected channels so callers
     // don't hang forever waiting for a response that will never arrive.
@@ -5548,7 +5605,9 @@ mod typed_string_put_tests {
             /* count */ 1,
             /* ioid */ None,
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(hdr.cmmd, CA_PROTO_WRITE, "command must be CA_PROTO_WRITE");
@@ -5573,7 +5632,9 @@ mod typed_string_put_tests {
             /* count */ 1,
             /* ioid */ Some(42),
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(hdr.data_type, native_double);
@@ -5609,7 +5670,9 @@ mod typed_string_put_tests {
             /* count */ values.len() as u32,
             /* ioid */ Some(7),
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(
@@ -5716,25 +5779,19 @@ mod monitor_pause_tests {
         assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
     }
 
-    /// a configured queue smaller than FLOW_CONTROL_OFF_THRESHOLD is
+    /// a configured queue smaller than MIN_MONITOR_QUEUE_SIZE is
     /// clamped up so a lone subscription's full channel can still reach
     /// the threshold and trip EVENTS_OFF (slot overflow is out of flow
     /// control, so an unclamped small queue would coalesce forever).
     #[test]
-    fn monitor_queue_clamped_to_flow_control_threshold() {
+    fn monitor_queue_clamped_to_min_size() {
         // Below threshold → clamped up.
-        assert_eq!(
-            resolve_monitor_queue_size(Some(5)),
-            FLOW_CONTROL_OFF_THRESHOLD
-        );
-        assert_eq!(
-            resolve_monitor_queue_size(Some(9)),
-            FLOW_CONTROL_OFF_THRESHOLD
-        );
+        assert_eq!(resolve_monitor_queue_size(Some(5)), MIN_MONITOR_QUEUE_SIZE);
+        assert_eq!(resolve_monitor_queue_size(Some(9)), MIN_MONITOR_QUEUE_SIZE);
         // At/above threshold → unchanged.
         assert_eq!(
-            resolve_monitor_queue_size(Some(FLOW_CONTROL_OFF_THRESHOLD)),
-            FLOW_CONTROL_OFF_THRESHOLD
+            resolve_monitor_queue_size(Some(MIN_MONITOR_QUEUE_SIZE)),
+            MIN_MONITOR_QUEUE_SIZE
         );
         assert_eq!(resolve_monitor_queue_size(Some(1000)), 1000);
         // Unset → default 256 (well above the threshold).

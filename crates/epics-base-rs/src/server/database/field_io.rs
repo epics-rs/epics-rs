@@ -6,6 +6,29 @@ use crate::types::EpicsValue;
 
 use super::PvDatabase;
 
+/// C `dbPutField`'s put-disable gate (`dbAccess.c:1255-1257`):
+/// `precord->disp && paddr->pfield != &precord->disp` → `S_db_putDisabled`.
+///
+/// This is the FIRST gate an *external* put crosses. It precedes `dbPut` —
+/// so it precedes the `SPC_NOMOD` rejection of PACT/LCNT/PUTF — and it
+/// precedes the PROC-driven `dbProcess` (`dbAccess.c:1265-1277`), so
+/// `caput REC.PROC 1` on a `DISP=1` record is refused, not force-processed.
+///
+/// Single owner for both external put boundaries: the CA / `dbpf` route
+/// ([`PvDatabase::put_record_field_from_ca`]) and the QSRV precondition
+/// check ([`PvDatabase::check_external_put_preconditions`]). Internal puts
+/// (`put_pv`, link and processing writes — the `dbPut` analogue) deliberately
+/// do not cross it.
+fn check_put_disabled(
+    instance: &crate::server::record::RecordInstance,
+    field_upper: &str,
+) -> CaResult<()> {
+    if instance.common.disp && field_upper != "DISP" {
+        return Err(CaError::PutDisabled(field_upper.to_string()));
+    }
+    Ok(())
+}
+
 /// Coerce a write `value` to a record field's stored `target` type. A
 /// `DBR_STRING` write to a `DBF_MENU` field resolves the label against THAT
 /// field's own menu first (C `dbConvert` `putStringMenu`: an exact label,
@@ -211,11 +234,9 @@ impl PvDatabase {
             return Ok(());
         };
         let instance = rec.read().await;
-        // DISP=1 blocks a put to any field except DISP itself
-        // (C: `precord->disp && pfield != &precord->disp` → S_db_putDisabled).
-        if instance.common.disp && field_upper != "DISP" {
-            return Err(CaError::PutDisabled(field_upper));
-        }
+        // DISP=1 blocks a put to any field except DISP itself — the shared
+        // gate owner, identical to the one the CA route crosses.
+        check_put_disabled(&instance, &field_upper)?;
         // Read-only / SPC_NOMOD field
         // (C: `special == SPC_ATTRIBUTE` → S_db_noMod) — same `read_only`
         // flag the Passive route checks, so all three modes gate uniformly.
@@ -700,6 +721,54 @@ impl PvDatabase {
         }
     }
 
+    /// C `dbPutField`'s put-driven process decision (`dbAccess.c:1264-1277`).
+    ///
+    /// Reached once the put has selected the record for processing — the `PROC`
+    /// field, or a `pp(TRUE)` field on a Passive record. C then splits on PACT:
+    ///
+    /// * **async-active** — C sets `rpro = TRUE` and does NOT call `dbProcess`.
+    ///   `recGblFwdLink` (`recGbl.c:296-300`) consumes RPRO when the device
+    ///   round trip completes and queues `scanOnce`, so the value this put just
+    ///   wrote still reaches the device, one cycle later. Calling `dbProcess`
+    ///   here instead lands in dbProcess's own PACT guard, which bumps LCNT and
+    ///   after MAX_LOCK raises SCAN_ALARM — an alarm C never raises for a client
+    ///   put — while dropping the deferred reprocess entirely: on two rapid
+    ///   puts to a Passive async output, C writes both values to the device and
+    ///   the port wrote only the first.
+    /// * **idle** — C sets `putf = TRUE` (the put-driven marker, cleared at the
+    ///   tail of the process cycle / in `complete_async_record_inner`, both the
+    ///   `recGblFwdLink:302` analogue) and calls `dbProcess`.
+    ///
+    /// Single owner of that decision for every external put: the `PROC`
+    /// intercept and the `pp`-field route in
+    /// [`Self::put_record_field_from_ca`] both go through it, so neither can
+    /// drift from C's rule or from each other. The DB-link propagation path
+    /// applies the same PACT→RPRO rule at its own targets (`processing.rs:3225`,
+    /// `:4220`, `links.rs:829`).
+    ///
+    /// The caller already holds `record_name`'s advisory write gate (the
+    /// `dbScanLock` analogue) — either `_record_gate`, or the QSRV atomic
+    /// group's `lock_records` epoch when entered via
+    /// `put_record_field_from_ca_already_locked`. The gate `Mutex` is not
+    /// reentrant, so processing MUST use the `_already_locked` entry.
+    async fn put_driven_process(&self, record_name: &str) {
+        {
+            let Some(rec) = self.get_record(record_name).await else {
+                return;
+            };
+            let mut instance = rec.write().await;
+            if instance.is_processing() {
+                instance.common.rpro = true;
+                return;
+            }
+            instance.common.putf = true;
+        }
+        let mut visited = HashSet::new();
+        let _ = self
+            .process_record_with_links_already_locked(record_name, &mut visited, 0)
+            .await;
+    }
+
     async fn put_record_field_from_ca_inner(
         &self,
         record_name: &str,
@@ -747,6 +816,17 @@ impl PvDatabase {
         // Special field intercepts (read lock, then drop)
         {
             let instance = rec.read().await;
+
+            // C `dbPutField` gate order (`dbAccess.c:1252-1277`): the DISP
+            // put-disable gate runs BEFORE `dbPut` — hence before the
+            // SPC_NOMOD rejection of PACT/LCNT/PUTF (`dbAccess.c:123`) — and
+            // BEFORE the PROC-driven `dbProcess`. So on a `DISP=1` record
+            // EVERY non-DISP field, PROC included, is refused with
+            // `S_db_putDisabled` and the record does not process.
+            check_put_disabled(&instance, &field)?;
+
+            // SPC_NOMOD fields (dbCommon.dbd): rejected inside C's `dbPut`,
+            // i.e. after the DISP gate above.
             match field.as_str() {
                 "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
                 "LCNT" => return Err(CaError::ReadOnlyField("LCNT".into())),
@@ -754,7 +834,7 @@ impl PvDatabase {
                 _ => {}
             }
 
-            // PROC intercept: trigger processing regardless of DISP.
+            // PROC intercept: trigger processing on any SCAN.
             // Falls through to the put_notify_tx registration below
             // so async records (motor, asyn-backed AO) signal real
             // completion; otherwise WRITE_NOTIFY would return ECA_NORMAL
@@ -795,16 +875,11 @@ impl PvDatabase {
                 } else {
                     None
                 };
-                let mut visited = HashSet::new();
-                // this PROC trigger already holds `record_name`'s
-                // advisory write gate — either `_record_gate` above, or
-                // the QSRV atomic group's `lock_records` epoch when
-                // entered via `put_record_field_from_ca_already_locked`.
-                // The gate `Mutex` is not reentrant, so the processing
-                // call MUST use the `_already_locked` variant.
-                let _ = self
-                    .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                    .await;
+                // C `dbPutField:1265-1277`: PROC is one of the two fields that
+                // selects the record for the put-driven process — with the same
+                // PACT→RPRO deferral as a `pp` field. Both go through the single
+                // owner.
+                self.put_driven_process(record_name).await;
                 // The wait-set fires the oneshot only after the whole
                 // FLNK/OUT chain (sync + async) settles. If it has
                 // already completed the chain was fully synchronous —
@@ -821,17 +896,13 @@ impl PvDatabase {
                     None => Ok(None),
                 };
             }
-
-            // DISP check: block CA puts to non-DISP fields when DISP=1
-            if instance.common.disp && field != "DISP" {
-                return Err(CaError::PutDisabled(field));
-            }
         }
 
-        // Normal field put (write lock)
+        // Normal field put (write lock) — C `dbPut`, which does NOT touch
+        // `putf`: the marker is raised only where C raises it, at the
+        // put-driven process decision (`put_driven_process`).
         let common_result = {
             let mut instance = rec.write().await;
-            instance.common.putf = true;
 
             // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
             // This matches C EPICS db_put_field() which converts from the CA client's type
@@ -846,15 +917,11 @@ impl PvDatabase {
                 .find(|f| f.name.eq_ignore_ascii_case(&field))
                 .is_some_and(|f| f.read_only);
             if is_read_only {
-                instance.common.putf = false;
                 return Err(CaError::ReadOnlyField(field));
             }
 
             // Pre-write special hook (C EPICS dbPutSpecial pass=0)
-            if let Err(e) = instance.record.special(&field, false) {
-                instance.common.putf = false;
-                return Err(e);
-            }
+            instance.record.special(&field, false)?;
 
             // Capture pre-put value for faac1df1 idempotent-write suppression.
             let prev_value = instance.record.get_field(&field);
@@ -916,10 +983,7 @@ impl PvDatabase {
                         Err(CaError::FieldNotFound(_)) => {
                             instance.put_common_field(&field, value)?
                         }
-                        Err(e) => {
-                            instance.common.putf = false;
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
             };
@@ -928,21 +992,13 @@ impl PvDatabase {
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
-            // C `dbAccess.c::dbPutField:1276` sets `precord->putf = TRUE`
-            // immediately before calling `dbProcess`, and the flag stays
-            // TRUE through the entire process cycle. It is cleared only
-            // in `recGblFwdLink` (recGbl.c:302) after FLNK fires, OR in
-            // the disable-alarm bail (dbAccess.c:576). The Rust port
-            // previously cleared `putf` here — BEFORE the
-            // `process_record_with_links` call below — so any code
-            // path (TPRO trace, async-completion logic, monitor on
-            // .PUTF) observing the bit during the process cycle saw
-            // `putf=0` and could not distinguish put-driven vs
-            // scan-driven processing.
-            //
-            // DO NOT clear `putf` here. The clearing now happens after
-            // the process call returns (synchronous completion) or in
-            // `complete_async_record` (async completion).
+            // `putf` is neither set nor cleared anywhere in this block: C's
+            // `dbPut` does not touch it. It is raised in `put_driven_process`
+            // (C `dbAccess.c:1274`) immediately before `dbProcess`, stays TRUE
+            // for the whole process cycle — including an async device round
+            // trip — and is cleared by the `recGblFwdLink:302` analogue at the
+            // cycle's tail (`processing.rs:2997` / `complete_async_record_inner`)
+            // or by the disable-alarm bail (`dbAccess.c:576`).
 
             instance.cleanup_subscribers();
             // C `dbPut:1408-1414` posts DBE_VALUE|DBE_LOG for the put field
@@ -1086,21 +1142,9 @@ impl PvDatabase {
         };
 
         if !should_process {
-            // No processing cycle. C never sets `putf` on this path, so
-            // clear the flag the field-put set at entry, and report
-            // immediate (synchronous) completion to a WRITE_NOTIFY caller.
-            // Collect-then-act: clone the handle under a brief map read, drop
-            // the map lock before the per-record write.
-            let rec_arc = {
-                let recs = self.inner.records.read().await;
-                recs.get(record_name).cloned()
-            };
-            if let Some(rec_arc) = rec_arc {
-                let mut guard = rec_arc.write().await;
-                if !guard.is_processing() {
-                    guard.common.putf = false;
-                }
-            }
+            // No processing cycle, so C never raises `putf` (and this put did
+            // not either). Report immediate (synchronous) completion to a
+            // WRITE_NOTIFY caller.
             return Ok(None);
         }
 
@@ -1176,19 +1220,10 @@ impl PvDatabase {
             }
         }
 
-        // Process the record after field put.
-        {
-            let mut visited = HashSet::new();
-            // `record_name`'s advisory write gate is already
-            // held by this `put` (the `_record_gate` taken above, or
-            // the QSRV atomic group's `lock_records` epoch via
-            // `put_record_field_from_ca_already_locked`). The gate
-            // `Mutex` is not reentrant — use the `_already_locked`
-            // processing entry.
-            let _ = self
-                .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                .await;
-        }
+        // Process the record after field put — through the single owner of C's
+        // `dbPutField:1269-1277` decision, so an async-active record takes the
+        // RPRO deferral instead of a doomed re-entrant `dbProcess`.
+        self.put_driven_process(record_name).await;
 
         // Is the ORIGINATING record itself still async-pending? Its
         // wait-set membership is taken + `leave`d at its own completion

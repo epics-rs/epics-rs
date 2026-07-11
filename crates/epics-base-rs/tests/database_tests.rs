@@ -2330,8 +2330,13 @@ async fn test_proc_works_any_scan() {
     assert!(!inst.common.udf);
 }
 
+/// C `dbAccess.c::dbPutField:1255-1257` returns `S_db_putDisabled` for a
+/// put to ANY field but DISP while `DISP=1` — the gate sits before `dbPut`
+/// AND before the PROC-driven `dbProcess` (`:1265-1277`). `PROC`'s pfield is
+/// not `&precord->disp`, so `caput REC.PROC 1` on a disabled record is
+/// refused and the record does NOT process.
 #[tokio::test]
-async fn test_proc_bypasses_disp() {
+async fn test_disp_blocks_proc_and_suppresses_processing() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
@@ -2343,7 +2348,42 @@ async fn test_proc_bypasses_disp() {
     let result = db
         .put_record_field_from_ca("REC", "PROC", EpicsValue::Char(1))
         .await;
-    assert!(result.is_ok());
+    assert!(
+        matches!(result, Err(CaError::PutDisabled(_))),
+        "DISP=1 must refuse a PROC put (C S_db_putDisabled), got {result:?}"
+    );
+
+    // ...and the DISP gate precedes dbProcess, so nothing processed: a
+    // fresh record is still UDF.
+    let rec = db.get_record("REC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        inst.common.udf,
+        "the refused PROC put must not have force-processed the record"
+    );
+}
+
+/// The same gate ordering for an SPC_NOMOD field: C rejects PACT with
+/// `S_db_noMod` inside `dbPut` (`dbAccess.c:123`), which `dbPutField` only
+/// reaches AFTER the DISP gate — so on a `DISP=1` record the error a client
+/// sees for `caput REC.PACT` is `S_db_putDisabled`, not `S_db_noMod`.
+#[tokio::test]
+async fn test_disp_gate_precedes_nomod_rejection() {
+    let db = PvDatabase::new();
+    db.add_record("REC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("REC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
+    }
+    let result = db
+        .put_record_field_from_ca("REC", "PACT", EpicsValue::Char(1))
+        .await;
+    assert!(
+        matches!(result, Err(CaError::PutDisabled(_))),
+        "DISP gate runs before the SPC_NOMOD rejection, got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -2753,6 +2793,130 @@ impl Record for AsyncRecord {
     fn field_list(&self) -> &'static [FieldDesc] {
         &[]
     }
+}
+
+/// An async output whose device write is observable: every process pass
+/// records the VAL it pushed to "the device". `process()` never completes on
+/// its own — the test drives `complete_async_record`, exactly like a real
+/// device callback.
+struct AsyncOutRecord {
+    val: f64,
+    device_writes: Arc<std::sync::Mutex<Vec<f64>>>,
+}
+impl Record for AsyncOutRecord {
+    fn record_type(&self) -> &'static str {
+        "async_out_test"
+    }
+    fn process_passive_fields(&self) -> &'static [&'static str] {
+        &["VAL"]
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        self.device_writes.lock().unwrap().push(self.val);
+        Ok(ProcessOutcome::async_pending())
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Double(self.val)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        match name {
+            "VAL" => {
+                if let EpicsValue::Double(v) = value {
+                    self.val = v;
+                    Ok(())
+                } else {
+                    Err(CaError::InvalidValue("bad".into()))
+                }
+            }
+            _ => Err(CaError::FieldNotFound(name.into())),
+        }
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+/// C `dbAccess.c::dbPutField:1269-1273` — a client put to a `pp` field of an
+/// async-active (PACT) record sets `rpro = TRUE` and does NOT call
+/// `dbProcess`. `recGblFwdLink` (`recGbl.c:296-300`) consumes RPRO when the
+/// device round trip completes and queues `scanOnce`, so the second value
+/// still reaches the device.
+///
+/// Pre-fix the port called `dbProcess` re-entrantly instead: it bailed at
+/// dbProcess's own PACT guard (bumping LCNT, and after MAX_LOCK raising a
+/// SCAN_ALARM C never raises for a client put) and never set RPRO — the
+/// second value landed in VAL and was never written out.
+#[tokio::test]
+async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
+    let db = PvDatabase::new();
+    let writes: Arc<std::sync::Mutex<Vec<f64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    db.add_record(
+        "ASYNC_OUT",
+        Box::new(AsyncOutRecord {
+            val: 0.0,
+            device_writes: writes.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Put 1: record is idle → putf=TRUE, process → device write of 1.0, PACT.
+    db.put_record_field_from_ca_no_notify("ASYNC_OUT", "VAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1.0],
+        "put 1 must reach device"
+    );
+
+    // Put 2 lands while the device round trip is still in flight.
+    db.put_record_field_from_ca_no_notify("ASYNC_OUT", "VAL", EpicsValue::Double(2.0))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ASYNC_OUT").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "still PACT from put 1");
+        assert!(
+            inst.common.rpro,
+            "put to a PACT record must set RPRO (C dbAccess.c:1272)"
+        );
+        assert_eq!(
+            inst.common.lcnt, 0,
+            "C's dbPutField never calls dbProcess on an active record, so LCNT \
+             must not advance (pre-fix it did, and after MAX_LOCK raised SCAN_ALARM)"
+        );
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![1.0],
+            "put 2 must NOT re-enter process while PACT"
+        );
+    }
+
+    // Device callback completes cycle 1. recGblFwdLink consumes RPRO and
+    // queues the reprocess (a detached task, C's scanOnce ring).
+    db.complete_async_record("ASYNC_OUT").await.unwrap();
+    for _ in 0..100 {
+        if writes.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1.0, 2.0],
+        "RPRO reprocess must push the second value to the device"
+    );
+    let rec = db.get_record("ASYNC_OUT").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.rpro,
+        "RPRO is consumed (cleared) by the completion tail"
+    );
 }
 
 #[tokio::test]

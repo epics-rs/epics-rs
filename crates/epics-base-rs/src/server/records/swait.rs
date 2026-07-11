@@ -1,6 +1,5 @@
-use crate::calc::StringInputs;
-use crate::calc::engine::value::StackValue;
-use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
+use crate::calc::NumericInputs;
+use crate::calc::{CompiledExpr, compile as calc_compile, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
@@ -80,23 +79,19 @@ impl Default for SwaitRecord {
 const CHAN: [char; 12] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 
 impl SwaitRecord {
+    /// C `swaitRecord.c:304,561` — swait compiles its CALC with the **numeric**
+    /// `postfix()`, not `sCalcPostfix()`. Its grammar is therefore epics-base
+    /// calc's: no SVAL, no string literals, no sCalc string functions.
     fn recompile(&mut self) {
-        self.compiled_calc = scalc_compile(&self.calc).ok();
+        self.compiled_calc = calc_compile(&self.calc).ok();
     }
 
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
-    /// the `VAL` token (`FETCH_VAL`, sCalcPerform.c:451-453) pushes — for swait
-    /// that is `&pwait->val` (C `swaitRecord.c:409`), i.e. the *previous* VAL.
-    ///
-    /// `prev_sval` is deliberately left empty: swait evaluates its CALC with the
-    /// *numeric* `calcPerform(&pwait->a, &pwait->val, pwait->rpcl)`
-    /// (`swaitRecord.c:409`), which takes no `psresult` — swait has no SVAL
-    /// field and the numeric `postfix()` element table has no SVAL token.
-    fn build_inputs(&self, prev_val: f64) -> StringInputs {
-        let mut inputs = StringInputs::new();
-        for i in 0..12 {
-            inputs.num_vars[i] = self.num_vals[i];
-        }
+    /// the `VAL` token (`FETCH_VAL`) pushes — for swait that is `&pwait->val`
+    /// (C `swaitRecord.c:409`), i.e. the *previous* VAL.
+    fn build_inputs(&self, prev_val: f64) -> NumericInputs {
+        let mut inputs = NumericInputs::new();
+        inputs.vars[..12].copy_from_slice(&self.num_vals[..12]);
         inputs.prev_val = prev_val;
         inputs
     }
@@ -443,11 +438,10 @@ impl Record for SwaitRecord {
 
         if let Some(ref compiled) = self.compiled_calc {
             let mut inputs = self.build_inputs(self.val);
-            if let Ok(result) = scalc_eval(compiled, &mut inputs) {
-                self.val = match result {
-                    StackValue::Double(v) => v,
-                    StackValue::Str(s) => s.parse::<f64>().unwrap_or(0.0),
-                };
+            // C `swaitRecord.c:409` — `calcPerform(&pwait->a, &pwait->val,
+            // pwait->rpcl)`: the numeric engine, whose result is a double.
+            if let Ok(v) = calc_eval(compiled, &mut inputs) {
+                self.val = v;
             }
         }
 

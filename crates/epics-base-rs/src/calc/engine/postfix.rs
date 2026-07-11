@@ -286,11 +286,62 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
     }
 }
 
-pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
+/// Is `op` in the element table of the C compiler for `kind`?
+///
+/// C has three *separate* compilers, each with its own `ELEMENT` table:
+/// `postfix.c` (calc/calcout/swait), `sCalcPostfix.c` (sCalc) and
+/// `aCalcPostfix.c` (aCalc). A symbol absent from the table being compiled
+/// against is never lexed at all: `get_element` fails, infix text is left
+/// unconsumed, and `postfix()` returns `CALC_ERR_SYNTAX` — a COMPILE error
+/// (`CLCV != 0`, reported at record init / CALC-field put).
+///
+/// The Rust port shares one tokenizer across the three engines, so the table
+/// difference has to be reapplied here, on the emitted opcode stream. Every
+/// opcode below is engine-specific in C; everything else is shared numeric
+/// core present in all three tables.
+fn opcode_in_grammar(kind: &ExprKind, op: &Opcode) -> bool {
+    match op {
+        // String ops (string literals, STR/DBL/LEN/BYTE/PRINTF/SSCANF/ESC/
+        // CRC16/…, `[i:j]`, `{find,replace}`, `|-`) exist only in
+        // sCalcPostfix.c's table.
+        Opcode::String(_) => matches!(kind, ExprKind::String),
+        // Array ops (IX/ARR/AVG/SUM/DERIV/FITPOLY/…) only in aCalcPostfix.c.
+        Opcode::Array(_) => matches!(kind, ExprKind::Array),
+        // `UNTIL` is in the sCalc and aCalc tables, not in postfix.c.
+        Opcode::Control(_) => !matches!(kind, ExprKind::Numeric),
+        Opcode::Core(core) => match core {
+            // `SVAL` (FETCH_SVAL) — sCalcPostfix.c:188 only; it pushes
+            // `psresult`, which numeric `calcPerform` does not even take.
+            CoreOp::FetchSval => matches!(kind, ExprKind::String),
+            // Double-letter args `AA`..`UU` — sCalc string args / aCalc array
+            // args. postfix.c has single letters only.
+            CoreOp::PushDoubleVar(_) | CoreOp::StoreDoubleVar(_) => {
+                !matches!(kind, ExprKind::Numeric)
+            }
+            // `>?` / `<?` (MAX_VAL/MIN_VAL) and `NRNDM` are synApps operator-
+            // table extensions; neither is in epics-base postfix.c.
+            CoreOp::MaxVal | CoreOp::MinVal | CoreOp::NormalRandom => {
+                !matches!(kind, ExprKind::Numeric)
+            }
+            _ => true,
+        },
+    }
+}
+
+/// Compile a token stream for ONE engine.
+///
+/// `kind` selects the C compiler being emulated (`postfix` / `sCalcPostfix` /
+/// `aCalcPostfix`) and is enforced, not inferred: a token outside that
+/// engine's grammar is rejected here with `CalcError::Syntax`, C's
+/// `CALC_ERR_SYNTAX`. The resulting `CompiledExpr` therefore carries only
+/// opcodes its evaluator can execute — the previous shared-table compile let
+/// `SVAL` or `PRINTF` into a numeric `calc.CALC` and failed at first process
+/// with `CalcError::Internal` instead of at load.
+pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcError> {
     if tokens.is_empty() {
         return Ok(CompiledExpr {
             code: vec![Opcode::Core(CoreOp::End)],
-            kind: ExprKind::Numeric,
+            kind,
             loop_pairs: Vec::new(),
         });
     }
@@ -301,10 +352,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
     let mut runtime_depth: i32 = 0;
     let mut cond_count: i32 = 0;
     let mut pos = 0;
-    #[allow(unused_mut)]
-    let mut has_string_ops = false;
-    #[allow(unused_mut)]
-    let mut has_array_ops = false;
     let mut bracket_depth: i32 = 0;
     let mut brace_depth: i32 = 0;
     let mut until_stack: Vec<usize> = Vec::new();
@@ -341,7 +388,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     operand_needed = false;
                     // C sCalcPostfix.c:452 lists FETCH_SVAL among the opcodes
                     // that mark the postfix USES_STRING.
-                    has_string_ops = true;
                 }
                 Token::Rndm => {
                     output.push(Opcode::Core(CoreOp::Random));
@@ -369,7 +415,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     )));
                     runtime_depth += 1;
                     operand_needed = false;
-                    has_string_ops = true;
                 }
 
                 // Unary operators
@@ -408,7 +453,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                         super::opcodes::ControlOp::Until(0), // placeholder
                     ));
                     until_stack.push(until_pc);
-                    has_string_ops = true;
                     // operand_needed remains true (body follows)
                 }
 
@@ -599,7 +643,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
                     stack.push(StackEntry::LParen); // reuse LParen mechanics
                     operand_needed = true;
-                    has_string_ops = true;
                     // Mark that we need to emit Subrange on RBracket
                     bracket_depth += 1;
                 }
@@ -609,7 +652,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
                     stack.push(StackEntry::LParen);
                     operand_needed = true;
-                    has_string_ops = true;
                     brace_depth += 1;
                 }
 
@@ -667,7 +709,6 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                         in_stack_pri: 6,
                     });
                     operand_needed = true;
-                    has_string_ops = true;
                 }
 
                 _ => return Err(CalcError::Syntax),
@@ -731,13 +772,12 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
 
     output.push(Opcode::Core(CoreOp::End));
 
-    let kind = if has_array_ops {
-        ExprKind::Array
-    } else if has_string_ops {
-        ExprKind::String
-    } else {
-        ExprKind::Numeric
-    };
+    // C's per-engine ELEMENT table, reapplied to the shared tokenizer's output:
+    // a token this engine's C compiler cannot lex is a compile error, not a
+    // runtime one.
+    if output.iter().any(|op| !opcode_in_grammar(&kind, op)) {
+        return Err(CalcError::Syntax);
+    }
 
     Ok(CompiledExpr {
         code: output,

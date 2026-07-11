@@ -1,4 +1,6 @@
-use epics_base_rs::calc::{NumericInputs, calc, compile, eval};
+use epics_base_rs::calc::{
+    CalcError, NumericInputs, StackValue, StringInputs, calc, compile, eval, scalc, scalc_compile,
+};
 
 fn make_inputs(vals: &[(u8, f64)]) -> NumericInputs {
     let mut inputs = NumericInputs::new();
@@ -6,6 +8,23 @@ fn make_inputs(vals: &[(u8, f64)]) -> NumericInputs {
         inputs.vars[idx as usize] = val;
     }
     inputs
+}
+
+/// Evaluate through the **sCalc** engine. `>?`, `<?` and `NRNDM` are in
+/// `sCalcPostfix.c`'s element table but not in epics-base `postfix.c`'s, so the
+/// numeric engine refuses them at compile time (`CALC_ERR_SYNTAX`).
+fn assert_scalc(expr: &str, inputs: &[(u8, f64)], expected: f64) {
+    let mut inp = StringInputs::new();
+    for &(idx, val) in inputs {
+        inp.num_vars[idx as usize] = val;
+    }
+    match scalc(expr, &mut inp).unwrap() {
+        StackValue::Double(result) => assert!(
+            (result - expected).abs() < 1e-9,
+            "Expression '{expr}': expected {expected}, got {result}"
+        ),
+        other => panic!("Expression '{expr}': expected a double, got {other:?}"),
+    }
 }
 
 fn assert_calc(expr: &str, inputs: &[(u8, f64)], expected: f64) {
@@ -257,14 +276,16 @@ fn test_max_vararg() {
 
 #[test]
 fn test_max_op() {
-    assert_calc("A>?B", &[(0, 3.0), (1, 5.0)], 5.0);
-    assert_calc("A>?B", &[(0, 7.0), (1, 5.0)], 7.0);
+    assert_scalc("A>?B", &[(0, 3.0), (1, 5.0)], 5.0);
+    assert_scalc("A>?B", &[(0, 7.0), (1, 5.0)], 7.0);
+    assert_eq!(compile("A>?B").unwrap_err(), CalcError::Syntax);
 }
 
 #[test]
 fn test_min_op() {
-    assert_calc("A<?B", &[(0, 3.0), (1, 5.0)], 3.0);
-    assert_calc("A<?B", &[(0, 7.0), (1, 5.0)], 5.0);
+    assert_scalc("A<?B", &[(0, 3.0), (1, 5.0)], 3.0);
+    assert_scalc("A<?B", &[(0, 7.0), (1, 5.0)], 5.0);
+    assert_eq!(compile("A<?B").unwrap_err(), CalcError::Syntax);
 }
 
 // ===== Ternary =====
@@ -343,10 +364,17 @@ fn test_rndm_range() {
 
 #[test]
 fn test_nrndm() {
-    // Just check it doesn't crash and produces a finite number
-    let mut inputs = NumericInputs::new();
-    let r = calc("NRNDM", &mut inputs).unwrap();
-    assert!(r.is_finite(), "NRNDM not finite: {}", r);
+    // NRNDM is sCalc/aCalc only; the numeric engine refuses it at compile.
+    let mut inputs = StringInputs::new();
+    let r = scalc("NRNDM", &mut inputs).unwrap();
+    match r {
+        StackValue::Double(v) => assert!(v.is_finite(), "NRNDM not finite: {v}"),
+        other => panic!("NRNDM must produce a double, got {other:?}"),
+    }
+    assert_eq!(
+        calc("NRNDM", &mut NumericInputs::new()),
+        Err(CalcError::Syntax)
+    );
 }
 
 // ===== Division by zero =====
@@ -522,8 +550,13 @@ fn test_full_a_to_u_sum() {
 #[test]
 fn test_double_letter_uu_parses() {
     // The lexer's doubled-letter variant (e.g. UU) must compile after
-    // #655 widened the legal range from A..L to A..U.
-    assert!(compile("UU").is_ok(), "UU should be a valid token");
-    assert!(compile("MM").is_ok(), "MM should be a valid token");
-    assert!(compile("VV").is_err(), "VV must remain rejected");
+    // #655 widened the legal range from A..L to A..U. Doubled letters are
+    // sCalc string args / aCalc array args — epics-base `postfix.c` has no
+    // doubled-letter operands at all, so they compile only in those engines.
+    assert!(scalc_compile("UU").is_ok(), "UU should be a valid token");
+    assert!(scalc_compile("MM").is_ok(), "MM should be a valid token");
+    assert!(scalc_compile("VV").is_err(), "VV must remain rejected");
+
+    assert_eq!(compile("UU").unwrap_err(), CalcError::Syntax);
+    assert!(compile("VV").is_err());
 }

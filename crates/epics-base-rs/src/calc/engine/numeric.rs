@@ -493,7 +493,9 @@ mod parity_tests {
     //! C-parity regression tests for calc engine fixes (doc/parity-review/01-calc.md).
     use super::{d2i, d2ui, f64_to_i32_wrap};
     use crate::calc::engine::error::calc_error_str;
-    use crate::calc::{ArrayInputs, CalcError, NumericInputs, acalc, calc, compile, eval};
+    use crate::calc::{
+        ArrayInputs, CalcError, NumericInputs, acalc, acalc_compile, calc, compile, eval,
+    };
 
     fn run(expr: &str) -> f64 {
         let mut inp = NumericInputs::new();
@@ -568,18 +570,22 @@ mod parity_tests {
     // well-formed array/string extension opcodes. The arity of every
     // non-vararg function (incl. 0-arg ARNDM/IX, 2-arg CAT/NSMOO/NDERIV/
     // FITPOLY/FITQ, 3-arg FITMPOLY/FITMQ) is now modelled exactly.
+    //
+    // These compile through `acalc_compile` — the aCalcPostfix.c element table
+    // is the only one of the three that has these tokens. The numeric
+    // `compile()` rejects them (see `numeric_calc_rejects_foreign_engine_tokens`).
     #[test]
     fn h1_array_extension_ops_compile() {
         // 2-arg array concat: CAT consumes 2 operands, pushes 1.
-        assert!(compile("CAT(AA,BB)").is_ok());
-        assert!(compile("CAT(AA,4)").is_ok());
+        assert!(acalc_compile("CAT(AA,BB)").is_ok());
+        assert!(acalc_compile("CAT(AA,4)").is_ok());
         // 0-arg array generator: ARNDM consumes 0, pushes 1.
-        assert!(compile("ARNDM").is_ok());
+        assert!(acalc_compile("ARNDM").is_ok());
         // Other 2-arg array ops.
-        assert!(compile("NSMOO(AA,2)").is_ok());
-        assert!(compile("NDERIV(AA,5)").is_ok());
-        assert!(compile("FITPOLY(AA,BB)").is_ok());
-        assert!(compile("FITQ(AA,BB)").is_ok());
+        assert!(acalc_compile("NSMOO(AA,2)").is_ok());
+        assert!(acalc_compile("NDERIV(AA,5)").is_ok());
+        assert!(acalc_compile("FITPOLY(AA,BB)").is_ok());
+        assert!(acalc_compile("FITQ(AA,BB)").is_ok());
 
         // And acalc end-to-end still produces an array result.
         let mut inputs = ArrayInputs::new(3);

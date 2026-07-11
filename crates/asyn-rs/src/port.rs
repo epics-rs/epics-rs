@@ -26,6 +26,17 @@ use std::any::Any;
 /// window.
 const AUTO_CONNECT_THROTTLE: Duration = Duration::from_secs(2);
 
+/// First autonomous connect-retry delay after a port drops. C
+/// `exceptionDisconnect` arms the port's connect timer at `.01` seconds
+/// (asynManager.c:2181-2182), so the reconnect is attempted essentially
+/// immediately and then backs off to [`DEFAULT_SECONDS_BETWEEN_PORT_CONNECT`].
+const CONNECT_RETRY_INITIAL: Duration = Duration::from_millis(10);
+
+/// C `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` (asynManager.c:48) — the interval
+/// `portConnectProcessCallback` re-arms the connect timer at after a failed
+/// attempt (asynManager.c:3281).
+const DEFAULT_SECONDS_BETWEEN_PORT_CONNECT: Duration = Duration::from_secs(20);
+
 /// Per-address device state for multi-device ports.
 #[derive(Debug, Clone)]
 pub struct DeviceState {
@@ -152,6 +163,21 @@ pub struct PortDriverBase {
     /// auto-connect attempt (C `dpCommon.lastConnectDisconnect`). `None`
     /// = no transition yet, so the first attempt is always permitted.
     pub last_connect_disconnect: Option<Instant>,
+    /// Deadline for the next *autonomous* connect attempt — the Rust
+    /// equivalent of C's per-port `connectTimer` (`port.connectTimer`,
+    /// asynManager.c:223). `None` = disarmed.
+    ///
+    /// Armed by [`Self::set_connected`] on a disconnect (C
+    /// `exceptionDisconnect`, asynManager.c:2181-2182) and re-armed by the
+    /// actor after a failed attempt; cleared on connect. The actor is what
+    /// services it — see `PortActor::service_connect_timer` — so this field
+    /// is the whole handoff between the transition owner and the timer.
+    pub connect_retry_at: Option<Instant>,
+    /// Back-off between failed autonomous connect attempts. C
+    /// `port.secondsBetweenPortConnect`, initialised to
+    /// `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` = 20 s (asynManager.c:48, 3249)
+    /// and used to re-arm the timer at asynManager.c:3281.
+    pub seconds_between_port_connect: Duration,
 }
 
 impl PortDriverBase {
@@ -175,6 +201,8 @@ impl PortDriverBase {
             device_states: HashMap::new(),
             timestamp_source: None,
             last_connect_disconnect: None,
+            connect_retry_at: None,
+            seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
         }
     }
 
@@ -217,6 +245,18 @@ impl PortDriverBase {
             // every disconnect (asynManager.c:2184) so the auto-reconnect
             // throttle measures from the moment the link dropped.
             self.last_connect_disconnect = Some(Instant::now());
+            // ...and arms the port's connect timer at .01 s when the port is
+            // auto-connect (asynManager.c:2181-2182), which is what makes the
+            // reconnect *autonomous*: it does not wait for queued traffic.
+            if self.auto_connect {
+                self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+            }
+        } else {
+            // The link is up — nothing left to retry. (C leaves the timer
+            // running and lets `portConnectTimerCallback` no-op on the
+            // `!connected` guard, asynManager.c:3257; disarming here is the
+            // same observable behaviour without the pointless wakeup.)
+            self.connect_retry_at = None;
         }
         // The interpose stack is a subscriber of this transition, exactly as
         // in C: `asynInterposeEos` registers an exception callback

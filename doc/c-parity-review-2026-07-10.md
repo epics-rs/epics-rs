@@ -799,7 +799,7 @@ Impact: `caput calc.CALC "1+"` returns write success on the port, write error on
 ### R8-2: calcout and scalcout are missing the CLCV/OCLV expression-validity fields entirely
 Severity: Medium
 Rust: `crates/epics-base-rs/src/server/records/calcout.rs:1255-1259`, `scalcout.rs:717-723,739-745` — compile errors discarded, no CLCV/OCLV field declared or served (acalcout.rs has them but sets clcv=1 generically where C stores the specific code).
-C reference: `calcoutRecord.c:326-345` — special() sets `clcv`/`oclv` to the exact postfix error code, posts DBE_VALUE, accepts the put; fields are DBF_LONG (`calcoutRecord.dbd.pod:729,1049`); sCalcoutRecord.c:464-478 same.
+C reference: `calcoutRecord.c:326-345` — special() sets `clcv`/`oclv` to the exact postfix error code, posts DBE_VALUE, accepts the put; fields are DBF_LONG (`calcoutRecord.dbd.pod:729,1049`); sCalcoutRecord.c:464-478 same. [CORRECTION, fix wave 6: "exact postfix error code" was wrong — C stores 0 (compiles) or -1 (postfix failed), nothing finer; verified by fixer-A4 against calcoutRecord.c. The fix implements C.]
 Impact: `caget calcout.CLCV` works on C (0 = OK, else calcErrorStr code) with monitors on re-put; the field does not exist on the port.
 
 ### R8-3: menu-string put accepts an out-of-range numeric index and leading/trailing whitespace; C putStringMenu rejects both
@@ -992,6 +992,170 @@ Rust: `crates/modbus-rs/src/driver.rs:538,655` — Acknowledge → Ok(Vec::new()
 C reference: `drvModbusAsyn.cpp:2231-2237` — 0x05 mapped to asynSuccess and goto done, past the data-copy; data_ unchanged, callbacks fire with prior data.
 Impact: a legal "command accepted, will take time" PLC response panics the port; combined with R8-69, unrecoverable.
 
+### Fix wave 6 — dispositions (2026-07-12)
+
+6 worktree fixers (opus), one commit per finding, merged into review/parity-r6
+and verified by main: workspace fmt --check clean, clippy --all-targets
+-D warnings clean, nextest 7723 passed / 0 failed / 2 skipped (first run,
+no flakes), doctests clean. All 21 wave-6 items FIXED; none NOT-REAL.
+
+Category A (fixer A4):
+- R8-1 FIXED 7693712e — uncompilable CALC put returns S_db_badField (SPC_CALC), value stays.
+- R8-2 FIXED a2e79164 — calcout/scalcout gain CLCV/OCLV (0 or -1, per the corrected C reading above); put ACCEPTED (asymmetry vs R8-1 preserved); acalcout's generic clcv=1 corrected.
+- R8-3 FIXED 8e477255 — single menu converter `putStringMenu` (exact strcmp, epicsParseUInt16, bound by nChoice); resolver miss now fails the put instead of falling to index 0.
+- R8-4 FIXED e7d6ed6e — SCAN/SSCN/PINI routed through that converter; three hand-written from_str tables deleted.
+- R8-5 FIXED 68a06da3 — per-dialect integer casts with one cast owner (`calc/engine/cast.rs`).
+- R7-3 FIXED 1a4573b6 — DISPOSITION CORRECTION: the Round-8 adjudication ("reject LOG2 in all three engines") was WRONG. Fixer-A4 compiled base's real postfix.c + calcPerform.c: `get_element` (postfix.c:187-216) is longest-prefix with no identifier boundary, so C lexes `LOG2` as `LOG`·`2` — CALC="LOG2" evaluates to log10(2)=0.30103; only `LOG2(A)` is a syntax error. The fix ports C's lexing: LOG2 symbol deleted (token/FuncName/CoreOp/evaluator arms) and the tokenizer's keyword-boundary rule (no C equivalent) removed. INT stays refused by Numeric, accepted by sCalc/aCalc as the NINT alias. Gate is a token-stream allowlist per engine (opcode-level would be blind to INT since sCalc maps INT and NINT to one opcode); moving it ahead of the parse also fixed `UNTIL(A);` failing Incomplete where C says Syntax. Three tests pinning invented behaviour corrected to C-verified values. SIGN-OFF: accepted by main on compiled-C evidence; user veto possible if the literal "reject LOG2" reading was wanted.
+
+Category B (fixer B4):
+- R8-16 FIXED 6cf91784 — CA_PROTO_ERROR echoing EVENT_ADD routed through MonitorStatusError (C ioExceptionNotify: deliver, no uninstall); EVENT_CANCEL/fire-and-forget WRITE stay on the global hook as C's defaultExcep/writeExcep.
+- R8-17 FIXED a96cb7d4 — `disconnect_channels()` single owner of the no-rights transition (C nciu::unresponsiveCircuitNotify convergence); `DisconnectKind` carries the per-path difference.
+- R8-20 FIXED 8e628c75 — mark_disconnected + drain fan-out moved ahead of the notification loop: C's disconnectAllIO-then-disconnectNotify order by construction on all three paths.
+- R8-21 FIXED f057dc49 — `MonitorFlow::admit` single owner of the EVENTS_OFF decision, crossed by both monitor loops.
+- R8-18 FIXED 87a66158 / R8-19 FIXED 2e767de5 — procServ info file: `bootstrap` single publish site, `Drop` single unlink site (infofile then pidfile).
+
+Category C (fixer C4):
+- R8-31 FIXED 2f1026a3 — `qsrv::put_status` single owner of pvxs PUT-rejection contract text; `wire_message()` the only BridgeError→Status.message conversion. Widened to the single-record path, group ACF gate, and the "put rejected: " Display prefix. Read-only now tested before DISP (C's order).
+- R8-32 FIXED 6825c468 — `route_frame` single teardown owner returning FrameFault for frames pvxs bev.reset()s (CMD_MESSAGE, DESTROY_CHANNEL SID, CREATE_CHANNEL CID, six op-reply IOID peeks); unhandled commands stay ignorable (pvxs forward-compat drain). Distinct: decoded-but-slotless IOID (benign completion race), handshake decoders (already propagate).
+- R8-33 FIXED 9fb33457 — RPC rejection family carries pvxs text: unmatched op "Not implemented", missing op "No such field" (pvxs NoField e.what()), trait/SharedPV defaults "RPC Not Implemented".
+- R7-34 FIXED fe795a9c — numeric-parse arm removed from String-typed DBE (substring-scan only, pvxs Kind::String); sibling option parsers verified correct (pvxs as<T> semantics).
+
+Category D (fixer D4):
+- R7-50 FIXED 750f5904 — win32 serial: closed-handle check is the single gate at the top of the option setter; every key refuses "disconnected:" (C drvAsynSerialPortWin32.c:96-101,180-185).
+- R8-46 FIXED 7878fba2 — asynRecord ASCII octet read sized by the 40-byte AINP field, not IMAX (asynRecord.c:1580).
+- R8-47 FIXED 95835c00 — Write/Read TMOD drains input before the write (C asynOctetSyncIO::writeRead flush).
+- R8-48 FIXED 63897dc8 — write carrier wraps `source: Box<AsynError>` (twin of PartialRead); status()/message()/is_transport_io()/is_fatal_transport() see through. Closed a latent bug: three private is_fatal_transport_error copies matched AsynError::Io by variant and were blind to wrapped fatal errors — deleted; AsynError is the single classification owner.
+- R8-49 FIXED 479637e5 — echo interpose keeps asynTimeout on timed-out echo read with C's message (fabricated "no echo - Loss of communication?" removed — appears nowhere in C asyn); gained its asynInterposeEcho iocsh registrar via RequestOp::PushEchoInterpose (post-registration driver mutation through the actor).
+- R8-50 FIXED 11da5829 — ip_port suffix whitelist replaced by C's actual parse (first blank starts protocol, one %5s token, exhaustive match); unknown tokens report C's `Unknown protocol "%s".`. COM is refused BY NAME (fixer decision, stated): accepting it as raw TCP would be C-unfaithful in both directions since asynInterposeCOM (RFC 2217) is unported — see R8-57.
+- R8-51 FIXED 3aa15048 — `refresh_connected_state()` single CNCT writer; special("CNCT") is C's callbackConnect (isConnected gate → driver transport connect/disconnect); PCNCT keeps attach/detach.
+- R8-52 FIXED 58e4df86 — motor init keys ACCS/ACCL reconciliation on loaded `accs > 0.0` (motorRecord.cc:4034), not ACCU.
+- R8-53 FIXED 33431443 — motor tweak folds VAL unconditionally (motorRecord.cc:2167-2181); invented hard-limit gate removed.
+
+Category E (fixers E4a, E4b):
+- R8-69 FIXED cbbd3e2d — modbus poller: "I/O status = port state" model; task loops until actor channel closes (C modbusExiting_), poll_cycle owns io_status/prev_io_status, fans callbacks with auxStatus (records → READ/INVALID), force_callback on transition, 1 s backoff while erroring. asyn-rs `notify_interface_value` gained the aux_status parameter (all seven modbus call sites).
+- R8-70 FIXED e06ec568 — `ModbusIoResponse::{Data, Acknowledged}` makes the empty-Vec dual meaning unrepresentable; poll()/read_absolute() keep the previous buffer on exception-05; masked-write readback merges into C's base.
+- R8-64 FIXED 28e55683 — `ValuePostGate::{OnChange, WithValue}` in the Record trait (public API change); four monitor loops share one value_gate() lookup; timestamp RVAL posts inside the VAL strncmp guard as C does.
+- R8-65 FIXED 7d885164 — `CircularBuffer::push` returns `FrameParams` (exactly C processCallbacks' assignments; None = "C left it alone", how CurrentImage freezes during flush). Also closed from the same anchor: SoftTrigger never cleared on re-arm, Control not turned off on "Acquisition Completed".
+- R8-66 FIXED 7e4fd9d7 — rg found three timestamp.as_f64() sites, not one: attribute channel, NDTimeStamp_RBV, stats TSTimestamp — all now read `array.time_stamp`.
+- R8-61 FIXED 322b06b9 — decompress of uncompressed input is SUCCESS pass-through + COMPRESSOR=NDCODEC_NONE.
+- R8-62 FIXED eb681996 — JPEG compress accepts RGB2/RGB3 (via `convert_rgb_layout`) and Int8/UInt8.
+- R8-63 FIXED bcfb5a78 — codec outcome enum `{PassThrough, Skipped, Converted, Failed}`: each variant owns its CodecStatus and message, so a call site cannot pair a benign skip with ERROR; "already compressed" is WARNING as in C.
+- R8-67 FIXED d98b14e9 — hand-built TIFF writer+reader (the `tiff` crate cannot express C's bytes: no PLANARCONFIG_SEPARATE, mandatory resolution tags, own RowsPerStrip). RGB2 SEPARATE RowsPerStrip=1, RGB3 SEPARATE RowsPerStrip=sizeY, mono/RGB1 CONTIG; PlanarConfiguration on every image; no resolution tags. `tiff` crate demoted to dev-dependency as independent test decoder.
+- R8-68 FIXED ac3a3866 — netCDF: netcdf3 crate's I8=NC_BYTE / U8=NC_CHAR naming had inverted C's types (UInt8 array_data now NC_BYTE, Attr_* strings NC_CHAR); `define_data_set` is the single owner of dimension/variable/global-attribute definitions, mirroring C's openFile order statement for statement.
+
+## Open Findings — surfaced during fix wave 6 (reported by fixers, pending independent verify)
+
+### R8-6: sCalc/aCalc ELEMENT tables not verified against compiled C; port accepts symbols the C tables lack
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/` string/array engine token allowlists — R7-3's compiled-C verification covered base's postfix.c only.
+C reference: sCalcPostfix.c / aCalcPostfix.c ELEMENT tables.
+Impact: port accepts `FMOD`, `>>>`, `0X` hex literals, single-letter vars Q–U (C sCalc/aCalc stop at A–P), `INF`/`NAN` in aCalc, and double-letter vars AA–UU where both C tables stop at LL. Closing needs sCalc/aCalc drivers compiled the same way as R7-3's.
+
+### R8-7: sCalc/aCalc division by zero returns IEEE inf; C returns -1 (sCalc) / myMAXFLOAT (aCalc)
+Severity: Medium
+Rust: string/array engine `/` evaluation — plain IEEE divide.
+C reference: sCalcPerform.c (`-1`), aCalcPerform.c (`myMAXFLOAT`). R8-5 covered MODULO only; `/` is a different site.
+Impact: any sCalc/aCalc expression dividing by zero yields a different VAL on the wire.
+
+### R8-8: aCalc `<<`/`>>` on an array operand bit-shifts elementwise; C shifts the array elements positionally
+Severity: Medium
+Rust: aCalc engine shift ops.
+C reference: aCalcPerform.c:1428+ — `<<`/`>>` with an array operand move elements, not bits.
+Impact: `AA<<2` produces a completely different array on the port.
+
+### R8-22: non-paused monitor queue drops the queued tail when the producer overflow slot is set; C replaces only the last log
+Severity: Medium
+Rust: epics-ca-rs server `coalesce_consume` non-paused path (flagged by fixer-B4 while working R8-21).
+C reference: db_queue_event_log queue-full branch — replaces the newest queued entry, keeps earlier ones.
+Impact: under burst load a subscriber can lose intermediate events C would deliver. Same family as R8-21, different path.
+
+### R8-23: EVENTS_OFF nDuplicates rule enforced per-subscription; C's is per-client (one shared circuit queue)
+Severity: Low
+Rust: per-subscription mpsc queues (structural; noted in R8-21's commit).
+C reference: event_read — one event queue per client; a duplicate on subscription B unblocks the drain of subscription A's entry.
+Impact: cross-subscription unblocking behaviour differs. Closing requires replacing per-subscription queues with one per-circuit queue — redesign-scale, recorded rather than attempted.
+
+### R8-34: in-op decode faults (truncated Status/PVData inside a GET/PUT/MONITOR reply) swallowed by per-op tasks
+Severity: Medium
+Rust: `crates/epics-pva-rs/src/client/ops_v2.rs`, `decode.rs` — R8-32's route_frame widening stopped at server_conn.rs.
+C reference: pvxs clientget.cpp:490-494 — decode fault inside an op body does `bev.reset()` (circuit-fatal).
+Impact: a malformed op reply body is silently dropped on the port; pvxs tears down the circuit.
+
+### R8-54: asynRecord does not clamp NRRD/NOWT back into the record fields
+Severity: Low
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs` octet I/O plan (flagged by fixer-D4 while working R8-46/47/48).
+C reference: `asynRecord.c:1499,1513` — performOctetIO writes the clamped values back to NRRD/NOWT.
+Impact: record fields show the requested, not effective, transfer sizes.
+
+### R8-55: asynRecord does not re-poll ENBL/AUCT/CNCT from the port each process
+Severity: Low
+Rust: `asyn_record/mod.rs` — CNCT writer is now single-owner (R8-51) but nothing re-reads the port per process.
+C reference: `asynRecord.c` monitorStatus — re-reads and posts on every process.
+Impact: out-of-band port state changes (another record toggling autoconnect) are not reflected until a CNCT-affecting event.
+
+### R8-56: octet READ ERRS text is `read: {e}`; C formats `%s nread %d %s`
+Severity: Low
+Rust: `asyn_record/mod.rs` octet read error path.
+C reference: `asynRecord.c:1591-1598`. R8-48 fixed the write-side ERRS shape; the read side was not in that finding.
+Impact: ERRS diagnostic text differs on read errors.
+
+### R8-57: asynInterposeCOM (RFC 2217 telnet COM-port-option negotiation) is not ported
+Severity: Medium
+Rust: `host:port COM` configurations are refused by name (R8-50 fix); no interpose exists.
+C reference: `asynInterposeCom.c` (856 lines: IAC/subnegotiation, baud/parity/stopbits/flow-control, modem/line-state decode), installed by drvAsynIPPort.c:1061.
+Impact: RFC 2217 serial-over-TCP devices unusable on the port. A subsystem port in its own right — needs its own assignment.
+
+### R8-58: asynInterposeDelay has no iocsh registrar; the layer is unreachable from a startup script
+Severity: Low
+Rust: `crates/asyn-rs/src/interpose/delay.rs` exists; no registrar (same gap R8-49 closed for echo).
+C reference: `asynInterposeDelay.c:221-234`. (asynInterposeFlush/Eos have no C registrar — Eos installs via asynInterposeEosConfig — so those two are NOT gaps.)
+Impact: startup scripts cannot install the delay interpose.
+
+### R8-71: NDPluginCircularBuff postCount==0 completes a sequence on every untriggered running frame in C; port only checks after a triggered push
+Severity: Medium
+Rust: `crates/ad-plugins-rs/src/circular_buff.rs` (flagged by fixer-E4a while working R8-65; changes frame forwarding, deliberately not folded in).
+C reference: NDPluginCircularBuff.cpp — `currentPostCount >= postCount` evaluated on every running frame; postCount==0 bumps ActualTriggerCount per frame.
+Impact: postCount=0 configurations forward/complete completely differently.
+
+### R8-72: SoftTrigger writeInt32 sets Triggered=1 for ANY value in C (including 0), and FlushOnSoftTrig>0 flushes the pre-buffer immediately from the write
+Severity: Medium
+Rust: `circular_buff.rs` — gates on non-zero write, never flushes from the write path.
+C reference: NDPluginCircularBuff.cpp writeInt32(SoftTrigger).
+Impact: `caput SoftTrigger 0` triggers on C, no-ops on the port; FlushOnSoftTrig flush timing differs.
+
+### R8-73: netCDF numArrays dimension chosen by frame count; C chooses by open mode
+Severity: Medium
+Rust: `crates/ad-plugins-rs/src/file_netcdf.rs` — `frames.len() > 1` selects NC_UNLIMITED.
+C reference: NDFileNetCDF.cpp — `openMode & NDFileModeMultiple` → dim0 = NC_UNLIMITED.
+Impact: a Capture/Stream file holding exactly one frame gets a fixed dimension of 1 where C writes NC_UNLIMITED — header-parity defect. Different anchor from R8-68 (open-mode plumbing, not nc_type/order).
+
+### R8-74: JPEG compress failure messages are a generic "JPEG compression failed"; C emits specific texts
+Severity: Low
+Rust: `crates/ad-plugins-rs/src/codec.rs` — compress_jpeg returns Option, not a typed error.
+C reference: NDPluginCodec.cpp — "JPEG only supports 8-bit data", "Unsupported array structure", "Unknown color mode %d".
+Impact: status level correct (ERROR, per R8-63); message text diverges.
+
+### R8-75: TiffWriter::array_color_mode falls back to dims-based inference when the ColorMode attribute is absent; C errors
+Severity: Low
+Rust: `crates/ad-plugins-rs/src/file_tiff.rs`.
+C reference: NDFileTIFF.cpp — a 3-D array without ColorMode is an error.
+Impact: attribute-less 3-D frames write on the port, fail on C.
+
+### Notes (fix wave 6)
+
+- Compile-load flakes, each passed in isolation and on re-run, none in
+  crates touched by the reporting fixer: `regression-ioc::families
+  o_seeded_record_suppresses_duplicate_post` (A4 run),
+  `epics-ca-rs::protocol_tests
+  server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects`
+  (E4b run). Main's post-merge workspace run was clean first-run.
+- Pre-existing, untouched: `epics-base-rs/tests/client_server.rs` does not
+  compile under `--all-features` (run_tcp_listener arity, WallTime vs
+  SystemTime) — behind the ca-server-tls-test feature; default-feature
+  builds clean. Confirmed pre-existing by fixer-E4a on the stashed tree.
+- TIFF parity is asserted at tag-set/tag-value/plane-layout level, not
+  byte-for-byte against libtiff (no C build on the fixer's machine).
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -1079,3 +1243,24 @@ Impact: a legal "command accepted, will take time" PLC response panics the port;
   01KX96GP5F4511X7551KGNATA2). Sign-off items pending user: R6-77 numeric
   token removals, R6-75 blocked-mask half, C's implLang="rust" truthful
   token. Fix wave 6 next.
+- Fix wave 6 (2026-07-12): all 21 R8 items + R7-3/R7-34/R7-50 FIXED across
+  6 worktree fixers (A4/B4/C4/D4/E4a/E4b, one commit per finding), merged
+  into review/parity-r6 and verified by main — workspace fmt --check clean,
+  clippy --all-targets -D warnings clean, nextest 7723/7723 first-run clean
+  (2 skipped), doctests clean. ADJUDICATION CORRECTION: R8's R7-3 verdict
+  ("reject LOG2 everywhere") was wrong — fixer-A4 compiled C's postfix.c and
+  proved LOG2 lexes as LOG·2 (longest-prefix, no identifier boundary); the
+  fix ports C's lexing instead. R8-2's finding text corrected (C stores 0/-1
+  in CLCV, not the postfix error code). Structural owners landed:
+  putStringMenu converter, calc/engine/cast.rs, per-engine ELEMENT-table
+  allowlists, MonitorFlow::admit, disconnect_channels()+DisconnectKind,
+  qsrv::put_status/wire_message, route_frame FrameFault,
+  PartialOctetRead write twin (3 private is_fatal_transport_error copies
+  deleted), RequestOp::PushEchoInterpose, refresh_connected_state,
+  ModbusIoResponse, ValuePostGate, CircularBuffer FrameParams, codec
+  outcome enum, hand-built TIFF writer/reader, netCDF define_data_set.
+  15 NEW fixer-surfaced findings recorded OPEN (R8-6..8, R8-22..23, R8-34,
+  R8-54..58, R8-71..75) — notable: R8-57 asynInterposeCOM is an unported
+  856-line subsystem; R8-23 is redesign-scale (per-circuit event queue).
+  Sign-off items pending user: R6-77 token removals, R6-75 blocked-mask
+  half, implLang="rust", R7-3's LOG2-as-LOG·2 reading. Next: R9 re-audit.

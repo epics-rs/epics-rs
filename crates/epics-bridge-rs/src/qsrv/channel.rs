@@ -7,6 +7,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+use epics_pva_rs::server_native::source::RemoteLog;
 
 use super::monitor::BridgeMonitor;
 use super::provider::Channel;
@@ -112,7 +113,12 @@ fn dbe_scalar_as_u8(sv: &ScalarValue) -> Option<u8> {
 /// is separate and unconditional (singlesource.cpp:161-167). Numeric
 /// form (`"5"` or an integer scalar) is masked to the value class the
 /// same way.
-pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
+///
+/// `log` is the operation's [`RemoteLog`]: a string DBE that selects
+/// NOTHING in the value class still falls back to `VALUE|ALARM`, but pvxs
+/// tells the client so first (singlesource.cpp:128-130) rather than
+/// letting the fallback pass for an honored request.
+pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Option<u16> {
     use epics_base_rs::server::recgbl::EventMask;
 
     let options = request
@@ -185,6 +191,15 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     }
     if raw.contains("ALARM") {
         raw_mask |= EventMask::ALARM.bits();
+    }
+    // pvxs `singlesource.cpp:128-130` — `if(!dbe && !mask.empty())`. The
+    // client named an event class the substring parse recognized nothing in
+    // (`"LOG"`, a lowercase `"value"`, `"PROPERTY"` alone), so the request
+    // is honored by the `VALUE|ALARM` fallback below rather than by what was
+    // asked for. pvxs reports that before falling back; an empty string
+    // (`DBE=""`) is not a selection at all and draws no warning.
+    if raw_mask == 0 && !raw.is_empty() {
+        log.warn(format!("record._options.DBE=\"{raw}\" selects empty mask"));
     }
     Some(dbe_value_class_mask(raw_mask))
 }
@@ -1148,7 +1163,7 @@ mod tests {
     fn dbe_mask_parses_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("VALUE | ALARM".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1163,7 +1178,7 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
             "DBE_VALUE,DBE_ARCHIVE,PROPERTY".into(),
         )));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(
             mask,
             (EventMask::VALUE | EventMask::LOG).bits(),
@@ -1180,7 +1195,7 @@ mod tests {
     fn dbe_string_property_only_falls_back_to_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("PROPERTY".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1192,7 +1207,7 @@ mod tests {
     fn dbe_string_log_spelling_not_recognized() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("LOG".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1208,7 +1223,8 @@ mod tests {
         let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
         for token in ["alarm", "value", "archive", "value | alarm", "dbe_value"] {
             let req = req_with_dbe(PvField::Scalar(ScalarValue::String(token.into())));
-            let mask = dbe_mask_from_pv_request(&req).expect("present option must parse");
+            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+                .expect("present option must parse");
             assert_eq!(
                 mask, fallback,
                 "lowercase DBE token {token:?} matches no uppercase substring, so pvxs falls back to VALUE|ALARM"
@@ -1225,7 +1241,8 @@ mod tests {
     fn dbe_string_uppercase_substring_in_mixed_case_still_selects() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("alarmALARM".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("present option must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+            .expect("present option must parse");
         assert_eq!(mask, EventMask::ALARM.bits());
     }
 
@@ -1234,7 +1251,7 @@ mod tests {
     #[test]
     fn dbe_mask_accepts_integer_form() {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, 5);
     }
 
@@ -1248,7 +1265,7 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(
             EventMask::PROPERTY.bits() as i32,
         )));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1258,7 +1275,7 @@ mod tests {
     fn dbe_numeric_zero_falls_back_to_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(0)));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1269,7 +1286,7 @@ mod tests {
         use epics_base_rs::server::recgbl::EventMask;
         let raw = (EventMask::VALUE | EventMask::PROPERTY).bits();
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(raw as i32)));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, EventMask::VALUE.bits());
     }
 
@@ -1279,7 +1296,7 @@ mod tests {
     fn dbe_numeric_string_uses_value_class_mask() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("8".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1288,7 +1305,7 @@ mod tests {
     #[test]
     fn dbe_mask_absent_returns_none() {
         let req = PvStructure::new("request");
-        assert!(dbe_mask_from_pv_request(&req).is_none());
+        assert!(dbe_mask_from_pv_request(&req, &RemoteLog::default()).is_none());
     }
 
     /// A numeric `record._options.DBE`
@@ -1327,7 +1344,7 @@ mod tests {
         for (field, expected) in cases {
             let label = format!("{field:?}");
             let req = req_with_dbe(field);
-            let mask = dbe_mask_from_pv_request(&req)
+            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
                 .unwrap_or_else(|| panic!("DBE {label} must coerce to a value-class mask"));
             assert_eq!(
                 mask, expected,

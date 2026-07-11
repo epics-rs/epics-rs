@@ -34,7 +34,7 @@ use epics_pva_rs::pvdata::encode::{
     decode_type_desc, default_value_for, encode_pv_field, encode_pv_field_with_bitset,
     encode_type_desc,
 };
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
 
 const ORDER: ByteOrder = ByteOrder::Little;
@@ -418,5 +418,142 @@ async fn group_put_const_member_without_putorder_emits_no_message() {
     assert_eq!(
         reply.header.command, CMD_PUT,
         "a channel-less const member must not draw a no-putorder warning"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R7-32 — single-record MONITOR, record._options.DBE selecting an empty mask
+// ---------------------------------------------------------------------------
+
+/// Drive a MONITOR INIT + START and return every frame the server sent up
+/// to (and including) the first MONITOR *data* frame. pvxs raises its
+/// `logRemote` inside `onSubscribe`, i.e. before the INIT reply its
+/// `connect()` sends; the Rust subscription is opened by the per-op
+/// subscriber task the read loop spawns, so the diagnostic lands just
+/// after the INIT reply instead. Same ioid, level and text — only its
+/// position relative to the INIT reply differs, so the caller inspects
+/// the set of frames rather than a fixed slot.
+fn monitor_until_data(
+    c: &mut FrameReader,
+    codec: &PvaCodec,
+    sid: u32,
+    ioid: u32,
+    pv_request: &[u8],
+) -> Vec<Frame> {
+    c.send(&codec.build_monitor_init(sid, ioid, pv_request, None));
+    c.send(&codec.build_monitor_start(sid, ioid));
+
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        let f = c.read();
+        let is_data = f.header.command == Command::Monitor.code() && {
+            let mut cur = f.cursor();
+            let _ioid = cur.get_u32(ORDER).unwrap();
+            cur.get_u8().unwrap() & 0x08 == 0
+        };
+        frames.push(f);
+        if is_data {
+            return frames;
+        }
+    }
+    panic!("no MONITOR data frame within 6 frames");
+}
+
+/// pvxs `singlesource.cpp:122-130`: a `record._options.DBE` string whose
+/// sloppy substring parse matches none of VALUE / ARCHIVE / ALARM selects
+/// an empty value mask. The subscription still falls back to VALUE|ALARM,
+/// but pvxs first tells the client its selection was empty. `"LOG"` is
+/// exactly that trap — an EPICS event-class name that is NOT one of the
+/// three spellings pvxs matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_empty_mask_warns_over_the_wire() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 51;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let req =
+        pv_request_with_options(&[("DBE", PvField::Scalar(ScalarValue::String("LOG".into())))]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    let messages: Vec<_> = frames
+        .iter()
+        .filter(|f| f.header.command == Command::Message.code())
+        .map(parse_message_frame)
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "exactly one empty-mask diagnostic is owed, got {messages:?}"
+    );
+    let (msg_ioid, mtype, text) = &messages[0];
+    assert_eq!(*msg_ioid, ioid, "the diagnostic carries the MONITOR's ioid");
+    assert_eq!(*mtype, MessageType::Warning as u8);
+    assert_eq!(text, "record._options.DBE=\"LOG\" selects empty mask");
+}
+
+/// A lowercase token is the same trap: pvxs's substring search is case
+/// SENSITIVE, so `"value"` matches nothing and selects an empty mask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_lowercase_token_warns_over_the_wire() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 52;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let req = pv_request_with_options(&[(
+        "DBE",
+        PvField::Scalar(ScalarValue::String("value|alarm".into())),
+    )]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    let messages: Vec<_> = frames
+        .iter()
+        .filter(|f| f.header.command == Command::Message.code())
+        .map(parse_message_frame)
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "one empty-mask diagnostic, got {messages:?}"
+    );
+    assert_eq!(
+        messages[0].2,
+        "record._options.DBE=\"value|alarm\" selects empty mask"
+    );
+}
+
+/// Control: a DBE that DOES select something in the value class is a
+/// request the server honors as asked — no diagnostic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_recognized_token_emits_no_message() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 53;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let req = pv_request_with_options(&[(
+        "DBE",
+        PvField::Scalar(ScalarValue::String("VALUE|ALARM".into())),
+    )]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f.header.command == Command::Message.code()),
+        "an honored DBE selection must draw no CMD_MESSAGE"
     );
 }

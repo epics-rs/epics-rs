@@ -273,7 +273,9 @@ async fn open_monitor(
     // and pva_pv-registered channels fall through to the
     // default mask (their DBE selection is not yet wired).
     let dbe_mask = match ctx.pv_request {
-        Some(PvField::Structure(ref req)) => crate::qsrv::channel::dbe_mask_from_pv_request(req),
+        Some(PvField::Structure(ref req)) => {
+            crate::qsrv::channel::dbe_mask_from_pv_request(req, &ctx.log)
+        }
         _ => None,
     };
     // resolve the per-operation negotiated monitor

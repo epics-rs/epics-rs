@@ -754,17 +754,30 @@ pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
 
 /// Compress an NDArray to JPEG.
 ///
-/// Only supports UInt8 data. Handles:
-/// - 2D arrays (mono/grayscale)
-/// - 3D arrays with dims\[0\]=3 (RGB1 interleaved)
+/// Mirrors C `compressJPEG` (NDPluginCodec.cpp:109-266), which decides the JPEG
+/// geometry from the dimension count (:146-169) and the *source pixel layout*
+/// from the `ColorMode` attribute (:181-227):
+/// - 2-D: grayscale, `[x, y]`.
+/// - 3-D RGB1 `[3, x, y]`: already pixel-interleaved, encoded as-is.
+/// - 3-D RGB2 `[x, 3, y]` and RGB3 `[x, y, 3]`: C walks the three colour planes
+///   (`pRed`/`pGreen`/`pBlue`, plane step `sizeX*3` for RGB2 and `sizeX` for
+///   RGB3) and re-interleaves each scanline into an RGB row before encoding.
+///   The port reaches the same pixel order through `convert_rgb_layout`, the
+///   single owner of RGB layout conversion (also used by the JPEG/TIFF/Magick
+///   file writers), so the interleave rule is not re-implemented here.
 ///
-/// Returns `None` if the data type is not UInt8 or the layout is unsupported.
+/// Both 8-bit types are accepted, as in C (`case NDInt8: case NDUInt8:`,
+/// :135-143). Returns `None` for anything C rejects: a non-8-bit type, a
+/// dimension count other than 2 or 3, or a 3-D array whose `ColorMode` is not
+/// one of the three RGB layouts.
 pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
-    if src.data.data_type() != NDDataType::UInt8 {
-        return None;
+    use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
+
+    match src.data.data_type() {
+        NDDataType::UInt8 | NDDataType::Int8 => {}
+        _ => return None,
     }
 
-    let raw = src.data.as_u8_slice();
     let info = src.info();
 
     // JPEG dimensions must fit in u16
@@ -772,34 +785,32 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
         return None;
     }
 
-    let (width, height, color_type) = match src.dims.len() {
-        2 => {
-            // Mono: dims = [x, y]
-            (
-                info.x_size as u16,
-                info.y_size as u16,
-                jpeg_encoder::ColorType::Luma,
-            )
-        }
-        3 if src.dims[0].size == 3 => {
-            // RGB1: dims = [3, x, y], pixel-interleaved
-            (
-                info.x_size as u16,
-                info.y_size as u16,
-                jpeg_encoder::ColorType::Rgb,
-            )
-        }
+    // RGB2/RGB3 are re-interleaved to RGB1 first; every other accepted layout
+    // encodes straight out of the input buffer.
+    let (color_type, interleaved) = match (src.dims.len(), info.color_mode) {
+        (2, NDColorMode::Mono | NDColorMode::RGB1) => (jpeg_encoder::ColorType::Luma, None),
+        (3, NDColorMode::RGB1) if info.color_size == 3 => (jpeg_encoder::ColorType::Rgb, None),
+        (3, mode @ (NDColorMode::RGB2 | NDColorMode::RGB3)) if info.color_size == 3 => (
+            jpeg_encoder::ColorType::Rgb,
+            Some(convert_rgb_layout(src, mode, NDColorMode::RGB1).ok()?),
+        ),
         _ => return None,
     };
 
+    let width = info.x_size as u16;
+    let height = info.y_size as u16;
+    let pixels = interleaved
+        .as_ref()
+        .map_or_else(|| src.data.as_u8_slice(), |a| a.data.as_u8_slice());
+
     let mut jpeg_buf = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut jpeg_buf, quality);
-    if encoder.encode(raw, width, height, color_type).is_err() {
+    if encoder.encode(pixels, width, height, color_type).is_err() {
         return None;
     }
 
     let compressed_size = jpeg_buf.len();
-    let original_size = raw.len();
+    let original_size = src.data.as_u8_slice().len();
 
     let mut arr = src.clone();
     arr.data = NDDataBuffer::U8(jpeg_buf);
@@ -809,9 +820,8 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
         level: 0,
         shuffle: 0,
         compressor: 0,
-        // JPEG input is constrained to UInt8 above; record the source type so
-        // the codec carries the original element type uniformly (C
-        // `NDArray::dataType`, NDPluginCodec.cpp:35-36).
+        // Record the source type so the codec carries the original element type
+        // uniformly (C `NDArray::dataType`, NDPluginCodec.cpp:35-36).
         original_data_type: src.data.data_type(),
     });
 
@@ -831,8 +841,18 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
 /// Uses jpeg-decoder to decode the JPEG data back to pixel data.
 /// Reconstructs proper dimensions and color layout (mono or RGB1).
 ///
+/// A decoded JPEG is always 8-bit mono or 8-bit RGB1 (C comment at
+/// NDPluginCodec.cpp:268-272), whatever the layout of the array that was
+/// compressed, so C overwrites the `ColorMode` attribute on the output
+/// (:318-322). Without that write an RGB2/RGB3 source's stale `ColorMode` would
+/// survive onto RGB1 data and every downstream `getInfo` would read the planes
+/// in the wrong order.
+///
 /// Returns `None` if the codec is not JPEG or decoding fails.
 pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
+    use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+    use ad_core_rs::color::NDColorMode;
+
     if src.codec.as_ref().map(|c| c.name) != Some(CodecName::JPEG) {
         return None;
     }
@@ -845,19 +865,19 @@ pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
     let width = metadata.width as usize;
     let height = metadata.height as usize;
 
-    let dims = match metadata.pixel_format {
-        jpeg_decoder::PixelFormat::L8 => {
-            // Grayscale
-            vec![NDDimension::new(width), NDDimension::new(height)]
-        }
-        jpeg_decoder::PixelFormat::RGB24 => {
-            // RGB1 interleaved
+    let (dims, color_mode) = match metadata.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => (
+            vec![NDDimension::new(width), NDDimension::new(height)],
+            NDColorMode::Mono,
+        ),
+        jpeg_decoder::PixelFormat::RGB24 => (
             vec![
                 NDDimension::new(3),
                 NDDimension::new(width),
                 NDDimension::new(height),
-            ]
-        }
+            ],
+            NDColorMode::RGB1,
+        ),
         _ => return None,
     };
 
@@ -865,6 +885,12 @@ pub fn decompress_jpeg(src: &NDArray) -> Option<NDArray> {
     arr.dims = dims;
     arr.data = NDDataBuffer::U8(pixels);
     arr.codec = None;
+    arr.attributes.add(NDAttribute::new_static(
+        "ColorMode",
+        "Color Mode",
+        NDAttrSource::Driver,
+        NDAttrValue::Int32(color_mode as i32),
+    ));
 
     Some(arr)
 }
@@ -1835,6 +1861,159 @@ mod tests {
         assert_eq!(decompressed.dims[1].size, 16); // width
         assert_eq!(decompressed.dims[2].size, 16); // height
         assert_eq!(decompressed.data.len(), 3 * 16 * 16);
+    }
+
+    // ---- R8-62: JPEG compression of RGB2 / RGB3 ----
+
+    /// The same RGB image in one of the three AD layouts. `pixel(x, y, c)` is
+    /// deterministic so the three arrays hold identical pixels, only ordered
+    /// differently.
+    fn make_rgb_layout(mode: ad_core_rs::color::NDColorMode, w: usize, h: usize) -> NDArray {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        let pixel = |x: usize, y: usize, c: usize| ((x * 7 + y * 13 + c * 61) % 256) as u8;
+        let dims = match mode {
+            NDColorMode::RGB1 => vec![3, w, h],
+            NDColorMode::RGB2 => vec![w, 3, h],
+            NDColorMode::RGB3 => vec![w, h, 3],
+            other => panic!("not an RGB layout: {other:?}"),
+        };
+        let mut arr = NDArray::new(
+            dims.into_iter().map(NDDimension::new).collect(),
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color Mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(mode as i32),
+        ));
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let idx = match mode {
+                            NDColorMode::RGB1 => c + x * 3 + y * w * 3,
+                            NDColorMode::RGB2 => x + c * w + y * w * 3,
+                            NDColorMode::RGB3 => x + y * w + c * w * h,
+                            _ => unreachable!(),
+                        };
+                        v[idx] = pixel(x, y, c);
+                    }
+                }
+            }
+        }
+        arr
+    }
+
+    #[test]
+    fn test_r8_62_jpeg_compresses_rgb2_and_rgb3_as_reinterleaved_rgb() {
+        // C compressJPEG walks the RGB2 (plane step sizeX*3) and RGB3 (plane step
+        // sizeX) colour planes and re-interleaves each scanline before encoding
+        // (NDPluginCodec.cpp:186-227), producing exactly the JPEG of the
+        // equivalent RGB1 image. The port rejected both layouts outright.
+        use ad_core_rs::color::NDColorMode;
+
+        let rgb1 = make_rgb_layout(NDColorMode::RGB1, 16, 8);
+        let reference = compress_jpeg(&rgb1, 90).expect("RGB1 must compress");
+
+        for mode in [NDColorMode::RGB2, NDColorMode::RGB3] {
+            let src = make_rgb_layout(mode, 16, 8);
+            let out = compress_jpeg(&src, 90)
+                .unwrap_or_else(|| panic!("{mode:?} must compress, C encodes it"));
+            assert_eq!(out.codec.as_ref().unwrap().name, CodecName::JPEG);
+            assert_eq!(&out.data.as_u8_slice()[0..2], &[0xFF, 0xD8], "SOI marker");
+            assert_eq!(
+                out.data.as_u8_slice(),
+                reference.data.as_u8_slice(),
+                "{mode:?} must encode the same pixels as the RGB1 image — a wrong \
+                 (or missing) scanline re-interleave changes the JPEG bytes"
+            );
+            // C's allocArray copies the input dimensions onto the output.
+            assert_eq!(out.dims.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_r8_62_decompressed_jpeg_reports_rgb1_colormode() {
+        // A decoded JPEG is always mono or RGB1 (C :268-272), so C overwrites the
+        // ColorMode attribute on the output (:318-322). An RGB2 source's stale
+        // ColorMode=3 on RGB1 data would make every downstream getInfo read the
+        // planes in the wrong order.
+        use ad_core_rs::color::NDColorMode;
+
+        let src = make_rgb_layout(NDColorMode::RGB2, 16, 8);
+        let compressed = compress_jpeg(&src, 90).expect("rgb2 jpeg");
+        assert_eq!(
+            compressed
+                .attributes
+                .get("ColorMode")
+                .unwrap()
+                .value
+                .as_i64(),
+            Some(NDColorMode::RGB2 as i64),
+            "the compressed frame keeps the source ColorMode"
+        );
+
+        let out = decompress_jpeg(&compressed).expect("jpeg decode");
+        assert_eq!(
+            out.attributes.get("ColorMode").unwrap().value.as_i64(),
+            Some(NDColorMode::RGB1 as i64),
+            "decompressed JPEG must be reported as RGB1"
+        );
+        assert_eq!(out.dims[0].size, 3);
+        assert_eq!(out.dims[1].size, 16);
+        assert_eq!(out.dims[2].size, 8);
+        assert_eq!(out.info().color_mode, NDColorMode::RGB1);
+
+        // Mono round-trip reports Mono, not a stale colour mode.
+        let mono = decompress_jpeg(&compress_jpeg(&make_u8_array(16, 16), 90).unwrap()).unwrap();
+        assert_eq!(
+            mono.attributes.get("ColorMode").unwrap().value.as_i64(),
+            Some(NDColorMode::Mono as i64)
+        );
+    }
+
+    #[test]
+    fn test_r8_62_jpeg_accepts_int8_like_c() {
+        // C accepts both 8-bit types (`case NDInt8: case NDUInt8:`, :135-143) and
+        // encodes the raw bytes; only wider types are rejected ("JPEG only
+        // supports 8-bit data").
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::Int8,
+        );
+        if let NDDataBuffer::I8(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i as i32 - 32) as i8;
+            }
+        }
+        let out = compress_jpeg(&arr, 90).expect("Int8 must compress");
+        assert_eq!(&out.data.as_u8_slice()[0..2], &[0xFF, 0xD8]);
+        assert_eq!(
+            out.codec.as_ref().unwrap().original_data_type,
+            NDDataType::Int8
+        );
+    }
+
+    #[test]
+    fn test_r8_62_jpeg_rejects_3d_without_an_rgb_colormode() {
+        // C's scanline loop switches on ColorMode; a 3-D array whose ColorMode is
+        // not RGB1/2/3 has no source layout ("Unknown color mode", :200-203 /
+        // :228-231) and never reaches the encoder.
+        let arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(8),
+                NDDimension::new(8),
+            ],
+            NDDataType::UInt8,
+        );
+        assert!(
+            compress_jpeg(&arr, 90).is_none(),
+            "3-D Mono (no ColorMode attribute) is not a JPEG-encodable layout in C"
+        );
     }
 
     #[test]

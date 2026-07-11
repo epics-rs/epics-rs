@@ -103,7 +103,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Div => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    // C calcPerform.c:157-160: bare IEEE divide (1/0 = +Inf, 0/0 = NaN).
+                    // sCalc, not base: a zero divisor is an ERROR, on both
+                    // evaluator paths (`sCalcPerform.c:495-500` no-string,
+                    // :1022-1030 string) — `return(-1)`, with `*presult`
+                    // never written. Base's DIV (`calcPerform.c:156-159`) is
+                    // a bare IEEE divide and the old comment here cited it;
+                    // the port must not inherit base's rule in sCalc.
+                    if b == 0.0 {
+                        return Err(CalcError::DivisionByZero);
+                    }
                     stack.push(StackValue::Double(a / b));
                 }
                 CoreOp::Mod => {
@@ -282,6 +290,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Sqrt => {
                     let a = pop1_f64(&mut stack)?;
+                    // sCalc, not base: a negative operand is an ERROR, not
+                    // NaN (`sCalcPerform.c:521-524` no-string, :1056-1061
+                    // string — both `if (< 0) return(-1)` BEFORE the sqrt).
+                    if a < 0.0 {
+                        return Err(CalcError::DomainError);
+                    }
                     stack.push(StackValue::Double(a.sqrt()));
                 }
                 CoreOp::Exp => {
@@ -290,10 +304,21 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Log10 => {
                     let a = pop1_f64(&mut stack)?;
+                    // sCalc, not base (`sCalcPerform.c:531-535`, :1068-1073).
+                    // Note the test is `< 0`, so LOG(0) is NOT caught here —
+                    // it produces -inf and is caught by the non-finite tail
+                    // below, exactly as in C.
+                    if a < 0.0 {
+                        return Err(CalcError::DomainError);
+                    }
                     stack.push(StackValue::Double(a.log10()));
                 }
                 CoreOp::LogE => {
                     let a = pop1_f64(&mut stack)?;
+                    // sCalc, not base (`sCalcPerform.c:537-541`, :1075-1080).
+                    if a < 0.0 {
+                        return Err(CalcError::DomainError);
+                    }
                     stack.push(StackValue::Double(a.ln()));
                 }
                 CoreOp::Sin => {
@@ -495,15 +520,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 StringOp::ToDouble => {
                     let v = pop1(&mut stack)?;
-                    match v {
-                        StackValue::Str(s) => {
-                            let d = s.trim().parse::<f64>().unwrap_or(0.0);
-                            stack.push(StackValue::Double(d));
-                        }
-                        StackValue::Double(d) => {
-                            stack.push(StackValue::Double(d));
-                        }
-                    }
+                    stack.push(StackValue::Double(to_double(&v)));
                 }
                 StringOp::Len => {
                     let v = pop1(&mut stack)?;
@@ -693,7 +710,28 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         }
     }
 
-    Ok(stack.last().cloned().unwrap_or(StackValue::Double(0.0)))
+    let result = stack.last().cloned().unwrap_or(StackValue::Double(0.0));
+    // Both of C's evaluator paths end with the same line — `sCalcPerform.c:833`
+    // (no-string) and `:2056` (string):
+    //     return(((isnan(*presult)||isinf(*presult)) ? -1 : 0));
+    // `*presult` is the DOUBLE form of the result: a string result is first
+    // run through `to_double` (:2046-2050). So an expression whose operators
+    // all succeeded still fails the perform when its value is not finite
+    // (`LOG(0)` = -inf, `1e300*1e300` = +inf, `ACOS(2)` = NaN) — the record
+    // then forces VAL=-1 / SVAL="***ERROR***" / CALC_ALARM.
+    if !to_double(&result).is_finite() {
+        return Err(CalcError::NonFiniteResult);
+    }
+    Ok(result)
+}
+
+/// C `to_double` (`sCalcPerform.c:83`) — `atof` of the stack element's string
+/// form; a double element is already its own double form.
+fn to_double(v: &StackValue) -> f64 {
+    match v {
+        StackValue::Double(d) => *d,
+        StackValue::Str(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+    }
 }
 
 const MAX_LOOP_ITERATIONS: usize = 1000;
@@ -1114,11 +1152,17 @@ mod parity_tests {
         assert_eq!(run_num("2 > 1"), 1.0);
     }
 
-    // division by zero yields IEEE Inf/NaN, not forced NaN.
+    // R8-7: this case used to pin base's IEEE divide (`1/0` = +Inf) onto the
+    // STRING engine, which was never sCalc's rule — it was read off
+    // `calcPerform.c` and never checked against `sCalcPerform.c`. The compiled
+    // C evaluator answers `st=-1` for all three (`sCalcPerform.c:495-500`,
+    // :1022-1030), i.e. a failed perform, so the expectations below are the
+    // C-verified ones.
     #[test]
-    fn h7_div_by_zero_is_ieee() {
-        assert_eq!(run_num("1/0"), f64::INFINITY);
-        assert_eq!(run_num("-1/0"), f64::NEG_INFINITY);
-        assert!(run_num("0/0").is_nan());
+    fn h7_div_by_zero_fails_the_perform() {
+        let mut inp = StringInputs::new();
+        assert!(scalc("1/0", &mut inp).is_err()); // C: PERFORM st=-1
+        assert!(scalc("-1/0", &mut inp).is_err()); // C: PERFORM st=-1
+        assert!(scalc("0/0", &mut inp).is_err()); // C: PERFORM st=-1
     }
 }

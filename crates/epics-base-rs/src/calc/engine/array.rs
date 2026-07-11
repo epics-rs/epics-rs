@@ -80,10 +80,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Div => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
+                    // aCalc, not base (`aCalcPerform.c:636-643`, :659-667,
+                    // :690-696): a zero divisor is `myMAXFLOAT` in all three
+                    // operand shapes — array/array, array/scalar and
+                    // scalar/scalar — never NaN and never an error. (C's
+                    // scalar/array shape promotes the scalar with
+                    // `toArray(ps,1)` and then runs the array/array loop, so
+                    // the per-element test below covers it too.)
                     stack.push(zip_map(
                         a,
                         b,
-                        |x, y| if y == 0.0 { f64::NAN } else { x / y },
+                        |x, y| if y == 0.0 { MY_MAXFLOAT } else { x / y },
                     )?);
                 }
                 CoreOp::Mod => {

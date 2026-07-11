@@ -24,6 +24,8 @@ pub enum CalcError {
     InvalidSubrange,
     BracketNotOpen,
     BraceNotOpen,
+    DomainError,
+    NonFiniteResult,
 }
 
 impl fmt::Display for CalcError {
@@ -51,6 +53,8 @@ impl fmt::Display for CalcError {
             CalcError::InvalidSubrange => write!(f, "Invalid subrange specification"),
             CalcError::BracketNotOpen => write!(f, "Close bracket found without open"),
             CalcError::BraceNotOpen => write!(f, "Close brace found without open"),
+            CalcError::DomainError => write!(f, "Operand outside the operator's domain"),
+            CalcError::NonFiniteResult => write!(f, "Result is not a finite number"),
         }
     }
 }
@@ -91,7 +95,9 @@ impl CalcError {
             | CalcError::LengthMismatch
             | CalcError::InvalidFormat
             | CalcError::EmptyArray
-            | CalcError::InvalidSubrange => 11,
+            | CalcError::InvalidSubrange
+            | CalcError::DomainError
+            | CalcError::NonFiniteResult => 11,
             // CALC_ERR_NULL_ARG       = 12
             CalcError::NullArg => 12,
             // CALC_ERR_INTERNAL       = 13

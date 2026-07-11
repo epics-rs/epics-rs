@@ -20,7 +20,6 @@ lz4_flex = "0.11"
 flate2 = "1"
 jpeg-encoder = "0.6"
 jpeg-decoder = "0.3"
-tiff = "0.9"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 netcdf3 = "0.6"
@@ -29,6 +28,11 @@ rayon = { version = "1", optional = true }
 rust-hdf5 = { version = "0.3.2", features = ["threadsafe", "all_filters", "parallel"] }
 epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, features = ["qsrv"], optional = true }
+
+[dev-dependencies]
+# Independent TIFF decoder, used only to check the bytes our hand-written
+# encoder produces (src/file_tiff.rs). Not used by the writer itself.
+tiff = "0.9"
 
 [features]
 default = ["parallel"]

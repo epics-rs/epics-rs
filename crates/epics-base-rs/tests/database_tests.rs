@@ -2330,8 +2330,13 @@ async fn test_proc_works_any_scan() {
     assert!(!inst.common.udf);
 }
 
+/// C `dbAccess.c::dbPutField:1255-1257` returns `S_db_putDisabled` for a
+/// put to ANY field but DISP while `DISP=1` — the gate sits before `dbPut`
+/// AND before the PROC-driven `dbProcess` (`:1265-1277`). `PROC`'s pfield is
+/// not `&precord->disp`, so `caput REC.PROC 1` on a disabled record is
+/// refused and the record does NOT process.
 #[tokio::test]
-async fn test_proc_bypasses_disp() {
+async fn test_disp_blocks_proc_and_suppresses_processing() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
         .await
@@ -2343,7 +2348,42 @@ async fn test_proc_bypasses_disp() {
     let result = db
         .put_record_field_from_ca("REC", "PROC", EpicsValue::Char(1))
         .await;
-    assert!(result.is_ok());
+    assert!(
+        matches!(result, Err(CaError::PutDisabled(_))),
+        "DISP=1 must refuse a PROC put (C S_db_putDisabled), got {result:?}"
+    );
+
+    // ...and the DISP gate precedes dbProcess, so nothing processed: a
+    // fresh record is still UDF.
+    let rec = db.get_record("REC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        inst.common.udf,
+        "the refused PROC put must not have force-processed the record"
+    );
+}
+
+/// The same gate ordering for an SPC_NOMOD field: C rejects PACT with
+/// `S_db_noMod` inside `dbPut` (`dbAccess.c:123`), which `dbPutField` only
+/// reaches AFTER the DISP gate — so on a `DISP=1` record the error a client
+/// sees for `caput REC.PACT` is `S_db_putDisabled`, not `S_db_noMod`.
+#[tokio::test]
+async fn test_disp_gate_precedes_nomod_rejection() {
+    let db = PvDatabase::new();
+    db.add_record("REC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("REC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("DISP", EpicsValue::Char(1)).unwrap();
+    }
+    let result = db
+        .put_record_field_from_ca("REC", "PACT", EpicsValue::Char(1))
+        .await;
+    assert!(
+        matches!(result, Err(CaError::PutDisabled(_))),
+        "DISP gate runs before the SPC_NOMOD rejection, got {result:?}"
+    );
 }
 
 #[tokio::test]

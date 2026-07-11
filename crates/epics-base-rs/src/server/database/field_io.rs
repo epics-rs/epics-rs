@@ -6,6 +6,29 @@ use crate::types::EpicsValue;
 
 use super::PvDatabase;
 
+/// C `dbPutField`'s put-disable gate (`dbAccess.c:1255-1257`):
+/// `precord->disp && paddr->pfield != &precord->disp` → `S_db_putDisabled`.
+///
+/// This is the FIRST gate an *external* put crosses. It precedes `dbPut` —
+/// so it precedes the `SPC_NOMOD` rejection of PACT/LCNT/PUTF — and it
+/// precedes the PROC-driven `dbProcess` (`dbAccess.c:1265-1277`), so
+/// `caput REC.PROC 1` on a `DISP=1` record is refused, not force-processed.
+///
+/// Single owner for both external put boundaries: the CA / `dbpf` route
+/// ([`PvDatabase::put_record_field_from_ca`]) and the QSRV precondition
+/// check ([`PvDatabase::check_external_put_preconditions`]). Internal puts
+/// (`put_pv`, link and processing writes — the `dbPut` analogue) deliberately
+/// do not cross it.
+fn check_put_disabled(
+    instance: &crate::server::record::RecordInstance,
+    field_upper: &str,
+) -> CaResult<()> {
+    if instance.common.disp && field_upper != "DISP" {
+        return Err(CaError::PutDisabled(field_upper.to_string()));
+    }
+    Ok(())
+}
+
 /// Coerce a write `value` to a record field's stored `target` type. A
 /// `DBR_STRING` write to a `DBF_MENU` field resolves the label against THAT
 /// field's own menu first (C `dbConvert` `putStringMenu`: an exact label,
@@ -211,11 +234,9 @@ impl PvDatabase {
             return Ok(());
         };
         let instance = rec.read().await;
-        // DISP=1 blocks a put to any field except DISP itself
-        // (C: `precord->disp && pfield != &precord->disp` → S_db_putDisabled).
-        if instance.common.disp && field_upper != "DISP" {
-            return Err(CaError::PutDisabled(field_upper));
-        }
+        // DISP=1 blocks a put to any field except DISP itself — the shared
+        // gate owner, identical to the one the CA route crosses.
+        check_put_disabled(&instance, &field_upper)?;
         // Read-only / SPC_NOMOD field
         // (C: `special == SPC_ATTRIBUTE` → S_db_noMod) — same `read_only`
         // flag the Passive route checks, so all three modes gate uniformly.
@@ -747,6 +768,17 @@ impl PvDatabase {
         // Special field intercepts (read lock, then drop)
         {
             let instance = rec.read().await;
+
+            // C `dbPutField` gate order (`dbAccess.c:1252-1277`): the DISP
+            // put-disable gate runs BEFORE `dbPut` — hence before the
+            // SPC_NOMOD rejection of PACT/LCNT/PUTF (`dbAccess.c:123`) — and
+            // BEFORE the PROC-driven `dbProcess`. So on a `DISP=1` record
+            // EVERY non-DISP field, PROC included, is refused with
+            // `S_db_putDisabled` and the record does not process.
+            check_put_disabled(&instance, &field)?;
+
+            // SPC_NOMOD fields (dbCommon.dbd): rejected inside C's `dbPut`,
+            // i.e. after the DISP gate above.
             match field.as_str() {
                 "PACT" => return Err(CaError::ReadOnlyField("PACT".into())),
                 "LCNT" => return Err(CaError::ReadOnlyField("LCNT".into())),
@@ -754,7 +786,7 @@ impl PvDatabase {
                 _ => {}
             }
 
-            // PROC intercept: trigger processing regardless of DISP.
+            // PROC intercept: trigger processing on any SCAN.
             // Falls through to the put_notify_tx registration below
             // so async records (motor, asyn-backed AO) signal real
             // completion; otherwise WRITE_NOTIFY would return ECA_NORMAL
@@ -820,11 +852,6 @@ impl PvDatabase {
                     }
                     None => Ok(None),
                 };
-            }
-
-            // DISP check: block CA puts to non-DISP fields when DISP=1
-            if instance.common.disp && field != "DISP" {
-                return Err(CaError::PutDisabled(field));
             }
         }
 

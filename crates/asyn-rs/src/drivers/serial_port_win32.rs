@@ -174,14 +174,12 @@ fn io_err() -> AsynError {
 /// A transport error meaning the serial line is broken and the connection must
 /// be torn down (vs a timeout, which leaves it open). Mirrors the unix
 /// backend's predicate and C `closeConnection`-on-fatal-error contract.
+///
+/// Classify by the carried status, not by the variant — the EOS interpose
+/// (installed by `configure`, as on unix) wraps a lower-layer hangup as
+/// `AsynError::PartialRead`, which a variant match reads as non-fatal.
 fn is_fatal_transport_error(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Disconnected,
-            ..
-        } | AsynError::Io(_)
-    )
+    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
 }
 
 // --- I/O state ---

@@ -8,7 +8,7 @@
 use crate::error::AsynResult;
 use crate::user::AsynUser;
 
-use super::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
+use super::{EomReason, OctetInterpose, OctetNext, OctetReadResult, PartialOctetRead};
 
 /// Fixed internal buffer size matching C asyn's INPUT_SIZE.
 const INPUT_BUFFER_SIZE: usize = 2048;
@@ -194,14 +194,20 @@ impl OctetInterpose for EosInterpose {
             // `in_buf_tail` has already advanced past them at :114-118 — so
             // dropping the count loses the data outright. Run C's tail, then
             // hand the error back with the partial attached.
+            //
+            // The partial carries a *copy* of the bytes, not just the count:
+            // `buf` here is the caller's buffer, but every dispatch hop above
+            // (`port_actor`'s scratch `Vec`, `SyncIO`'s) owns a different one
+            // and drops it on `?`. Only bytes that travel inside the error
+            // reach the record.
             let result = match next.read(user, &mut self.in_buf[..]) {
                 Ok(r) => r,
                 Err(e) => {
                     if n_read < maxchars {
                         buf[n_read] = 0;
                     }
-                    return Err(e.with_partial_read(OctetReadResult {
-                        nbytes_transferred: n_read,
+                    return Err(e.with_partial_read(PartialOctetRead {
+                        data: buf[..n_read].to_vec(),
                         eom_reason: eom,
                     }));
                 }
@@ -717,8 +723,14 @@ mod tests {
             .partial_read()
             .expect("a read that transferred bytes before failing must report them");
         assert_eq!(
-            partial.nbytes_transferred, 3,
+            partial.nbytes_transferred(),
+            3,
             "C publishes *nbytesTransfered = nRead on the error path"
+        );
+        assert_eq!(
+            partial.data, b"abc",
+            "the bytes travel with the error, not only in the caller's buffer — \
+             every dispatch hop above this one owns a different buffer"
         );
         assert_eq!(
             partial.eom_reason,
@@ -758,7 +770,12 @@ mod tests {
         base.served = true;
         let err = interpose.read(&user, &mut buf, &mut base).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Disconnected);
-        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred), Some(0));
+        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred()), Some(0));
+        assert_eq!(
+            err.partial_read().map(|p| p.data.as_slice()),
+            Some(&[][..]),
+            "a zero transfer is reported as an empty partial, not omitted"
+        );
         assert_eq!(buf[0], 0, "null-terminated with zero bytes read");
     }
 
@@ -782,7 +799,11 @@ mod tests {
 
         let err = interpose.read(&user, &mut buf, &mut base).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);
-        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred), Some(2));
+        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred()), Some(2));
+        assert_eq!(
+            err.partial_read().map(|p| p.data.as_slice()),
+            Some(&b"XY"[..])
+        );
         assert_eq!(&buf[..2], b"XY");
         assert!(
             err.to_string().contains("cable yanked"),

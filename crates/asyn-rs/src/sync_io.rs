@@ -306,4 +306,61 @@ mod tests {
         }
         assert_eq!(sio.timeout(), before, "10× r/w must preserve timeout");
     }
+
+    /// R7-46: C `asynOctetSyncIO::read` hands the caller `*nbytesTransfered`
+    /// alongside the failing status — `pasynOctet->read` fills the caller's
+    /// buffer before returning `asynTimeout`, so a partial line is not lost to
+    /// a SyncIO caller. `read_octet`'s `Err` must therefore carry the transfer:
+    /// the bytes ride inside `AsynError::PartialRead`, not in a buffer that `?`
+    /// drops on the way out of the actor.
+    #[test]
+    fn read_octet_error_carries_the_partial_transfer() {
+        use crate::error::{AsynError, AsynResult, AsynStatus};
+        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::user::AsynUser;
+
+        struct PartialThenTimeout(PortDriverBase);
+        impl PortDriver for PartialThenTimeout {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<(usize, EomReason)> {
+                buf[..3].copy_from_slice(b"abc");
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }
+                .with_partial_read(PartialOctetRead {
+                    data: b"abc".to_vec(),
+                    eom_reason: EomReason::empty(),
+                }))
+            }
+        }
+
+        let (handle, _jh) = create_port_runtime(
+            PartialThenTimeout(PortDriverBase::new("syncpartial", 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        let sio =
+            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+
+        let err = sio.read_octet(0, 32).unwrap_err();
+        assert_eq!(
+            err.status(),
+            AsynStatus::Timeout,
+            "the timeout still surfaces"
+        );
+        let partial = err
+            .partial_read()
+            .expect("the transfer must survive the actor dispatch and reach the caller");
+        assert_eq!(partial.data, b"abc");
+        assert_eq!(partial.nbytes_transferred(), 3);
+    }
 }

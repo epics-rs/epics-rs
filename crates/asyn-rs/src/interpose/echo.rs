@@ -72,11 +72,14 @@ impl OctetInterpose for EchoInterpose {
                 .with_timeout(user.timeout);
             let echo_result = match next.read(&echo_user, &mut echo_buf) {
                 Ok(r) => r,
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    ..
-                }) => {
-                    // C parity: timeout gets specific "Loss of communication?" message
+                // C parity: a timeout on the echo read gets the specific
+                // "Loss of communication?" message (asynInterposeEcho.c).
+                // Classify by the carried status, not the variant: the layer
+                // below this one may be the EOS interpose, which returns C's
+                // `asynTimeout` wrapped as `PartialRead` — a variant match
+                // would drop such a timeout into the generic branch and
+                // report the wrong diagnostic.
+                Err(e) if e.status() == AsynStatus::Timeout => {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: format!(

@@ -2233,6 +2233,29 @@ impl DeviceSupport for AsynDeviceSupport {
                     self.last_ts = result.timestamp;
                 }
                 Err(e) => {
+                    // A failed octet read that still transferred bytes hands
+                    // them to the record. C `devAsynOctet::readIt`
+                    // (devAsynOctet.c:693-717) passes the record's own value
+                    // buffer straight to `pasynOctet->read`, so on an
+                    // `asynTimeout` after a partial line the driver has
+                    // *already* written those bytes into `psi->val` /
+                    // `pwf->bptr`; readIt returns the failing status but the
+                    // data is in the record. Only the success-gated fields
+                    // (UDF, NORD/LEN — callbackSiRead:924-931,
+                    // callbackWfRead:1055-1061) stay untouched, which is what
+                    // the alarm below plus `skip_convert` express here.
+                    // Dropping the value on the error path is what R6-48's
+                    // partial never reached.
+                    if let Some(partial) = e.partial_read() {
+                        let result = RequestResult::octet_read_eom(
+                            partial.data.clone(),
+                            partial.nbytes_transferred(),
+                            partial.eom_reason.bits(),
+                        );
+                        if let Some(val) = self.result_to_value(&result) {
+                            skip_convert = self.store_read_value(record, val);
+                        }
+                    }
                     // Convert asyn error to EPICS alarm (C parity: asynStatusToEpicsAlarm)
                     let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
                     self.last_alarm_status = alarm_status;
@@ -7028,6 +7051,86 @@ mod tests {
             EpicsValue::CharArray(v) => assert_eq!(v, long),
             other => panic!("expected CharArray, got {other:?}"),
         }
+    }
+
+    /// R7-46: C `devAsynOctet::readIt` (devAsynOctet.c:693-717) passes the
+    /// record's own value buffer to `pasynOctet->read`, so a partial line
+    /// followed by a timeout leaves those bytes *in the record* (`psi->val`)
+    /// and returns the failing status; `processCommon` maps it to
+    /// TIMEOUT_ALARM/INVALID (:805-808). The port's error branch mapped the
+    /// alarm but dropped the bytes, because the transfer never left the
+    /// driver's buffer.
+    #[test]
+    fn octet_partial_read_stores_the_bytes_and_the_timeout_alarm() {
+        use crate::error::{AsynError, AsynResult, AsynStatus};
+        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::user::AsynUser;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        struct PartialThenTimeout(PortDriverBase);
+        impl PortDriver for PartialThenTimeout {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<(usize, EomReason)> {
+                buf[..3].copy_from_slice(b"abc");
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }
+                .with_partial_read(PartialOctetRead {
+                    data: b"abc".to_vec(),
+                    eom_reason: EomReason::empty(),
+                }))
+            }
+        }
+
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(PartialThenTimeout(PortDriverBase::new(
+                "octet_partial",
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, "octet_partial".into(), interrupts);
+
+        let link = AsynLink {
+            port_name: "octet_partial".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_max_size = 40;
+        ads.reason_set = true;
+
+        let mut rec = StringinRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(
+            rec.val.as_str_lossy(),
+            "abc",
+            "the bytes the device did send reach VAL, as C's in-place read does"
+        );
+        assert_eq!(
+            (ads.last_alarm_status, ads.last_alarm_severity),
+            (
+                epics_base_rs::server::recgbl::alarm_status::TIMEOUT_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            ),
+            "the failing status still raises TIMEOUT/INVALID (asynStatusToEpicsAlarm)"
+        );
     }
 
     /// Full asynOctetCmdResponse chain through the factory: the literal DRVINFO

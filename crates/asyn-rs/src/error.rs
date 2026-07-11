@@ -32,19 +32,22 @@ pub enum AsynError {
     /// [`AsynError::Status`] alone cannot express that: `?` on a
     /// partially-filled read discards the count and the eom reason, and the
     /// bytes already written into the caller's buffer become unrecoverable
-    /// because the interpose's `in_buf_tail` has advanced past them. Build
-    /// this with [`AsynError::with_partial_read`] rather than by hand, and
-    /// read it back with [`AsynError::partial_read`].
-    #[error("asyn: {status:?} - {message} (after {} partial bytes)", partial.nbytes_transferred)]
+    /// because the interpose's `in_buf_tail` has advanced past them — and
+    /// because every dispatch hop above the driver (`port_actor` →
+    /// `PortHandle` → device support) owns its own buffer, which `?` drops.
+    /// Carrying the bytes *in* the error is what makes the transfer and the
+    /// status one value: a consumer cannot take the failure without also
+    /// being handed everything the device did send. Build this with
+    /// [`AsynError::with_partial_read`] rather than by hand, and read it back
+    /// with [`AsynError::partial_read`].
+    #[error("asyn: {status:?} - {message} (after {} partial bytes)", partial.nbytes_transferred())]
     PartialRead {
         status: AsynStatus,
         message: String,
-        /// How much of the caller's buffer was filled before the failure,
-        /// and the end-of-message reason accumulated up to that point. The
-        /// bytes themselves are already in the caller's buffer — this is the
-        /// `*nbytesTransfered` / `*eomReason` pair C writes out alongside the
-        /// error.
-        partial: crate::interpose::OctetReadResult,
+        /// The bytes transferred before the failure and the end-of-message
+        /// reason accumulated up to that point — the `*nbytesTransfered` /
+        /// `*eomReason` pair C writes out alongside the error.
+        partial: crate::interpose::PartialOctetRead,
     },
 
     #[error("port not found: {0}")]
@@ -135,8 +138,15 @@ impl AsynError {
     }
 
     /// The partial octet transfer delivered before this error, if any —
-    /// C's `*nbytesTransfered` / `*eomReason` on the failure path.
-    pub fn partial_read(&self) -> Option<&crate::interpose::OctetReadResult> {
+    /// C's `*nbytesTransfered` / `*eomReason` / caller-buffer contents on the
+    /// failure path.
+    ///
+    /// Every consumer of an octet read MUST consult this on the error path:
+    /// C `asynRecord::performOctetIO` (asynRecord.c:1591-1629) and
+    /// `devAsynOctet::readIt` (devAsynOctet.c:693-717) both publish the
+    /// transfer regardless of the returned status, so an error branch that
+    /// looks only at the status silently drops device data C delivers.
+    pub fn partial_read(&self) -> Option<&crate::interpose::PartialOctetRead> {
         match self {
             AsynError::PartialRead { partial, .. } => Some(partial),
             _ => None,
@@ -152,7 +162,7 @@ impl AsynError {
     /// Re-attaching overwrites: in a stacked interpose chain the outermost
     /// layer is the one that filled the caller's buffer, so its count is the
     /// authoritative `*nbytesTransfered`.
-    pub fn with_partial_read(self, partial: crate::interpose::OctetReadResult) -> Self {
+    pub fn with_partial_read(self, partial: crate::interpose::PartialOctetRead) -> Self {
         let status = self.status();
         let message = match self {
             AsynError::Status { message, .. } | AsynError::PartialRead { message, .. } => message,

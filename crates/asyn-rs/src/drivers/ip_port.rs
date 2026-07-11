@@ -664,13 +664,19 @@ impl DrvAsynIPPort {
                 Ok((r.nbytes_transferred, r.eom_reason))
             }
             Err(e) => {
-                let is_timeout = matches!(
-                    e,
-                    AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        ..
-                    }
-                );
+                // Classify by the carried status, not by the variant — the
+                // same rule `is_fatal_transport_error` already follows. The
+                // read below is dispatched through the interpose chain, and
+                // `drvAsynIPPortConfigure` installs the EOS interpose by
+                // default (iocsh.rs), which wraps *every* lower-layer failure
+                // — including a zero-byte recv timeout — as `PartialRead`
+                // (C `asynInterposeEos.c:242-253` likewise returns the
+                // lower-layer `asynTimeout`, unchanged, alongside the count).
+                // A variant match therefore never saw a timeout on a default
+                // IP port and `disconnectOnReadTimeout` could not fire; C runs
+                // its test inside readRaw, below the interpose, where the raw
+                // recv timeout is visible (drvAsynIPPort.c:798-806).
+                let is_timeout = e.status() == AsynStatus::Timeout;
                 // C parity: auto-disconnect on:
                 // 1. disconnectOnReadTimeout AND a timeout error AND a
                 //    positive request timeout. C gates this on
@@ -1569,6 +1575,87 @@ mod tests {
         let mut buf = [0u8; 32];
         let n = drv.read_octet(&user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"OK");
+
+        handle.join().unwrap();
+    }
+
+    /// R7-47: `disconnectOnReadTimeout Y` must tear the socket down on a read
+    /// timeout even when the EOS interpose is installed — which
+    /// `drvAsynIPPortConfigure` does by default (iocsh.rs), so this is the
+    /// *normal* configuration, not a corner case. C runs its disconnect test
+    /// inside readRaw, below the interpose, on the raw recv timeout
+    /// (drvAsynIPPort.c:798-806); asyn-rs runs it above the interpose, where
+    /// the same timeout arrives wrapped as `PartialRead` — so the test must
+    /// key off `e.status()`, not the error variant. Matching by variant made
+    /// the option inert on every default IP port.
+    #[test]
+    fn disconnect_on_read_timeout_fires_through_the_eos_interpose() {
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+
+        let (listener, port) = start_echo_server();
+        // The peer accepts and then says nothing: the read must time out with
+        // zero bytes, which the EOS interpose reports as PartialRead(Timeout, 0).
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            drop(stream);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        })));
+        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 32];
+        let err = drv
+            .read_octet(&user, &mut buf)
+            .expect_err("a silent peer must time the read out");
+        assert_eq!(
+            err.status(),
+            AsynStatus::Timeout,
+            "the interpose keeps C's asynTimeout status, it only wraps it"
+        );
+        assert!(
+            !drv.base().connected,
+            "disconnectOnReadTimeout must drop the connection (C drvAsynIPPort.c:798-806)"
+        );
+
+        handle.join().unwrap();
+    }
+
+    /// Boundary companion to the test above: `disconnectOnReadTimeout` is off
+    /// by default, so the same timeout through the same interpose must leave
+    /// the socket up.
+    #[test]
+    fn read_timeout_without_the_option_keeps_the_connection() {
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            drop(stream);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        })));
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
+        let mut buf = [0u8; 32];
+        assert!(drv.read_octet(&user, &mut buf).is_err());
+        assert!(
+            drv.base().connected,
+            "a plain read timeout leaves the socket intact (C returns asynTimeout, no close)"
+        );
 
         handle.join().unwrap();
     }

@@ -531,6 +531,78 @@ async fn monitor_dbe_lowercase_token_warns_over_the_wire() {
     );
 }
 
+/// R7-34: a numeric *string* DBE is the same trap. pvxs switches on the
+/// field's kind (singlesource.cpp:117-140) — `Kind::String` runs the substring
+/// scan and nothing else; only `Kind::Integer`/`Kind::Real` reach
+/// `fld.as<uint8_t>()`. So `DBE="1"` names no event class: empty mask, one
+/// Warning, VALUE|ALARM fallback. The port used to parse the string
+/// numerically, so `"1"` silently negotiated a VALUE-only subscription (ALARM
+/// transitions never reached the client) and no diagnostic was owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_numeric_string_warns_over_the_wire() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    // "1" would have been DBE_VALUE, "2" DBE_ALARM, "7" VALUE|LOG|ALARM.
+    for (i, raw) in ["1", "2", "7"].iter().enumerate() {
+        let ioid: u32 = 61 + i as u32;
+        let mut c = FrameReader::connect(addr);
+        let sid = c.create_channel("RLOG:a");
+
+        let req = pv_request_with_options(&[(
+            "DBE",
+            PvField::Scalar(ScalarValue::String((*raw).into())),
+        )]);
+        let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+        let messages: Vec<_> = frames
+            .iter()
+            .filter(|f| f.header.command == Command::Message.code())
+            .map(parse_message_frame)
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "DBE={raw:?} selects an empty mask and owes exactly one warning, got {messages:?}"
+        );
+        let (msg_ioid, mtype, text) = &messages[0];
+        assert_eq!(*msg_ioid, ioid);
+        assert_eq!(*mtype, MessageType::Warning as u8);
+        assert_eq!(
+            text,
+            &format!("record._options.DBE=\"{raw}\" selects empty mask")
+        );
+    }
+}
+
+/// Control: the SAME value carried as a numeric field (not a string) IS read
+/// as a mask — pvxs's `Kind::Integer` branch does `fld.as<uint8_t>()`
+/// (singlesource.cpp:134-136). `DBE=1` (Int) is an honored VALUE selection, so
+/// no diagnostic. This is the boundary the string arm must not cross.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_numeric_int_is_honored_without_warning() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 64;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let req = pv_request_with_options(&[("DBE", PvField::Scalar(ScalarValue::Int(1)))]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f.header.command == Command::Message.code()),
+        "a numeric-typed DBE=1 is an honored VALUE selection and must draw no CMD_MESSAGE"
+    );
+}
+
 /// Control: a DBE that DOES select something in the value class is a
 /// request the server honors as asked — no diagnostic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

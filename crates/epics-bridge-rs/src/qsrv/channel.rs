@@ -154,11 +154,17 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
         _ => return None,
     };
 
-    // Numeric-as-string: `"5"` resolves through the same value-class
-    // mask as the integer form.
-    if let Ok(n) = raw.trim().parse::<u32>() {
-        return Some(dbe_value_class_mask((n & 0xFFFF) as u16));
-    }
+    // A String-typed DBE is NEVER parsed numerically. pvxs switches on the
+    // field's *kind* (singlesource.cpp:117-140): `Kind::String` runs the
+    // substring scan below and nothing else, while only `Kind::Integer` /
+    // `Kind::Real` reach `fld.as<uint8_t>()`. So `DBE="1"` selects no bit,
+    // draws the empty-mask warning, and falls back to VALUE|ALARM — it does
+    // NOT mean DBE_VALUE. (This is unlike `queueSize`/`block`/`atomic`, which
+    // pvxs reads with `as<T>()` regardless of kind; `Value::as` does
+    // `parseTo<int64_t>` on string storage, data.cpp:442-449, so their
+    // numeric-string parse is correct.) The port used to parse the string
+    // first, so `DBE="1"` selected VALUE-only where pvxs gives VALUE|ALARM,
+    // and the warning never fired.
 
     // String DBE: pvxs does "sloppy" substring matching for only VALUE,
     // ARCHIVE, and ALARM (singlesource.cpp:122-127). `LOG` is NOT a
@@ -1369,14 +1375,38 @@ mod tests {
         assert_eq!(mask, EventMask::VALUE.bits());
     }
 
-    /// numeric-string DBE goes through the same value-class mask as
-    /// the integer form (`"8"` = PROPERTY → VALUE|ALARM fallback).
+    /// A String-typed DBE is never parsed numerically. pvxs switches on the
+    /// field's kind (singlesource.cpp:117-140): `Kind::String` does the
+    /// substring scan and nothing else — only `Kind::Integer`/`Kind::Real`
+    /// reach `fld.as<uint8_t>()`. So `"1"` does NOT mean DBE_VALUE: it
+    /// matches no token, selects an empty mask, draws the warning, and falls
+    /// back to VALUE|ALARM. The port used to parse it, giving VALUE-only and
+    /// no warning. Boundary cases: `"1"`/`"2"` (would have been a strict
+    /// subset of the fallback), `"7"` (would have equalled it silently),
+    /// `"8"` (PROPERTY-only), `"0"`.
     #[test]
-    fn dbe_numeric_string_uses_value_class_mask() {
+    fn dbe_numeric_string_is_not_parsed_numerically() {
         use epics_base_rs::server::recgbl::EventMask;
-        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("8".into())));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
-        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for raw in ["0", "1", "2", "7", "8", " 5 "] {
+            let log = RemoteLog::default();
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::String(raw.into())));
+            let mask = dbe_mask_from_pv_request(&req, &log).expect("must parse");
+            assert_eq!(
+                mask, fallback,
+                "a numeric string selects no event class, so DBE={raw:?} falls back to VALUE|ALARM"
+            );
+            let logged = log.take();
+            assert_eq!(
+                logged.len(),
+                1,
+                "an empty-mask selection owes the client one warning, DBE={raw:?}: {logged:?}"
+            );
+            assert_eq!(
+                logged[0].message,
+                format!("record._options.DBE=\"{raw}\" selects empty mask")
+            );
+        }
     }
 
     /// missing DBE option resolves to None so the monitor

@@ -1960,23 +1960,56 @@ impl AsynRecord {
         }
     }
 
+    /// Clamp the operator's requested transfer sizes into the record fields —
+    /// the single owner of NOWT/NRRD's effective value.
+    ///
+    /// C `performOctetIO` does not clamp into locals: it writes the clamped
+    /// value back into the record itself — `nowt = omax` when a Binary write
+    /// asks for more than the output buffer holds (asynRecord.c:1499) and
+    /// `nrrd = inlen` when the read asks for more than the IFMT-selected input
+    /// buffer holds (:1512) — and `monitor()` `POST_IF_NEW`s both (:1020,1022).
+    /// The fields therefore show the *effective* transfer sizes, not the
+    /// requested ones. Called from [`Self::build_io_plan`] on the scan thread
+    /// before the plan snapshot, so the synchronous and off-thread runners see
+    /// one already-clamped value and nothing downstream re-derives it.
+    ///
+    /// Gated on the octet interface exactly as C is — `performIO` only reaches
+    /// `performOctetIO` for `IFACE == asynOctet` (asynRecord.c:1326-1331), and
+    /// the register handlers never touch NRRD/NOWT. Inside `performOctetIO`
+    /// both clamps run before any TMOD test, so a Read-only cycle still clamps
+    /// NOWT and a Write-only cycle still clamps NRRD.
+    ///
+    /// C compares with `>` against signed ints, so a negative NRRD/NOWT is left
+    /// in the field untouched; mirrored here. The `max(0)` guards at the buffer
+    /// arithmetic keep the negative out of the slice math without rewriting the
+    /// field.
+    fn clamp_transfer_sizes(&mut self, in_len: usize) {
+        if self.ofmt == ASYN_FMT_BINARY && self.nowt > self.omax {
+            self.nowt = self.omax;
+        }
+        let in_len = in_len.min(i32::MAX as usize) as i32;
+        if self.nrrd > in_len {
+            self.nrrd = in_len;
+        }
+    }
+
     /// Build the octet output payload by `OFMT`, mirroring
     /// `asynRecord.c:1486-1502`:
     ///   - ASCII  -> `dbTranslateEscape(AOUT)`: the AOUT string with escape
     ///     sequences (`\r\n` -> CRLF) translated.
     ///   - Hybrid -> `dbTranslateEscape(BOUT read as a C string)`: the binary
     ///     output buffer, escape-translated (stops at the first NUL).
-    ///   - Binary -> raw BOUT, `NOWT` bytes clamped to `OMAX`, no translation.
+    ///   - Binary -> raw BOUT, `NOWT` bytes (already clamped to `OMAX` by
+    ///     [`Self::clamp_transfer_sizes`]), no translation.
     ///
     /// ASCII/Hybrid emit the full translated buffer; only Binary is
-    /// length-bounded by `NOWT`/`OMAX`. Previously the record sent raw AOUT
+    /// length-bounded by `NOWT`. Previously the record sent raw AOUT
     /// for both ASCII and Hybrid (ASCII shipped literal backslashes, Hybrid
     /// ignored BOUT) and clamped every mode by `NOWT`.
     fn octet_output_buffer(&self) -> Vec<u8> {
         match self.ofmt {
             ASYN_FMT_BINARY => {
-                let omax = self.omax.max(0) as usize;
-                let nowt = (self.nowt.max(0) as usize).min(omax);
+                let nowt = self.nowt.max(0) as usize;
                 self.bout[..nowt.min(self.bout.len())].to_vec()
             }
             ASYN_FMT_HYBRID => {
@@ -1995,9 +2028,8 @@ impl AsynRecord {
     /// Snapshot the record fields `performIO` reads into an [`IoPlan`] so the
     /// I/O can run without touching the record (synchronously here, or off
     /// the scan thread in [`run_io_plan`]).
-    fn build_io_plan(&self) -> IoPlan {
-        let octet_out = self.octet_output_buffer();
-        let octet_out_len = octet_out.len();
+    fn build_io_plan(&mut self) -> IoPlan {
+        let iface = InterfaceType::from_u16(self.iface as u16);
         // C `performOctetIO` (asynRecord.c:1503-1517): the input buffer is
         // chosen by IFMT — ASCII reads into the fixed 40-byte AINP string
         // (`inlen = sizeof(ainp)`), Hybrid and Binary into the IMAX-sized BINP
@@ -2015,6 +2047,21 @@ impl AsynRecord {
         } else {
             self.imax.max(0) as usize
         };
+        // C reaches the NOWT/NRRD clamps and the OFMT output-buffer build only
+        // inside `performOctetIO`, i.e. only for the octet interface
+        // (asynRecord.c:1326-1331). Gate both here for the same reason: a
+        // register-interface cycle must leave NRRD/NOWT alone and has no octet
+        // payload to send.
+        let (octet_out, octet_out_len) = if iface == InterfaceType::Octet {
+            self.clamp_transfer_sizes(in_len);
+            let out = self.octet_output_buffer();
+            let len = out.len();
+            (out, len)
+        } else {
+            (Vec::new(), 0)
+        };
+        // NRRD is already clamped to `in_len` for the octet interface — the only
+        // one that reads this field — so `min` is the same bound.
         let octet_buf_size = if self.nrrd > 0 {
             (self.nrrd as usize).min(in_len)
         } else {
@@ -2029,7 +2076,7 @@ impl AsynRecord {
         };
         IoPlan {
             tmod: TransferMode::from_u16(self.tmod as u16),
-            iface: InterfaceType::from_u16(self.iface as u16),
+            iface,
             reason: self.resolved_reason,
             addr: self.addr,
             timeout,
@@ -4660,10 +4707,86 @@ mod tests {
             vec![b'\\', b'r', 0x00, 0x01],
             "Binary writes raw BOUT untranslated, NOWT bytes"
         );
-        // NOWT clamps to OMAX.
+        // NOWT > OMAX is clamped by `clamp_transfer_sizes` (C asynRecord.c:1499
+        // writes the clamp back into the field), which `build_io_plan` runs
+        // before this; the payload is then simply the first NOWT bytes.
         rec.omax = 3;
         rec.nowt = 10;
+        rec.clamp_transfer_sizes(AINP_SIZE);
+        assert_eq!(rec.nowt, 3);
         assert_eq!(rec.octet_output_buffer(), vec![b'\\', b'r', 0x00]);
+    }
+
+    /// R8-54: C `performOctetIO` writes the clamped transfer sizes back into
+    /// the record — `nowt = omax` (asynRecord.c:1499) and `nrrd = inlen`
+    /// (:1512) — and `monitor()` POST_IF_NEWs them (:1020,1022), so the fields
+    /// show the *effective* sizes. The port used to clamp only into locals, so
+    /// NOWT/NRRD kept the operator's over-large request forever.
+    #[test]
+    fn nowt_and_nrrd_are_clamped_back_into_the_record() {
+        // Binary output: NOWT > OMAX clamps to OMAX.
+        let mut rec = AsynRecord::default();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.tmod = TransferMode::WriteRead as i32;
+        rec.ofmt = ASYN_FMT_BINARY;
+        rec.ifmt = ASYN_FMT_BINARY;
+        rec.omax = 8;
+        rec.nowt = 500;
+        rec.imax = 16;
+        rec.nrrd = 900;
+        rec.build_io_plan();
+        assert_eq!(rec.nowt, 8, "NOWT clamps back to OMAX");
+        assert_eq!(rec.nrrd, 16, "NRRD clamps back to IMAX for a Binary read");
+
+        // ASCII input: the read capacity is sizeof(AINP), not IMAX
+        // (asynRecord.c:1504-1505), so NRRD clamps to 40 even with IMAX=80.
+        let mut ascii = AsynRecord::default();
+        ascii.iface = InterfaceType::Octet as i32;
+        ascii.tmod = TransferMode::Read as i32;
+        ascii.ifmt = ASYN_FMT_ASCII;
+        ascii.imax = 80;
+        ascii.nrrd = 900;
+        ascii.build_io_plan();
+        assert_eq!(
+            ascii.nrrd, AINP_SIZE as i32,
+            "ASCII NRRD clamps to AINP_SIZE"
+        );
+
+        // A Read-only cycle still clamps NOWT, and a Write-only cycle still
+        // clamps NRRD: C runs both clamps before any TMOD test.
+        let mut read_only = AsynRecord::default();
+        read_only.iface = InterfaceType::Octet as i32;
+        read_only.tmod = TransferMode::Read as i32;
+        read_only.ofmt = ASYN_FMT_BINARY;
+        read_only.omax = 4;
+        read_only.nowt = 99;
+        read_only.build_io_plan();
+        assert_eq!(read_only.nowt, 4, "TMOD=Read still clamps NOWT");
+
+        // ASCII/Hybrid output is not length-bounded by NOWT in C, so the NOWT
+        // clamp is Binary-only (asynRecord.c:1496-1501).
+        let mut ascii_out = AsynRecord::default();
+        ascii_out.iface = InterfaceType::Octet as i32;
+        ascii_out.tmod = TransferMode::Write as i32;
+        ascii_out.ofmt = ASYN_FMT_ASCII;
+        ascii_out.omax = 4;
+        ascii_out.nowt = 99;
+        ascii_out.build_io_plan();
+        assert_eq!(ascii_out.nowt, 99, "ASCII output leaves NOWT alone");
+
+        // A register interface never reaches performOctetIO, so neither field
+        // is touched (asynRecord.c:1326-1360).
+        let mut i32_rec = AsynRecord::default();
+        i32_rec.iface = InterfaceType::Int32 as i32;
+        i32_rec.tmod = TransferMode::WriteRead as i32;
+        i32_rec.ofmt = ASYN_FMT_BINARY;
+        i32_rec.omax = 8;
+        i32_rec.nowt = 500;
+        i32_rec.imax = 16;
+        i32_rec.nrrd = 900;
+        i32_rec.build_io_plan();
+        assert_eq!(i32_rec.nowt, 500, "Int32 interface leaves NOWT alone");
+        assert_eq!(i32_rec.nrrd, 900, "Int32 interface leaves NRRD alone");
     }
 
     #[test]

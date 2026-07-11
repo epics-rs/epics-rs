@@ -154,11 +154,23 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
 ///
 /// `SIGPIPE` is set to ignored synchronously (via `nix::sys::signal`)
 /// so a write to a dead client socket doesn't kill the supervisor.
-/// `SIGTERM`/`SIGINT` are converted to a single [`ShutdownSignal`]
-/// future. `SIGHUP` is deliberately NOT handled here — it means
-/// "reopen the log file" (logrotate), which the supervisor owns; if it
-/// were folded into the shutdown set a logrotate `kill -HUP` would tear
-/// the IOC down.
+/// `SIGTERM` is converted to a [`ShutdownSignal`] future. `SIGHUP` is
+/// deliberately NOT handled here — it means "reopen the log file"
+/// (logrotate), which the supervisor owns; if it were folded into the
+/// shutdown set a logrotate `kill -HUP` would tear the IOC down.
+///
+/// `in_fg_mode` selects between C's two dispositions for `SIGINT` /
+/// `SIGQUIT` (`procServ.cc:503-509`):
+///
+/// * **foreground** — both are `SIG_IGN`. The launching terminal is the
+///   operator's console session: `Ctrl-C` and `Ctrl-\` are keystrokes
+///   the console client forwards to the child, not instructions to the
+///   supervisor. Without this, `Ctrl-C` at a `procserv-rs -f` prompt
+///   shuts the supervisor down and drops the IOC, and `Ctrl-\` kills it
+///   with a core dump via the default `SIGQUIT` disposition.
+/// * **daemon** — `SIGINT` joins `SIGTERM` as a shutdown trigger and
+///   `SIGQUIT` keeps its default disposition, exactly as C leaves them
+///   when `inFgMode` is false.
 ///
 /// Registration is non-fatal. C installs every handler in the foreground
 /// parent before `forkAndGo` (`procServ.cc:477,551`) with **unchecked**
@@ -169,7 +181,7 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
 /// "never checks": a failed registration is logged and the corresponding
 /// handler is dropped, leaving the daemon running. Hence the infallible
 /// return type — sibling of the PS-48 pidfile/log warn-continue policy.
-pub async fn install_signal_handlers() -> ShutdownSignal {
+pub async fn install_signal_handlers(in_fg_mode: bool) -> ShutdownSignal {
     // SIGPIPE → ignore. tokio::signal doesn't expose SIG_IGN
     // directly, so use nix.
     // SAFETY: signal(SIGPIPE, SIG_IGN) is async-signal-safe and
@@ -180,6 +192,22 @@ pub async fn install_signal_handlers() -> ShutdownSignal {
         }
     }
 
+    // C `procServ.cc:503-509`: in foreground mode both SIGINT and
+    // SIGQUIT are SIG_IGN, so the console's ^C / ^\ belong to the
+    // operator's session and never reach the supervisor as a shutdown.
+    // Unchecked in C; logged-and-continued here, like every other
+    // registration in this function.
+    if in_fg_mode {
+        for sig in [Signal::SIGINT, Signal::SIGQUIT] {
+            // SAFETY: disposition-only (SIG_IGN); no userspace handler.
+            unsafe {
+                if let Err(e) = signal(sig, SigHandler::SigIgn) {
+                    tracing::error!(error = %e, signal = ?sig, "procserv-rs: unable to ignore signal in foreground mode; continuing");
+                }
+            }
+        }
+    }
+
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -187,11 +215,18 @@ pub async fn install_signal_handlers() -> ShutdownSignal {
             None
         }
     };
-    let mut intr = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::error!(error = %e, "procserv-rs: unable to register SIGINT handler; graceful SIGINT shutdown disabled");
-            None
+    // In foreground mode SIGINT stays ignored — registering the tokio
+    // stream would re-arm it as a shutdown trigger and undo the SIG_IGN
+    // above.
+    let mut intr = if in_fg_mode {
+        None
+    } else {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "procserv-rs: unable to register SIGINT handler; graceful SIGINT shutdown disabled");
+                None
+            }
         }
     };
 
@@ -273,6 +308,65 @@ mod tests {
         assert!(
             parked.is_err(),
             "an absent (failed-to-register) signal stream must never resolve"
+        );
+    }
+
+    /// Query a signal's current disposition without changing it
+    /// (`sigaction(sig, NULL, &old)`).
+    fn disposition(sig: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: query-only — a null `act` leaves the disposition
+        // untouched and fills `old`.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &mut old), 0);
+            old.sa_sigaction
+        }
+    }
+
+    /// R6-25 / C `procServ.cc:503-509`: foreground mode sets SIGINT and
+    /// SIGQUIT to `SIG_IGN`. `Ctrl-C` and `Ctrl-\` at a `procserv-rs -f`
+    /// prompt are the console client's keystrokes; they must not shut
+    /// the supervisor down (SIGINT) or core-dump it (SIGQUIT's default).
+    ///
+    /// nextest runs each test in its own process, so mutating this
+    /// process's dispositions is contained.
+    #[tokio::test]
+    async fn foreground_mode_ignores_sigint_and_sigquit() {
+        let _shutdown = install_signal_handlers(true).await;
+        assert_eq!(
+            disposition(libc::SIGINT),
+            libc::SIG_IGN,
+            "foreground mode must ignore SIGINT (C procServ.cc:504-505)"
+        );
+        assert_eq!(
+            disposition(libc::SIGQUIT),
+            libc::SIG_IGN,
+            "foreground mode must ignore SIGQUIT (C procServ.cc:506-507)"
+        );
+    }
+
+    /// The other side of the same C gate: with `inFgMode` false, C
+    /// installs neither `SIG_IGN`, so SIGINT stays a shutdown trigger
+    /// (tokio installs its own handler — the disposition is neither
+    /// `SIG_IGN` nor `SIG_DFL`) and SIGQUIT keeps its default.
+    #[tokio::test]
+    async fn daemon_mode_keeps_sigint_as_shutdown_and_sigquit_default() {
+        let _shutdown = install_signal_handlers(false).await;
+        let sigint = disposition(libc::SIGINT);
+        assert_ne!(
+            sigint,
+            libc::SIG_IGN,
+            "daemon mode must not ignore SIGINT — it is a shutdown trigger"
+        );
+        assert_ne!(
+            sigint,
+            libc::SIG_DFL,
+            "daemon mode installs a SIGINT handler for graceful shutdown"
+        );
+        assert_eq!(
+            disposition(libc::SIGQUIT),
+            libc::SIG_DFL,
+            "C leaves SIGQUIT alone outside foreground mode"
         );
     }
 }

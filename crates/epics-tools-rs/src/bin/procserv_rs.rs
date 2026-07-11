@@ -604,7 +604,7 @@ mod app {
             // and dropped inside `install_signal_handlers`, never aborting
             // the already-daemonized child. Matches C's unchecked sigaction
             // (procServ.cc:496-509).
-            let shutdown = install_signal_handlers().await;
+            let shutdown = install_signal_handlers(foreground).await;
 
             // Race the supervisor against the shutdown signal. The
             // supervisor's own `quit` keystroke also returns from

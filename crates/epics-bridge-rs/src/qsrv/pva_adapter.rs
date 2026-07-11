@@ -1626,7 +1626,7 @@ mod tests {
 
     /// pvxs installs no `onRPC` for QSRV records (singlesource.cpp:427-460);
     /// an RPC EXEC replies "RPC Not Implemented" (serverget.cpp:482-486).
-    /// QsrvPvStore must inherit the default "RPC not supported": RPC must
+    /// QsrvPvStore must inherit the default "RPC Not Implemented": RPC must
     /// NOT become a write-through, so `pvcall PV value=...` cannot mutate a
     /// record and a parameterless RPC is rejected rather than acting as a
     /// GET.
@@ -1650,7 +1650,7 @@ mod tests {
             .await
             .expect_err("parameterless RPC on a QSRV record must be rejected");
         assert!(
-            err.message.contains("RPC not supported"),
+            err.message == epics_pva_rs::server_native::source::RPC_NOT_IMPLEMENTED,
             "expected unsupported-RPC error, got: {err}"
         );
 
@@ -1669,7 +1669,7 @@ mod tests {
             .await
             .expect_err("RPC write-through on a QSRV record must be rejected");
         assert!(
-            err.message.contains("RPC not supported"),
+            err.message == epics_pva_rs::server_native::source::RPC_NOT_IMPLEMENTED,
             "expected unsupported-RPC error, got: {err}"
         );
 
@@ -1738,7 +1738,7 @@ mod tests {
             .await
             .expect_err("RPC on a QSRV group must be rejected");
         assert!(
-            err.message.contains("RPC not supported"),
+            err.message == epics_pva_rs::server_native::source::RPC_NOT_IMPLEMENTED,
             "expected unsupported-RPC error, got: {err}"
         );
 

@@ -398,6 +398,10 @@ impl ChannelInvalidator {
     }
 }
 
+/// `serverget.cpp:486` — the text pvxs sends when an RPC EXEC lands on a
+/// channel whose source installed no `onRPC` handler.
+pub const RPC_NOT_IMPLEMENTED: &str = "RPC Not Implemented";
+
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
     /// the wire layer to mint [`AccessChecked`] tokens for the typed
@@ -1106,8 +1110,10 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
-    /// Dispatch an RPC. The default impl returns "RPC not supported";
-    /// implementors can override to provide actual RPC behaviour.
+    /// Dispatch an RPC. The default impl is the "source installed no RPC
+    /// handler" case, which pvxs answers with the fixed text
+    /// `"RPC Not Implemented"` (`!chan->onRPC`, serverget.cpp:482-486);
+    /// implementors override to provide actual RPC behaviour.
     ///
     /// Returns an [`RpcReply`] on success — pvxs's two `ExecOp::reply()`
     /// overloads (`pvxs/srvcommon.h:108`): `RpcReply::Value(desc, value)` for
@@ -1122,7 +1128,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         request_value: PvField,
     ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let _ = (name, request_desc, request_value);
-        async move { Err(OpError::failed("RPC not supported by this source")) }
+        async move { Err(OpError::failed(RPC_NOT_IMPLEMENTED)) }
     }
 
     /// Type-state-enforced RPC. pvxs treats RPC as READ-class for

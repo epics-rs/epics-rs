@@ -15,6 +15,17 @@ const NUM_CHANNELS: usize = 16; // A-P
 /// (each can reference all 16 variables A-P), stores results back into A-P,
 /// then writes outputs via OUTA-OUTP links.
 pub struct TransformRecord {
+    /// `VAL` — a dummy. C `transformRecord.c:422` sets `ptran->val = 0` once in
+    /// `init_record` ("Gotta have a .val field.  Make its value reproducible.")
+    /// and NOTHING else ever touches it: `process()` iterates the channels from
+    /// `&ptran->a`, `monitor()` posts from `&ptran->a`, and the calc loop writes
+    /// `&ptran->a + i` — `->val` is never read, written or posted. It is a plain
+    /// writable DBF_DOUBLE (`transformRecord.dbd:43`, no `special`), so a client
+    /// put stores here and a later `caget .VAL` reads it back; that is the
+    /// field's entire behaviour. Aliasing VAL to channel A (the port's previous
+    /// shape) made `caget .VAL` return A and fired a `.VAL` monitor on every A
+    /// change — neither happens on C.
+    pub val: f64,
     pub vals: [f64; NUM_CHANNELS],
     pub calcs: [String; NUM_CHANNELS],
     compiled: [Option<CompiledExpr>; NUM_CHANNELS],
@@ -40,6 +51,7 @@ pub struct TransformRecord {
 impl Default for TransformRecord {
     fn default() -> Self {
         Self {
+            val: 0.0,
             vals: [0.0; NUM_CHANNELS],
             calcs: Default::default(),
             compiled: Default::default(),
@@ -571,7 +583,8 @@ impl Record for TransformRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         if name == "VAL" {
-            return Some(EpicsValue::Double(self.vals[0]));
+            // The dummy result field — never written by process()/monitor().
+            return Some(EpicsValue::Double(self.val));
         }
         if name == "COPT" {
             return Some(EpicsValue::Short(self.copt));
@@ -599,7 +612,9 @@ impl Record for TransformRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         if name == "VAL" {
-            self.vals[0] = value
+            // Stored and readable back, but inert: no calc, output link or
+            // monitor consumes it (C `transformRecord.c` never reads `->val`).
+            self.val = value
                 .to_f64()
                 .ok_or_else(|| CaError::TypeMismatch("VAL".into()))?;
             return Ok(());
@@ -679,12 +694,12 @@ impl Record for TransformRecord {
     /// `transform.A` survives one cycle.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after {
-            let idx = if field == "VAL" {
-                Some(0)
-            } else {
-                Self::channel_index(field)
-            };
-            if let Some(i) = idx {
+            // C `transformRecord.c:698-704` marks the "new value" bitmap only
+            // for a field in the `A..P` range (`i = fieldIndex -
+            // transformRecordA; if ((i >= 0) && (i < MAX_FIELDS))`). VAL sits
+            // below `transformRecordA`, so a put to VAL marks nothing — it is
+            // not a channel.
+            if let Some(i) = Self::channel_index(field) {
                 self.fresh_put[i] = true;
             }
         }
@@ -925,13 +940,53 @@ mod tests {
         assert_eq!(rec.vals[1], 6.0);
     }
 
+    /// R9-62 — `VAL` is a constant-0 dummy, NOT an alias of channel A.
+    ///
+    /// C `transformRecord.c:422` sets `ptran->val = 0` once at init and no
+    /// other line in the record reads or writes `->val`: `process()` and
+    /// `monitor()` both walk the channels from `&ptran->a`. So `caget .VAL`
+    /// returns 0 no matter what A computes, and a `.VAL` monitor never fires.
+    /// The superseded `test_transform_val_is_a` asserted `VAL == 42` here,
+    /// pinning an alias C does not have.
     #[test]
-    fn test_transform_val_is_a() {
+    fn r9_62_val_is_a_constant_zero_dummy_not_channel_a() {
         let mut rec = TransformRecord::new();
         rec.put_field("CLCA", EpicsValue::String("42".into()))
             .unwrap();
         rec.process().unwrap();
-        // VAL returns vals[0] which is A
-        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(42.0)));
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::Double(42.0)),
+            "CLCA computed channel A"
+        );
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::Double(0.0)),
+            "VAL stays at its init value — process() never touches ->val"
+        );
+    }
+
+    /// A client put to VAL is stored and read back (plain writable DBF_DOUBLE,
+    /// `transformRecord.dbd:43`), but it is inert: it does not become channel
+    /// A, and a subsequent process leaves it alone.
+    #[test]
+    fn r9_62_val_put_is_stored_but_never_feeds_a_channel() {
+        let mut rec = TransformRecord::new();
+        rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(7.0)));
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::Double(0.0)),
+            "a put to VAL must not land in channel A"
+        );
+        rec.put_field("CLCA", EpicsValue::String("3".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(3.0)));
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::Double(7.0)),
+            "process() leaves the put-stored VAL untouched"
+        );
     }
 }

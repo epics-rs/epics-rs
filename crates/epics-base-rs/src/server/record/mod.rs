@@ -30,4 +30,4 @@ pub use record_trait::{
     FieldMetadataOverride, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record,
     RecordProcessResult, SubroutineFn,
 };
-pub use scan::ScanType;
+pub use scan::{ScanType, SimModeScan};

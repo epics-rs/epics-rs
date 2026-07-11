@@ -173,9 +173,13 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         // records but `menuYesNo` (NO/YES) elsewhere — so it is resolved by
         // each record's `menu_field_choices`, not here.
         "OLDSIMM" => Some(MENU_SIMM),
-        // Simulation-mode scan rate (`menuScan`); `.SCAN` itself is served
-        // by the common-field path.
-        "SSCN" => Some(MENU_SCAN),
+        // Scan mechanism and its simulation-mode twin, both `menu(menuScan)`
+        // (`dbCommon.dbd.pod:66`, `SSCN` on the 21 records that carry it).
+        // Their values live in `CommonFields`, not in a record's field list,
+        // but the menu is the same shared table every other menu field uses —
+        // for the string→index put converter AND for the DBR_ENUM choice
+        // labels served with a GET/MONITOR of `.SCAN`.
+        "SCAN" | "SSCN" => Some(MENU_SCAN),
         // Output mode select (`menuOmsl`).
         "OMSL" => Some(MENU_OMSL),
         // Invalid-output action (`menuIvoa`).
@@ -310,9 +314,7 @@ pub fn resolve_menu_field_string(
     dbf_type: DbFieldType,
     s: &str,
 ) -> CaResult<EpicsValue> {
-    let index = menu_index_from_string(choices, s, MenuBound::DbPut)
-        .ok_or_else(|| bad_choice(field, choices, s))?;
-    Ok(menu_index_value(dbf_type, index))
+    resolve_menu_field_string_bounded(field, choices, dbf_type, s, MenuBound::DbPut)
 }
 
 /// C `S_db_badChoice` ("Illegal choice", `dbAccessDefs.h:183`) — the status
@@ -342,17 +344,32 @@ pub fn resolve_menu_field_string_db_load(
     dbf_type: DbFieldType,
     s: &str,
 ) -> CaResult<EpicsValue> {
-    let index = menu_index_from_string(choices, s, MenuBound::DbLoad)
-        .ok_or_else(|| bad_choice(field, choices, s))?;
+    resolve_menu_field_string_bounded(field, choices, dbf_type, s, MenuBound::DbLoad)
+}
+
+/// The one string→menu-index converter. Both public entry points are this
+/// function with their C converter's bound; a caller that already knows which
+/// converter it is (`RecordInstance::put_common_field` vs its `_db_load` twin)
+/// passes the bound directly.
+pub(crate) fn resolve_menu_field_string_bounded(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+    bound: MenuBound,
+) -> CaResult<EpicsValue> {
+    let index =
+        menu_index_from_string(choices, s, bound).ok_or_else(|| bad_choice(field, choices, s))?;
     Ok(menu_index_value(dbf_type, index))
 }
 
 /// Which C converter's out-of-menu bound applies.
 #[derive(Clone, Copy)]
-enum MenuBound {
-    /// `dbConvert.c::putStringMenu` — `val < nChoice`.
+pub(crate) enum MenuBound {
+    /// `dbConvert.c::putStringMenu` — `val < nChoice`. Every runtime `dbPut`.
     DbPut,
     /// `dbStaticRun.c::dbPutStringNum` — `!(val > nChoice && nChoice > 0 && val < 65535)`.
+    /// The `.db`/dbd loader only.
     DbLoad,
 }
 

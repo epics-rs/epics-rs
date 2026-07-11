@@ -15,6 +15,7 @@ use super::common_fields::CommonFields;
 use super::link::{
     ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_v2, parse_output_link_v2,
 };
+use super::menu_choices::MenuBound;
 use super::pini::PiniMode;
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
@@ -235,16 +236,20 @@ fn epics_parse_int32_base10(s: &str) -> Option<i32> {
 /// (RPRO/TPRO/BKPT) are deliberately omitted: they are recomputed every
 /// process, not `.db` init directives, so coercing a loaded value would be
 /// overwritten immediately.
-fn coerce_common_field_string(name: &str, value: EpicsValue) -> CaResult<EpicsValue> {
+fn coerce_common_field_string(
+    name: &str,
+    value: EpicsValue,
+    bound: MenuBound,
+) -> CaResult<EpicsValue> {
     let s = match &value {
         EpicsValue::String(s) => s,
         _ => return Ok(value),
     };
     // Canonical DBF type per numeric/menu common field, chosen to match the
-    // variant its `put_common_field` arm binds. `PINI`/`SCAN`/`SSCN` are absent
-    // on purpose: their arms consume the raw `String` through their own
-    // `from_str`.
+    // variant its `put_common_field` arm binds. The `DBF_MENU` fields take
+    // `Enum`, C's `epicsEnum16` menu index.
     let dbf = match name {
+        "SCAN" | "SSCN" | "PINI" => DbFieldType::Enum,
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
         | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
         "DISP" | "UDF" => DbFieldType::Char,
@@ -258,8 +263,17 @@ fn coerce_common_field_string(name: &str, value: EpicsValue) -> CaResult<EpicsVa
     // menu fields follow in `coerce_write_value`. The failure PROPAGATES: the
     // field-blind `EpicsValue::parse` fallback below must never see a menu
     // field, or `caput REC.PRIO Bogus` lands as index 0 instead of failing.
+    //
+    // SCAN/SSCN/PINI are menu fields like any other and go through the same
+    // converter. They used to each carry a hand-written `from_str` that drifted
+    // from C: `ScanType::from_str` case-folded and invented `"0.5 second"`
+    // aliases for menuScan's `".5 second"` (and mapped any out-of-range index
+    // to Passive), `SimModeScan::from_str` took any u16, `PiniMode::from_str`
+    // trimmed. C has ONE converter and it does none of that.
     if let Some(choices) = super::menu_choices::shared_menu_choices(name) {
-        return super::menu_choices::resolve_menu_field_string(name, choices, dbf, &text);
+        return super::menu_choices::resolve_menu_field_string_bounded(
+            name, choices, dbf, &text, bound,
+        );
     }
     // Numeric (non-menu) common field: C's `dbPut` runs the string through
     // `epicsParse*`, which tolerates whitespace around the digits.
@@ -646,11 +660,7 @@ impl RecordInstance {
         // dbGetFieldIndex) patches the record-level cache for this field.
         self.apply_field_metadata_override(field, &mut snap);
 
-        // Common-field enum mapping (e.g. .SCAN choices) is field-specific
-        // and not part of the per-record cache.
-        self.populate_common_enum_info(field, &mut snap);
-
-        // DBF_MENU field (a shared menu such as `OMSL`/`HHSV`/`SIMM`/... or
+        // DBF_MENU field (a shared menu such as `SCAN`/`OMSL`/`HHSV`/... or
         // a record-specific menu such as `sel.SELM`): carry the menu index
         // as DBR_ENUM and attach its `menu()` choice labels. See
         // `attach_menu_enum`. This overrides any record VAL enum table
@@ -1140,29 +1150,6 @@ impl RecordInstance {
         }
     }
 
-    /// Populate enum strings for common fields accessed via CA (e.g. .SCAN).
-    fn populate_common_enum_info(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
-        match field {
-            "SCAN" => {
-                snap.enums = Some(super::super::snapshot::EnumInfo {
-                    strings: vec![
-                        "Passive".into(),
-                        "Event".into(),
-                        "I/O Intr".into(),
-                        "10 second".into(),
-                        "5 second".into(),
-                        "2 second".into(),
-                        "1 second".into(),
-                        ".5 second".into(),
-                        ".2 second".into(),
-                        ".1 second".into(),
-                    ],
-                });
-            }
-            _ => {}
-        }
-    }
-
     /// Extract analog alarm limits from CommonFields.
     // DBR_GR_*/DBR_CTRL_* alarm limits MUST be severity-gated — C
     // get_alarm_double returns `prec->hhsv ? prec->hihi : epicsNAN`
@@ -1309,11 +1296,38 @@ impl RecordInstance {
         }
     }
 
-    /// Set a common field value. Returns what scan index changes are needed.
+    /// Set a common field value from a runtime `dbPut` (CA/PVA/`dbpf`/link).
+    /// Returns what scan index changes are needed.
+    ///
+    /// A `DBF_MENU` common field's string is converted by C's runtime
+    /// converter, `dbConvert.c::putStringMenu` — see [`MenuBound::DbPut`].
     pub fn put_common_field(
         &mut self,
         name: &str,
         value: EpicsValue,
+    ) -> CaResult<CommonFieldPutResult> {
+        self.put_common_field_bounded(name, value, MenuBound::DbPut)
+    }
+
+    /// Set a common field value from the `.db` loader, which in C is a
+    /// different converter with a different out-of-menu bound
+    /// (`dbStaticRun.c::dbPutStringNum`; see [`MenuBound::DbLoad`]). It is what
+    /// lets `field(SSCN,"65535")` — the menuScan "use SCAN" sentinel, out of
+    /// the menu's 0-9 range — load, while `caput REC.SSCN 65535` is refused at
+    /// runtime exactly as C refuses it.
+    pub fn put_common_field_db_load(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+    ) -> CaResult<CommonFieldPutResult> {
+        self.put_common_field_bounded(name, value, MenuBound::DbLoad)
+    }
+
+    fn put_common_field_bounded(
+        &mut self,
+        name: &str,
+        value: EpicsValue,
+        bound: MenuBound,
     ) -> CaResult<CommonFieldPutResult> {
         let name = name.to_ascii_uppercase();
         self.record.validate_put(&name, &value)?;
@@ -1324,7 +1338,7 @@ impl RecordInstance {
         // typed arms below apply a `field(PHAS, "1")` / `field(PRIO, "HIGH")`
         // directive instead of silently dropping it at IOC load. String-typed
         // and already-typed values pass through unchanged.
-        let value = coerce_common_field_string(&name, value)?;
+        let value = coerce_common_field_string(&name, value, bound)?;
         match name.as_str() {
             "SEVR" => {
                 if let EpicsValue::Short(v) = value {
@@ -1401,12 +1415,15 @@ impl RecordInstance {
                     self.common.udfs = AlarmSeverity::from_u16(v as u16);
                 }
             }
+            // The `String` form never reaches these three menu arms:
+            // `coerce_common_field_string` has already run it through the one
+            // menu converter, which either produced an `Enum` index or failed
+            // the put with `S_db_badChoice`.
             "SCAN" => {
                 let old_scan = self.common.scan;
                 let new_scan = match &value {
                     EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
                     EpicsValue::Enum(v) => ScanType::from_u16(*v),
-                    EpicsValue::String(s) => ScanType::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.scan = new_scan;
@@ -1425,7 +1442,6 @@ impl RecordInstance {
                 let new_sscn = match &value {
                     EpicsValue::Short(v) => SimModeScan::from_u16(*v as u16),
                     EpicsValue::Enum(v) => SimModeScan::from_u16(*v),
-                    EpicsValue::String(s) => SimModeScan::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.sscn = new_sscn;
@@ -1441,7 +1457,6 @@ impl RecordInstance {
                     EpicsValue::Short(v) => PiniMode::from_u16(*v as u16),
                     EpicsValue::Char(v) => PiniMode::from_u16(*v as u16),
                     EpicsValue::Enum(v) => PiniMode::from_u16(*v),
-                    EpicsValue::String(s) => PiniMode::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
             }
@@ -4318,8 +4333,8 @@ mod common_field_dbload_tests {
     fn db_loaded_string_common_fields_take_effect() {
         let mut inst = RecordInstance::new("REC".to_string(), AiRecord::default());
         let put = |inst: &mut RecordInstance, f: &str, v: &str| {
-            inst.put_common_field(f, EpicsValue::String(v.into()))
-                .unwrap_or_else(|e| panic!("put_common_field({f}, {v:?}) failed: {e}"));
+            inst.put_common_field_db_load(f, EpicsValue::String(v.into()))
+                .unwrap_or_else(|e| panic!("put_common_field_db_load({f}, {v:?}) failed: {e}"));
         };
 
         // Integer-valued directives.
@@ -4338,7 +4353,7 @@ mod common_field_dbload_tests {
         put(&mut inst, "UDF", "0");
         assert!(!inst.common.udf, "field(UDF, \"0\")");
 
-        // Menu-label directives (resolved via resolve_menu_string).
+        // Menu-label directives (resolved via the one menu converter).
         put(&mut inst, "PRIO", "HIGH");
         assert_eq!(inst.common.prio, 2, "field(PRIO, \"HIGH\")");
         put(&mut inst, "DISS", "MAJOR");

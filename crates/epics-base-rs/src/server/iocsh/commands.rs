@@ -1118,7 +1118,10 @@ fn cmd_db_load_records() -> CommandDef {
                         }
                         for (name, value) in common_fields {
                             use crate::server::record::CommonFieldPutResult;
-                            match instance.put_common_field(&name, value) {
+                            // `.db` load: C's loader converter, whose menu
+                            // bound differs from a runtime dbPut's
+                            // (`dbStaticRun.c::dbPutStringNum`).
+                            match instance.put_common_field_db_load(&name, value) {
                                 Ok(CommonFieldPutResult::ScanChanged {
                                     old_scan,
                                     new_scan,

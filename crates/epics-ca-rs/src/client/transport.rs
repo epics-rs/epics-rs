@@ -2066,9 +2066,34 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                                     ));
                                 }
                             }
-                            // EVENT_ADD errors travel through
-                            // MonitorStatusError (Bug 5 path); EVENT_CANCEL
-                            // confirmations don't have a per-op waiter.
+                            CA_PROTO_EVENT_ADD => {
+                                // C `cac::eventAddExcep` (`cac.cpp:1030-1038`,
+                                // jump-table entry at `cac.cpp:97`) routes the
+                                // echoed EVENT_ADD's `m_available` (the
+                                // subscription id) through
+                                // `ioExceptionNotify` — the status reaches the
+                                // subscription's exception callback and the
+                                // subscription STAYS INSTALLED. Read/write use
+                                // `ioExceptionNotifyAndUninstall` instead; the
+                                // asymmetry is deliberate, because rsrv keeps
+                                // re-posting the monitor (`camessage.c:513-522`
+                                // emits this ERROR on every send-buffer-load
+                                // failure while the circuit stays up), so the
+                                // subscription must survive to receive the next
+                                // attempt.
+                                //
+                                // `on_monitor_error` (via MonitorStatusError)
+                                // is exactly that: delivers
+                                // `Err(ServerError(status))` to the subscriber
+                                // without removing the registry record.
+                                let _ = event_tx.send(TransportEvent::MonitorStatusError {
+                                    subid: ioid,
+                                    eca_status,
+                                });
+                            }
+                            // EVENT_CANCEL confirmations have no per-op waiter;
+                            // C maps them to `defaultExcep` (global exception
+                            // hook only) — the `ServerError` event below.
                             _ => {}
                         }
                     }
@@ -2762,6 +2787,190 @@ mod malformed_header_close_tests {
         );
 
         // Clean EOF resolves the loop.
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod error_echo_dispatch_tests {
+    //! R8-16: a `CA_PROTO_ERROR` echoing an `EVENT_ADD` header must reach
+    //! the subscription's callback. C `cac::exceptionRespAction` dispatches
+    //! by the *echoed* command through `tcpExcepJumpTableCAC`
+    //! (`cac.cpp:93-97`): EVENT_ADD → `eventAddExcep` → `ioExceptionNotify`
+    //! (`cac.cpp:1030-1038`) — status delivered, subscription NOT
+    //! uninstalled. rsrv emits this frame whenever a monitor update will
+    //! not fit the send buffer (`camessage.c:513-522`) with the circuit
+    //! staying up, so a swallowed error is a silently stalled monitor.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Builds a `CA_PROTO_ERROR` frame whose 16-byte payload echoes a
+    /// request header of `echo_cmd` carrying `echo_available`
+    /// (ioid / subscription id).
+    fn error_frame(echo_cmd: u16, echo_available: u32, eca_status: u32, cid: u32) -> Vec<u8> {
+        let mut echoed = CaHeader::new(echo_cmd);
+        echoed.postsize = 16;
+        echoed.data_type = 6;
+        echoed.count = 1;
+        echoed.cid = 0x2A;
+        echoed.available = echo_available;
+        let echoed = echoed.to_bytes();
+
+        let mut err = CaHeader::new(CA_PROTO_ERROR);
+        err.postsize = echoed.len() as u16;
+        err.cid = cid;
+        err.available = eca_status;
+
+        let mut frame = err.to_bytes().to_vec();
+        frame.extend_from_slice(&echoed);
+        frame
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r8_16_error_echoing_event_add_reaches_the_subscription() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        // ECA_TOLARGE echoing subscription id 0xCAFE_BABE — the exact
+        // frame rsrv sends when a monitor update overruns the send buffer.
+        const SUBID: u32 = 0xCAFE_BABE;
+        const ECA_TOLARGE: u32 = 0xC8;
+        let frame = error_frame(CA_PROTO_EVENT_ADD, SUBID, ECA_TOLARGE, 0x2A);
+
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write ERROR frame");
+        client.flush().await.expect("flush");
+
+        // The subscription-scoped delivery must appear. Pre-fix the
+        // dispatcher's `_ => {}` arm swallowed it and only the global
+        // `ServerError` hook fired.
+        let mut saw_status_error = false;
+        let mut saw_server_error = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !(saw_status_error && saw_server_error) {
+            match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+                Ok(Some(TransportEvent::MonitorStatusError { subid, eca_status })) => {
+                    assert_eq!(subid, SUBID, "must carry the echoed subscription id");
+                    assert_eq!(eca_status, ECA_TOLARGE, "must carry the ECA status");
+                    saw_status_error = true;
+                }
+                Ok(Some(TransportEvent::ServerError { .. })) => saw_server_error = true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_status_error,
+            "CA_PROTO_ERROR echoing EVENT_ADD must be routed to the \
+             subscription (C: eventAddExcep → ioExceptionNotify)"
+        );
+        assert!(
+            saw_server_error,
+            "the global exception hook must still fire (C: cac::exception)"
+        );
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+
+    /// The asymmetry C encodes in the jump table: read/write use
+    /// `ioExceptionNotifyAndUninstall`, EVENT_ADD does not. A read error
+    /// must therefore still complete-and-remove its in-flight IO, and must
+    /// NOT emit a subscription-scoped error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r8_16_error_echoing_read_notify_still_uninstalls_the_io() {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        const IOID: u32 = 7;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        in_flight.reads.insert(
+            IOID,
+            super::super::types::ReadWaiter::OneShot {
+                cid: 0x2A,
+                mode: super::super::types::ReadReplyMode::Plain,
+                reply_tx,
+            },
+        );
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight.clone(),
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        ));
+
+        const ECA_GETFAIL: u32 = 0xC4;
+        let frame = error_frame(CA_PROTO_READ_NOTIFY, IOID, ECA_GETFAIL, 0x2A);
+        let mut client = client_io;
+        client.write_all(&frame).await.expect("write ERROR frame");
+        client.flush().await.expect("flush");
+
+        let got = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("read waiter must be completed by the echoed READ_NOTIFY error")
+            .expect("waiter must not be dropped without a reply");
+        assert!(
+            matches!(
+                got,
+                Err(epics_base_rs::error::CaError::ServerError(ECA_GETFAIL))
+            ),
+            "read error must carry the ECA status"
+        );
+        assert!(
+            !in_flight.reads.contains_key(&IOID),
+            "read exceptions uninstall the IO (C: ioExceptionNotifyAndUninstall)"
+        );
+
+        // No subscription-scoped delivery for a read echo.
+        let mut saw_status_error = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await
+        {
+            if matches!(ev, TransportEvent::MonitorStatusError { .. }) {
+                saw_status_error = true;
+            }
+        }
+        assert!(
+            !saw_status_error,
+            "a READ_NOTIFY echo must not be routed to a subscription"
+        );
+
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }

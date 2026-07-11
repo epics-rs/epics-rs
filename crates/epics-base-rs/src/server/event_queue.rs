@@ -181,6 +181,12 @@ struct QueInner {
     /// pass and does not re-consult `flowCtrlMode` per entry.
     draining: bool,
     subs: HashMap<u32, SubQ>,
+    /// C `event_que::quota` (`dbEvent.c:79`) — ring entries reserved by the
+    /// subscriptions attached here, `EVENT_ENTRIES` each. A subscription may
+    /// attach while `quota < size - EVENT_ENTRIES` (`dbEvent.c:453`); this is
+    /// what caps a queue at `size / EVENT_ENTRIES - 1` monitors and guarantees
+    /// the ring cannot fill.
+    quota: usize,
     size: usize,
     replace_threshold: usize,
 }
@@ -217,7 +223,20 @@ impl QueInner {
     /// quota once the cancelled subscription has drained (`dbEvent.c:999-1002`).
     fn detach(&mut self, sid: u32) {
         while self.remove_front(sid).is_some() {}
-        self.subs.remove(&sid);
+        if self.subs.remove(&sid).is_some() {
+            self.quota -= EVENT_ENTRIES;
+        }
+    }
+
+    /// C `db_add_event`'s attach test (`dbEvent.c:451-457`): take this queue if
+    /// it still has room for one more monitor's reservation.
+    fn try_attach(&mut self, sid: u32) -> bool {
+        if self.quota >= self.size - EVENT_ENTRIES {
+            return false;
+        }
+        self.quota += EVENT_ENTRIES;
+        self.subs.insert(sid, SubQ::new());
+        true
     }
 
     /// May a reader take an entry right now? C `event_read`'s gate
@@ -252,6 +271,7 @@ impl EvQue {
                 n_duplicates: 0,
                 draining: false,
                 subs: HashMap::new(),
+                quota: 0,
                 size: event_que_size(),
                 replace_threshold: events_per_que(),
             }),
@@ -420,6 +440,11 @@ impl EvQue {
     pub fn npend(&self, sid: u32) -> usize {
         self.lock().subs.get(&sid).map_or(0, |s| s.events.len())
     }
+
+    /// C `quota` — ring entries reserved by the monitors attached here.
+    pub fn quota(&self) -> usize {
+        self.lock().quota
+    }
 }
 
 /// C `event_user` (`dbEvent.c:84-105`) — one per CA circuit. Owns the EVENTS_OFF
@@ -449,22 +474,28 @@ impl EventUser {
         }
     }
 
-    /// Attach a subscription to a queue of this circuit.
+    /// C `db_add_event`'s queue-selection loop (`dbEvent.c:446-469`): walk the
+    /// chain for the first queue whose `quota` still admits a monitor, and chain
+    /// a fresh one only when none does.
     ///
-    /// Every subscription currently gets a ring of its own — C's chained-queue
-    /// shape (`nextque`) with the quota exhausted. What that costs is R8-23:
-    /// C's `nDuplicates` is a field of the queue, shared by the ~35
-    /// subscriptions its quota admits (`dbEvent.c:446-469`), so a duplicate
-    /// queued for one of them releases the EVENTS_OFF drain of the others,
-    /// which per-subscription rings cannot express. The rings share this
-    /// circuit's `flowCtrlMode` either way.
+    /// The sharing this produces is not an implementation detail — it is where
+    /// `nDuplicates` lives (R8-23). A duplicate queued for any monitor on the
+    /// queue releases the EVENTS_OFF drain of every monitor on it, which
+    /// per-subscription rings cannot express.
     fn attach_que(&self, sid: u32) -> Arc<EvQue> {
-        let que = Arc::new(EvQue::new(self.flow.clone()));
-        que.lock().subs.insert(sid, SubQ::new());
-        self.ques
+        let mut ques = self
+            .ques
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(que.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for que in ques.iter() {
+            if que.lock().try_attach(sid) {
+                return que.clone();
+            }
+        }
+        let que = Arc::new(EvQue::new(self.flow.clone()));
+        let attached = que.lock().try_attach(sid);
+        debug_assert!(attached, "a fresh queue must admit its first monitor");
+        ques.push(que.clone());
         que
     }
 
@@ -777,5 +808,124 @@ mod tests {
             .expect("the held entry is delivered");
         waker.await.unwrap();
         assert_eq!(val(&got), 2, "the held entry carries the latest value");
+    }
+
+    /// R8-23 boundary — a duplicate on a SIBLING subscription. C's `nDuplicates`
+    /// is a field of the queue (`dbEvent.c:80`), so `event_read`'s gate
+    /// (`flowCtrlMode && nDuplicates == 0`, `dbEvent.c:947`) is answered by the
+    /// queue as a whole: a duplicate queued for monitor B releases the drain of
+    /// monitor A's entry even though A has no duplicate of its own.
+    ///
+    /// The per-subscription queues this replaced evaluated the gate per monitor,
+    /// so A stayed suspended until EVENTS_ON.
+    #[tokio::test]
+    async fn duplicate_on_a_sibling_subscription_releases_the_events_off_drain() {
+        let user = EventUser::new();
+        let (sink_a, mut reader_a) = attach(&user, 1);
+        let (sink_b, _reader_b) = attach(&user, 2);
+        assert!(
+            Arc::ptr_eq(&reader_a.queue(), &_reader_b.queue()),
+            "the quota admits both monitors to one queue — C's sharing granularity"
+        );
+
+        sink_a.post(ev(1)); // A: npend 1, no duplicate of its own
+        sink_b.post(ev(10));
+        sink_b.post(ev(11)); // B: npend 2 ⇒ the queue holds one duplicate
+        assert_eq!(reader_a.queue().n_duplicates(), 1);
+
+        user.flow_ctrl_on();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), reader_a.recv())
+            .await
+            .expect("a duplicate anywhere on the queue must release the drain")
+            .expect("A's entry is delivered");
+        assert_eq!(val(&got), 1);
+    }
+
+    /// The complement of the boundary above — EVENTS_OFF with the queue holding
+    /// NO duplicate on any subscription: every reader on it suspends, and
+    /// EVENTS_ON releases them all.
+    #[tokio::test]
+    async fn flow_control_without_duplicates_suspends_every_reader_on_the_queue() {
+        let user = EventUser::new();
+        user.flow_ctrl_on();
+        let (sink_a, mut reader_a) = attach(&user, 1);
+        let (sink_b, mut reader_b) = attach(&user, 2);
+        sink_a.post(ev(1));
+        sink_b.post(ev(2));
+        assert_eq!(reader_a.queue().n_duplicates(), 0);
+        assert!(matches!(reader_a.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(reader_b.try_recv(), Err(TryRecvError::Empty)));
+        user.flow_ctrl_off();
+        assert_eq!(val(&reader_a.try_recv().unwrap()), 1);
+        assert_eq!(val(&reader_b.try_recv().unwrap()), 2);
+    }
+
+    /// Boundary `quota == size - EVENT_ENTRIES`: C chains a new queue rather than
+    /// overbooking the ring (`dbEvent.c:446-469`), so a circuit's monitors past
+    /// the cap share a *different* `nDuplicates`.
+    #[tokio::test]
+    async fn quota_exhaustion_chains_a_second_queue() {
+        let user = EventUser::new();
+        let cap = event_que_size() / EVENT_ENTRIES - 1;
+        let mut held = Vec::new();
+        for sid in 0..cap as u32 {
+            held.push(attach(&user, sid));
+        }
+        let first = held[0].1.queue();
+        for (_, reader) in &held {
+            assert!(Arc::ptr_eq(&reader.queue(), &first), "all within quota");
+        }
+        assert_eq!(first.quota(), event_que_size() - EVENT_ENTRIES);
+
+        let (_sink, overflow) = attach(&user, cap as u32);
+        assert!(
+            !Arc::ptr_eq(&overflow.queue(), &first),
+            "the {cap}th monitor exhausts the quota; the next one chains a queue"
+        );
+        assert_eq!(overflow.queue().quota(), EVENT_ENTRIES);
+    }
+
+    /// C releases the cancelled monitor's quota (`dbEvent.c:999-1002`), so the
+    /// freed slot is reusable — the next attach lands back on the first queue
+    /// instead of chaining forever.
+    #[tokio::test]
+    async fn detaching_a_monitor_releases_its_quota() {
+        let user = EventUser::new();
+        let cap = event_que_size() / EVENT_ENTRIES - 1;
+        let mut held: Vec<_> = (0..cap as u32).map(|sid| attach(&user, sid)).collect();
+        let first = held[0].1.queue();
+        assert_eq!(first.quota(), event_que_size() - EVENT_ENTRIES);
+        held.pop(); // cancel one monitor: sink and reader both go
+        assert_eq!(first.quota(), event_que_size() - 2 * EVENT_ENTRIES);
+        let (_sink, reader) = attach(&user, 900);
+        assert!(
+            Arc::ptr_eq(&reader.queue(), &first),
+            "the released quota must be reusable"
+        );
+    }
+
+    /// Teardown symmetry on a SHARED queue: cancelling one monitor removes only
+    /// its own duplicates from the queue-level count; its sibling's stay.
+    #[tokio::test]
+    async fn detaching_one_monitor_leaves_a_siblings_duplicates_counted() {
+        let user = EventUser::new();
+        let (sink_a, reader_a) = attach(&user, 1);
+        let (sink_b, reader_b) = attach(&user, 2);
+        let que = reader_a.queue();
+        for v in 1..=3 {
+            sink_a.post(ev(v)); // A: npend 3 ⇒ 2 duplicates
+        }
+        for v in 10..=11 {
+            sink_b.post(ev(v)); // B: npend 2 ⇒ 1 duplicate
+        }
+        assert_eq!(que.n_duplicates(), 3);
+        drop(reader_a);
+        drop(sink_a);
+        assert_eq!(que.n_duplicates(), 1, "only A's duplicates left the ring");
+        assert_eq!(que.npend(2), 2, "B's entries are untouched");
+        drop(reader_b);
+        drop(sink_b);
+        assert_eq!(que.n_duplicates(), 0);
+        assert_eq!(que.quota(), 0, "both monitors released their reservation");
     }
 }

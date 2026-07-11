@@ -1156,6 +1156,269 @@ Impact: attribute-less 3-D frames write on the port, fail on C.
 - TIFF parity is asserted at tag-set/tag-value/plane-layout level, not
   byte-for-byte against libtiff (no C build on the fixer's machine).
 
+## Round 9 — re-audit (2026-07-12): wave-6 fix verification + adjudications + fresh findings
+
+Same 5 auditor panels (opus, read-only), blocks R9-1..15 / 16..30 / 31..45 /
+46..60 / 61..75. Round report: `rounds/01KX9CG69T1ECXGFHBQ91SPP1R.md`.
+
+### Fix verification result
+
+All 30 wave-6 fix commits independently verified CORRECT AND COMPLETE against
+the C/C++ reference (A: 6, B: 6, C: 4, D: 9, E: 10) — zero wrong or
+incomplete fixes. Notable verifications: R7-3's LOG2-as-LOG·2 reading
+re-confirmed directly against postfix.c:206-213 (reverse-table prefix match
+via epicsStrnCaseCmp, no identifier boundary); R8-2's corrected 0/-1 reading
+re-confirmed including the empty-expression contract split (base
+postfix("")→-1, sCalc/aCalc→0).
+
+### Adjudications of wave-6 fixer-surfaced findings (all 15 CONFIRMED)
+
+- R8-6 CONFIRMED. Structural cause exposed: numeric engine has a strict token
+  allowlist (`token_in_base_table`, postfix.rs:455) but sCalc/aCalc are gated
+  only by `opcode_in_grammar`, whose `Opcode::Control(_) | Opcode::Core(_) =>
+  true` arm (postfix.rs:438) waves through every core opcode — FMOD,
+  `>>>`→ShrLogical, vars Q–U/MM–UU all reach the string/array engines.
+  C tables verified directly: sCalc/aCalc single-letter operands stop at P,
+  double at LL; FMOD and `>>>` in neither operators table; aCalc has no
+  INF/NAN literal (only ISINF/ISNAN). Fix = per-engine token allowlists from
+  sCalcPostfix.c/aCalcPostfix.c, as R7-3 did for base.
+- R8-7 CONFIRMED, characterization sharpened. sCalc: contract is
+  sCalcPerform.c:497-500 `if (pd[1]==0) return(-1)` — the WHOLE perform
+  errors, which sCalcoutRecord.c:357-364 turns into
+  CALC_ALARM/INVALID with VAL FROZEN (not a value of -1); port yields
+  VAL=+Inf, no alarm. The port comment mis-cites base calcPerform.c. aCalc:
+  port yields NaN, C yields myMAXFLOAT=1e35 in every DIV form
+  (aCalcPerform.c:636-692); fixer already used MY_MAXFLOAT in aCalc Mod —
+  DIV omission is an internal inconsistency.
+- R8-8 CONFIRMED, WIDENED. Port has NO array-shift path at all: Shl/Shr
+  (array.rs:218-227) always bit-shift elementwise. C LEFT/RIGHT_SHIFT
+  dispatch on isDouble(ps): array operand gets a positional element move by
+  myNINT(e) (`<<` negates the count), zero-fills the vacated tail, and
+  linearly interpolates for fractional shift amounts.
+- R8-22 CONFIRMED. C db_queue_event_log (dbEvent.c:812-820) replaces only
+  `*pevent->pLastLog` in place when npend>0 && (flowCtrlMode ||
+  rngSpace<=EVENTSPERQUE) — keeps earlier distinct queued entries. Rust
+  `coalesce_consume` (epics-base-rs server/pv.rs:331-352) drains the ENTIRE
+  rx backlog on overflow-slot-set and delivers only the newest.
+- R8-23 CONFIRMED. C nDuplicates is a field of ev_que (dbEvent.c:80), shared
+  across every subscription attached to that queue (dbEvent.c:453);
+  event_read drains the whole ring, suspends only when flowCtrlMode &&
+  nDuplicates==0 (dbEvent.c:947). Precision correction: sharing granularity
+  is per-ev_que/quota, not literally per-client. Redesign-scale (shared
+  queue), same primitive family as R8-21/R8-22.
+- R8-34 CONFIRMED, NARROWED TO MONITOR. GET/PUT/RPC/PUT_GET/GET_FIELD/PROCESS
+  already route replies through `decode_op_or_reset` → server.close()
+  (ops_v2.rs:65-78 + wrong-op-kind arms). MONITOR is the sole live surface:
+  typed loop (ops_v2.rs:3042-3045, 3233-3251) and raw loop (2461-2464,
+  2569-2575) end only the subscription via MonitorEnd::Fatal +
+  unregister_ioid, never server.close() — leaving the circuit (and its
+  mutated shared reader type-cache) serving other channels. Port comments
+  claim "pvxs resets the connection" — the implementation does not
+  (clientmon.cpp:601-607 does). Fix: monitor-loop server.close() on
+  Fatal-decode faults (op-status-error/cancel stay op-local).
+- R8-54 CONFIRMED (nowt=omax asynRecord.c:1499, nrrd=inlen :1513,
+  POST_IF_NEW :1020,1022; port clamps only into locals).
+- R8-55 CONFIRMED, C-REFERENCE CORRECTED. Not "per process": mechanism is
+  exceptCallback → monitorStatus (asynRecord.c:903-917) on ANY
+  asynException, re-reading isAutoConnect/isConnected/isEnabled
+  (:1085-1099) + POST_IF_NEW (:1125-1133). Port emits
+  Connect/Enable/AutoConnect exceptions (port.rs:273,388,423) but
+  register_trace_exception_callback filters to Trace* masks only
+  (mod.rs:1705-1714), so shared-port state changes never refresh this
+  record's AUCT/CNCT/ENBL.
+- R8-56 CONFIRMED, WIDENED. Final read-error ERRS is `"%s  nread %d %s"`
+  with %s ∈ {timeout,overflow,error} (asynRecord.c:1593-1598, overwriting
+  the earlier "Error %s" at :1583); port emits "read: {e}". The overflow
+  branch is a second read-side ERRS divergence in the same routine → R9-49.
+- R8-57 CONFIRMED (856-line asynInterposeCom.c, installed by
+  drvAsynIPPort.c:1061; no Rust port; subsystem-scale own assignment).
+- R8-58 CONFIRMED (DelayInterpose exists, no iocsh command, no
+  RequestOp::PushDelayInterpose; C asynInterposeDelay.c:221-234).
+- R8-71 CONFIRMED (C tests currentPostCount >= postCount at
+  NDPluginCircularBuff.cpp:178 OUTSIDE the triggered branches; port only
+  inside, circular_buff.rs:250,323).
+- R8-72 CONFIRMED (C writeInt32(SoftTrigger) sets Triggered=1
+  unconditionally for any value incl. 0, :271, and flushPreBuffer()
+  immediately when flushOn>0, :276-277; port gates on value!=0,
+  circular_buff.rs:718, lazy flush only).
+- R8-73 CONFIRMED (NDFileNetCDF.cpp:118 openMode & NDFileModeMultiple vs
+  port frames.len()>1, file_netcdf.rs:537).
+- R8-74 CONFIRMED (three C texts :140,:166,:201 vs generic
+  "JPEG compression failed", codec.rs:1148).
+- R8-75 CONFIRMED (port dims-based fallback file_tiff.rs:174-178 writes
+  RGB1; C leaves colorMode=Mono → asynError NDFileTIFF.cpp:220-224).
+
+### Category A — epics-base-rs (R9-1..R9-3)
+
+### R9-1: aCalc relational/equality operators use a 1e-11 tolerance; C compares with exact IEEE operators
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:115-168` — Eq/Ne/Lt/Le/Gt/Ge all test against a fabricated epsilon (Eq: `(x-y).abs() < 1e-11`, :118-119; Lt: `(y-x) > 1e-11`, :135); fires for scalar and array operands alike.
+C reference: `aCalcPerform.c:1347-1354` (array), `:1372-1380` (array/scalar), `:1092+` (scalar) — all exact, matching calcPerform.c:371-396. Port's numeric and string engines already compare exactly (string.rs has an explicit "must not apply an epsilon" comment) — the tolerance survives only in aCalc.
+Impact: `AA==BB` returns 1 for elements differing by up to 1e-11 where C returns 0; `A<B` returns 0 for genuine sub-1e-11 differences where C returns 1. Different result array on the wire.
+
+### R9-2: aCalc scalar→array promotion never applies C's isnan(scalar) → fill 0 rule
+Severity: Low
+Rust: `crates/epics-base-rs/src/calc/engine/array_value.rs:32-37` (broadcast), `:67-72` (Array↔Double zip_map arms) — NaN scalar broadcast verbatim → all-NaN operand array.
+C reference: `aCalcPerform.c:135-141` — to_array(setValues=1): `if (isnan(ps->d)) ...a[ii]=0.` — reached via toArray(ps,1) on the deeper operand (:630 arithmetic, :1337 relational/bitwise/ATAN2/CAT group).
+Impact: NaN-scalar-deeper-operand binary ops (e.g. `SQRT(-1)+AA`) yield AA-combined-with-0 on C, all-NaN on the port. Order-specific: array OP NaN-scalar-on-top matches C.
+
+### R9-3: calcout/scalcout init_record skips the compile for an empty CALC/OCAL; C compiles unconditionally and lands CLCV/OCLV = -1
+Severity: Low
+Rust: `crates/epics-base-rs/src/server/records/calcout.rs:1021-1029` — `if !self.calc.is_empty() { … }` (and the OCAL twin) leaves clcv=0 at load.
+C reference: `calcoutRecord.c:100,108` — postfix() runs at init pass 1 with no empty guard; base postfix("")→-1 (postfix.c:236-238), so field(CALC,"") yields CLCV=-1.
+Impact: base calcout loaded with explicit field(CALC,"") serves CLCV=0 on the port vs -1 on C. Load-time, calcout-specific (scalcout/acalcout init compile unconditionally; runtime empty put lands -1 correctly on both).
+
+### Category B — epics-ca-rs + epics-tools-rs (R9-16..R9-18)
+
+### R9-16: caget/cainfo print partial per-PV output on partial connect failure (no connect_pvs gate)
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/bin/caget-rs.rs:628-644` (and cainfo-rs.rs:133-178) — per-PV tasks independently wait_connected and print on success; a never-connecting PV prints `*** not connected` interleaved with connected PVs' values. No all-channels barrier gates the read/print phase.
+C reference: `tool_lib.c` connect_pvs (create_pvs then ca_pend_io, returns 1 on ECA_TIMEOUT), called from caget.c:378/cainfo.c:228 BEFORE caget()/cainfo(); any connect failure → get+print never runs, zero stdout values, stderr "not found." messages, exit 1.
+Impact: with mixed connect results C emits zero value lines; Rust emits values for connected PVs. Stdout diverges for parsers; exit codes agree (both 1).
+
+### R9-17: camonitor does not rebuild the subscription when the field type changes across reconnect
+Severity: Low
+Rust: `crates/epics-ca-rs/src/bin/camonitor-rs.rs:362-367` — subscribes once with the first-connect type; connection-event loop (:322-345) only flags and prints `*** disconnected`; reconnect re-issues EVENT_ADD with the frozen DBR type.
+C reference: `camonitor.c:143-147` — on reconnect with changed ca_field_type: ca_clear_subscription, then :155-180 re-derives the request type (ENUM → DBR_TIME_STRING) and re-subscribes.
+Impact: PV reconnecting with a changed native type (numeric→ENUM after IOC change) prints state labels on C, raw indices on Rust.
+
+### R9-18: caput exits 1 (and prints nothing) on a post-put readback timeout; C prints the value line and exits 0
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/bin/caput-rs.rs:357-370` — readback CaError::Timeout → FatalReadback::Timeout → stderr "Read operation timed out…" + exit(1) before any `New :` line. Comment at :465-467/:475-485 claims C caput.c:186-188 "returns ECA_TIMEOUT" — misread.
+C reference: `caput.c:130-240` — :186-188 prints the timeout message but does NOT return; falls through to `*** no data available (timeout)` per PV (:207-208) and unconditionally `return 0` (:239). Only the !nConn guard (:181) returns 1 (Disconnect classification in the port is correct).
+Impact: slow readback after a successful put: C exits 0 with a `New :` line; Rust exits 1 with none — breaks scripts keying on caput's status.
+
+### Category C — epics-pva-rs + epics-bridge-rs (R9-31..R9-32)
+
+### R9-31: Boolean-typed record._options.DBE is parsed numerically; pvxs's kind switch excludes Kind::Bool
+Severity: Medium
+Rust: `crates/epics-bridge-rs/src/qsrv/channel.rs:88` — dbe_scalar_as_u8 maps `ScalarValue::Boolean(b) => *b as u8`, so numeric dispatch (:150-151) treats boolean DBE=true as mask 1 → VALUE only.
+C reference: `singlesource.cpp:131-138` — switch(kind) reaches as<uint8_t>() only for Kind::Integer/Kind::Real; Kind::Bool hits `default: break` → dbe=0 → `dbe &= 7; if(!dbe) dbe = VALUE|ALARM` (:141-144). The dbe_scalar_as_u8 comment cites what as<uint8_t> CAN convert (data.cpp:402-435) — pvxs never calls it for bool.
+Impact: MONITOR with boolean DBE=true negotiates VALUE-only (0x1) vs pvxs VALUE|ALARM (0x5): alarm-only transitions silently never delivered — the identical defect R7-34 fixed for the string kind, open for the boolean kind. false coincidentally agrees. Single site (dbe_mask_from_pv_request; groups use a fixed mask).
+
+### R9-32: MONITOR record._options.ackAny of real/boolean type is silently dropped; pvxs converts via as<uint32_t>
+Severity: Low
+Rust: `crates/epics-pva-rs/src/server_native/tcp.rs:196` — ackAny match handles String + integer variants; `_ => {}` swallows Float/Double/Boolean, leaving ack_at=1 (:151); the `ack_at==0 → queue_size/2` fallback (:212) never fires for them.
+C reference: `servermon.cpp:555-558` — `if(ackAny.as(ival))` (tryAs<uint32_t>) succeeds for real and bool storage → op->ackAt = ival; only non-scalars reach the Crit log (:569-571). Port comment at :199-200 describes only the non-scalar case.
+Impact: pipelined MONITOR with ackAny Double(4.0)/Boolean(false) gets ackAt=1 (ACK every event) vs pvxs ackAt=4 / queue_size/2 — MONITOR_ACK cadence and the ackAt-1 watermark clamp (servermon.cpp:332-333) diverge on the wire.
+
+### Category D — asyn-rs + motor-rs (R9-46..R9-50)
+
+### R9-46: asynRecord clamps a non-positive TMOT to 1 s; C passes the operator's TMOT straight through
+Severity: Medium
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs:2025-2029` — `if self.tmot > 0.0 { … } else { Duration::from_secs(1) }`; the :2024 comment ("falls back to the 1 s default") is fabricated.
+C reference: `asynRecord.c:818` — `pasynUser->timeout = pasynRec->tmot;` verbatim, no fallback (:309's timeout=1 is a one-time createAsynUser seed; dbd initial("1.0") is a field default, not a clamp).
+Impact: asyn convention: <0 wait forever, 0 non-blocking poll, >0 bounded. TMOT=0: C immediate poll, port blocks 1 s. TMOT<0: C blocks indefinitely, port times out at 1 s with a spurious READ/MAJOR alarm C never raises.
+
+### R9-47: option and EOS puts never re-read the driver; C's setOption/setEos fall through to getOptions/getEos on every set
+Severity: Medium
+Rust: `mod.rs:1853-1858` (write_option, no re-read) and `:2957-2972` (IEOS/OEOS, no read-back); read_options_from_driver only from connect_device (:1929).
+C reference: `asynRecord.c:845-849` — `case callbackSetOption: setOption(); /* no break */ case callbackGetOption: getOptions();` (:851-855 setEos→getEos twin). getOptions (:1834+) re-reads every option and POST_IF_NEWs it even when the set failed.
+Impact: a driver that rounds/rejects a requested value leaves the port's BAUD/…/IEOS/OEOS showing the REQUESTED value; C shows the driver's actual value and reverts rejected puts to live driver state.
+
+### R9-48: register-interface read/write errors report generic ERRS text instead of C's per-interface diagnostic
+Severity: Low
+Rust: `mod.rs:688` (all register writes → "write: {e}"), `:818/:831/:843` (Int32/UInt32/Float64 reads → "read: {e}").
+C reference: `asynRecord.c:1378/:1391/:1414/:1429/:1450/:1463` — "Int32 write error, %s" etc., per interface and direction.
+Impact: ERRS on OPI screens loses which interface failed and the C error tail. Distinct sites from R8-48 (octet write) and R8-56 (octet read).
+
+### R9-49: an ASCII/Hybrid overflow read sets no ERRS; C writes "Overflow nread %d %s"
+Severity: Low
+Rust: `mod.rs:800-802` — overflow branch only raise_io_alarm(READ, Minor); no out.errs; process() cleared ERRS at :3043 → blank.
+C reference: `asynRecord.c:1602-1608` (ASCII) / `:1609-1615` (Hybrid) — reportError "Overflow nread %d %s" alongside the MINOR alarm.
+Impact: terminator-less response filling AINP/BINP: C's ERRS says why; port's ERRS is blank.
+
+### R9-50: a pre-write flush failure lands in ERRS; C discards the flush status
+Severity: Low
+Rust: `mod.rs:861-865` — IoPhase::Flush recorder sets out.errs="flush: {e}"; a subsequent successful write/read does not clear it.
+C reference: `asynRecord.c:1521` — flush() return value discarded; a flush failure never reaches ERRS.
+Impact: port surfaces a diagnostic on a path C treats as best-effort; a successful transaction can carry a stale flush error string.
+
+### Category E — synApps + AD (R9-61..R9-72)
+
+### R9-61: transform record ignores IVLA="Do Nothing"; missing global skip-on-INVALID-input
+Severity: High
+Rust: `crates/epics-base-rs/src/server/records/transform.rs:504-518` — ivla used only per-channel (on eval Err, `if ivla==1 { vals[i]=prev_vals[i] }`); nothing tests the record's input-alarm severity; calcs and all 16 output-link writes always run.
+C reference: `transformRecord.c:554-560` — `if ((nsev >= INVALID_ALARM) && (ivla == transformIVLA_DO_NOTHING)) { …; pact=FALSE; return; }` — no calcs, no output writes that cycle.
+Impact: with a maximize-severity input link gone INVALID and IVLA="Do Nothing", C freezes; Rust recomputes and drives every output link. The entire hold-outputs mode is absent, plus an invented per-channel value-restore C never performs.
+
+### R9-62: transform VAL is aliased to channel A; C keeps VAL a constant-0 dummy
+Severity: Medium
+Rust: `transform.rs:544-546` (get_field VAL → vals[0]), `:572-577` (put VAL → vals[0]); test test_transform_val_is_a pins the invented behaviour.
+C reference: `transformRecord.c:422` sets val=0 once at init; process()/monitor() iterate from &ptran->a and never touch ->val.
+Impact: `caget transform.VAL` returns 0 on C, channel A on Rust; a .VAL monitor never fires on C, fires on every A change on Rust.
+
+### R9-63: transform calc failure raises no CALC_ALARM/UDF
+Severity: Medium
+Rust: `transform.rs:513-517` — eval Err only optionally restores the value; no STAT/SEVR, no UDF; no check_alarms/value_is_undefined override (framework default reads only channel A).
+C reference: `transformRecord.c:593-596` — `recGblSetSevr(CALC_ALARM, INVALID_ALARM); udf = TRUE`; checkAlarms (:773-779) raises UDF_ALARM.
+Impact: failing calculation on any channel: NO_ALARM on Rust, CALC/INVALID + UDF on C.
+
+### R9-64: transform input-link read failure keeps the stale channel value; C zeroes it
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/database/processing.rs:1680-1684` — failed read leaves the value unchanged (stale); transform overrides nothing.
+C reference: `transformRecord.c:537-541` — `if (!RTN_SUCCESS(status)) { *pval = 0.; }` (transform-specific; calcRecord does not zero).
+Impact: on a disconnected INPx source, C drives that channel and its OUTx to 0; Rust re-outputs the last good value.
+
+### R9-65: swait DOPT="Use DOL" never fetches the DOL link — writes a stale DOLD
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/records/swait.rs:451` — `oval = if dopt==1 { dold } else { val }`; dold is only client-put/default; descriptor table (:143-366) has no DOLN/DOLV and multi_input_links (:615) lists only INAN–INLN — DOL link never registered or read.
+C reference: `swaitRecord.c:763-772` — execOutput: `if (dopt) { if (!dolv) recDynLinkGet(&caLinkStruct[DOL_INDEX], &dold, …); outValue = dold; }` — live DOL PV value fetched at output time.
+Impact: DOPT="Use DOL" writes the current DOL PV value on C, a stale/zero DOLD on Rust — the whole output mode produces a wrong OUT value.
+
+### R9-66: ROI plugin bins a disabled dimension; C forces binning=1
+Severity: Medium
+Rust: `crates/ad-plugins-rs/src/roi.rs:216-218` (3-D) / `:331-332` (2-D) — bin factor taken unconditionally; resolve_axis (:137-145) resolves only offset/size from enable.
+C reference: `NDPluginROI.cpp:98-102` — disabled else branch: offset=0, size=full, binning=1.
+Impact: Enable=0 with leftover DimNBin>1: C outputs full resolution; Rust outputs a shrunken axis of bin-sums — wrong dims and pixel values.
+
+### R9-67: ROI Dim{0,1,2}MaxSize readbacks use the physical dim index, not logical X/Y/color
+Severity: Medium
+Rust: `roi.rs:421-424` — max_size[i] from physical dims[i].
+C reference: `NDPluginROI.cpp:80-82` userDims={xDim,yDim,colorDim}; posts Dim{N}MaxSize = dims[userDims[N]].size (:111,120,129).
+Impact: RGB1 (dims [color,x,y]): C reports Dim0MaxSize=X-width, Dim2MaxSize=color-count; Rust swaps them — ROI slider bounds wrong for every RGB image.
+
+### R9-68: NDPluginProcess SaveBackground/SaveFlatField capture the wrong frame and defer ValidXxx
+Severity: Medium
+Rust: `crates/ad-plugins-rs/src/process.rs:361-368` — deferred one-shot consumed at the next process(), converting that frame's INPUT; valid_background recomputed only at :383 on the next frame.
+C reference: `NDPluginProcess.cpp:287-298` — synchronously inside writeInt32: convert this->pArrays[0] (last OUTPUT array) and setIntegerParam(ValidBackground, 1) immediately.
+Impact: (a) stored reference is previous output frame on C vs next raw input on Rust — different pixels subtracted/divided; (b) caget ValidBackground right after SaveBackground: 1 on C, 0 on Rust until another frame (forever if none).
+
+### R9-69: sub record runs SNAM on a failed INPn link read; C skips do_sub that cycle
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/record/record_instance.rs:2004-2023` — subroutine gated only by suppress_subroutine_run (assigned solely from the aSub LFLG=READ path, processing.rs:279); plain subRecord has no fetch-failure gate.
+C reference: `subRecord.c:146-147` — `if (status == 0) status = do_sub(prec)`; fetch_values (:407-418) returns -1 on the first failed dbGetLink → SNAM skipped, VAL frozen.
+Impact: failed INPn read: C leaves VAL unchanged, no SNAM; Rust invokes SNAM with stale/partial A–U and recomputes VAL.
+
+### R9-70: sseq DLYn is not quantized to the OS clock tick
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/records/sseq.rs:525` uses dly raw; put path stores raw; no epicsThreadSleepQuantum rounding in the crate.
+C reference: `sseqRecord.c:197-200` (init) + DLY special path — `dly = quantum * NINT(dly/quantum); db_post_events(DBE_VALUE)`.
+Impact: DLYn readback differs; a sub-half-quantum delay (0.004 s at 10 ms quantum) rounds to 0 on C (fires immediately) but waits ~4 ms on Rust — different step sequencing.
+
+### R9-71: codec BSLZ4 decompress-failure text differs from C
+Severity: Low
+Rust: `crates/ad-plugins-rs/src/codec.rs:1196` — "Failed to BSLZ4 decompress".
+C reference: `NDPluginCodec.cpp:601` — decompressBSLZ4 sets "Failed to Blosc decompress" (a C copy-paste, but the reference contract).
+Impact: NDCodecCodecError PV text diverges for a corrupt BSLZ4 frame. Same class as R8-74, different site.
+
+### R9-72: swait A–L input-field monitors carry a spurious DBE_LOG bit
+Severity: Low
+Rust: generic monitor epilogue posts every changed subscribed field with aux_mask = alarm_bits | VALUE | LOG (`processing.rs:2644`) — correct for calc, not swait.
+C reference: `swaitRecord.c:650` posts changed input fields with monitor_mask | DBE_VALUE (LOG only when VAL's own ADEL fired that cycle) — unlike calcRecord.c:420 which adds | DBE_LOG.
+Impact: a DBE_LOG subscriber to swait .A–.L gets an archive event on every input change on Rust; C emits LOG only on ADEL-crossing cycles.
+
+### Notes (Round 9)
+
+- R9-18/R9-46/R9-62 include test-skepticism hits: port comments/tests
+  citing C behaviour the reference does not have (caput.c:186-188 "returns
+  ECA_TIMEOUT" misread; asynRecord 1 s TMOT fallback fabricated;
+  test_transform_val_is_a pins invented behaviour).
+- Auditor-E scaler candidates NOT reported (C-side verified, Rust-side
+  unconfirmed): user-stop COUTP double-fire, RATE→TP quirk — future-round
+  material.
+- Extensive audited-clean inventories per panel are in the round report.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -1264,3 +1527,22 @@ Impact: attribute-less 3-D frames write on the port, fail on C.
   856-line subsystem; R8-23 is redesign-scale (per-circuit event queue).
   Sign-off items pending user: R6-77 token removals, R6-75 blocked-mask
   half, implLang="rust", R7-3's LOG2-as-LOG·2 reading. Next: R9 re-audit.
+- Round 9 (2026-07-12): same 5 auditor panels (opus, read-only), triple
+  mandate. Fix verification: all 30 wave-6 commits CORRECT AND COMPLETE —
+  zero fix-verification findings, second consecutive clean wave.
+  Adjudications: all 15 wave-6 fixer-surfaced items CONFIRMED (R8-34
+  narrowed to MONITOR-only; R8-55's C mechanism corrected to event-driven
+  exceptCallback; R8-56 and R8-8 widened; R8-7 sharpened — sCalc div/0 is
+  INVALID_ALARM + VAL frozen, not -1). 17 NEW findings: High 1 / Medium 11 /
+  Low 5 — A: 3 (1M/2L, aCalc epsilon comparisons the headline), B: 3
+  (2M/1L, CA-tools exit-code/stdout contracts), C: 2 (1M/1L, pvRequest
+  kind-dispatch siblings of R7-34), D: 5 (2M/3L, asynRecord TMOT
+  passthrough + option-readback sourcing + ERRS text cluster), E: 12
+  (1H/9M/2L — transform record cluster R9-61..64 dominates, swait DOL
+  fetch, ROI disabled-dim/MaxSize, Process SaveBackground timing, sub
+  fetch-gate, sseq DLY quantum). Themes: invented-behaviour comments/tests
+  (three test-skepticism hits); records ported without their
+  input-failure/hold modes (transform IVLA, sub fetch gate, transform
+  zero-on-fail); kind-dispatch gaps in pvRequest option parsing. Fix wave 7
+  next: 32 items (15 confirmed + 17 new), R8-23 event-queue redesign and
+  R8-57 asynInterposeCOM port assigned as dedicated structural tasks.

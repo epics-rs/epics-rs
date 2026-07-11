@@ -53,7 +53,9 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::server::iocsh::registry::*;
 
 use crate::datatype::{self, ALL_DATA_TYPES, ModbusDataType};
-use crate::driver::{ModbusConfig, ModbusEngine, ModbusFunctionCode, OctetTransport};
+use crate::driver::{
+    ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
+};
 use crate::error::ModbusError;
 use crate::interpose::LinkType;
 use crate::protocol::MAX_MODBUS_FRAME_SIZE;
@@ -1378,7 +1380,7 @@ impl PortDriver for ModbusPortDriver {
                     };
                     let readback =
                         (modbus_address + self.engine.config().readback_offset()).max(0) as u16;
-                    let regs = self
+                    let response = self
                         .engine
                         .do_modbus_io(
                             self.transport.as_mut(),
@@ -1388,7 +1390,18 @@ impl PortDriver for ModbusPortDriver {
                             1,
                         )
                         .map_err(to_asyn)?;
-                    let current = u32::from(regs.first().copied().unwrap_or(0));
+                    let current = match response {
+                        ModbusIoResponse::Data(regs) => {
+                            u32::from(regs.first().copied().unwrap_or(0))
+                        }
+                        // Exception 05 copies nothing into C's readback
+                        // destination, which is the local `epicsUInt16 data =
+                        // value` (drvModbusAsyn.cpp:578, :2231-2237) — so the
+                        // read/modify/write merges the record's own value with
+                        // itself, instead of merging against a zero word that was
+                        // never read.
+                        ModbusIoResponse::Acknowledged => value & 0xFFFF,
+                    };
                     // data |= (value & mask); data &= (value | ~mask)
                     (current & !mask) | (value & mask)
                 }
@@ -3002,6 +3015,48 @@ mod tests {
             &frames[1][6..12],
             &[0x01, 0x06, 0x00, 0x02, 0xAB, 0xF0],
             "write carries (current & ~mask) | (value & mask)"
+        );
+    }
+
+    /// R8-70 sibling: the masked-write readback can itself answer exception 05.
+    /// C's readback destination is the local `epicsUInt16 data = value`
+    /// (drvModbusAsyn.cpp:578) and exception 05 copies nothing into it (:2231),
+    /// so the merge runs against the record's own value and the write carries it
+    /// unchanged. Treating the empty response as a zero word (the old
+    /// `unwrap_or(0)`) instead cleared every bit outside the mask.
+    #[test]
+    fn uint32_digital_partial_mask_readback_acknowledge_merges_the_written_value() {
+        // The readback answers exception 05 (fcode 0x83), then the write echoes.
+        // The value carries bits OUTSIDE the mask (0xAB00), which is what
+        // separates C's behaviour (they survive, because the merge base is the
+        // record's own value) from a zero merge base (they are cleared).
+        let ack = tcp_response(1, &[0x01, 0x83, 0x05]);
+        let write_echo = tcp_response(2, &[0x01, 0x06, 0x00, 0x02, 0xAB, 0x12]);
+        let transport = ReplayTransport::new(vec![Ok(ack), Ok(write_echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_REL_WSR_ACK", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("relative config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 2;
+        driver
+            .write_uint32_digital(&mut user, 0xAB12, 0x00FF)
+            .expect("an Acknowledge readback is a success, not an error");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 2, "the readback still precedes the write");
+        // merged = (value & ~mask) | (value & mask) = value = 0xAB12. A zero
+        // merge base would have written 0x0012, dropping the high byte.
+        assert_eq!(
+            &frames[1][6..12],
+            &[0x01, 0x06, 0x00, 0x02, 0xAB, 0x12],
+            "with nothing read back, the merge runs against the value C left in \
+             its readback local — the record's own value"
         );
     }
 

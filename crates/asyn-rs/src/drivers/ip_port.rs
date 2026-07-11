@@ -549,13 +549,12 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
 /// `recv`/`send` error but returns `asynTimeout` with the socket intact on
 /// a poll/timeout expiry.
 fn is_fatal_transport_error(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Disconnected,
-            ..
-        } | AsynError::Io(_)
-    )
+    // Classify by the carried status, not by the variant: a read that timed
+    // out or dropped *after* delivering partial bytes arrives as
+    // `AsynError::PartialRead` (C `asynInterposeEos.c:242-253` returns the
+    // status together with the bytes), and a variant match would have read
+    // that as non-fatal and left a dead socket reporting `connected`.
+    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
 }
 
 /// Map an `AsynUser` timeout to the socket-level receive/send timeout,

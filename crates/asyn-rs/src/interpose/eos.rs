@@ -62,6 +62,20 @@ impl EosInterpose {
         }
     }
 
+    /// Single owner of the link-scoped input state: the read-ahead buffer
+    /// (`in_buf_head` / `in_buf_tail`) and the partial-EOS match position
+    /// (`eos_in_match`). Every site that must forget bytes belonging to a
+    /// past link or a past terminator routes through here — `flush`
+    /// (C `flushIt`, asynInterposeEos.c:262-264) and `connection_changed`
+    /// (C `eosInExceptionHandler`, asynInterposeEos.c:146-150) clear all
+    /// three; `set_input_eos` clears only the match position, because C
+    /// leaves `inBuf` alone on a terminator change.
+    fn reset_link_state(&mut self) {
+        self.in_buf_head = 0;
+        self.in_buf_tail = 0;
+        self.eos_in_match = 0;
+    }
+
     pub fn get_input_eos(&self) -> &[u8] {
         &self.config.input_eos
     }
@@ -165,16 +179,33 @@ impl OctetInterpose for EosInterpose {
 
             // Read more data from the lower layer into our internal buffer.
             //
-            // C parity (`asynInterposeEos.c::readIt`): the lower-layer
-            // `status` is preserved across the whole loop. When the
-            // lower read fails, C `break`s the loop and then executes
-            // `return status` — the caller sees the error/timeout
-            // regardless of how many bytes were already accumulated in
-            // `nRead`. An earlier Rust version swallowed the error into
-            // `Ok(...)` when `n_read > 0`, dropping the timeout/error
-            // indication entirely. We surface the lower-layer error
-            // even when partial data was buffered, matching C.
-            let result = next.read(user, &mut self.in_buf[..])?;
+            // C parity (`asynInterposeEos.c::readIt:242-253`): a failing
+            // lower-layer read `break`s the loop and falls through to the
+            // SAME tail as a successful one — null-terminate, `*eomReason =
+            // eom`, `*nbytesTransfered = nRead` — and only then `return
+            // status`. So the caller gets the error AND everything already
+            // transferred: the classic partial-line timeout reaches
+            // asynRecord as `asynTimeout` with `AINP="abc"`, `NORD=3`
+            // (asynRecord.c:1591,1627 assign `eomr`/`nord` regardless of
+            // status).
+            //
+            // `?` here would return the bare error and drop both the count
+            // and the eom reason. The bytes are not recoverable afterwards —
+            // `in_buf_tail` has already advanced past them at :114-118 — so
+            // dropping the count loses the data outright. Run C's tail, then
+            // hand the error back with the partial attached.
+            let result = match next.read(user, &mut self.in_buf[..]) {
+                Ok(r) => r,
+                Err(e) => {
+                    if n_read < maxchars {
+                        buf[n_read] = 0;
+                    }
+                    return Err(e.with_partial_read(OctetReadResult {
+                        nbytes_transferred: n_read,
+                        eom_reason: eom,
+                    }));
+                }
+            };
 
             // Filter out CNT from lower layer — the lower read may have set CNT
             // because available data exceeded our buffer size. This is not a
@@ -226,9 +257,7 @@ impl OctetInterpose for EosInterpose {
     }
 
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
-        self.in_buf_head = 0;
-        self.in_buf_tail = 0;
-        self.eos_in_match = 0;
+        self.reset_link_state();
         next.flush(user)
     }
 
@@ -241,6 +270,17 @@ impl OctetInterpose for EosInterpose {
 
     fn set_output_eos(&mut self, eos: &[u8]) {
         self.config.output_eos = eos.to_vec();
+    }
+
+    /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151): on
+    /// `asynExceptionConnect` the interpose drops its read-ahead buffer and
+    /// its partial-EOS match position. Without it the first read on a
+    /// re-established link is served from up to `INPUT_BUFFER_SIZE` bytes of
+    /// the *previous* connection's traffic, and an `eos_in_match == 1` left
+    /// over from a 2-byte terminator that straddled the drop makes the first
+    /// byte of the new session complete a spurious EOS match.
+    fn connection_changed(&mut self) {
+        self.reset_link_state();
     }
 }
 
@@ -434,6 +474,84 @@ mod tests {
         );
     }
 
+    /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151) drops the
+    /// read-ahead buffer on `asynExceptionConnect`. Boundary: bytes of the
+    /// *old* link are still buffered when the link changes — the first read
+    /// on the new link must come from the new link, not from `in_buf`.
+    #[test]
+    fn connection_change_drops_stale_read_ahead() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        });
+        // One lower read grabs "OLD1\nOLD2\n"; the first read returns "OLD1"
+        // and leaves "OLD2\n" stranded in in_buf.
+        let mut old_link = MockOctetBase::new(b"OLD1\nOLD2\n");
+        let user = AsynUser::default();
+        let mut buf = [0u8; 32];
+
+        let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"OLD1");
+        assert_ne!(
+            interpose.in_buf_tail, interpose.in_buf_head,
+            "precondition: OLD2\\n is buffered read-ahead"
+        );
+
+        // The link drops and comes back (either edge fires C's
+        // asynExceptionConnect).
+        interpose.connection_changed();
+        assert_eq!(interpose.in_buf_head, 0);
+        assert_eq!(interpose.in_buf_tail, 0);
+
+        let mut new_link = MockOctetBase::new(b"NEW1\n");
+        let r = interpose.read(&user, &mut buf, &mut new_link).unwrap();
+        assert_eq!(
+            &buf[..r.nbytes_transferred],
+            b"NEW1",
+            "first read after reconnect must not serve the previous link's bytes"
+        );
+    }
+
+    /// The other half of C's reset: `eosInMatch`. Boundary: a 2-byte
+    /// terminator straddles the drop, leaving `eos_in_match == 1`. Without
+    /// the reset the first byte of the new session that happens to equal the
+    /// terminator's *second* byte completes a spurious EOS match, truncating
+    /// the first response and reporting EOS one byte early.
+    #[test]
+    fn connection_change_clears_partial_eos_match() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\r', b'\n'],
+            output_eos: vec![],
+        });
+        let user = AsynUser::default();
+
+        // Old link ends mid-terminator: "AB\r" leaves eos_in_match == 1.
+        let mut old_link = MockOctetBase::new(b"AB\r");
+        let mut buf = [0u8; 32];
+        let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"AB\r");
+        assert_eq!(
+            interpose.eos_in_match, 1,
+            "precondition: the trailing \\r left a partial match"
+        );
+
+        interpose.connection_changed();
+        assert_eq!(interpose.eos_in_match, 0);
+
+        // New session's first byte is '\n' — the terminator's second byte.
+        // With a stale match it would complete the EOS and return 0 bytes;
+        // after the reset it is ordinary data.
+        let mut new_link = MockOctetBase::new(b"\nHELLO\r\n");
+        let mut buf2 = [0u8; 32];
+        let r = interpose.read(&user, &mut buf2, &mut new_link).unwrap();
+        assert_eq!(
+            &buf2[..r.nbytes_transferred],
+            b"\nHELLO",
+            "a stale partial match must not eat the new session's first byte"
+        );
+        assert!(r.eom_reason.contains(EomReason::EOS));
+    }
+
     #[test]
     fn test_eos_config_getters_setters() {
         let mut interpose = EosInterpose::new(EosConfig::default());
@@ -534,64 +652,142 @@ mod tests {
         assert!(!r.eom_reason.contains(EomReason::CNT));
     }
 
+    /// A base that serves one EOS-less chunk and then fails — the classic
+    /// "device emitted a partial line and went quiet" timeout.
+    struct PartialThenErrBase {
+        chunk: Vec<u8>,
+        err: Option<AsynError>,
+        served: bool,
+    }
+    impl OctetNext for PartialThenErrBase {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+            if !self.served {
+                self.served = true;
+                buf[..self.chunk.len()].copy_from_slice(&self.chunk);
+                return Ok(OctetReadResult {
+                    nbytes_transferred: self.chunk.len(),
+                    // No CNT/EOS — short read, EOS layer keeps reading.
+                    eom_reason: EomReason::empty(),
+                });
+            }
+            Err(self.err.take().expect("base read called twice after error"))
+        }
+        fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+            Ok(0)
+        }
+        fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            Ok(())
+        }
+    }
+
+    /// R6-48: C `asynInterposeEos.c::readIt:242-253` runs the SAME tail on
+    /// the error path as on the success path — null-terminate, publish the
+    /// eom reason, publish `nRead` — and only then `return status`. So the
+    /// caller gets the timeout AND the three bytes the device did send. The
+    /// bytes land in the caller's buffer; the count and eom ride on the
+    /// error.
+    ///
+    /// The previous version of this test asserted only `is_err()`, cementing
+    /// the byte loss it was meant to guard.
     #[test]
     fn test_lower_layer_error_surfaces_with_partial_data() {
-        // BUG 1 regression: C `asynInterposeEos.c::readIt` preserves the
-        // lower-layer `status` and `return status` even when partial
-        // data was already accumulated. An earlier Rust version
-        // converted the timeout/error into `Ok(...)` whenever
-        // `n_read > 0`, hiding the failure from the caller.
-        //
-        // This base feeds one chunk with no EOS, then a timeout. The
-        // EOS layer has buffered "abc" (n_read > 0) and must still
-        // propagate the timeout `Err`, not return `Ok`.
-        struct PartialThenErrBase {
-            served: bool,
-        }
-        impl OctetNext for PartialThenErrBase {
-            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-                if !self.served {
-                    self.served = true;
-                    let data = b"abc";
-                    buf[..data.len()].copy_from_slice(data);
-                    Ok(OctetReadResult {
-                        nbytes_transferred: data.len(),
-                        // No CNT/EOS — short read, EOS layer keeps reading.
-                        eom_reason: EomReason::empty(),
-                    })
-                } else {
-                    Err(AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        message: "read timeout".into(),
-                    })
-                }
-            }
-            fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
-                Ok(0)
-            }
-            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
-                Ok(())
-            }
-        }
-
         let mut interpose = EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         });
-        let mut base = PartialThenErrBase { served: false };
+        let mut base = PartialThenErrBase {
+            chunk: b"abc".to_vec(),
+            err: Some(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }),
+            served: false,
+        };
         let user = AsynUser::default();
-        let mut buf = [0u8; 64];
+        let mut buf = [0xFFu8; 64];
 
         let err = interpose
             .read(&user, &mut buf, &mut base)
             .expect_err("lower-layer timeout must surface even with partial data");
-        match err {
-            AsynError::Status {
-                status: AsynStatus::Timeout,
-                ..
-            } => {}
-            other => panic!("expected Timeout error, got {other:?}"),
-        }
+
+        // The status is preserved (this much the old test checked)...
+        assert_eq!(err.status(), AsynStatus::Timeout);
+        // ...and so is everything C hands back alongside it.
+        let partial = err
+            .partial_read()
+            .expect("a read that transferred bytes before failing must report them");
+        assert_eq!(
+            partial.nbytes_transferred, 3,
+            "C publishes *nbytesTransfered = nRead on the error path"
+        );
+        assert_eq!(
+            partial.eom_reason,
+            EomReason::empty(),
+            "no EOS was matched and the buffer never filled"
+        );
+        assert_eq!(
+            &buf[..3],
+            b"abc",
+            "the partial line is in the caller's buffer"
+        );
+        assert_eq!(buf[3], 0, "C null-terminates on the error path too");
+    }
+
+    /// Boundary: the error arrives with *nothing* accumulated. C still runs
+    /// the tail, so `nRead` is 0 — the partial must be reported as zero-length,
+    /// not omitted, and the status must survive unchanged.
+    #[test]
+    fn lower_layer_error_with_no_partial_reports_zero() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\n'],
+            output_eos: vec![],
+        });
+        let mut base = PartialThenErrBase {
+            chunk: Vec::new(),
+            err: Some(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "peer closed".into(),
+            }),
+            served: false,
+        };
+        let user = AsynUser::default();
+        let mut buf = [0xFFu8; 16];
+
+        // A zero-byte Ok read breaks the loop, so drive the error directly:
+        // mark the chunk as served so the first call returns the error.
+        base.served = true;
+        let err = interpose.read(&user, &mut buf, &mut base).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Disconnected);
+        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred), Some(0));
+        assert_eq!(buf[0], 0, "null-terminated with zero bytes read");
+    }
+
+    /// Boundary: a non-status error (`Io`) picked up mid-accumulation folds
+    /// into C's generic `asynError` and still carries the partial. Without
+    /// the single `AsynError::status()` owner this would have been
+    /// misclassified by every consumer that matched on the variant.
+    #[test]
+    fn io_error_mid_accumulation_carries_partial_as_generic_error() {
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![b'\r', b'\n'],
+            output_eos: vec![],
+        });
+        let mut base = PartialThenErrBase {
+            chunk: b"XY".to_vec(),
+            err: Some(AsynError::Io(std::io::Error::other("cable yanked"))),
+            served: false,
+        };
+        let user = AsynUser::default();
+        let mut buf = [0u8; 32];
+
+        let err = interpose.read(&user, &mut buf, &mut base).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error);
+        assert_eq!(err.partial_read().map(|p| p.nbytes_transferred), Some(2));
+        assert_eq!(&buf[..2], b"XY");
+        assert!(
+            err.to_string().contains("cable yanked"),
+            "the underlying cause must survive the fold, got {err}"
+        );
     }
 
     #[test]

@@ -53,6 +53,19 @@ impl ActorMessage {
     }
 }
 
+/// Sleep until `deadline`, or never if there is none.
+///
+/// A disarmed connect timer must not make the `select!` arm ready — otherwise
+/// the actor would spin. `pending()` is the "this arm never completes" form,
+/// leaving the other arms (request / shutdown) to drive the loop exactly as
+/// they did before the timer existed.
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Marks a claimed request's cancel token `Done` when execution leaves the
 /// dispatch scope, on every exit path (reply, early return, panic). This is the
 /// C `callbackActive -> idle` transition: once the port thread finishes the
@@ -144,6 +157,7 @@ impl PortActor {
     /// - The shutdown channel is closed (shutdown signaled)
     pub fn run_with_shutdown(mut self, mut shutdown_rx: mpsc::Receiver<()>) {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -152,7 +166,13 @@ impl PortActor {
                 self.drain_channel();
 
                 if self.heap.is_empty() {
-                    // Wait for either a message or shutdown
+                    // Wait for a message, shutdown, or the connect-retry
+                    // deadline. The timer arm is what makes the autonomous
+                    // reconnect work with NO queued traffic (C's connect timer
+                    // fires on its own timer queue and posts a Connect-priority
+                    // request to the port thread, asynManager.c:3252-3266); here
+                    // the actor IS the port thread, so it wakes itself.
+                    let retry_at = self.driver.base().connect_retry_at;
                     tokio::select! {
                         msg = self.rx.recv() => {
                             match msg {
@@ -161,16 +181,63 @@ impl PortActor {
                             }
                         }
                         _ = shutdown_rx.recv() => break,
+                        _ = sleep_until_opt(retry_at) => {}
                     }
                     // Drain any more that arrived
                     self.drain_channel();
                 }
+
+                // Run any due connect retry before servicing the queue: a
+                // request dequeued now would otherwise see a port that the
+                // timer was about to bring back up.
+                self.service_connect_timer();
 
                 // Process one eligible request from the heap
                 self.process_one();
             }
         });
         let _ = self.driver.shutdown();
+    }
+
+    /// C `portConnectTimerCallback` + `portConnectProcessCallback`
+    /// (asynManager.c:3252-3283), collapsed into one step because the actor
+    /// is both the timer's consumer and the port thread the callback would
+    /// have queued onto.
+    ///
+    /// C's timer callback re-checks `!connected && autoConnect` before
+    /// queueing (:3257) — the port may have come back since the timer was
+    /// armed — and the process callback re-checks `isConnected` again (:3277)
+    /// before calling `pasynCommon->connect`. On failure it re-arms at
+    /// `secondsBetweenPortConnect` (:3281), which is the 20 s retry loop that
+    /// keeps a dead link trying forever.
+    ///
+    /// The re-arm decision keys on the port still being disconnected rather
+    /// than on the connect call's return: that is what C's own guards test
+    /// (`!pport->dpc.connected`), it is identical for any driver that reports
+    /// failure honestly, and it cannot wedge a port whose `connect()` returns
+    /// success without actually bringing the link up.
+    fn service_connect_timer(&mut self) {
+        match self.driver.base().connect_retry_at {
+            Some(at) if at <= Instant::now() => {}
+            _ => return,
+        }
+        // Disarm first: `connect()` re-arms via `set_connected` on either
+        // edge, and a stale deadline left behind here would spin the loop.
+        self.driver.base_mut().connect_retry_at = None;
+
+        // C :3257 — the port reconnected (or auto-connect was turned off)
+        // while the timer was pending: nothing to do.
+        if self.driver.base().connected || !self.driver.base().auto_connect {
+            return;
+        }
+
+        let _ = self.driver.connect(&AsynUser::default());
+
+        if !self.driver.base().connected {
+            // Still down — back off and try again (C :3281).
+            let retry = self.driver.base().seconds_between_port_connect;
+            self.driver.base_mut().connect_retry_at = Some(Instant::now() + retry);
+        }
     }
 
     fn drain_channel(&mut self) {
@@ -279,47 +346,7 @@ impl PortActor {
         // Connect ops and Connect-priority requests bypass enabled/connected checks
         // (C parity: Connect priority processed even when disabled/disconnected)
         if !is_connect_op && !is_connect_priority {
-            // Auto-connect: try to reconnect if disconnected and
-            // auto_connect is set, throttled to at most one attempt per 2s
-            // window (C `autoConnectDevice`, asynManager.c:704-739).
-            // Without the gate a burst of N queued requests to an offline
-            // auto_connect port fires N back-to-back full connect attempts.
-            // `auto_connect_throttle_ok` is the gate;
-            // `stamp_auto_connect_attempt` restarts the window after the
-            // attempt — success or failure — mirroring the C stamp at
-            // :718/:735. The single-threaded actor owns the driver
-            // throughout, so C's `autoConnectActive` re-entry guard has no
-            // observable analogue here (no concurrent dispatch can re-enter).
-            if self.driver.base().flags.multi_device {
-                let ds = self.driver.base().device_states.get(&user.addr);
-                let dev_disconnected = !ds.map_or(true, |d| d.connected);
-                let dev_auto = ds.map_or(self.driver.base().auto_connect, |d| d.auto_connect);
-                if dev_disconnected
-                    && dev_auto
-                    && self
-                        .driver
-                        .base()
-                        .auto_connect_throttle_ok(user.addr, Instant::now())
-                {
-                    // For multi-device, auto-connect the specific address
-                    let connect_user = AsynUser::new(user.reason).with_addr(user.addr);
-                    let _ = self.driver.connect_addr(&connect_user);
-                    self.driver
-                        .base_mut()
-                        .stamp_auto_connect_attempt(user.addr, Instant::now());
-                }
-            } else if !self.driver.base().connected
-                && self.driver.base().auto_connect
-                && self
-                    .driver
-                    .base()
-                    .auto_connect_throttle_ok(-1, Instant::now())
-            {
-                let _ = self.driver.connect(&AsynUser::default());
-                self.driver
-                    .base_mut()
-                    .stamp_auto_connect_attempt(-1, Instant::now());
-            }
+            self.auto_connect_device(user.addr, user.reason);
 
             // Check ready
             if let Err(e) = self.driver.base().check_ready_addr(user.addr) {
@@ -331,6 +358,76 @@ impl PortActor {
         // Dispatch
         let result = self.dispatch_io(&mut user, &op);
         let _ = reply.send(result);
+    }
+
+    /// C `autoConnectDevice` (asynManager.c:704-739) — the single owner of
+    /// every auto-connect attempt, port-level and device-level.
+    ///
+    /// The order is the whole point: C reconnects the **port** first
+    /// (`connectAttempt(&pport->dpc)` at :716) and bails out if the port is
+    /// still down (:721), only then reconnecting the device (:723-737). A
+    /// multi-device port that skipped straight to the device would never
+    /// reopen its transport — `PortDriver::connect_addr`'s default just
+    /// flips the per-address `connected` flag (port.rs) and opens no socket,
+    /// so the port-level `check_ready` that follows rejects the request
+    /// forever.
+    ///
+    /// Both levels are throttled to one attempt per 2 s window
+    /// (`auto_connect_throttle_ok`, C :712-713 / :729-730), and every attempt
+    /// restarts the window whether it succeeded or failed
+    /// (`stamp_auto_connect_attempt`, C :718 / :735) — so a burst of N queued
+    /// requests to an offline port fires one attempt, not N. A port whose
+    /// throttle window has not elapsed gives up for this request exactly as C
+    /// does (`return FALSE` at :713), without falling through to the device.
+    ///
+    /// Returns whether the addressed device is connected afterwards. The
+    /// single-threaded actor owns the driver throughout, so C's
+    /// `autoConnectActive` re-entry guard has no observable analogue here.
+    fn auto_connect_device(&mut self, addr: i32, reason: usize) -> bool {
+        // --- Port level (C :705-721). Runs for single- and multi-device
+        // ports alike: in C the port `dpCommon` is reconnected before any
+        // device `dpCommon` is even looked at.
+        if !self.driver.base().connected && self.driver.base().auto_connect {
+            if !self
+                .driver
+                .base()
+                .auto_connect_throttle_ok(-1, Instant::now())
+            {
+                return false;
+            }
+            let _ = self.driver.connect(&AsynUser::default());
+            self.driver
+                .base_mut()
+                .stamp_auto_connect_attempt(-1, Instant::now());
+        }
+        if !self.driver.base().connected {
+            // C :721 — the port is still down, so the device cannot come up.
+            return false;
+        }
+        if !self.driver.base().flags.multi_device {
+            // C :722 `if(!pdevice) return TRUE`.
+            return true;
+        }
+
+        // --- Device level (C :723-737).
+        let ds = self.driver.base().device_states.get(&addr);
+        let dev_disconnected = !ds.is_none_or(|d| d.connected);
+        let dev_auto = ds.map_or(self.driver.base().auto_connect, |d| d.auto_connect);
+        if dev_disconnected && dev_auto {
+            if !self
+                .driver
+                .base()
+                .auto_connect_throttle_ok(addr, Instant::now())
+            {
+                return false;
+            }
+            let connect_user = AsynUser::new(reason).with_addr(addr);
+            let _ = self.driver.connect_addr(&connect_user);
+            self.driver
+                .base_mut()
+                .stamp_auto_connect_attempt(addr, Instant::now());
+        }
+        self.driver.base().is_device_connected(addr)
     }
 
     fn dispatch_io(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
@@ -1456,6 +1553,235 @@ mod tests {
         // inside the 2s throttle window and were refused without a connect
         // call (C autoConnectDevice 2.0s gate, asynManager.c:712-713).
         assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// R6-49: C `autoConnectDevice` reconnects the PORT first
+    /// (`connectAttempt(&pport->dpc)`, asynManager.c:716) and only then the
+    /// device (:723-737). A multi-device port whose transport dropped used to
+    /// call `connect_addr` alone — whose default merely flips the per-address
+    /// flag and opens no socket — so the port-level `check_ready` rejected
+    /// every subsequent request forever.
+    ///
+    /// Boundary 1 (here): the port's connect succeeds, so the device connect
+    /// runs after it and the request goes through.
+    /// Boundary 2 (below): the port's connect fails, so the device connect
+    /// must NOT run (C :721 `return FALSE`).
+    #[test]
+    fn actor_multi_device_auto_connect_reconnects_port_first() {
+        struct MultiDriver {
+            base: PortDriverBase,
+            calls: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+            port_connect_succeeds: bool,
+        }
+        impl PortDriver for MultiDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.calls.lock().push("connect");
+                if self.port_connect_succeeds {
+                    // A real driver reopens its transport here; the flag flip
+                    // is what `check_ready` keys on.
+                    self.base.set_connected(true);
+                }
+                Ok(())
+            }
+            fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.calls.lock().push("connect_addr");
+                self.base.connect_addr(user.addr);
+                Ok(())
+            }
+        }
+
+        let mk = |port_connect_succeeds: bool| {
+            let mut base = PortDriverBase::new(
+                "multi_ac",
+                4,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            base.params.set_int32(0, 1, 7).unwrap();
+            // The transport dropped: port down, and the device with it.
+            base.connected = false;
+            base.auto_connect = true;
+            base.device_state(1).connected = false;
+            let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            (
+                MultiDriver {
+                    base,
+                    calls: calls.clone(),
+                    port_connect_succeeds,
+                },
+                calls,
+            )
+        };
+
+        // Boundary 1: port comes back → port connect, then device connect.
+        let (drv, calls) = mk(true);
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0)
+            .with_addr(1)
+            .with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::Int32Read, user);
+        assert!(
+            result.is_ok(),
+            "a multi-device auto-connect port must reopen its transport, got {result:?}"
+        );
+        assert_eq!(
+            calls.lock().clone(),
+            vec!["connect", "connect_addr"],
+            "the PORT must be reconnected before the device (C asynManager.c:716 then :723)"
+        );
+
+        // Boundary 2: the port stays down → C bails at :721 before touching
+        // the device, and the request fails Disconnected.
+        let (drv, calls) = mk(false);
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0)
+            .with_addr(1)
+            .with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::Int32Read, user);
+        match result {
+            Err(AsynError::Status { status, .. }) => {
+                assert_eq!(status, AsynStatus::Disconnected)
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        assert_eq!(
+            calls.lock().clone(),
+            vec!["connect"],
+            "a device connect must not be attempted while the port is still down"
+        );
+    }
+
+    /// R6-47: an auto-connect port that drops must reconnect on its own, with
+    /// NO queued traffic. C `exceptionDisconnect` arms the port's connect
+    /// timer at .01 s (asynManager.c:2181-2182); `portConnectTimerCallback`
+    /// then posts a Connect-priority request (:3252-3266) and
+    /// `portConnectProcessCallback` calls the driver's connect (:3268-3283).
+    /// Before this, `port_actor`'s only auto-connect attempt lived inside
+    /// `process_one` — it fired only when a request was dequeued, so an
+    /// I/O-Intr-only or quiescent port stayed dead forever.
+    ///
+    /// Uses the real runtime (`create_port_runtime`), because the timer lives
+    /// in the actor's idle `select!` — the whole point is that nothing else
+    /// wakes it.
+    #[test]
+    fn idle_auto_connect_port_reconnects_without_queued_traffic() {
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FlappyDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+            /// Mirrors `base.connected` outside the actor so the test can
+            /// observe the reconnect without sending any request (sending one
+            /// would itself trigger the `process_one` auto-connect and prove
+            /// nothing about the timer).
+            link_up: Arc<std::sync::atomic::AtomicBool>,
+            /// Connect attempts to fail before the link comes back — proves
+            /// the retry loop re-arms rather than giving up after one try.
+            fail_first: usize,
+        }
+        impl PortDriver for FlappyDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.fail_first {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "link still down".into(),
+                    });
+                }
+                self.base.set_connected(true);
+                self.link_up.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.base.set_connected(false);
+                self.link_up.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let link_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut base = PortDriverBase::new("retry_test", 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        base.auto_connect = true;
+        // Shorten C's 20 s back-off (asynManager.c:48) so the second attempt
+        // lands inside the test. The first attempt always uses C's .01 s.
+        base.seconds_between_port_connect = Duration::from_millis(30);
+        let drv = FlappyDriver {
+            base,
+            connect_calls: connect_calls.clone(),
+            link_up: link_up.clone(),
+            fail_first: 1,
+        };
+        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default());
+
+        // Drop the link. `Disconnect` is a lifecycle op, so this is the last
+        // request the port ever sees — from here on there is NO queued
+        // traffic, exactly the case the old code could not recover from.
+        handle
+            .port_handle()
+            .submit_blocking(RequestOp::Disconnect, AsynUser::default())
+            .unwrap();
+        assert!(
+            !link_up.load(Ordering::SeqCst),
+            "precondition: the port is down"
+        );
+
+        // Wait for the autonomous retries: .01 s (fails) then 30 ms (succeeds).
+        // Not one request is submitted in this loop.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !link_up.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            link_up.load(Ordering::SeqCst),
+            "an idle auto-connect port must reconnect on its own timer, with no queued traffic"
+        );
+        assert!(
+            connect_calls.load(Ordering::SeqCst) >= 2,
+            "the failed first attempt must re-arm the timer (C asynManager.c:3281), got {} call(s)",
+            connect_calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Boundary: auto-connect OFF. C arms the timer only when
+    /// `pport->dpc.autoConnect` is set (asynManager.c:2181), so a manual port
+    /// that drops must stay down until something explicitly connects it.
+    #[test]
+    fn disconnect_does_not_arm_retry_when_auto_connect_is_off() {
+        let mut base = PortDriverBase::new("no_auto", 1, PortFlags::default());
+        base.auto_connect = false;
+        assert!(base.set_connected(false));
+        assert!(
+            base.connect_retry_at.is_none(),
+            "a non-auto-connect port must not schedule an autonomous reconnect"
+        );
+
+        // ...and with auto-connect on, the same edge arms it.
+        let mut base = PortDriverBase::new("auto", 1, PortFlags::default());
+        base.auto_connect = true;
+        assert!(base.set_connected(false));
+        assert!(base.connect_retry_at.is_some());
+        // Coming back up disarms it.
+        assert!(base.set_connected(true));
+        assert!(base.connect_retry_at.is_none());
     }
 
     #[test]

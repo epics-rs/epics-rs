@@ -26,6 +26,17 @@ use std::any::Any;
 /// window.
 const AUTO_CONNECT_THROTTLE: Duration = Duration::from_secs(2);
 
+/// First autonomous connect-retry delay after a port drops. C
+/// `exceptionDisconnect` arms the port's connect timer at `.01` seconds
+/// (asynManager.c:2181-2182), so the reconnect is attempted essentially
+/// immediately and then backs off to [`DEFAULT_SECONDS_BETWEEN_PORT_CONNECT`].
+const CONNECT_RETRY_INITIAL: Duration = Duration::from_millis(10);
+
+/// C `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` (asynManager.c:48) — the interval
+/// `portConnectProcessCallback` re-arms the connect timer at after a failed
+/// attempt (asynManager.c:3281).
+const DEFAULT_SECONDS_BETWEEN_PORT_CONNECT: Duration = Duration::from_secs(20);
+
 /// Per-address device state for multi-device ports.
 #[derive(Debug, Clone)]
 pub struct DeviceState {
@@ -152,6 +163,21 @@ pub struct PortDriverBase {
     /// auto-connect attempt (C `dpCommon.lastConnectDisconnect`). `None`
     /// = no transition yet, so the first attempt is always permitted.
     pub last_connect_disconnect: Option<Instant>,
+    /// Deadline for the next *autonomous* connect attempt — the Rust
+    /// equivalent of C's per-port `connectTimer` (`port.connectTimer`,
+    /// asynManager.c:223). `None` = disarmed.
+    ///
+    /// Armed by [`Self::set_connected`] on a disconnect (C
+    /// `exceptionDisconnect`, asynManager.c:2181-2182) and re-armed by the
+    /// actor after a failed attempt; cleared on connect. The actor is what
+    /// services it — see `PortActor::service_connect_timer` — so this field
+    /// is the whole handoff between the transition owner and the timer.
+    pub connect_retry_at: Option<Instant>,
+    /// Back-off between failed autonomous connect attempts. C
+    /// `port.secondsBetweenPortConnect`, initialised to
+    /// `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` = 20 s (asynManager.c:48, 3249)
+    /// and used to re-arm the timer at asynManager.c:3281.
+    pub seconds_between_port_connect: Duration,
 }
 
 impl PortDriverBase {
@@ -175,6 +201,8 @@ impl PortDriverBase {
             device_states: HashMap::new(),
             timestamp_source: None,
             last_connect_disconnect: None,
+            connect_retry_at: None,
+            seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
         }
     }
 
@@ -217,13 +245,47 @@ impl PortDriverBase {
             // every disconnect (asynManager.c:2184) so the auto-reconnect
             // throttle measures from the moment the link dropped.
             self.last_connect_disconnect = Some(Instant::now());
+            // ...and arms the port's connect timer at .01 s when the port is
+            // auto-connect (asynManager.c:2181-2182), which is what makes the
+            // reconnect *autonomous*: it does not wait for queued traffic.
+            if self.auto_connect {
+                self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+            }
+        } else {
+            // The link is up — nothing left to retry. (C leaves the timer
+            // running and lets `portConnectTimerCallback` no-op on the
+            // `!connected` guard, asynManager.c:3257; disarming here is the
+            // same observable behaviour without the pointless wakeup.)
+            self.connect_retry_at = None;
         }
+        // The interpose stack is a subscriber of this transition, exactly as
+        // in C: `asynInterposeEos` registers an exception callback
+        // (asynInterposeEos.c:110) and drops its read-ahead buffer +
+        // partial-EOS match on `asynExceptionConnect`
+        // (asynInterposeEos.c:142-151). Both C edges — `exceptionConnect`
+        // (asynManager.c:2158) and `exceptionDisconnect` (asynManager.c:2185)
+        // — raise that same exception, so both edges reset here. Driving the
+        // hook from this owner (rather than from an out-of-band subscriber)
+        // keeps it impossible to change `connected` without the stack
+        // hearing about it: `interpose_octet` and `connected` live in the
+        // same struct behind the same lock.
+        self.interpose_octet.connection_changed();
         self.announce_exception(AsynException::Connect, -1);
         true
     }
 
     /// Per-address variant — for multi-device ports. Same edge
     /// guarantee as [`Self::set_connected`].
+    ///
+    /// Deliberately does *not* reset the interpose stack. In C each
+    /// interpose is installed on one (port, addr) pair and registers its
+    /// exception callback on that address's `dpCommon`, so a device-level
+    /// connect exception only resets *that* device's interpose
+    /// (asynManager.c:611-625 fans out per-`dpCommon`). `interpose_octet`
+    /// here is port-scoped, so clearing it from a per-device transition
+    /// would discard read-ahead belonging to the port's other addresses.
+    /// The port-level transition owner [`Self::set_connected`] carries the
+    /// reset.
     pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
         let was = self.device_state(addr).connected;
         if was == connected {
@@ -254,10 +316,9 @@ impl PortDriverBase {
     ///
     /// Uses monotonic [`Instant`], not wall clock: the throttle is purely
     /// internal timing, never serialised, so it must be immune to NTP
-    /// steps. `addr` selects the per-device anchor on multi-device ports;
-    /// single-device ports use the port-level anchor.
+    /// steps. `addr` selects the anchor via [`Self::is_device_addr`].
     pub fn auto_connect_throttle_ok(&self, addr: i32, now: Instant) -> bool {
-        let last = if self.flags.multi_device {
+        let last = if self.is_device_addr(addr) {
             self.device_states
                 .get(&addr)
                 .and_then(|d| d.last_connect_disconnect)
@@ -270,13 +331,30 @@ impl PortDriverBase {
         }
     }
 
+    /// Does `addr` name a *device* on this port, or the port itself?
+    ///
+    /// C `findDpCommon` resolves a `pasynUser` to `&pdevice->dpc` only when
+    /// the port is multi-device AND the user is bound to a real address;
+    /// otherwise to `&pport->dpc` (a connectDevice with `addr < 0` leaves
+    /// `pdevice` null). This is the one owner of that resolution, so the
+    /// throttle read [`Self::auto_connect_throttle_ok`] and the throttle
+    /// write [`Self::stamp_auto_connect_attempt`] can never disagree about
+    /// which anchor an address refers to. Keying on the address (rather than
+    /// on `multi_device` alone) is what lets a multi-device port hold a
+    /// *port-level* anchor at `addr = -1`: the old form sent `-1` into
+    /// `device_states`, inventing a phantom device whose anchor no
+    /// disconnect ever stamped.
+    pub fn is_device_addr(&self, addr: i32) -> bool {
+        self.flags.multi_device && addr >= 0
+    }
+
     /// Single owner for the post-attempt throttle stamp. C
     /// `autoConnectDevice` stamps `lastConnectDisconnect` immediately after
     /// every `connectAttempt`, success or failure (asynManager.c:718,
     /// 735), so the window restarts from the end of the attempt — a failed
     /// reconnect is not retried until the throttle elapses again.
     pub fn stamp_auto_connect_attempt(&mut self, addr: i32, now: Instant) {
-        if self.flags.multi_device {
+        if self.is_device_addr(addr) {
             self.device_state(addr).last_connect_disconnect = Some(now);
         } else {
             self.last_connect_disconnect = Some(now);
@@ -1973,6 +2051,62 @@ mod tests {
             .unwrap();
         assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
         assert!(!r2.eom_reason.contains(EomReason::EOS));
+    }
+
+    /// R6-46 owner path: `set_connected` is the single transition owner, so
+    /// every driver that reconnects through it (serial, IP, prologix …) gets
+    /// the interpose reset for free. C wires this as an exception callback
+    /// (`asynInterposeEos.c:110,142-151`); here the owner drives the stack
+    /// directly. Boundaries: both edges reset (C's `asynExceptionConnect`
+    /// fires from `exceptionConnect` AND `exceptionDisconnect`), and a
+    /// no-op call (same state) must not.
+    #[test]
+    fn set_connected_resets_interpose_link_state() {
+        use crate::interpose::{OctetInterpose, OctetNext, OctetReadResult};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingInterpose(Arc<AtomicUsize>);
+        impl OctetInterpose for CountingInterpose {
+            fn read(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<OctetReadResult> {
+                next.read(user, buf)
+            }
+            fn write(
+                &mut self,
+                user: &mut AsynUser,
+                data: &[u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<usize> {
+                next.write(user, data)
+            }
+            fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
+                next.flush(user)
+            }
+            fn connection_changed(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("reset_test", 1, PortFlags::default());
+        base.push_octet_interpose(Box::new(CountingInterpose(resets.clone())));
+
+        // Port starts connected. Disconnect edge → reset (C exceptionDisconnect).
+        assert!(base.set_connected(false));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // Redundant call, no state change → no fan-out, no reset.
+        assert!(!base.set_connected(false));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // Reconnect edge → reset again (C exceptionConnect).
+        assert!(base.set_connected(true));
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -904,14 +904,13 @@ fn resolve_intr_alarm(
 /// [`asyn_status_to_alarm_with_default`] (specific statuses —
 /// Timeout/Overflow/Disconnected/Disabled — map direction-independently).
 fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u16) {
-    use epics_base_rs::server::record::AlarmSeverity;
-    match e {
-        AsynError::Status { status, .. } => {
-            asyn_status_to_alarm_with_default(*status, default_stat)
-        }
-        // Non-status asyn errors take C's asynError/default branch.
-        _ => (default_stat, AlarmSeverity::Invalid as u16),
-    }
+    // `AsynError::status()` is the single owner of error → asynStatus, so a
+    // status-carrying variant added later (e.g. `PartialRead`, which reports
+    // a real timeout alongside the bytes it did receive) keeps its condition
+    // code instead of silently falling into the generic asynError branch.
+    // Non-status variants map to `AsynStatus::Error`, which
+    // `asyn_status_to_alarm_with_default` resolves to C's default branch.
+    asyn_status_to_alarm_with_default(e.status(), default_stat)
 }
 
 /// [`asyn_error_to_alarm_with_default`] with C's input default (`READ_ALARM`).

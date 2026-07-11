@@ -456,14 +456,16 @@ pub struct DrvAsynSerialPort {
 /// or EOF but returns `asynTimeout` with the fd intact on a poll timeout.
 /// Mirrors the same predicate in `ip_port.rs` (both transports share the
 /// `closeConnection`-on-fatal-error contract).
+///
+/// Classify by the carried status, not by the variant: reads and writes are
+/// dispatched through the interpose chain, and `configure` installs the EOS
+/// interpose by default, which wraps a lower-layer failure — including the
+/// hangup this predicate exists to catch — as `AsynError::PartialRead`
+/// (eos.rs:199-207, mirroring C `asynInterposeEos.c:242-253`, which returns
+/// the lower-layer status unchanged). A variant match reads such a hangup as
+/// non-fatal and leaves a dead fd reporting `connected`.
 fn is_fatal_transport_error(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Disconnected,
-            ..
-        } | AsynError::Io(_)
-    )
+    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
 }
 
 impl DrvAsynSerialPort {
@@ -2037,6 +2039,46 @@ mod tests {
         assert!(
             !drv.base().connected,
             "DRV-31: fatal write error must set connected=false"
+        );
+    }
+
+    /// R7-47 (same defect family as the IP port's `is_timeout`): reads and
+    /// writes dispatch through the interpose chain, and `configure` installs
+    /// the EOS interpose by default — which wraps a lower-layer hangup as
+    /// `PartialRead` (C `asynInterposeEos.c:242-253` returns the lower status
+    /// unchanged). Classifying by the error *variant* read that hangup as
+    /// non-fatal and left a dead fd reporting `connected`; the status is the
+    /// contract.
+    #[test]
+    fn fatal_transport_error_sees_through_the_eos_interpose_wrapper() {
+        use crate::interpose::PartialOctetRead;
+
+        let wrapped_hangup = AsynError::Status {
+            status: AsynStatus::Disconnected,
+            message: "hangup".into(),
+        }
+        .with_partial_read(PartialOctetRead {
+            data: b"AB".to_vec(),
+            eom_reason: EomReason::empty(),
+        });
+        assert!(
+            is_fatal_transport_error(&wrapped_hangup),
+            "a hangup wrapped by the EOS interpose is still fatal"
+        );
+
+        // Boundary: a timeout — wrapped the same way — must stay non-fatal, or
+        // every EOS-port read timeout would tear the link down.
+        let wrapped_timeout = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(PartialOctetRead {
+            data: b"AB".to_vec(),
+            eom_reason: EomReason::empty(),
+        });
+        assert!(
+            !is_fatal_transport_error(&wrapped_timeout),
+            "a partial-line timeout leaves the fd intact (C returns asynTimeout)"
         );
     }
 

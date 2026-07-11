@@ -5,6 +5,7 @@ pub mod cvt_bpt;
 pub mod database;
 pub mod db_loader;
 pub mod device_support;
+pub mod event_queue;
 pub mod ioc_app;
 pub mod ioc_builder;
 pub mod iocsh;

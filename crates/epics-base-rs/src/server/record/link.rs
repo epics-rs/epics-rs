@@ -899,29 +899,64 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         return ParsedLink::Constant(inner.to_string());
     }
 
-    // DB link: try rsplit on '.', validate field part is uppercase alpha 1-4 chars
-    if let Some((rec, field)) = link_part.rsplit_once('.') {
-        let field_upper = field.to_ascii_uppercase();
-        let is_valid_field = !field_upper.is_empty()
-            && field_upper.len() <= 4
-            && field_upper.chars().all(|c| c.is_ascii_uppercase());
-        if is_valid_field {
-            return ParsedLink::Db(DbLink {
-                record: rec.to_string(),
-                field: field_upper,
-                policy,
-                monitor_switch: ms,
-            });
-        }
+    // DB link: split record from field exactly as C `dbNameToAddr`
+    // (`dbAccess.c:667-671`) does — see [`split_record_field`].
+    if let Some((rec, field)) = split_record_field(link_part) {
+        return ParsedLink::Db(DbLink {
+            record: rec.to_string(),
+            field,
+            policy,
+            monitor_switch: ms,
+        });
     }
 
-    // No dot or invalid field part → DB link with default field VAL
+    // No dot, or a remainder that is not a field name → DB link with the
+    // default `VAL` field (C `dbFindFieldPart`'s "absent field name" branch,
+    // `dbStaticLib.c:1802-1811`, which resolves to `pvalFldDes`).
     ParsedLink::Db(DbLink {
         record: link_part.to_string(),
         field: "VAL".to_string(),
         policy,
         monitor_switch: ms,
     })
+}
+
+/// Split a link target into `(record, FIELD)`, mirroring C `dbNameToAddr`
+/// (`dbAccess.c:667-671`).
+///
+/// C terminates the *record* name at the **first** `.`
+/// (`dbStaticLib.c:1548-1571` `dbFindRecordPart`: `strchr(pname, '.')`), then
+/// matches the remainder against the record type's field table
+/// (`dbStaticLib.c:1781-1846` `dbFindFieldPart`). That lexer accepts a field
+/// name that is a C identifier — `[A-Za-z_][A-Za-z0-9_]*` — and imposes no
+/// character-class or length restriction beyond it.
+///
+/// The port has no field table at parse time, so the identifier rule is the
+/// guard. It matters that digits and `_` are accepted and that the 4-character
+/// cap is gone: `mbboDirect` has `B0`…`BF`, `sseq` has `DO1`…`LNKA`, and
+/// dbCommon has `OLDSIMM`/`NAMSG`. Pre-fix `'0'.is_ascii_uppercase()` was
+/// `false`, so `INP="DIRECT.B0"` fell through to a link to a *record* literally
+/// named `"DIRECT.B0"` — which never resolves locally, and
+/// `classify_cp_link`'s `convert_to_ca` then re-routed it as an external CA
+/// channel, losing lock-set atomicity, `PP` target processing and `MS`
+/// severity inheritance.
+///
+/// Returns `None` when there is no `.` or the remainder is not a field name,
+/// which is C's "absent field name" case (the link addresses `VAL`). Keeping
+/// the whole string as the record name in that case is also what preserves a
+/// dotted *remote* PV name (`OTHER:PV.1:X`) for the CA-link fallback, which
+/// reconstructs the channel name from `record`/`field`.
+fn split_record_field(link_part: &str) -> Option<(&str, String)> {
+    let (rec, field) = link_part.split_once('.')?;
+    let mut chars = field.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((rec, field.to_ascii_uppercase()))
 }
 
 /// Parse an **output** link.

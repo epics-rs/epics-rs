@@ -4054,6 +4054,99 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
     }
 }
 
+/// R6-2 — a link whose target field name carries a digit (`B0`, `DO1`,
+/// `LNK1`) is a plain local DB link. C `dbNameToAddr` (`dbAccess.c:667-671`)
+/// terminates the record name at the first `.` and matches the remainder
+/// against the record type's field table — no character-class restriction.
+/// Pre-fix the port required the field part to be all-`is_ascii_uppercase`, so
+/// `'0'` failed the guard and `INP="DIRECT.B0"` parsed as a link to a *record*
+/// literally named `"DIRECT.B0"`: it never resolved locally and was re-routed
+/// as an external CA channel, losing lock-set atomicity and PP/MS semantics.
+#[tokio::test]
+async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
+    use epics_base_rs::server::record::{DbLink, LinkProcessPolicy, MonitorSwitch, ParsedLink};
+    use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
+
+    // Parse boundary: the field part is a C identifier, so digits and `_` are
+    // legal and the old 4-character cap is gone (dbCommon has `OLDSIMM`).
+    assert_eq!(
+        epics_base_rs::server::record::parse_link_v2("DIRECT.B0 NPP MS"),
+        ParsedLink::Db(DbLink {
+            record: "DIRECT".to_string(),
+            field: "B0".to_string(),
+            policy: LinkProcessPolicy::NoProcess,
+            monitor_switch: MonitorSwitch::Maximize,
+        })
+    );
+    for (link, field) in [
+        ("SEQ.DO1", "DO1"),
+        ("SEQ.LNK1", "LNK1"),
+        ("SEQ.LNKA", "LNKA"),
+        ("REC.OLDSIMM", "OLDSIMM"),
+        ("REC._X1", "_X1"),
+    ] {
+        match epics_base_rs::server::record::parse_link_v2(link) {
+            ParsedLink::Db(db) => assert_eq!(db.field, field, "link {link}"),
+            other => panic!("link {link} must be a Db link, got {other:?}"),
+        }
+    }
+    // A remainder that is NOT a field name (leading digit) is C's "absent
+    // field name" case: the whole string stays the record/PV name, which is
+    // what preserves a dotted remote PV for the CA fallback.
+    match epics_base_rs::server::record::parse_link_v2("OTHER:PV.1:X") {
+        ParsedLink::Db(db) => {
+            assert_eq!(db.record, "OTHER:PV.1:X");
+            assert_eq!(db.field, "VAL");
+        }
+        other => panic!("expected a whole-name Db link, got {other:?}"),
+    }
+    // The record name terminates at the FIRST `.`, not the last.
+    match epics_base_rs::server::record::parse_link_v2("A.B.C") {
+        ParsedLink::Db(db) => {
+            assert_eq!(db.record, "A.B.C", "'B.C' is not a field name");
+            assert_eq!(db.field, "VAL");
+        }
+        other => panic!("expected a whole-name Db link, got {other:?}"),
+    }
+
+    // End to end: an ai whose INP names `DIRECT.B0` reads the B0 bit out of
+    // the local mbboDirect record, not a nonexistent record "DIRECT.B0".
+    let db = PvDatabase::new();
+    let mut direct = MbboDirectRecord::default();
+    direct.put_field("B0", EpicsValue::Short(1)).unwrap();
+    db.add_record("DIRECT", Box::new(direct)).await.unwrap();
+    db.add_record("SINK", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("SINK").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("DIRECT.B0".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SINK", &mut visited, 0)
+        .await
+        .unwrap();
+
+    match db.get_pv("SINK").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 1.0).abs() < 1e-10,
+            "SINK.INP=DIRECT.B0 must read the B0 bit (1), got {v}"
+        ),
+        other => panic!("expected Double(1.0), got {other:?}"),
+    }
+    // The link resolved locally, so the record is NOT in LINK/INVALID alarm.
+    if let Some(rec) = db.get_record("SINK").await {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            epics_base_rs::server::record::AlarmSeverity::NoAlarm,
+            "a resolvable local link must not raise LINK_ALARM"
+        );
+    }
+}
+
 /// A **modifier-less** (bare) multi-input link must behave like NPP —
 /// C `dbParseLink` (`dbStaticLib.c:2252,2369-2371`) leaves `pvlOptPP`
 /// unset for a bare link, so `dbDbGetValue` (`dbDbLink.c:175`) does NOT

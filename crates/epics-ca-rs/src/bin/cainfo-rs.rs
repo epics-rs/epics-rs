@@ -130,51 +130,51 @@ async fn main() {
 
     // -p selects the priority virtual circuit.
     let priority = args.priority.unwrap_or(0);
+    // C `cainfo.c:228-232`: `connect_pvs` gates the ENTIRE per-PV print
+    // phase (`if (!result) result = cainfo(pvs, nPvs)`). One PV that fails
+    // to connect inside the single `ca_pend_io` window aborts before
+    // `cainfo()` runs — stdout stays empty and the tool exits 1. It never
+    // prints a `State: never connected` block, because a connect failure
+    // means the print phase never happens.
+    let channels =
+        match epics_ca_rs::cli::connect_pvs(&client, &args.pv_names, priority, timeout).await {
+            Ok(channels) => channels,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+
     let mut failed = false;
-    for pv_name in &args.pv_names {
-        let ch = client.create_channel_with_priority(pv_name, priority);
-        match ch.wait_connected(timeout).await {
-            Ok(()) => match ch.info().await {
-                Ok(info) => {
-                    // C `cainfo.c::printResult`: PV name on its own
-                    // line, then five indented lines using a
-                    // fixed-column key layout. Mirror it exactly so
-                    // existing operator workflows that grep on
-                    // `State:` / `Host:` etc. keep working.
-                    let read_prefix = if info.access_rights.read { "" } else { "no " };
-                    let write_prefix = if info.access_rights.write { "" } else { "no " };
-                    println!(
-                        "{name}\n    \
-                         State:            connected\n    \
-                         Host:             {host}\n    \
-                         Access:           {rp}read, {wp}write\n    \
-                         Native data type: {dbf}\n    \
-                         Request type:     {dbr}\n    \
-                         Element count:    {n}",
-                        name = info.pv_name,
-                        host = info.server_addr,
-                        rp = read_prefix,
-                        wp = write_prefix,
-                        dbf = dbf_name(info.native_type),
-                        dbr = dbr_name(info.native_type),
-                        n = info.element_count,
-                    );
-                }
-                Err(e) => {
-                    eprintln!("{pv_name}: {e}");
-                    failed = true;
-                }
-            },
-            Err(_) => {
-                // C `cainfo` prints "never connected" on connect-fail
-                // (since `ca_state(chid)` returns the never-connected
-                // state when the search hasn't resolved). Mirror that
-                // shape — operators that pipe to grep / awk expect
-                // the same key prefixes regardless of state.
+    for (pv_name, ch) in args.pv_names.iter().zip(&channels) {
+        match ch.info().await {
+            Ok(info) => {
+                // C `cainfo.c::printResult`: PV name on its own
+                // line, then five indented lines using a
+                // fixed-column key layout. Mirror it exactly so
+                // existing operator workflows that grep on
+                // `State:` / `Host:` etc. keep working.
+                let read_prefix = if info.access_rights.read { "" } else { "no " };
+                let write_prefix = if info.access_rights.write { "" } else { "no " };
                 println!(
-                    "{pv_name}\n    \
-                     State:            never connected"
+                    "{name}\n    \
+                     State:            connected\n    \
+                     Host:             {host}\n    \
+                     Access:           {rp}read, {wp}write\n    \
+                     Native data type: {dbf}\n    \
+                     Request type:     {dbr}\n    \
+                     Element count:    {n}",
+                    name = info.pv_name,
+                    host = info.server_addr,
+                    rp = read_prefix,
+                    wp = write_prefix,
+                    dbf = dbf_name(info.native_type),
+                    dbr = dbr_name(info.native_type),
+                    n = info.element_count,
                 );
+            }
+            Err(e) => {
+                eprintln!("{pv_name}: {e}");
                 failed = true;
             }
         }

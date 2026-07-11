@@ -568,18 +568,26 @@ async fn main() {
     // Route -p into the priority circuit (libca
     // `tool_lib.c` passes `caPriority` to `ca_create_channel`).
     let priority = args.priority.unwrap_or(0);
-    let channels: Vec<_> = args
-        .pv_names
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                client.create_channel_with_priority(name, priority),
-            )
-        })
-        .collect();
+    // C `caget.c:553-556`: `connect_pvs` gates the ENTIRE get+print phase.
+    // Any PV that fails to connect inside the one `ca_pend_io` window
+    // aborts before `caget()` runs, so stdout carries zero value lines and
+    // the tool exits 1 — a connected PV's value is NEVER printed alongside
+    // a missing PV's marker.
+    let channels =
+        match epics_ca_rs::cli::connect_pvs(&client, &args.pv_names, priority, timeout).await {
+            Ok(channels) => args
+                .pv_names
+                .iter()
+                .cloned()
+                .zip(channels)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
 
-    // Connect + read all PVs in parallel within single timeout window
+    // Read all PVs in parallel within a single timeout window
     // (C: connect_pvs → ca_pend_io → ca_array_get → ca_pend_io).
     // `-n`: render ENUM fields as the numeric index. Without it the
     // default readback requests the STRING form (state label), see the
@@ -630,10 +638,12 @@ async fn main() {
         let t = timeout;
         let ch = ch.clone();
         handles.push(tokio::spawn(async move {
-            let connect = ch.wait_connected(t).await;
-            if connect.is_err() {
-                return (name, Err("not connected".to_string()));
-            }
+            // Every channel is connected here — `connect_pvs` above is the
+            // barrier. A channel can still drop between the barrier and the
+            // GET (C: `ca_state != cs_conn` → `ECA_DISCONN`,
+            // `caget.c:219-221`), which surfaces below as a Disconnected
+            // read error and prints the same `*** not connected` marker.
+            //
             // Bound the CA payload at the request boundary and pick the
             // request-mode count contract (C `caget.c:197-218`): the
             // callback path (`-c`) sends a count-0 autosize request so a

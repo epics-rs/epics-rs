@@ -193,12 +193,21 @@ async fn main() {
             .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
     );
 
-    // -p selects the priority virtual circuit.
-    let ch = client.create_channel_with_priority(&pv_name, args.priority.unwrap_or(0));
-    if let Err(e) = ch.wait_connected(timeout).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+    // -p selects the priority virtual circuit. C `caput.c:406-410` runs the
+    // same `connect_pvs` barrier as caget/cainfo ("If the connection fails,
+    // we're done"): its ECA_TIMEOUT diagnostic names the single PV, and the
+    // put phase never starts.
+    let names = [pv_name.clone()];
+    let ch =
+        match epics_ca_rs::cli::connect_pvs(&client, &names, args.priority.unwrap_or(0), timeout)
+            .await
+        {
+            Ok(mut channels) => channels.remove(0),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
 
     // The channel's native field type drives how the value to WRITE is
     // encoded (C `ca_field_type`, caput.c:143) — it must stay the real

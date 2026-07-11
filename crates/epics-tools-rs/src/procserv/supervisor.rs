@@ -66,6 +66,10 @@ pub struct ProcServ {
     /// bind them itself, where a `?` failure already reaches the launching
     /// process directly.
     prebound: Option<Vec<PreboundListener>>,
+    /// The launching terminal, attached as a client in foreground mode
+    /// (C `AddConnection(clientFactory(0))`, `procServ.cc:568`). Built by
+    /// the binary, which owns the `inFgMode && logFile != "-"` gate.
+    console: Option<IncomingClient>,
 }
 
 impl ProcServ {
@@ -77,7 +81,18 @@ impl ProcServ {
         Ok(Self {
             config: Arc::new(config),
             prebound: None,
+            console: None,
         })
+    }
+
+    /// Attach the launching terminal as a client, so the operator types
+    /// into the child and sees its output inline (C `procServ.cc:566-569`).
+    /// Build it with [`crate::procserv::console::attach_console`]; it joins
+    /// the roster through the same path as an accepted socket, greeting and
+    /// all.
+    pub fn with_console(mut self, console: IncomingClient) -> Self {
+        self.console = Some(console);
+        self
     }
 
     /// Adopt listeners already bound in the foreground process (see
@@ -99,6 +114,13 @@ impl ProcServ {
     ///   wrapper that wires those into a shutdown signal)
     pub async fn run(self) -> ProcServResult<i32> {
         let mut state = SupervisorState::bootstrap(self.config, self.prebound).await?;
+        // C adds the console connection to the same list the accept items
+        // feed (`AddConnection`, `procServ.cc:568`), before the select
+        // loop starts — so the greeting is on screen before the child's
+        // first output.
+        if let Some(console) = self.console {
+            state.handle_new_client(console).await;
+        }
         state.event_loop().await
     }
 }
@@ -1171,6 +1193,80 @@ mod tests {
             restart_mode: RestartMode::OnExit,
             holdoff: Duration::from_millis(10),
             wait_for_manual_start: false,
+        }
+    }
+
+    /// R6-24 / C `procServ.cc:566-569`: in foreground mode the launching
+    /// terminal is a client like any other. It must land in the same
+    /// roster as an accepted socket, receive the same greeting, and feed
+    /// the same party-line inbound — that is what makes `^X` / `^R` and
+    /// typing into the IOC shell work without a separate telnet session.
+    #[tokio::test]
+    async fn console_client_joins_the_roster_and_the_party_line() {
+        use crate::procserv::client::{ClientPeer, ClientStream, IncomingClient};
+        use crate::procserv::console::ConsoleStream;
+
+        let mut state = SupervisorState::for_test(min_config());
+        let (keystrokes_tx, keystrokes_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (screen_tx, mut screen_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        state
+            .handle_new_client(IncomingClient {
+                stream: ClientStream::Console(ConsoleStream::from_channels(
+                    keystrokes_rx,
+                    screen_tx,
+                )),
+                peer: ClientPeer::Console,
+                readonly: false,
+            })
+            .await;
+
+        assert_eq!(
+            state.clients.len(),
+            1,
+            "the console must join the client roster (C AddConnection)"
+        );
+
+        // The greeting reaches the terminal, as it does an accepted socket
+        // (C writes it from the `clientItem` constructor).
+        let mut screen = Vec::new();
+        let banner = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match screen_rx.recv().await {
+                    Some(chunk) => {
+                        screen.extend_from_slice(&chunk);
+                        if String::from_utf8_lossy(&screen).contains("@@@ Welcome to procServ") {
+                            return true;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            banner,
+            Ok(true),
+            "the console must get the welcome banner; saw {:?}",
+            String::from_utf8_lossy(&screen)
+        );
+
+        // Keystrokes reach the supervisor's inbound — the same channel a
+        // telnet client's bytes arrive on, so the menu keys and the
+        // child's stdin work from the terminal.
+        keystrokes_tx
+            .send(b"dbl\r".to_vec())
+            .await
+            .expect("console read task is alive");
+        let typed = tokio::time::timeout(Duration::from_secs(2), state.inbound_rx.recv())
+            .await
+            .expect("keystrokes must reach the supervisor within 2s")
+            .expect("inbound channel open");
+        match typed.1 {
+            crate::procserv::client::InboundEvent::Data { bytes } => {
+                assert_eq!(bytes, b"dbl\r".to_vec(), "console input forwarded verbatim")
+            }
+            other => panic!("expected console keystrokes as Data, got {other:?}"),
         }
     }
 

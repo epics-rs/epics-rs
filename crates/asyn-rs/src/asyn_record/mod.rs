@@ -1858,12 +1858,32 @@ impl AsynRecord {
         }
     }
 
+    /// Refresh CNCT from the port's *transport* state — the single owner of
+    /// that field's value.
+    ///
+    /// C parity: CNCT is a readback, not a latch. `monitorStatus`
+    /// (asynRecord.c:1089-1093) assigns it from `pasynManager->isConnected` on
+    /// every cycle, and `isConnected` fails (→ CNCT=0) when the record is bound
+    /// to no port. It says nothing about whether *this record* found its port —
+    /// that is PCNCT (asynRecord.c:519-527, `connectDevice` /
+    /// `pasynManager->disconnect`). Driving CNCT anywhere else is what gave the
+    /// field two meanings: `connect_device` used to latch `cnct = 1` on a
+    /// successful *attach*, so a registered-but-unconnected port (noAutoConnect,
+    /// or a link that dropped) reported "Connected" on a dead wire.
+    fn refresh_connected_state(&mut self) {
+        let connected = match self.port_entry {
+            Some(ref entry) => entry.handle.is_connected_blocking().unwrap_or(false),
+            None => false,
+        };
+        self.cnct = i32::from(connected);
+    }
+
     /// Attempt to connect to the port specified in the PORT field.
     fn connect_device(&mut self) {
         if self.port.is_empty() {
             self.pcnct = 0;
-            self.cnct = 0;
             self.port_entry = None;
+            self.refresh_connected_state();
             self.clear_trace_exception_callback();
             return;
         }
@@ -1908,20 +1928,23 @@ impl AsynRecord {
                 // Read serial/IP options from driver
                 self.read_options_from_driver(&entry.handle);
 
-                // Mark connected
+                // Attached to the port (C `connectDevice` sets PCNCT=1,
+                // asynRecord.c:1305).
                 self.pcnct = 1;
-                self.cnct = 1;
                 // C asynRecord.c connectDevice queries the port's actual
-                // enable / auto-connect state into ENBL / AUCT — it must
-                // not force them to 1, which would discard a user who
-                // configured ENBL=0 or a port registered noAutoConnect.
-                // Keep the current field value if the query fails.
+                // enable / auto-connect / connect state into ENBL / AUCT /
+                // CNCT — it must not force them to 1, which would discard a
+                // user who configured ENBL=0 or a port registered
+                // noAutoConnect, and would claim a live wire on a port whose
+                // transport is down. Keep the current field value if the query
+                // fails.
                 if let Ok(enabled) = entry.handle.is_enabled_blocking() {
                     self.enbl = i32::from(enabled);
                 }
                 if let Ok(auto) = entry.handle.is_auto_connect_blocking() {
                     self.auct = i32::from(auto);
                 }
+                self.refresh_connected_state();
                 // Only clear errors if drv_user_create succeeded (don't mask the error)
                 if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
                     self.errs.clear();
@@ -1930,8 +1953,8 @@ impl AsynRecord {
             None => {
                 self.errs = format!("port '{}' not found", self.port);
                 self.pcnct = 0;
-                self.cnct = 0;
                 self.port_entry = None;
+                self.refresh_connected_state();
                 self.clear_trace_exception_callback();
             }
         }
@@ -2689,23 +2712,73 @@ impl Record for AsynRecord {
                 }
             }
 
-            // Connection management
+            // CNCT — connect / disconnect the port's *transport*. C
+            // `asynCallbackSpecial::callbackConnect` (asynRecord.c:537-539,
+            // 857-889): read `pasynManager->isConnected`, and only then call
+            // `pasynCommon->connect` (CNCT=1 on a disconnected port) or
+            // `pasynCommon->disconnect` (CNCT=0 on a connected one). The
+            // isConnected gate is C's, not defensive padding: connecting an
+            // already-connected port is an error in the drivers
+            // (drvAsynIPPort.c `connectIt`: "already connected"), and CNCT is
+            // written by monitorStatus on every cycle, so a re-put of the value
+            // the record just read back must not re-drive the wire.
+            //
+            // This is NOT the record↔port attachment — that is PCNCT below.
+            // CNCT used to be a duplicate of it (attach on 1, detach on 0),
+            // which left the driver's transport untouched: a CNCT=0 put
+            // orphaned the record while the socket stayed open, and CNCT=1
+            // could not bring a dropped link back up.
             "CNCT" => {
-                if self.cnct != 0 {
-                    self.connect_device();
-                } else {
-                    self.pcnct = 0;
-                    self.port_entry = None;
-                    self.clear_trace_exception_callback();
+                let want = self.cnct != 0;
+                match self.port_entry {
+                    Some(ref entry) => {
+                        let handle = entry.handle.clone();
+                        match handle.is_connected_blocking() {
+                            Ok(is_connected) => {
+                                let res = match (want, is_connected) {
+                                    (true, false) => Some(("connect", handle.connect_blocking())),
+                                    (false, true) => {
+                                        Some(("disconnect", handle.disconnect_blocking()))
+                                    }
+                                    // Already in the requested state: C issues
+                                    // no driver call at all.
+                                    _ => None,
+                                };
+                                if let Some((what, Err(e))) = res {
+                                    self.errs =
+                                        format!("asynCallbackSpecial callbackConnect {what}: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                self.errs = format!("asynCallbackSpecial isConnected error: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        self.errs = "asynCallbackSpecial isConnected error".to_string();
+                    }
                 }
+                // C monitorStatus re-reads CNCT from isConnected right after
+                // (asynRecord.c:1089-1093), so a refused or failed request
+                // snaps the field back to the wire's real state instead of
+                // leaving the operator's value latched.
+                self.refresh_connected_state();
             }
+
+            // PCNCT — attach / detach *this record* to the port. C
+            // asynRecord.c:519-527: `connectDevice` on 1;
+            // `exceptionCallbackRemove` + `pasynManager->disconnect` +
+            // `cancelIOInterruptScan` on 0. The driver's transport is not
+            // touched either way.
             "PCNCT" => {
                 if self.pcnct != 0 {
                     self.connect_device();
                 } else {
-                    self.cnct = 0;
                     self.port_entry = None;
                     self.clear_trace_exception_callback();
+                    // Detached: `isConnected` has no device to report on, which
+                    // is C's CNCT=0 (monitorStatus, :1091-1093).
+                    self.refresh_connected_state();
                 }
             }
 
@@ -3809,6 +3882,131 @@ mod tests {
         bin.process().unwrap();
         assert_eq!(bin.binp, b"abc".to_vec(), "partial bytes reach BINP too");
         assert_eq!(bin.nord, 3);
+    }
+
+    /// R8-51: CNCT drives the *driver's transport*, PCNCT the record↔port
+    /// attachment. C `special` routes a CNCT put to `asynCallbackSpecial`
+    /// (asynRecord.c:537-539), whose `callbackConnect` (:857-889) reads
+    /// `pasynManager->isConnected` and then calls `pasynCommon->connect` or
+    /// `->disconnect` — while PCNCT (:519-527) only runs `connectDevice` /
+    /// `pasynManager->disconnect`, never touching the wire. And CNCT is a
+    /// *readback*: `monitorStatus` (:1089-1093) assigns it from `isConnected`.
+    ///
+    /// Before the fix CNCT was a duplicate of PCNCT: a CNCT=0 put detached the
+    /// record and left the socket open, CNCT=1 could not raise a dropped link,
+    /// and `connect_device` latched CNCT=1 on a mere attach — so a
+    /// registered-but-disconnected port reported a live wire.
+    #[test]
+    fn cnct_drives_the_transport_and_pcnct_the_attachment() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        /// Counts the transport calls C would make through `pasynCommon`.
+        struct CountingDriver {
+            base: PortDriverBase,
+            connects: Arc<AtomicUsize>,
+            disconnects: Arc<AtomicUsize>,
+        }
+        impl PortDriver for CountingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn disconnect(&mut self, _user: &AsynUser) -> crate::error::AsynResult<()> {
+                self.disconnects.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(false);
+                Ok(())
+            }
+        }
+
+        let port_name = "test_cnct_transport";
+        let connects = Arc::new(AtomicUsize::new(0));
+        let disconnects = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(CountingDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                connects: connects.clone(),
+                disconnects: disconnects.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        // The actor auto-connected the port at startup; CNCT reads that back
+        // rather than latching on the attach.
+        assert_eq!(rec.cnct, 1, "CNCT is the port's transport state");
+        assert_eq!(rec.pcnct, 1, "PCNCT is the attachment");
+        let base_connects = connects.load(Ordering::SeqCst);
+
+        // CNCT=0 → pasynCommon->disconnect. The record stays attached.
+        rec.cnct = 0;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            disconnects.load(Ordering::SeqCst),
+            1,
+            "CNCT=0 must disconnect the driver's transport"
+        );
+        assert_eq!(rec.cnct, 0, "readback follows the wire");
+        assert_eq!(
+            rec.pcnct, 1,
+            "CNCT must not detach the record (that is PCNCT)"
+        );
+        assert!(
+            rec.port_entry.is_some(),
+            "CNCT must not drop the port binding"
+        );
+
+        // CNCT=1 on a disconnected port → pasynCommon->connect.
+        rec.cnct = 1;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            base_connects + 1,
+            "CNCT=1 must connect the driver's transport"
+        );
+        assert_eq!(rec.cnct, 1);
+
+        // C's isConnected gate: re-putting the state the port is already in
+        // issues no driver call at all (asynRecord.c:865-882).
+        rec.cnct = 1;
+        rec.special("CNCT", true).unwrap();
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            base_connects + 1,
+            "an already-connected port must not be re-connected"
+        );
+
+        // PCNCT=0 detaches the record and leaves the transport alone.
+        let disconnects_before = disconnects.load(Ordering::SeqCst);
+        rec.pcnct = 0;
+        rec.special("PCNCT", true).unwrap();
+        assert!(rec.port_entry.is_none(), "PCNCT=0 detaches the record");
+        assert_eq!(
+            disconnects.load(Ordering::SeqCst),
+            disconnects_before,
+            "PCNCT must not touch the driver's transport"
+        );
+        assert_eq!(
+            rec.cnct, 0,
+            "detached: isConnected has no device to report on (C :1091)"
+        );
     }
 
     /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`

@@ -781,6 +781,25 @@ impl PortHandle {
         let result = self.submit_blocking(RequestOp::GetAutoConnect, AsynUser::new(0))?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
+
+    /// Query whether the port's transport is connected (blocking) — C
+    /// `pasynManager->isConnected`.
+    pub fn is_connected_blocking(&self) -> AsynResult<bool> {
+        let result = self.submit_blocking(RequestOp::GetConnected, AsynUser::new(0))?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Connect the port's transport (blocking) — C `pasynCommon->connect`.
+    pub fn connect_blocking(&self) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::Connect, AsynUser::new(0))?;
+        Ok(())
+    }
+
+    /// Disconnect the port's transport (blocking) — C `pasynCommon->disconnect`.
+    pub fn disconnect_blocking(&self) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::Disconnect, AsynUser::new(0))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

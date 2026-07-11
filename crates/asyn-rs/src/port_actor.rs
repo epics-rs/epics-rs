@@ -272,6 +272,7 @@ impl PortActor {
                 | RequestOp::SetAutoConnect { .. }
                 | RequestOp::GetEnable
                 | RequestOp::GetAutoConnect
+                | RequestOp::GetConnected
                 | RequestOp::BlockProcess
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
@@ -614,6 +615,14 @@ impl PortActor {
             RequestOp::GetAutoConnect => {
                 let auto = self.driver.base().auto_connect;
                 Ok(RequestResult::int32_read(i32::from(auto)))
+            }
+            RequestOp::GetConnected => {
+                // C `pasynManager->isConnected`: the transport state the driver
+                // publishes, which `asynRecord` reads back into CNCT and gates
+                // its connect/disconnect request on (asynRecord.c:1089-1093,
+                // 858-888).
+                let connected = self.driver.base().is_connected();
+                Ok(RequestResult::int32_read(i32::from(connected)))
             }
             RequestOp::GetBoundsInt32 => {
                 let (low, high) = self.driver.get_bounds_int32(user)?;

@@ -250,6 +250,13 @@ pub enum RequestOp {
     SetOutputEos {
         eos: Vec<u8>,
     },
+    /// Query whether the port's *transport* is connected. C parity:
+    /// `pasynManager->isConnected` — the state the driver publishes through
+    /// `exceptionConnect`/`exceptionDisconnect`, not "is a record bound to
+    /// this port". `asynRecord` reads it in `monitorStatus` (asynRecord.c:
+    /// 1089-1093) to refresh CNCT, and gates its `callbackConnect` on it
+    /// (:858-888) so a CNCT put never re-connects an already-connected port.
+    GetConnected,
 }
 
 /// Result returned by the worker after executing a request.

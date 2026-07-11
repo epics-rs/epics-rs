@@ -152,8 +152,19 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
 /// when a graceful-shutdown signal arrives. Must be called from
 /// inside the tokio runtime — uses `tokio::signal::unix`.
 ///
+/// This is the single owner of the supervisor's signal *dispositions* —
+/// and, because an ignored disposition survives `execve`, of every
+/// disposition the child inherits that [`super::child`] does not
+/// explicitly reset. Any new `SIG_IGN` that C sets in its parent belongs
+/// here, not at a call site.
+///
 /// `SIGPIPE` is set to ignored synchronously (via `nix::sys::signal`)
 /// so a write to a dead client socket doesn't kill the supervisor.
+/// `SIGXFSZ` is ignored unconditionally, matching C
+/// (`procServ.cc:502-503`): a write past `RLIMIT_FSIZE` — an oversized
+/// log under a `ulimit -f` — must return `EFBIG` to the supervisor
+/// rather than kill it, and the child inherits the ignored disposition
+/// through `execvp` exactly as it does under C.
 /// `SIGTERM` is converted to a [`ShutdownSignal`] future. `SIGHUP` is
 /// deliberately NOT handled here — it means "reopen the log file"
 /// (logrotate), which the supervisor owns; if it were folded into the
@@ -189,6 +200,17 @@ pub async fn install_signal_handlers(in_fg_mode: bool) -> ShutdownSignal {
     unsafe {
         if let Err(e) = signal(Signal::SIGPIPE, SigHandler::SigIgn) {
             tracing::error!(error = %e, "procserv-rs: unable to ignore SIGPIPE; continuing");
+        }
+    }
+
+    // C `procServ.cc:502-503`: SIGXFSZ → SIG_IGN in the parent, in both
+    // modes. The child then inherits it ignored (SIG_IGN survives
+    // `execve`), which is why `child::restore_c_child_signal_environment`
+    // must not reset it.
+    // SAFETY: disposition-only (SIG_IGN); no userspace handler.
+    unsafe {
+        if let Err(e) = signal(Signal::SIGXFSZ, SigHandler::SigIgn) {
+            tracing::error!(error = %e, "procserv-rs: unable to ignore SIGXFSZ; continuing");
         }
     }
 
@@ -342,6 +364,38 @@ mod tests {
             disposition(libc::SIGQUIT),
             libc::SIG_IGN,
             "foreground mode must ignore SIGQUIT (C procServ.cc:506-507)"
+        );
+    }
+
+    /// R6-76 / C `procServ.cc:502-503`: `sigaction(SIGXFSZ, SIG_IGN)` runs
+    /// in the parent unconditionally — no `inFgMode` gate. A write past
+    /// `RLIMIT_FSIZE` (a `ulimit -f`-capped log) must fail with `EFBIG`,
+    /// not kill the supervisor, and the child must inherit the ignored
+    /// disposition through `execvp`.
+    #[tokio::test]
+    async fn sigxfsz_is_ignored_in_daemon_mode() {
+        assert_eq!(
+            disposition(libc::SIGXFSZ),
+            libc::SIG_DFL,
+            "precondition: SIGXFSZ starts at its default disposition"
+        );
+        let _shutdown = install_signal_handlers(false).await;
+        assert_eq!(
+            disposition(libc::SIGXFSZ),
+            libc::SIG_IGN,
+            "SIGXFSZ must be ignored in the parent (C procServ.cc:502-503)"
+        );
+    }
+
+    /// Same set in foreground mode — the C call sits above the `inFgMode`
+    /// block, so both modes must land on `SIG_IGN`.
+    #[tokio::test]
+    async fn sigxfsz_is_ignored_in_foreground_mode() {
+        let _shutdown = install_signal_handlers(true).await;
+        assert_eq!(
+            disposition(libc::SIGXFSZ),
+            libc::SIG_IGN,
+            "SIGXFSZ must be ignored in foreground mode too"
         );
     }
 

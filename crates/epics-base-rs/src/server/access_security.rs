@@ -1295,13 +1295,9 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
             "HAG" => {
                 let name = read_paren_name(&mut chars)?;
                 let members = read_brace_list(&mut chars)?;
-                // store every HAG host lowercased — C
-                // `asHagAddHost` (asLibRoutines.c:1218-1256)
-                // `tolower()`s each host char so host matching is
-                // case-insensitive.
-                let lowered: Vec<String> = members.iter().map(|m| m.to_ascii_lowercase()).collect();
-                let expanded = expand_hag_members(&lowered);
-                config.hag.insert(name, expanded);
+                // C `asHagAddHost` reads `asCheckClientIP` at ACF-parse
+                // time and stores names or resolved IPs accordingly.
+                config.hag.insert(name, hag_members(&members));
             }
             "ASG" => {
                 let name = read_paren_name(&mut chars)?;
@@ -1449,54 +1445,81 @@ fn skip_unknown_top_level_block(
     Ok(())
 }
 
-/// Expand HAG members with their resolved IP addresses for soft
-/// hostname matching.
+/// C `asCheckClientIP` (`asLibRoutines.c:34`) — process-global, default
+/// `0`/false, set from the shell before the ACF is loaded.
 ///
-/// Mirrors epics-base libcom commit 932e9f3 ("asLib: soft fallback on
-/// DNS lookup failure"). Upstream resolves each hostname to its IP at
-/// parse time and matches the connecting client's IP against the
-/// resolved set; the fix made DNS failure a non-fatal warning instead
-/// of an `abort()`.
+/// It is the **single owner of what a host identity means** across access
+/// security, and it decides two things that must agree or nothing matches:
 ///
-/// We keep the original behaviour of matching the literal HOST_NAME
-/// the client sent over CA (which is what the CA protocol gives us —
-/// `HOST_NAME` is the peer's self-reported hostname, not its IP) and
-/// additionally append every resolved IPv4/IPv6 literal so an
-/// IP-presenting client (gateway, NATed peer with no reverse DNS) still
-/// matches. DNS failures are dropped silently — the parser never
-/// aborts, so a single bad entry doesn't deny the entire IOC.
-fn expand_hag_members(members: &[String]) -> Vec<String> {
+/// * how `HAG` members are stored ([`hag_members`]) — lowercased literal
+///   names, or resolved dotted-quad IPs;
+/// * what the CA server records as a client's host — the name the client
+///   claims over `CA_PROTO_HOST_NAME`, or its peer IP
+///   (`camessage.c:839-843`, `caservertask.c:1425-1437`).
+///
+/// C's default is `0`: rsrv stores the client-supplied hostname
+/// unconditionally and HAGs match on names. The IP-checking mode is opt-in.
+static AS_CHECK_CLIENT_IP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read the [`AS_CHECK_CLIENT_IP`] mode.
+pub fn as_check_client_ip() -> bool {
+    AS_CHECK_CLIENT_IP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the [`AS_CHECK_CLIENT_IP`] mode. C exposes this as an iocsh
+/// *variable* (`var asCheckClientIP 1`, registered in
+/// `libComRegister.c:476`); this port has no iocsh variable mechanism, so
+/// the closest idiom is the `asCheckClientIP <0|1>` iocsh command that
+/// calls this.
+///
+/// Ordering is C's: [`hag_members`] reads the flag when the ACF is
+/// *parsed*, so — exactly as in C — it must be set **before** `asInit`,
+/// or the HAG entries are stored in the wrong form.
+pub fn set_as_check_client_ip(on: bool) {
+    AS_CHECK_CLIENT_IP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Store one HAG's members the way C `asHagAddHost`
+/// (`asLibRoutines.c:1218-1256`) does, which depends on
+/// [`as_check_client_ip`]:
+///
+/// * **default (`false`)** — each host is stored as a lowercased literal
+///   name. The client identity it is matched against is the name the
+///   client claimed over `CA_PROTO_HOST_NAME`, so no DNS is involved on
+///   either side.
+/// * **`true`** — each host is resolved to a dotted-quad IP at parse time;
+///   an unresolvable entry is stored as `unresolved:<host>` (C's own
+///   sentinel, which simply never matches) rather than aborting the load.
+///   The client identity is then the peer IP.
+///
+/// The two halves are read from the same flag on purpose: a mixed
+/// configuration (names on one side, IPs on the other) matches nothing,
+/// which is precisely the R7-16 defect.
+fn hag_members(members: &[String]) -> Vec<String> {
+    if !as_check_client_ip() {
+        return members.iter().map(|m| m.to_ascii_lowercase()).collect();
+    }
+
     use std::net::ToSocketAddrs;
-    let mut out: Vec<String> = Vec::with_capacity(members.len());
-    for m in members {
-        out.push(m.clone());
-        // Bare IP literal: nothing more to add — `m` already covers
-        // the IP-match path. The to_socket_addrs() trick below would
-        // round-trip an IP to itself, but skipping the syscall keeps
-        // ACF reload latency proportional to actual hostnames.
-        if m.parse::<std::net::IpAddr>().is_ok() {
-            continue;
-        }
-        match format!("{m}:0").to_socket_addrs() {
-            Ok(iter) => {
-                for sa in iter {
-                    let ip = sa.ip().to_string();
-                    if !out.iter().any(|s| s == &ip) {
-                        out.push(ip);
-                    }
-                }
-            }
+    members
+        .iter()
+        .map(|m| match format!("{m}:0").to_socket_addrs() {
+            Ok(mut iter) => match iter.next() {
+                Some(sa) => sa.ip().to_string(),
+                None => format!("unresolved:{m}"),
+            },
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     target: "epics_base_rs::access_security",
                     host = %m,
                     error = %e,
-                    "ACF HAG: DNS lookup failed; keeping literal entry (libcom 932e9f3 soft fallback)"
+                    "ACF: Unable to resolve host (asCheckClientIP=1)"
                 );
+                format!("unresolved:{m}")
             }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 fn skip_ws_comments(chars: &mut std::iter::Peekable<std::str::Chars>) {
@@ -2090,13 +2113,47 @@ ASG(SECURE) {
         assert_eq!(config.hag["lab"], vec!["lab-pc1.invalid"]);
     }
 
+    /// R7-16 / C `asHagAddHost` (`asLibRoutines.c:1218-1256`): with
+    /// `asCheckClientIP` at its default 0, a HAG host is stored as a
+    /// lowercased **name** and nothing else — no DNS runs, and no resolved
+    /// IP is appended. The identity it matches is the name the client
+    /// claimed over `CA_PROTO_HOST_NAME`, so a peer IP must NOT match.
+    ///
+    /// The port used to append resolved IPs to every entry, because its CA
+    /// server keyed ACF on the peer IP. Both halves are C's now.
     #[test]
-    fn hag_dns_resolution_appends_ip_for_match() {
-        // Loopback name `localhost` is universally resolvable on
-        // Linux/macOS/Windows. The expansion must add 127.0.0.1 (and
-        // optionally ::1) alongside the literal entry so a peer
-        // presenting `127.0.0.1` as its HOST_NAME still matches the
-        // HAG, mirroring upstream's IP-based comparison.
+    fn hag_stores_names_by_default() {
+        set_as_check_client_ip(false);
+        let acf = r#"
+HAG(local) { LocalHost }
+ASG(DEFAULT) {
+    RULE(1, WRITE) { HAG(local) }
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.hag["local"],
+            vec!["localhost"],
+            "C stores the lowercased literal name and resolves nothing"
+        );
+        assert_eq!(
+            config.check_access("DEFAULT", "localhost", "alice"),
+            AccessLevel::ReadWrite,
+            "the claimed host name matches the HAG"
+        );
+        assert_eq!(
+            config.check_access("DEFAULT", "127.0.0.1", "alice"),
+            AccessLevel::NoAccess,
+            "a peer IP does not match a name HAG — that is what asCheckClientIP=1 is for"
+        );
+    }
+
+    /// The other side of C's flag: `asCheckClientIP = 1` resolves every HAG
+    /// host to a dotted-quad IP at ACF-parse time, and the CA server keys
+    /// on the peer IP.
+    #[test]
+    fn hag_stores_resolved_ips_under_as_check_client_ip() {
+        set_as_check_client_ip(true);
         let acf = r#"
 HAG(local) { localhost }
 ASG(DEFAULT) {
@@ -2104,15 +2161,28 @@ ASG(DEFAULT) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        let entries = &config.hag["local"];
-        assert!(
-            entries.contains(&"localhost".to_string()),
-            "literal hostname always preserved"
+        set_as_check_client_ip(false); // restore before asserting
+        assert_eq!(
+            config.hag["local"],
+            vec!["127.0.0.1"],
+            "C resolves the host to its IP under asCheckClientIP"
         );
-        assert!(
-            entries.iter().any(|s| s == "127.0.0.1"),
-            "resolved IPv4 appended for IP-presenting peers"
+        assert_eq!(
+            config.check_access("DEFAULT", "127.0.0.1", "alice"),
+            AccessLevel::ReadWrite,
+            "the peer IP matches the resolved HAG"
         );
+    }
+
+    /// C `asHagAddHost` under `asCheckClientIP = 1` does not abort on a
+    /// name it cannot resolve: it logs and stores `unresolved:<host>`, a
+    /// sentinel that simply never matches.
+    #[test]
+    fn hag_unresolvable_under_as_check_client_ip_becomes_sentinel() {
+        set_as_check_client_ip(true);
+        let config = parse_acf("HAG(lab) { lab-pc1.invalid }\n").unwrap();
+        set_as_check_client_ip(false);
+        assert_eq!(config.hag["lab"], vec!["unresolved:lab-pc1.invalid"]);
     }
 
     #[test]

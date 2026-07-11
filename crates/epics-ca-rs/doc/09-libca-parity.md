@@ -82,7 +82,7 @@ the C ABI surface**. Details below.
 | Hostname-based access | ✅ | ✅ |
 | Username-based access | ✅ | ✅ |
 | INPA-INPL evaluation in rules | ✅ | ⚠️ partial |
-| `EPICS_CAS_USE_HOST_NAMES` toggle | ✅ | ✅ (default `NO`, peer IP authoritative) |
+| `asCheckClientIP` toggle | ✅ (iocsh var) | ✅ (iocsh command; default `0`, client-claimed name authoritative) |
 | Reverse-DNS lookup | ⚠️ (most builds skip) | ❌ |
 | Late access-rights re-evaluation on HOST/CLIENT_NAME change | ✅ | ✅ |
 | `CA_PROTO_ACCESS_RIGHTS` event broadcast | ✅ | ✅ |
@@ -156,24 +156,28 @@ link libca directly.
 A few cases where `epics-ca-rs` deliberately diverges from libca,
 typically for safety or simplicity:
 
-1. **Default `EPICS_CAS_USE_HOST_NAMES = NO`**. libca's default
-   varies by version; rsrv usually defaults to `NO`. We hard-pin to
-   `NO` for security.
-
-2. **Per-client subscriber mpsc bounded at 64 on the server**. libca's
+1. **Per-client subscriber mpsc bounded at 64 on the server**. libca's
    per-record event queue is a free-list with overflow tracking. We
    substitute a fixed bounded queue + coalesce slot which has
    equivalent observable behaviour but smaller code surface.
 
-3. **`CaClient::drop` aborts tasks immediately**. libca has a graceful
+2. **`CaClient::drop` aborts tasks immediately**. libca has a graceful
    `ca_context_destroy` that waits for in-flight callbacks. Use
    `CaClient::shutdown().await` for graceful semantics.
 
-4. **No `READ_BUILD` (cmd=16) or `SIGNAL` (cmd=25) handling**. Both
+3. **No `READ_BUILD` (cmd=16) or `SIGNAL` (cmd=25) handling**. Both
    are deprecated; modern clients don't emit them. Server replies
    with `CA_PROTO_ERROR` if it ever sees one.
 
-5. **DBR_STSACK_STRING ackt/acks for SimplePv = 0**. libca returns the
+An earlier revision of this list opened with a fourth item: a hard-pinned
+`EPICS_CAS_USE_HOST_NAMES = NO` default, described as matching rsrv. That
+was not a deliberate divergence but a mistake — no such variable exists
+anywhere in epics-base, and rsrv's real default is the opposite: it trusts
+the client-supplied hostname, and `asCheckClientIP` is the opt-in for IP
+matching. The port now follows C in both modes (R7-16); see
+`08-environment.md`.
+
+4. **DBR_STSACK_STRING ackt/acks for SimplePv = 0**. libca returns the
    record's actual ACKT/ACKS; we substitute 0 for `SimplePv` (which
    has no record-level alarm-acknowledge state). Records work
    identically.

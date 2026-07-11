@@ -273,9 +273,11 @@ const C_CHILD_BLOCKED_SIGNALS: [Signal; 3] = [Signal::SIGPIPE, Signal::SIGTERM, 
 /// site override) is not in the blocked set, so both real kill paths still work —
 /// exactly as they do, and don't, under C.
 ///
-/// SIGINT/SIGQUIT are deliberately untouched: in foreground mode C sets them to
-/// `SIG_IGN` (`procServ.cc:504-508`) and an ignored disposition is inherited
-/// through `execvp`, which is already what the port's child sees.
+/// SIGINT/SIGQUIT/SIGXFSZ are deliberately untouched: C sets them to `SIG_IGN`
+/// in the parent (`procServ.cc:502-508`; SIGINT/SIGQUIT only in foreground mode,
+/// SIGXFSZ always) and an ignored disposition is inherited through `execvp`,
+/// which is already what the port's child sees now that
+/// [`super::daemon::install_signal_handlers`] owns the parent dispositions.
 ///
 /// Async-signal-safe (`sigaction`/`pthread_sigmask` only), as required between
 /// `fork` and `exec`. Failures are unreportable here and non-fatal — the child

@@ -127,8 +127,13 @@ fn drained_socket_probe() -> OsRecvQueueProbe {
     std::sync::Arc::new(|| false)
 }
 
-/// Default echo interval (matches C EPICS CA_CONN_VERIFY_PERIOD).
-/// Overridden by EPICS_CA_CONN_TMO environment variable.
+/// `EPICS_CA_CONN_TMO` — C's `cac::connectionTimeout()`, default 30 s.
+///
+/// One knob, two uses, exactly as in C: it is the idle interval after
+/// which a circuit sends CA_PROTO_ECHO, and it is the retry cadence a
+/// name-service circuit waits out after a failed connect
+/// (`tcpiiu.cpp:653-657`). Not a connect *deadline* — C's `::connect()`
+/// blocks under the OS timeout, and nothing caps it.
 ///
 /// C `cac.cpp:186-194` parses CONN_TMO as `double` and falls
 /// back to the default (30 s) on parse failure, on `<= 0.0`, AND on
@@ -140,7 +145,7 @@ fn drained_socket_probe() -> OsRecvQueueProbe {
 /// instead of falling back to the default. Match C: keep as
 /// `Duration` with full sub-second precision; only `parse error`
 /// or `value <= 0.0` falls back to the default.
-fn echo_idle() -> Duration {
+pub(crate) fn connection_timeout() -> Duration {
     epics_base_rs::runtime::env::get("EPICS_CA_CONN_TMO")
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
@@ -150,9 +155,9 @@ fn echo_idle() -> Duration {
 /// Legacy seconds accessor kept for call sites that need a coarse
 /// number (e.g. `tokio::time::sleep(Duration::from_secs(N))` over a
 /// long interval where sub-second precision does not matter). New
-/// timer code should call `echo_idle()` directly.
+/// timer code should call `connection_timeout()` directly.
 fn echo_idle_secs() -> u64 {
-    let d = echo_idle();
+    let d = connection_timeout();
     d.as_secs().max(1)
 }
 
@@ -875,19 +880,19 @@ async fn connect_server(
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
     tracing::debug!(server = %server_addr, "establishing TCP virtual circuit");
-    let stream = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TcpStream::connect(server_addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    // No application-level connect deadline. C `tcpRecvThread::connect`
+    // (`tcpiiu.cpp:606-661`) issues a *blocking* `::connect()` and lets the
+    // OS TCP stack bound it — on Linux that is tcp_syn_retries, ~130 s of
+    // exponentially backed-off SYNs. A hardcoded 5 s cap here made every
+    // server whose handshake takes longer than that (SYN-lossy path,
+    // congested WAN link) permanently unreachable from the port while a C
+    // client on the same wire connects fine. The search engine retries the
+    // address on its own cadence if this attempt fails, which is what C's
+    // `disconnectNotify` + `break` leaves to the same layer.
+    let stream = match TcpStream::connect(server_addr).await {
+        Ok(s) => s,
+        Err(e) => {
             tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!(server = %server_addr, "TCP connect timed out");
             return None;
         }
     };
@@ -1214,7 +1219,7 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
     // socket error (`Err`) or a 0-byte accept still closes (`TcpClosed`):
     // those are a dead socket, not a slow one, mirroring C's `flushToWire`
     // failure → `shutdown(SHUT_WR)` teardown (`tcpiiu.cpp:168-176`).
-    let send_timeout = echo_idle();
+    let send_timeout = connection_timeout();
     let mut batch = Vec::with_capacity(4096);
     while let Some(frame) = rx.recv().await {
         let mut drained: usize = 1;
@@ -3220,7 +3225,7 @@ mod write_loop_timeout_tests {
             .expect("frame enqueue must succeed");
 
         // First event on the stall must be CircuitUnresponsive (keep the
-        // socket), never TcpClosed. `echo_idle()` (default CONN_TMO 30 s)
+        // socket), never TcpClosed. `connection_timeout()` (default CONN_TMO 30 s)
         // elapses on the paused clock and the send watchdog fires.
         let evt = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
             .await
@@ -3382,6 +3387,87 @@ mod write_loop_timeout_tests {
             "the gate must be set once the idle-recv stall fires"
         );
         task.abort();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod connect_deadline_tests {
+    //! R7-19: the client must impose **no** application-level deadline on
+    //! the TCP connect.
+    //!
+    //! C `tcpRecvThread::connect` (`tcpiiu.cpp:606-661`) issues a blocking
+    //! `::connect()` and lets the OS TCP stack bound it — on Linux ~130 s
+    //! of exponentially backed-off SYN retries. The port capped it at a
+    //! hardcoded 5 s, so a server whose handshake is slow but alive (SYN
+    //! loss, congested WAN) was reachable from a C client on the same wire
+    //! and unreachable from this one.
+    use super::*;
+    use crate::client::types::{InFlightOps, ServerLastRxAt};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A local address whose SYNs the kernel drops: a listening socket
+    /// with a full accept queue. Linux (`tcp_abort_on_overflow = 0`, the
+    /// default) answers an overflowing SYN with silence, so the connecting
+    /// peer sits in SYN-SENT and retries — exactly the "slow but live
+    /// server" shape, without needing a route off the box.
+    ///
+    /// Returns the blackhole address and the listener, which the caller
+    /// must keep alive (and must never accept from).
+    fn syn_blackhole() -> (SocketAddr, socket2::Socket, std::net::TcpStream) {
+        use socket2::{Domain, Socket, Type};
+
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .expect("bind");
+        // Backlog 0 → the kernel rounds to a 1-slot accept queue.
+        sock.listen(0).expect("listen");
+        let addr: SocketAddr = sock.local_addr().expect("local_addr").as_socket().unwrap();
+
+        // Fill the single accept-queue slot. This handshake completes; the
+        // *next* SYN is the one that gets dropped. Held for the test's
+        // lifetime so the queue stays full.
+        let filler = std::net::TcpStream::connect(addr).expect("fill accept queue");
+
+        (addr, sock, filler)
+    }
+
+    /// With `start_paused`, tokio auto-advances virtual time whenever the
+    /// runtime is otherwise idle — so any timer left in the connect path
+    /// fires immediately while the real SYN is still in flight. The outer
+    /// 10-minute timeout is therefore the *only* timer that may fire: if
+    /// it does, the connect had no deadline of its own, which is the
+    /// contract. Pre-fix, the inner 5 s cap fired first and `connect_server`
+    /// resolved to `None`.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connect_has_no_application_level_deadline() {
+        let (addr, _listener, _filler) = syn_blackhole();
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let identity = Arc::new(parking_lot::RwLock::new(
+            crate::client::types::ClientIdentity::from_env(),
+        ));
+        let connect = connect_server(
+            addr,
+            0,
+            event_tx,
+            InFlightOps::new(),
+            ServerLastRxAt::default(),
+            identity,
+            #[cfg(feature = "experimental-rust-tls")]
+            None,
+            #[cfg(feature = "experimental-rust-tls")]
+            None,
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(600), connect).await;
+        assert!(
+            outcome.is_err(),
+            "connect must still be in the OS's hands after 10 minutes of virtual time; \
+             it resolved instead ({:?}), which means an application-level deadline fired \
+             (C tcpiiu.cpp:606-661 has none)",
+            outcome.map(|c| c.is_some())
+        );
     }
 }
 

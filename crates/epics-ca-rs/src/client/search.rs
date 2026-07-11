@@ -442,8 +442,8 @@ pub(crate) async fn run_search_engine(
     }
 
     // Spawn a connection task per EPICS_CA_NAME_SERVERS entry.
-    // Each task auto-reconnects with exponential backoff and forwards
-    // outgoing search bytes to its TCP socket. Incoming responses are
+    // Each task auto-reconnects on C's EPICS_CA_CONN_TMO cadence and
+    // forwards outgoing search bytes to its TCP socket. Incoming responses are
     // queued via tcp_response_tx for the main loop to process through
     // the shared handle_udp_response parser.
     let (tcp_response_tx, mut tcp_response_rx) = mpsc::unbounded_channel::<ParsedDatagram>();
@@ -629,28 +629,37 @@ pub(crate) async fn run_search_engine(
 
 /// Long-lived task: maintain a TCP connection to one nameserver, forward
 /// outgoing search bytes from `outgoing_rx`, and feed parsed response
-/// frames into `response_tx`. Reconnects with exponential backoff on
-/// failure.
+/// frames into `response_tx`.
+///
+/// This is libca's name-service circuit (`tcpiiu::isNameService()`), and
+/// C's retry rule for it is a fixed cadence, not a backoff:
+/// `tcpRecvThread::connect` (`tcpiiu.cpp:606-661`) issues a *blocking*
+/// `::connect()` — bounded by the OS, never by an application deadline —
+/// and on failure sleeps `cacRef.connectionTimeout()` (EPICS_CA_CONN_TMO,
+/// default 30 s) before trying the same address again, indefinitely. The
+/// port's 5 s connect cap plus 1→30 s exponential backoff diverged in
+/// both directions: it abandoned a slow-but-live name server C would have
+/// reached, and it hammered a down one far harder than C does.
 async fn run_nameserver_connection(
     addr: SocketAddr,
     mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
 ) {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
-
     loop {
-        let stream =
-            match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-                Ok(Ok(s)) => s,
-                _ => {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
-                    continue;
-                }
-            };
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(
+                    target: "epics_ca_rs::client::search",
+                    nameserver = %addr,
+                    error = %e,
+                    "EPICS_CA_NAME_SERVERS connect failed; retrying after EPICS_CA_CONN_TMO"
+                );
+                tokio::time::sleep(super::transport::connection_timeout()).await;
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
-        backoff = Duration::from_secs(1);
 
         let (mut reader, mut writer) = stream.into_split();
 
@@ -678,7 +687,7 @@ async fn run_nameserver_connection(
             &epics_base_rs::runtime::env::hostname(),
         ));
         if writer.write_all(&handshake).await.is_err() {
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(super::transport::connection_timeout()).await;
             continue;
         }
 
@@ -831,10 +840,10 @@ async fn run_nameserver_connection(
         }
 
         if writer_failed {
-            // Brief pause before reconnect to avoid a spin loop when the
-            // nameserver is fully unreachable.
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(max_backoff);
+            // Same cadence as a failed connect: one knob (CONN_TMO), so a
+            // nameserver that accepts and immediately drops cannot be
+            // hammered any harder than one that refuses outright.
+            tokio::time::sleep(super::transport::connection_timeout()).await;
         }
     }
 }

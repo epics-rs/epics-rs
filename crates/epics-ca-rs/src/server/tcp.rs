@@ -128,31 +128,6 @@ mod cap_parse_tests {
     }
 }
 
-/// Forward-DNS verification for `EPICS_CAS_USE_HOST_NAMES=YES`.
-///
-/// Resolve `claimed` (the client-supplied hostname) to a list of IPs
-/// and require `peer` (the actual TCP peer IP) to appear among them.
-/// Returns `true` only when a match is found, `false` on resolution
-/// failure or mismatch — fail closed.
-///
-/// Done via `tokio::net::lookup_host` which dispatches to the
-/// platform resolver (getaddrinfo), so honours `/etc/hosts`, NIS,
-/// LDAP, etc. The DNS lookup is per-HOST_NAME-message so the cost
-/// is paid once per CA client connection, not per put / per
-/// channel.
-async fn host_resolves_to_peer(claimed: &str, peer: std::net::IpAddr) -> bool {
-    if claimed.is_empty() {
-        return false;
-    }
-    // `lookup_host` requires a port — a sentinel `:0` is fine since
-    // we discard everything except the IP.
-    let target = format!("{claimed}:0");
-    match tokio::net::lookup_host(target).await {
-        Ok(mut iter) => iter.any(|sa| sa.ip() == peer),
-        Err(_) => false,
-    }
-}
-
 /// Per-socket send timeout. Without this, a client that stops
 /// reading (frozen GUI, dead viewer holding the socket open) causes
 /// every server `write` to block once the kernel send buffer fills,
@@ -481,7 +456,10 @@ struct ClientState {
     /// (LIFO) so the most-recently-freed SID is reused first —
     /// keeps the active set's SIDs clustered near the low end.
     free_sids: Vec<u32>,
-    hostname: String,
+    /// This circuit's access-security host identity. See [`HostIdentity`]
+    /// — the variant, not a runtime check at the write site, decides
+    /// whether `CA_PROTO_HOST_NAME` may replace it.
+    hostname: HostIdentity,
     username: String,
     /// Authentication method for ACF `METHOD()` clause matching.
     /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
@@ -554,6 +532,78 @@ struct ClientState {
     stats: Option<Arc<super::ca_server::ServerStats>>,
 }
 
+/// The access-security host identity of one CA circuit, and — by
+/// construction — whether the client may still set it.
+///
+/// C keeps this in `client->pHostName` and decides at accept time, from
+/// the global `asCheckClientIP` (`asLibRoutines.c:34`, default 0), which
+/// of two things that pointer means:
+///
+/// * `asCheckClientIP == 0` (**C's default**) — `create_tcp_client` leaves
+///   it NULL and `host_name_action` stores whatever name the client sends
+///   in `CA_PROTO_HOST_NAME`, unconditionally (`camessage.c:845-875`).
+///   Until then the identity is `""` (`camessage.c:770` passes
+///   `pHostName ? pHostName : ""` to `asAddClient`), which matches no HAG.
+///   HAG entries are host *names* in this mode, so this is the identity
+///   `HOST(...)` rules are written against.
+/// * `asCheckClientIP == 1` — `create_tcp_client` fills it with the peer's
+///   dotted-quad IP (`caservertask.c:1425-1437`) and `host_name_action`
+///   returns early without storing the claimed name
+///   (`camessage.c:839-843`).
+///
+/// The port adds a third source with no C counterpart: an mTLS-verified
+/// certificate identity, which likewise cannot be overwritten by a
+/// client-supplied name.
+///
+/// Modelling this as two variants rather than a `String` plus an "is it
+/// allowed to change?" check at the write site is what makes the illegal
+/// transition unrepresentable: [`Self::claim`] is the only writer, and it
+/// is a no-op on a [`Self::Pinned`] identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostIdentity {
+    /// C's default: the name the client claims. Empty until
+    /// `CA_PROTO_HOST_NAME` arrives.
+    Claimed(String),
+    /// Derived from the connection itself — the peer IP under
+    /// `asCheckClientIP`, or an mTLS-verified cert identity. A
+    /// client-supplied name never replaces it.
+    Pinned(String),
+}
+
+impl HostIdentity {
+    /// The identity string ACF/HAG matching runs against.
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Claimed(h) | Self::Pinned(h) => h,
+        }
+    }
+
+    /// Apply a `CA_PROTO_HOST_NAME` claim. Returns whether it was taken —
+    /// `false` on a [`Self::Pinned`] identity, which is C's
+    /// `host_name_action` early return under `asCheckClientIP`.
+    fn claim(&mut self, name: String) -> bool {
+        match self {
+            Self::Claimed(h) => {
+                *h = name;
+                true
+            }
+            Self::Pinned(_) => false,
+        }
+    }
+}
+
+/// What [`ClientState::refuse_message`] left for the parse loop to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// The whole body was already buffered — nothing to drain from
+    /// future reads. Resume parsing at this offset.
+    ResumeAt(usize),
+    /// The body has not fully arrived. Everything still in the buffer
+    /// belongs to the refused message, and `recv_bytes_to_drain` carries
+    /// the shortfall for the reader loop's drain preamble.
+    DrainPending,
+}
+
 impl ClientState {
     fn new(
         acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
@@ -567,7 +617,7 @@ impl ClientState {
             channel_trap: HashMap::new(),
             next_sid: AtomicU32::new(1),
             free_sids: Vec::new(),
-            hostname: String::new(),
+            hostname: HostIdentity::Claimed(String::new()),
             username: String::new(),
             auth_method: String::new(),
             auth_authority: String::new(),
@@ -592,6 +642,37 @@ impl ClientState {
         }
     }
 
+    /// Refuse the message that starts at `offset` **without tearing the
+    /// circuit down**: discard exactly its `msg_len` bytes and let the
+    /// stream resume at the next message.
+    ///
+    /// This is the single owner of [`Self::recv_bytes_to_drain`]. C's
+    /// `camessage` refuses a message the same way at both of its
+    /// refuse-but-keep-serving sites — ECA_DEFUNCT
+    /// (`camessage.c:2438-2439`) and ECA_TOLARGE (`:2484-2486`): the error
+    /// goes out on the wire, `recvBytesToDrain` remembers the part of the
+    /// body that has not arrived yet, and `camessage`'s drain preamble
+    /// (`:2375-2383`) throws those bytes away as they land. Neither closes
+    /// the connection — every channel and subscription on the circuit
+    /// survives.
+    ///
+    /// `buffered` is the total length of the accumulation buffer, so
+    /// `buffered - offset` is what has actually arrived of this message.
+    /// The accounting is exact in both directions, which is why callers
+    /// never need to reason about the field themselves: a body that is
+    /// already fully buffered leaves nothing to drain and parsing resumes
+    /// in-buffer, while a short body carries only the shortfall forward.
+    fn refuse_message(&mut self, buffered: usize, offset: usize, msg_len: usize) -> Refused {
+        let arrived = buffered - offset;
+        match msg_len.checked_sub(arrived) {
+            None | Some(0) => Refused::ResumeAt(offset + msg_len),
+            Some(shortfall) => {
+                self.recv_bytes_to_drain = shortfall;
+                Refused::DrainPending
+            }
+        }
+    }
+
     async fn audit(&self, event: &str, pv: &str, value: &str, result: &str) {
         if let Some(ref logger) = self.audit {
             logger
@@ -599,7 +680,7 @@ impl ClientState {
                     event,
                     peer: &self.peer,
                     user: &self.username,
-                    host: &self.hostname,
+                    host: self.hostname.as_str(),
                     pv,
                     value,
                     result,
@@ -701,7 +782,7 @@ impl ClientState {
         };
         cfg.compute_for_name(
             asg_name,
-            &self.hostname,
+            self.hostname.as_str(),
             &self.username,
             &[],
             asl,
@@ -724,7 +805,7 @@ impl ClientState {
                 // access. The gateway audits/traps writes in its own
                 // write hook, so no TRAPWRITE rule resolves here.
                 if let Some(hook) = pv.access_hook() {
-                    let decision = hook(&self.username, &self.hostname);
+                    let decision = hook(&self.username, self.hostname.as_str());
                     let bits = match (decision.read, decision.write) {
                         (_, true) => 3,
                         (true, false) => 1,
@@ -1344,10 +1425,23 @@ where
         state.cap_token_verifier = cap_token_verifier;
         state.tls_channel_binding = tls_channel_binding;
     }
-    // Default hostname: verified TLS identity if present, otherwise the
-    // peer IP. Matches C rsrv default with EPICS_CAS_USE_HOST_NAMES=NO,
-    // upgraded transparently when mTLS is in effect.
-    state.hostname = initial_hostname.unwrap_or_else(|| peer.ip().to_string());
+    // The circuit's ACF host identity is decided once, here — C decides it
+    // in `create_tcp_client` (`caservertask.c:1425-1437`) for exactly the
+    // same reason. See `HostIdentity`.
+    state.hostname = match initial_hostname {
+        // Port extension, no C counterpart: an mTLS-verified cert identity
+        // outranks both of C's modes and no client-supplied name replaces
+        // it (doc/11-tls-design.md).
+        Some(verified) => HostIdentity::Pinned(verified),
+        // C `asCheckClientIP == 1`: the peer's address is the identity and
+        // CA_PROTO_HOST_NAME is ignored.
+        None if epics_base_rs::server::access_security::as_check_client_ip() => {
+            HostIdentity::Pinned(peer.ip().to_string())
+        }
+        // C's default: NULL `pHostName` — i.e. `""` to `asAddClient` —
+        // until the client claims a name over CA_PROTO_HOST_NAME.
+        None => HostIdentity::Claimed(String::new()),
+    };
     // PR #641: surface the mTLS authentication context to the ACF
     // check. Plaintext peers stay with empty fields — every legacy
     // rule (no METHOD/AUTHORITY clause) ignores them.
@@ -1498,18 +1592,18 @@ where
 
             let mut offset = 0;
             while offset + CaHeader::SIZE <= accumulated.len() {
-                // C `camessage` dispatcher (camessage.c:2471-2489): if
-                // msgsize > maxstk (recv buffer ceiling, =
-                // rsrvSizeofLargeBufTCP after expand), emit ECA_TOLARGE
-                // via send_err and drain the rest of the message. Rust
-                // `CaHeader::from_bytes_extended` returns
-                // CaError::Protocol("payload too large") when the
-                // extended postsize exceeds `max_payload_size()`
-                // (default 16 MiB), and the `?` propagation silently
-                // closes the connection. C clients waiting on the
-                // ECA_TOLARGE error callback see only EOF. Pre-check
-                // the extended postsize here and emit the wire reply
-                // before propagating the error.
+                // C `camessage` dispatcher (camessage.c:2471-2489): when
+                // msgsize exceeds the recv-buffer ceiling even after
+                // `casExpandRecvBuffer` (= rsrvSizeofLargeBufTCP), C emits
+                // ECA_TOLARGE via send_err, sets `recvBytesToDrain` to skip
+                // the oversize body, and **keeps serving** — `status =
+                // RSRV_OK`. Rust `CaHeader::from_bytes_extended` returns
+                // CaError::Protocol("payload too large") when the extended
+                // postsize exceeds `max_payload_size()` (default 16 MiB), so
+                // pre-check it here, reply, and refuse just this message.
+                // Closing the circuit instead (as this did pre-R7-18) let a
+                // single oversize array caput destroy every channel and
+                // subscription the client held; C loses none of them.
                 //
                 // Normal-form headers can't overflow `max_payload_size()`
                 // because their postsize is u16 (max 0xfffe < 16 MiB),
@@ -1529,7 +1623,8 @@ where
                 if peer_v49 && buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
                     let ext_post =
                         u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
-                    if ext_post > crate::protocol::max_payload_size() {
+                    let max_payload = crate::protocol::max_payload_size();
+                    if ext_post > max_payload {
                         // Build a stand-in header for the error reply
                         // (cmmd echoed from the malformed frame; cid
                         // sentinel 0xFFFFFFFF per `vsend_err`
@@ -1541,17 +1636,35 @@ where
                             &probe_hdr,
                             ECA_TOLARGE,
                             0xFFFF_FFFF,
-                            "CAS: Server unable to load large request message",
+                            // C's text, including the byte ceiling
+                            // (`camessage.c:2478-2480`).
+                            &format!(
+                                "CAS: Server unable to load large request message. \
+                                 Max bytes={max_payload}"
+                            ),
                             state.client_minor_version,
                         )
                         .await;
                         let _ = writer.lock().await.flush().await;
-                        break 'client_loop Err(epics_base_rs::error::CaError::Protocol(format!(
-                            "CA payload too large: ext_post={} > max={} \
-                         (matches C dispatcher ECA_TOLARGE wire reply + drop)",
+                        tracing::warn!(
+                            peer = %state.peer,
                             ext_post,
-                            crate::protocol::max_payload_size()
-                        )));
+                            max = max_payload,
+                            "CAS: server unable to load large request message"
+                        );
+                        // Extended-form frame: 16-byte header + 8-byte annex
+                        // + body (`camessage.c:2419`).
+                        let msg_len = 24usize.saturating_add(ext_post);
+                        match state.refuse_message(accumulated.len(), offset, msg_len) {
+                            Refused::ResumeAt(next) => {
+                                offset = next;
+                                continue;
+                            }
+                            Refused::DrainPending => {
+                                offset = accumulated.len();
+                                break;
+                            }
+                        }
                     }
                 }
                 // C `rsrv/camessage.c:~2410`: when the buffer holds a
@@ -1597,14 +1710,19 @@ where
                     )
                     .await;
                     let _ = writer.lock().await.flush().await;
-                    // Drain this message: C discards the whole recv
-                    // buffer and remembers how many of the declared
-                    // bytes have yet to arrive.
+                    // Same refuse-but-keep-serving shape as ECA_TOLARGE
+                    // above, through the same owner.
                     let msg_len = hdr_size + actual_post;
-                    let buffered = accumulated.len() - offset;
-                    state.recv_bytes_to_drain = msg_len.saturating_sub(buffered);
-                    offset = accumulated.len();
-                    break;
+                    match state.refuse_message(accumulated.len(), offset, msg_len) {
+                        Refused::ResumeAt(next) => {
+                            offset = next;
+                            continue;
+                        }
+                        Refused::DrainPending => {
+                            offset = accumulated.len();
+                            break;
+                        }
+                    }
                 }
 
                 // C `rsrv/camessage.c:2452` rejects misaligned payloads
@@ -1958,40 +2076,36 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 ));
             }
 
-            // EPICS_CAS_USE_HOST_NAMES (default NO) controls whether we
-            // trust the client-supplied hostname for ACF matching. When NO,
-            // the peer IP set during accept() is authoritative.
-            let trust_client_hostname =
-                epics_base_rs::runtime::env::get_or("EPICS_CAS_USE_HOST_NAMES", "NO")
-                    .eq_ignore_ascii_case("YES");
-            if trust_client_hostname {
-                let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
-
-                // Forward-DNS verification: resolve the client-supplied
-                // hostname back to IPs and require one of them to match
-                // the actual peer address. Without this check a hostile
-                // client could spoof an arbitrary hostname (e.g. that
-                // of a privileged operator console) and gain whatever
-                // ACF rights the ACL grants to that host. C rsrv has
-                // historically deferred this verification to operators
-                // (relying on USE_HOST_NAMES=NO in untrusted networks);
-                // we fail closed here for stricter defaults.
-                let verified = host_resolves_to_peer(&claimed, peer.ip()).await;
-                if verified {
-                    state.hostname = claimed;
-                    // Re-evaluate access rights for all existing channels
-                    reeval_access_rights(state, writer).await?;
-                } else {
-                    tracing::warn!(
-                        peer = %peer,
-                        claimed_host = %claimed,
-                        "CAS_USE_HOST_NAMES: forward-DNS mismatch, ignoring HOST_NAME"
-                    );
-                    state.audit("host_name", "", &claimed, "dns_mismatch").await;
-                    // Keep state.hostname as the peer IP fallback set
-                    // at accept(); ACL rules continue to evaluate
-                    // against the IP rather than the spoofed hostname.
-                }
+            // C `host_name_action` (`camessage.c:845-875`) stores the
+            // client-supplied name **unconditionally** — the whole of C's
+            // gating is the `asCheckClientIP` early return above it
+            // (`:839-843`), which this port models as a pinned identity.
+            // So: hand the claim to `HostIdentity`, which takes it only if
+            // the identity is not pinned to the peer address or an
+            // mTLS-verified cert.
+            //
+            // This is C's trust model, quirk included: rsrv believes the
+            // name and leaves verification to the operator, who is expected
+            // to set `asCheckClientIP=1` on an untrusted network. A HOST()
+            // rule in an .acf therefore grants exactly what it grants under
+            // C. Pre-R7-16 the port defaulted to the peer IP behind a
+            // fictitious `EPICS_CAS_USE_HOST_NAMES` knob (no such variable
+            // exists anywhere in epics-base), so a `HOST(node)` HAG that
+            // granted WRITE under C granted nothing here.
+            let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
+            if state.hostname.claim(claimed.clone()) {
+                // Re-evaluate access rights for all existing channels.
+                reeval_access_rights(state, writer).await?;
+            } else {
+                tracing::debug!(
+                    peer = %peer,
+                    claimed_host = %claimed,
+                    identity = state.hostname.as_str(),
+                    "HOST_NAME ignored: identity is pinned (asCheckClientIP or mTLS)"
+                );
+                state
+                    .audit("host_name", "", &claimed, "ignored_pinned")
+                    .await;
             }
         }
 
@@ -3498,7 +3612,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     epics_base_rs::server::access_security::TrapWriteFields {
                         pv_name: audit_pv.clone(),
                         user: state.username.clone(),
-                        host: state.hostname.clone(),
+                        host: state.hostname.as_str().to_string(),
                         peer: state.peer.clone(),
                         value_str: display_value.clone(),
                         dbr_type: write_type as u16,
@@ -3520,7 +3634,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     if let Some(hook) = pv.write_hook() {
                         let ctx = epics_base_rs::server::pv::WriteContext {
                             user: state.username.clone(),
-                            host: state.hostname.clone(),
+                            host: state.hostname.as_str().to_string(),
                             peer: state.peer.clone(),
                         };
                         hook(new_value, ctx).await.map(|()| None)
@@ -6615,6 +6729,271 @@ mod extended_header_split_tests {
             res.is_ok(),
             "clean EOF after partial extended header must be Ok, got {res:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_identity_tests {
+    //! R7-16: the ACF host identity of a circuit.
+    //!
+    //! C rsrv's default (`asCheckClientIP == 0`, `asLibRoutines.c:34`) is to
+    //! store the hostname the client claims over `CA_PROTO_HOST_NAME`
+    //! unconditionally (`camessage.c:845-875`) and match HAGs against that
+    //! name (`asLibRoutines.c:1223`). The port instead keyed ACF on the peer
+    //! IP unless a fictitious `EPICS_CAS_USE_HOST_NAMES=YES` was set — a
+    //! variable that does not exist anywhere in epics-base — so a
+    //! `HOST(node)` rule that granted WRITE under C granted nothing here.
+    use super::*;
+
+    #[test]
+    fn claimed_identity_takes_the_client_supplied_name() {
+        // C's default path: `create_tcp_client` leaves pHostName NULL, so
+        // the identity is "" until the client claims one.
+        let mut id = HostIdentity::Claimed(String::new());
+        assert_eq!(
+            id.as_str(),
+            "",
+            "no claim yet — C passes \"\" to asAddClient"
+        );
+
+        assert!(id.claim("opi-01.lab".into()), "a claimed identity takes it");
+        assert_eq!(
+            id.as_str(),
+            "opi-01.lab",
+            "C stores the client-supplied name unconditionally (camessage.c:845-875)"
+        );
+    }
+
+    #[test]
+    fn pinned_identity_ignores_the_client_supplied_name() {
+        // C's `asCheckClientIP == 1` path: the peer IP is the identity and
+        // `host_name_action` returns early without storing the claim
+        // (camessage.c:839-843). The port's mTLS identity is pinned the
+        // same way.
+        let mut id = HostIdentity::Pinned("10.0.0.7".into());
+        assert!(
+            !id.claim("privileged-console".into()),
+            "a pinned identity refuses the claim"
+        );
+        assert_eq!(
+            id.as_str(),
+            "10.0.0.7",
+            "a client cannot spoof its way past a pinned identity"
+        );
+    }
+
+    /// The connection-setup decision, made where C makes it
+    /// (`create_tcp_client`, `caservertask.c:1425-1437`). Reproduces the
+    /// same three-way match `handle_client` runs, pinning the mapping from
+    /// (mTLS identity, asCheckClientIP) to variant.
+    #[test]
+    fn identity_source_is_decided_once_at_connection_setup() {
+        use epics_base_rs::server::access_security::{as_check_client_ip, set_as_check_client_ip};
+
+        let peer: SocketAddr = "192.168.4.9:44321".parse().unwrap();
+        let decide = |verified: Option<String>| match verified {
+            Some(v) => HostIdentity::Pinned(v),
+            None if as_check_client_ip() => HostIdentity::Pinned(peer.ip().to_string()),
+            None => HostIdentity::Claimed(String::new()),
+        };
+
+        // C default: claimable, empty until CA_PROTO_HOST_NAME.
+        set_as_check_client_ip(false);
+        assert_eq!(decide(None), HostIdentity::Claimed(String::new()));
+
+        // asCheckClientIP=1: pinned to the peer's dotted-quad address.
+        set_as_check_client_ip(true);
+        assert_eq!(
+            decide(None),
+            HostIdentity::Pinned("192.168.4.9".into()),
+            "C fills pHostName with the peer IP (caservertask.c:1432)"
+        );
+
+        // An mTLS-verified identity outranks both modes.
+        assert_eq!(
+            decide(Some("CN=alice".into())),
+            HostIdentity::Pinned("CN=alice".into())
+        );
+        set_as_check_client_ip(false);
+        assert_eq!(
+            decide(Some("CN=alice".into())),
+            HostIdentity::Pinned("CN=alice".into()),
+            "the cert identity is pinned regardless of asCheckClientIP"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oversize_request_tests {
+    //! R7-18: an oversize inbound request must NOT tear the circuit down.
+    //!
+    //! C `camessage.c:2472-2489` answers a message it cannot buffer with
+    //! `send_err(ECA_TOLARGE)`, sets `recvBytesToDrain` to skip the body,
+    //! and returns `RSRV_OK` — the circuit and every channel and
+    //! subscription on it survive. The port used to `break 'client_loop
+    //! Err(..)` here, so one oversize array caput destroyed the whole
+    //! client. Server-side sibling of the client-side R6-21 fix.
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Boundary test for the single owner of `recv_bytes_to_drain`. The
+    /// three cases are the three relations between "declared message
+    /// length" and "bytes actually buffered".
+    #[test]
+    fn refuse_message_accounts_exactly_at_every_boundary() {
+        let mut state = ClientState::new(
+            Arc::new(tokio::sync::RwLock::new(None)),
+            5064,
+            Arc::new(PvDatabase::new()),
+        );
+
+        // Short body: only the shortfall is carried forward.
+        assert_eq!(state.refuse_message(100, 0, 4128), Refused::DrainPending);
+        assert_eq!(state.recv_bytes_to_drain, 4028);
+
+        // Exactly buffered: nothing to drain, parsing resumes past it.
+        state.recv_bytes_to_drain = 0;
+        assert_eq!(state.refuse_message(4128, 0, 4128), Refused::ResumeAt(4128));
+        assert_eq!(state.recv_bytes_to_drain, 0);
+
+        // Over-buffered: the trailing bytes are a *following message* and
+        // must survive. Discarding the whole buffer here (what the
+        // pre-R7-18 drain did) would silently eat it.
+        state.recv_bytes_to_drain = 0;
+        assert_eq!(state.refuse_message(4144, 0, 4128), Refused::ResumeAt(4128));
+        assert_eq!(state.recv_bytes_to_drain, 0);
+
+        // Same, at a non-zero offset (an earlier message in the batch).
+        state.recv_bytes_to_drain = 0;
+        assert_eq!(
+            state.refuse_message(4160, 16, 4128),
+            Refused::ResumeAt(4144)
+        );
+        assert_eq!(state.recv_bytes_to_drain, 0);
+    }
+
+    /// End-to-end: an oversize extended-form request draws ECA_TOLARGE,
+    /// its body is drained, and the circuit keeps serving — the ECHO that
+    /// follows the oversize body is answered.
+    ///
+    /// `EPICS_CA_MAX_ARRAY_BYTES` is lowered so the oversize body is a few
+    /// KiB rather than 16 MiB. nextest runs each test in its own process,
+    /// so the env mutation is contained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversize_request_draws_eca_tolarge_and_keeps_the_circuit() {
+        const MAX_BYTES: usize = 4096;
+        // SAFETY: nextest gives each test its own process; no other thread
+        // in it reads the environment concurrently at this point.
+        unsafe { std::env::set_var("EPICS_CA_MAX_ARRAY_BYTES", MAX_BYTES.to_string()) };
+
+        let db = Arc::new(PvDatabase::new());
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = "127.0.0.1:55124".parse().unwrap();
+
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+
+        let mut client = client_io;
+
+        // Identify as V49 — C only reads the extended annex for a V49 peer.
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = CA_MINOR_VERSION;
+        client.write_all(&ver.to_bytes()).await.unwrap();
+
+        // Extended-form WRITE with a body one element past the ceiling.
+        let ext_post: u32 = (MAX_BYTES + 8) as u32;
+        let mut hdr = CaHeader::new(CA_PROTO_WRITE);
+        hdr.postsize = 0xFFFF;
+        let mut frame = hdr.to_bytes().to_vec();
+        frame.extend_from_slice(&ext_post.to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes()); // extended count
+        client.write_all(&frame).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Read one whole CA frame (header + declared payload) so the next
+        // read starts on a frame boundary.
+        async fn read_frame(c: &mut tokio::io::DuplexStream) -> [u8; 16] {
+            let mut hdr = [0u8; 16];
+            tokio::time::timeout(Duration::from_secs(2), c.read_exact(&mut hdr))
+                .await
+                .expect("server must answer, not hang")
+                .expect("server must answer, not close the circuit");
+            let postsize = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+            if postsize > 0 {
+                let mut body = vec![0u8; postsize];
+                c.read_exact(&mut body).await.expect("frame body");
+            }
+            hdr
+        }
+
+        // Skip the VERSION handshake frames, then the ECA_TOLARGE error
+        // must come back on the wire — not an EOF.
+        let reply = loop {
+            let f = read_frame(&mut client).await;
+            if u16::from_be_bytes([f[0], f[1]]) != CA_PROTO_VERSION {
+                break f;
+            }
+        };
+        assert_eq!(
+            u16::from_be_bytes([reply[0], reply[1]]),
+            CA_PROTO_ERROR,
+            "oversize request must draw a CA_PROTO_ERROR"
+        );
+        assert_eq!(
+            u32::from_be_bytes([reply[12], reply[13], reply[14], reply[15]]),
+            ECA_TOLARGE,
+            "C answers an unbufferable request with ECA_TOLARGE (camessage.c:2478)"
+        );
+
+        // The circuit must still be up: pre-fix this had already been torn
+        // down with a Protocol error.
+        assert!(
+            !handle.is_finished(),
+            "an oversize request must not close the circuit (C keeps serving)"
+        );
+
+        // Ship the oversize body — the server drains it — then an ECHO.
+        // The ECHO is only answered if the drain consumed exactly the body.
+        client
+            .write_all(&vec![0u8; ext_post as usize])
+            .await
+            .unwrap();
+        let echo = CaHeader::new(CA_PROTO_ECHO);
+        client.write_all(&echo.to_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let echo_reply = read_frame(&mut client).await;
+        assert_eq!(
+            u16::from_be_bytes([echo_reply[0], echo_reply[1]]),
+            CA_PROTO_ECHO,
+            "the message after a drained oversize body must be parsed normally — \
+             the drain must consume the body exactly, no more and no less"
+        );
+
+        handle.abort();
     }
 }
 

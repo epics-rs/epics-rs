@@ -90,7 +90,7 @@ Source: `src/protocol.rs`. All values are u16 big-endian.
 | 18   | `CA_PROTO_CREATE_CHAN`       | C→S, S→C        | Create channel + claim native type |
 | 19   | `CA_PROTO_WRITE_NOTIFY`      | C→S, S→C        | Write with completion callback |
 | 20   | `CA_PROTO_CLIENT_NAME`       | C→S             | Client process owner name (for ACF) |
-| 21   | `CA_PROTO_HOST_NAME`         | C→S             | Client hostname (gated by `EPICS_CAS_USE_HOST_NAMES`) |
+| 21   | `CA_PROTO_HOST_NAME`         | C→S             | Client hostname (trusted by default; ignored under `asCheckClientIP` / mTLS) |
 | 22   | `CA_PROTO_ACCESS_RIGHTS`     | S→C             | Access rights bitmap (read=1, write=2) |
 | 23   | `CA_PROTO_ECHO`              | both            | Liveness probe |
 | 24   | `CA_PROTO_REPEATER_REGISTER` | C→rep           | Register with local repeater |

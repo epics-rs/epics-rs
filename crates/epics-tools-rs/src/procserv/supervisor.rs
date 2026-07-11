@@ -361,6 +361,29 @@ impl SupervisorState {
 
     async fn event_loop(&mut self) -> ProcServResult<i32> {
         loop {
+            // C's poll loop re-checks `processFactoryNeedsRestart()` on
+            // every iteration, after servicing connections
+            // (`procServ.cc:654`). Firing the due relaunch here — rather
+            // than from a `select!` arm — is the single owner of the
+            // "child now running" transition and cannot be starved by a
+            // client that keeps arm 1 ready. The timer arm below exists
+            // only to wake the loop when the holdoff elapses.
+            if self
+                .pending_restart
+                .as_ref()
+                .is_some_and(|p| p.at <= tokio::time::Instant::now())
+            {
+                self.pending_restart = None;
+                // `respawn_child` emits C's `@@@ Restarting child`
+                // announcement itself. A failed (re)spawn reschedules
+                // behind the holdoff rather than aborting the supervisor
+                // (C never gives up on a forkpty failure,
+                // processFactory.cc:158,188).
+                if let Err(e) = self.respawn_child().await {
+                    self.schedule_spawn_retry(e)?;
+                }
+            }
+
             // Snapshot the pending-restart deadline (Copy) before
             // borrowing `self.child` mutably below, so the timer arm
             // borrows only this local — not `self`.
@@ -426,26 +449,12 @@ impl SupervisorState {
                     self.reopen_log().await;
                 }
 
-                // 5. Crash-loop holdoff elapsed → fire the scheduled
-                //    relaunch. Lowest priority so a manual restart/kill
-                //    keystroke (arm 1) that arrives during the wait
-                //    preempts it: that path respawns and clears
-                //    `pending_restart`, after which `restart_at` is
-                //    `None` and this arm parks again. C: the poll loop
-                //    restarts once `now >= _restartTime`, unless
-                //    `restartOnce()` already zeroed it.
-                _ = restart_due => {
-                    if self.pending_restart.take().is_some() {
-                        // `respawn_child` emits C's `@@@ Restarting child`
-                        // announcement itself — no separate banner here. A
-                        // failed (re)spawn reschedules behind the holdoff
-                        // rather than aborting the supervisor (C never gives
-                        // up on a forkpty failure, processFactory.cc:158,188).
-                        if let Err(e) = self.respawn_child().await {
-                            self.schedule_spawn_retry(e)?;
-                        }
-                    }
-                }
+                // 5. Crash-loop holdoff elapsed → wake the loop so the
+                //    top-of-loop check above fires the relaunch. Lowest
+                //    priority so a keystroke (arm 1) still preempts the
+                //    wakeup; the relaunch itself is not owned here.
+                //    Parks forever when no restart is scheduled.
+                _ = restart_due => {}
             }
         }
     }
@@ -488,33 +497,34 @@ impl SupervisorState {
                 let mut quit = false;
                 for action in &actions {
                     match action {
-                        Action::None => {}
                         Action::KillChild => {
-                            // C broadcasts the kill notice to all clients
-                            // (and the log) before signalling — SendToAll
-                            // with a NULL sender (clientFactory.cc:236-239).
-                            // Only the live-kill path reaches here; a kill
-                            // key on a dead child is a RestartChild action.
-                            if self.child.is_some() {
-                                self.send_to_all(b"\r\n@@@ Got a kill command\r\n", Origin::Server)
-                                    .await;
-                                if let Some(slot) = self.child.as_ref() {
-                                    let _ = slot.handle.signal(self.config.child.kill_signal);
-                                }
+                            // C's kill block (clientFactory.cc:236-240) is
+                            // unconditional: the notice goes to every client
+                            // and the log whether or not a child is running.
+                            // Only the signal is conditional —
+                            // `processFactorySendSignal` no-ops without a
+                            // running item (processFactory.cc:279-287) — so a
+                            // kill key on a dead child still marks the console.
+                            self.send_to_all(b"\r\n@@@ Got a kill command\r\n", Origin::Server)
+                                .await;
+                            if let Some(slot) = self.child.as_ref() {
+                                let _ = slot.handle.signal(self.config.child.kill_signal);
                             }
                         }
                         Action::RestartChild => {
-                            // Force a respawn (clears any holdoff).
-                            // `respawn_child` emits C's `@@@ Restarting
-                            // child` announcement itself — matching C, where
-                            // a manual `restartOnce()` just zeros
-                            // `_restartTime` and the next poll routes through
-                            // processFactory, which prints it.
-                            if self.child.is_none()
-                                && let Err(e) = self.respawn_child().await
-                            {
-                                tracing::error!(error = %e, "procserv-rs: manual respawn failed");
-                            }
+                            // C `restartOnce()` (processFactory.cc:289-291)
+                            // does not spawn: it zeros `_restartTime` so the
+                            // *next* poll-loop iteration routes through
+                            // processFactory, which prints `@@@ Restarting
+                            // child` and forks. Request the relaunch the same
+                            // way — due immediately, fired at the top of the
+                            // event loop. Deferring is what keeps the same
+                            // keystroke's kill block (above, and after this in
+                            // C's scan order) from signalling a child that C
+                            // has not spawned yet.
+                            self.pending_restart = Some(PendingRestart {
+                                at: tokio::time::Instant::now(),
+                            });
                         }
                         Action::ToggleRestartMode => {
                             self.restart_mode = self.restart_mode.next();

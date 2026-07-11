@@ -737,6 +737,37 @@ impl Record for TransformRecord {
         self.nsev = ctx.nsev;
     }
 
+    /// A channel whose INPx link failed to read is ZEROED. C
+    /// `transformRecord.c:537-541`, in the input loop:
+    ///
+    /// ```c
+    /// if (plink->type != CONSTANT) {
+    ///     status = dbGetLink(plink, DBR_DOUBLE, pval, NULL, NULL);
+    ///     if (!RTN_SUCCESS(status)) { *pval = 0.; }
+    /// }
+    /// ```
+    ///
+    /// This is transform-specific: `calcRecord.c::fetch_values` (427-443)
+    /// leaves `*pvalue` at its stale value on the same failure, and so do
+    /// sub/sel/swait. So the zeroing lives here, not in the framework's shared
+    /// multi-input apply.
+    ///
+    /// The framework reports the links that produced a value this cycle; a
+    /// channel is zeroed when its link is CONFIGURED (non-empty — C's `type !=
+    /// CONSTANT`) yet absent from that list. An unset channel is C's CONSTANT
+    /// link: not read, not zeroed. A constant-valued link ("5") always
+    /// resolves, so it never reaches the zeroing branch either.
+    ///
+    /// Runs before `process()` (the framework's report point), which is where C
+    /// does it — the zero is what the calc loop and the OUTx write then see.
+    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        for i in 0..NUM_CHANNELS {
+            if !self.inp_links[i].is_empty() && !resolved.contains(&INP_FIELD_NAMES[i]) {
+                self.vals[i] = 0.0;
+            }
+        }
+    }
+
     /// C `transformRecord.c:593-595`: a channel whose `sCalcPerform` failed
     /// raises `recGblSetSevr(ptran, CALC_ALARM, INVALID_ALARM)`. Raised from
     /// the `checkAlarms` slot, which the framework runs BEFORE
@@ -804,6 +835,13 @@ impl Record for TransformRecord {
 static OUT_FIELD_NAMES: [&str; NUM_CHANNELS] = [
     "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI", "OUTJ", "OUTK", "OUTL",
     "OUTM", "OUTN", "OUTO", "OUTP",
+];
+
+/// INPA..INPP field names, indexed by channel 0..15 — the link-field spelling
+/// the framework reports back through [`Record::set_resolved_input_links`].
+static INP_FIELD_NAMES: [&str; NUM_CHANNELS] = [
+    "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK", "INPL",
+    "INPM", "INPN", "INPO", "INPP",
 ];
 
 #[cfg(test)]

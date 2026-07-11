@@ -962,6 +962,39 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Change-detected auxiliary fields this record posts with C's
+    /// `monitor_mask | DBE_VALUE` — VAL's monitor mask ORed with `DBE_VALUE`,
+    /// and NOT the framework default `monitor_mask | DBE_VALUE | DBE_LOG`.
+    ///
+    /// The difference is the forced `DBE_LOG`. For a field named here the LOG
+    /// bit is present only when it is already in VAL's monitor mask — i.e. only
+    /// when VAL's own ADEL deadband crossed this cycle — so a `DBE_LOG`
+    /// subscriber (an archiver) receives the field exactly on the cycles C
+    /// sends it, instead of on every change.
+    ///
+    /// `swaitRecord.c::monitor` (646-653) is this shape for its A..L inputs:
+    ///
+    /// ```c
+    /// if (*pnew != *pprev)
+    ///     db_post_events(pwait, pnew, monitor_mask | DBE_VALUE);
+    /// ```
+    ///
+    /// while `calcRecord.c:420` — the same loop, one module over — writes
+    /// `monitor_mask | DBE_VALUE | DBE_LOG`. The two records genuinely differ,
+    /// so the mask is a per-record property, not a framework-wide rule.
+    ///
+    /// Distinct from [`Self::value_only_change_fields`] (a literal `DBE_VALUE`,
+    /// which drops the ADEL LOG bit as well) and from
+    /// [`Self::fields_posted_with_value_mask`] (posted from INSIDE C's
+    /// `if (monitor_mask)` guard, so they do not post at all on a cycle where
+    /// VAL itself does not). The fields named here post on every change,
+    /// guard or no guard.
+    ///
+    /// Default: empty.
+    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The array-style monitor decision (C waveform/aai/aao `monitor()`,
     /// waveformRecord.c:291-326). `None` (the default) means the record has
     /// no MPST/APST/HASH mechanism and the generic MDEL/ADEL deadband

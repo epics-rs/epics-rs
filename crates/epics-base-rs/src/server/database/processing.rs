@@ -281,6 +281,40 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
     instance.suppress_subroutine_run = ds.skip_run;
 }
 
+/// The event mask a change-detected AUXILIARY field posts with — the single
+/// owner of that decision, shared by the three snapshot builders (the main
+/// process path, the async-write completion, and `process_local`).
+///
+/// C's usual shape for the "post every input/aux field that changed" loop is
+/// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400,
+/// motor `DBE_VAL_LOG`) — that is the default. Two record-declared exceptions
+/// narrow it, and they are NOT the same narrowing:
+///
+/// * [`Record::value_only_change_fields`] — C posts a literal `DBE_VALUE`
+///   (tableRecord.c:659, scaler `Sn`): alarm bits + `DBE_VALUE`, never `LOG`.
+/// * [`Record::fields_posted_with_monitor_mask`] — C posts
+///   `monitor_mask | DBE_VALUE` (swaitRecord.c:650): VAL's own monitor mask,
+///   so `DBE_LOG` rides along exactly when VAL's ADEL deadband crossed.
+///
+/// `deadband_mask` is that VAL monitor mask for this cycle (alarm bits, plus
+/// `DBE_VALUE` when MDEL crossed and `DBE_LOG` when ADEL crossed).
+fn aux_change_mask(
+    field: &str,
+    value_only: &[&'static str],
+    monitor_masked: &[&'static str],
+    alarm_bits: crate::server::recgbl::EventMask,
+    deadband_mask: crate::server::recgbl::EventMask,
+) -> crate::server::recgbl::EventMask {
+    use crate::server::recgbl::EventMask;
+    if value_only.contains(&field) {
+        alarm_bits | EventMask::VALUE
+    } else if monitor_masked.contains(&field) {
+        deadband_mask | EventMask::VALUE
+    } else {
+        alarm_bits | EventMask::VALUE | EventMask::LOG
+    }
+}
+
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
 /// the record name with the `.TIME` suffix stripped; otherwise `None`.
 ///
@@ -2768,6 +2802,9 @@ impl PvDatabase {
             // (e.g. scaler VAL, scalerRecord.c:478). Consulted here and in
             // the generic change loop below.
             let value_only = instance.record.value_only_change_fields();
+            // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
+            // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
+            let monitor_masked = instance.record.fields_posted_with_monitor_mask();
             let deadband_mask = {
                 let mut m = alarm_bits;
                 if include_val {
@@ -2860,15 +2897,13 @@ impl PvDatabase {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
-                            // A value-only field posts DBE_VALUE (+ this
-                            // cycle's alarm bits) without the LOG bit —
-                            // `aux_mask` minus LOG is exactly
-                            // `alarm_bits | DBE_VALUE`.
-                            let mask = if value_only.contains(&field.as_str()) {
-                                alarm_bits | EventMask::VALUE
-                            } else {
-                                aux_mask
-                            };
+                            let mask = aux_change_mask(
+                                field,
+                                value_only,
+                                monitor_masked,
+                                alarm_bits,
+                                deadband_mask,
+                            );
                             sub_updates.push((field.clone(), val, mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
@@ -3905,6 +3940,9 @@ impl PvDatabase {
             // (e.g. scaler VAL, scalerRecord.c:478). Consulted here and in
             // the generic change loop below.
             let value_only = instance.record.value_only_change_fields();
+            // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
+            // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
+            let monitor_masked = instance.record.fields_posted_with_monitor_mask();
             let deadband_mask = {
                 let mut m = alarm_bits;
                 if include_val {
@@ -4033,15 +4071,13 @@ impl PvDatabase {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
-                            // A value-only field posts DBE_VALUE (+ this
-                            // cycle's alarm bits) without the LOG bit —
-                            // `aux_mask` minus LOG is exactly
-                            // `alarm_bits | DBE_VALUE`.
-                            let mask = if value_only.contains(&field.as_str()) {
-                                alarm_bits | EventMask::VALUE
-                            } else {
-                                aux_mask
-                            };
+                            let mask = aux_change_mask(
+                                field,
+                                value_only,
+                                monitor_masked,
+                                alarm_bits,
+                                deadband_mask,
+                            );
                             sub_updates.push((field.clone(), val, mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
@@ -5053,6 +5089,9 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     // scalerRecord.c:478). Consulted here and in the generic change loop
     // below.
     let value_only = instance.record.value_only_change_fields();
+    // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
+    // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
+    let monitor_masked = instance.record.fields_posted_with_monitor_mask();
     let deadband_mask = {
         let mut m = alarm_bits;
         if include_val {
@@ -5138,14 +5177,13 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                         sub_updates.push((field.clone(), val, deadband_mask));
                     }
                 } else if changed {
-                    // A value-only field posts DBE_VALUE (+ this cycle's
-                    // alarm bits) without the LOG bit — `aux_mask` minus
-                    // LOG is exactly `alarm_bits | DBE_VALUE`.
-                    let mask = if value_only.contains(&field.as_str()) {
-                        alarm_bits | EventMask::VALUE
-                    } else {
-                        aux_mask
-                    };
+                    let mask = aux_change_mask(
+                        field,
+                        value_only,
+                        monitor_masked,
+                        alarm_bits,
+                        deadband_mask,
+                    );
                     sub_updates.push((field.clone(), val, mask));
                 } else if force_fields.contains(&field.as_str()) {
                     // C `monitor()` posts a re-marked field with

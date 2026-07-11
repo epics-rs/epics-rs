@@ -46,6 +46,15 @@ pub struct SwaitRecord {
     pub odly: f32,
     pub out: String,
     pub prec: i16,
+    // MDEL / ADEL (C `swaitRecord.dbd:477-486`, both DBF_DOUBLE): the monitor
+    // and archive deadbands `monitor()` (swaitRecord.c:622-640) tests VAL
+    // against to build `monitor_mask`. The record had neither field, so both
+    // read back as the framework's 0.0 default and every VAL change crossed
+    // both deadbands — and a client could not set them at all
+    // (`FieldNotFound`). The A..L input posts inherit this mask, which is what
+    // makes their DBE_LOG bit conditional (see `fields_posted_with_monitor_mask`).
+    pub mdel: f64,
+    pub adel: f64,
     // INxN: input link names; INxP: process passive flags (0/1)
     pub inp_names: [String; 12], // INAN..INLN
     pub inp_passive: [i16; 12],  // INAP..INLP
@@ -76,6 +85,8 @@ impl Default for SwaitRecord {
             odly: 0.0,
             out: String::new(),
             prec: 0,
+            mdel: 0.0,
+            adel: 0.0,
             inp_names: Default::default(),
             inp_passive: [0; 12],
             num_vals: [0.0; 12],
@@ -204,6 +215,16 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
     FieldDesc {
@@ -548,6 +569,25 @@ impl Record for SwaitRecord {
         &["DOLD"]
     }
 
+    /// C `swaitRecord.c::monitor` (646-653) posts a changed input A..L with
+    /// `monitor_mask | DBE_VALUE` — no forced `DBE_LOG`:
+    ///
+    /// ```c
+    /// for (i=0, pnew=&pwait->a, pprev=&pwait->la; i<MAX_FIELDS; i++, pnew++, pprev++) {
+    ///     if (*pnew != *pprev) {
+    ///         db_post_events(pwait, pnew, monitor_mask|DBE_VALUE);
+    ///         ...
+    /// ```
+    ///
+    /// so an archiver subscribed `DBE_LOG` to `swait.A` is sent a value only on
+    /// a cycle where VAL's own ADEL deadband crossed (which puts `DBE_LOG` into
+    /// `monitor_mask`), not on every change. `calcRecord.c:420` writes
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` in the same loop and keeps the
+    /// framework default.
+    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
+        &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+    }
+
     /// `OEVT` ("Output Event"): post the numeric output event when output
     /// fires. C `swaitRecord.c` `execOutput` runs `if (pwait->oevt > 0)
     /// post_event((int)pwait->oevt);` (swaitRecord.c:797) right after the OUT
@@ -580,6 +620,8 @@ impl Record for SwaitRecord {
             "ODLY" => Some(EpicsValue::Float(self.odly)),
             // OUTN is aliased to common.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Double(self.adel)),
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -645,6 +687,16 @@ impl Record for SwaitRecord {
                     as f32;
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
+            "MDEL" => {
+                self.mdel = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MDEL".into()))?;
+            }
+            "ADEL" => {
+                self.adel = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ADEL".into()))?;
+            }
             "PREC" => {
                 if let EpicsValue::Short(v) = value {
                     self.prec = v;

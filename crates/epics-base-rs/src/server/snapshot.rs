@@ -85,28 +85,36 @@ pub struct Snapshot {
     pub class_name: Option<String>,
 }
 
-/// Extract the low `n` bits of `snap.timestamp.nanoseconds`
-/// into `snap.user_tag` and zero those bits in the timestamp.
+/// Split `snap.timestamp.nanoseconds` across `nanoseconds` / `user_tag`
+/// along `nsec_mask` — the mask a record's `info(Q:time:tag,
+/// "nsec:lsb:N")` resolves to (pvxs `MappingInfo::updateNsecMask`,
+/// `typeutils.cpp:79-88`).
 ///
-/// Mirrors pvxs `iocsource.cpp:240` — for a record with
-/// `info(Q:time:tag, "nsec:lsb:N")`, the IOC publishes the timestamp
-/// with the low N nanosecond bits stripped into `timeStamp.userTag`,
-/// which clients use as a pulse-id / event-id. With N=20 (typical),
-/// `nanoseconds` keeps wall-clock precision down to ~1µs while the
-/// userTag carries a 20-bit event id.
+/// Mirrors pvxs `iocsource.cpp:239-248` byte for byte:
 ///
-/// `n` must be in `1..=30`; callers parse the info value and clamp
-/// before reaching this helper (out-of-range is a no-op at the
-/// caller site).
-pub fn apply_nsec_lsb_split(snap: &mut Snapshot, n: u8) {
-    debug_assert!((1..=30).contains(&n));
+/// ```text
+/// node["timeStamp.nanoseconds"] = meta.time.nsec & ~info.nsecMask;
+/// if(info.nsecMask)
+///     utag = meta.time.nsec & info.nsecMask;
+/// ```
+///
+/// The mask — not a bit count — is the parameter, so "the feature is
+/// off" has exactly one representation: `nsec_mask == 0`. pvxs gates the
+/// `userTag` override on the same test, and `nsec & ~0` is the identity,
+/// so a zero mask leaves both fields untouched. With the typical
+/// `nsec:lsb:20` mask (`0x000F_FFFF`), `nanoseconds` keeps wall-clock
+/// precision down to ~1 µs while the userTag carries a 20-bit event id.
+pub fn apply_nsec_mask(snap: &mut Snapshot, nsec_mask: u64) {
+    if nsec_mask == 0 {
+        return;
+    }
+    // pvxs holds `nsecMask` as `uint64_t` and applies it to the
+    // `epicsUInt32` `nsec`, so only the low 32 bits can ever take effect.
+    let mask = nsec_mask as u32;
     let secs = snap.timestamp.unix_secs();
     let nanos = snap.timestamp.subsec_nanos();
-    let mask = (1u32 << n) - 1;
-    let user_tag_bits = nanos & mask;
-    let cleared_nanos = nanos & !mask;
-    snap.user_tag = user_tag_bits as i32;
-    snap.timestamp = WallTime::from_unix(secs, cleared_nanos);
+    snap.user_tag = (nanos & mask) as i32;
+    snap.timestamp = WallTime::from_unix(secs, nanos & !mask);
 }
 
 impl Snapshot {
@@ -169,17 +177,17 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
-    /// With N=20, the low 20 nanosecond bits land in userTag
-    /// and are cleared from the timestamp. Use a known nanosecond
+    /// With the `nsec:lsb:20` mask, the low 20 nanosecond bits land in
+    /// userTag and are cleared from the timestamp. Use a known nanosecond
     /// value so the bit math is easy to verify.
     #[test]
-    fn nsec_lsb_split_extracts_user_tag() {
+    fn nsec_mask_extracts_user_tag() {
         let nanos: u32 = 123_456_789; // 0x075BCD15 — sub-second
         // Inject the exact integer (secs, nsec); a `SystemTime` would truncate
         // these low nanosecond digits to 100 ns on Windows before the split.
         let ts = WallTime::from_unix(42, nanos);
         let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
-        apply_nsec_lsb_split(&mut snap, 20);
+        apply_nsec_mask(&mut snap, (1 << 20) - 1);
         let mask: u32 = (1 << 20) - 1;
         let expected_user_tag = (nanos & mask) as i32;
         let expected_nanos = nanos & !mask;
@@ -188,14 +196,57 @@ mod tests {
         assert_eq!(snap.timestamp.subsec_nanos(), expected_nanos);
     }
 
-    /// N=1 splits the single LSB into the userTag.
+    /// The `nsec:lsb:1` mask splits the single LSB into the userTag.
     #[test]
-    fn nsec_lsb_split_n1_keeps_high_bits() {
+    fn nsec_mask_n1_keeps_high_bits() {
         let ts = WallTime::from_unix(0, 7); // ...0111
         let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
-        apply_nsec_lsb_split(&mut snap, 1);
+        apply_nsec_mask(&mut snap, 1);
         assert_eq!(snap.user_tag, 1);
         assert_eq!(snap.timestamp.subsec_nanos(), 6);
+    }
+
+    /// Mask 0 (pvxs's `nsecMask` initialiser — no `Q:time:tag`, or one that
+    /// does not parse) is the off state: `nsec & ~0` is the identity and
+    /// pvxs's `if(info.nsecMask)` gate leaves `userTag` at the record's own
+    /// UTAG. Neither field may be touched.
+    #[test]
+    fn nsec_mask_zero_is_a_no_op() {
+        let ts = WallTime::from_unix(9, 123_456_789);
+        let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
+        snap.user_tag = -7; // record's own UTAG
+        apply_nsec_mask(&mut snap, 0);
+        assert_eq!(snap.user_tag, -7);
+        assert_eq!(snap.timestamp.unix_secs(), 9);
+        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_789);
+    }
+
+    /// `nsec:lsb:31` — the mask pvxs builds one past the old Rust `1..=30`
+    /// clamp. `nanoseconds` is always < 1e9 < 2^30, so a 31-bit mask moves
+    /// the whole nanosecond field into `userTag` and publishes 0 nanoseconds
+    /// (pvxs `iocsource.cpp:239-248`).
+    #[test]
+    fn nsec_mask_31_moves_all_nanoseconds_to_user_tag() {
+        let nanos: u32 = 999_999_999;
+        let ts = WallTime::from_unix(1, nanos);
+        let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
+        apply_nsec_mask(&mut snap, (1u64 << 31) - 1);
+        assert_eq!(snap.user_tag, nanos as i32);
+        assert_eq!(snap.timestamp.subsec_nanos(), 0);
+        assert_eq!(snap.timestamp.unix_secs(), 1);
+    }
+
+    /// pvxs holds `nsecMask` as a `uint64_t` but applies it to the 32-bit
+    /// `nsec`, so a mask wider than 32 bits behaves exactly like the
+    /// all-ones 32-bit mask.
+    #[test]
+    fn nsec_mask_wider_than_32_bits_clears_all_nanoseconds() {
+        let nanos: u32 = 123_456_789;
+        let ts = WallTime::from_unix(3, nanos);
+        let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
+        apply_nsec_mask(&mut snap, (1u64 << 40) - 1);
+        assert_eq!(snap.user_tag, nanos as i32);
+        assert_eq!(snap.timestamp.subsec_nanos(), 0);
     }
 
     #[test]

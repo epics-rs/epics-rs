@@ -187,6 +187,44 @@ fn parse_alarm_severity(value: &EpicsValue) -> AlarmSeverity {
 /// menu-label forms uniformly, so the arm receives the value it expects.
 ///
 /// Only fields whose canonical type is numeric/menu are listed; the
+/// Port of libcom `epicsParseInt32(str, &to, 10, NULL)`
+/// (`libcom/src/misc/epicsStdlib.c:26-53,245-261`), which is how pvxs parses
+/// the `nsec:lsb:` digit count. Returns `None` for every status the C
+/// returns non-zero for:
+///
+/// - `S_stdlib_noConversion` — `strtol` consumed nothing (empty / no digits)
+/// - `S_stdlib_extraneous` — trailing non-space bytes with `units == NULL`
+/// - `S_stdlib_overflow` — outside `epicsInt32`
+///
+/// Leading and trailing ASCII whitespace and a leading `+`/`-` sign are
+/// accepted, matching `epicsParseLong`'s `isspace` skips and `strtol`.
+fn epics_parse_int32_base10(s: &str) -> Option<i32> {
+    // `while ((c = *str) && isspace(c)) ++str;` then `strtol(str, &endp, 10)`.
+    let body = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (sign, digits) = match body.strip_prefix(['+', '-']) {
+        Some(rest) if body.starts_with('-') => (-1i64, rest),
+        Some(rest) => (1i64, rest),
+        None => (1i64, body),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None; // endp == str → S_stdlib_noConversion
+    }
+    // `if (c && !units) return S_stdlib_extraneous;` after skipping trailing
+    // whitespace.
+    if !digits[end..]
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .is_empty()
+    {
+        return None;
+    }
+    // ERANGE from `strtol`, then the explicit `epicsInt32` range check.
+    let magnitude: i64 = digits[..end].parse().ok()?;
+    i32::try_from(sign * magnitude).ok()
+}
+
 /// String-typed common fields (DESC, ASG, OUT, TSEL, …) and already-typed
 /// non-String writes pass through untouched, and an unparseable String is
 /// returned as-is so the arm drops it exactly as before. The runtime
@@ -606,44 +644,55 @@ impl RecordInstance {
         self.attach_menu_enum(field, &mut snap);
 
         // apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
-        // typeutils.cpp:79 splits the low N bits of the timestamp's
-        // nanoseconds into `timeStamp.userTag` and clears those bits
-        // from `nanoseconds`. Standard pvxs convention is `nsec:lsb:N`
-        // with N in 1..=30; values outside that range are ignored to
-        // match pvxs's bounds clamp. The split is applied to both
-        // `snap.timestamp` and `snap.user_tag` so downstream encoders
-        // (NTScalar `timeStamp`, QSRV groups via `+nsecmask`) all see
-        // the same shape.
-        if let Some(n) = self.parse_qtime_tag_nsec_lsb() {
-            crate::server::snapshot::apply_nsec_lsb_split(&mut snap, n);
-        }
+        // `iocsource.cpp:239-248` publishes `nanoseconds & ~nsecMask` and
+        // moves `nanoseconds & nsecMask` into `timeStamp.userTag`. The
+        // split is applied to both `snap.timestamp` and `snap.user_tag` so
+        // downstream encoders (NTScalar `timeStamp`, QSRV groups) all see
+        // the same shape. A zero mask (tag absent or unparseable) is a
+        // no-op inside the helper, exactly as pvxs's `if(info.nsecMask)`
+        // gate is.
+        crate::server::snapshot::apply_nsec_mask(&mut snap, self.qtime_nsec_mask());
 
         Some(snap)
     }
 
-    /// Parse `info(Q:time:tag, "nsec:lsb:N")` and return `N`.
-    /// Returns `None` when the info tag is absent or malformed (pvxs
-    /// silently ignores bad values; we match that by returning None
-    /// so the timestamp is emitted unchanged).
-    fn parse_qtime_tag_nsec_lsb(&self) -> Option<u8> {
-        let raw = self.get_info("Q:time:tag")?;
-        // Accept `nsec:lsb:N` with arbitrary whitespace and case.
-        let mut parts = raw.split(':');
-        let key = parts.next()?.trim();
-        let suffix = parts.next()?.trim();
-        let n = parts.next()?.trim();
-        if !key.eq_ignore_ascii_case("nsec") || !suffix.eq_ignore_ascii_case("lsb") {
-            return None;
-        }
-        let n: u32 = n.parse().ok()?;
-        // pvxs clamps to [1, 30]; values outside leave the timestamp
-        // alone (the userTag is meaningful only with a non-trivial
-        // mask, and >30 would consume all nanoseconds).
-        if (1..=30).contains(&n) {
-            Some(n as u8)
-        } else {
-            None
-        }
+    /// Resolve `info(Q:time:tag)` to pvxs's `MappingInfo::nsecMask`.
+    /// Returns 0 (the "no split" mask) when the tag is absent or does not
+    /// parse — pvxs leaves `nsecMask` at its 0 initialiser in that case.
+    ///
+    /// pvxs `ioc/typeutils.cpp:79-88`:
+    ///
+    /// ```c
+    /// if(auto val = ent.info("Q:time:tag")) {
+    ///     epicsInt32 dig = 0;
+    ///     if(strncmp(val, "nsec:lsb:", 9)==0 && !epicsParseInt32(&val[9], &dig, 10, nullptr)) {
+    ///         nsecMask = (uint64_t(1u)<<dig)-1u;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The prefix test is a byte-exact `strncmp` — no case folding and no
+    /// whitespace tolerance, so `NSEC:LSB:4` and `nsec: lsb: 4` do NOT
+    /// match and leave the timestamp alone. There is no bounds clamp
+    /// either: any `dig` `epicsParseInt32` accepts is shifted verbatim, so
+    /// `nsec:lsb:31` yields the `0x7FFF_FFFF` mask pvxs actually serves.
+    fn qtime_nsec_mask(&self) -> u64 {
+        let Some(rest) = self
+            .get_info("Q:time:tag")
+            .and_then(|v| v.strip_prefix("nsec:lsb:"))
+        else {
+            return 0;
+        };
+        let Some(dig) = epics_parse_int32_base10(rest) else {
+            return 0;
+        };
+        // C shifts `uint64_t(1u)` by an `epicsInt32`. A `dig` outside
+        // `0..=63` is UB in C++; every ISA EPICS builds on (x86-64 `shlq`,
+        // aarch64 `lsl`) takes the shift count modulo 64, which is what
+        // `wrapping_shl` does — so `nsec:lsb:64` disables the split
+        // (mask 0) and a negative `dig` shifts by `dig & 63`, the same
+        // masks pvxs produces on those hosts.
+        1u64.wrapping_shl(dig as u32) - 1
     }
 
     /// Populate DisplayInfo from record fields if applicable.
@@ -3046,6 +3095,92 @@ mod metadata_cache_tests {
         inst2.set_info("Q:form", "Nonsense");
         let snap2 = inst2.snapshot_for_field("VAL").unwrap();
         assert_eq!(snap2.display.expect("ai display").form, 0);
+    }
+
+    /// `info(Q:time:tag)` resolves to pvxs's `nsecMask`
+    /// (`ioc/typeutils.cpp:79-88`). The prefix test there is a byte-exact
+    /// `strncmp("nsec:lsb:", 9)` and the digit count is fed straight to
+    /// `(uint64_t(1u)<<dig)-1u` — no case folding, no whitespace tolerance
+    /// around the prefix, and no bounds clamp. Each boundary gets a case.
+    #[test]
+    fn qtime_nsec_mask_matches_pvxs_updatensecmask() {
+        let cases: &[(&str, u64)] = &[
+            // parses: `epicsParseInt32` skips whitespace around the digits
+            // and accepts a sign.
+            ("nsec:lsb:20", (1 << 20) - 1),
+            ("nsec:lsb:1", 1),
+            ("nsec:lsb: 4 ", 0xF),
+            ("nsec:lsb:+4", 0xF),
+            // no clamp: 31 is the mask pvxs actually serves (the old Rust
+            // `(1..=30)` guard dropped it), and 0 is pvxs's "off" mask.
+            ("nsec:lsb:31", 0x7FFF_FFFF),
+            ("nsec:lsb:0", 0),
+            // `strncmp` is byte-exact: case-folded or whitespace-split
+            // prefixes do not match, so pvxs leaves `nsecMask` at 0.
+            ("NSEC:LSB:4", 0),
+            ("Nsec:Lsb:4", 0),
+            ("nsec: lsb: 4", 0),
+            (" nsec:lsb:4", 0),
+            // `epicsParseInt32` failures: no conversion, extraneous trailing
+            // bytes, overflow past epicsInt32.
+            ("nsec:lsb:", 0),
+            ("nsec:lsb:abc", 0),
+            ("nsec:lsb:4x", 0),
+            ("nsec:lsb:4 5", 0),
+            ("nsec:lsb:99999999999999999999", 0),
+            ("nsec:lsb:2147483648", 0),
+        ];
+        for (tag, want) in cases {
+            let mut inst = ai_instance();
+            inst.set_info("Q:time:tag", *tag);
+            assert_eq!(
+                inst.qtime_nsec_mask(),
+                *want,
+                "info(Q:time:tag, {tag:?}) must resolve to nsecMask {want:#x}"
+            );
+        }
+        // Tag absent entirely → pvxs never enters the `if(auto val = ...)`
+        // body and `nsecMask` stays 0.
+        assert_eq!(ai_instance().qtime_nsec_mask(), 0);
+    }
+
+    /// End-to-end on the snapshot: `nsec:lsb:31` publishes
+    /// `nanoseconds & ~mask` (0, since nanoseconds < 1e9 < 2^31) and
+    /// `userTag = nanoseconds & mask` (pvxs `iocsource.cpp:239-248`). The
+    /// old `(1..=30)` clamp served the raw nanoseconds and the record's
+    /// utag instead.
+    #[test]
+    fn qtime_nsec_lsb_31_is_served_not_ignored() {
+        use std::time::{Duration, SystemTime};
+        let mut inst = ai_instance();
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_789);
+        inst.common.utag = 5;
+        inst.set_info("Q:time:tag", "nsec:lsb:31");
+
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(snap.user_tag, 123_456_789);
+        assert_eq!(snap.timestamp.subsec_nanos(), 0);
+        assert_eq!(snap.timestamp.unix_secs(), 42);
+    }
+
+    /// The mirror boundary: a tag pvxs's `strncmp` rejects must leave the
+    /// timestamp and the record's own utag alone. The old case-insensitive
+    /// split matched `NSEC:LSB:4` and masked the wire timestamp pvxs serves
+    /// unmasked.
+    #[test]
+    fn qtime_uppercase_tag_leaves_timestamp_untouched() {
+        use std::time::{Duration, SystemTime};
+        let mut inst = ai_instance();
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_789);
+        inst.common.utag = 5;
+        inst.set_info("Q:time:tag", "NSEC:LSB:4");
+
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(
+            snap.user_tag, 5,
+            "record utag must survive a non-matching tag"
+        );
+        assert_eq!(snap.timestamp.subsec_nanos(), 123_456_789);
     }
 
     /// the served `timeStamp.userTag` defaults to the record's `utag`

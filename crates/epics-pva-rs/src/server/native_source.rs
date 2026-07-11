@@ -432,7 +432,7 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
     // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
     // the codec already added POSIX_TIME_AT_EPICS_EPOCH on decode) and
     // `Snapshot.user_tag` is the nsec-LSB / pulse-id tag that
-    // `apply_nsec_lsb_split` strips out of `nanoseconds` (mirroring
+    // `apply_nsec_mask` strips out of `nanoseconds` (mirroring
     // pvxs `meta.time.nsec & ~info.nsecMask` for the wire nanoseconds and
     // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
     // overwrote the acquisition time with serialization time and zeroed

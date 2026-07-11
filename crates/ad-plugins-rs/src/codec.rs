@@ -36,7 +36,7 @@ pub fn original_data_type(array: &NDArray) -> NDDataType {
 ///
 /// The byte slice is reinterpreted as the target type using native endianness.
 /// Returns `None` if the byte count is not a multiple of the element size.
-fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<NDDataBuffer> {
+pub(crate) fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Option<NDDataBuffer> {
     let elem_size = data_type.element_size();
     if bytes.len() % elem_size != 0 {
         return None;

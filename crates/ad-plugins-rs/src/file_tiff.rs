@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
+use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::FilePluginController;
@@ -11,44 +13,124 @@ use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
 };
 
-use tiff::ColorType;
-use tiff::decoder::Decoder;
-use tiff::encoder::TiffEncoder;
-use tiff::encoder::colortype;
-use tiff::tags::Tag;
-
-// Custom TIFF tag numbers — must match C++ NDFileTIFF.cpp:37-41 exactly.
+// TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
+// (NDFileTIFF.cpp:225-237, :243-271); 65000-65003 and 65010+ are the custom
+// EPICS tags (:37-42).
+const TAG_IMAGE_WIDTH: u16 = 256;
+const TAG_IMAGE_LENGTH: u16 = 257;
+const TAG_BITS_PER_SAMPLE: u16 = 258;
+const TAG_COMPRESSION: u16 = 259;
+const TAG_PHOTOMETRIC: u16 = 262;
+const TAG_IMAGE_DESCRIPTION: u16 = 270;
+const TAG_MAKE: u16 = 271;
+const TAG_MODEL: u16 = 272;
+const TAG_STRIP_OFFSETS: u16 = 273;
+const TAG_SAMPLES_PER_PIXEL: u16 = 277;
+const TAG_ROWS_PER_STRIP: u16 = 278;
+const TAG_STRIP_BYTE_COUNTS: u16 = 279;
+const TAG_PLANAR_CONFIG: u16 = 284;
+const TAG_SOFTWARE: u16 = 305;
+const TAG_SAMPLE_FORMAT: u16 = 339;
 const TIFFTAG_NDTIMESTAMP: u16 = 65000;
 const TIFFTAG_UNIQUEID: u16 = 65001;
 const TIFFTAG_EPICSTSSEC: u16 = 65002;
 const TIFFTAG_EPICSTSNSEC: u16 = 65003;
 const TIFFTAG_FIRST_ATTRIBUTE: u16 = 65010;
 
-/// Signed-RGB color types. The `tiff` crate only ships unsigned RGB
-/// (`colortype::RGB8/16/32`); C++ libtiff handles signed RGB by setting
-/// `SAMPLEFORMAT_INT` on an otherwise identical RGB layout. These local
-/// `ColorType` impls do exactly that — same bit layout, `SampleFormat::Int`.
-mod signed_rgb {
-    use tiff::encoder::colortype::ColorType;
-    use tiff::tags::{PhotometricInterpretation, SampleFormat};
+// TIFF field types.
+const TYPE_ASCII: u16 = 2;
+const TYPE_SHORT: u16 = 3;
+const TYPE_LONG: u16 = 4;
+const TYPE_DOUBLE: u16 = 12;
 
-    macro_rules! signed_rgb {
-        ($name:ident, $inner:ty, $bits:expr) => {
-            pub struct $name;
-            impl ColorType for $name {
-                type Inner = $inner;
-                const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::RGB;
-                const BITS_PER_SAMPLE: &'static [u16] = &[$bits, $bits, $bits];
-                const SAMPLE_FORMAT: &'static [SampleFormat] =
-                    &[SampleFormat::Int, SampleFormat::Int, SampleFormat::Int];
-            }
-        };
+// libtiff constants, as passed by C.
+const COMPRESSION_NONE: u16 = 1;
+const PHOTOMETRIC_MINISBLACK: u16 = 1;
+const PHOTOMETRIC_RGB: u16 = 2;
+const PLANARCONFIG_CONTIG: u16 = 1;
+const PLANARCONFIG_SEPARATE: u16 = 2;
+const SAMPLEFORMAT_UINT: u16 = 1;
+const SAMPLEFORMAT_INT: u16 = 2;
+const SAMPLEFORMAT_IEEEFP: u16 = 3;
+
+/// The image geometry C derives in `NDFileTIFF::openFile` (NDFileTIFF.cpp:
+/// 180-224) together with the strip layout its `writeFile` (:383-406) writes.
+///
+/// The two are one decision: RGB2 and RGB3 are stored as three *separate* colour
+/// planes (`PLANARCONFIG_SEPARATE`), and RGB2 additionally uses one row per strip
+/// because its source rows interleave the planes. Deriving both from a single
+/// struct is what keeps the tag values and the strip bytes from disagreeing.
+struct TiffLayout {
+    width: usize,
+    height: usize,
+    samples_per_pixel: u16,
+    photometric: u16,
+    planar_config: u16,
+    rows_per_strip: usize,
+    color_mode: NDColorMode,
+}
+
+/// One IFD entry, ready to be laid out.
+struct IfdEntry {
+    tag: u16,
+    field_type: u16,
+    count: u32,
+    /// Encoded value bytes; inlined into the entry when ≤ 4 bytes, otherwise
+    /// written to the value area and referenced by offset.
+    data: Vec<u8>,
+}
+
+impl IfdEntry {
+    fn ascii(tag: u16, value: &str) -> Self {
+        let mut data = value.as_bytes().to_vec();
+        data.push(0); // TIFF ASCII values are NUL-terminated, and the NUL counts.
+        Self {
+            tag,
+            field_type: TYPE_ASCII,
+            count: data.len() as u32,
+            data,
+        }
     }
 
-    signed_rgb!(RGBI8, i8, 8);
-    signed_rgb!(RGBI16, i16, 16);
-    signed_rgb!(RGBI32, i32, 32);
-    signed_rgb!(RGBI64, i64, 64);
+    fn short(tag: u16, values: &[u16]) -> Self {
+        Self {
+            tag,
+            field_type: TYPE_SHORT,
+            count: values.len() as u32,
+            data: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        }
+    }
+
+    fn long(tag: u16, values: &[u32]) -> Self {
+        Self {
+            tag,
+            field_type: TYPE_LONG,
+            count: values.len() as u32,
+            data: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        }
+    }
+
+    /// libtiff writes the size tags (ImageWidth, ImageLength, RowsPerStrip) as
+    /// SHORT when the value fits and LONG otherwise (`TIFFWriteDirectoryTag
+    /// ShortLong`), so a C-written file uses whichever the value calls for.
+    fn short_or_long(tag: u16, value: usize) -> ADResult<Self> {
+        let value = u32::try_from(value)
+            .map_err(|_| ADError::InvalidDimensions("TIFF dimension exceeds 2^32".into()))?;
+        Ok(if value <= u32::from(u16::MAX) {
+            Self::short(tag, &[value as u16])
+        } else {
+            Self::long(tag, &[value])
+        })
+    }
+
+    fn double(tag: u16, value: f64) -> Self {
+        Self {
+            tag,
+            field_type: TYPE_DOUBLE,
+            count: 1,
+            data: value.to_le_bytes().to_vec(),
+        }
+    }
 }
 
 /// Format an NDAttribute value as the C++ `epicsSnprintf` "name:value" tag
@@ -97,46 +179,236 @@ impl TiffWriter {
             })
     }
 
-    fn normalize_for_write(array: &NDArray) -> ADResult<(NDArray, u32, u32, bool)> {
-        match array.dims.as_slice() {
-            [x] => {
-                let mut normalized = NDArray::new(
-                    vec![NDDimension::new(x.size), NDDimension::new(1)],
-                    array.data.data_type(),
-                );
-                normalized.data = array.data.clone();
-                normalized.unique_id = array.unique_id;
-                normalized.timestamp = array.timestamp;
-                normalized.attributes = array.attributes.clone();
-                normalized.codec = array.codec.clone();
-                Ok((normalized, x.size as u32, 1, false))
+    /// C's `openFile` structure switch (NDFileTIFF.cpp:180-224). Note the two
+    /// RGB planar layouts: RGB2 gets `rowsPerStrip = 1` because its rows
+    /// interleave the three planes, RGB3 keeps `rowsPerStrip = sizeY` because
+    /// each plane is already contiguous. Both are `PLANARCONFIG_SEPARATE`.
+    fn layout(array: &NDArray) -> ADResult<TiffLayout> {
+        let color_mode = Self::array_color_mode(array);
+        let mono = |width: usize, height: usize| TiffLayout {
+            width,
+            height,
+            samples_per_pixel: 1,
+            photometric: PHOTOMETRIC_MINISBLACK,
+            planar_config: PLANARCONFIG_CONTIG,
+            rows_per_strip: height,
+            color_mode: NDColorMode::Mono,
+        };
+
+        Ok(match array.dims.as_slice() {
+            [x] => mono(x.size, 1),
+            [x, y] => mono(x.size, y.size),
+            [c, x, y] if c.size == 3 && color_mode == NDColorMode::RGB1 => TiffLayout {
+                width: x.size,
+                height: y.size,
+                samples_per_pixel: 3,
+                photometric: PHOTOMETRIC_RGB,
+                planar_config: PLANARCONFIG_CONTIG,
+                rows_per_strip: y.size,
+                color_mode: NDColorMode::RGB1,
+            },
+            [x, c, y] if c.size == 3 && color_mode == NDColorMode::RGB2 => TiffLayout {
+                width: x.size,
+                height: y.size,
+                samples_per_pixel: 3,
+                photometric: PHOTOMETRIC_RGB,
+                planar_config: PLANARCONFIG_SEPARATE,
+                rows_per_strip: 1,
+                color_mode: NDColorMode::RGB2,
+            },
+            [x, y, c] if c.size == 3 && color_mode == NDColorMode::RGB3 => TiffLayout {
+                width: x.size,
+                height: y.size,
+                samples_per_pixel: 3,
+                photometric: PHOTOMETRIC_RGB,
+                planar_config: PLANARCONFIG_SEPARATE,
+                rows_per_strip: y.size,
+                color_mode: NDColorMode::RGB3,
+            },
+            _ => {
+                return Err(ADError::InvalidDimensions(
+                    "unsupported array structure".into(),
+                ));
             }
-            [x, y] => Ok((array.clone(), x.size as u32, y.size as u32, false)),
-            [_, _, _] => {
-                let color_mode = Self::array_color_mode(array);
-                let rgb1 = match color_mode {
-                    NDColorMode::RGB1 => array.clone(),
-                    NDColorMode::RGB2 | NDColorMode::RGB3 => {
-                        convert_rgb_layout(array, color_mode, NDColorMode::RGB1)?
-                    }
-                    other => {
-                        return Err(ADError::UnsupportedConversion(format!(
-                            "unsupported TIFF color mode: {:?}",
-                            other
-                        )));
-                    }
-                };
-                Ok((
-                    rgb1.clone(),
-                    rgb1.dims[1].size as u32,
-                    rgb1.dims[2].size as u32,
-                    true,
-                ))
-            }
-            _ => Err(ADError::InvalidDimensions(
-                "unsupported TIFF array dimensions".into(),
-            )),
+        })
+    }
+
+    /// C `sampleFormat`/`bitsPerSample` (NDFileTIFF.cpp:139-179).
+    fn sample_format_and_bits(data_type: NDDataType) -> (u16, u16) {
+        match data_type {
+            NDDataType::Int8 => (SAMPLEFORMAT_INT, 8),
+            NDDataType::UInt8 => (SAMPLEFORMAT_UINT, 8),
+            NDDataType::Int16 => (SAMPLEFORMAT_INT, 16),
+            NDDataType::UInt16 => (SAMPLEFORMAT_UINT, 16),
+            NDDataType::Int32 => (SAMPLEFORMAT_INT, 32),
+            NDDataType::UInt32 => (SAMPLEFORMAT_UINT, 32),
+            NDDataType::Int64 => (SAMPLEFORMAT_INT, 64),
+            NDDataType::UInt64 => (SAMPLEFORMAT_UINT, 64),
+            NDDataType::Float32 => (SAMPLEFORMAT_IEEEFP, 32),
+            NDDataType::Float64 => (SAMPLEFORMAT_IEEEFP, 64),
         }
+    }
+
+    /// The strips C's `writeFile` emits, as `(strip index, source byte range)`
+    /// **in the order C writes them** (NDFileTIFF.cpp:383-406).
+    ///
+    /// For RGB2 that order is not the strip order: C walks rows and writes red
+    /// row *s* as strip `s`, green as strip `sizeY + s`, blue as strip
+    /// `2*sizeY + s`, so the file's byte stream stays row-interleaved while the
+    /// StripOffsets table de-interleaves it into three planes. A reader walking
+    /// strips in index order therefore sees plane R, plane G, plane B — which is
+    /// exactly how C's own `readFile` recovers the image (:497-505, as RGB3).
+    fn strip_writes(layout: &TiffLayout, bytes_per_sample: usize) -> Vec<(usize, Range<usize>)> {
+        let TiffLayout { width, height, .. } = *layout;
+        match layout.color_mode {
+            NDColorMode::RGB2 => {
+                let strip = width * bytes_per_sample; // one row of one plane
+                let mut writes = Vec::with_capacity(3 * height);
+                for row in 0..height {
+                    let red = 3 * row * strip;
+                    writes.push((row, red..red + strip));
+                    writes.push((height + row, red + strip..red + 2 * strip));
+                    writes.push((2 * height + row, red + 2 * strip..red + 3 * strip));
+                }
+                writes
+            }
+            NDColorMode::RGB3 => {
+                let plane = width * height * bytes_per_sample;
+                (0..3).map(|p| (p, p * plane..(p + 1) * plane)).collect()
+            }
+            // Mono and RGB1 are chunky: a single strip holding the whole image.
+            _ => {
+                let total =
+                    width * height * usize::from(layout.samples_per_pixel) * bytes_per_sample;
+                vec![(0, 0..total)]
+            }
+        }
+    }
+
+    /// Serialise a classic little-endian TIFF: header, strip data, then the IFD
+    /// and its value area.
+    ///
+    /// Written by hand rather than through the `tiff` crate because that crate
+    /// cannot express `PLANARCONFIG_SEPARATE` (its ImageEncoder assumes chunky
+    /// strips of `width * samples` each) and unconditionally emits XResolution /
+    /// YResolution / ResolutionUnit, which C never sets. The tag set below is
+    /// exactly C's `TIFFSetField` calls plus the baseline structural tags libtiff
+    /// itself writes (Compression, StripOffsets, StripByteCounts).
+    fn encode(array: &NDArray, layout: &TiffLayout) -> ADResult<Vec<u8>> {
+        let raw = array.data.as_u8_slice();
+        let (sample_format, bits_per_sample) = Self::sample_format_and_bits(array.data.data_type());
+        let bytes_per_sample = usize::from(bits_per_sample) / 8;
+
+        let writes = Self::strip_writes(layout, bytes_per_sample);
+        let expected: usize = writes.iter().map(|(_, r)| r.len()).sum();
+        if raw.len() < expected {
+            return Err(ADError::InvalidDimensions(format!(
+                "TIFF: array holds {} bytes, the {:?} layout needs {}",
+                raw.len(),
+                layout.color_mode,
+                expected
+            )));
+        }
+
+        let mut out: Vec<u8> = Vec::with_capacity(expected + 1024);
+        out.extend_from_slice(b"II"); // little-endian
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // IFD offset, patched below
+
+        let strip_count = writes.len();
+        let mut strip_offsets = vec![0u32; strip_count];
+        let mut strip_byte_counts = vec![0u32; strip_count];
+        for (index, range) in writes {
+            strip_offsets[index] = out.len() as u32;
+            strip_byte_counts[index] = range.len() as u32;
+            out.extend_from_slice(&raw[range]);
+        }
+        if out.len() % 2 != 0 {
+            out.push(0); // IFDs must begin on a word boundary
+        }
+
+        let samples = usize::from(layout.samples_per_pixel);
+        let mut entries = vec![
+            IfdEntry::short_or_long(TAG_IMAGE_WIDTH, layout.width)?,
+            IfdEntry::short_or_long(TAG_IMAGE_LENGTH, layout.height)?,
+            IfdEntry::short(TAG_BITS_PER_SAMPLE, &vec![bits_per_sample; samples]),
+            IfdEntry::short(TAG_COMPRESSION, &[COMPRESSION_NONE]),
+            IfdEntry::short(TAG_PHOTOMETRIC, &[layout.photometric]),
+            IfdEntry::long(TAG_STRIP_OFFSETS, &strip_offsets),
+            IfdEntry::short(TAG_SAMPLES_PER_PIXEL, &[layout.samples_per_pixel]),
+            IfdEntry::short_or_long(TAG_ROWS_PER_STRIP, layout.rows_per_strip)?,
+            IfdEntry::long(TAG_STRIP_BYTE_COUNTS, &strip_byte_counts),
+            IfdEntry::short(TAG_PLANAR_CONFIG, &[layout.planar_config]),
+            IfdEntry::short(TAG_SAMPLE_FORMAT, &vec![sample_format; samples]),
+        ];
+
+        // Standard tags derived from well-known attributes (NDFileTIFF.cpp:243-271).
+        let model = array
+            .attributes
+            .get("Model")
+            .map(|a| a.value.as_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let make = array
+            .attributes
+            .get("Manufacturer")
+            .map(|a| a.value.as_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        entries.push(IfdEntry::ascii(TAG_MODEL, &model));
+        entries.push(IfdEntry::ascii(TAG_MAKE, &make));
+        entries.push(IfdEntry::ascii(TAG_SOFTWARE, "EPICS areaDetector"));
+        if let Some(desc) = array.attributes.get("TIFFImageDescription") {
+            entries.push(IfdEntry::ascii(
+                TAG_IMAGE_DESCRIPTION,
+                &desc.value.as_string(),
+            ));
+        }
+
+        // EPICS metadata tags 65000-65003 — types per C's tiffFieldInfo (:47-51).
+        entries.push(IfdEntry::double(TIFFTAG_NDTIMESTAMP, array.time_stamp));
+        entries.push(IfdEntry::long(TIFFTAG_UNIQUEID, &[array.unique_id as u32]));
+        entries.push(IfdEntry::long(TIFFTAG_EPICSTSSEC, &[array.timestamp.sec]));
+        entries.push(IfdEntry::long(TIFFTAG_EPICSTSNSEC, &[array.timestamp.nsec]));
+
+        // NDArray attributes as ASCII tags from 65010 (:277-355).
+        for (i, attr) in array.attributes.iter().enumerate() {
+            let Some(tag) = TIFFTAG_FIRST_ATTRIBUTE.checked_add(i as u16) else {
+                break; // C stops at TIFFTAG_LAST_ATTRIBUTE (65535).
+            };
+            entries.push(IfdEntry::ascii(tag, &attribute_tag_string(attr)));
+        }
+
+        entries.sort_by_key(|e| e.tag); // TIFF requires ascending tag order
+
+        let ifd_offset = out.len();
+        let ifd_size = 2 + 12 * entries.len() + 4;
+        let mut values_offset = ifd_offset + ifd_size;
+        let mut ifd: Vec<u8> = Vec::with_capacity(ifd_size);
+        let mut values: Vec<u8> = Vec::new();
+
+        ifd.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in &entries {
+            ifd.extend_from_slice(&entry.tag.to_le_bytes());
+            ifd.extend_from_slice(&entry.field_type.to_le_bytes());
+            ifd.extend_from_slice(&entry.count.to_le_bytes());
+            if entry.data.len() <= 4 {
+                let mut inline = entry.data.clone();
+                inline.resize(4, 0);
+                ifd.extend_from_slice(&inline);
+            } else {
+                ifd.extend_from_slice(&(values_offset as u32).to_le_bytes());
+                values.extend_from_slice(&entry.data);
+                if values.len() % 2 != 0 {
+                    values.push(0);
+                }
+                values_offset = ifd_offset + ifd_size + values.len();
+            }
+        }
+        ifd.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+
+        out.extend_from_slice(&ifd);
+        out.extend_from_slice(&values);
+        out[4..8].copy_from_slice(&(ifd_offset as u32).to_le_bytes());
+        Ok(out)
     }
 
     fn attach_color_mode(array: &mut NDArray, color_mode: NDColorMode) {
@@ -160,159 +432,9 @@ impl NDFileWriter for TiffWriter {
             .current_path
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-        let (array, width, height, is_rgb) = Self::normalize_for_write(array)?;
-
-        let file = std::fs::File::create(path)?;
-        let mut encoder = TiffEncoder::new(file)
-            .map_err(|e| ADError::UnsupportedConversion(format!("TIFF encoder error: {}", e)))?;
-
-        // Collect attribute tag data before borrowing encoder mutably.
-        // C++ writes NDArray attributes as custom TIFF tags starting at tag
-        // 65010 (TIFFTAG_FIRST_ATTRIBUTE), value format "name:value" (colon).
-        let attr_tags: Vec<(u16, String)> = array
-            .attributes
-            .iter()
-            .enumerate()
-            .map(|(i, attr)| {
-                let tag_num = TIFFTAG_FIRST_ATTRIBUTE.saturating_add(i as u16);
-                (tag_num, attribute_tag_string(attr))
-            })
-            .collect();
-
-        // Standard tags derived from well-known attributes (NDFileTIFF.cpp:243-271).
-        let model = array
-            .attributes
-            .get("Model")
-            .map(|a| a.value.as_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let make = array
-            .attributes
-            .get("Manufacturer")
-            .map(|a| a.value.as_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let image_description = array
-            .attributes
-            .get("TIFFImageDescription")
-            .map(|a| a.value.as_string());
-
-        let unique_id = array.unique_id;
-        let time_stamp = array.time_stamp;
-        let ts_sec = array.timestamp.sec;
-        let ts_nsec = array.timestamp.nsec;
-
-        // Macro to reduce repetition: create image encoder, write custom tags, write data.
-        macro_rules! write_with_tags {
-            ($ct:ty, $data:expr) => {{
-                let mut image = encoder.new_image::<$ct>(width, height).map_err(|e| {
-                    ADError::UnsupportedConversion(format!("TIFF encoder error: {}", e))
-                })?;
-
-                macro_rules! tag {
-                    ($tag:expr, $val:expr) => {
-                        image.encoder().write_tag($tag, $val).map_err(|e| {
-                            ADError::UnsupportedConversion(format!("TIFF tag write error: {}", e))
-                        })?;
-                    };
-                }
-
-                // EPICS metadata tags 65000-65003 — typed values matching C++.
-                tag!(Tag::Unknown(TIFFTAG_NDTIMESTAMP), time_stamp);
-                tag!(Tag::Unknown(TIFFTAG_UNIQUEID), unique_id as u32);
-                tag!(Tag::Unknown(TIFFTAG_EPICSTSSEC), ts_sec);
-                tag!(Tag::Unknown(TIFFTAG_EPICSTSNSEC), ts_nsec);
-
-                // Standard tags (NDFileTIFF.cpp:243-271).
-                tag!(Tag::Software, "EPICS areaDetector");
-                tag!(Tag::Model, &*model);
-                tag!(Tag::Make, &*make);
-                if let Some(desc) = &image_description {
-                    tag!(Tag::ImageDescription, &**desc);
-                }
-
-                // NDArray attributes as custom tags starting at 65010.
-                for (tag_num, tag_val) in &attr_tags {
-                    tag!(Tag::Unknown(*tag_num), &**tag_val);
-                }
-
-                image
-                    .write_data($data)
-                    .map_err(|e| ADError::UnsupportedConversion(format!("TIFF write error: {}", e)))
-            }};
-        }
-
-        match &array.data {
-            NDDataBuffer::U8(v) => {
-                if is_rgb {
-                    write_with_tags!(colortype::RGB8, v)
-                } else {
-                    write_with_tags!(colortype::Gray8, v)
-                }
-            }
-            NDDataBuffer::I8(v) => {
-                if is_rgb {
-                    write_with_tags!(signed_rgb::RGBI8, v)
-                } else {
-                    write_with_tags!(colortype::GrayI8, v)
-                }
-            }
-            NDDataBuffer::U16(v) => {
-                if is_rgb {
-                    write_with_tags!(colortype::RGB16, v)
-                } else {
-                    write_with_tags!(colortype::Gray16, v)
-                }
-            }
-            NDDataBuffer::I16(v) => {
-                if is_rgb {
-                    write_with_tags!(signed_rgb::RGBI16, v)
-                } else {
-                    write_with_tags!(colortype::GrayI16, v)
-                }
-            }
-            NDDataBuffer::U32(v) => {
-                if is_rgb {
-                    write_with_tags!(colortype::RGB32, v)
-                } else {
-                    write_with_tags!(colortype::Gray32, v)
-                }
-            }
-            NDDataBuffer::I32(v) => {
-                if is_rgb {
-                    write_with_tags!(signed_rgb::RGBI32, v)
-                } else {
-                    write_with_tags!(colortype::GrayI32, v)
-                }
-            }
-            NDDataBuffer::I64(v) => {
-                if is_rgb {
-                    write_with_tags!(signed_rgb::RGBI64, v)
-                } else {
-                    write_with_tags!(colortype::GrayI64, v)
-                }
-            }
-            NDDataBuffer::U64(v) => {
-                if is_rgb {
-                    write_with_tags!(colortype::RGB64, v)
-                } else {
-                    write_with_tags!(colortype::Gray64, v)
-                }
-            }
-            NDDataBuffer::F32(v) => {
-                if is_rgb {
-                    write_with_tags!(colortype::RGB32Float, v)
-                } else {
-                    write_with_tags!(colortype::Gray32Float, v)
-                }
-            }
-            NDDataBuffer::F64(v) => {
-                if is_rgb {
-                    write_with_tags!(colortype::RGB64Float, v)
-                } else {
-                    write_with_tags!(colortype::Gray64Float, v)
-                }
-            }
-        }?;
-
+        let layout = Self::layout(array)?;
+        let bytes = Self::encode(array, &layout)?;
+        std::fs::write(path, bytes)?;
         Ok(())
     }
 
@@ -321,100 +443,8 @@ impl NDFileWriter for TiffWriter {
             .current_path
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
-
-        let file = std::fs::File::open(path)?;
-        let mut decoder = Decoder::new(file)
-            .map_err(|e| ADError::UnsupportedConversion(format!("TIFF decode error: {}", e)))?;
-
-        let (width, height) = decoder
-            .dimensions()
-            .map_err(|e| ADError::UnsupportedConversion(format!("TIFF dimensions error: {}", e)))?;
-        let color_type = decoder
-            .colortype()
-            .map_err(|e| ADError::UnsupportedConversion(format!("TIFF colortype error: {}", e)))?;
-
-        let result = decoder
-            .read_image()
-            .map_err(|e| ADError::UnsupportedConversion(format!("TIFF read error: {}", e)))?;
-
-        let (dims, color_mode) = match color_type {
-            ColorType::Gray(_) => (
-                vec![
-                    NDDimension::new(width as usize),
-                    NDDimension::new(height as usize),
-                ],
-                NDColorMode::Mono,
-            ),
-            ColorType::RGB(_) => (
-                vec![
-                    NDDimension::new(3),
-                    NDDimension::new(width as usize),
-                    NDDimension::new(height as usize),
-                ],
-                NDColorMode::RGB1,
-            ),
-            other => {
-                return Err(ADError::UnsupportedConversion(format!(
-                    "unsupported TIFF color type: {:?}",
-                    other
-                )));
-            }
-        };
-
-        let mut array = match result {
-            tiff::decoder::DecodingResult::U8(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::UInt8);
-                arr.data = NDDataBuffer::U8(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::U16(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::UInt16);
-                arr.data = NDDataBuffer::U16(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::U32(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::UInt32);
-                arr.data = NDDataBuffer::U32(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::U64(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::UInt64);
-                arr.data = NDDataBuffer::U64(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::I8(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::Int8);
-                arr.data = NDDataBuffer::I8(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::I16(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::Int16);
-                arr.data = NDDataBuffer::I16(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::I32(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::Int32);
-                arr.data = NDDataBuffer::I32(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::I64(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::Int64);
-                arr.data = NDDataBuffer::I64(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::F32(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::Float32);
-                arr.data = NDDataBuffer::F32(data);
-                arr
-            }
-            tiff::decoder::DecodingResult::F64(data) => {
-                let mut arr = NDArray::new(dims.clone(), NDDataType::Float64);
-                arr.data = NDDataBuffer::F64(data);
-                arr
-            }
-        };
-        Self::attach_color_mode(&mut array, color_mode);
-        Ok(array)
+        let bytes = std::fs::read(path)?;
+        decode(&bytes)
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -425,6 +455,148 @@ impl NDFileWriter for TiffWriter {
     fn supports_multiple_arrays(&self) -> bool {
         false
     }
+}
+
+/// Read one classic TIFF, mirroring C `NDFileTIFF::readFile`
+/// (NDFileTIFF.cpp:426-560).
+///
+/// C classifies the image from (photometric, planarConfig, samplesPerPixel):
+/// MINISBLACK/CONTIG/1 → Mono `[x, y]`, RGB/CONTIG/3 → RGB1 `[3, x, y]`, and
+/// RGB/SEPARATE/3 → RGB3 `[x, y, 3]` — a planar file always comes back as RGB3,
+/// even when written from an RGB2 array, because the strips are read in index
+/// order and that order is plane R, plane G, plane B. Anything else is an error.
+/// Strips are concatenated in index order into the array buffer (:513-524).
+fn decode(bytes: &[u8]) -> ADResult<NDArray> {
+    let err = |m: &str| ADError::UnsupportedConversion(format!("TIFF decode error: {m}"));
+
+    let read_u16 = |off: usize| -> ADResult<u16> {
+        bytes
+            .get(off..off + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or_else(|| err("truncated"))
+    };
+    let read_u32 = |off: usize| -> ADResult<u32> {
+        bytes
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| err("truncated"))
+    };
+
+    if bytes.len() < 8 || &bytes[0..2] != b"II" || read_u16(2)? != 42 {
+        return Err(err("not a little-endian classic TIFF"));
+    }
+
+    // The reader only needs the integer tags; ASCII/DOUBLE entries are skipped.
+    let ifd = read_u32(4)? as usize;
+    let entry_count = read_u16(ifd)? as usize;
+    let mut tags: BTreeMap<u16, Vec<u64>> = BTreeMap::new();
+    for i in 0..entry_count {
+        let entry = ifd + 2 + 12 * i;
+        let tag = read_u16(entry)?;
+        let size = match read_u16(entry + 2)? {
+            TYPE_SHORT => 2usize,
+            TYPE_LONG => 4,
+            _ => continue,
+        };
+        let n = read_u32(entry + 4)? as usize;
+        let base = if n * size <= 4 {
+            entry + 8
+        } else {
+            read_u32(entry + 8)? as usize
+        };
+        let mut values = Vec::with_capacity(n);
+        for k in 0..n {
+            values.push(match size {
+                2 => u64::from(read_u16(base + 2 * k)?),
+                _ => u64::from(read_u32(base + 4 * k)?),
+            });
+        }
+        tags.insert(tag, values);
+    }
+
+    let scalar = |tag: u16| -> Option<u64> { tags.get(&tag).and_then(|v| v.first().copied()) };
+    let width = scalar(TAG_IMAGE_WIDTH).ok_or_else(|| err("no ImageWidth"))? as usize;
+    let height = scalar(TAG_IMAGE_LENGTH).ok_or_else(|| err("no ImageLength"))? as usize;
+    let bits = scalar(TAG_BITS_PER_SAMPLE).ok_or_else(|| err("no BitsPerSample"))?;
+    let samples_per_pixel = scalar(TAG_SAMPLES_PER_PIXEL).unwrap_or(1);
+    let photometric = scalar(TAG_PHOTOMETRIC).ok_or_else(|| err("no PhotometricInterpretation"))?;
+    let planar_config = scalar(TAG_PLANAR_CONFIG).unwrap_or(u64::from(PLANARCONFIG_CONTIG));
+    // C: "Sample format is not defined! Default UINT is used." (:457-463)
+    let sample_format = match scalar(TAG_SAMPLE_FORMAT) {
+        Some(0) | None => u64::from(SAMPLEFORMAT_UINT),
+        Some(v) => v,
+    };
+
+    let data_type = match (bits, sample_format as u16) {
+        (8, SAMPLEFORMAT_INT) => NDDataType::Int8,
+        (8, SAMPLEFORMAT_UINT) => NDDataType::UInt8,
+        (16, SAMPLEFORMAT_INT) => NDDataType::Int16,
+        (16, SAMPLEFORMAT_UINT) => NDDataType::UInt16,
+        (32, SAMPLEFORMAT_INT) => NDDataType::Int32,
+        (32, SAMPLEFORMAT_UINT) => NDDataType::UInt32,
+        (64, SAMPLEFORMAT_INT) => NDDataType::Int64,
+        (64, SAMPLEFORMAT_UINT) => NDDataType::UInt64,
+        (32, SAMPLEFORMAT_IEEEFP) => NDDataType::Float32,
+        (64, SAMPLEFORMAT_IEEEFP) => NDDataType::Float64,
+        _ => {
+            return Err(err(&format!(
+                "unsupported bitsPerSample={bits} sampleFormat={sample_format}"
+            )));
+        }
+    };
+
+    let (dims, color_mode) = match (photometric as u16, planar_config as u16, samples_per_pixel) {
+        (PHOTOMETRIC_MINISBLACK, PLANARCONFIG_CONTIG, 1) => (
+            vec![NDDimension::new(width), NDDimension::new(height)],
+            NDColorMode::Mono,
+        ),
+        (PHOTOMETRIC_RGB, PLANARCONFIG_CONTIG, 3) => (
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(width),
+                NDDimension::new(height),
+            ],
+            NDColorMode::RGB1,
+        ),
+        (PHOTOMETRIC_RGB, PLANARCONFIG_SEPARATE, 3) => (
+            vec![
+                NDDimension::new(width),
+                NDDimension::new(height),
+                NDDimension::new(3),
+            ],
+            NDColorMode::RGB3,
+        ),
+        _ => {
+            return Err(err(&format!(
+                "unsupported photoMetric={photometric}, planarConfig={planar_config}, \
+                 samplesPerPixel={samples_per_pixel}"
+            )));
+        }
+    };
+
+    let offsets = tags
+        .get(&TAG_STRIP_OFFSETS)
+        .ok_or_else(|| err("no StripOffsets"))?;
+    let counts = tags
+        .get(&TAG_STRIP_BYTE_COUNTS)
+        .ok_or_else(|| err("no StripByteCounts"))?;
+    if offsets.len() != counts.len() {
+        return Err(err("StripOffsets/StripByteCounts length mismatch"));
+    }
+    let mut raw: Vec<u8> = Vec::new();
+    for (offset, byte_count) in offsets.iter().zip(counts) {
+        let (start, len) = (*offset as usize, *byte_count as usize);
+        let strip = bytes
+            .get(start..start + len)
+            .ok_or_else(|| err("strip extends past the end of the file"))?;
+        raw.extend_from_slice(strip);
+    }
+
+    let mut array = NDArray::new(dims, data_type);
+    array.data = crate::codec::buffer_from_bytes(&raw, data_type)
+        .ok_or_else(|| err("strip data is not a whole number of samples"))?;
+    TiffWriter::attach_color_mode(&mut array, color_mode);
+    Ok(array)
 }
 
 /// TIFF file processor wrapping FilePluginController<TiffWriter>.
@@ -481,10 +653,14 @@ impl NDPluginProcess for TiffFileProcessor {
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::NDDataBuffer;
+    // The tests verify the bytes this module writes with an INDEPENDENT TIFF
+    // decoder (the `tiff` crate), not with our own reader.
     use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
     use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tiff::decoder::Decoder;
+    use tiff::tags::Tag;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -840,6 +1016,243 @@ mod tests {
         // SampleFormat 2 = SAMPLEFORMAT_INT.
         assert!(sf.iter().all(|&s| s == 2), "expected signed sample format");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- R8-67: PlanarConfiguration, separate RGB2/RGB3 planes, RowsPerStrip ----
+
+    /// An RGB image in one of the three AD layouts; `pixel(x, y, c)` is
+    /// deterministic so every layout holds the same pixels, ordered differently.
+    fn rgb_array(mode: NDColorMode, w: usize, h: usize) -> NDArray {
+        let dims = match mode {
+            NDColorMode::RGB1 => vec![3, w, h],
+            NDColorMode::RGB2 => vec![w, 3, h],
+            NDColorMode::RGB3 => vec![w, h, 3],
+            other => panic!("not an RGB layout: {other:?}"),
+        };
+        let mut arr = NDArray::new(
+            dims.into_iter().map(NDDimension::new).collect(),
+            NDDataType::UInt8,
+        );
+        TiffWriter::attach_color_mode(&mut arr, mode);
+        if let NDDataBuffer::U8(v) = &mut arr.data {
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let idx = match mode {
+                            NDColorMode::RGB1 => c + x * 3 + y * w * 3,
+                            NDColorMode::RGB2 => x + c * w + y * w * 3,
+                            NDColorMode::RGB3 => x + y * w + c * w * h,
+                            _ => unreachable!(),
+                        };
+                        v[idx] = pixel(x, y, c);
+                    }
+                }
+            }
+        }
+        arr
+    }
+
+    fn pixel(x: usize, y: usize, c: usize) -> u8 {
+        ((x * 7 + y * 13 + c * 61) % 256) as u8
+    }
+
+    fn mono_array(w: usize, h: usize) -> NDArray {
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(w), NDDimension::new(h)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(v) = &mut arr.data {
+            v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
+        }
+        arr
+    }
+
+    /// The image bytes as a reader gets them: every strip, in **strip index**
+    /// order (not file order), concatenated — exactly what C's readFile does with
+    /// TIFFReadEncodedStrip (NDFileTIFF.cpp:513-524). Offsets and counts come
+    /// from an independent TIFF decoder.
+    fn strips_in_index_order(path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        let mut decoder = Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+        let offsets = decoder.get_tag_u32_vec(Tag::StripOffsets).unwrap();
+        let counts = decoder.get_tag_u32_vec(Tag::StripByteCounts).unwrap();
+        assert_eq!(offsets.len(), counts.len());
+        let mut out = Vec::new();
+        for (off, count) in offsets.iter().zip(&counts) {
+            out.extend_from_slice(&bytes[*off as usize..(*off + *count) as usize]);
+        }
+        out
+    }
+
+    fn write_tiff(prefix: &str, array: &NDArray) -> PathBuf {
+        let path = temp_path(prefix);
+        let mut writer = TiffWriter::new();
+        writer.open_file(&path, NDFileMode::Single, array).unwrap();
+        writer.write_file(array).unwrap();
+        writer.close_file().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_r8_67_every_image_carries_planarconfiguration() {
+        // C sets TIFFTAG_PLANARCONFIG on every image (NDFileTIFF.cpp:229):
+        // CONTIG(1) for mono and RGB1, SEPARATE(2) for RGB2 and RGB3. The port
+        // emitted tag 284 on no image at all.
+        for (name, array, expected) in [
+            ("planar_mono", mono_array(4, 3), PLANARCONFIG_CONTIG),
+            (
+                "planar_rgb1",
+                rgb_array(NDColorMode::RGB1, 4, 3),
+                PLANARCONFIG_CONTIG,
+            ),
+            (
+                "planar_rgb2",
+                rgb_array(NDColorMode::RGB2, 4, 3),
+                PLANARCONFIG_SEPARATE,
+            ),
+            (
+                "planar_rgb3",
+                rgb_array(NDColorMode::RGB3, 4, 3),
+                PLANARCONFIG_SEPARATE,
+            ),
+        ] {
+            let path = write_tiff(name, &array);
+            let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+            assert_eq!(
+                decoder.get_tag_u32(Tag::PlanarConfiguration).unwrap() as u16,
+                expected,
+                "{name}: PlanarConfiguration (tag 284) must be on disk with C's value"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn test_r8_67_rgb2_and_rgb3_are_written_as_three_separate_planes() {
+        // C writes RGB2/RGB3 as three separate colour planes (:389-405): reading
+        // the strips in index order yields plane R, then G, then B. The port
+        // converted both to RGB1 and wrote chunky RGBRGB… bytes instead.
+        let (w, h) = (4usize, 3usize);
+        let mut expected_planes: Vec<u8> = Vec::new();
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    expected_planes.push(pixel(x, y, c));
+                }
+            }
+        }
+
+        for (name, mode) in [
+            ("sep_rgb2", NDColorMode::RGB2),
+            ("sep_rgb3", NDColorMode::RGB3),
+        ] {
+            let path = write_tiff(name, &rgb_array(mode, w, h));
+            assert_eq!(
+                strips_in_index_order(&path),
+                expected_planes,
+                "{mode:?}: on-disk strips must be the R, G and B planes in order"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+
+        // RGB1 stays chunky: the single strip holds pixel-interleaved RGB.
+        let mut expected_chunky: Vec<u8> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    expected_chunky.push(pixel(x, y, c));
+                }
+            }
+        }
+        let path = write_tiff("sep_rgb1", &rgb_array(NDColorMode::RGB1, w, h));
+        assert_eq!(strips_in_index_order(&path), expected_chunky);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_r8_67_rows_per_strip_matches_c() {
+        // C: rowsPerStrip = sizeY for mono/RGB1/RGB3, but 1 for RGB2 because its
+        // rows interleave the planes (:190-219). The `tiff` crate instead chose a
+        // ~1 MB strip height, so the tag value (and the strip count) diverged on
+        // every image.
+        let (w, h) = (4usize, 3usize);
+        for (name, array, rows, strips) in [
+            ("rps_mono", mono_array(w, h), h as u32, 1),
+            ("rps_rgb1", rgb_array(NDColorMode::RGB1, w, h), h as u32, 1),
+            ("rps_rgb2", rgb_array(NDColorMode::RGB2, w, h), 1, 3 * h),
+            ("rps_rgb3", rgb_array(NDColorMode::RGB3, w, h), h as u32, 3),
+        ] {
+            let path = write_tiff(name, &array);
+            let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+            assert_eq!(
+                decoder.get_tag_u32(Tag::RowsPerStrip).unwrap(),
+                rows,
+                "{name}: RowsPerStrip"
+            );
+            assert_eq!(
+                decoder.get_tag_u32_vec(Tag::StripOffsets).unwrap().len(),
+                strips,
+                "{name}: strip count"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn test_r8_67_no_resolution_tags() {
+        // C never calls TIFFSetField for XResolution/YResolution/ResolutionUnit,
+        // so a C-written file carries none of them; the `tiff` crate emitted all
+        // three (1/1, 1/1, unit None) on every image.
+        let path = write_tiff("no_resolution", &rgb_array(NDColorMode::RGB1, 4, 3));
+        let mut decoder = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        for tag in [Tag::XResolution, Tag::YResolution, Tag::ResolutionUnit] {
+            assert!(
+                decoder.get_tag(tag).is_err(),
+                "{tag:?} must not be written — C sets no resolution tags"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_r8_67_planar_file_reads_back_as_rgb3() {
+        // C's readFile maps RGB/SEPARATE/3 to RGB3 dims [x, y, 3] (:497-505), so
+        // an RGB2 frame round-trips as RGB3 holding the same pixels. Our reader
+        // must do the same — the `tiff` crate's decoder reads only the first band
+        // of a planar image, which is why read_file is hand-written too.
+        let (w, h) = (4usize, 3usize);
+        let path = write_tiff("planar_read", &rgb_array(NDColorMode::RGB2, w, h));
+
+        let mut writer = TiffWriter::new();
+        writer
+            .open_file(
+                &path,
+                NDFileMode::Single,
+                &NDArray::new(vec![], NDDataType::UInt8),
+            )
+            .unwrap();
+        let read_back = writer.read_file().unwrap();
+        writer.close_file().unwrap();
+
+        assert_eq!(
+            read_back.dims.iter().map(|d| d.size).collect::<Vec<_>>(),
+            vec![w, h, 3]
+        );
+        assert_eq!(
+            read_back
+                .attributes
+                .get("ColorMode")
+                .unwrap()
+                .value
+                .as_i64(),
+            Some(NDColorMode::RGB3 as i64)
+        );
+        assert_eq!(
+            read_back.data.as_u8_slice(),
+            rgb_array(NDColorMode::RGB3, w, h).data.as_u8_slice(),
+            "the RGB2 pixels must come back as the same image in RGB3 layout"
+        );
         std::fs::remove_file(&path).ok();
     }
 

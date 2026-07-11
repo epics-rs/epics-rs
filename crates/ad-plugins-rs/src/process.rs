@@ -133,9 +133,18 @@ pub struct ProcessState {
     pub background: Option<Vec<f64>>,
     pub flat_field: Option<Vec<f64>>,
     /// Single filter buffer (equivalent to C++ `pFilter`).
+    ///
+    /// Invariant (NDPluginProcess.cpp:182-187): this buffer is dropped **only**
+    /// when its element count no longer matches the incoming frame. No
+    /// parameter write may free it — a requested reset re-seeds the contents in
+    /// place via the RC coefficients, it does not discard them.
     pub filter_state: Option<Vec<f64>>,
     /// Number of frames filtered since last reset.
     pub num_filtered: usize,
+    /// Pending `ResetFilter` request (C++ local `resetFilter`, read from the
+    /// parameter at NDPluginProcess.cpp:73 and cleared at :91-93). Consumed by
+    /// [`ProcessState::process`], which is the only owner allowed to act on it.
+    reset_filter_pending: bool,
 }
 
 impl ProcessState {
@@ -146,6 +155,7 @@ impl ProcessState {
             flat_field: None,
             filter_state: None,
             num_filtered: 0,
+            reset_filter_pending: false,
         }
     }
 
@@ -314,10 +324,17 @@ impl ProcessState {
         }
     }
 
-    /// Reset the filter state, clearing the filter buffer.
+    /// Request a filter reset on the next processed frame.
+    ///
+    /// This is the `ResetFilter` parameter write. C only clears the PV
+    /// (NDPluginProcess.cpp:91-93) and lets `processCallbacks` act on the local
+    /// flag; `pFilter` keeps its contents, so the reset formula at :204-209
+    /// (`newFilter = rOffset + rc1*filter[i] + rc2*data[i]`) evaluates against
+    /// the **previous** filter buffer. Freeing the buffer here would make
+    /// `filter[i] == data[i]` on the next frame and change the reinitialized
+    /// value whenever `RC1 != 0`.
     pub fn reset_filter(&mut self) {
-        self.filter_state = None;
-        self.num_filtered = 0;
+        self.reset_filter_pending = true;
     }
 
     /// Process an array through the configured pipeline.
@@ -332,6 +349,13 @@ impl ProcessState {
         for i in 0..n {
             values[i] = src.data.get_as_f64(i).unwrap_or(0.0);
         }
+
+        // C reads the ResetFilter parameter once per frame and clears the PV
+        // immediately (NDPluginProcess.cpp:73, :91-93) — before the EnableFilter
+        // block, so a reset requested while filtering is disabled is consumed
+        // and lost. Take the flag here for the same reason.
+        let reset_requested = self.reset_filter_pending;
+        self.reset_filter_pending = false;
 
         // 0. Save background/flat field (one-shot flags)
         if self.config.save_background {
@@ -448,21 +472,23 @@ impl ProcessState {
         if self.config.enable_filter {
             let fc = &self.config.filter;
 
-            // Ensure filter buffer exists and matches element count
+            // C++ NDPluginProcess.cpp:181-201. The filter buffer is released
+            // ONLY on an element-count mismatch (:184); a fresh buffer is then
+            // seeded from the current frame and forces a reset (:198).
             if let Some(ref f) = self.filter_state {
                 if f.len() != n {
                     self.filter_state = None;
                 }
             }
 
-            let mut reset_filter = self.filter_state.is_none();
-            if self.num_filtered >= fc.num_filter && fc.auto_reset {
+            let mut reset_filter = reset_requested;
+            if self.filter_state.is_none() {
+                // No current filter array: seed it from this frame, reset (:189-199).
+                self.filter_state = Some(values.clone());
                 reset_filter = true;
             }
-
-            // Initialize filter buffer from current data if needed
-            if self.filter_state.is_none() {
-                self.filter_state = Some(values.clone());
+            if self.num_filtered >= fc.num_filter && fc.auto_reset {
+                reset_filter = true;
             }
 
             let filter = self.filter_state.as_mut().unwrap();
@@ -650,6 +676,11 @@ impl NDPluginProcess for ProcessProcessor {
         if let Some(idx) = self.params.save_flat_field {
             result.param_updates.push(ParamUpdate::int32(idx, 0));
         }
+        // C clears the ResetFilter PV inside processCallbacks (:91-93), not on
+        // the parameter write.
+        if let Some(idx) = self.params.reset_filter {
+            result.param_updates.push(ParamUpdate::int32(idx, 0));
+        }
 
         result
     }
@@ -812,8 +843,11 @@ impl NDPluginProcess for ProcessProcessor {
         } else if Some(reason) == p.enable_filter {
             s.config.enable_filter = params.value.as_i32() != 0;
         } else if Some(reason) == p.filter_type {
+            // C maps FilterType to coefficients in the database
+            // (NDProcess.template:809-825 `FilterTypeSeq` writes FC/OC/RC only)
+            // and NDPluginProcess::writeInt32 (:274-329) never touches pFilter
+            // or numFiltered. Only the coefficients change here.
             s.apply_filter_type(params.value.as_i32());
-            s.reset_filter();
             // Push updated coefficients back
             let fc = &s.config.filter;
             for (i, idx) in p.fc.iter().enumerate() {
@@ -845,10 +879,10 @@ impl NDPluginProcess for ProcessProcessor {
             }
         } else if Some(reason) == p.reset_filter {
             if params.value.as_i32() != 0 {
+                // Arm the reset; the next processed frame consumes it, clears
+                // the PV and zeroes NumFiltered (NDPluginProcess.cpp:91-93,
+                // :204-210). C does neither at parameter-write time.
                 s.reset_filter();
-                if let Some(idx) = p.num_filtered {
-                    updates.push(ParamUpdate::int32(idx, 0));
-                }
             }
         } else if Some(reason) == p.auto_reset_filter {
             s.config.filter.auto_reset = params.value.as_i32() != 0;
@@ -1459,13 +1493,92 @@ mod tests {
         assert!(state.filter_state.is_some());
         assert_eq!(state.num_filtered, 2);
 
-        // Manual reset
+        // Manual reset: C only clears the ResetFilter PV (NDPluginProcess.cpp:91-93).
+        // The buffer stays, and NumFiltered is zeroed by the next frame's reset
+        // loop (:210), not by the parameter write.
         state.reset_filter();
-        assert!(state.filter_state.is_none());
-        assert_eq!(state.num_filtered, 0);
+        assert!(
+            state.filter_state.is_some(),
+            "buffer must survive the reset"
+        );
+        assert_eq!(state.num_filtered, 2);
 
-        // Next frame should act as first frame (reset mode)
+        // Next frame runs the reset formula, so num_filtered restarts at 1.
         let _ = state.process(&make_f64_array(&[200.0]));
+        assert_eq!(state.num_filtered, 1);
+    }
+
+    #[test]
+    fn test_r6_69_manual_reset_keeps_previous_filter_contents() {
+        // R6-69 / NDPluginProcess.cpp:91,184,204-209 — ResetFilter does not free
+        // pFilter; it is released only on an element-count mismatch. The reset
+        // formula therefore reads the PREVIOUS filter contents:
+        //   newFilter = rOffset + rc1*filter[i] + rc2*data[i]
+        // With RC1 != 0 that differs from a filter re-seeded off the current frame.
+        //
+        // CopyToFilter (fc=[0,0,1,0], oc=[1,0,0,0]) makes filter[i] == the last
+        // frame's input and data[i] == the pre-update filter, so the values below
+        // are easy to follow.
+        let cfg = || ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 10,
+                fc: [0.0, 0.0, 1.0, 0.0],
+                oc: [1.0, 0.0, 0.0, 0.0],
+                rc: [0.5, 2.0], // rc1 = 0.5 (reads the old filter), rc2 = 2.0
+                r_offset: 1.0,
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        };
+
+        let mut state = ProcessState::new(cfg());
+        // Frame 0 seeds the buffer from the frame itself (no prior filter):
+        //   filter = 1.0 + 0.5*100 + 2.0*100 = 251, then CopyToFilter -> 100.
+        let _ = state.process(&make_f64_array(&[100.0]));
+        assert_eq!(state.filter_state.as_ref().unwrap()[0], 100.0);
+
+        // Arm the manual reset, then send a frame of 10.
+        state.reset_filter();
+        let out = state.process(&make_f64_array(&[10.0])).unwrap();
+
+        // Reset uses the PREVIOUS filter (100), not the current data (10):
+        //   newFilter = 1.0 + 0.5*100 + 2.0*10 = 71
+        // Output (O1 = 1) is that reinitialized filter value.
+        assert_eq!(out.data.get_as_f64(0).unwrap(), 71.0);
+        assert_eq!(state.num_filtered, 1);
+        // A buffer re-seeded from the current frame would have given
+        // 1.0 + 0.5*10 + 2.0*10 = 26 — the pre-fix behaviour.
+    }
+
+    #[test]
+    fn test_r6_69_element_count_mismatch_frees_the_buffer() {
+        // The one path that DOES release pFilter (NDPluginProcess.cpp:182-187):
+        // a frame whose element count differs from the buffer's.
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 10,
+                fc: [0.0, 0.0, 1.0, 0.0],
+                oc: [1.0, 0.0, 0.0, 0.0],
+                rc: [0.5, 2.0],
+                r_offset: 1.0,
+                ..Default::default()
+            },
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        let _ = state.process(&make_f64_array(&[100.0]));
+        assert_eq!(state.filter_state.as_ref().unwrap().len(), 1);
+
+        // Two elements now: the old buffer is dropped and re-seeded from this
+        // frame, so the reset reads filter[i] == data[i] == 10.
+        //   newFilter = 1.0 + 0.5*10 + 2.0*10 = 26
+        let out = state.process(&make_f64_array(&[10.0, 10.0])).unwrap();
+        assert_eq!(state.filter_state.as_ref().unwrap().len(), 2);
+        assert_eq!(out.data.get_as_f64(0).unwrap(), 26.0);
         assert_eq!(state.num_filtered, 1);
     }
 

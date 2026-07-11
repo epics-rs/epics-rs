@@ -775,9 +775,12 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     let result = ch.put(&put).await;
     let err = result.expect_err("group PUT must be rejected");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("TEST:count.VAL"),
-        "error must name the denied member channel; got: {msg}"
+    // pvxs's `doFieldPreProcessing` throws the bare contract text
+    // (iocsource.cpp:385); the denied member channel is a server-log detail,
+    // never part of the Status.message the client receives.
+    assert_eq!(
+        msg, "put rejected: Put not permitted",
+        "member ACF denial must carry pvxs's contract text and no member identity"
     );
 
     // Verify the allowed member's record was NOT pre-emptively

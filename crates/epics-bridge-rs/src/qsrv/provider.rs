@@ -1990,11 +1990,13 @@ ASG(ROLE_GATED) {
             epics_pva_rs::pvdata::PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(2.0)),
         ));
         let result = ch.put(&put_struct).await;
-        assert!(result.is_err(), "expected access denied");
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("denied"),
-            "expected denial message, got: {err}"
+        let err = result.expect_err("expected access denied");
+        // pvxs `doFieldPreProcessing` (iocsource.cpp:385) throws exactly this
+        // on a write-ACF denial; the wire carries no identity detail.
+        assert_eq!(
+            super::super::put_status::wire_message(&err),
+            "Put not permitted",
+            "denial must carry pvxs's contract text"
         );
     }
 

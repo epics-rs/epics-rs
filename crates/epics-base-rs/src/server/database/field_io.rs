@@ -234,12 +234,12 @@ impl PvDatabase {
             return Ok(());
         };
         let instance = rec.read().await;
-        // DISP=1 blocks a put to any field except DISP itself — the shared
-        // gate owner, identical to the one the CA route crosses.
-        check_put_disabled(&instance, &field_upper)?;
         // Read-only / SPC_NOMOD field
         // (C: `special == SPC_ATTRIBUTE` → S_db_noMod) — same `read_only`
         // flag the Passive route checks, so all three modes gate uniformly.
+        // C tests SPC_ATTRIBUTE *before* `disp` (iocsource.cpp:365-369), so a
+        // read-only field on a DISP=1 record reports S_db_noMod, not
+        // S_db_putDisabled; the two errors carry different wire text.
         let is_read_only = instance
             .record
             .field_list()
@@ -249,6 +249,9 @@ impl PvDatabase {
         if is_read_only {
             return Err(CaError::ReadOnlyField(field_upper));
         }
+        // DISP=1 blocks a put to any field except DISP itself — the shared
+        // gate owner, identical to the one the CA route crosses.
+        check_put_disabled(&instance, &field_upper)?;
         Ok(())
     }
 

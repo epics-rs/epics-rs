@@ -460,7 +460,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 crate::qsrv::AnyChannel::Single(single) => single
                     .put_with_options(&pv, opts)
                     .await
-                    .map_err(|e| OpError::failed(e.to_string())),
+                    .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e))),
                 crate::qsrv::AnyChannel::Group(group) => {
                     // `atomic` lives in the INIT pvRequest on the wire
                     // path; fall back to the value for in-process
@@ -473,7 +473,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     group
                         .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                        .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
             }
         }
@@ -555,7 +555,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     group
                         .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                        .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
                 crate::qsrv::AnyChannel::Single(single) => {
                     // Single-record: generic read-merge-write under the
@@ -584,7 +584,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     single
                         .put_with_options(&pv, opts)
                         .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                        .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
             }
         }
@@ -889,7 +889,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             channel
                 .put(&pv)
                 .await
-                .map_err(|e| OpError::failed(e.to_string()))
+                .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
     }
 

@@ -36,6 +36,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     // record's previous calculation result (the VAL field).
                     stack.push(inputs.prev_val);
                 }
+                CoreOp::FetchSval => {
+                    // C's numeric `postfix()` element table has no SVAL token,
+                    // so `calcPerform` can never see FETCH_SVAL. It reaches this
+                    // evaluator only because the port shares one tokenizer with
+                    // sCalc, and is rejected like every other string-only opcode
+                    // (the `Opcode::String(_)` catch-all below).
+                    return Err(CalcError::Internal);
+                }
                 CoreOp::NormalRandom => {
                     let u1 = simple_random();
                     let u2 = simple_random();

@@ -47,6 +47,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // C FETCH_VAL pushes *presult (the record's previous result).
                     stack.push(StackValue::Double(inputs.prev_val));
                 }
+                CoreOp::FetchSval => {
+                    // C FETCH_SVAL (sCalcPerform.c:927-932) pushes `psresult`,
+                    // the record's previous *string* result. (C's `strncpy(...,
+                    // SCALC_STRING_SIZE)` there is the fixed char[40] copy of
+                    // the same buffer; the port's SVAL is an unbounded PvString,
+                    // so the stored value is seeded verbatim.)
+                    stack.push(StackValue::Str(inputs.prev_sval.clone()));
+                }
 
                 // Type-aware arithmetic
                 CoreOp::Add => {

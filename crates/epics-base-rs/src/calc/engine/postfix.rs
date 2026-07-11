@@ -335,6 +335,14 @@ pub fn compile(tokens: &[Token]) -> Result<CompiledExpr, CalcError> {
                     runtime_depth += 1;
                     operand_needed = false;
                 }
+                Token::FetchSval => {
+                    output.push(Opcode::Core(CoreOp::FetchSval));
+                    runtime_depth += 1;
+                    operand_needed = false;
+                    // C sCalcPostfix.c:452 lists FETCH_SVAL among the opcodes
+                    // that mark the postfix USES_STRING.
+                    has_string_ops = true;
+                }
                 Token::Rndm => {
                     output.push(Opcode::Core(CoreOp::Random));
                     runtime_depth += 1;

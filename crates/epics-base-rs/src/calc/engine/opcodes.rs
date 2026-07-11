@@ -85,6 +85,10 @@ pub enum CoreOp {
     Random,
     NormalRandom,
     FetchVal,
+    /// C `FETCH_SVAL` (sCalcPerform.c:927-932) — push the previous *string*
+    /// result (`psresult`). String-calc only; the numeric and array
+    /// evaluators reject it, as their C element tables cannot emit it.
+    FetchSval,
 
     // Assignment
     StoreVar(u8),       // 0..15 = A..P

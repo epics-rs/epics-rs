@@ -114,6 +114,11 @@ pub struct StringInputs {
     pub str_vars: [String; CALC_NARGS], // AA..UU
     /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`).
     pub prev_val: f64,
+    /// Previous *string* calculation result, read by the `SVAL` token
+    /// (C `FETCH_SVAL`, sCalcPerform.c:927-932, which pushes `psresult`).
+    /// Empty for a fresh evaluation, and for callers whose C counterpart
+    /// passes no `psresult` (numeric `calcPerform`).
+    pub prev_sval: String,
 }
 
 impl StringInputs {
@@ -122,6 +127,7 @@ impl StringInputs {
             num_vars: [0.0; CALC_NARGS],
             str_vars: std::array::from_fn(|_| String::new()),
             prev_val: 0.0,
+            prev_sval: String::new(),
         }
     }
 }

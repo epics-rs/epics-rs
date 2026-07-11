@@ -2305,6 +2305,42 @@ impl AsynRecord {
         }
     }
 
+    /// The I/O timeout this cycle carries — the single owner of TMOT's
+    /// translation into `AsynUser::timeout`.
+    ///
+    /// C `asynCallbackProcess` assigns the field verbatim:
+    /// `pasynUser->timeout = pasynRec->tmot` (asynRecord.c:818). The `double`
+    /// is three-valued, and the transports read all three:
+    ///
+    /// * `> 0` — bounded wait.
+    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:741-742` computes
+    ///   `readPollmsec = (int)(timeout * 1000)` and floors a zero to a 1 ms
+    ///   poll; `drvAsynSerialPort.c:902-905` sets `VMIN=0, VTIME=0`, the termios
+    ///   "return whatever is already buffered" read.
+    /// * `< 0` — wait forever (`readPollmsec = -1`).
+    ///
+    /// The port used to substitute a 1 s wait for BOTH non-positive cases, so an
+    /// operator asking for a poll got a one-second block on a silent device.
+    /// `tmot >= 0` now passes through verbatim: `Duration::ZERO` reaches the
+    /// transports, whose own zero handling already reproduces C's
+    /// (`ip_port::socket_poll_timeout` floors it to the same 1 ms;
+    /// `serial_port::duration_to_poll_ms` yields the same 0 ms `poll()`).
+    ///
+    /// `tmot < 0` cannot be expressed. `AsynUser::timeout` is an unsigned
+    /// `Duration` by deliberate framework-wide design — every blocking driver
+    /// operation is bounded, so a stuck device cannot wedge the port actor
+    /// thread indefinitely. That is the signed-off deviation **DRV-42**
+    /// (`user.rs:15-22`, filed at
+    /// `doc/c-parity-review-drivers-2026-06-29.md:98`), and this record is not
+    /// allowed to override it: a negative TMOT falls back to the bounded 1 s
+    /// default. A non-finite or out-of-range TMOT takes the same fallback —
+    /// `Duration::try_from_secs_f64` rejects it, and C's `(int)` cast of such a
+    /// value is undefined behaviour, so there is no C semantics to port.
+    fn io_timeout(&self) -> std::time::Duration {
+        const DRV42_BOUNDED_FALLBACK: std::time::Duration = std::time::Duration::from_secs(1);
+        std::time::Duration::try_from_secs_f64(self.tmot).unwrap_or(DRV42_BOUNDED_FALLBACK)
+    }
+
     /// Clamp the operator's requested transfer sizes into the record fields —
     /// the single owner of NOWT/NRRD's effective value.
     ///
@@ -2412,13 +2448,7 @@ impl AsynRecord {
         } else {
             in_len
         };
-        // C `asynRecord.c` sets `pasynUser->timeout = precord->tmot` before
-        // every transfer; a non-positive `tmot` falls back to the 1 s default.
-        let timeout = if self.tmot > 0.0 {
-            std::time::Duration::from_secs_f64(self.tmot)
-        } else {
-            std::time::Duration::from_secs(1)
-        };
+        let timeout = self.io_timeout();
         IoPlan {
             tmod: TransferMode::from_u16(self.tmod as u16),
             iface,
@@ -5137,6 +5167,108 @@ mod tests {
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
         register_port(port_name, handle, Arc::new(TraceManager::new()));
         requested
+    }
+
+    /// R9-46: C `asynCallbackProcess` assigns TMOT to the asynUser verbatim —
+    /// `pasynUser->timeout = pasynRec->tmot` (asynRecord.c:818) — and the value
+    /// is three-valued: `>0` bounded wait, `==0` non-blocking poll
+    /// (`drvAsynIPPort.c:741-742` floors the poll to 1 ms;
+    /// `drvAsynSerialPort.c:902-905` sets `VMIN=0,VTIME=0`), `<0` wait forever.
+    /// The port substituted a 1 s wait for BOTH non-positive cases, so an
+    /// operator asking for a poll got a one-second block on a silent device.
+    ///
+    /// `tmot >= 0` now passes through verbatim. `tmot < 0` remains the bounded
+    /// 1 s fallback: DRV-42 (`user.rs:15-22`) makes `AsynUser::timeout` an
+    /// unsigned `Duration` on purpose — every blocking driver op is bounded —
+    /// and that is a signed-off framework deviation, not something this record
+    /// may override. Boundary-per-case, not scenario-per-case.
+    #[test]
+    fn tmot_is_passed_through_verbatim_when_non_negative() {
+        use std::time::Duration;
+
+        let plan_timeout = |tmot: f64| {
+            let mut rec = AsynRecord::default();
+            rec.tmot = tmot;
+            rec.build_io_plan().timeout
+        };
+
+        // The defect: a zero TMOT is a poll, not a one-second wait.
+        assert_eq!(
+            plan_timeout(0.0),
+            Duration::ZERO,
+            "TMOT=0 is C's non-blocking poll"
+        );
+        // Positive values were already verbatim; pin them so the owner keeps them.
+        assert_eq!(plan_timeout(2.5), Duration::from_millis(2500));
+        assert_eq!(plan_timeout(0.001), Duration::from_millis(1));
+        // DRV-42: "wait forever" is unrepresentable — bounded fallback.
+        assert_eq!(
+            plan_timeout(-1.0),
+            Duration::from_secs(1),
+            "negative TMOT falls back to the DRV-42 bounded default"
+        );
+        // Same fallback for values `Duration` cannot carry. C casts these with
+        // `(int)`, which is undefined behaviour, so there is no C semantics here.
+        assert_eq!(plan_timeout(f64::NAN), Duration::from_secs(1));
+        assert_eq!(plan_timeout(f64::INFINITY), Duration::from_secs(1));
+    }
+
+    /// R9-46, end to end: the TMOT the operator set is the timeout the driver's
+    /// `AsynUser` carries. Pins the value at the C boundary
+    /// (`pasynUser->timeout`), not just inside the plan.
+    #[test]
+    fn tmot_zero_reaches_the_driver_as_a_zero_timeout() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        struct TimeoutSpy {
+            base: PortDriverBase,
+            seen: Arc<Mutex<Option<std::time::Duration>>>,
+        }
+        impl PortDriver for TimeoutSpy {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<usize> {
+                *self.seen.lock().unwrap() = Some(user.timeout);
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let port_name = "test_tmot_zero_to_driver";
+        let seen = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(TimeoutSpy {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                seen: seen.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = read_rec(port_name, 0, 40, 0);
+        rec.tmot = 0.0;
+        rec.process().unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(std::time::Duration::ZERO),
+            "the driver's asynUser must carry the operator's TMOT=0 poll"
+        );
     }
 
     fn read_rec(port_name: &str, ifmt: i32, imax: i32, nrrd: i32) -> AsynRecord {

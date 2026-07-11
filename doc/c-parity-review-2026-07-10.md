@@ -403,7 +403,53 @@ Observable: any `CALC`/`OCAL`/`CLCx` expression containing the `VAL` token evalu
 - **`scaler-rs`** — SCAL-1..SCAL-9 surface re-checked against the round-2 doc; no new divergence. **`std-rs`** — STD-9 (`throttle` WAIT ⟺ `pending_value.is_some()`) and STD-11a (`epid.dt` from `time_per_point_actual`) confirmed landed. **`modbus-rs`** — R54/R56/R57/R58 confirmed CLEARED per the round-3/4 log; R34/R52 are asyn-rs-contract items outside this category's scope. **`mqtt-rs`** — no OPEN items in the inventory doc.
 ## Cleared During Review
 
-(none yet — fix phase not started)
+### Fix wave 1 (2026-07-11): categories D + E — merged 1caa6034 / d7363692, verified by main (workspace clippy -D warnings clean, nextest 7462/7462 passed)
+
+Category D (asyn-rs / motor-rs):
+- R6-46: FIXED db4d0347 — `OctetInterpose::connection_changed()` hook + stack fan-out routed through the single owner `PortDriverBase::set_connected`; EOS resets via `reset_link_state()` shared with `flush()`.
+- R6-47: FIXED 9a03baa0 — autonomous connect timer: 0.01 s on disconnect, re-arm every `secondsBetweenPortConnect` (20 s default) on failure; fires with no queued traffic.
+- R6-48: FIXED fe221c8a — `AsynError::PartialRead { status, message, partial }`; partial bytes + eom delivered with the error; all status-extracting sites moved to `e.status()`; the test that cemented the byte loss rewritten.
+- R6-49: FIXED b9706d87 — `auto_connect_device` connects the PORT first (bail if still down) then the device; widening closed a latent `device_states[-1]` phantom-index bug via `is_device_addr` as single owner.
+- R6-50: FIXED 8736e14f — failed poll synthesizes last-known status with `comms_error`/`problem` forced on through the same notify path (MSTA bit 12 → COMM/INVALID); C quirks kept (`last_moving` carries forward; repeated identical failure posts nothing). Same defect fixed at `asyn-rs/runtime/axis.rs::poll_motor`.
+
+Category E (ad-plugins-rs / ad-core-rs / optics-rs / epics-base-rs):
+- R6-61: FIXED 13c01a17 — overlay geometry from `NDArrayInfo` strides, RGB1/2/3 writes all three planes.
+- R6-62: FIXED 2c103003 — polint tableau walk matches C's 1-based `ns` (also fixes the d-branch path, wider than cited); expected values from the compiled C function.
+- R6-63: FIXED 116ba576 — pf4 "Other" unknown/out-of-range → `absLen==0` → `exp(-inf)=0` opaque; case-sensitive material match.
+- R6-64: FIXED f9d1a718 — `create_file_name` runs `check_path` first; file_controller duplicates routed through `check_path_str`.
+- R6-65: FIXED d034fc75 — `NDArray::update_time_stamps` is the single owner of the `epicsTS`/`timeStamp` pair; `alloc` stamps neither.
+- R6-66: FIXED 2c862c94 — false color on Int8 via low-byte LUT. Partially NOT-REAL as cited: C reads FalseColor only for NDInt8/NDUInt8, so non-8-bit types already matched; pinned by test.
+- R6-67: FIXED 6f3bc358 — split the two C consumers: `interpolate_mu` reproduces filterDrive `calcTrans` ([j-1,j] + rejects), pf4 gets `other_absorption_length_um` with C's negative-frac extrapolation quirk.
+- R6-68: FIXED abd68f72 — XOR draw mode on float/64-bit via C's int-cast narrowing.
+- R6-69: FIXED 8893e19d — manual ResetFilter keeps the buffer; freed only on element-count mismatch.
+- R6-70: FIXED 447e2ba1 + 4076fa0b (same finding; second commit is example-driver fallout) — constructor seeds only what ADDriver.cpp:180-191 seeds.
+- R5-2 sibling (carryover): FIXED d76dcd64 — `prev_val` seeded from C's `presult` cell (swait VAL; scalcout VAL/OVAL per phase; transform per-channel); `build_inputs` takes the result cell as a parameter so call sites cannot forget it.
+
+## Open Findings — surfaced during fix wave 1 (reported by fixers, pending independent verify)
+
+### R6-51: prologix read error drops bytes accumulated in `acc`; C retains them for the next call
+Severity: Medium (REPORTED by fixer-D while widening R6-48)
+Rust: `crates/asyn-rs/src/drivers/prologix.rs:575` — returns `Err(e)` and drops `acc`.
+C reference: `prologixRead` reports `*nbytesTransfered = 0` on error but retains the bytes in `pdpvt->buf`/`bufCount` so the next call resumes from them.
+Impact: bytes read before the error are lost permanently instead of being delivered on the next read. Distinct from R6-48 (retention across calls, not delivery with the error).
+
+### R6-71: `SVAL` token missing from the string-calc engine
+Severity: Medium (REPORTED by fixer-E)
+Rust: `crates/epics-base-rs/src/calc` — no `SVAL` token in lexer/evaluator (`rg -i sval` → none).
+C reference: `sCalcPostfix.c:188` / `sCalcPerform.c:927-932` — `FETCH_SVAL` pushes `*psresult` (previous SVAL/OSV).
+Impact: any sCalcout/swait expression using the `SVAL` token fails to parse or evaluates wrongly; the R5-2-sibling fix seeded numeric `prev_val` only.
+
+### R6-72: `OverlayDef.color` is `[u8;3]`; C stores int per channel
+Severity: Low (REPORTED by fixer-E)
+Rust: `crates/ad-plugins-rs/src/overlay.rs` — `OverlayDef.color: [u8; 3]`.
+C reference: `NDPluginOverlay.h` — per-channel `int` color.
+Impact: overlay color values above 255 (meaningful on 16-bit images) cannot be expressed.
+
+### R6-73: `FilterMaterial.density` is `f32`; C `matdensity[]` is double
+Severity: Low (REPORTED by fixer-E)
+Rust: `crates/optics-rs/src/snl/pf4.rs` — `FilterMaterial.density: f32`.
+C reference: `pf4.st` — `matdensity[]` double.
+Impact: ~5e-8 relative difference in absorption length; below current test tolerance but a real numeric deviation.
 
 ## Review Log
 
@@ -420,3 +466,12 @@ Observable: any `CALC`/`OCAL`/`CLCx` expression containing the `VAL` token evalu
   divergences faithful-to-C-quirks required (R6-62/63/67 — C's off-by-one/div-zero
   behaviour is the contract). Numbering kept in per-category blocks (gaps intentional).
   Fix phase pending user go-ahead.
+- Fix wave 1 (2026-07-11): 5 worktree fixers (opus) launched, one per category.
+  D (R6-46..50) and E (R6-61..70 + R5-2 sibling) finished within the window: all 16
+  items FIXED (R6-66 partially NOT-REAL as cited), merged into review/parity-r6
+  (1caa6034, d7363692) and verified by main — workspace `cargo clippy --all-targets
+  -D warnings` clean, `cargo nextest run --workspace` 7462 passed / 0 failed /
+  2 skipped. 4 new findings surfaced by the fixers (R6-51, R6-71..73) recorded
+  OPEN pending independent verify. A (R6-1..8), B (R6-16..29), C (R6-31..35)
+  still in flight. Deferred-by-sign-off carryovers (DRV-16/17, DRV-53, motor
+  R60/R64) deliberately excluded from fixer scope — awaiting user decision.

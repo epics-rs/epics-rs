@@ -116,16 +116,17 @@ impl EpidSoftDeviceSupport {
                         //           recGblSetSevr(...,LINK_ALARM,INVALID);
                         //   }
                         // — the integral term is seeded from the OUTL
-                        // output link's *actual current value* so the
-                        // loop turns on without a bump. The framework
-                        // reads OUTL's current value into `I` BEFORE
-                        // this runs via `EpidRecord::pre_process_actions`
-                        // (a `ReadDbLink` on `OUTL`). So `i` already
-                        // holds the readback value here — keep it.
-                        // When OUTL is CONSTANT/empty there is no
-                        // ReadDbLink and `i` keeps its prior value,
-                        // matching C's `outl.type != CONSTANT` guard.
-                        // (`i` was loaded from `epid.i` above.)
+                        // output link's *actual current value* so the loop
+                        // turns on without a bump. This is C's line, and it
+                        // is reached only AFTER the `dt < mdt` gate above:
+                        // consume the staged readback here, so a gated cycle
+                        // never touches `.I`. `outl_seed` is `None` for a
+                        // CONSTANT/empty OUTL (nothing was read), and then `i`
+                        // keeps its prior value — C's `outl.type != CONSTANT`
+                        // guard. (`i` was loaded from `epid.i` above.)
+                        if let Some(seed) = epid.outl_seed {
+                            i = seed;
+                        }
                     } else {
                         // Anti-windup: only accumulate integral if output not saturated,
                         // or if the integral change would move away from saturation.
@@ -163,17 +164,14 @@ impl EpidSoftDeviceSupport {
                         //                     &oval,..))
                         //           recGblSetSevr(...,LINK_ALARM,INVALID);
                         //   }
-                        // — the output is seeded from the OUTL output
-                        // link's *actual current value*. The framework
-                        // reads OUTL's current value into `OVAL` BEFORE
-                        // this runs via `EpidRecord::pre_process_actions`
-                        // (a `ReadDbLink` on `OUTL` into `OVAL` for the
-                        // FMOD==1 edge). So `epid.oval` already holds the
-                        // read-back value here. When OUTL is
-                        // CONSTANT/empty there is no ReadDbLink and
-                        // `epid.oval` keeps its prior value, matching
-                        // C's `outl.type != CONSTANT` guard.
-                        oval = epid.oval;
+                        // — the output is seeded from the OUTL output link's
+                        // *actual current value*. This is C's line, reached
+                        // only AFTER the `dt < mdt` gate above: consume the
+                        // staged readback here, so a gated cycle never touches
+                        // `.OVAL`. `outl_seed` is `None` for a CONSTANT/empty
+                        // OUTL (nothing was read), and then OVAL keeps its
+                        // prior value — C's `outl.type != CONSTANT` guard.
+                        oval = epid.outl_seed.unwrap_or(epid.oval);
                     } else {
                         e = cval - pcval;
                         let sign = if d > 0.0 { 1.0 } else { -1.0 };

@@ -1301,3 +1301,249 @@ fn test_special_cnt_stop_fires_coutp() {
         "special(CNT=0) must also fire the COUTP link"
     );
 }
+
+// ============================================================
+// Forward link (FLNK) — C scalerRecord.c:470-481
+// ============================================================
+
+/// C `scalerRecord.c:476-481` fires `recGblFwdLink` *inside* process,
+/// while `ss==IDLE && pcnt==0 && us==IDLE`, and only *then* runs the
+/// auto-count block (`:484-541`), which re-arms and drives `ss` to
+/// COUNTING. The FLNK therefore fires on every completed auto-count
+/// cycle even though the record leaves process() counting again.
+#[test]
+fn test_fwd_link_fires_on_completed_autocount_cycle() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1; // AutoCount
+    rec.dly1 = 0.0; // re-arm immediately
+    rec.tp1 = 1.0;
+    rec.ss = 2; // COUNTING (auto-count in progress)
+    rec.us = 0; // IDLE — not a user count
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    // Device support reports the auto-count cycle finished.
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 2, "auto-count immediately re-armed (COUNTING)");
+    assert!(
+        rec.should_fire_forward_link(),
+        "FLNK must fire for the completed auto-count cycle even though \
+         the auto-count block already re-armed ss to COUNTING"
+    );
+}
+
+/// Same cycle, but DLY1 > 0: the auto-count block parks in
+/// SCALER_STATE_WAITING instead of COUNTING. C's `recGblFwdLink` ran
+/// before that state change, so the link still fires.
+#[test]
+fn test_fwd_link_fires_on_completed_autocount_cycle_with_delay() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.dly1 = 5.0; // hold before re-arming
+    rec.tp1 = 1.0;
+    rec.ss = 2; // COUNTING
+    rec.us = 0;
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 1, "auto-count parked in WAITING");
+    assert!(
+        rec.should_fire_forward_link(),
+        "FLNK must fire even though the auto-count block moved ss to WAITING"
+    );
+}
+
+/// C `scalerRecord.c:470` — the `ss==IDLE` guard: a process cycle taken
+/// while the hardware is still counting fires nothing.
+#[test]
+fn test_fwd_link_does_not_fire_while_counting() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 1;
+    rec.ss = 2; // COUNTING, device support has NOT reported done
+    rec.us = 0;
+    rec.cnt = 0;
+    rec.pcnt = 0;
+
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 2);
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no FLNK while the auto-count is still running"
+    );
+}
+
+/// OneShot behaviour is unchanged: the user count completes, the record
+/// ends IDLE/IDLE with PCNT=0, and C fires the forward link.
+#[test]
+fn test_fwd_link_fires_on_oneshot_completion() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.cont = 0; // OneShot
+    rec.ss = 2; // COUNTING
+    rec.us = 3; // USER_COUNTING
+    rec.cnt = 1;
+    rec.pcnt = 1;
+    rec.s[0] = 10_000_000;
+
+    rec.set_done();
+    rec.process().unwrap();
+
+    assert_eq!(rec.ss, 0);
+    assert_eq!(rec.us, 0);
+    assert_eq!(rec.pcnt, 0);
+    assert!(
+        rec.should_fire_forward_link(),
+        "OneShot completion still fires FLNK"
+    );
+}
+
+/// C `scalerRecord.c:470` — `us != IDLE` (a start request waiting out
+/// DLY) reaches no `recGblFwdLink`.
+#[test]
+fn test_fwd_link_does_not_fire_while_waiting_out_dly() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.dly = 100.0;
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    assert_eq!(rec.us, 1); // USER_STATE_WAITING
+
+    rec.process().unwrap();
+
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no FLNK on a cycle spent waiting out DLY"
+    );
+}
+
+// ============================================================
+// R7-66: REQSTART gate -> direction copy is bounded by NCH
+// ============================================================
+
+/// C `scalerRecord.c:413-414` (REQSTART):
+///   for (i=0; i<pscal->nch; i++) { pdir[i] = pgate[i]; ... }
+/// The copy stops at NCH. `D` fields for channels the hardware does not
+/// have are user-writable scratch (`special()` sets D on a PR put) and C
+/// never touches them at count start.
+#[test]
+fn test_count_start_copies_gates_to_directions_only_up_to_nch() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.tp = 1.0;
+    rec.init_record(1).unwrap();
+
+    // A 4-channel card.
+    rec.nch = 4;
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.pr[0] = 10_000_000;
+    rec.pr[2] = 500;
+
+    // Channels the card does not have: gate clear, direction set by the user.
+    rec.d[4] = 1;
+    rec.d[10] = 1;
+    rec.d[MAX_SCALER_CHANNELS - 1] = 1;
+
+    rec.cnt = 1;
+    rec.special("CNT", true).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "counting");
+
+    // Active channels took their gate value.
+    assert_eq!(&rec.d[0..4], &[1, 0, 1, 0], "D1..D4 copied from G1..G4");
+    // Beyond NCH, C leaves D alone.
+    assert_eq!(rec.d[4], 1, "D5 is beyond NCH and must not be cleared");
+    assert_eq!(rec.d[10], 1, "D11 is beyond NCH and must not be cleared");
+    assert_eq!(
+        rec.d[MAX_SCALER_CHANNELS - 1],
+        1,
+        "D64 is beyond NCH and must not be cleared"
+    );
+}
+
+// ============================================================
+// R7-65: auto-count sub-millisecond branch copies gates -> directions
+// ============================================================
+
+/// C `scalerRecord.c:524-528` — when `TP1 < 1 ms`, auto-count falls back on
+/// the user's per-channel presets, and the gate array is copied into the
+/// direction array first:
+///   for (i=0; i<pscal->nch; i++) {
+///       pdir[i] = pgate[i];
+///       if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
+///   }
+/// The copy is unconditional; only the preset write is gated on G.
+#[test]
+fn test_autocount_sub_ms_copies_gates_to_directions() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 4;
+    rec.tp1 = 0.0; // below 1 ms → user-preset branch
+    rec.cont = 1; // auto-count mode
+
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.pr[0] = 1000;
+    rec.pr[2] = 500;
+    // Stale directions from an earlier configuration.
+    rec.d[0] = 0;
+    rec.d[1] = 1;
+    rec.d[2] = 0;
+    rec.d[3] = 1;
+    // Beyond NCH: C's loop stops at nch, so these survive.
+    rec.d[10] = 1;
+
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count armed");
+
+    assert_eq!(
+        &rec.d[0..4],
+        &[1, 0, 1, 0],
+        "D1..D4 copied from G1..G4 on the sub-ms auto-count re-arm"
+    );
+    assert_eq!(rec.d[10], 1, "beyond NCH, D is untouched");
+}
+
+/// The other side of C's `tp1 >= 1.e-3` boundary (`scalerRecord.c:512-523`):
+/// that branch programs only channel 0 from `TP1*FREQ` "regardless of any
+/// presets the user may have set" and never assigns `pdir`. The directions
+/// must be left exactly as the user left them.
+#[test]
+fn test_autocount_timed_branch_does_not_touch_directions() {
+    let mut rec = ScalerRecord::default();
+    rec.freq = 1e7;
+    rec.nch = 4;
+    rec.tp1 = 1.0; // >= 1 ms → timed branch
+    rec.cont = 1;
+
+    rec.g[0] = 1;
+    rec.g[1] = 0;
+    rec.g[2] = 1;
+    rec.g[3] = 0;
+    rec.d[0] = 0;
+    rec.d[1] = 1;
+    rec.d[2] = 0;
+    rec.d[3] = 1;
+
+    rec.process().unwrap();
+    assert_eq!(rec.ss, 2, "auto-count armed");
+
+    assert_eq!(
+        &rec.d[0..4],
+        &[0, 1, 0, 1],
+        "the timed auto-count branch leaves D alone"
+    );
+}

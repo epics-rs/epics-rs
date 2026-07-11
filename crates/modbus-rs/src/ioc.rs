@@ -695,11 +695,13 @@ impl ModbusPortDriver {
     /// Flush a freshly-converted set of registers to the slave with the
     /// configured write function.
     ///
-    /// In relative mode the registers are also staged into the engine buffer
-    /// at `offset` so a subsequent cached read reflects the write. In absolute
-    /// mode the request targets `offset` as the wire address directly and
-    /// nothing is staged — the buffer is only `config.length` words and the
-    /// wire address can lie far outside it.
+    /// The register cache (`engine.data_`) is NOT touched. C's scalar writes
+    /// — `writeInt32` (`drvModbusAsyn.cpp:760-776`), `writeInt64` (`:920-936`),
+    /// `writeFloat64`, `writeUInt32Digital` (`:596-617`) — convert the value
+    /// into a *local* `epicsUInt16 buffer[4]` / `epicsUInt16 data` and send
+    /// that; `data_` keeps whatever the poller (or the init read-once) last
+    /// put there. Only the array/string writes transmit *from* `data_`, and
+    /// they use [`Self::flush_write_staged`].
     fn flush_write(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
         let function = self.engine.config().function;
         // C parity (drvModbusAsyn.cpp:760-767 / 920-927 / writeFloat64): a
@@ -739,13 +741,32 @@ impl ModbusPortDriver {
                 .do_modbus_io(self.transport.as_mut(), function, addr, regs, regs.len())
                 .map_err(to_asyn)?;
         }
-        let buf = self.engine.data_mut();
-        for (i, &r) in regs.iter().enumerate() {
-            if let Some(slot) = buf.get_mut(offset as usize + i) {
-                *slot = r;
+        Ok(())
+    }
+
+    /// Flush registers that C transmits *from* the register cache.
+    ///
+    /// C's array and string writes — `writeInt32Array` (`drvModbusAsyn.cpp:
+    /// 1402`), `writeFloat64Array` (`:1232`), `writeOctet` (`:1537-1554`) —
+    /// set `dataAddress = data_ + offset` and convert the record's elements
+    /// straight INTO `data_`, so the cache carries the written values and a
+    /// cached read on the port sees them. The conversion happens before the
+    /// I/O, so a failed request still leaves the staged values behind.
+    ///
+    /// Absolute mode stages nothing: C aliases `data_` as a scratch transmit
+    /// buffer there (`dataAddress = data_; outIndex = 0;`, `:1219-1221`), and
+    /// the port's reads go to the wire rather than to the cache, so the staged
+    /// words are never observable.
+    fn flush_write_staged(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
+        if !self.is_absolute() {
+            let buf = self.engine.data_mut();
+            for (i, &r) in regs.iter().enumerate() {
+                if let Some(slot) = buf.get_mut(offset as usize + i) {
+                    *slot = r;
+                }
             }
         }
-        Ok(())
+        self.flush_write(offset, regs)
     }
 
     /// After a successful write, stage the value into the parameter cache and
@@ -1141,7 +1162,7 @@ impl PortDriver for ModbusPortDriver {
             regs.extend(datatype::write_int32(dt, v).map_err(to_asyn)?);
             out_index += rc;
         }
-        self.flush_write(user.addr, &regs)
+        self.flush_write_staged(user.addr, &regs)
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
@@ -1180,7 +1201,7 @@ impl PortDriver for ModbusPortDriver {
             regs.extend(datatype::write_float(dt, v).map_err(to_asyn)?);
             out_index += rc;
         }
-        self.flush_write(user.addr, &regs)
+        self.flush_write_staged(user.addr, &regs)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -1358,7 +1379,7 @@ impl PortDriver for ModbusPortDriver {
             data
         };
         let (regs, consumed) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)?;
+        self.flush_write_staged(user.addr, &regs)?;
         // Relative mode caches the value and fans out its monitor (see
         // `cache_write_numeric`); absolute mode has no parameter-table slot
         // for a wire address and no poller, so it skips the cache.
@@ -3954,5 +3975,113 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("data type"));
+    }
+    // ---- R7-63: scalar writes must not stage into the register cache ----
+
+    /// C `writeInt32` (drvModbusAsyn.cpp:748-776) converts the value into a
+    /// LOCAL `epicsUInt16 buffer[4]` and sends that; `data_` — the register
+    /// cache the poller fills and `readInt32` (`:541,:550`) serves — is never
+    /// touched. So a read record on a write port keeps returning the
+    /// last-polled / init-read value after a write, not the just-written one.
+    #[test]
+    fn relative_scalar_write_leaves_the_register_cache_untouched() {
+        // WriteMultipleRegisters echo response.
+        let pdu = [0x01u8, 0x10, 0x00, 0x00, 0x00, 0x01];
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_NOSTAGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("config must build");
+
+        // Stand in for what the port's init read-once / poller left behind.
+        driver.engine.data_mut()[0] = 0x1111;
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        driver
+            .write_int32(&mut user, 0x2222)
+            .expect("scalar write must succeed");
+
+        assert_eq!(
+            driver.engine.data()[0],
+            0x1111,
+            "C's scalar write converts into a local buffer; the cache keeps the polled value"
+        );
+        assert_eq!(
+            driver.read_int32(&user).expect("cached read"),
+            0x1111,
+            "a read on the write port is served the polled value, not the written one"
+        );
+    }
+
+    /// The uint32-digital scalar write is the same C shape (`epicsUInt16 data
+    /// = value;` at drvModbusAsyn.cpp:578, sent from that local) — no staging.
+    #[test]
+    fn relative_uint32_digital_write_leaves_the_register_cache_untouched() {
+        let pdu = [0x01u8, 0x06, 0x00, 0x00, 0x00, 0x0f];
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_DIG_NOSTAGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("config must build");
+        driver.engine.data_mut()[0] = 0x1111;
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        // mask 0xFFFF -> straight write, no read/modify/write.
+        driver
+            .write_uint32_digital(&mut user, 0x000f, 0xffff)
+            .expect("digital write must succeed");
+
+        assert_eq!(driver.engine.data()[0], 0x1111, "cache untouched");
+    }
+
+    /// Control: the ARRAY write does stage. C `writeInt32Array`
+    /// (drvModbusAsyn.cpp:1402) converts straight into `data_` and transmits
+    /// from it (`dataAddress = data_ + offset`), so the cache carries the
+    /// written registers.
+    #[test]
+    fn relative_array_write_stages_into_the_register_cache() {
+        let pdu = [0x01u8, 0x10, 0x00, 0x00, 0x00, 0x02];
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_ARR_STAGE",
+            cfg,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("config must build");
+        driver.engine.data_mut()[0] = 0x1111;
+        driver.engine.data_mut()[1] = 0x1111;
+
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        driver
+            .write_int32_array(&user, &[0x2222, 0x3333])
+            .expect("array write must succeed");
+
+        assert_eq!(driver.engine.data()[0], 0x2222, "array write stages reg 0");
+        assert_eq!(driver.engine.data()[1], 0x3333, "array write stages reg 1");
     }
 }

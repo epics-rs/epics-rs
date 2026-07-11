@@ -143,6 +143,19 @@ pub struct ScalerRecord {
     /// flag and the CNT-triggered `process()` emits the `WriteDbLink`
     /// and clears it.
     coutp_pending: bool,
+
+    /// The forward-link decision C makes *inside* `process()`.
+    ///
+    /// C `scalerRecord.c:470-481` calls `recGblFwdLink(pscal)` while
+    /// still in the middle of process — after `updateCounts()`, guarded
+    /// by `ss==IDLE && pcnt==0 && us==IDLE`, and **before** the
+    /// auto-count block (`:484-541`) re-arms and drives `ss` to WAITING
+    /// or COUNTING. The framework calls `should_fire_forward_link()`
+    /// only *after* `process()` returns, so re-reading `ss`/`us`/`pcnt`
+    /// there answers a different question than C asked. `process()` is
+    /// the single owner: it clears this flag on entry and sets it at
+    /// exactly C's `recGblFwdLink` line; the hook only reports it.
+    fire_fwd_link: bool,
 }
 
 impl ScalerRecord {
@@ -207,6 +220,7 @@ impl Default for ScalerRecord {
             done_flag: false,
             reqstart_old_pr1: 0,
             coutp_pending: false,
+            fire_fwd_link: false,
         }
     }
 }
@@ -268,6 +282,18 @@ impl ScalerRecord {
             0
         } else {
             (self.nch as usize).min(MAX_SCALER_CHANNELS)
+        }
+    }
+
+    /// C's gate → direction copy, the single owner of `d[]`'s count-start value.
+    ///
+    /// C `scalerRecord.c:413-414` (REQSTART) and `:525-526` (auto-count re-arm)
+    /// both run `for (i=0; i<pscal->nch; i++) pdir[i] = pgate[i];` — the bound is
+    /// `nch`, not the physical array size, so `D` fields above the configured
+    /// channel count keep whatever the user last put there.
+    fn copy_gates_to_directions(&mut self) {
+        for i in 0..self.active_channels() {
+            self.d[i] = self.g[i];
         }
     }
 
@@ -406,7 +432,25 @@ impl ScalerRecord {
     /// (`scalerRecord.c:514-522`). It is dispatched as a single
     /// `CMD_AUTOCOUNT` whose `handle_command` reproduces
     /// `scalerRecord.c:510-535`.
-    fn build_autocount_actions(&self) -> Vec<ProcessAction> {
+    ///
+    /// The `D` fields are the record's, not the driver's: C sets them here in
+    /// `process()` (`:525`), exactly as it does at REQSTART (`:413`), so the
+    /// copy stays with the record and only the preset writes are dispatched.
+    fn build_autocount_actions(&mut self) -> Vec<ProcessAction> {
+        // C `scalerRecord.c:524-528` — below a millisecond, auto-count falls
+        // back on the *user's* per-channel presets, so the gates decide which
+        // channels count and the directions follow them:
+        //     for (i=0; i<pscal->nch; i++) {
+        //         pdir[i] = pgate[i];
+        //         if (pgate[i]) (*pdset->write_preset)(pscal, i, ppreset[i]);
+        //     }
+        // The copy is unconditional; only the preset write is gated. The
+        // `tp1 >= 1ms` branch (`:512-523`) programs channel 0 from `tp1*freq`
+        // "regardless of any presets the user may have set" (`:506-507`) and
+        // never touches `pdir`.
+        if self.tp1 < 1.0e-3 {
+            self.copy_gates_to_directions();
+        }
         let mut actions = vec![
             ProcessAction::DeviceCommand {
                 command: CMD_RESET,
@@ -625,6 +669,10 @@ impl Record for ScalerRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let prev_scaler_state = self.ss;
+        // C fires the forward link (or does not) exactly once per
+        // process() cycle; every path that leaves process() without
+        // reaching `scalerRecord.c:480` leaves the link unfired.
+        self.fire_fwd_link = false;
         let mut just_finished_user_count = false;
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
@@ -705,10 +753,8 @@ impl Record for ScalerRecord {
                         self.pr[0] = expected_pr1;
                     }
 
-                    // Set directions from gates
-                    for i in 0..MAX_SCALER_CHANNELS {
-                        self.d[i] = self.g[i];
-                    }
+                    // Set directions from gates (C `scalerRecord.c:413-414`)
+                    self.copy_gates_to_directions();
 
                     // Queue reset → write_presets → arm via DeviceCommands
                     actions.extend(self.build_start_actions());
@@ -761,11 +807,15 @@ impl Record for ScalerRecord {
             });
         }
 
-        // VAL = T on completion
+        // C scalerRecord.c:470-481 — "done counting?": while ss==IDLE,
+        // VAL takes T if we just left COUNTING, and `recGblFwdLink()`
+        // fires. Both are decided HERE, before the auto-count block
+        // below re-arms `ss`.
         if self.ss == SCALER_STATE_IDLE && self.pcnt == 0 && self.us == USER_STATE_IDLE {
             if prev_scaler_state == SCALER_STATE_COUNTING {
                 self.val = self.t;
             }
+            self.fire_fwd_link = true;
         }
 
         // AutoCount — C scalerRecord.c:484-541.
@@ -896,7 +946,11 @@ impl Record for ScalerRecord {
     }
 
     fn should_fire_forward_link(&self) -> bool {
-        self.ss == SCALER_STATE_IDLE && self.us == USER_STATE_IDLE && self.pcnt == 0
+        // Report the decision `process()` captured at C's
+        // `recGblFwdLink` line; do NOT re-evaluate `ss`/`us`/`pcnt`
+        // here — under CONT=AutoCount the auto-count block has already
+        // moved `ss` to WAITING/COUNTING by the time the framework asks.
+        self.fire_fwd_link
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

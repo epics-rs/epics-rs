@@ -11,6 +11,49 @@ pub struct FieldDesc {
     pub read_only: bool,
 }
 
+/// How C gates a secondary field named by
+/// [`Record::fields_posted_with_value_mask`] *inside* the guard that decides
+/// whether VAL posts at all.
+///
+/// Both variants share the outer guard (the field posts only on a cycle where
+/// VAL's own monitor mask is live, and carries that same mask); they differ in
+/// whether C re-tests the secondary field's own value once inside it. Folding
+/// the two into one rule is what over- or under-posts the field: gating
+/// `timestamp`'s RVAL on its own change silences it (see [`Self::WithValue`]),
+/// and NOT gating `ai`'s RVAL on its own change posts a raw count that never
+/// moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuePostGate {
+    /// C re-tests the field's own previous value inside the guard, and posts
+    /// only if it moved: `ai` `RVAL` — `if (prec->oraw != prec->rval) {
+    /// db_post_events(&prec->rval, monitor_mask); prec->oraw = prec->rval; }`
+    /// (aiRecord.c:460-465).
+    OnChange,
+    /// C posts the field whenever the guard fires, with no test of its own
+    /// value: `timestamp` `RVAL` — `if (strncmp(oval, val, ...)) {
+    /// db_post_events(&val[0], mask); db_post_events(&rval, mask); }`
+    /// (timestampRecord.c:158-162). The VAL-string change is the *only* gate,
+    /// so a cycle that re-renders the same seconds count still re-posts RVAL.
+    WithValue,
+}
+
+/// The [`ValuePostGate`] a record declared for `field`, or `None` when `field`
+/// is not one of its secondary value-mask fields.
+///
+/// The single lookup for [`Record::fields_posted_with_value_mask`], shared by
+/// every monitor loop (both `process_record_*` paths, the deferred-completion
+/// path, and `RecordInstance::process_local`) so they cannot drift apart on how
+/// a secondary field is gated.
+pub(crate) fn value_gate(
+    value_masked: &'static [(&'static str, ValuePostGate)],
+    field: &str,
+) -> Option<ValuePostGate> {
+    value_masked
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(_, gate)| *gate)
+}
+
 /// Outcome of a record's array-style monitor decision, returned by
 /// [`Record::array_monitor_post`] (C waveform/aai/aao `monitor()`,
 /// waveformRecord.c:291-326).
@@ -832,19 +875,15 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Secondary value fields a record posts with the *primary VAL
-    /// monitor mask*, gated INSIDE C's `if (monitor_mask)` guard — i.e.
-    /// only on a cycle where VAL itself is posted (an alarm change or an
-    /// MDEL/ADEL crossing) AND the field actually changed, NOT a forced
-    /// `DBE_VALUE | DBE_LOG` on every change.
+    /// monitor mask*, from INSIDE the same guard C wraps its VAL post in —
+    /// never with a forced `DBE_VALUE | DBE_LOG` on every change.
     ///
     /// Mirrors C records that drive a raw secondary field with the shared
-    /// `monitor_mask` rather than `monitor_mask | DBE_VALUE | DBE_LOG`. The
-    /// canonical case is `ai` `RVAL`: `db_post_events(prec, &prec->rval,
-    /// monitor_mask)` nested in `if (monitor_mask)` (aiRecord.c:460-465).
-    /// Under a non-default MDEL the raw count (RVAL) can change while VAL
-    /// stays inside the deadband, so C is silent on RVAL that cycle and —
-    /// on an alarm-only cycle — posts RVAL with `DBE_ALARM` alone, never the
-    /// forced `DBE_VALUE | DBE_LOG`.
+    /// `monitor_mask` rather than `monitor_mask | DBE_VALUE | DBE_LOG`. Each
+    /// entry pairs the field with the gate C applies to it *inside* that
+    /// guard — see [`ValuePostGate`], which is the whole reason this is a
+    /// pair and not a bare name: `ai` re-tests the raw value
+    /// (`if (prec->oraw != prec->rval)`) while `timestamp` does not.
     ///
     /// Distinct from the default change-detected aux post (which carries
     /// `DBE_VALUE | DBE_LOG` unconditionally): ao `RVAL`/`RBV`, mbbo/
@@ -853,7 +892,7 @@ pub trait Record: Send + Sync + 'static {
     /// they stay on the default path and must NOT be named here.
     ///
     /// Default: empty.
-    fn fields_posted_with_value_mask(&self) -> &'static [&'static str] {
+    fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
         &[]
     }
 

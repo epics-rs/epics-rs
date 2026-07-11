@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, ValuePostGate};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Analog input record with conversion support.
@@ -706,8 +706,10 @@ impl Record for AiRecord {
     /// changed — never with a forced `DBE_VALUE | DBE_LOG`. Under a
     /// non-default MDEL the raw count can change while VAL stays inside the
     /// deadband, so RVAL must NOT post on the default aux path.
-    fn fields_posted_with_value_mask(&self) -> &'static [&'static str] {
-        &["RVAL"]
+    fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
+        // C re-tests the raw value inside the guard (`if (prec->oraw !=
+        // prec->rval)`, aiRecord.c:462), so an unchanged RVAL is not re-posted.
+        &[("RVAL", ValuePostGate::OnChange)]
     }
 }
 

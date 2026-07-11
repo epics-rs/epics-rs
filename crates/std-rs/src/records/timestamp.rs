@@ -1,6 +1,6 @@
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record,
+    EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record, ValuePostGate,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
@@ -77,6 +77,13 @@ pub struct TimestampRecord {
     /// clock (`epicsTimeFromTime_t(&time, time(0))`, whole seconds, no
     /// fraction); any other value uses the EPICS time-stamp framework.
     tse: i16,
+    /// Whether the last `process()` rendered a VAL string different from the
+    /// previous one — C `monitor()`'s `strncmp(oval, val, sizeof(val))` gate
+    /// (`timestampRecord.c:158`), captured during `process()` because the
+    /// framework asks for the decision after `oval` has already been committed.
+    /// It is the ONLY gate on this record's monitors: VAL and RVAL both post
+    /// exactly when it is true (`:159-160`).
+    val_changed: bool,
 }
 
 impl Default for TimestampRecord {
@@ -87,6 +94,7 @@ impl Default for TimestampRecord {
             rval: 0,
             tst: 0,
             tse: 0,
+            val_changed: false,
         }
     }
 }
@@ -230,6 +238,12 @@ impl Record for TimestampRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let (formatted, sec_past_epoch) = self.format_timestamp();
+        // C `monitor()` compares the freshly rendered string against OVAL and
+        // posts VAL *and* RVAL only if they differ (timestampRecord.c:158-162),
+        // then copies VAL into OVAL. RVAL itself is refreshed on every process
+        // (`:94`) — a caget of RVAL between posts reads the current second — so
+        // only the *posting* is gated, never the value.
+        self.val_changed = formatted != self.val;
         self.oval = std::mem::replace(&mut self.val, formatted);
         self.rval = sec_past_epoch;
         Ok(ProcessOutcome::complete())
@@ -320,9 +334,31 @@ impl Record for TimestampRecord {
     /// `if let Some(val) = dval` push is skipped) and routes `VAL`
     /// through the generic change-detection loop, which posts it only
     /// when it differs from the last posted value — matching C exactly.
-    /// `RVAL` already change-detects through that same loop.
     fn monitor_deadband_field(&self) -> &'static str {
         ""
+    }
+
+    /// C `monitor()`'s single gate: the `strncmp(oval, val)` string change
+    /// (`timestampRecord.c:158`). Reported here so the framework's VAL monitor
+    /// mask is live only on a cycle that re-rendered a different string — which
+    /// is also the gate `RVAL` hangs off (see
+    /// [`Self::fields_posted_with_value_mask`]).
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.val_changed)
+    }
+
+    /// C posts `RVAL` from *inside* the VAL-string-change guard, with VAL's own
+    /// monitor mask and with no test of RVAL's own value
+    /// (`db_post_events(&ptimestamp->rval, monitor_mask)`,
+    /// `timestampRecord.c:160`) — so the seconds count reaches monitors exactly
+    /// when the rendered string moves, and no more often.
+    ///
+    /// Left to the generic change-detection loop instead, `RVAL` posts on every
+    /// process that crosses a second — ~59 spurious `DBE_VALUE|DBE_LOG` events a
+    /// minute per subscriber under a coarse TST such as `HH:MM`, whose VAL only
+    /// changes once a minute.
+    fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
+        &[("RVAL", ValuePostGate::WithValue)]
     }
 
     fn clears_udf(&self) -> bool {

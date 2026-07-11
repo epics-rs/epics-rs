@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
-use crate::server::record::{NotifyWaitSet, RecordInstance};
+use crate::server::record::{NotifyWaitSet, RecordInstance, ValuePostGate, value_gate};
 use crate::types::EpicsValue;
 
 use super::{PvDatabase, apply_timestamp};
@@ -2677,15 +2677,20 @@ impl PvDatabase {
                             Some(prev) => prev != &val,
                             None => true,
                         };
-                        if value_masked.contains(&field.as_str()) {
-                            // C posts this secondary value field with VAL's
-                            // own monitor_mask, nested in `if (monitor_mask)`
-                            // (ai RVAL, aiRecord.c:460-465): only when VAL is
-                            // posted this cycle (deadband_mask non-empty) and
-                            // the field changed — never a forced
+                        if let Some(gate) = value_gate(value_masked, field) {
+                            // C posts this secondary value field with VAL's own
+                            // monitor_mask, from inside the guard that decides
+                            // whether VAL posts at all — never a forced
                             // DBE_VALUE|DBE_LOG. `deadband_mask` is that VAL
-                            // monitor mask.
-                            if changed && !deadband_mask.is_empty() {
+                            // monitor mask; `ValuePostGate` says whether C also
+                            // re-tests the field's own value inside the guard
+                            // (ai RVAL, aiRecord.c:462) or posts it whenever the
+                            // guard fires (timestamp RVAL, timestampRecord.c:160).
+                            let post = match gate {
+                                ValuePostGate::OnChange => changed && !deadband_mask.is_empty(),
+                                ValuePostGate::WithValue => include_val,
+                            };
+                            if post {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
@@ -3878,15 +3883,20 @@ impl PvDatabase {
                             Some(prev) => prev != &val,
                             None => true,
                         };
-                        if value_masked.contains(&field.as_str()) {
-                            // C posts this secondary value field with VAL's
-                            // own monitor_mask, nested in `if (monitor_mask)`
-                            // (ai RVAL, aiRecord.c:460-465): only when VAL is
-                            // posted this cycle (deadband_mask non-empty) and
-                            // the field changed — never a forced
+                        if let Some(gate) = value_gate(value_masked, field) {
+                            // C posts this secondary value field with VAL's own
+                            // monitor_mask, from inside the guard that decides
+                            // whether VAL posts at all — never a forced
                             // DBE_VALUE|DBE_LOG. `deadband_mask` is that VAL
-                            // monitor mask.
-                            if changed && !deadband_mask.is_empty() {
+                            // monitor mask; `ValuePostGate` says whether C also
+                            // re-tests the field's own value inside the guard
+                            // (ai RVAL, aiRecord.c:462) or posts it whenever the
+                            // guard fires (timestamp RVAL, timestampRecord.c:160).
+                            let post = match gate {
+                                ValuePostGate::OnChange => changed && !deadband_mask.is_empty(),
+                                ValuePostGate::WithValue => include_val,
+                            };
+                            if post {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
@@ -4992,13 +5002,15 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                     Some(prev) => prev != &val,
                     None => true,
                 };
-                if value_masked.contains(&field.as_str()) {
-                    // C posts this secondary value field with VAL's own
-                    // monitor_mask, nested in `if (monitor_mask)` (ai RVAL,
-                    // aiRecord.c:460-465): only when VAL is posted this cycle
-                    // (deadband_mask non-empty) and the field changed — never
-                    // a forced DBE_VALUE|DBE_LOG.
-                    if changed && !deadband_mask.is_empty() {
+                if let Some(gate) = value_gate(value_masked, field) {
+                    // See the same branch in `process_record_with_links_inner`:
+                    // the secondary field carries VAL's own monitor mask and is
+                    // gated the way C gates it inside the VAL guard.
+                    let post = match gate {
+                        ValuePostGate::OnChange => changed && !deadband_mask.is_empty(),
+                        ValuePostGate::WithValue => include_val,
+                    };
+                    if post {
                         sub_updates.push((field.clone(), val, deadband_mask));
                     }
                 } else if changed {

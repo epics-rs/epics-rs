@@ -362,6 +362,52 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         ));
     }
 
+    // asynInterposeEcho portName addr -------------------------------------
+    //
+    // C `asynInterposeEcho.c:189-207` registers this so a startup script can
+    // install the echo layer on an already-configured port — the interpose is
+    // useless without it, since a driver's own configure command never installs
+    // it. C reports "%s interposeInterface failed." and returns -1 when the
+    // port is unknown (:180-184).
+    //
+    // As with `asynOctetSetInputEos`, the interpose stack is port-wide, so the
+    // C `addr` is accepted for command-line compatibility but not routed.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynInterposeEcho",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: true,
+                },
+            ],
+            "asynInterposeEcho portName [addr] - install the echo interpose \
+             (half-duplex devices that echo each char)",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "portName required".to_string())?;
+                let _addr = arg_int(args, 1).unwrap_or(0);
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => {
+                        if let Err(e) = handle.push_echo_interpose_blocking() {
+                            ctx.println(&format!("{port} interposeInterface failed: {e}"));
+                        }
+                    }
+                    Err(_) => ctx.println(&format!("{port} interposeInterface failed.")),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
     // asynSetTraceMask ----------------------------------------------------
     {
         let mgr_r = mgr.clone();
@@ -917,9 +963,10 @@ mod tests {
         // succeeds) — we count one CommandDef per C-side function.
         assert_eq!(
             cmds.len(),
-            8,
+            9,
             "asyn iocsh command set: asynReport, asynSetOption, \
-             asynOctetSet{{Input,Output}}Eos, and the four trace mutators"
+             asynOctetSet{{Input,Output}}Eos, asynInterposeEcho, and the four \
+             trace mutators"
         );
         assert!(set_trace_mask.args.len() == 3);
 
@@ -946,6 +993,7 @@ mod tests {
             "asynSetOption",
             "asynOctetSetInputEos",
             "asynOctetSetOutputEos",
+            "asynInterposeEcho",
             "asynSetTraceMask",
             "asynSetTraceIOMask",
             "asynSetTraceInfoMask",
@@ -1069,6 +1117,130 @@ mod tests {
             Some(&[b'\n'][..]),
             "output EOS must reach the driver as decoded LF"
         );
+    }
+
+    /// R8-49: C registers `asynInterposeEcho` with iocsh
+    /// (`asynInterposeEcho.c:189-207`) because nothing else installs the layer
+    /// — no driver configure command pushes it, so without the registrar a
+    /// startup script cannot reach a half-duplex echo device at all. Drive the
+    /// command against a registered port and prove the port's octet write goes
+    /// from one 2-byte link write to two 1-byte writes, each confirmed by its
+    /// echo.
+    #[test]
+    fn iocsh_interpose_echo_installs_the_layer_on_a_registered_port() {
+        use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+        use crate::request::RequestOp;
+        use std::collections::VecDeque;
+
+        /// The link under the interpose stack: echoes back whatever is written
+        /// and records the size of each write it sees.
+        struct EchoingLink {
+            sizes: Arc<Mutex<Vec<usize>>>,
+            echo: VecDeque<u8>,
+        }
+        impl OctetNext for EchoingLink {
+            fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                match self.echo.pop_front() {
+                    Some(b) => {
+                        buf[0] = b;
+                        Ok(OctetReadResult {
+                            nbytes_transferred: 1,
+                            eom_reason: EomReason::CNT,
+                        })
+                    }
+                    None => Ok(OctetReadResult {
+                        nbytes_transferred: 0,
+                        eom_reason: EomReason::empty(),
+                    }),
+                }
+            }
+            fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.sizes.lock().unwrap().push(data.len());
+                self.echo.extend(data.iter().copied());
+                Ok(data.len())
+            }
+            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        /// Dispatches its octet write through the base's interpose stack, the
+        /// way every real driver does (`serial_port.rs::write_octet`).
+        struct InterposedDriver {
+            base: PortDriverBase,
+            link: EchoingLink,
+        }
+        impl PortDriver for InterposedDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.base
+                    .interpose_octet
+                    .dispatch_write(user, data, &mut self.link)
+            }
+        }
+
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port(InterposedDriver {
+            base: PortDriverBase::new("echo_port", 1, PortFlags::default()),
+            link: EchoingLink {
+                sizes: sizes.clone(),
+                echo: VecDeque::new(),
+            },
+        })
+        .unwrap();
+        let handle = mgr.find_port_handle("echo_port").unwrap();
+
+        // Before the command: the stack is empty, so the link sees the whole
+        // payload in one write.
+        handle
+            .submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"AB".to_vec(),
+                },
+                AsynUser::default(),
+            )
+            .expect("plain write succeeds");
+        assert_eq!(sizes.lock().unwrap().as_slice(), &[2]);
+
+        let ctx = make_ctx();
+        let cmds = build_asyn_commands(mgr.clone());
+        let echo_cmd = cmds
+            .iter()
+            .find(|c| c.name == "asynInterposeEcho")
+            .expect("asynInterposeEcho must be registered");
+        echo_cmd
+            .handler
+            .call(&[ArgValue::String("echo_port".to_string())], &ctx)
+            .expect("handler returns Ok");
+
+        // After the command: the echo layer is on the port, so the same
+        // payload reaches the link one byte at a time.
+        handle
+            .submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"AB".to_vec(),
+                },
+                AsynUser::default(),
+            )
+            .expect("echoed write succeeds");
+        assert_eq!(
+            sizes.lock().unwrap().as_slice(),
+            &[2, 1, 1],
+            "asynInterposeEcho must install the echo layer on the live port"
+        );
+
+        // An unknown port is C's `interposeInterface failed.` (:180-184), not a
+        // panic and not a silent success.
+        echo_cmd
+            .handler
+            .call(&[ArgValue::String("no_such_port".to_string())], &ctx)
+            .expect("unknown port is reported, not an Err");
     }
 
     /// `Report` request op invokes the driver's `report(level)` on the

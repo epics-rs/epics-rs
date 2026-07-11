@@ -800,6 +800,13 @@ impl PortHandle {
         self.submit_blocking(RequestOp::Disconnect, AsynUser::new(0))?;
         Ok(())
     }
+
+    /// Install the echo interpose on the port (blocking) — C
+    /// `asynInterposeEcho(portName, addr)`.
+    pub fn push_echo_interpose_blocking(&self) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::PushEchoInterpose, AsynUser::new(0))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -257,6 +257,16 @@ pub enum RequestOp {
     /// 1089-1093) to refresh CNCT, and gates its `callbackConnect` on it
     /// (:858-888) so a CNCT put never re-connects an already-connected port.
     GetConnected,
+    /// Install the echo interpose on top of the port's octet stack. C parity:
+    /// `asynInterposeEcho(portName, addr)`
+    /// (`asynInterposeEcho.c:165-190`), the iocsh command a startup script
+    /// runs *after* the port is configured.
+    ///
+    /// It is a request rather than a direct `push_interpose` because the actor
+    /// owns the driver once the port is registered — the same reason
+    /// `SetOption` / `SetInputEos` are requests. Installing from the shell
+    /// thread would race every in-flight transfer.
+    PushEchoInterpose,
 }
 
 /// Result returned by the worker after executing a request.

@@ -497,6 +497,11 @@ impl Record for TransformRecord {
             if let Some(ref compiled) = self.compiled[i] {
                 let mut inputs = NumericInputs::new();
                 inputs.vars[..NUM_CHANNELS].copy_from_slice(&self.vals);
+                // C `transformRecord.c:593` calls `sCalcPerform(&ptran->a, 16,
+                // ..., pval, ...)` with `pval = &ptran->a + i` (`:564`, `:569`),
+                // so the `VAL` token in CLCx pushes *this channel's* current
+                // value — not a single record-wide previous VAL, and not 0.
+                inputs.prev_val = self.vals[i];
                 match eval(compiled, &mut inputs) {
                     Ok(result) => {
                         self.vals[i] = result;
@@ -749,6 +754,30 @@ mod tests {
             rec.get_field("OUTA"),
             Some(EpicsValue::String("pv2".into()))
         );
+    }
+
+    /// A `VAL` token in `CLCx` reads *that channel's* current value: C
+    /// `transformRecord.c:593` passes `pval = &ptran->a + i` as `presult`
+    /// (`:564`, `:569`), so each channel gets its own result cell — not one
+    /// record-wide previous VAL, and not 0.
+    #[test]
+    fn r5_2_sibling_clc_val_token_reads_that_channels_value() {
+        let mut rec = TransformRecord::new();
+        rec.put_field("B", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("C", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("CLCB", EpicsValue::String("VAL*2".into()))
+            .unwrap();
+        rec.put_field("CLCC", EpicsValue::String("VAL+1".into()))
+            .unwrap();
+
+        // Each CLCx evaluates against its own channel's value: a single
+        // record-wide previous VAL (or a 0 seed) could not produce both.
+        rec.process().unwrap();
+        assert_eq!(rec.vals[1], 2.0, "B = VAL(B)*2 = 1*2");
+        assert_eq!(rec.vals[2], 101.0, "C = VAL(C)+1 = 100+1");
+        rec.process().unwrap();
+        assert_eq!(rec.vals[1], 4.0, "B = 2*2");
+        assert_eq!(rec.vals[2], 102.0, "C = 101+1");
     }
 
     #[test]

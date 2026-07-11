@@ -84,11 +84,15 @@ impl SwaitRecord {
         self.compiled_calc = scalc_compile(&self.calc).ok();
     }
 
-    fn build_inputs(&self) -> StringInputs {
+    /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
+    /// the `VAL` token (`FETCH_VAL`, sCalcPerform.c:451-453) pushes — for swait
+    /// that is `&pwait->val` (C `swaitRecord.c:409`), i.e. the *previous* VAL.
+    fn build_inputs(&self, prev_val: f64) -> StringInputs {
         let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
         }
+        inputs.prev_val = prev_val;
         inputs
     }
 
@@ -433,7 +437,7 @@ impl Record for SwaitRecord {
         self.prev_val = self.val;
 
         if let Some(ref compiled) = self.compiled_calc {
-            let mut inputs = self.build_inputs();
+            let mut inputs = self.build_inputs(self.val);
             if let Ok(result) = scalc_eval(compiled, &mut inputs) {
                 self.val = match result {
                     StackValue::Double(v) => v,
@@ -624,5 +628,44 @@ impl Record for SwaitRecord {
             ("INKN", "K"),
             ("INLN", "L"),
         ]
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    /// The CALC `VAL` token reads the *previous* VAL: C `swaitRecord.c:409`
+    /// calls `sCalcPerform(&pwait->a, ..., &pwait->val, ...)`, so `FETCH_VAL`
+    /// pushes `*presult` = the VAL from the last cycle. `CALC="VAL+A"` therefore
+    /// accumulates instead of collapsing to `A` every cycle.
+    #[test]
+    fn r5_2_sibling_calc_val_token_reads_previous_val() {
+        let mut rec = SwaitRecord::default();
+        rec.put_field("CALC", EpicsValue::String("VAL+A".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
+
+        rec.process().unwrap();
+        assert_eq!(rec.val, 2.0, "first cycle: 0 + A");
+        rec.process().unwrap();
+        assert_eq!(rec.val, 4.0, "second cycle: previous VAL (2) + A");
+        rec.process().unwrap();
+        assert_eq!(rec.val, 6.0, "third cycle: previous VAL (4) + A");
+    }
+
+    /// Boundary: a CALC with no `VAL` token is unaffected by the seeding — the
+    /// result is still a pure function of the inputs.
+    #[test]
+    fn r5_2_sibling_calc_without_val_token_is_unchanged() {
+        let mut rec = SwaitRecord::default();
+        rec.put_field("CALC", EpicsValue::String("A+1".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
+
+        rec.process().unwrap();
+        assert_eq!(rec.val, 6.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, 6.0, "no VAL token: no accumulation");
     }
 }

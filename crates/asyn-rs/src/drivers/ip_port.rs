@@ -594,6 +594,90 @@ pub(crate) fn maxchars_zero_error() -> AsynError {
     }
 }
 
+/// Whether a failed read must tear the socket down — C `readRaw`'s
+/// `should_disconnect` (drvAsynIPPort.c:798-806), verbatim:
+///
+/// ```c
+/// (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
+///  ((SOCKERRNO != SOCK_EWOULDBLOCK) && (SOCKERRNO != SOCK_EINTR)))
+/// ```
+///
+/// So: a timeout tears down only when the option is on *and* the request carried
+/// a positive timeout (a `timeout == 0` poll — floored to a 1 ms socket poll by
+/// [`socket_poll_timeout`] — expires as `asynTimeout` with the socket intact),
+/// and any non-would-block, non-EINTR error tears down unconditionally.
+///
+/// Single owner of the rule. C applies it *inside* `readRaw`, which is below the
+/// interpose chain — so it governs both the data path
+/// ([`DrvAsynIPPort::read_octet_core`]) and the RFC 2217 negotiation
+/// ([`NegotiationLink`]), which C likewise drives through `readIt`/`readRaw`
+/// (`asynInterposeCom.c:103` calls `pasynOctetDrv->read`, the driver below).
+/// Both callers reach the teardown through it, so neither can drift.
+fn should_disconnect_after_read_error(
+    e: &AsynError,
+    disconnect_on_read_timeout: bool,
+    timeout: Duration,
+) -> bool {
+    // Classify by the carried status, not the variant: an interpose below may
+    // wrap the lower-layer timeout in `PartialRead`, and a variant match would
+    // miss it.
+    let is_timeout = e.status() == AsynStatus::Timeout;
+    (disconnect_on_read_timeout && is_timeout && timeout > Duration::ZERO) || e.is_fatal_transport()
+}
+
+/// The raw link the RFC 2217 negotiation drives, and the teardown decision it
+/// hands back.
+///
+/// C's COM interpose negotiates against `pinterposePvt->pasynOctetDrv`
+/// (`asynInterposeCom.c:339`, :430, :103) — the octet driver *below* itself, so
+/// the negotiation is neither IAC-stuffed nor unstuffed. But that lower driver is
+/// `drvAsynIPPort`'s `readIt`/`readRaw`, which still applies the
+/// disconnect-on-read-timeout / fatal-error teardown per read. Handing
+/// [`ComPortOptions`] a bare `IpIoState` would have skipped it, leaving a COM
+/// port with `disconnectOnReadTimeout=Y` holding a socket C would have closed.
+///
+/// The socket has one owner ([`DrvAsynIPPort`]), and a `&mut IpIoState` borrow is
+/// live for the whole negotiation, so this cannot call `drop_connection` itself.
+/// It records the decision instead and the owner applies it once the borrow ends
+/// — the same "return the delta, let the owner commit it" shape the rest of the
+/// driver uses.
+struct NegotiationLink<'a> {
+    io: &'a mut IpIoState,
+    disconnect_on_read_timeout: bool,
+    /// Set when a read failed in a way C's `readRaw` would have closed the
+    /// socket for. Read back by [`DrvAsynIPPort::with_negotiation`].
+    teardown: bool,
+}
+
+impl OctetNext for NegotiationLink<'_> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        let r = self.io.read(user, buf);
+        if let Err(ref e) = r {
+            if should_disconnect_after_read_error(e, self.disconnect_on_read_timeout, user.timeout)
+            {
+                self.teardown = true;
+            }
+        }
+        r
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let r = self.io.write(user, data);
+        if let Err(ref e) = r {
+            // C `writeRaw` (drvAsynIPPort.c:625-640) closes the connection on any
+            // failing send, which `is_fatal_transport` is the single owner of.
+            if e.is_fatal_transport() {
+                self.teardown = true;
+            }
+        }
+        r
+    }
+
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.io.flush(user)
+    }
+}
+
 /// Classify a failed socket read for the IP client read arms. A non-fatal
 /// timeout (see [`is_nonfatal_read_timeout`]) surfaces as `asynTimeout` with
 /// the socket left intact; any other error is a real transport failure
@@ -729,22 +813,11 @@ impl DrvAsynIPPort {
                 // IP port and `disconnectOnReadTimeout` could not fire; C runs
                 // its test inside readRaw, below the interpose, where the raw
                 // recv timeout is visible (drvAsynIPPort.c:798-806).
-                let is_timeout = e.status() == AsynStatus::Timeout;
-                // C parity: auto-disconnect on:
-                // 1. disconnectOnReadTimeout AND a timeout error AND a
-                //    positive request timeout. C gates this on
-                //    `(disconnectOnReadTimeout) && (timeout > 0)`
-                //    (drvAsynIPPort.c:799), so a `timeout == 0` poll (now a
-                //    1 ms socket poll via `socket_poll_timeout`) that expires
-                //    is reported as `asynTimeout` with the socket left intact,
-                //    never torn down.
-                // 2. Any fatal transport error (connection reset) —
-                //    `is_fatal_transport_error` is the single owner of that
-                //    classification, shared with the write path.
-                let should_disconnect = (self.disconnect_on_read_timeout
-                    && is_timeout
-                    && user.timeout > Duration::ZERO)
-                    || e.is_fatal_transport();
+                let should_disconnect = should_disconnect_after_read_error(
+                    &e,
+                    self.disconnect_on_read_timeout,
+                    user.timeout,
+                );
                 if should_disconnect && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
@@ -798,6 +871,32 @@ impl DrvAsynIPPort {
         })
     }
 
+    /// Run one RFC 2217 exchange against the link below the interpose, then
+    /// apply whatever teardown C's `readRaw`/`writeRaw` would have applied
+    /// during it.
+    ///
+    /// The single gate for every negotiation in this driver — the connect-time
+    /// handshake and each `setOption` — so the socket-teardown rule cannot be
+    /// enforced on one path and missed on the other. See [`NegotiationLink`] for
+    /// why the decision is carried out rather than applied in place.
+    fn with_negotiation<T>(
+        &mut self,
+        f: impl FnOnce(&mut ComPortOptions, &mut NegotiationLink) -> T,
+    ) -> Option<T> {
+        let com = self.com.as_mut()?;
+        let mut link = NegotiationLink {
+            io: &mut self.io,
+            disconnect_on_read_timeout: self.disconnect_on_read_timeout,
+            teardown: false,
+        };
+        let out = f(com, &mut link);
+        let teardown = link.teardown;
+        if teardown && self.base.connected {
+            self.drop_connection();
+        }
+        Some(out)
+    }
+
     /// Run the RFC 2217 handshake against the freshly-connected server.
     ///
     /// C wires this to `asynExceptionConnect` (`asynInterposeCom.c:763-774`):
@@ -805,23 +904,23 @@ impl DrvAsynIPPort {
     /// — the negotiation is replayed so the serial line comes back up with the
     /// settings the IOC last asked for. Its failure is reported and *swallowed*,
     /// exactly as C's `exceptionHandler` does (`asynPrint(ASYN_TRACE_ERROR)`,
-    /// :770-772): a terminal server that refuses the negotiation still leaves a
-    /// usable TCP link, and failing the connect here would instead put the port
-    /// into an endless reconnect loop.
+    /// :770-772): a terminal server that merely refuses the negotiation still
+    /// leaves a usable TCP link, and failing the connect here would instead put
+    /// the port into an endless reconnect loop. A negotiation that failed because
+    /// the *socket* died is a different matter, and `with_negotiation` has
+    /// already closed it by the time we get here — same as C.
     fn restore_com_settings(&mut self) {
-        let Some(com) = self.com.as_mut() else {
+        let Some(Err(e)) = self.with_negotiation(|com, link| com.restore_settings(link)) else {
             return;
         };
-        if let Err(e) = com.restore_settings(&mut self.io) {
-            asyn_trace!(
-                Some(self.base.trace),
-                &self.base.port_name,
-                TraceMask::ERROR,
-                "Unable to restore parameters for port {}: {}",
-                self.base.port_name,
-                e.message()
-            );
-        }
+        asyn_trace!(
+            Some(self.base.trace),
+            &self.base.port_name,
+            TraceMask::ERROR,
+            "Unable to restore parameters for port {}: {}",
+            self.base.port_name,
+            e.message()
+        );
     }
 
     /// Push an interpose layer onto the octet I/O stack.
@@ -1201,10 +1300,12 @@ impl PortDriver for DrvAsynIPPort {
         // seven serial keys negotiate, `hostInfo`/`disconnectOnReadTimeout` fall
         // through to the IP chain — which is why this is one dispatch and not two
         // independent option maps.
-        if let Some(com) = self.com.as_mut() {
-            if ComPortOptions::owns_key(key) {
-                return com.set_option(&mut self.io, key, value);
-            }
+        if self.com.is_some() && ComPortOptions::owns_key(key) {
+            // Same teardown gate as the connect-time handshake: C's setOption
+            // reads run through the same `readIt`/`readRaw` below the interpose.
+            return self
+                .with_negotiation(|com, link| com.set_option(link, key, value))
+                .expect("com is Some");
         }
         // C `drvAsynIPPort.c::setOption`/`getOption` compare option keys
         // with `epicsStrCaseCmp` (case-insensitive). Match that here: the
@@ -1843,6 +1944,69 @@ mod tests {
         drv.set_option("baud", "115200").unwrap();
         assert_eq!(drv.get_option("baud").unwrap(), "115200");
 
+        server.join().unwrap();
+    }
+
+    /// R8-57 boundary: C runs the negotiation's reads through
+    /// `readIt`/`readRaw`, so `readRaw`'s teardown gate (drvAsynIPPort.c:798-806)
+    /// governs them too — a negotiation read that times out with
+    /// `disconnectOnReadTimeout=Y` closes the socket. Driving the raw link would
+    /// have silently skipped that.
+    ///
+    /// Both sides of the gate, since it is a conjunction: option OFF leaves the
+    /// socket up (the handshake merely fails and is logged); option ON closes it.
+    ///
+    /// The server must stay alive and keep *draining* past the client's 2 s
+    /// negotiation timeout. Closing early with the client's handshake bytes still
+    /// unread would send an RST, and an RST tears the socket down through the
+    /// other disjunct (`is_fatal_transport`) no matter how the option is set —
+    /// which would pass the ON case for the wrong reason and fail the OFF case.
+    #[test]
+    fn a_timed_out_negotiation_read_honours_disconnect_on_read_timeout() {
+        /// A server that answers nothing but keeps draining, so the client's
+        /// negotiation read expires as a genuine timeout.
+        fn silent_server() -> (u16, thread::JoinHandle<()>) {
+            let (listener, port) = start_echo_server();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_millis(2600);
+                let mut scratch = [0u8; 64];
+                while std::time::Instant::now() < deadline {
+                    match stream.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => continue, // our own 100 ms poll expiring
+                    }
+                }
+            });
+            (port, handle)
+        }
+
+        // Option OFF (C's default) — the handshake fails, the link survives.
+        let (port, server) = silent_server();
+        let mut drv = DrvAsynIPPort::new("comto1", &format!("127.0.0.1:{port} COM")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(
+            drv.base.is_connected(),
+            "handshake failure alone must not close the socket (C only asynPrints)"
+        );
+        assert!(drv.io.inner.is_some());
+        server.join().unwrap();
+
+        // Option ON — the same silent server now costs the socket, because C
+        // applies readRaw's teardown to the negotiation's reads too.
+        let (port, server) = silent_server();
+        let mut drv = DrvAsynIPPort::new("comto2", &format!("127.0.0.1:{port} COM")).unwrap();
+        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(
+            !drv.base.is_connected(),
+            "a timed-out negotiation read must close the socket, as C readRaw does"
+        );
+        assert!(drv.io.inner.is_none());
         server.join().unwrap();
     }
 

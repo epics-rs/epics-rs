@@ -6176,26 +6176,43 @@ async fn handle_op(
                     return Err(PvaError::Decode(format!("INIT pvRequest value: {e}")));
                 }
             };
-        let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
-            Ok(m) => m,
-            Err(e) => {
-                // The only variant today is `EmptyMask`: pvRequest
-                // selected no field that exists in the value
-                // descriptor (e.g. `field(noSuch)`). pvxs treats
-                // this as an INIT-level error
-                // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
-                // fell back to all-fields, leaking fields the client
-                // didn't request.
-                send_chan_op_error(
-                    &chan_tx,
-                    kind,
-                    ioid,
-                    subcmd,
-                    &format!("invalid pvRequest mask: {e}"),
-                    order,
-                )
-                .await?;
-                return Ok(());
+        // An RPC is never masked. pvxs `serverget.cpp:402` connects it with a
+        // default-constructed (falsy) prototype — `ctrl->connect(Value())` —
+        // so `ServerGPRConnect::connect`'s `if(prototype)` arm
+        // (`serverget.cpp:198-201`) never runs and `request2mask()` is not
+        // invoked for CMD_RPC at all. The reply is written whole
+        // (`to_wire(R, desc(value)) + to_wire_full(R, value)`,
+        // `serverget.cpp:105-109`), never through `pvMask`, so the op carries
+        // no selection mask. Running `request_to_mask` here rejected every
+        // RPC whose pvRequest named a field (`RPCBuilder::pvRequest("field(
+        // value)")`, or a gateway forwarding a downstream pvRequest) with
+        // `EmptyMask` — the RPC prototype is `FieldDesc::Variant`, which
+        // matches no named selector — where pvxs answers `Status{}` and runs
+        // the call.
+        let mask = if kind == OpKind::Rpc {
+            crate::proto::BitSet::new()
+        } else {
+            match crate::pv_request::request_to_mask(&intro, &req_desc) {
+                Ok(m) => m,
+                Err(e) => {
+                    // The only variant today is `EmptyMask`: pvRequest
+                    // selected no field that exists in the value
+                    // descriptor (e.g. `field(noSuch)`). pvxs treats
+                    // this as an INIT-level error
+                    // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
+                    // fell back to all-fields, leaking fields the client
+                    // didn't request.
+                    send_chan_op_error(
+                        &chan_tx,
+                        kind,
+                        ioid,
+                        subcmd,
+                        &format!("invalid pvRequest mask: {e}"),
+                        order,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         };
 

@@ -668,7 +668,7 @@ fn keep_port_runtime(handle: PortRuntimeHandle) {
 /// `noAutoConnect`, and install the default EOS interpose unless
 /// `noProcessEos` (C `drvAsynIPPort.c:1065-1066`). Shared by the iocsh
 /// command and its tests so the install decision has a single owner.
-fn build_configured_ip_port(
+pub(crate) fn build_configured_ip_port(
     port: &str,
     host: &str,
     no_auto_connect: bool,

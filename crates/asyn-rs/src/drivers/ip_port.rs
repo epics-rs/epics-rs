@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::com::{ComInterpose, ComPortOptions};
-use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+use crate::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
@@ -551,17 +551,60 @@ pub struct DrvAsynIPPort {
     /// `getOption("hostInfo")` returns it verbatim. Kept so the IP driver's
     /// `get_option` can echo the live endpoint instead of the generic map.
     host_info: String,
-    /// The RFC 2217 negotiation state, present exactly when the configure
+    /// Both halves of C's COM interpose, present exactly when the configure
     /// string's protocol token was `COM` — C's `tty->isCom` (`drvAsynIPPort.c`
     /// :113, :364-365) and the `asynInterposeCOM` install it gates (:1061).
+    com: Option<ComState>,
+}
+
+/// The two halves of C's `asynInterposeCOM`, which it interposes on the port as
+/// two separate interfaces (`asynInterposeCom.c:792-824`). One `Option`, so "a
+/// COM port has both halves and a non-COM port has neither" holds by type.
+struct ComState {
+    /// The `asynOctet` half — IAC stuffing.
     ///
-    /// This is the *option* half of C's COM interpose. It lives on the driver
-    /// rather than in the interpose stack because C's `setOption`/`getOption`
-    /// negotiate against `pasynOctetDrv` — the octet driver *below* the
-    /// interpose (`asynInterposeCom.c:339`, :430) — which here is `self.io`,
-    /// reached directly. The octet half (IAC stuffing) *is* in the stack, as
-    /// [`crate::interpose::com::ComInterpose`].
-    com: Option<ComPortOptions>,
+    /// Deliberately **not** pushed onto [`PortDriverBase::interpose_octet`]. C
+    /// installs COM at :1061 and the EOS interpose at :1065, and its
+    /// `interposeInterface` makes each *later* install the *outer* one — so C's
+    /// chain is `EOS → COM → driver`, with COM directly above the IP driver's
+    /// octet interface and below every other interpose. This stack's `push`
+    /// appends, and dispatch runs index 0 first, so a later push lands *inner*:
+    /// pushing COM at construction would have put it *outside* the EOS layer that
+    /// `build_configured_ip_port` pushes afterwards, leaving EOS to scan
+    /// still-stuffed bytes and hunt terminators in a stream COM had not yet
+    /// unescaped.
+    ///
+    /// Making it the base link instead (see [`DrvAsynIPPort::with_base_link`])
+    /// puts it beneath every stack layer *by construction*, so no push order can
+    /// get it wrong — rather than pinning the ordering with a convention that the
+    /// next person to push a layer has to know about.
+    octet: ComInterpose,
+    /// The `asynOption` half — the negotiation and the serial settings it
+    /// carries. Driven against the raw link, since C's `setOption`/`getOption`
+    /// negotiate through `pasynOctetDrv`, the driver *below* the interpose
+    /// (`asynInterposeCom.c:339`, :430) — so the negotiation is neither stuffed
+    /// nor unstuffed by the octet half above.
+    options: ComPortOptions,
+}
+
+/// The base of the interpose chain for a COM port: the socket with the IAC layer
+/// wrapped around it. See [`ComState::octet`] for why COM lives here rather than
+/// on the stack.
+struct ComLink<'a> {
+    io: &'a mut IpIoState,
+    com: &'a mut ComInterpose,
+}
+
+impl OctetNext for ComLink<'_> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        self.com.read(user, buf, self.io)
+    }
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.com.write(user, data, self.io)
+    }
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.com.flush(user, self.io)
+    }
 }
 
 /// True for a socket read error that C `readRaw` treats as a non-fatal
@@ -769,10 +812,7 @@ impl DrvAsynIPPort {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
-        let result = self
-            .base
-            .interpose_octet
-            .dispatch_read(user, buf, &mut self.io);
+        let result = self.with_base_link(|stack, link| stack.dispatch_read(user, buf, link));
         match result {
             Ok(r) => {
                 asyn_trace_io!(
@@ -850,15 +890,13 @@ impl DrvAsynIPPort {
         base.auto_connect = true;
 
         // C `drvAsynIPPortConfigure` (:1061): `if (tty->isCom) asynInterposeCOM(...)`
-        // — the COM layer is installed at configure time, before the port ever
-        // connects, so the very first byte of the very first transfer is already
-        // IAC-escaped. Both halves go in together (R8-57).
-        let com = if config.protocol == IpProtocol::Com {
-            base.push_octet_interpose(Box::new(ComInterpose::new()));
-            Some(ComPortOptions::new())
-        } else {
-            None
-        };
+        // — installed at configure time, before the port ever connects, so the
+        // very first byte of the very first transfer is already IAC-escaped
+        // (R8-57).
+        let com = (config.protocol == IpProtocol::Com).then(|| ComState {
+            octet: ComInterpose::new(),
+            options: ComPortOptions::new(),
+        });
 
         Ok(Self {
             base,
@@ -869,6 +907,30 @@ impl DrvAsynIPPort {
             host_info: config_str.to_string(),
             com,
         })
+    }
+
+    /// Dispatch through the interpose stack onto the port's base octet link.
+    ///
+    /// Single owner of what the chain terminates at: the raw socket, or — for a
+    /// COM port — the socket wrapped in the IAC layer, which is what puts COM
+    /// beneath every stack layer by construction (see [`ComState::octet`]). Every
+    /// octet path goes through here, so read, write and flush cannot disagree
+    /// about where the chain ends.
+    fn with_base_link<T>(
+        &mut self,
+        f: impl FnOnce(&mut crate::interpose::OctetInterposeStack, &mut dyn OctetNext) -> T,
+    ) -> T {
+        let stack = &mut self.base.interpose_octet;
+        match self.com.as_mut() {
+            Some(com) => {
+                let mut link = ComLink {
+                    io: &mut self.io,
+                    com: &mut com.octet,
+                };
+                f(stack, &mut link)
+            }
+            None => f(stack, &mut self.io),
+        }
     }
 
     /// Run one RFC 2217 exchange against the link below the interpose, then
@@ -889,7 +951,7 @@ impl DrvAsynIPPort {
             disconnect_on_read_timeout: self.disconnect_on_read_timeout,
             teardown: false,
         };
-        let out = f(com, &mut link);
+        let out = f(&mut com.options, &mut link);
         let teardown = link.teardown;
         if teardown && self.base.connected {
             self.drop_connection();
@@ -1243,11 +1305,7 @@ impl PortDriver for DrvAsynIPPort {
             data,
             "write"
         );
-        match self
-            .base
-            .interpose_octet
-            .dispatch_write(user, data, &mut self.io)
-        {
+        match self.with_base_link(|stack, link| stack.dispatch_write(user, data, link)) {
             Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: drvAsynIPPort.c::writeIt closes the connection
@@ -1289,7 +1347,7 @@ impl PortDriver for DrvAsynIPPort {
         // `flush` (resetting `EosInterpose::in_buf` etc.) and finally
         // reaches `IpIoState::flush`, which drains the OS socket's
         // receive buffer.
-        self.base.interpose_octet.dispatch_flush(user, &mut self.io)
+        self.with_base_link(|stack, link| stack.dispatch_flush(user, link))
     }
 
     fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
@@ -1426,7 +1484,7 @@ impl PortDriver for DrvAsynIPPort {
         // last acknowledged, refreshed on every `set_option` and reconnect.
         if let Some(com) = self.com.as_ref() {
             if ComPortOptions::owns_key(key) {
-                return com.get_option(key);
+                return com.options.get_option(key);
             }
         }
         if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
@@ -2750,19 +2808,99 @@ mod tests {
         assert_eq!(cfg.port, 5000);
     }
 
-    /// R8-57: `isCom` is what gates the interpose install (C drvAsynIPPort.c
-    /// :1061), so a COM port must come up with the IAC layer already on its
-    /// octet stack — before the first transfer, not lazily at connect — and a
-    /// TCP port must not.
+    /// R8-57: `isCom` is what gates the install (C drvAsynIPPort.c:1061), so a
+    /// COM port comes up with the IAC layer already in place — before the first
+    /// transfer, not lazily at connect — and a TCP port never gets one.
+    ///
+    /// The IAC layer is the chain's *base*, not a stack entry (see
+    /// `ComState::octet`), so the interpose stack itself stays empty: that is
+    /// what keeps an EOS or echo layer pushed later from landing underneath it.
     #[test]
-    fn com_port_installs_the_iac_interpose_at_configure_time() {
+    fn com_port_installs_the_iac_layer_at_configure_time() {
         let com = DrvAsynIPPort::new("comport", "1.2.3.4:5000 COM").unwrap();
-        assert_eq!(com.base.interpose_octet.len(), 1);
         assert!(com.com.is_some());
+        assert_eq!(
+            com.base.interpose_octet.len(),
+            0,
+            "the IAC layer is the base link, not a reorderable stack entry"
+        );
 
         let tcp = DrvAsynIPPort::new("tcpport", "1.2.3.4:5000 TCP").unwrap();
-        assert_eq!(tcp.base.interpose_octet.len(), 0);
         assert!(tcp.com.is_none());
+        assert_eq!(tcp.base.interpose_octet.len(), 0);
+    }
+
+    /// R8-57 ordering: C installs COM at :1061 and the EOS interpose at :1065,
+    /// and `interposeInterface` makes each *later* install the *outer* one — so
+    /// C's chain is `EOS → COM → driver`, and EOS sees bytes COM has already
+    /// unstuffed.
+    ///
+    /// This is the regression that pushing COM onto the interpose stack caused:
+    /// the stack dispatches index 0 first and `push` appends, so a COM pushed at
+    /// construction sat *outside* the EOS layer `build_configured_ip_port` pushes
+    /// afterwards, inverting C's chain.
+    ///
+    /// Most streams do not notice, because unstuffing and terminator-stripping
+    /// commute — a 0xFF escape never creates or destroys a `\n`. What does not
+    /// commute is the *byte budget*: the caller's buffer is filled by whichever
+    /// layer is outermost. The device sends `A <IAC IAC> B \n` into a 3-byte read.
+    ///
+    ///   * C's order (EOS above COM): COM unstuffs first, so EOS fills the 3 bytes
+    ///     with real data — `A <IAC> B`.
+    ///   * inverted (COM above EOS): EOS fills the 3 bytes with the *stuffed*
+    ///     stream — `A <IAC> <IAC>` — and COM then unstuffs that down to 2, so `B`
+    ///     is silently dropped from the read.
+    ///
+    /// Assert the 3 bytes. Under the inverted chain this returns 2 and fails.
+    #[test]
+    fn eos_pushed_after_com_sits_above_it_and_sees_unstuffed_bytes() {
+        use crate::interpose::com::IAC;
+
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            // Refuse the handshake; this test is about the data path.
+            stream.write_all(&[IAC, 252, 0]).unwrap(); // IAC WONT BINARY
+            stream.flush().unwrap();
+            let mut hs = [0u8; 3];
+            stream.read_exact(&mut hs).unwrap();
+            // One escaped IAC inside a terminated line.
+            stream.write_all(&[b'A', IAC, IAC, b'B', b'\n']).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        // The iocsh path: DrvAsynIPPort::new installs COM, then the EOS interpose
+        // goes on top (noProcessEos defaults off, C :1064-1065).
+        let mut drv = crate::iocsh::build_configured_ip_port(
+            "com_eos",
+            &format!("127.0.0.1:{port} COM"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            drv.base.interpose_octet.len(),
+            1,
+            "EOS is the only stack layer; COM is the base"
+        );
+        drv.connect(&AsynUser::default()).unwrap();
+        drv.set_input_eos(b"\n").unwrap();
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 3];
+        let (n, _eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            &[b'A', IAC, b'B'],
+            "the 3-byte read must carry 3 bytes of device data — an escape byte \
+             must not eat one of them, which is what happens when COM sits above EOS"
+        );
+
+        server.join().unwrap();
     }
 
     /// R8-57: C interposes the COM asynOption interface *above* the IP driver's

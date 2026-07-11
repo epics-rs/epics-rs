@@ -132,6 +132,15 @@ const ASYN_FMT_HYBRID: i32 = 1;
 /// suppresses escape translation (`asynRecord.c:1496-1502`).
 const ASYN_FMT_BINARY: i32 = 2;
 
+/// Capacity of the `AINP` input string, in bytes — `sizeof(pasynRec->ainp)`.
+/// `AINP` is a `DBF_STRING` (`asynRecord.dbd:261`), i.e. EPICS
+/// `MAX_STRING_SIZE` = 40 including the NUL terminator. C `performOctetIO`
+/// sizes the ASCII read by exactly this (`asynRecord.c:1505-1506`
+/// `inlen = sizeof(pasynRec->ainp)`) and keys the ASCII overflow on it
+/// (`:1602-1608`), independent of `IMAX` — only Hybrid and Binary read into the
+/// `IMAX`-sized `BINP` buffer.
+const AINP_SIZE: usize = 40;
+
 /// Decode a C-style backslash-escaped string into the raw bytes the
 /// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
 /// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
@@ -504,12 +513,14 @@ struct IoPlan {
     f64out: f64,
     // Read inputs.
     octet_buf_size: usize,
-    // Full input-buffer capacity (IMAX). `octet_buf_size` is the per-request
-    // read length (`min(NRRD, IMAX)` or IMAX); overflow is keyed on the full
-    // capacity so an NRRD-limited short read never reads as overflow — C
-    // `performOctetIO` checks `nbytes >= inlen` where `inlen == sizeof(ainp)`
-    // / IMAX, independent of NRRD (asynRecord.c:1602/1609).
-    imax: usize,
+    // C `performOctetIO`'s `inlen` (asynRecord.c:1503-1511): the capacity of the
+    // IFMT-selected input buffer — `sizeof(ainp)` (= AINP_SIZE) for ASCII, IMAX
+    // for Hybrid/Binary, which read into BINP. It is both the default read
+    // length and the overflow threshold (`:1602-1620`); `octet_buf_size` is the
+    // per-request read length (`min(NRRD, inlen)` or `inlen`), so an
+    // NRRD-limited short read can never reach `in_len` and never reads as
+    // overflow — the same reason C's check is independent of NRRD.
+    in_len: usize,
     ifmt: i32,
 }
 
@@ -687,23 +698,22 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
 
             out.eomr = Some(eom as i32);
             // NORD is the raw transfer count (C `nord = nbytesTransfered`,
-            // asynRecord.c:1627) — independent of the AINP overflow
+            // asynRecord.c:1627) — independent of the overflow
             // NUL-truncation below and of UTF-8-lossy expansion.
             out.nord = Some(data.len() as i32);
-            // C performOctetIO flags an ASCII/Hybrid read that filled
-            // the whole input buffer with no terminator as a MINOR
-            // READ alarm and NUL-truncates the buffer
-            // (asynRecord.c:1602-1615). The buffer-full-without-EOS
-            // condition is exactly asyn's `ASYN_EOM_CNT` set with
-            // neither END nor EOS; pairing it with `len >= IMAX` keeps
-            // an NRRD-limited short read from reading as overflow.
-            // Binary uses `>` (C says "should not happen") so it never
-            // flags — restrict to ASCII/Hybrid.
-            let overflow = plan.ifmt != ASYN_FMT_BINARY
-                && plan.imax > 0
-                && data.len() >= plan.imax
-                && (eom & EomReason::CNT.bits()) != 0
-                && (eom & (EomReason::END.bits() | EomReason::EOS.bits())) == 0;
+            // C performOctetIO's overflow tests (asynRecord.c:1602-1621) are
+            // plain length compares against the IFMT-selected buffer capacity
+            // `inlen`, with no end-of-message condition: a read that filled the
+            // buffer is an overflow even when the driver reported EOS/END. Each
+            // raises a MINOR READ alarm; ASCII and Hybrid also NUL-terminate the
+            // buffer at its last byte. An NRRD-limited read can never reach
+            // `in_len` (it is capped by it), so it cannot false-positive.
+            // Binary compares with `>` ("should not happen") — so it never fires
+            // in practice, since the driver cannot return more than requested.
+            let overflow = match plan.ifmt {
+                ASYN_FMT_BINARY => data.len() > plan.in_len,
+                _ => plan.in_len > 0 && data.len() >= plan.in_len,
+            };
             // C stores the device bytes into the single IFMT-selected
             // field (ASCII -> AINP, Binary/Hybrid -> BINP,
             // asynRecord.c:1503-1509) and posts TINP (escaped) for
@@ -715,12 +725,19 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 // final byte so the string leaves room for the
                 // conceptual terminator.
                 let bytes = if overflow {
-                    &data[..plan.imax - 1]
+                    &data[..plan.in_len - 1]
                 } else {
                     &data[..]
                 };
                 out.ainp = Some(String::from_utf8_lossy(bytes).to_string());
             } else {
+                let mut data = data;
+                // Hybrid overflow: C writes the NUL into the BINP buffer itself
+                // (`inptr[imax - 1] = '\0'`, :1615). Binary is left untouched
+                // (:1616-1621 reports but does not terminate).
+                if overflow && plan.ifmt == ASYN_FMT_HYBRID {
+                    data[plan.in_len - 1] = 0;
+                }
                 out.binp = Some(data);
             }
             if overflow {
@@ -1893,14 +1910,27 @@ impl AsynRecord {
     fn build_io_plan(&self) -> IoPlan {
         let octet_out = self.octet_output_buffer();
         let octet_out_len = octet_out.len();
-        // Clamp against negative IMAX/NRRD — both are settable Long fields;
-        // a negative value sign-extends to a huge usize and would request a
+        // C `performOctetIO` (asynRecord.c:1503-1517): the input buffer is
+        // chosen by IFMT — ASCII reads into the fixed 40-byte AINP string
+        // (`inlen = sizeof(ainp)`), Hybrid and Binary into the IMAX-sized BINP
+        // buffer — and the read length is NRRD clamped to that capacity, or the
+        // whole capacity when NRRD is 0. IMAX must NOT size an ASCII read: with
+        // the default IMAX=80 that would let a terminator-less response consume
+        // 80 bytes with no overflow alarm, where C stops at 40, raises
+        // READ/MINOR and leaves the rest in the driver.
+        //
+        // Clamp against negative IMAX/NRRD — both are settable Long fields; a
+        // negative value sign-extends to a huge usize and would request a
         // multi-GB buffer.
-        let imax = self.imax.max(0) as usize;
-        let octet_buf_size = if self.nrrd > 0 {
-            (self.nrrd as usize).min(imax)
+        let in_len = if self.ifmt == ASYN_FMT_ASCII {
+            AINP_SIZE
         } else {
-            imax
+            self.imax.max(0) as usize
+        };
+        let octet_buf_size = if self.nrrd > 0 {
+            (self.nrrd as usize).min(in_len)
+        } else {
+            in_len
         };
         // C `asynRecord.c` sets `pasynUser->timeout = precord->tmot` before
         // every transfer; a non-positive `tmot` falls back to the 1 s default.
@@ -1923,7 +1953,7 @@ impl AsynRecord {
             ui32mask: self.ui32mask,
             f64out: self.f64out,
             octet_buf_size,
-            imax,
+            in_len,
             ifmt: self.ifmt,
         }
     }
@@ -3849,80 +3879,198 @@ mod tests {
         assert_eq!(c.nsev, AlarmSeverity::Major, "int32 write err -> MAJOR");
     }
 
-    /// C `performOctetIO` flags an ASCII/Hybrid read that fills the input
-    /// buffer with no terminator as READ/MINOR and NUL-truncates the buffer
-    /// (asynRecord.c:1602-1615). asyn keys this on `ASYN_EOM_CNT` set without
-    /// END/EOS and a transfer that reaches IMAX.
-    #[test]
-    fn octet_overflow_raises_minor_and_truncates() {
+    /// A port whose driver hands back `min(fill, buf.len())` `Z` bytes with the
+    /// given end-of-message reason, and records the buffer size the record asked
+    /// for. The requested size IS C's `nread` (asynRecord.c:1512-1517), so it
+    /// pins which capacity — `sizeof(ainp)` or IMAX — sized the read.
+    fn spawn_fill_port(
+        port_name: &'static str,
+        fill: usize,
+        eom: crate::interpose::EomReason,
+    ) -> Arc<Mutex<Option<usize>>> {
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
-        use epics_base_rs::server::recgbl::alarm_status;
-        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
         use tokio::sync::mpsc;
 
-        const IMAX: usize = 4;
-
-        struct OverflowDriver(PortDriverBase);
-        impl PortDriver for OverflowDriver {
+        struct FillDriver {
+            base: PortDriverBase,
+            fill: usize,
+            eom: EomReason,
+            requested: Arc<Mutex<Option<usize>>>,
+        }
+        impl PortDriver for FillDriver {
             fn base(&self) -> &PortDriverBase {
-                &self.0
+                &self.base
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.0
+                &mut self.base
             }
             fn io_read_octet_eom(
                 &mut self,
                 _user: &AsynUser,
                 buf: &mut [u8],
             ) -> crate::error::AsynResult<(usize, EomReason)> {
-                // Fill the whole buffer; CNT only (count reached, no EOS/END).
-                let n = IMAX.min(buf.len());
+                *self.requested.lock().unwrap() = Some(buf.len());
+                let n = self.fill.min(buf.len());
                 for b in buf[..n].iter_mut() {
                     *b = b'Z';
                 }
-                Ok((n, EomReason::CNT))
+                Ok((n, self.eom))
             }
         }
 
-        let port_name = "test_io_alarm_overflow";
+        let requested = Arc::new(Mutex::new(None));
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(
-            Box::new(OverflowDriver(PortDriverBase::new(
-                port_name,
-                1,
-                PortFlags::default(),
-            ))),
+            Box::new(FillDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                fill,
+                eom,
+                requested: requested.clone(),
+            }),
             rx,
         );
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
         register_port(port_name, handle, Arc::new(TraceManager::new()));
+        requested
+    }
 
+    fn read_rec(port_name: &str, ifmt: i32, imax: i32, nrrd: i32) -> AsynRecord {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.connect_device();
         rec.iface = 0;
         rec.tmod = TransferMode::Read as i32;
-        rec.imax = IMAX as i32;
-        rec.ifmt = ASYN_FMT_ASCII;
-        rec.process().unwrap();
+        rec.ifmt = ifmt;
+        rec.imax = imax;
+        rec.nrrd = nrrd;
+        rec
+    }
 
-        assert_eq!(rec.errs, "", "overflow is not an error, only a MINOR alarm");
-        assert_eq!(rec.nord, IMAX as i32, "NORD is the raw transfer count");
-        assert_eq!(
-            rec.ainp, "ZZZ",
-            "ASCII overflow NUL-truncates AINP at the buffer end (IMAX-1 chars)"
-        );
-
+    fn read_alarm(rec: &mut AsynRecord) -> (u16, epics_base_rs::server::record::AlarmSeverity) {
+        use epics_base_rs::server::record::CommonFields;
         let mut c = CommonFields::default();
         rec.check_alarms(&mut c);
-        assert_eq!(c.nsta, alarm_status::READ_ALARM, "overflow -> READ");
-        assert_eq!(c.nsev, AlarmSeverity::Minor, "overflow -> MINOR");
+        (c.nsta, c.nsev)
+    }
+
+    /// R8-46: C sizes an ASCII read by `sizeof(pasynRec->ainp)` = 40, NOT by
+    /// IMAX (asynRecord.c:1503-1506), and keys the ASCII overflow on the same 40
+    /// (`:1602-1608`). With the default IMAX=80 a terminator-less response must
+    /// stop at 40 bytes, land 39 chars in AINP, raise READ/MINOR, and leave the
+    /// rest of the response in the driver.
+    #[test]
+    fn ascii_read_is_sized_by_ainp_size_not_imax() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_inlen_is_ainp";
+        let requested = spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.process().unwrap();
+
+        assert_eq!(
+            *requested.lock().unwrap(),
+            Some(AINP_SIZE),
+            "the ASCII read length is sizeof(ainp), not IMAX"
+        );
+        assert_eq!(rec.nord, AINP_SIZE as i32, "NORD is the raw transfer count");
+        assert_eq!(rec.ainp.len(), AINP_SIZE - 1, "AINP NUL-truncated at 40");
+        assert_eq!(rec.errs, "", "overflow is not an error, only a MINOR alarm");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
+    }
+
+    /// The ASCII overflow boundary is `>=`: 39 bytes fit, 40 overflow.
+    #[test]
+    fn ascii_read_below_ainp_size_is_not_overflow() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_inlen_under";
+        spawn_fill_port(port, AINP_SIZE - 1, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.process().unwrap();
+
+        assert_eq!(rec.nord, (AINP_SIZE - 1) as i32);
+        assert_eq!(rec.ainp.len(), AINP_SIZE - 1, "all 39 bytes land in AINP");
+        assert_eq!(read_alarm(&mut rec).1, AlarmSeverity::NoAlarm);
+    }
+
+    /// C's overflow test is a plain length compare (`nbytesTransfered >=
+    /// sizeof(ainp)`, asynRecord.c:1602) — a full buffer overflows even when the
+    /// driver reported an EOS/END end-of-message, so no eomReason may gate it.
+    #[test]
+    fn ascii_overflow_fires_even_when_the_read_ended_on_eos() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_overflow_eos";
+        spawn_fill_port(port, 100, EomReason::EOS);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.process().unwrap();
+
+        assert_eq!(rec.nord, AINP_SIZE as i32);
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
+    }
+
+    /// An NRRD-limited read is capped below the buffer capacity, so it can never
+    /// reach the overflow threshold (C clamps NRRD to `inlen` and compares the
+    /// transfer against `inlen`, asynRecord.c:1513/1602).
+    #[test]
+    fn nrrd_limited_ascii_read_is_never_overflow() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_ascii_nrrd_short";
+        let requested = spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 20);
+        rec.process().unwrap();
+
+        assert_eq!(*requested.lock().unwrap(), Some(20), "NRRD sizes the read");
+        assert_eq!(rec.nord, 20);
+        assert_eq!(rec.ainp.len(), 20, "no truncation below the threshold");
+        assert_eq!(read_alarm(&mut rec).1, AlarmSeverity::NoAlarm);
+    }
+
+    /// Hybrid is the mode that IS sized by IMAX (it reads into BINP,
+    /// asynRecord.c:1507-1510) and whose overflow NULs the buffer's last byte
+    /// (`inptr[imax - 1] = '\0'`, :1615).
+    #[test]
+    fn hybrid_read_is_sized_by_imax_and_nuls_the_buffer_end_on_overflow() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        let port = "test_hybrid_inlen_is_imax";
+        let requested = spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_HYBRID, 4, 0);
+        rec.process().unwrap();
+
+        assert_eq!(
+            *requested.lock().unwrap(),
+            Some(4),
+            "IMAX sizes a Hybrid read"
+        );
+        assert_eq!(rec.nord, 4);
+        assert_eq!(rec.binp, vec![b'Z', b'Z', b'Z', 0], "BINP NUL at IMAX-1");
+        assert_eq!(rec.ainp, "", "Hybrid must not touch AINP");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
     }
 
     /// C `gpibUniversalCmd`/`gpibAddressedCmd` raise COMM/MAJOR when the port

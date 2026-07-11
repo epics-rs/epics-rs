@@ -273,7 +273,9 @@ async fn open_monitor(
     // and pva_pv-registered channels fall through to the
     // default mask (their DBE selection is not yet wired).
     let dbe_mask = match ctx.pv_request {
-        Some(PvField::Structure(ref req)) => crate::qsrv::channel::dbe_mask_from_pv_request(req),
+        Some(PvField::Structure(ref req)) => {
+            crate::qsrv::channel::dbe_mask_from_pv_request(req, &ctx.log)
+        }
         _ => None,
     };
     // resolve the per-operation negotiated monitor
@@ -447,8 +449,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 _ => None,
             };
             let opts = match init_req {
-                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log),
+                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
             };
             let channel = provider
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
@@ -469,7 +471,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => crate::qsrv::channel::atomic_from_pv_request(&pv),
                     };
                     group
-                        .put_with_options(&pv, opts, atomic_override)
+                        .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }
@@ -541,15 +543,17 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => PvStructure::new(""),
                     };
                     let opts = match init_req {
-                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                        Some(req) => {
+                            crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
+                        }
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
                     };
                     let atomic_override = match init_req {
                         Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
                         None => crate::qsrv::channel::atomic_from_pv_request(&pv),
                     };
                     group
-                        .put_with_options(&pv, opts, atomic_override)
+                        .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }
@@ -572,8 +576,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         }
                     };
                     let opts = match init_req {
-                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                        Some(req) => {
+                            crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
+                        }
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
                     };
                     single
                         .put_with_options(&pv, opts)
@@ -1859,6 +1865,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let checked = AccessGate::open()
@@ -1939,6 +1946,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let got = store
@@ -1980,6 +1988,7 @@ mod tests {
             authority: String::new(),
             roles: vec!["operators".into(), "experts".into()],
             pv_request: None,
+            log: Default::default(),
         };
         let creds = ctx_to_creds(&ctx);
         assert_eq!(
@@ -2110,6 +2119,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("FLNK:a", "127.0.0.1", "anonymous", "anonymous", "")
@@ -2290,6 +2300,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let checked = AccessGate::open()
@@ -2393,6 +2404,7 @@ mod tests {
                 authority: String::new(),
                 roles: Vec::new(),
                 pv_request: Some(PvField::Structure(req)),
+                log: Default::default(),
             };
             let checked = AccessGate::open()
                 .check(group_pv, "127.0.0.1", "anonymous", "anonymous", "")
@@ -2532,6 +2544,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("BR120:grp", "127.0.0.1", "anonymous", "anonymous", "")
@@ -2640,6 +2653,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("BR120E:grp", "127.0.0.1", "anonymous", "anonymous", "")

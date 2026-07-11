@@ -20,6 +20,13 @@
 //! Rust. Attaching an [`ExecOp`] to the actual wire dispatch is opt-in:
 //! callers wire the underlying [`tokio::sync::mpsc::Sender`] /
 //! [`tokio::sync::oneshot::Sender`] themselves.
+//!
+//! That includes [`RemoteLogger`]: it is the pvxs-shaped *ergonomic*
+//! wrapper, not the runtime's diagnostic path. The wired source→client
+//! diagnostic channel a [`super::source::ChannelSource`] gets for free
+//! is [`super::source::RemoteLog`], carried on every
+//! [`super::source::ChannelContext`] and drained by the connection into
+//! IOID-tagged `CMD_MESSAGE` frames before the operation's reply.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -324,6 +331,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 

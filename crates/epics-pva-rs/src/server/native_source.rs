@@ -1040,6 +1040,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 

@@ -2032,6 +2032,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         // No channel yet: a GET-only path sees a closed PV.

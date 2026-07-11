@@ -7,6 +7,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+use epics_pva_rs::server_native::source::RemoteLog;
 
 use super::monitor::BridgeMonitor;
 use super::provider::Channel;
@@ -112,7 +113,12 @@ fn dbe_scalar_as_u8(sv: &ScalarValue) -> Option<u8> {
 /// is separate and unconditional (singlesource.cpp:161-167). Numeric
 /// form (`"5"` or an integer scalar) is masked to the value class the
 /// same way.
-pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
+///
+/// `log` is the operation's [`RemoteLog`]: a string DBE that selects
+/// NOTHING in the value class still falls back to `VALUE|ALARM`, but pvxs
+/// tells the client so first (singlesource.cpp:128-130) rather than
+/// letting the fallback pass for an honored request.
+pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Option<u16> {
     use epics_base_rs::server::recgbl::EventMask;
 
     let options = request
@@ -186,6 +192,15 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     if raw.contains("ALARM") {
         raw_mask |= EventMask::ALARM.bits();
     }
+    // pvxs `singlesource.cpp:128-130` — `if(!dbe && !mask.empty())`. The
+    // client named an event class the substring parse recognized nothing in
+    // (`"LOG"`, a lowercase `"value"`, `"PROPERTY"` alone), so the request
+    // is honored by the `VALUE|ALARM` fallback below rather than by what was
+    // asked for. pvxs reports that before falling back; an empty string
+    // (`DBE=""`) is not a selection at all and draws no warning.
+    if raw_mask == 0 && !raw.is_empty() {
+        log.warn(format!("record._options.DBE=\"{raw}\" selects empty mask"));
+    }
     Some(dbe_value_class_mask(raw_mask))
 }
 
@@ -220,31 +235,89 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
     }
 }
 
-/// Map a `record._options.process` scalar to a [`ProcessMode`],
-/// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448).
-/// pvxs reads the option through `proc.as<bool>` and, on success, sets
-/// `forceProc = b ? True : False`; only when `as<bool>` raises
-/// `NoConvert` does it fall through to the `"passive"` string check, and
-/// any other unrecognized value is logged and left `Unset`.
-/// `True`/`False`/`Unset` map to Force/Inhibit/Passive here.
+/// Map a present `record._options.process` field to a [`ProcessMode`],
+/// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448)
+/// including which values it reports to the client:
 ///
-/// This is the *same* `as<bool>` coercion used for
-/// `record._options.atomic`/`block`, so it routes through the shared
-/// [`scalar_as_bool`] owner rather than re-deriving it: a bool, any
-/// signed/unsigned integer or real scalar maps by nonzero truthiness
-/// (`copyOutScalar` `bool(src)`, src/data.cpp:402-408), and a string is
-/// accepted only as the exact tokens `"true"`/`"false"` — no trim, case
-/// sensitive (src/data.cpp:459-461). Every NoConvert outcome — the
-/// literal `"passive"`, a whitespace-wrapped `" false "`, or any other
-/// value — collapses to the passive default, matching pvxs's
-/// `else if(proc.as(s))` / log-and-default tail. The earlier parser
-/// forced real scalars to passive and trimmed strings, both of which
-/// diverged from `as<bool>`.
-fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
-    match scalar_as_bool(sv) {
-        Some(true) => ProcessMode::Force,
-        Some(false) => ProcessMode::Inhibit,
-        None => ProcessMode::Passive,
+/// ```text
+///   proc.as<bool>() succeeds  -> forceProc = True | False   (silent)
+///   else "passive"            -> forceProc = Unset          (silent)
+///   else                      -> forceProc left Unset, logRemote(Warn)
+/// ```
+///
+/// `True`/`False`/`Unset` map to Force/Inhibit/Passive here. The `as<bool>`
+/// coercion is the *same* one `record._options.atomic`/`block` use, so it
+/// routes through the shared [`scalar_as_bool`] owner rather than being
+/// re-derived: a bool, any signed/unsigned integer or real scalar maps by
+/// nonzero truthiness (`copyOutScalar` `bool(src)`, src/data.cpp:402-408),
+/// and a string is accepted only as the exact tokens `"true"`/`"false"` —
+/// no trim, case sensitive (src/data.cpp:459-461).
+///
+/// The third arm is what this function exists for: `"passive"` is a
+/// SUPPORTED spelling of the default and is silent, while a
+/// whitespace-wrapped `" false "`, a typo, or a non-scalar field is an
+/// UNSUPPORTED value — same passive outcome, but pvxs names it to the
+/// client. Collapsing both into a silent passive (as this did) loses that
+/// distinction, which is the only thing the client can act on: the PUT it
+/// asked to force will silently not process.
+fn process_mode_from_field(field: &PvField, log: &RemoteLog) -> ProcessMode {
+    if let PvField::Scalar(sv) = field {
+        match scalar_as_bool(sv) {
+            Some(true) => return ProcessMode::Force,
+            Some(false) => return ProcessMode::Inhibit,
+            // NoConvert — pvxs falls through to its `proc.as(s)` check.
+            None => {
+                if matches!(sv, ScalarValue::String(s) if s.as_str_lossy() == "passive") {
+                    return ProcessMode::Passive;
+                }
+            }
+        }
+    }
+    // pvxs iocsource.cpp:446-447 — "oops, unsupported type or unexpected
+    // value". `forceProc` keeps its incoming default (Unset ⇒ Passive) and
+    // the client is told which option was ignored, and with what value.
+    log.warn(format!(
+        "Ignoring unsupported record._options.process: {}",
+        render_option_value(field)
+    ));
+    ProcessMode::Passive
+}
+
+/// Render a pvRequest option value the way pvxs's `SB()<<value` does —
+/// `Value`'s default (tree) formatter, `datafmt.cpp:187-211`:
+/// `<type name> = <value>` with strings quoted, terminated by the `"\n"`
+/// the formatter always writes. That trailing newline is part of the
+/// message pvxs puts on the wire, so it is part of the contract.
+///
+/// Only values that fail `as<bool>` ever reach here — every numeric and
+/// boolean scalar converts — so in practice this renders strings. A
+/// non-scalar field (structure / union / array) also fails `as<bool>` and
+/// `as<string>` in pvxs; its full tree rendering is approximated by the
+/// type name alone, which is all a client needs to identify the offending
+/// option.
+fn render_option_value(field: &PvField) -> String {
+    let scalar = match field {
+        PvField::Scalar(sv) => sv,
+        _ => return "<non-scalar>\n".to_string(),
+    };
+    match scalar {
+        ScalarValue::String(s) => {
+            // pvxs `escape()` — backslash and quote are the escapes a
+            // pvRequest option value can realistically carry.
+            let escaped = s.as_str_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+            format!("string = \"{escaped}\"\n")
+        }
+        ScalarValue::Boolean(b) => format!("bool = {b}\n"),
+        ScalarValue::Byte(v) => format!("int8 = {v}\n"),
+        ScalarValue::Short(v) => format!("int16 = {v}\n"),
+        ScalarValue::Int(v) => format!("int32 = {v}\n"),
+        ScalarValue::Long(v) => format!("int64 = {v}\n"),
+        ScalarValue::UByte(v) => format!("uint8 = {v}\n"),
+        ScalarValue::UShort(v) => format!("uint16 = {v}\n"),
+        ScalarValue::UInt(v) => format!("uint32 = {v}\n"),
+        ScalarValue::ULong(v) => format!("uint64 = {v}\n"),
+        ScalarValue::Float(v) => format!("float32 = {v}\n"),
+        ScalarValue::Double(v) => format!("float64 = {v}\n"),
     }
 }
 
@@ -289,7 +362,11 @@ impl PutOptions {
     /// Looks for `record._options.process` (bool / integer / "true" /
     /// "false" / "passive") and `record._options.block` (bool / integer /
     /// unsigned / real / "true" / "false", via pvxs `as<bool>` coercion).
-    pub fn from_pv_request(request: &PvStructure) -> Self {
+    ///
+    /// `log` is the operation's [`RemoteLog`]: a `process` value pvxs
+    /// cannot interpret is reported to the client rather than silently
+    /// defaulted (see [`process_mode_from_field`]).
+    pub fn from_pv_request(request: &PvStructure, log: &RemoteLog) -> Self {
         let mut opts = Self::default();
 
         // Navigate: record -> _options -> process/block
@@ -308,12 +385,15 @@ impl PutOptions {
             // process option. pvxs reads `record._options.process` via
             // `Value::as<bool>` first — accepting an actual bool, an
             // integer, or a bool-parsable string — then falls back to the
-            // literal string "passive"; anything else is ignored and the
-            // mode stays passive/default (ioc/iocsource.cpp:426-448). The
-            // earlier Rust path matched only `String`, silently dropping
-            // the boolean and numeric forms a PVA client can legally send.
-            if let Some(PvField::Scalar(sv)) = opt_struct.get_field("process") {
-                opts.process = process_mode_from_scalar(sv);
+            // literal string "passive"; anything else keeps the passive
+            // default AND is reported to the client
+            // (ioc/iocsource.cpp:426-448). An ABSENT option is not a value
+            // at all: pvxs returns before the log, so the field must be
+            // matched on presence, not on being a scalar — a non-scalar
+            // `process` is a present-but-unsupported value and draws the
+            // same warning.
+            if let Some(field) = opt_struct.get_field("process") {
+                opts.process = process_mode_from_field(field, log);
             }
 
             // block option. pvxs reads `record._options.block` via
@@ -863,7 +943,7 @@ impl Channel for BridgeChannel {
         // structure (the legacy location). New callers should
         // prefer [`BridgeChannel::put_with_options`] and pass options
         // extracted from the INIT pvRequest.
-        let opts = PutOptions::from_pv_request(value);
+        let opts = PutOptions::from_pv_request(value, &RemoteLog::default());
         self.put_with_options(value, opts).await
     }
 
@@ -931,7 +1011,7 @@ mod tests {
     #[test]
     fn put_options_from_empty_request() {
         let req = PvStructure::new("empty");
-        let opts = PutOptions::from_pv_request(&req);
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
         assert_eq!(opts.process, ProcessMode::Passive);
         assert!(!opts.block);
     }
@@ -956,7 +1036,7 @@ mod tests {
         req.fields
             .push(("record".into(), PvField::Structure(record)));
 
-        let opts = PutOptions::from_pv_request(&req);
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
         assert_eq!(opts.process, ProcessMode::Force);
         assert!(opts.block);
     }
@@ -981,7 +1061,7 @@ mod tests {
         req.fields
             .push(("record".into(), PvField::Structure(record)));
 
-        let opts = PutOptions::from_pv_request(&req);
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
         assert_eq!(opts.process, ProcessMode::Inhibit);
         assert!(!opts.block); // block disabled when process=false
     }
@@ -1005,7 +1085,13 @@ mod tests {
     /// map to Force/Inhibit, not silently fall back to passive.
     #[test]
     fn put_options_process_accepts_boolean_and_integer_scalars() {
-        let f = |v| PutOptions::from_pv_request(&req_with_process(PvField::Scalar(v))).process;
+        let f = |v| {
+            PutOptions::from_pv_request(
+                &req_with_process(PvField::Scalar(v)),
+                &RemoteLog::default(),
+            )
+            .process
+        };
 
         assert_eq!(f(ScalarValue::Boolean(true)), ProcessMode::Force);
         assert_eq!(f(ScalarValue::Boolean(false)), ProcessMode::Inhibit);
@@ -1031,7 +1117,13 @@ mod tests {
     /// whitespace-wrapped `" false "` wrongly inhibited processing.
     #[test]
     fn put_options_process_real_truthiness_and_no_trim() {
-        let f = |v| PutOptions::from_pv_request(&req_with_process(PvField::Scalar(v))).process;
+        let f = |v| {
+            PutOptions::from_pv_request(
+                &req_with_process(PvField::Scalar(v)),
+                &RemoteLog::default(),
+            )
+            .process
+        };
 
         // real scalars coerce by nonzero truthiness, not silently passive
         assert_eq!(f(ScalarValue::Double(1.0)), ProcessMode::Force);
@@ -1083,7 +1175,10 @@ mod tests {
     /// completion barrier.
     #[test]
     fn put_options_block_accepts_integer_and_string_forms() {
-        let f = |v| PutOptions::from_pv_request(&req_with_block(PvField::Scalar(v))).block;
+        let f = |v| {
+            PutOptions::from_pv_request(&req_with_block(PvField::Scalar(v)), &RemoteLog::default())
+                .block
+        };
 
         // boolean (already worked)
         assert!(f(ScalarValue::Boolean(true)));
@@ -1124,7 +1219,7 @@ mod tests {
         req.fields
             .push(("record".into(), PvField::Structure(record)));
 
-        let opts = PutOptions::from_pv_request(&req);
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
         assert_eq!(opts.process, ProcessMode::Inhibit);
         assert!(!opts.block, "block=1 must be cleared when process=false");
     }
@@ -1148,7 +1243,7 @@ mod tests {
     fn dbe_mask_parses_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("VALUE | ALARM".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1163,7 +1258,7 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
             "DBE_VALUE,DBE_ARCHIVE,PROPERTY".into(),
         )));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(
             mask,
             (EventMask::VALUE | EventMask::LOG).bits(),
@@ -1180,7 +1275,7 @@ mod tests {
     fn dbe_string_property_only_falls_back_to_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("PROPERTY".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1192,7 +1287,7 @@ mod tests {
     fn dbe_string_log_spelling_not_recognized() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("LOG".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1208,7 +1303,8 @@ mod tests {
         let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
         for token in ["alarm", "value", "archive", "value | alarm", "dbe_value"] {
             let req = req_with_dbe(PvField::Scalar(ScalarValue::String(token.into())));
-            let mask = dbe_mask_from_pv_request(&req).expect("present option must parse");
+            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+                .expect("present option must parse");
             assert_eq!(
                 mask, fallback,
                 "lowercase DBE token {token:?} matches no uppercase substring, so pvxs falls back to VALUE|ALARM"
@@ -1225,7 +1321,8 @@ mod tests {
     fn dbe_string_uppercase_substring_in_mixed_case_still_selects() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("alarmALARM".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("present option must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+            .expect("present option must parse");
         assert_eq!(mask, EventMask::ALARM.bits());
     }
 
@@ -1234,7 +1331,7 @@ mod tests {
     #[test]
     fn dbe_mask_accepts_integer_form() {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, 5);
     }
 
@@ -1248,7 +1345,7 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(
             EventMask::PROPERTY.bits() as i32,
         )));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1258,7 +1355,7 @@ mod tests {
     fn dbe_numeric_zero_falls_back_to_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(0)));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1269,7 +1366,7 @@ mod tests {
         use epics_base_rs::server::recgbl::EventMask;
         let raw = (EventMask::VALUE | EventMask::PROPERTY).bits();
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(raw as i32)));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, EventMask::VALUE.bits());
     }
 
@@ -1279,7 +1376,7 @@ mod tests {
     fn dbe_numeric_string_uses_value_class_mask() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("8".into())));
-        let mask = dbe_mask_from_pv_request(&req).expect("must parse");
+        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1288,7 +1385,7 @@ mod tests {
     #[test]
     fn dbe_mask_absent_returns_none() {
         let req = PvStructure::new("request");
-        assert!(dbe_mask_from_pv_request(&req).is_none());
+        assert!(dbe_mask_from_pv_request(&req, &RemoteLog::default()).is_none());
     }
 
     /// A numeric `record._options.DBE`
@@ -1327,7 +1424,7 @@ mod tests {
         for (field, expected) in cases {
             let label = format!("{field:?}");
             let req = req_with_dbe(field);
-            let mask = dbe_mask_from_pv_request(&req)
+            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
                 .unwrap_or_else(|| panic!("DBE {label} must coerce to a value-class mask"));
             assert_eq!(
                 mask, expected,

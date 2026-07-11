@@ -3959,6 +3959,116 @@ async fn test_empty_array_into_array_field_is_a_silent_no_op() {
     );
 }
 
+/// R6-9 — a put to a field name no record type owns. C `dbNameToAddr`
+/// (`dbAccess.c:660-676`) resolves the field part with `dbFindFieldPart`, then
+/// falls back to `dbGetAttributePart`; a name that matches neither returns
+/// `S_dbLib_fieldNotFound`, so `dbPutField` never runs and every caller reports
+/// the failure (`dbpf` prints "PV '%s' not found" and returns -1,
+/// `dbTest.c:787-795`). The port's `put_common_field` fell through to
+/// `Ok(NoChange)`, so a misspelled field was a silent success.
+#[tokio::test]
+async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
+    let db = PvDatabase::new();
+    db.add_record("BADFLD", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    // The common-field owner itself.
+    {
+        let rec = db.get_record("BADFLD").await.unwrap();
+        let mut inst = rec.write().await;
+        let err = inst
+            .put_common_field("NOSUCH", EpicsValue::Double(1.0))
+            .expect_err("an unknown field name must not report success");
+        assert!(
+            matches!(err, CaError::FieldNotFound(ref f) if f == "NOSUCH"),
+            "expected FieldNotFound (S_dbLib_fieldNotFound), got {err:?}"
+        );
+        // Boundary: a *known* common field on the same record still succeeds.
+        inst.put_common_field("DESC", EpicsValue::String("ok".into()))
+            .expect("a real dbCommon field must still be accepted");
+    }
+
+    // dbPut (`put_pv`) and dbPutField (`put_record_field_from_ca`) — the two
+    // entry points `dbpf` / a link / QSRV reach.
+    assert!(
+        db.put_pv("BADFLD.NOSUCH", EpicsValue::Double(1.0))
+            .await
+            .is_err(),
+        "put_pv to a nonexistent field must fail (C dbNameToAddr → S_db_badField)"
+    );
+    assert!(
+        db.put_record_field_from_ca("BADFLD", "NOSUCH", EpicsValue::Double(1.0))
+            .await
+            .is_err(),
+        "dbPutField to a nonexistent field must fail"
+    );
+    // …and the record is otherwise untouched by the rejected puts.
+    assert_eq!(
+        db.get_pv("BADFLD.DESC").await.unwrap(),
+        EpicsValue::String("ok".into())
+    );
+}
+
+/// R6-9 boundary — a record *attribute* is a different C outcome from an
+/// unknown name: it resolves, but the write is refused. `NAME` is
+/// `special(SPC_NOMOD)` (`dbCommon.dbd:13-17`) → `dbPutSpecial` pass 0 returns
+/// `S_db_noMod` (`dbAccess.c:123-124`); `RTYP` is an attribute, whose address
+/// carries `special == SPC_ATTRIBUTE` → `dbPutField` returns the same
+/// `S_db_noMod` (`dbAccess.c:1252-1253`). Neither may silently succeed, and
+/// neither may be reported as "field not found".
+#[tokio::test]
+async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
+    let db = PvDatabase::new();
+    db.add_record("ATTRFLD", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("ATTRFLD").await.unwrap();
+    let mut inst = rec.write().await;
+
+    for field in ["NAME", "RTYP"] {
+        let err = inst
+            .put_common_field(field, EpicsValue::String("hijack".into()))
+            .expect_err("an attribute write must not report success");
+        assert!(
+            matches!(err, CaError::ReadOnlyField(ref f) if f == field),
+            "{field}: expected ReadOnlyField (S_db_noMod), got {err:?}"
+        );
+    }
+    assert_eq!(inst.name, "ATTRFLD", "NAME must be unchanged");
+}
+
+/// R6-9 boundary — `OUTN` exists only on `swait` (it aliases `common.out`
+/// there). On any other record type C has no such field, so the put is an
+/// `S_dbLib_fieldNotFound` like any other unknown name; the port's `OUTN` arm
+/// used to swallow it.
+#[tokio::test]
+async fn r6_9_outn_is_swait_only() {
+    use epics_base_rs::server::records::swait::SwaitRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("OUTN_AO", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("OUTN_SW", Box::new(SwaitRecord::default()))
+        .await
+        .unwrap();
+
+    let ao = db.get_record("OUTN_AO").await.unwrap();
+    let err = ao
+        .write()
+        .await
+        .put_common_field("OUTN", EpicsValue::String("TGT".into()))
+        .expect_err("OUTN on a non-swait record is not a field");
+    assert!(matches!(err, CaError::FieldNotFound(ref f) if f == "OUTN"));
+
+    let sw = db.get_record("OUTN_SW").await.unwrap();
+    let mut sw = sw.write().await;
+    sw.put_common_field("OUTN", EpicsValue::String("TGT".into()))
+        .expect("OUTN on swait must still be accepted");
+    assert_eq!(sw.common.out, "TGT");
+}
+
 /// R6-6 — C `piniProcess` (`iocInit.c:608-627`) sweeps the database once per
 /// distinct `PHAS`, ascending, so PINI records process in phase order; within a
 /// phase the order is database load order (`doRecordPini` under

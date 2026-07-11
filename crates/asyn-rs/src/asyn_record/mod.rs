@@ -864,6 +864,18 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
             if overflow {
+                // C: reportError(status, "Overflow nread %d %s",
+                // nbytesTransfered, pasynUser->errorMessage) in all three
+                // overflow branches (asynRecord.c:1602-1621), alongside the
+                // MINOR alarm. The `%s` tail is the driver's message; an
+                // overflow that did not *fail* has none, and C then splices
+                // whatever is left in its long-lived `pasynUser` — the empty
+                // string for a record that has not yet seen an error. Take this
+                // cycle's error text when there is one and the empty string
+                // otherwise: the port does not carry a stale diagnostic across
+                // cycles.
+                let tail = err.as_ref().map(|e| e.message()).unwrap_or_default();
+                out.report_error(format!("Overflow nread {nread} {tail}"));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
             }
         }
@@ -4674,11 +4686,62 @@ mod tests {
         );
         assert_eq!(rec.nord, AINP_SIZE as i32, "NORD is the raw transfer count");
         assert_eq!(rec.ainp.len(), AINP_SIZE - 1, "AINP NUL-truncated at 40");
-        assert_eq!(rec.errs, "", "overflow is not an error, only a MINOR alarm");
+        // R9-49 corrects this expectation: C `reportError`s the overflow
+        // (asynRecord.c:1602-1608) *as well as* raising the MINOR alarm. The
+        // previous `assert_eq!(rec.errs, "")` with the comment "overflow is not
+        // an error, only a MINOR alarm" pinned behaviour the C reference does
+        // not have — ERRS is the only place C tells the operator the response
+        // was truncated. The trailing space is C's: the format is
+        // "Overflow nread %d %s" and the `%s` (pasynUser->errorMessage) is empty
+        // when the read itself did not fail.
+        assert_eq!(rec.errs, "Overflow nread 40 ");
         assert_eq!(
             read_alarm(&mut rec),
             (alarm_status::READ_ALARM, AlarmSeverity::Minor)
         );
+    }
+
+    /// R9-49: every C overflow branch reports "Overflow nread %d %s"
+    /// (asynRecord.c:1602-1615) — ASCII against `sizeof(ainp)`, Hybrid against
+    /// IMAX — and the text overwrites the read-status text when the read both
+    /// failed and overflowed (`reportError` `strncpy`s over ERRS, and the
+    /// overflow check runs last). The port raised the MINOR alarm and left ERRS
+    /// blank, so `process()`'s ERRS clear (:3043 equivalent) was all the
+    /// operator saw.
+    #[test]
+    fn overflow_read_reports_errs_in_every_ifmt() {
+        use crate::interpose::EomReason;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        // ASCII: 100 bytes offered, 40-byte AINP -> overflow at 40.
+        let port = "test_overflow_errs_ascii";
+        spawn_fill_port(port, 100, EomReason::CNT);
+        let mut ascii = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        ascii.process().unwrap();
+        assert_eq!(ascii.errs, "Overflow nread 40 ");
+        assert_eq!(
+            read_alarm(&mut ascii),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
+
+        // Hybrid: the capacity is IMAX (asynRecord.c:1609-1615).
+        let hport = "test_overflow_errs_hybrid";
+        spawn_fill_port(hport, 100, EomReason::CNT);
+        let mut hybrid = read_rec(hport, ASYN_FMT_HYBRID, 16, 0);
+        hybrid.process().unwrap();
+        assert_eq!(hybrid.errs, "Overflow nread 16 ");
+        assert_eq!(
+            read_alarm(&mut hybrid),
+            (alarm_status::READ_ALARM, AlarmSeverity::Minor)
+        );
+
+        // A read that fits reports nothing.
+        let sport = "test_overflow_errs_short";
+        spawn_fill_port(sport, 8, EomReason::END);
+        let mut short = read_rec(sport, ASYN_FMT_ASCII, 80, 0);
+        short.process().unwrap();
+        assert_eq!(short.errs, "", "a read inside the buffer reports nothing");
     }
 
     /// The ASCII overflow boundary is `>=`: 39 bytes fit, 40 overflow.

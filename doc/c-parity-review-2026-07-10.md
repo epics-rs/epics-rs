@@ -444,6 +444,39 @@ Category C (epics-pva-rs / epics-bridge-rs / epics-base-rs):
 - R6-34: FIXED 2d59ae6c — `RpcReply` enum (Empty | Value) models both pvxs ExecOp::reply() overloads end-to-end (server emit, client decode, gateway relay). PUBLIC API CHANGE: ChannelSource::rpc*/SharedPV::rpc*/PvaClient::pvrpc* carry RpcReply; Into<RpcReply> keeps existing handlers compiling.
 - R6-35: FIXED 8d5daedf — MONITOR FINISH trailing update decoded and delivered before stream end; single owner `monitor_finish_body` consulted by typed, marker-flattening, and raw-gateway paths.
 
+### Fix wave 3 (2026-07-12): category B — merged into review/parity-r6, verified by main (workspace clippy -D warnings clean, nextest 7541/7541 passed on re-run; first run had 2 compile-load flakes, see notes)
+
+Category B (epics-ca-rs / epics-tools-rs):
+- R6-16: FIXED bae068a6 — recv echo timeout marks unresponsive + keeps the socket; close only on real socket error.
+- R6-17: FIXED 048ce75f — flow control keyed on socket-buffer occupancy, trigger scaled from EPICS_CA_MAX_ARRAY_BYTES; consumer-queue latch removed; 07-flow-control.md / 09-libca-parity.md corrected.
+- R6-18: FIXED 7e9d3edf — server gates extended CA header on peer V49; shared version-aware `set_payload_size(..., peer_minor)` primitive.
+- R6-19: FIXED c2aa82a4 — zero-count requests to pre-V413 peers substitute the native element count.
+- R6-20: FIXED b019a4a2 — request element counts bounded against negotiated circuit limits.
+- R6-21: FIXED 873725be — no receive cap by default; oversize payload never closes the circuit.
+- R6-22: FIXED 80269738 — repeater registration retried every 1 s until CONFIRM. Residual OPEN: libca's odd/even `m_available` address alternation across retries not implemented.
+- R6-23: FIXED 92bb559e — libca beacon anomaly bands (0.80x/1.25x/3.25x); reverses a deliberate prior divergence that was only needed before R6-16 (documented in commit).
+- R6-24: FIXED 6f0c2e77 — foreground mode attaches the launching terminal as a console client through the existing spawn_client owner; termios RAII guard; verified on a real PTY.
+- R6-25: FIXED 6c2512a7 — foreground mode SIG_IGNs SIGINT/SIGQUIT.
+- R6-26: FIXED 749a585c — all six child-launch failure paths exit 255.
+- R6-27: FIXED 9bbd5ad3 — verifyClients() bind-test sweep on every registration.
+- R6-28: FIXED 53360707 — beacon EMA alpha 0.125.
+- R6-29: FIXED 3f7906ea — scalar DBR_STRING put framed align8(strlen+1), >40 non-NUL → ECA_BADCOUNT; put framing consolidated into single owner `protocol::build_put_frame` (was two owners).
+
+### R6-30: server restarts the beacon ramp on every TCP accept/disconnect — "Rust enhancement", not C parity
+Severity: Medium (REPORTED by fixer-B; server-side sibling exposed by R6-23)
+Rust: `crates/epics-ca-rs/src/server/tcp.rs:811-815,1091-1095` — beacon_reset on connect/disconnect, self-described as non-parity.
+C reference: `online_notify.c:66,128` — ramp restarts only at startup and after ctlPause.
+Impact: with R6-23's client bands installed, a peer connecting to an epics-rs server produces ShortPeriod anomalies on every other client (log noise, search wakes, watchdog flags).
+
+### R6-74: `EpicsValue::String::to_bytes` truncates >39-char strings on non-client-put paths; C raises ECA_BADCOUNT
+Severity: Medium (REPORTED by fixer-B; R6-29 was explicitly scoped to the client put path)
+Rust: `crates/epics-base-rs/src/types/value.rs` — fixed-40 truncation on remaining paths.
+Impact: an oversized string silently truncates where libca errors.
+
+### R6-75: procServ child inherits `SIGPIPE=SIG_IGN`; C's child gets default disposition
+Severity: Low (REPORTED by fixer-B, adjacent to R6-25 but child-side)
+Impact: a child that relies on dying from SIGPIPE (classic pipeline behaviour) keeps running under procserv-rs.
+
 ## Open Findings — surfaced during fix wave 1 (reported by fixers, pending independent verify)
 
 ### R6-51: prologix read error drops bytes accumulated in `acc`; C retains them for the next call
@@ -486,7 +519,8 @@ Impact: `caput -a` of a multi-element array to a scalar fails on the port, succe
 - PINI=PAUSE/PAUSED passes absent: the port has no iocPause lifecycle (`InitHookState` lacks AtIocPause/AfterIocPaused). Values store and serve correctly (R6-5); only the passes are missing. Feature gap, needs a lifecycle decision — not silently inventable.
 - `put_pv` posts no monitor events by its documented contract (caller's job); R6-7's empty-request path on that entry point does not itself post DBE_VALUE|DBE_LOG. General audit of that contract is a separate question.
 - Pre-existing (not touched): `cargo build -p epics-base-rs --all-features` fails at `tests/client_server.rs:148` (`WallTime` vs `SystemTime`), gated behind the `ca-server-tls-test` feature; present since before this round (at 70b4a74b).
-- Flaky under load (not root-caused): `epics-pva-rs::stability` `pva_fr_8_pause_holds_latest_then_resume_delivers` and `array_concurrent_subop_replies_error_not_silent` each failed once in runs launched right after a rebuild, pass in isolation and on a quiet machine (fixer-A report); both passed in main's post-merge workspace runs.
+- Flaky under load (not root-caused): `epics-pva-rs::stability` `pva_fr_8_pause_holds_latest_then_resume_delivers` and `array_concurrent_subop_replies_error_not_silent` each failed once in runs launched right after a rebuild, pass in isolation and on a quiet machine (fixer-A report); both passed in main's post-merge workspace runs. Same pattern after the wave-3 merge: `regression-ioc::motor d_motor_moves_again_on_second_caput` and `regression-ioc::families o_seeded_record_suppresses_duplicate_post` failed once in the first post-rebuild workspace run, then passed in isolation AND in a second full workspace run (7541/7541). Also pre-existing per fixer-B: `epics-ca-rs protocol_tests::mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer` (UDP-burst timing, fails on the unmodified tree too).
+- Observation (fixer-B, pre-existing): `epics-tools-rs listener.rs:154,236` log "listener accepted" at bind time with the listener's own address — reads as a spurious client connection.
 
 ## Review Log
 
@@ -518,3 +552,9 @@ Impact: `caput -a` of a multi-element array to a scalar fails on the port, succe
   is a public API change (RpcReply); R6-3 respelled two epics-ca-rs tests that
   encoded the wrong `CP CA` semantics. 2 new findings (R6-9, R6-10) + residual
   notes recorded. B (R6-16..29) still in flight.
+- Fix wave 3 (2026-07-12): B (R6-16..29) finished — all 14 FIXED, merged and verified
+  by main (workspace clippy clean; nextest first run 7539/7541 with 2 compile-load
+  flakes, clean re-run 7541/7541; the two flakes pass in isolation and are logged
+  under notes). 3 new findings (R6-30, R6-74, R6-75) + R6-22 residual recorded OPEN.
+  All 42 round-6 findings are now closed; remaining OPEN: R6-9, R6-10, R6-30, R6-51,
+  R6-71..75 (9 items, all fixer-surfaced) + 4 deferred-by-sign-off carryovers.

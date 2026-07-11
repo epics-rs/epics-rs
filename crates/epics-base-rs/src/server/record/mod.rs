@@ -28,7 +28,7 @@ pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub(crate) use record_trait::value_gate;
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,
-    FieldMetadataOverride, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record,
-    RecordProcessResult, SubroutineFn, ValuePostGate,
+    FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessContext, ProcessOutcome,
+    ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
 };
 pub use scan::{ScanType, SimModeScan};

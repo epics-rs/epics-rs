@@ -204,6 +204,7 @@ mod tests {
         ProcessContext {
             udf: false,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
+            nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
             phas,
             tse: 0,
             time: SystemTime::UNIX_EPOCH,
@@ -219,6 +220,7 @@ mod tests {
         ProcessContext {
             udf: false,
             udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
+            nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
             phas,
             tse: -2,
             time,

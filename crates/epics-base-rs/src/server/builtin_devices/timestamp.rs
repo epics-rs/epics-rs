@@ -374,6 +374,7 @@ mod tests {
         ProcessContext {
             udf: false,
             udfs: AlarmSeverity::Invalid,
+            nsev: AlarmSeverity::NoAlarm,
             phas: 0,
             tse: -2,
             time,

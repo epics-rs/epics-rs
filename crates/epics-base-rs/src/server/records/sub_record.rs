@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Number of subroutine input arguments. C `subRecord.c`:
@@ -330,6 +330,12 @@ impl Record for SubRecord {
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &INP_VAL_PAIRS
+    }
+
+    /// C `subRecord.c::fetch_values` (407-418) returns -1 on the first failed
+    /// `dbGetLink` and `process` (146) then skips `do_sub`.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
     }
 }
 

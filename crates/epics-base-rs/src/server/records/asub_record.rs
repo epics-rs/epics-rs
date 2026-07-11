@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, FieldMetadataOverride, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, FieldMetadataOverride, InputFetchPolicy, ProcessOutcome, Record,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
@@ -537,6 +539,12 @@ impl Record for ASubRecord {
                 })
                 .collect()
         })
+    }
+
+    /// C `aSubRecord.c::fetch_values` (277-289) returns on the first failed
+    /// `dbGetLink` and `process` (216-218) then skips `do_sub`.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
     }
 }
 

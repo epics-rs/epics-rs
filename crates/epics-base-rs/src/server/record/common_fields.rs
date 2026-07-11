@@ -106,6 +106,7 @@ impl CommonFields {
         super::record_trait::ProcessContext {
             udf: self.udf,
             udfs: self.udfs,
+            nsev: self.nsev,
             phas: self.phas,
             tse: self.tse,
             time: self.time,

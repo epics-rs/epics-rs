@@ -217,6 +217,24 @@ pub enum RecordProcessResult {
     /// is the continuation that releases the held PACT (same by-construction
     /// invariant as the `AsyncPendingNotify` ODLY defer).
     CompleteDeferOutput,
+    /// Completed synchronously (PACT cleared), and the framework runs the ALARM
+    /// epilogue ONLY: the UDF update, `check_alarms`, `recGblResetAlarms`
+    /// (committing SEVR/STAT/AMSG and posting those fields with their C masks)
+    /// and the timestamp. The VALUE side is skipped entirely — no `monitor()`
+    /// value posts (so the last-posted trackers stay put and the next publishing
+    /// cycle re-detects the change, exactly as C leaves `LA..LP` un-updated), no
+    /// OUT / OEVT write, no process actions, no forward link.
+    ///
+    /// C parity `transformRecord.c:554-560`: an INVALID input severity with
+    /// `IVLA == transformIVLA_DO_NOTHING` makes `process()` run
+    /// `recGblGetTimeStamp` + `checkAlarms` + `recGblResetAlarms`, clear `pact`
+    /// and `return` — skipping the calc loop, all 16 OUTx `dbPutLink` writes,
+    /// `monitor()` and `recGblFwdLink()`.
+    ///
+    /// Distinct from [`RecordProcessResult::CompleteNoEmit`], which skips the
+    /// alarm commit and the timestamp too (C `compressRecord.c:365` returns
+    /// before `checkAlarms`).
+    CompleteAlarmOnly,
 }
 
 /// Complete outcome of a record's process() call.
@@ -259,6 +277,16 @@ impl ProcessOutcome {
     pub fn complete_no_emit() -> Self {
         Self {
             result: RecordProcessResult::CompleteNoEmit,
+            actions: Vec::new(),
+            device_did_compute: false,
+        }
+    }
+
+    /// Completed synchronously with the alarm epilogue only — no value posts,
+    /// no output, no forward link. See `RecordProcessResult::CompleteAlarmOnly`.
+    pub fn complete_alarm_only() -> Self {
+        Self {
+            result: RecordProcessResult::CompleteAlarmOnly,
             actions: Vec::new(),
             device_did_compute: false,
         }
@@ -321,6 +349,15 @@ pub struct ProcessContext {
     pub udf: bool,
     /// `dbCommon.udfs` — alarm severity raised for a UDF record.
     pub udfs: crate::server::record::AlarmSeverity,
+    /// `dbCommon.nsev` — the *pending* (new) alarm severity this cycle has
+    /// accumulated so far, BEFORE the record body runs. C `dbGetLink` folds an
+    /// `MS`-class input link's severity into `nsev` at fetch time, so a record
+    /// body that branches on the input severity reads it here — e.g.
+    /// `transformRecord.c:554` `if ((ptran->nsev >= INVALID_ALARM) && (ptran->ivla
+    /// == transformIVLA_DO_NOTHING))`. The framework folds every input-link alarm
+    /// into `common.nsev` before building this snapshot, so `nsev` is the single
+    /// source of truth; the record never re-derives it from the links.
+    pub nsev: crate::server::record::AlarmSeverity,
     /// `dbCommon.phas` — phase. Used by device support for format
     /// selection (`devTimeOfDay.c:122`).
     pub phas: i16,
@@ -367,6 +404,35 @@ pub struct ProcessSnapshot {
     /// would wrongly reach `DBE_VALUE` subscribers whenever any other
     /// field changed in the same pass.
     pub changed_fields: Vec<(String, EpicsValue, crate::server::recgbl::EventMask)>,
+}
+
+/// What C's `fetch_values()` does when one of the record's input links fails
+/// to read, and whether that failure gates the record body.
+///
+/// Every C record with an INPA..INPx block has a `fetch_values()` helper, but
+/// they do not share a failure shape, so the framework cannot pick one rule
+/// for all of them — each record declares its own via
+/// [`Record::input_fetch_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFetchPolicy {
+    /// Read every configured link; a failed read does not stop the loop.
+    /// C `calcRecord.c::fetch_values` (427-443) and
+    /// `transformRecord.c::process` (531-545) keep going after a failed
+    /// `dbGetLink`, so the inputs behind the failure still refresh.
+    ReadAll,
+    /// Stop at the FIRST failed link and skip the record body this cycle.
+    ///
+    /// C `subRecord.c::fetch_values` (407-418) `return -1`s on the first
+    /// failing `dbGetLink`, so the inputs behind it are never read and keep
+    /// their previous values; `subRecord.c::process` (145-146) then runs
+    /// `do_sub` only `if (status == 0)`, freezing VAL/UDF and raising none of
+    /// the subroutine's alarms. `aSubRecord.c` (277-289 fetch, 216-218
+    /// process) is the same shape.
+    ///
+    /// The framework consumes the gate through the single subroutine-skip
+    /// owner (`RecordInstance::suppress_subroutine_run`), which is what runs
+    /// the body for these two record types.
+    AbortOnFirstFailure,
 }
 
 /// Trait that all EPICS record types must implement.
@@ -896,6 +962,39 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Change-detected auxiliary fields this record posts with C's
+    /// `monitor_mask | DBE_VALUE` — VAL's monitor mask ORed with `DBE_VALUE`,
+    /// and NOT the framework default `monitor_mask | DBE_VALUE | DBE_LOG`.
+    ///
+    /// The difference is the forced `DBE_LOG`. For a field named here the LOG
+    /// bit is present only when it is already in VAL's monitor mask — i.e. only
+    /// when VAL's own ADEL deadband crossed this cycle — so a `DBE_LOG`
+    /// subscriber (an archiver) receives the field exactly on the cycles C
+    /// sends it, instead of on every change.
+    ///
+    /// `swaitRecord.c::monitor` (646-653) is this shape for its A..L inputs:
+    ///
+    /// ```c
+    /// if (*pnew != *pprev)
+    ///     db_post_events(pwait, pnew, monitor_mask | DBE_VALUE);
+    /// ```
+    ///
+    /// while `calcRecord.c:420` — the same loop, one module over — writes
+    /// `monitor_mask | DBE_VALUE | DBE_LOG`. The two records genuinely differ,
+    /// so the mask is a per-record property, not a framework-wide rule.
+    ///
+    /// Distinct from [`Self::value_only_change_fields`] (a literal `DBE_VALUE`,
+    /// which drops the ADEL LOG bit as well) and from
+    /// [`Self::fields_posted_with_value_mask`] (posted from INSIDE C's
+    /// `if (monitor_mask)` guard, so they do not post at all on a cycle where
+    /// VAL itself does not). The fields named here post on every change,
+    /// guard or no guard.
+    ///
+    /// Default: empty.
+    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The array-style monitor decision (C waveform/aai/aao `monitor()`,
     /// waveformRecord.c:291-326). `None` (the default) means the record has
     /// no MPST/APST/HASH mechanism and the generic MDEL/ADEL deadband
@@ -1099,6 +1198,57 @@ pub trait Record: Send + Sync + 'static {
         _selector: Option<u16>,
     ) -> Option<Vec<(&'static str, &'static str)>> {
         None
+    }
+
+    /// How C's `fetch_values()` for this record type reacts to a link read
+    /// that fails. Drives the framework's [`Self::multi_input_links`] fetch
+    /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::ReadAll
+    }
+
+    /// Input links this record reads at OUTPUT time instead of during the
+    /// input-fetch phase: `(link_name_field, value_field)` pairs. The framework
+    /// reads each configured link immediately before the OUT write, and ONLY on
+    /// a cycle where the output actually fires ([`Self::should_output`] and no
+    /// IVOA veto), then writes the value into `value_field` via
+    /// [`Self::put_field`]; a failed read leaves the field alone.
+    ///
+    /// C `swaitRecord.c::execOutput` (763-772) does exactly this for `DOL`:
+    ///
+    /// ```c
+    /// if (pwait->dopt) {                    /* DOPT = "Use DOL" */
+    ///     if (!pwait->dolv) {               /* DOL PV connected */
+    ///         oldDold = pwait->dold;
+    ///         recDynLinkGet(&pcbst->caLinkStruct[DOL_INDEX], &(pwait->dold), ...);
+    ///         if (pwait->dold != oldDold)
+    ///             db_post_events(pwait, &pcbst->pwait->dold, DBE_VALUE);
+    ///     }
+    ///     outValue = pwait->dold;
+    /// }
+    /// ```
+    ///
+    /// The timing is the point: the value written out is the one the link holds
+    /// at output time (ODLY delay-end included), and a cycle whose output does
+    /// not fire never refreshes — or posts — the field. Fetching such a link in
+    /// the normal input phase would do both. Default: none.
+    fn output_time_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// The value the framework writes to the OUT link. The single owner of
+    /// "what goes out", shared by the soft-OUT write, the async-completion
+    /// write and the simulated SIOL redirect.
+    ///
+    /// The default is the C staging convention: the record computed the output
+    /// into `OVAL` during `process()` (`calcout`/`ao`/`bo`/...), falling back to
+    /// `VAL` for records that have no `OVAL`. Override when the record's C
+    /// composes the output value at *output* time rather than staging it — e.g.
+    /// swait, whose `execOutput` (`swaitRecord.c:763-772`) picks between `VAL`
+    /// and the just-fetched `DOLD` and whose `OVAL` field is C's "Old Value"
+    /// (the previous VAL, used only by the OOPT test), not an output stage.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        self.get_field("OVAL").or_else(|| self.val())
     }
 
     /// Return multi-output link field pairs: (link_field, value_field).

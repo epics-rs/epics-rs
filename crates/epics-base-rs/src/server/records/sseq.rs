@@ -887,6 +887,46 @@ impl Record for SseqRecord {
         "sseq"
     }
 
+    /// C `sseqRecord.c::init_record` (197-200) rounds EVERY `DLYn` to a whole
+    /// OS clock tick before the record can run:
+    ///
+    /// ```c
+    /// for (index = 0; index < NUM_LINKS; index++, plinkGroup++) {
+    ///     plinkGroup->dly = epicsThreadSleepQuantum() *
+    ///         NINT(plinkGroup->dly/epicsThreadSleepQuantum());
+    ///     db_post_events(pR, &plinkGroup->dly, DBE_VALUE);
+    /// ```
+    ///
+    /// so a `DLY3=0.003` loaded from the db file is a 0.0 s delay, not 3 ms —
+    /// the delay the record actually waits and the value a client reads back
+    /// are the same rounded number. (C's `db_post_events` here runs during
+    /// iocInit, before any client can subscribe, so it has no observable
+    /// effect; the rounded field value does.)
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            for step in &mut self.steps {
+                step.dly = crate::runtime::time::quantize_to_sleep_quantum(step.dly);
+            }
+        }
+        Ok(())
+    }
+
+    /// A put to any `DLYn` re-quantizes and posts DLY1 — see `special()` for
+    /// the C quirk that makes it DLY1 and not the field written.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        if Self::step_index_from_suffix(put_field).is_some_and(|(_, p)| p == "DLY") {
+            &["DLY1"]
+        } else {
+            &[]
+        }
+    }
+
+    /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
+    /// `DBE_VALUE`, not the framework default `DBE_VALUE | DBE_LOG`.
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        &["DLY1"]
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut live = Vec::new();
         // An abort in flight drains the outstanding put-callbacks, then
@@ -949,6 +989,29 @@ impl Record for SseqRecord {
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {
+            return Ok(());
+        }
+        // A put to any DLYn re-quantizes DLY1 — yes, DLY1, not the field that
+        // was written. C `sseqRecord.c::special` (1140-1156) computes
+        // `lnkIndex` from the put field and then never applies it, unlike the
+        // STRn case right above it which does `plinkGroup += lnkIndex`:
+        //
+        //     lnkIndex = ((char *)paddr->pfield - (char *)&pR->dly1) /
+        //                sizeof(struct linkGroup);
+        //     plinkGroup = (struct linkGroup *)&pR->dly1;
+        //     plinkGroup->dly = epicsThreadSleepQuantum() *
+        //                       NINT(plinkGroup->dly/epicsThreadSleepQuantum());
+        //     db_post_events(pR, &plinkGroup->dly, DBE_VALUE);
+        //
+        // So `plinkGroup` still points at the DLY1 group. The put DLYn keeps
+        // its raw value and DLY1 is what gets rounded and posted. Present since
+        // the record was moved into the calc module (calc c9115f8) and never
+        // corrected upstream; it is C's observable behaviour, so it is the
+        // contract. (Every DLYn IS quantized — at init, see `init_record`.)
+        if Self::step_index_from_suffix(field).is_some_and(|(_, p)| p == "DLY") {
+            self.steps[0].dly = crate::runtime::time::quantize_to_sleep_quantum(self.steps[0].dly);
+            // The DBE_VALUE post of DLY1 is the framework's, via
+            // `monitor_side_effect_fields` + `value_only_change_fields`.
             return Ok(());
         }
         // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics:

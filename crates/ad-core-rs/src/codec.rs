@@ -28,6 +28,42 @@ impl CodecName {
             Self::LZ4HDF5 => "lz4hdf5",
         }
     }
+
+    /// Value of the `COMPRESSOR` parameter that selects this codec, i.e. C
+    /// `NDCodecCompressor_t` (Codec.h:12-18): NONE=0, JPEG=1, BLOSC=2, LZ4=3,
+    /// BSLZ4=4. The Rust-only zlib/lz4hdf5 codecs take ordinals after the C set
+    /// so they never shadow a C ordinal.
+    ///
+    /// This is the single mapping between the `COMPRESSOR` wire value and the
+    /// codec, used both when the operator writes the parameter and when the
+    /// Codec plugin reports the codec it found on a decompressed array
+    /// (C `setIntegerParam(NDCodecCompressor, ...)`, NDPluginCodec.cpp:734-757).
+    pub fn ordinal(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::JPEG => 1,
+            Self::Blosc => 2,
+            Self::LZ4 => 3,
+            Self::BSLZ4 => 4,
+            Self::Zlib => 5,
+            Self::LZ4HDF5 => 6,
+        }
+    }
+
+    /// Inverse of [`CodecName::ordinal`]. Unknown ordinals select `None`, as C
+    /// does for any compressor value outside the enum (NDPluginCodec.cpp:680-683
+    /// `case NDCODEC_NONE: default:`).
+    pub fn from_ordinal(ordinal: i32) -> Self {
+        match ordinal {
+            1 => Self::JPEG,
+            2 => Self::Blosc,
+            3 => Self::LZ4,
+            4 => Self::BSLZ4,
+            5 => Self::Zlib,
+            6 => Self::LZ4HDF5,
+            _ => Self::None,
+        }
+    }
 }
 
 /// Blosc sub-compressor names (matching C++ `NDCodecBloscCompName`).

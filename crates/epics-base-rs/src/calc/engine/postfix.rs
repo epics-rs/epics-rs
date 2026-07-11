@@ -150,7 +150,7 @@ fn func_arity(func: &FuncName) -> u8 {
         FuncName::FitMPoly | FuncName::FitMQ => 3,
 
         // Everything else is a 1-arg function: one operand in, one out.
-        //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Log2, Sin,
+        //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Sin,
         //     Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Ceil, Floor,
         //     Nint, Int, IsInf, Not
         //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, BinRead,
@@ -175,7 +175,6 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::Exp => CoreOp::Exp,
         FuncName::Log10 => CoreOp::Log10,
         FuncName::LogE | FuncName::Ln => CoreOp::LogE,
-        FuncName::Log2 => CoreOp::Log2,
         FuncName::Sin => CoreOp::Sin,
         FuncName::Cos => CoreOp::Cos,
         FuncName::Tan => CoreOp::Tan,
@@ -286,19 +285,144 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
     }
 }
 
-/// Is `op` in the element table of the C compiler for `kind`?
+/// Is `tok` a symbol of base `postfix.c`'s ELEMENT table (postfix.c:73-179)?
 ///
 /// C has three *separate* compilers, each with its own `ELEMENT` table:
 /// `postfix.c` (calc/calcout/swait), `sCalcPostfix.c` (sCalc) and
-/// `aCalcPostfix.c` (aCalc). A symbol absent from the table being compiled
-/// against is never lexed at all: `get_element` fails, infix text is left
-/// unconsumed, and `postfix()` returns `CALC_ERR_SYNTAX` — a COMPILE error
-/// (`CLCV != 0`, reported at record init / CALC-field put).
+/// `aCalcPostfix.c` (aCalc). The table IS the lexer: `get_element` looks a
+/// symbol up in it, and a symbol that is not there is never lexed. The infix
+/// text is then left unconsumed and `postfix()` returns `CALC_ERR_SYNTAX` — a
+/// COMPILE error (`CLCV != 0`, reported at record init / CALC-field put), not a
+/// runtime one.
 ///
-/// The Rust port shares one tokenizer across the three engines, so the table
-/// difference has to be reapplied here, on the emitted opcode stream. Every
-/// opcode below is engine-specific in C; everything else is shared numeric
-/// core present in all three tables.
+/// The Rust port shares ONE tokenizer across the three engines, so the table
+/// difference has to be reapplied. It is reapplied *here*, on the token stream,
+/// because that is the only level at which it survives: sCalc and aCalc map
+/// `INT` and `NINT` to the very same `NINT` opcode (sCalcPostfix.c:150,
+/// aCalcPostfix.c:152), so by the time the stream is opcodes there is nothing
+/// left to distinguish base's `NINT` (in its table) from `INT` (not in it).
+///
+/// This is an ALLOWLIST, not a list of exceptions: a new token in the shared
+/// tokenizer is refused by the numeric engine until someone shows it in the C
+/// table. The old exception-list shape is exactly what let `INT` and `LOG2`
+/// through the numeric engine — everything not named was accepted.
+///
+/// Verified against the real compiler: `postfix.c` + `calcPerform.c` built
+/// standalone from epics-base and asked. Every symbol below compiles; every
+/// symbol in the false arms answers `CALC_ERR_SYNTAX` (11).
+fn token_in_base_table(tok: &Token) -> bool {
+    match tok {
+        // Literals and operands: "." "0".."9" "0X" INF NAN (LITERAL_OPERAND),
+        // "A".."U" (OPERAND FETCH_A..FETCH_U — CALCPERFORM_NARGS is 21),
+        // RNDM, VAL, PI, D2R, R2D.
+        Token::Number(_) | Token::Var(_) | Token::Rndm | Token::FetchVal | Token::Const(_) => true,
+
+        // Operators, all present in postfix.c:74-179.
+        Token::Plus
+        | Token::Minus
+        | Token::Star
+        | Token::Slash
+        | Token::Percent
+        | Token::Caret
+        | Token::DoubleStar
+        | Token::Eq
+        | Token::Ne
+        | Token::Lt
+        | Token::Le
+        | Token::Gt
+        | Token::Ge
+        | Token::AndAnd
+        | Token::OrOr
+        | Token::BitAnd
+        | Token::BitOr
+        | Token::BitXor
+        | Token::Tilde
+        | Token::Shl
+        | Token::Shr
+        | Token::ShrLogical
+        | Token::Bang
+        | Token::Question
+        | Token::Colon
+        | Token::LParen
+        | Token::RParen
+        | Token::Comma
+        | Token::Semicolon
+        | Token::Assign
+        | Token::AndKeyword
+        | Token::OrKeyword => true,
+
+        Token::Func(f) => func_in_base_table(f),
+
+        // NOT in postfix.c's table, each one a synApps sCalc/aCalc extension:
+        //   AA..UU  — sCalc string args / aCalc array args (base has single
+        //             letters only)
+        //   SVAL    — sCalcPostfix.c:188; pushes `psresult`, which numeric
+        //             `calcPerform` does not even take
+        //   NRNDM, `>?`, `<?` — synApps operator-table extensions
+        //   UNTIL   — sCalc/aCalc loop keyword
+        //   string literals, `[i:j]`, `{find,replace}`, `|-` — sCalc/aCalc
+        Token::DoubleVar(_)
+        | Token::FetchSval
+        | Token::Nrndm
+        | Token::MaxOp
+        | Token::MinOp
+        | Token::UntilKeyword
+        | Token::StringLiteral(_)
+        | Token::LBracket
+        | Token::RBracket
+        | Token::LBrace
+        | Token::RBrace
+        | Token::PipeMinus => false,
+    }
+}
+
+/// The function/operator symbols of base `postfix.c`'s table (postfix.c:90-143).
+fn func_in_base_table(f: &FuncName) -> bool {
+    match f {
+        FuncName::Abs
+        | FuncName::Sqrt
+        | FuncName::Sqr
+        | FuncName::Exp
+        | FuncName::Log10
+        | FuncName::LogE
+        | FuncName::Ln
+        | FuncName::Sin
+        | FuncName::Cos
+        | FuncName::Tan
+        | FuncName::Asin
+        | FuncName::Acos
+        | FuncName::Atan
+        | FuncName::Atan2
+        | FuncName::Fmod
+        | FuncName::Sinh
+        | FuncName::Cosh
+        | FuncName::Tanh
+        | FuncName::Ceil
+        | FuncName::Floor
+        | FuncName::Nint
+        | FuncName::IsNan
+        | FuncName::IsInf
+        | FuncName::Finite
+        | FuncName::Max
+        | FuncName::Min
+        | FuncName::Not => true,
+
+        // `INT` is sCalc/aCalc only (sCalcPostfix.c:150, aCalcPostfix.c:152 —
+        // where it is an alias of NINT, i.e. it ROUNDS). base's lexer splits
+        // `INT(A)` into the operands I, N, T and answers CALC_ERR_SYNTAX.
+        FuncName::Int => false,
+
+        // Everything else is a string (sCalc) or array (aCalc) function.
+        _ => false,
+    }
+}
+
+/// Is `op` an opcode the C compiler for `kind` can emit?
+///
+/// The token allowlist above owns base's table. This owns the sCalc/aCalc
+/// split, which is only visible once an opcode has been chosen: `[` is a
+/// substring in sCalc and an array index in aCalc, so the two engines share
+/// tokens but never share ops.
 fn opcode_in_grammar(kind: &ExprKind, op: &Opcode) -> bool {
     match op {
         // String ops (string literals, STR/DBL/LEN/BYTE/PRINTF/SSCANF/ESC/
@@ -307,24 +431,11 @@ fn opcode_in_grammar(kind: &ExprKind, op: &Opcode) -> bool {
         Opcode::String(_) => matches!(kind, ExprKind::String),
         // Array ops (IX/ARR/AVG/SUM/DERIV/FITPOLY/…) only in aCalcPostfix.c.
         Opcode::Array(_) => matches!(kind, ExprKind::Array),
-        // `UNTIL` is in the sCalc and aCalc tables, not in postfix.c.
-        Opcode::Control(_) => !matches!(kind, ExprKind::Numeric),
-        Opcode::Core(core) => match core {
-            // `SVAL` (FETCH_SVAL) — sCalcPostfix.c:188 only; it pushes
-            // `psresult`, which numeric `calcPerform` does not even take.
-            CoreOp::FetchSval => matches!(kind, ExprKind::String),
-            // Double-letter args `AA`..`UU` — sCalc string args / aCalc array
-            // args. postfix.c has single letters only.
-            CoreOp::PushDoubleVar(_) | CoreOp::StoreDoubleVar(_) => {
-                !matches!(kind, ExprKind::Numeric)
-            }
-            // `>?` / `<?` (MAX_VAL/MIN_VAL) and `NRNDM` are synApps operator-
-            // table extensions; neither is in epics-base postfix.c.
-            CoreOp::MaxVal | CoreOp::MinVal | CoreOp::NormalRandom => {
-                !matches!(kind, ExprKind::Numeric)
-            }
-            _ => true,
-        },
+        // `SVAL` (FETCH_SVAL) is sCalcPostfix.c:188 alone — it pushes the
+        // previous *string* result, which neither `calcPerform` nor
+        // `aCalcPerform` even takes. aCalc's table has no such element.
+        Opcode::Core(CoreOp::FetchSval) => matches!(kind, ExprKind::String),
+        Opcode::Control(_) | Opcode::Core(_) => true,
     }
 }
 
@@ -338,6 +449,13 @@ fn opcode_in_grammar(kind: &ExprKind, op: &Opcode) -> bool {
 /// `SVAL` or `PRINTF` into a numeric `calc.CALC` and failed at first process
 /// with `CalcError::Internal` instead of at load.
 pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcError> {
+    // C's `get_element` fails on a symbol that is not in this compiler's table,
+    // before any parsing happens. Base's table is the strict subset, so this is
+    // where the numeric engine refuses `INT`, `SVAL`, `AA`, `UNTIL`, `>?` …
+    if matches!(kind, ExprKind::Numeric) && !tokens.iter().all(token_in_base_table) {
+        return Err(CalcError::Syntax);
+    }
+
     if tokens.is_empty() {
         return Ok(CompiledExpr {
             code: vec![Opcode::Core(CoreOp::End)],

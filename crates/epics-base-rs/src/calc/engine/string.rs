@@ -296,10 +296,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let a = pop1_f64(&mut stack)?;
                     stack.push(StackValue::Double(a.ln()));
                 }
-                CoreOp::Log2 => {
-                    let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(a.log2()));
-                }
                 CoreOp::Sin => {
                     let a = pop1_f64(&mut stack)?;
                     stack.push(StackValue::Double(a.sin()));

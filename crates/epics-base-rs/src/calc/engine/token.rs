@@ -9,7 +9,6 @@ pub enum FuncName {
     Log10,
     LogE,
     Ln,
-    Log2,
     Sin,
     Cos,
     Tan,
@@ -239,7 +238,12 @@ impl<'a> Tokenizer<'a> {
             (b"CEIL", Token::Func(FuncName::Ceil)),
             (b"NINT", Token::Func(FuncName::Nint)),
             (b"LOGE", Token::Func(FuncName::LogE)),
-            (b"LOG2", Token::Func(FuncName::Log2)),
+            // No `LOG2`: none of the three C element tables has that symbol
+            // (postfix.c:73-179, sCalcPostfix.c:97-215, aCalcPostfix.c:99-224),
+            // so all three C lexers split `LOG2` into `LOG` and the literal
+            // `2` — `CALC="LOG2"` is log10(2), and `LOG2(A)` is a syntax error
+            // (an operand may not be followed by `(`). Listing it here made the
+            // port answer log2 instead, in every engine.
             (b"RNDM", Token::Rndm),
             // C sCalcPostfix.c:188 `{"SVAL", 0, 0, 1, OPERAND, FETCH_SVAL}`.
             (b"SVAL", Token::FetchSval),
@@ -341,15 +345,16 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
+        // C `get_element` (postfix.c:187-216, sCalcPostfix.c, aCalcPostfix.c)
+        // walks its alphabetically-sorted ELEMENT table backwards and takes the
+        // FIRST symbol that prefixes the remaining text — a longest-prefix
+        // match with NO identifier boundary. Calc has no identifiers, so there
+        // is nothing for a boundary to protect: C lexes `LOG2` as `LOG` then
+        // the literal `2`, and `A AND B` the same as `AANDB`. Requiring a
+        // non-alphanumeric after a keyword (which this loop used to do) made
+        // `LOG2` fall apart into the variables L, O, G.
         for (kw, tok) in &keywords {
             if rem.len() >= kw.len() && rem[..kw.len()] == **kw {
-                let is_literal = matches!(tok, Token::Number(_));
-                if !is_literal
-                    && kw.len() < rem.len()
-                    && (rem[kw.len()].is_ascii_alphanumeric() || rem[kw.len()] == b'_')
-                {
-                    continue;
-                }
                 self.pos += kw.len();
                 return Some(tok.clone());
             }

@@ -200,10 +200,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                     let a = pop1(&mut stack)?;
                     stack.push(a.ln());
                 }
-                CoreOp::Log2 => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.log2());
-                }
                 CoreOp::Sin => {
                     let a = pop1(&mut stack)?;
                     stack.push(a.sin());
@@ -565,13 +561,14 @@ mod parity_tests {
         }
     }
 
-    // Regression: a genuinely malformed array expression is still
-    // rejected — too few operands for a 2-arg function leaves the
-    // runtime stack short of exactly 1 value.
+    // Regression: an aCalc expression is rejected by the numeric compiler for
+    // the reason C rejects it — `CAT` and `AA` are not in postfix.c's ELEMENT
+    // table, so C's lexer never reaches the arity question. Verified against
+    // the C compiler: `CAT(AA)` is CALC_ERR_SYNTAX (11), not an arity error.
+    // (aCalc's own arity check for CAT lives in the array engine's tests.)
     #[test]
     fn h1_array_extension_arity_mismatch_rejected() {
-        // CAT needs 2 operands; one operand -> net depth 0 -> Incomplete.
-        assert!(matches!(compile("CAT(AA)"), Err(CalcError::Incomplete)));
+        assert!(matches!(compile("CAT(AA)"), Err(CalcError::Syntax)));
     }
 
     // max/min NaN propagation matches C.

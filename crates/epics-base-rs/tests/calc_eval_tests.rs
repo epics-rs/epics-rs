@@ -471,15 +471,22 @@ fn test_empty_expression() {
     assert!((result - 0.0).abs() < 1e-9);
 }
 
+/// `LOG2` is in no C element table — base, sCalc and aCalc all lex it as `LOG`
+/// applied to the literal `2`, which makes `LOG2(8)` an operand followed by
+/// `(`: CALC_ERR_SYNTAX. It is not a base-2 logarithm in any dialect.
+/// See tests/calc_grammar_tables.rs (R7-3).
 #[test]
 fn test_log2() {
-    assert_calc("LOG2(8)", &[], 3.0);
+    assert!(matches!(compile("LOG2(8)"), Err(CalcError::Syntax)));
+    assert_calc("LOG2", &[], 2.0f64.log10());
 }
 
+/// `INT` is a synApps sCalc/aCalc symbol (an alias of NINT). base's `postfix()`
+/// has no such element, so `calc`/`calcout` reject it at compile time.
 #[test]
 fn test_int() {
-    assert_calc("INT(3.7)", &[], 4.0);
-    assert_calc("INT(-3.7)", &[], -4.0);
+    assert!(matches!(compile("INT(3.7)"), Err(CalcError::Syntax)));
+    assert!(matches!(compile("INT(-3.7)"), Err(CalcError::Syntax)));
 }
 
 #[test]

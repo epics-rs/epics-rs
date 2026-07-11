@@ -268,10 +268,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let a = pop1(&mut stack)?;
                     stack.push(a.map(|x| x.ln()));
                 }
-                CoreOp::Log2 => {
-                    let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.log2()));
-                }
                 CoreOp::Sin => {
                     let a = pop1(&mut stack)?;
                     stack.push(a.map(|x| x.sin()));

@@ -459,6 +459,24 @@ impl DrvAsynSerialPort {
         Ok(())
     }
 
+    /// The disconnected gate both option entry points open with. C-Win32
+    /// `getOption` (`drvAsynSerialPortWin32.c:96-101`) and `setOption`
+    /// (`:180-185`) test `commHandle == INVALID_HANDLE_VALUE` *before* they
+    /// look at the key, so on a closed port EVERY key — baud/bits/parity/stop/
+    /// break as well as the flow-control set — reports `asynError` with the
+    /// message `"<device> disconnected:"`, and no key may be cached, defaulted
+    /// or stored. Calling this first is what makes "the handle is open" an
+    /// invariant for the rest of both functions rather than a per-key check.
+    fn check_option_connected(&self) -> AsynResult<()> {
+        if self.io.handle_val.is_none() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{} disconnected:", self.config.device),
+            });
+        }
+        Ok(())
+    }
+
     /// GetCommState → modify → SetCommState, the single owner of a live-port
     /// DCB update used by every `set_option` key.
     fn modify_dcb<F: FnOnce(&mut DCB)>(&self, f: F) -> AsynResult<()> {
@@ -661,6 +679,13 @@ impl PortDriver for DrvAsynSerialPort {
     fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
         use dcb_bits::*;
 
+        // C-Win32 setOption's opening guard (drvAsynSerialPortWin32.c:180-185):
+        // a closed handle errors for every key, before any value is parsed or
+        // stored. Unlike the POSIX backend — whose C twin mutates its cached
+        // termios whether or not the port is open (R7-48) — the Win32 backend
+        // has no cache to write: the DCB *is* the device.
+        self.check_option_connected()?;
+
         let key = key.trim().to_ascii_lowercase();
         let value = value.trim();
 
@@ -672,9 +697,7 @@ impl PortDriver for DrvAsynSerialPort {
                 })?;
                 // Windows accepts an arbitrary BaudRate (no termios speed
                 // table), matching C-Win32's direct dcb.BaudRate assignment.
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| dcb.BaudRate = baud)?;
-                }
+                self.modify_dcb(|dcb| dcb.BaudRate = baud)?;
                 self.config.baud = baud;
             }
             "bits" => {
@@ -696,9 +719,7 @@ impl PortDriver for DrvAsynSerialPort {
                     DataBits::Seven => 7,
                     DataBits::Eight => 8,
                 };
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| dcb.ByteSize = byte_size)?;
-                }
+                self.modify_dcb(|dcb| dcb.ByteSize = byte_size)?;
                 self.config.data_bits = bits;
             }
             "parity" => {
@@ -722,9 +743,7 @@ impl PortDriver for DrvAsynSerialPort {
                     Parity::Even => EVENPARITY,
                     Parity::Odd => ODDPARITY,
                 };
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| dcb.Parity = dcb_parity)?;
-                }
+                self.modify_dcb(|dcb| dcb.Parity = dcb_parity)?;
                 self.config.parity = parity;
             }
             "stop" => {
@@ -742,58 +761,52 @@ impl PortDriver for DrvAsynSerialPort {
                     StopBits::One => ONESTOPBIT,
                     StopBits::Two => TWOSTOPBITS,
                 };
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| dcb.StopBits = dcb_stop)?;
-                }
+                self.modify_dcb(|dcb| dcb.StopBits = dcb_stop)?;
                 self.config.stop_bits = stop;
             }
             "clocal" => {
                 // C-Win32 setOption clocal: Y = ignore modem status (no DSR
                 // flow, DTR asserted); N = honor it (DSR flow, DTR handshake).
                 let enabled = parse_bool_option(value)?;
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| {
-                        let bf = &mut dcb._bitfield;
-                        if enabled {
-                            set_flag(bf, F_OUTX_DSR_FLOW, false);
-                            set_flag(bf, F_DSR_SENSITIVITY, false);
-                            set_field(
-                                bf,
-                                F_DTR_CONTROL_SHIFT,
-                                F_DTR_CONTROL_MASK,
-                                DTR_CONTROL_ENABLE,
-                            );
-                        } else {
-                            set_flag(bf, F_OUTX_DSR_FLOW, true);
-                            set_flag(bf, F_DSR_SENSITIVITY, true);
-                            set_field(
-                                bf,
-                                F_DTR_CONTROL_SHIFT,
-                                F_DTR_CONTROL_MASK,
-                                DTR_CONTROL_HANDSHAKE,
-                            );
-                        }
-                    })?;
-                }
+                self.modify_dcb(|dcb| {
+                    let bf = &mut dcb._bitfield;
+                    if enabled {
+                        set_flag(bf, F_OUTX_DSR_FLOW, false);
+                        set_flag(bf, F_DSR_SENSITIVITY, false);
+                        set_field(
+                            bf,
+                            F_DTR_CONTROL_SHIFT,
+                            F_DTR_CONTROL_MASK,
+                            DTR_CONTROL_ENABLE,
+                        );
+                    } else {
+                        set_flag(bf, F_OUTX_DSR_FLOW, true);
+                        set_flag(bf, F_DSR_SENSITIVITY, true);
+                        set_field(
+                            bf,
+                            F_DTR_CONTROL_SHIFT,
+                            F_DTR_CONTROL_MASK,
+                            DTR_CONTROL_HANDSHAKE,
+                        );
+                    }
+                })?;
             }
             "crtscts" => {
                 let enabled = parse_bool_option(value)?;
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| {
-                        let bf = &mut dcb._bitfield;
-                        set_flag(bf, F_OUTX_CTS_FLOW, enabled);
-                        set_field(
-                            bf,
-                            F_RTS_CONTROL_SHIFT,
-                            F_RTS_CONTROL_MASK,
-                            if enabled {
-                                RTS_CONTROL_HANDSHAKE
-                            } else {
-                                RTS_CONTROL_ENABLE
-                            },
-                        );
-                    })?;
-                }
+                self.modify_dcb(|dcb| {
+                    let bf = &mut dcb._bitfield;
+                    set_flag(bf, F_OUTX_CTS_FLOW, enabled);
+                    set_field(
+                        bf,
+                        F_RTS_CONTROL_SHIFT,
+                        F_RTS_CONTROL_MASK,
+                        if enabled {
+                            RTS_CONTROL_HANDSHAKE
+                        } else {
+                            RTS_CONTROL_ENABLE
+                        },
+                    );
+                })?;
                 if enabled {
                     self.config.flow_control = FlowControl::Hardware;
                 } else if self.config.flow_control == FlowControl::Hardware {
@@ -802,15 +815,11 @@ impl PortDriver for DrvAsynSerialPort {
             }
             "ixon" => {
                 let enabled = parse_bool_option(value)?;
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| set_flag(&mut dcb._bitfield, F_OUT_X, enabled))?;
-                }
+                self.modify_dcb(|dcb| set_flag(&mut dcb._bitfield, F_OUT_X, enabled))?;
             }
             "ixoff" => {
                 let enabled = parse_bool_option(value)?;
-                if self.io.handle_val.is_some() {
-                    self.modify_dcb(|dcb| set_flag(&mut dcb._bitfield, F_IN_X, enabled))?;
-                }
+                self.modify_dcb(|dcb| set_flag(&mut dcb._bitfield, F_IN_X, enabled))?;
             }
             "ixany" => {
                 // C-Win32 setOption: ixany is unsupported on Windows.
@@ -821,9 +830,8 @@ impl PortDriver for DrvAsynSerialPort {
             }
             "break" => {
                 // C-Win32 setOption break: "off" no-op, "on"/"" standard break,
-                // a number = milliseconds. Validate first, then require the
-                // handle (a break on a closed port errors, matching the unix
-                // backend and C reaching the dead handle).
+                // a number = milliseconds. The closed-port case is already
+                // refused by the opening guard.
                 if value != "off" {
                     let break_ms = if value.is_empty() || value == "on" {
                         250
@@ -852,13 +860,11 @@ impl PortDriver for DrvAsynSerialPort {
                 if !other.is_empty() {
                     return Err(AsynError::OptionNotFound(other.to_string()));
                 }
-                // Empty key: re-apply the configured line state when open (C
+                // Empty key: re-apply the configured line state (C
                 // applyOptions re-pushes its cached config), the Win32 twin of
                 // the unix empty-key re-apply.
-                if self.io.handle_val.is_some() {
-                    let config = self.config.clone();
-                    self.modify_dcb(|dcb| apply_config_to_dcb(&config, dcb))?;
-                }
+                let config = self.config.clone();
+                self.modify_dcb(|dcb| apply_config_to_dcb(&config, dcb))?;
             }
         }
         Ok(())
@@ -867,9 +873,13 @@ impl PortDriver for DrvAsynSerialPort {
     fn get_option(&self, key: &str) -> AsynResult<String> {
         use dcb_bits::*;
 
-        // Read the live DCB when connected, else fall back to the cached
-        // config (the flow-control keys have no cached field, so they report
-        // the disconnected default).
+        // C-Win32 getOption's opening guard (drvAsynSerialPortWin32.c:96-101):
+        // a closed handle errors for every key before the key is inspected —
+        // there is no disconnected readback, cached or defaulted.
+        self.check_option_connected()?;
+
+        // With the guard passed the handle is open, so the live DCB is always
+        // available (C reads it once via GetCommConfig for the same reason).
         let live_dcb = || -> AsynResult<DCB> {
             let handle = self.io.handle_or_err()?;
             let mut dcb: DCB = unsafe { std::mem::zeroed() };
@@ -901,61 +911,41 @@ impl PortDriver for DrvAsynSerialPort {
             }
             .to_string()),
             "clocal" => {
-                if self.io.handle_val.is_some() {
-                    let dcb = live_dcb()?;
-                    // C getOption: clocal is 'N' when DSR flow is on, else 'Y'.
-                    Ok(if get_flag(dcb._bitfield, F_OUTX_DSR_FLOW) {
-                        "N"
-                    } else {
-                        "Y"
-                    }
-                    .to_string())
+                let dcb = live_dcb()?;
+                // C getOption: clocal is 'N' when DSR flow is on, else 'Y'.
+                Ok(if get_flag(dcb._bitfield, F_OUTX_DSR_FLOW) {
+                    "N"
                 } else {
-                    Ok("N".to_string())
+                    "Y"
                 }
+                .to_string())
             }
             "crtscts" => {
-                if self.io.handle_val.is_some() {
-                    let dcb = live_dcb()?;
-                    Ok(if get_flag(dcb._bitfield, F_OUTX_CTS_FLOW) {
-                        "Y"
-                    } else {
-                        "N"
-                    }
-                    .to_string())
+                let dcb = live_dcb()?;
+                Ok(if get_flag(dcb._bitfield, F_OUTX_CTS_FLOW) {
+                    "Y"
                 } else {
-                    Ok(match self.config.flow_control {
-                        FlowControl::Hardware => "Y",
-                        _ => "N",
-                    }
-                    .to_string())
+                    "N"
                 }
+                .to_string())
             }
             "ixon" => {
-                if self.io.handle_val.is_some() {
-                    let dcb = live_dcb()?;
-                    Ok(if get_flag(dcb._bitfield, F_OUT_X) {
-                        "Y"
-                    } else {
-                        "N"
-                    }
-                    .to_string())
+                let dcb = live_dcb()?;
+                Ok(if get_flag(dcb._bitfield, F_OUT_X) {
+                    "Y"
                 } else {
-                    Ok("N".to_string())
+                    "N"
                 }
+                .to_string())
             }
             "ixoff" => {
-                if self.io.handle_val.is_some() {
-                    let dcb = live_dcb()?;
-                    Ok(if get_flag(dcb._bitfield, F_IN_X) {
-                        "Y"
-                    } else {
-                        "N"
-                    }
-                    .to_string())
+                let dcb = live_dcb()?;
+                Ok(if get_flag(dcb._bitfield, F_IN_X) {
+                    "Y"
                 } else {
-                    Ok("N".to_string())
+                    "N"
                 }
+                .to_string())
             }
             // C-Win32 getOption reports ixany as 'N' (unsupported).
             "ixany" => Ok("N".to_string()),
@@ -1057,5 +1047,65 @@ mod tests {
     fn new_is_parse_only_no_eos() {
         let drv = DrvAsynSerialPort::new("s1", "COM1").unwrap();
         assert_eq!(drv.base().interpose_octet.len(), 0);
+    }
+
+    /// R7-50: C-Win32 guards getOption AND setOption on the closed handle
+    /// (`drvAsynSerialPortWin32.c:96-101,180-185`) *before* the key is
+    /// inspected, so every key — not just the flow-control subset — reports
+    /// asynError "<device> disconnected:" while the port is closed, and no key
+    /// may be stored to the cached config.
+    #[test]
+    fn options_on_a_closed_handle_report_disconnected_for_every_key() {
+        let mut drv = DrvAsynSerialPort::new("s_disc", "COM1").unwrap();
+        assert!(
+            drv.io.handle_val.is_none(),
+            "new() must not open the device"
+        );
+
+        for key in [
+            "baud", "bits", "parity", "stop", "clocal", "crtscts", "ixon", "ixoff", "ixany",
+            "break",
+        ] {
+            match drv.get_option(key) {
+                Err(AsynError::Status { status, message }) => {
+                    assert_eq!(status, AsynStatus::Error, "get_option({key}) status");
+                    assert!(
+                        message.contains("disconnected:"),
+                        "get_option({key}) message: {message}"
+                    );
+                }
+                other => panic!("get_option({key}) must error while closed, got {other:?}"),
+            }
+        }
+
+        for (key, value) in [
+            ("baud", "19200"),
+            ("bits", "7"),
+            ("parity", "even"),
+            ("stop", "2"),
+            ("clocal", "Y"),
+            ("crtscts", "Y"),
+            ("ixon", "Y"),
+            ("ixoff", "Y"),
+            ("break", "on"),
+        ] {
+            match drv.set_option(key, value) {
+                Err(AsynError::Status { status, message }) => {
+                    assert_eq!(status, AsynStatus::Error, "set_option({key}) status");
+                    assert!(
+                        message.contains("disconnected:"),
+                        "set_option({key}) message: {message}"
+                    );
+                }
+                other => panic!("set_option({key}) must error while closed, got {other:?}"),
+            }
+        }
+
+        // The refused set_option calls must not have reached the cached config.
+        assert_eq!(drv.config.baud, 9600);
+        assert_eq!(drv.config.data_bits, DataBits::Eight);
+        assert_eq!(drv.config.parity, Parity::None);
+        assert_eq!(drv.config.stop_bits, StopBits::One);
+        assert_eq!(drv.config.flow_control, FlowControl::None);
     }
 }

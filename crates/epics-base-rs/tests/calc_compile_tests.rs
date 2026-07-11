@@ -1,8 +1,20 @@
-use epics_base_rs::calc::compile;
 use epics_base_rs::calc::engine::opcodes::{CoreOp, Opcode};
+use epics_base_rs::calc::{CalcError, compile, scalc_compile};
 
 fn opcodes_without_end(expr: &str) -> Vec<Opcode> {
     let compiled = compile(expr).unwrap();
+    compiled
+        .code
+        .into_iter()
+        .filter(|op| !matches!(op, Opcode::Core(CoreOp::End)))
+        .collect()
+}
+
+/// Same, through the sCalc compiler. `>?`, `<?`, `NRNDM` and the doubled-letter
+/// args live in `sCalcPostfix.c`'s element table, not in epics-base
+/// `postfix.c`'s — the numeric compiler rejects them (`CALC_ERR_SYNTAX`).
+fn scalc_opcodes_without_end(expr: &str) -> Vec<Opcode> {
+    let compiled = scalc_compile(expr).unwrap();
     compiled
         .code
         .into_iter()
@@ -262,9 +274,12 @@ fn test_tilde_bitnot() {
     assert_eq!(ops, vec![c(CoreOp::PushVar(0)), c(CoreOp::BitNot)]);
 }
 
+/// `>?` / `<?` are sCalc/aCalc operator-table entries (`sCalcPostfix.c`,
+/// `aCalcPostfix.c`); epics-base `postfix.c`'s operator table has neither, so
+/// the numeric compiler must refuse them.
 #[test]
 fn test_max_min_operators() {
-    let ops = opcodes_without_end("A>?B");
+    let ops = scalc_opcodes_without_end("A>?B");
     assert_eq!(
         ops,
         vec![
@@ -274,7 +289,7 @@ fn test_max_min_operators() {
         ]
     );
 
-    let ops = opcodes_without_end("A<?B");
+    let ops = scalc_opcodes_without_end("A<?B");
     assert_eq!(
         ops,
         vec![
@@ -283,6 +298,9 @@ fn test_max_min_operators() {
             c(CoreOp::MinVal)
         ]
     );
+
+    assert_eq!(compile("A>?B").unwrap_err(), CalcError::Syntax);
+    assert_eq!(compile("A<?B").unwrap_err(), CalcError::Syntax);
 }
 
 #[test]
@@ -299,11 +317,14 @@ fn test_constants() {
 
 #[test]
 fn test_random() {
+    // RNDM is in all three C element tables.
     let ops = opcodes_without_end("RNDM");
     assert_eq!(ops, vec![c(CoreOp::Random)]);
 
-    let ops = opcodes_without_end("NRNDM");
+    // NRNDM is sCalc/aCalc only (`sCalcPostfix.c`), not in `postfix.c`.
+    let ops = scalc_opcodes_without_end("NRNDM");
     assert_eq!(ops, vec![c(CoreOp::NormalRandom)]);
+    assert_eq!(compile("NRNDM").unwrap_err(), CalcError::Syntax);
 }
 
 #[test]
@@ -361,8 +382,11 @@ fn test_nested_functions() {
 }
 
 #[test]
+/// Doubled-letter args (`AA`..) are sCalc string args / aCalc array args.
+/// epics-base `postfix.c` has single letters only, so the numeric compiler
+/// refuses them.
 fn test_double_var() {
-    let ops = opcodes_without_end("AA+BB");
+    let ops = scalc_opcodes_without_end("AA+BB");
     assert_eq!(
         ops,
         vec![
@@ -371,4 +395,6 @@ fn test_double_var() {
             c(CoreOp::Add),
         ]
     );
+
+    assert_eq!(compile("AA+BB").unwrap_err(), CalcError::Syntax);
 }

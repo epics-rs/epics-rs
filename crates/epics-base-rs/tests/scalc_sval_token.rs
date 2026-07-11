@@ -27,8 +27,7 @@
 use std::collections::HashSet;
 
 use epics_base_rs::calc::{
-    CalcError, ExprKind, NumericInputs, StackValue, StringInputs, compile, eval, scalc,
-    scalc_compile,
+    CalcError, ExprKind, StackValue, StringInputs, compile, scalc, scalc_compile,
 };
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
@@ -76,23 +75,135 @@ fn sval_of_a_fresh_evaluation_is_the_empty_string() {
     );
 }
 
-/// C `sCalcPostfix.c:452` lists FETCH_SVAL among the opcodes that mark the
-/// postfix USES_STRING, so an SVAL-only expression is a string expression.
+/// `CompiledExpr::kind` names the engine the program was compiled FOR — the C
+/// compiler being emulated — not a type inferred from the opcodes. Every
+/// sCalc program is a `String`-engine program, whether or not it touches a
+/// string.
 #[test]
-fn sval_marks_the_expression_as_string_typed() {
+fn scalc_programs_carry_the_string_engine_kind() {
     assert_eq!(scalc_compile("SVAL").unwrap().kind, ExprKind::String);
-    assert_eq!(scalc_compile("VAL").unwrap().kind, ExprKind::Numeric);
+    assert_eq!(scalc_compile("VAL").unwrap().kind, ExprKind::String);
+    assert_eq!(compile("VAL").unwrap().kind, ExprKind::Numeric);
 }
 
-/// The numeric evaluator has no SVAL: C's `postfix()` element table cannot
-/// emit FETCH_SVAL, so `calcPerform` never sees it. The port shares one
-/// tokenizer across calc/sCalc/aCalc, so the token compiles — but the numeric
-/// evaluator rejects it, exactly as it rejects every other string-only opcode.
+/// R6-77 — the numeric engine rejects SVAL at COMPILE time.
+///
+/// C's `postfix()` element table has no SVAL entry, so the symbol is never
+/// lexed: the infix text is left unconsumed and `postfix()` returns
+/// `CALC_ERR_SYNTAX` (`postfix.c:475-477`). A `calc`/`calcout` record with
+/// `CALC = "SVAL"` therefore reports `CLCV != 0` at load — it never reaches
+/// `calcPerform`.
+///
+/// Pre-fix the port shared one compiler across calc/sCalc/aCalc: SVAL compiled
+/// into a numeric program and only blew up at first process, with
+/// `CalcError::Internal`.
 #[test]
 fn numeric_calc_rejects_sval() {
-    let compiled = compile("SVAL").unwrap();
-    let mut inputs = NumericInputs::new();
-    assert_eq!(eval(&compiled, &mut inputs), Err(CalcError::Internal));
+    assert_eq!(compile("SVAL").unwrap_err(), CalcError::Syntax);
+    assert_eq!(compile("SVAL+'x'").unwrap_err(), CalcError::Syntax);
+    // C's CALC_ERR_SYNTAX == 11 — the code a record parks in CLCV.
+    assert_eq!(compile("SVAL").unwrap_err().code(), 11);
+
+    // The whole string-only token class, not just SVAL: string literals and
+    // the sCalc string functions are equally absent from postfix.c's table.
+    for expr in ["'abc'", "\"abc\"", "PRINTF('%d',A)", "LEN(AA)", "STR(A)"] {
+        assert_eq!(
+            compile(expr).unwrap_err(),
+            CalcError::Syntax,
+            "numeric calc must reject the string-only expression {expr:?} at compile time"
+        );
+    }
+
+    // ...and the sCalc engine still accepts every one of them.
+    assert!(scalc_compile("SVAL+'x'").is_ok());
+    assert!(scalc_compile("PRINTF('%d',A)").is_ok());
+}
+
+/// The other direction of the same split: the array-only tokens of
+/// `aCalcPostfix.c` are not in `postfix.c`'s table either, and the string
+/// engine's table (`sCalcPostfix.c`) has neither the array functions nor,
+/// symmetrically, does the array engine have the string functions.
+#[test]
+fn engines_reject_each_others_tokens_at_compile_time() {
+    use epics_base_rs::calc::acalc_compile;
+
+    // Array tokens: aCalc only.
+    for expr in ["IX", "AVG(AA)", "CAT(AA,BB)", "ARR(A)"] {
+        assert_eq!(
+            compile(expr).unwrap_err(),
+            CalcError::Syntax,
+            "numeric calc must reject array token expression {expr:?}"
+        );
+        assert_eq!(
+            scalc_compile(expr).unwrap_err(),
+            CalcError::Syntax,
+            "sCalc must reject array token expression {expr:?}"
+        );
+        assert!(acalc_compile(expr).is_ok(), "aCalc must accept {expr:?}");
+    }
+
+    // String tokens: sCalc only.
+    for expr in ["SVAL", "PRINTF('%d',A)", "'abc'"] {
+        assert_eq!(
+            acalc_compile(expr).unwrap_err(),
+            CalcError::Syntax,
+            "aCalc must reject string token expression {expr:?}"
+        );
+    }
+
+    // `UNTIL` is in the sCalc and aCalc tables, not in postfix.c's.
+    assert_eq!(compile("UNTIL 1; 42").unwrap_err(), CalcError::Syntax);
+    assert!(scalc_compile("UNTIL 1; 42").is_ok());
+}
+
+/// R6-77, swait half — swait's CALC is compiled by the **numeric** `postfix()`
+/// (C `swaitRecord.c:304,561`) and evaluated by `calcPerform` (`:409`), so its
+/// grammar is epics-base calc's, not sCalc's: a string expression does not
+/// compile, CLCV is set, and VAL is never assigned.
+///
+/// The port previously ran swait through the sCalc engine and then coerced the
+/// `StackValue` back to a double with `s.parse().unwrap_or(0.0)`. `'42'` is the
+/// discriminator: the string engine compiles it, produces `Str("42")`, and the
+/// coercion lands **42.0** in VAL — a value C's swait can never produce, since
+/// its compiler cannot lex a string literal at all.
+#[tokio::test]
+async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
+    use epics_base_rs::server::records::swait::SwaitRecord;
+
+    let db = PvDatabase::new();
+
+    let mut good = SwaitRecord::default();
+    good.put_field("CALC", EpicsValue::String("3+4".into()))
+        .unwrap();
+    db.add_record("SW_NUM", Box::new(good)).await.unwrap();
+
+    let mut bad = SwaitRecord::default();
+    bad.put_field("CALC", EpicsValue::String("'42'".into()))
+        .unwrap();
+    db.add_record("SW_STR", Box::new(bad)).await.unwrap();
+
+    for name in ["SW_NUM", "SW_STR"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    let num = db.get_record("SW_NUM").await.unwrap();
+    assert_eq!(
+        num.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(7.0)),
+        "a numeric swait CALC must still evaluate"
+    );
+
+    let strr = db.get_record("SW_STR").await.unwrap();
+    assert_eq!(
+        strr.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(0.0)),
+        "a string swait CALC must not compile (C postfix() has no string tokens), \
+         so VAL keeps its initial value — pre-fix the string engine evaluated it \
+         and parked 42.0 here"
+    );
 }
 
 /// scalcout CALC: SVAL is the record's previous SVAL, so a self-referential

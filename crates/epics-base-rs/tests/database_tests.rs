@@ -2866,7 +2866,11 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     db.put_record_field_from_ca_no_notify("ASYNC_OUT", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
-    assert_eq!(*writes.lock().unwrap(), vec![1.0], "put 1 must reach device");
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1.0],
+        "put 1 must reach device"
+    );
 
     // Put 2 lands while the device round trip is still in flight.
     db.put_record_field_from_ca_no_notify("ASYNC_OUT", "VAL", EpicsValue::Double(2.0))

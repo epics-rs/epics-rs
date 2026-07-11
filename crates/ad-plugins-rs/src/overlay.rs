@@ -154,42 +154,47 @@ fn format_epics_time(ts: ad_core_rs::timestamp::EpicsTimestamp, fmt: &str) -> St
 // ---------------------------------------------------------------------------
 
 macro_rules! draw_on_typed_buffer {
-    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, xor) => {{
-        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, $ts, |data: &mut [$T], idx: usize, mode: DrawMode, value: $T| {
-            match mode {
-                DrawMode::Set => data[idx] = value,
-                DrawMode::XOR => data[idx] ^= value,
-            }
-        });
-    }};
-    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, set_only) => {{
-        draw_on_typed_buffer!(@inner $data, $T, $overlays, $w, $h, $ts, |data: &mut [$T], idx: usize, _mode: DrawMode, value: $T| {
-            data[idx] = value;
-        });
-    }};
-    (@inner $data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr, $set_fn:expr) => {{
+    ($data:expr, $T:ty, $overlays:expr, $w:expr, $h:expr, $ts:expr) => {{
         let data: &mut [$T] = $data;
         let w: usize = $w;
         let h: usize = $h;
         let array_ts: ad_core_rs::timestamp::EpicsTimestamp = $ts;
-        let set_fn = $set_fn;
 
         for overlay in $overlays.iter() {
             // C++ uses pOverlay->green for mono overlays
-            let value: $T = overlay.color[1] as $T;
+            let green: i32 = overlay.color[1] as i32;
+            let value: $T = green as $T;
             let wx = overlay.width_x.max(1);
             let wy = overlay.width_y.max(1);
 
-            // Closure to set a single pixel
+            // Closure to set a single pixel.
+            //
+            // NDPluginOverlay.cpp:56-61 `setPixel` mono arm, templated over
+            // every `epicsType` including epicsFloat32/epicsFloat64:
+            //   Set: *pValue = (epicsType)pOverlay->green
+            //   XOR: *pValue = (epicsType)((int)*pValue ^ (int)pOverlay->green)
+            // The XOR therefore narrows through a 32-bit `int` for *all* widths
+            // — float pixels are truncated to int, xor'd, and cast back; 64-bit
+            // pixels lose their high word. Rust's `as` casts reproduce both.
+            // (C's float->int conversion is UB when out of range; `as i32`
+            // saturates instead of trapping.)
             let mut set_pixel = |x: usize, y: usize| {
                 if x < w && y < h {
                     let idx = y * w + x;
-                    set_fn(data, idx, overlay.draw_mode, value);
+                    match overlay.draw_mode {
+                        DrawMode::Set => data[idx] = value,
+                        DrawMode::XOR => data[idx] = ((data[idx] as i32) ^ green) as $T,
+                    }
                 }
             };
 
             match &overlay.shape {
-                OverlayShape::Cross { center_x, center_y, size_x, size_y } => {
+                OverlayShape::Cross {
+                    center_x,
+                    center_y,
+                    size_x,
+                    size_y,
+                } => {
                     // C++ doOverlayT Cross (NDPluginOverlay.cpp:94-117): the
                     // horizontal arm spans SizeX/2 each side of the center, the
                     // vertical arm SizeY/2 — independent extents. xwide/ywide
@@ -223,7 +228,12 @@ macro_rules! draw_on_typed_buffer {
                         }
                     }
                 }
-                OverlayShape::Rectangle { x, y, width, height } => {
+                OverlayShape::Rectangle {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
                     // C doOverlayT Rectangle (NDPluginOverlay.cpp:119-145):
                     // xmax = PositionX + SizeX is INCLUSIVE, so the rectangle is
                     // SizeX+1 px wide / SizeY+1 tall. Border thickness grows
@@ -257,7 +267,12 @@ macro_rules! draw_on_typed_buffer {
                         }
                     }
                 }
-                OverlayShape::Ellipse { center_x, center_y, rx, ry } => {
+                OverlayShape::Ellipse {
+                    center_x,
+                    center_y,
+                    rx,
+                    ry,
+                } => {
                     // C++ doOverlayT Ellipse: parametric over the first
                     // quadrant, mirrored to the other three; for each of
                     // `xwide` thickness layers shrink the radii by jj. C++
@@ -294,7 +309,15 @@ macro_rules! draw_on_typed_buffer {
                         }
                     }
                 }
-                OverlayShape::Text { x, y, size_x, size_y, text, font, timestamp_format } => {
+                OverlayShape::Text {
+                    x,
+                    y,
+                    size_x,
+                    size_y,
+                    text,
+                    font,
+                    timestamp_format,
+                } => {
                     // C++ NDPluginOverlay.cpp text path: a fixed-cell bitmap
                     // font (no scaling); characters advance by the full font
                     // width; xmax = PositionX + SizeX clips trailing chars;
@@ -309,9 +332,7 @@ macro_rules! draw_on_typed_buffer {
                     };
                     let xmin = *x;
                     let xmax = x.saturating_add(*size_x);
-                    let ymax = y
-                        .saturating_add(*size_y)
-                        .min(y.saturating_add(bmp.height));
+                    let ymax = y.saturating_add(*size_y).min(y.saturating_add(bmp.height));
                     for (ci, ch) in rendered.chars().enumerate() {
                         // C tests `if (cp[ii] < 32) continue;` on a signed
                         // `char`, so bytes >= 128 are negative and skipped along
@@ -358,50 +379,34 @@ pub fn draw_overlays(src: &NDArray, overlays: &[OverlayDef]) -> NDArray {
 
     match &mut arr.data {
         NDDataBuffer::U8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::U16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::I16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::I32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::U32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::F32(data) => {
-            draw_on_typed_buffer!(
-                data.as_mut_slice(),
-                f32,
-                overlays,
-                w,
-                h,
-                arr.timestamp,
-                set_only
-            );
+            draw_on_typed_buffer!(data.as_mut_slice(), f32, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::F64(data) => {
-            draw_on_typed_buffer!(
-                data.as_mut_slice(),
-                f64,
-                overlays,
-                w,
-                h,
-                arr.timestamp,
-                set_only
-            );
+            draw_on_typed_buffer!(data.as_mut_slice(), f64, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::I8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::I64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, w, h, arr.timestamp);
         }
         NDDataBuffer::U64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, w, h, arr.timestamp, xor);
+            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, w, h, arr.timestamp);
         }
     }
 
@@ -1211,11 +1216,20 @@ mod tests {
     }
 
     #[test]
-    fn test_f32_overlay_ignores_xor() {
-        let arr = NDArray::new(
+    fn test_r6_68_f32_xor_narrows_through_int() {
+        // R6-68 / NDPluginOverlay.cpp:60 — the XOR arm of setPixel is templated
+        // over every epicsType, floats included:
+        //   *pValue = (epicsType)((int)*pValue ^ (int)pOverlay->green)
+        // So a float pixel is truncated to int, xor'd, and cast back. It must
+        // NOT degrade to Set.
+        let mut arr = NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::Float32,
         );
+        // Seed the two pixels we check: 12.75 truncates to 12, 0.0 to 0.
+        if let NDDataBuffer::F32(ref mut v) = arr.data {
+            v[4 * 8 + 4] = 12.75;
+        }
         let overlays = vec![OverlayDef {
             shape: OverlayShape::Cross {
                 center_x: 4,
@@ -1223,17 +1237,52 @@ mod tests {
                 size_x: 2,
                 size_y: 2,
             },
-            draw_mode: DrawMode::XOR, // should be treated as Set for floats
+            draw_mode: DrawMode::XOR,
             color: [0, 100, 0],
             width_x: 1,
             width_y: 1,
         }];
 
         let out = draw_overlays(&arr, &overlays);
-        if let NDDataBuffer::F32(ref v) = out.data {
-            // Center pixel should be set (XOR falls back to Set for floats)
-            assert_eq!(v[4 * 8 + 4], 100.0);
+        let NDDataBuffer::F32(ref v) = out.data else {
+            panic!("expected F32 buffer");
+        };
+        // (int)12.75 == 12; 12 ^ 100 == 104 (the fraction is dropped, as in C).
+        assert_eq!(v[4 * 8 + 4], 104.0, "float XOR must narrow through int");
+        // A zero pixel on the arm xors to the plain color.
+        assert_eq!(v[4 * 8 + 5], 100.0);
+    }
+
+    #[test]
+    fn test_r6_68_i64_xor_narrows_through_int() {
+        // The same `(int)` narrowing applies to 64-bit pixels: C xors only the
+        // low 32 bits and sign-extends the result back to epicsInt64.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::Int64,
+        );
+        if let NDDataBuffer::I64(ref mut v) = arr.data {
+            v[1 * 4 + 1] = 0x0000_0007_0000_0005; // high word must be discarded
         }
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Cross {
+                center_x: 1,
+                center_y: 1,
+                size_x: 0,
+                size_y: 0,
+            },
+            draw_mode: DrawMode::XOR,
+            color: [0, 3, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+
+        let out = draw_overlays(&arr, &overlays);
+        let NDDataBuffer::I64(ref v) = out.data else {
+            panic!("expected I64 buffer");
+        };
+        // C: (epicsInt64)((int)0x0000000700000005 ^ 3) == (epicsInt64)(5 ^ 3) == 6
+        assert_eq!(v[1 * 4 + 1], 6);
     }
 
     #[test]

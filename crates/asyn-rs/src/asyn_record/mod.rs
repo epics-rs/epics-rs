@@ -931,9 +931,19 @@ fn record_phase_result(
 ) {
     match phase {
         IoPhase::Flush => {
-            if let Err(e) = res {
-                out.report_error(format!("flush: {e}"));
-            }
+            // C `performOctetIO` calls the flush for its side effect only and
+            // discards the status — the call is a bare statement, not assigned
+            // to `status` (asynRecord.c:1521), unlike every other transfer in
+            // the routine. So a flush failure never reaches `reportError` and
+            // never reaches ERRS.
+            //
+            // That is not an oversight to "improve on": the flush is
+            // best-effort housekeeping before the write, and reporting it gave
+            // the port a diagnostic C does not have — one that a *successful*
+            // write/read afterwards would not clear, so a whole good
+            // transaction could carry a stale "flush: ..." string. Dropping the
+            // result here is what keeps ERRS meaning "this transfer failed".
+            let _ = res;
         }
         IoPhase::Write => record_write_result(plan, out, res),
         IoPhase::Read => record_read_result(plan, out, res),
@@ -3900,6 +3910,94 @@ mod tests {
         writer.process().unwrap();
         assert!(!writer.errs.is_empty(), "write error must set ERRS");
         assert_eq!(writer.nawt, 0, "failed write must reset NAWT to 0");
+    }
+
+    /// R9-50: C `performOctetIO` calls the pre-write flush as a bare statement
+    /// and discards its status (asynRecord.c:1521) — unlike every other
+    /// transfer in the routine, whose status is assigned and reported. So a
+    /// flush failure never reaches ERRS. The port recorded `"flush: {e}"`,
+    /// and since ERRS is only cleared at the top of `process()`, a *successful*
+    /// Write/Read transaction still ended carrying the flush complaint.
+    #[test]
+    fn flush_failure_is_discarded_and_does_not_reach_errs() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        /// Flush fails; the write and the read that follow it succeed. C's
+        /// Write/Read flushes first (:1518-1523), so this is the exact shape
+        /// the finding is about.
+        struct FlushFailsDriver(PortDriverBase);
+        impl PortDriver for FlushFailsDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_flush(&mut self, _user: &mut AsynUser) -> crate::error::AsynResult<()> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "flush boom".into(),
+                })
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                data: &[u8],
+            ) -> crate::error::AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                buf[..2].copy_from_slice(b"OK");
+                Ok((2, EomReason::END))
+            }
+        }
+
+        let port_name = "test_flush_failure_discarded";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(FlushFailsDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.tmod = TransferMode::WriteRead as i32;
+        rec.ofmt = ASYN_FMT_ASCII;
+        rec.ifmt = ASYN_FMT_ASCII;
+        rec.aout = "CMD".to_string();
+        rec.process().unwrap();
+
+        assert_eq!(rec.ainp, "OK", "the write/read after the flush still ran");
+        assert_eq!(
+            rec.errs, "",
+            "C discards the flush status; a good transaction reports nothing"
+        );
+        assert_eq!(read_alarm(&mut rec).1, AlarmSeverity::NoAlarm);
+
+        // TMOD=Flush is a flush-only cycle: still nothing in ERRS.
+        rec.tmod = TransferMode::Flush as i32;
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "", "a flush-only cycle reports nothing either");
     }
 
     /// R8-56: the octet read-error ERRS is C's `"%s  nread %d %s"` with the

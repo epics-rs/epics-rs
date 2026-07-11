@@ -46,6 +46,16 @@ pub struct TransformRecord {
     /// inside `dbGetLink`, i.e. before the record body reads it
     /// (`transformRecord.c:554`).
     nsev: AlarmSeverity,
+    /// `dbCommon.udf` as transform maintains it. C `transformRecord.c:521`
+    /// clears `ptran->udf` at the top of every `process()` and sets it TRUE
+    /// only where a channel's `sCalcPerform` fails (`:593-596`, alongside
+    /// `recGblSetSevr(CALC_ALARM, INVALID_ALARM)`); `checkAlarms` (`:773-779`)
+    /// then raises `UDF_ALARM` at `UDFS`. It is a per-cycle flag, not a
+    /// property of any value — transform's VAL is an inert dummy (R9-62), so
+    /// the framework's default `value_is_undefined()` (VAL is NaN) can never
+    /// express it. Both [`Record::value_is_undefined`] and
+    /// [`Record::check_alarms`] read this cell.
+    calc_failed: bool,
 }
 
 impl Default for TransformRecord {
@@ -62,6 +72,7 @@ impl Default for TransformRecord {
             prec: 0,
             fresh_put: [false; NUM_CHANNELS],
             nsev: AlarmSeverity::NoAlarm,
+            calc_failed: false,
         }
     }
 }
@@ -483,6 +494,12 @@ impl Record for TransformRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // C `transformRecord.c:521` `ptran->udf = FALSE;` — the very first
+        // thing every cycle does, including the IVLA-abandoned one below (C
+        // clears it before the test), so the flag only ever reports THIS
+        // cycle's calc failures.
+        self.calc_failed = false;
+
         // IVLA="Do Nothing" + an INVALID input severity: C
         // `transformRecord.c:554-560` abandons the WHOLE cycle —
         //
@@ -549,13 +566,20 @@ impl Record for TransformRecord {
                         self.vals[i] = result;
                     }
                     Err(_) => {
-                        // C `transformRecord.c:593-596`: a failing
-                        // `sCalcPerform` leaves `*pval` untouched and raises
-                        // CALC_ALARM/INVALID + `udf = TRUE`; the loop
-                        // continues with the next channel. IVLA plays no part
-                        // here — it gates the whole cycle on the INPUT
-                        // severity (see the top of `process`), never a single
-                        // channel's calc result.
+                        // C `transformRecord.c:593-596`:
+                        //
+                        //   if (sCalcPerform(...)) {
+                        //       recGblSetSevr(ptran, CALC_ALARM, INVALID_ALARM);
+                        //       ptran->udf = TRUE;
+                        //   }
+                        //
+                        // `*pval` is left untouched and the loop continues with
+                        // the next channel. The severity is raised by
+                        // `check_alarms` below (the framework's `checkAlarms`
+                        // slot) off this flag. IVLA plays no part here — it
+                        // gates the whole cycle on the INPUT severity (see the
+                        // top of `process`), never a single channel's calc.
+                        self.calc_failed = true;
                     }
                 }
             }
@@ -713,6 +737,30 @@ impl Record for TransformRecord {
         self.nsev = ctx.nsev;
     }
 
+    /// C `transformRecord.c:593-595`: a channel whose `sCalcPerform` failed
+    /// raises `recGblSetSevr(ptran, CALC_ALARM, INVALID_ALARM)`. Raised from
+    /// the `checkAlarms` slot, which the framework runs BEFORE
+    /// `rec_gbl_check_udf` — so on a calc failure CALC_ALARM lands first and
+    /// the equal-severity UDF_ALARM (`checkAlarms`, `:773-779`) cannot displace
+    /// it under `rec_gbl_set_sevr`'s strict-greater rule. Same order, same
+    /// outcome as C.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.calc_failed {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::CALC_ALARM,
+                AlarmSeverity::Invalid,
+            );
+        }
+    }
+
+    /// Transform's UDF is C's `ptran->udf`: cleared at the top of every
+    /// `process()` and set only by a failing channel calc. It is NOT derived
+    /// from VAL — VAL is an inert dummy (R9-62).
+    fn value_is_undefined(&self) -> bool {
+        self.calc_failed
+    }
+
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
         &[
             ("INPA", "A"),
@@ -761,6 +809,89 @@ static OUT_FIELD_NAMES: [&str; NUM_CHANNELS] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calc::{CoreOp, ExprKind, Opcode};
+    use crate::server::record::CommonFields;
+
+    /// A compiled program that compiles clean but fails at eval — the port's
+    /// analogue of C `sCalcPerform()` returning non-zero. Two constants and no
+    /// operator leave 2 values on the stack, which the numeric engine reports
+    /// as `CalcError::Internal`. The infix compiler's end-of-expression depth
+    /// check rejects every *string* form of this (see
+    /// `s6_transform_broken_calc_does_not_abort_sibling_channels`), so the
+    /// failing postfix program has to be installed directly — exactly the state
+    /// C guards against with its runtime check.
+    fn eval_failing_program() -> CompiledExpr {
+        CompiledExpr {
+            code: vec![
+                Opcode::Core(CoreOp::PushConst(1.0)),
+                Opcode::Core(CoreOp::PushConst(2.0)),
+                Opcode::Core(CoreOp::End),
+            ],
+            kind: ExprKind::Numeric,
+            loop_pairs: Vec::new(),
+        }
+    }
+
+    /// R9-63 — a failing channel calc raises CALC_ALARM/INVALID and sets UDF.
+    ///
+    /// C `transformRecord.c:593-596`:
+    /// `if (sCalcPerform(...)) { recGblSetSevr(ptran, CALC_ALARM, INVALID_ALARM);
+    /// ptran->udf = TRUE; }`, and `checkAlarms` (`:773-779`) then raises
+    /// UDF_ALARM at UDFS. The port raised nothing at all.
+    #[test]
+    fn r9_63_calc_failure_raises_calc_alarm_and_udf() {
+        let mut rec = TransformRecord::new();
+        rec.calcs[0] = "bad".into();
+        rec.compiled[0] = Some(eval_failing_program());
+        rec.process().unwrap();
+
+        assert!(
+            rec.value_is_undefined(),
+            "a failing calc sets udf=TRUE (C transformRecord.c:595)"
+        );
+
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.nsev,
+            AlarmSeverity::Invalid,
+            "CALC_ALARM is raised at INVALID_ALARM severity"
+        );
+        assert_eq!(
+            common.nsta,
+            crate::server::recgbl::alarm_status::CALC_ALARM,
+            "the status is CALC_ALARM, not UDF_ALARM — C raises CALC first and \
+             recGblSetSevr is strict-greater, so the equal-severity UDF_ALARM \
+             that checkAlarms adds cannot displace it"
+        );
+    }
+
+    /// The flag is per-cycle: C clears `ptran->udf` at the top of every
+    /// `process()` (`transformRecord.c:521`), so a cycle whose calc succeeds
+    /// clears the alarm the previous failure raised.
+    #[test]
+    fn r9_63_calc_success_clears_the_previous_failure() {
+        let mut rec = TransformRecord::new();
+        rec.calcs[0] = "bad".into();
+        rec.compiled[0] = Some(eval_failing_program());
+        rec.process().unwrap();
+        assert!(rec.value_is_undefined());
+
+        rec.put_field("CLCA", EpicsValue::String("5".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert!(
+            !rec.value_is_undefined(),
+            "a clean cycle clears udf (C sets udf = FALSE on entry)"
+        );
+        let mut common = CommonFields::default();
+        rec.check_alarms(&mut common);
+        assert_eq!(
+            common.nsev,
+            AlarmSeverity::NoAlarm,
+            "no CALC_ALARM on a cycle whose calcs all succeeded"
+        );
+    }
 
     #[test]
     fn test_transform_default() {

@@ -66,6 +66,39 @@ impl CodecName {
     }
 }
 
+/// Severity the Codec plugin reports in its `CodecStatus` parameter, i.e. C
+/// `NDCodecStatus_t` (NDPluginCodec.h:42-46).
+///
+/// C keeps three levels apart and the numeric values are the contract seen by
+/// every client of the `CodecStatus` PV:
+///
+/// - `Success` (0): the codec did its job, or the array passed through because
+///   there was nothing to do (NDPluginCodec.cpp:659, :732-735).
+/// - `Warning` (1): benign — the operation was skipped, not failed. C uses it
+///   only for "array is already compressed" (:672-675, :466-469, :361-365,
+///   :537-541), where the frame flows on unchanged.
+/// - `Error` (2): a genuine failure — unsupported input, an encoder/decoder
+///   error, a failed allocation, an unexpected codec (:141, :167, :202, :252,
+///   :279, :392-397, :760).
+///
+/// The value is carried as this enum rather than an integer so no call site can
+/// invent a level that C does not have, and so a benign skip cannot be reported
+/// with the same number as a real failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecStatus {
+    Success = 0,
+    Warning = 1,
+    Error = 2,
+}
+
+impl CodecStatus {
+    /// The `CodecStatus` parameter value (C `(int)codecStatus`,
+    /// NDPluginCodec.cpp:776).
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
 /// Blosc sub-compressor names (matching C++ `NDCodecBloscCompName`).
 ///
 /// Indexed by `NDCodecBloscComp_t`: `BloscLZ`, `LZ4`, `LZ4HC`, `Snappy`,

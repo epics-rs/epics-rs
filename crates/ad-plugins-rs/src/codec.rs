@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use ad_core_rs::codec::{Codec, CodecName};
+use ad_core_rs::codec::{Codec, CodecName, CodecStatus};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
@@ -1066,24 +1066,55 @@ impl CodecProcessor {
     }
 }
 
-/// What the codec plugin decided for one input array, mirroring the three exits
-/// of C `NDPluginCodec::processCallbacks` (NDPluginCodec.cpp:670-778).
+/// What the codec plugin decided for one input array, mirroring the exits of C
+/// `NDPluginCodec::processCallbacks` (NDPluginCodec.cpp:670-778).
 ///
 /// C distinguishes "the input *is* the result" (`result = pArray`, no error,
 /// codecStatus untouched) from "the codec produced nothing" (`result = NULL` +
 /// errorMessage, and the `finish:` block then substitutes `pArray` so the frame
 /// still flows downstream). Both end up publishing the input array, so an
 /// `Option<NDArray>` cannot tell them apart — collapsing them is what made an
-/// uncompressed input to a Decompress plugin report a codec failure. Keeping the
-/// two exits distinct here is what lets the parameter updates below follow C.
+/// uncompressed input to a Decompress plugin report a codec failure.
+///
+/// The reported severity and error string are derived from the variant
+/// ([`CodecOutcome::status`] / [`CodecOutcome::error_message`]), so they are a
+/// property of what happened rather than integers picked at the publish site: a
+/// benign skip cannot be reported with a failure's severity, and no site can
+/// invent a level C does not have.
 enum CodecOutcome {
-    /// C `result = pArray`: the input is the output, unchanged and not an error.
+    /// C `result = pArray`, codecStatus SUCCESS: the input is the output,
+    /// unchanged and not an error.
     PassThrough,
-    /// C `result = <new array>`: the codec produced a new array.
+    /// C `result = pArray` + errorMessage + `NDCODEC_WARNING` (:671-676, and the
+    /// same guard inside each compressor, e.g. :466-469): the operation was
+    /// skipped, not failed — the frame flows on unchanged.
+    Skipped(&'static str),
+    /// C `result = <new array>`, codecStatus SUCCESS: the codec produced a new
+    /// array.
     Converted(NDArray),
-    /// C `result = NULL` + errorMessage: the codec failed; the input is
-    /// republished but the error is reported.
+    /// C `result = NULL` + errorMessage + `NDCODEC_ERROR`: the codec failed; the
+    /// input is republished but the error is reported.
     Failed(&'static str),
+}
+
+impl CodecOutcome {
+    /// Severity reported in `CodecStatus` (C `NDCodecStatus_t`).
+    fn status(&self) -> CodecStatus {
+        match self {
+            Self::PassThrough | Self::Converted(_) => CodecStatus::Success,
+            Self::Skipped(_) => CodecStatus::Warning,
+            Self::Failed(_) => CodecStatus::Error,
+        }
+    }
+
+    /// Text reported in `CodecError` (C `errorMessage`, empty unless the codec
+    /// had something to say).
+    fn error_message(&self) -> &'static str {
+        match self {
+            Self::PassThrough | Self::Converted(_) => "",
+            Self::Skipped(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 impl NDPluginProcess for CodecProcessor {
@@ -1106,8 +1137,9 @@ impl NDPluginProcess for CodecProcessor {
                 ..
             } => CodecOutcome::PassThrough,
             CodecMode::Compress { .. } if array.codec.is_some() => {
-                // Already compressed — C passes the input through (:671-676).
-                CodecOutcome::PassThrough
+                // Already compressed — C passes the input through, but reports it
+                // as a benign WARNING with an error string (:671-676).
+                CodecOutcome::Skipped("Array already compressed")
             }
             CodecMode::Compress { codec, .. } => match codec {
                 CodecName::LZ4 => CodecOutcome::Converted(compress_lz4(array)),
@@ -1167,9 +1199,13 @@ impl NDPluginProcess for CodecProcessor {
             }
         };
 
+        let status = outcome.status();
+        let error = outcome.error_message().to_string();
+
         // C recomputes NDCodecCompFactor only when `result != pArray`
-        // (:726-730, :763-767); on a pass-through or a failure it keeps 1.0.
-        let (output, status, error) = match outcome {
+        // (:726-730, :763-767); on any exit that republishes the input it stays
+        // at 1.0.
+        let output = match outcome {
             CodecOutcome::Converted(out) => {
                 let output_bytes = out.data.as_u8_slice().len();
                 self.compression_ratio = match self.mode {
@@ -1178,15 +1214,11 @@ impl NDPluginProcess for CodecProcessor {
                     }
                     CodecMode::Decompress => output_bytes as f64 / original_bytes.max(1) as f64,
                 };
-                (out, 0, String::new())
+                out
             }
-            CodecOutcome::PassThrough => {
+            CodecOutcome::PassThrough | CodecOutcome::Skipped(_) | CodecOutcome::Failed(_) => {
                 self.compression_ratio = 1.0;
-                (array.clone(), 0, String::new())
-            }
-            CodecOutcome::Failed(message) => {
-                self.compression_ratio = 1.0;
-                (array.clone(), 1, message.to_string())
+                array.clone()
             }
         };
 
@@ -1198,7 +1230,7 @@ impl NDPluginProcess for CodecProcessor {
             updates.push(ParamUpdate::int32(idx, value));
         }
         if let Some(idx) = self.params.codec_status {
-            updates.push(ParamUpdate::int32(idx, status));
+            updates.push(ParamUpdate::int32(idx, status.as_i32()));
         }
         if let Some(idx) = self.params.codec_error {
             updates.push(ParamUpdate::Octet {
@@ -2558,6 +2590,109 @@ mod tests {
             result.output_arrays[0].data.as_u8_slice(),
             corrupted.data.as_u8_slice(),
             "the input array is republished on failure"
+        );
+    }
+
+    // ---- R8-63: the three-level CodecStatus contract ----
+
+    #[test]
+    fn test_r8_63_status_levels_match_c() {
+        // C NDCodecStatus_t (NDPluginCodec.h:42-46): SUCCESS=0, WARNING=1,
+        // ERROR=2. These are the values every CodecStatus PV client reads.
+        assert_eq!(CodecStatus::Success.as_i32(), 0);
+        assert_eq!(CodecStatus::Warning.as_i32(), 1);
+        assert_eq!(CodecStatus::Error.as_i32(), 2);
+    }
+
+    #[test]
+    fn test_r8_63_already_compressed_is_a_warning_not_success() {
+        // C :671-676 — compressing an already-compressed array is benign but not
+        // silent: errorMessage "Array already compressed", codecStatus WARNING,
+        // and the input passes through. The port reported SUCCESS with no error.
+        let pool = NDArrayPool::new(1_000_000);
+        let compressed = compress_lz4(&make_u8_array(16, 16));
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::Zlib,
+            quality: 85,
+        });
+        let result = proc.process_array(&compressed, &pool);
+
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(CodecStatus::Warning.as_i32()),
+            "already-compressed input must report WARNING(1)"
+        );
+        assert_eq!(
+            octet_update(&result.param_updates, 13),
+            Some("Array already compressed".to_string())
+        );
+        // The frame still flows on, still LZ4-compressed.
+        assert_eq!(
+            result.output_arrays[0].codec.as_ref().unwrap().name,
+            CodecName::LZ4
+        );
+    }
+
+    #[test]
+    fn test_r8_63_genuine_failures_are_error_not_warning() {
+        // C reports ERROR(2) for real failures: a JPEG-unsupported input
+        // (:141/:167/:202/:252) and a codec that fails to decode (:279, :760).
+        // The port hardcoded 1 (WARNING) on every failure, making the two levels
+        // indistinguishable.
+        let pool = NDArrayPool::new(1_000_000);
+
+        // Compress: UInt16 is not JPEG-encodable ("JPEG only supports 8-bit data").
+        let wide = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::JPEG,
+            quality: 85,
+        });
+        let result = proc.process_array(&wide, &pool);
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(CodecStatus::Error.as_i32()),
+            "an unsupported JPEG input is an ERROR"
+        );
+
+        // Decompress: a truncated payload is a decoder failure.
+        let mut corrupted = compress_lz4(&make_u8_array(16, 16));
+        if let NDDataBuffer::U8(ref mut v) = corrupted.data {
+            v.truncate(3);
+        }
+        let mut proc = processor_with_params(CodecMode::Decompress);
+        let result = proc.process_array(&corrupted, &pool);
+        assert_eq!(
+            int32_update(&result.param_updates, 12),
+            Some(CodecStatus::Error.as_i32()),
+            "a failed decompress is an ERROR"
+        );
+    }
+
+    #[test]
+    fn test_r8_63_successful_and_passthrough_paths_report_success() {
+        // The other two levels must stay at SUCCESS(0): a real compression, and
+        // the pass-through exits (C :659, :680-683, :732-735).
+        let pool = NDArrayPool::new(1_000_000);
+        let arr = make_u8_array(16, 16);
+
+        let mut proc = processor_with_params(CodecMode::Compress {
+            codec: CodecName::LZ4,
+            quality: 85,
+        });
+        let compressed = proc.process_array(&arr, &pool);
+        assert_eq!(
+            int32_update(&compressed.param_updates, 12),
+            Some(CodecStatus::Success.as_i32())
+        );
+
+        let mut proc = processor_with_params(CodecMode::Decompress);
+        let passthrough = proc.process_array(&arr, &pool);
+        assert_eq!(
+            int32_update(&passthrough.param_updates, 12),
+            Some(CodecStatus::Success.as_i32())
         );
     }
 

@@ -12,7 +12,9 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
-use super::link::{ParsedLink, parse_link_v2, parse_output_link_v2};
+use super::link::{
+    ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_v2, parse_output_link_v2,
+};
 use super::pini::PiniMode;
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
@@ -1406,7 +1408,7 @@ impl RecordInstance {
             "FLNK" => {
                 if let EpicsValue::String(s) = value {
                     self.common.flnk = s.as_str_lossy().into_owned();
-                    self.parsed_flnk = parse_link_v2(&self.common.flnk);
+                    self.parsed_flnk = parse_forward_link_v2(&self.common.flnk);
                 }
             }
             "INP" => {
@@ -1418,18 +1420,20 @@ impl RecordInstance {
             "OUT" => {
                 if let EpicsValue::String(s) = value {
                     let s = s.as_str_lossy();
-                    // C parity (acd1aef): CP/CPP modifiers on output links are
-                    // meaningless (they request "process on change" semantics
-                    // that only apply to input links). dbParseLink in C strips
-                    // them and emits an errlogPrintf warning naming the source
-                    // record and field. Mirror the diagnostic here.
-                    let trimmed = s.trim_end();
-                    if trimmed.ends_with(" CP") || trimmed.ends_with(" CPP") {
+                    // C `dbParseLink` (dbStaticLib.c:2382-2386) discards a
+                    // CP/CPP modifier on a DBF_OUTLINK and warns once, naming
+                    // the holder record, its field and the target. The discard
+                    // itself is owned by `parse_output_link_v2` below; only the
+                    // diagnostic lives here, where the record name exists and
+                    // the link text is being (re)loaded rather than re-parsed
+                    // per process cycle.
+                    if out_link_discards_cp(&s) {
                         tracing::warn!(
                             target: "epics_base_rs::record",
-                            record = %name,
+                            record = %self.name,
                             field = "OUT",
-                            "CP/CPP modifier ignored on output link"
+                            link = %s,
+                            "Discarding CP/CPP modifier in CA output link"
                         );
                     }
                     self.common.out = s.into_owned();

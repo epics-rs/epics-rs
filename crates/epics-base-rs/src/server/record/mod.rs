@@ -13,9 +13,10 @@ pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use link::{
-    CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkProcessPolicy,
-    LinkType, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, link_field_type,
-    parse_link, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
+    CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkFieldType,
+    LinkProcessPolicy, LinkType, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink,
+    link_field_type, out_link_discards_cp, parse_forward_link_v2, parse_link, parse_link_field,
+    parse_link_v2, parse_output_link_v2, pvajson_identity_key,
 };
 pub use menu_choices::{
     MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,

@@ -778,6 +778,120 @@ impl ProcessClass {
             Self::Cp => (LinkProcessPolicy::ChannelProcess, false),
         }
     }
+
+    fn is_cp_or_cpp(self) -> bool {
+        matches!(self, Self::Cp | Self::Cpp)
+    }
+
+    /// C `dbStaticLib.c:2369-2373` — a single `else if` chain over
+    /// `strstr(pstr, …)` in the order `NPP, CPP, PP, CA, CP` that *assigns*
+    /// (never OR-s) exactly one class. The order is load-bearing: `CPP` must be
+    /// tested before `PP`, since `"CPP"` contains `"PP"`.
+    fn from_modifier_text(mods: &str) -> Self {
+        if mods.contains("NPP") {
+            Self::Npp
+        } else if mods.contains("CPP") {
+            Self::Cpp
+        } else if mods.contains("PP") {
+            Self::Pp
+        } else if mods.contains("CA") {
+            Self::Ca
+        } else if mods.contains("CP") {
+            Self::Cp
+        } else {
+            Self::Npp
+        }
+    }
+}
+
+/// Which link *field* a link string is being parsed for — C's `ftype` argument
+/// to `dbParseLink`, i.e. the `pfldDes->field_type` of the field that holds the
+/// link (`dbAccess.c:1094` `dbPutFieldLink`).
+///
+/// The field type filters the parsed modifiers (`dbStaticLib.c:2380-2391`),
+/// which is why the same text means different things in `INP` and `OUT`:
+///
+/// ```c
+/// switch(ftype) {
+/// case DBF_INLINK:  /* accept all */ break;
+/// case DBF_OUTLINK:
+///     if (modifiers & (pvlOptCPP|pvlOptCP))
+///         errlogPrintf(ERL_WARNING ": Discarding CP/CPP modifier in CA output link …");
+///     modifiers &= ~(pvlOptCPP|pvlOptCP);
+///     break;
+/// case DBF_FWDLINK: modifiers &= pvlOptCA; break;
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkFieldType {
+    /// `DBF_INLINK` — `INP`, `INPA`…, `DOL`, `SDIS`, `TSEL`, `SIML`, … Every
+    /// modifier is accepted.
+    In,
+    /// `DBF_OUTLINK` — `OUT`, `dfanout.OUTA`…, `sseq.LNK1`…, `SIOL`. `CP`/`CPP`
+    /// is meaningless (it asks for input-side "process on change") and is
+    /// discarded with a warning.
+    Out,
+    /// `DBF_FWDLINK` — `FLNK` (`dbCommon.dbd.pod:575`), `fanout.LNK1`…
+    /// (`fanoutRecord.dbd.pod:144`). Only `CA` survives; every process and
+    /// maximize-severity modifier is masked off.
+    Fwd,
+}
+
+impl LinkFieldType {
+    /// Apply C's per-field-type modifier mask (`dbStaticLib.c:2380-2391`).
+    ///
+    /// Silent by design: some OUT links (`dfanout.OUTn`, `sseq.LNKn`) are
+    /// re-parsed from their raw text on every process cycle, so C's one-shot
+    /// load-time `errlogPrintf` cannot live here. The diagnostic is emitted at
+    /// the one-shot put/load boundary via [`out_link_discards_cp`], which also
+    /// has the holder record's name — the `%s.%s` half of C's message.
+    fn mask(self, class: ProcessClass, ms: MonitorSwitch) -> (ProcessClass, MonitorSwitch) {
+        match self {
+            Self::In => (class, ms),
+            // `modifiers &= ~(pvlOptCPP|pvlOptCP)`.
+            Self::Out => {
+                let class = if class.is_cp_or_cpp() {
+                    ProcessClass::Npp
+                } else {
+                    class
+                };
+                (class, ms)
+            }
+            // `modifiers &= pvlOptCA` — everything except the CA bit is
+            // cleared, including the maximize-severity switch.
+            Self::Fwd => {
+                let class = if class == ProcessClass::Ca {
+                    ProcessClass::Ca
+                } else {
+                    ProcessClass::Npp
+                };
+                (class, MonitorSwitch::NoMaximize)
+            }
+        }
+    }
+}
+
+/// Does `s`, read as a `DBF_OUTLINK`, carry a `CP`/`CPP` modifier that
+/// [`parse_output_link_v2`] will discard?
+///
+/// The query behind C's load-time warning (`dbStaticLib.c:2382-2386`
+/// `"Discarding CP/CPP modifier in CA output link from %s.%s to %s."`). It uses
+/// the same modifier resolution as the parser, so it cannot drift from what is
+/// actually discarded — unlike a trailing-`" CP"` text test, which misses
+/// `"TARGET CP MS"` and mis-fires on a target whose *name* ends in `CP`.
+pub fn out_link_discards_cp(s: &str) -> bool {
+    let s = s.trim();
+    // Only a plain PV link reaches the modifier scan in C; a JSON/hardware/
+    // scheme link never does.
+    if s.is_empty() || s.starts_with(['{', '@', '#', '"']) {
+        return false;
+    }
+    let Some((_, mods)) = s.split_once(' ') else {
+        return false;
+    };
+    // Resolve through the same chain the parser uses, so the warning cannot
+    // drift from the mask: exactly the classes the OUT mask downgrades.
+    ProcessClass::from_modifier_text(mods).is_cp_or_cpp()
 }
 
 /// Split a link string into its target and its modifiers, mirroring C
@@ -791,30 +905,23 @@ impl ProcessClass {
 /// maximize-severity switch is a second, independent `else if` chain
 /// (`:2375-2378`) in the order `NMS, MSI, MSS, MS`, longest match first.
 ///
-/// Returns `(target, policy, monitor_switch, force_ca)`. Shared by the
-/// plain-text path and the `ca://` scheme path so `ca://PV MS` parses its `MS`
-/// instead of folding it into the PV name.
-fn split_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
+/// Returns `(target, policy, monitor_switch, force_ca)` with `ftype`'s modifier
+/// mask ([`LinkFieldType::mask`]) already applied. Shared by the plain-text path
+/// and the `ca://` scheme path so `ca://PV MS` parses its `MS` instead of
+/// folding it into the PV name.
+fn split_link_modifiers(
+    s: &str,
+    ftype: LinkFieldType,
+) -> (&str, LinkProcessPolicy, MonitorSwitch, bool) {
     let Some((target, mods)) = s.split_once(' ') else {
-        // No space ⇒ no modifier text at all ⇒ modifiers stay zeroed (NPP).
+        // No space ⇒ no modifier text at all ⇒ modifiers stay zeroed (NPP),
+        // and every mask leaves zero at zero.
         let (policy, force_ca) = ProcessClass::default().resolve();
         return (s, policy, MonitorSwitch::NoMaximize, force_ca);
     };
 
-    // Process class — one assignment, longest match first.
-    let class = if mods.contains("NPP") {
-        ProcessClass::Npp
-    } else if mods.contains("CPP") {
-        ProcessClass::Cpp
-    } else if mods.contains("PP") {
-        ProcessClass::Pp
-    } else if mods.contains("CA") {
-        ProcessClass::Ca
-    } else if mods.contains("CP") {
-        ProcessClass::Cp
-    } else {
-        ProcessClass::Npp
-    };
+    // Process class — one assignment, C's fixed chain order.
+    let class = ProcessClass::from_modifier_text(mods);
 
     // Maximize-severity switch — independent chain, longest match first.
     let ms = if mods.contains("NMS") {
@@ -829,12 +936,26 @@ fn split_link_modifiers(s: &str) -> (&str, LinkProcessPolicy, MonitorSwitch, boo
         MonitorSwitch::NoMaximize
     };
 
+    // C filters the parsed modifiers by the holding field's type before the
+    // link is ever built (`dbStaticLib.c:2380-2391`), so the mask belongs here
+    // — at the single parse owner — not at each consumer.
+    let (class, ms) = ftype.mask(class, ms);
     let (policy, force_ca) = class.resolve();
     (target, policy, ms, force_ca)
 }
 
-/// Parse a link string into a ParsedLink (v2 — distinguishes constants from DB links).
+/// Parse a `DBF_INLINK` (`INP`, `INPA`…, `DOL`, `SDIS`, `TSEL`, `SIML`, …).
+/// Every modifier is accepted — see [`parse_link_field`].
 pub fn parse_link_v2(s: &str) -> ParsedLink {
+    parse_link_field(s, LinkFieldType::In)
+}
+
+/// Parse a link string held by a link field of type `ftype`, applying that
+/// type's C modifier mask (`dbStaticLib.c:2380-2391`). The single owner of
+/// "link text → [`ParsedLink`]"; [`parse_link_v2`],
+/// [`parse_output_link_v2`] and [`parse_forward_link_v2`] are its three
+/// field-type entry points.
+pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     let s = s.trim();
     // JSON-style links (epics-base PR #86) — try first so a leading
     // `{` is not mistaken for a leading-special record-name warning.
@@ -857,7 +978,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
     // alarm gate is applied at the record-processing boundary.
     if let Some(rest) = s.strip_prefix("ca://") {
-        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest);
+        let (pv, policy, ms, _force_ca) = split_link_modifiers(rest, ftype);
         return ParsedLink::Ca(CaLink {
             pv: pv.to_string(),
             monitor_switch: ms,
@@ -889,7 +1010,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     }
 
     // Isolate the target from its modifiers — see [`split_link_modifiers`].
-    let (link_part, policy, ms, force_ca) = split_link_modifiers(s);
+    let (link_part, policy, ms, force_ca) = split_link_modifiers(s, ftype);
 
     // A `CA` modifier forces the link to be a CA link (C
     // `dbStaticLib.c:2372` — `pinfo->modifiers = pvlOptCA`, and
@@ -976,21 +1097,36 @@ fn split_record_field(link_part: &str) -> Option<(&str, String)> {
     Some((rec, field.to_ascii_uppercase()))
 }
 
-/// Parse an **output** link.
+/// Parse a `DBF_OUTLINK` (record `OUT`, `dfanout.OUTA`…, `sseq.LNK1`…,
+/// `SIOL`).
 ///
-/// Output and input links share [`parse_link_v2`]: C `dbParseLink`
-/// zeroes the modifier set for both link types (`dbStaticLib.c:2252`),
-/// so a modifier-less link is NPP (`NoProcess`) regardless of
-/// direction. The OUT-link target-processing decision — process when
-/// the link is explicit ` PP` **or** the destination field is `.PROC`
-/// — lives in the write path
-/// ([`crate::server::database::Database::write_db_link_value`]),
-/// matching C `dbDbPutValue` (`dbDbLink.c:387-390`); it is no longer
-/// encoded as a parse-time policy override. This entry point is
-/// retained as the OUT-link parse boundary named by `dbPutLink`
-/// callers (record `OUT` / dfanout `OUTn` / sseq `LNKn`).
+/// C `dbParseLink` **discards** `CP`/`CPP` on a `DBF_OUTLINK` with a startup
+/// warning (`dbStaticLib.c:2382-2387`): those modifiers ask for input-side
+/// "process the holder when the source changes", which is meaningless on an
+/// output. Honouring them opens a monitor on the *target* and reprocesses the
+/// *holder* on every target change — a processing loop (holder writes TARGET →
+/// TARGET change fires CP → holder reprocesses → writes TARGET …) that cannot
+/// happen on a C IOC.
+///
+/// A modifier-less link is NPP (`NoProcess`) in both directions — C zeroes the
+/// modifier set first (`:2252`). The OUT-link target-processing decision —
+/// process when the link is explicit ` PP` **or** the destination field is
+/// `.PROC` — lives in the write path
+/// ([`crate::server::database::Database::write_db_link_value`]), matching C
+/// `dbDbPutValue` (`dbDbLink.c:387-390`).
 pub fn parse_output_link_v2(s: &str) -> ParsedLink {
-    parse_link_v2(s)
+    parse_link_field(s, LinkFieldType::Out)
+}
+
+/// Parse a `DBF_FWDLINK` (`FLNK` — `dbCommon.dbd.pod:575`; `fanout.LNK1`… —
+/// `fanoutRecord.dbd.pod:144`).
+///
+/// C masks the modifier set to `pvlOptCA` alone (`dbStaticLib.c:2390`): a
+/// forward link only triggers processing, so every process-class modifier
+/// other than `CA` and every maximize-severity modifier is dropped. `CA` is
+/// kept because it still decides whether the trigger crosses IOCs.
+pub fn parse_forward_link_v2(s: &str) -> ParsedLink {
+    parse_link_field(s, LinkFieldType::Fwd)
 }
 
 /// Determine the [`LinkType`] of a record's string link field directly
@@ -1727,5 +1863,97 @@ mod json_link_tests {
         );
         assert_eq!(LinkProcessPolicy::ProcessPassive.cp_passive_only(), None);
         assert_eq!(LinkProcessPolicy::NoProcess.cp_passive_only(), None);
+    }
+
+    /// R6-4 — `DBF_OUTLINK` discards CP/CPP (`dbStaticLib.c:2382-2387`
+    /// `modifiers &= ~(pvlOptCPP|pvlOptCP)`), so an OUT link can never report
+    /// `cp_passive_only()` and can never be registered as a CP holder by
+    /// `classify_cp_link`. The boundary that matters is the *combination* —
+    /// C strips only the CP/CPP bit, leaving PP/CA/MS untouched.
+    #[test]
+    fn out_link_discards_cp_and_cpp_but_keeps_the_other_modifiers() {
+        for text in ["TARGET.VAL CP", "TARGET.VAL CPP", "TARGET CP MS"] {
+            match parse_output_link_v2(text) {
+                ParsedLink::Db(db) => {
+                    assert_eq!(
+                        db.policy,
+                        LinkProcessPolicy::NoProcess,
+                        "{text} must lose its CP/CPP class"
+                    );
+                    assert_eq!(
+                        db.policy.cp_passive_only(),
+                        None,
+                        "{text} must not be a CP holder"
+                    );
+                }
+                other => panic!("expected Db link for {text}, got {other:?}"),
+            }
+        }
+        // The MS bit survives the OUTLINK mask (only CP/CPP is cleared).
+        match parse_output_link_v2("TARGET CP MS") {
+            ParsedLink::Db(db) => assert_eq!(db.monitor_switch, MonitorSwitch::Maximize),
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // `PP CP` — C's chain matches PP first, so there is no CP bit to strip
+        // and the link stays a processing output link.
+        match parse_output_link_v2("TARGET PP CP") {
+            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::ProcessPassive),
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // A ` CA` OUT link is still an external channel — CA is not masked.
+        assert!(matches!(
+            parse_output_link_v2("OTHER:PV CA"),
+            ParsedLink::Ca(_)
+        ));
+    }
+
+    /// The warning predicate must agree with what the parser actually discards:
+    /// true exactly when the OUT mask downgrades a CP/CPP class.
+    #[test]
+    fn out_link_discards_cp_predicate_tracks_the_mask() {
+        for text in ["TARGET CP", "TARGET CPP", "TARGET CP MS", "TARGET MSI CPP"] {
+            assert!(out_link_discards_cp(text), "{text} loses its CP/CPP");
+        }
+        for text in [
+            "TARGET",            // no modifiers at all
+            "TARGET PP",         // PP wins the chain
+            "TARGET CA",         // CA wins the chain
+            "TARGET NPP",        // NPP wins the chain
+            "TARGET PP CP",      // PP is matched before CP
+            "TARGETCP",          // a name that merely ends in "CP" is not a modifier
+            "\"CP\"",            // quoted constant, never modifier-scanned
+            "{ca: {pv: \"X\"}}", // JSON link, never modifier-scanned
+        ] {
+            assert!(!out_link_discards_cp(text), "{text} discards nothing");
+        }
+    }
+
+    /// R6-4 — `DBF_FWDLINK` masks the modifier set to `pvlOptCA` alone
+    /// (`dbStaticLib.c:2390`): every process class other than CA, and every
+    /// maximize-severity switch, is cleared.
+    #[test]
+    fn fwd_link_masks_everything_except_ca() {
+        for text in ["NEXT PP", "NEXT CP", "NEXT CPP", "NEXT NPP"] {
+            match parse_forward_link_v2(text) {
+                ParsedLink::Db(db) => {
+                    assert_eq!(db.policy, LinkProcessPolicy::NoProcess, "{text}");
+                    assert_eq!(db.monitor_switch, MonitorSwitch::NoMaximize, "{text}");
+                }
+                other => panic!("expected Db link for {text}, got {other:?}"),
+            }
+        }
+        // MS is masked off even without a process-class modifier.
+        match parse_forward_link_v2("NEXT MS") {
+            ParsedLink::Db(db) => assert_eq!(db.monitor_switch, MonitorSwitch::NoMaximize),
+            other => panic!("expected Db link, got {other:?}"),
+        }
+        // CA is the one bit that survives — a forward link may still cross IOCs.
+        match parse_forward_link_v2("OTHER:REC CA MS") {
+            ParsedLink::Ca(ca) => {
+                assert_eq!(ca.pv, "OTHER:REC");
+                assert_eq!(ca.monitor_switch, MonitorSwitch::NoMaximize);
+            }
+            other => panic!("expected Ca link, got {other:?}"),
+        }
     }
 }

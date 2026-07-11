@@ -1388,7 +1388,10 @@ impl PvDatabase {
                     if link_str.is_empty() {
                         continue;
                     }
-                    let parsed = crate::server::record::parse_link_v2(link_str);
+                    // fanout `LNK1`..`LNKF` are `DBF_FWDLINK`
+                    // (`fanoutRecord.dbd.pod:144`), so C masks their modifiers
+                    // to `pvlOptCA` alone (`dbStaticLib.c:2390`).
+                    let parsed = crate::server::record::parse_forward_link_v2(link_str);
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                         // C `fanoutRecord.c:110/121/138` dispatches each
                         // selected LNKn via `dbScanFwdLink` →

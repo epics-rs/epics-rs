@@ -5157,6 +5157,62 @@ async fn test_dol_cp_link_triggers_processing() {
     }
 }
 
+/// R6-4 — an `OUT` link is a `DBF_OUTLINK`, and C's `dbParseLink` discards its
+/// CP/CPP modifier before the link is ever built
+/// (`dbStaticLib.c:2382-2387` — `modifiers &= ~(pvlOptCPP|pvlOptCP)`, with a
+/// startup warning). It must therefore never enter the CP trigger registry:
+/// registering it would make the holder reprocess on every target change,
+/// which — since the holder *writes* that target — is a processing loop that
+/// does not exist on a C IOC. The same text on an `INP` (`DBF_INLINK`) does
+/// register, which is the boundary this pins.
+#[tokio::test]
+async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
+    let db = PvDatabase::new();
+    db.add_record("CPOUT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("CPOUT_HOLDER", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("CPIN_HOLDER", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("CPOUT_HOLDER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("CPOUT_TGT PP CP".into()))
+            .unwrap();
+    }
+    if let Some(rec) = db.get_record("CPIN_HOLDER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("CPOUT_TGT CP".into()))
+            .unwrap();
+    }
+    db.setup_cp_links().await;
+
+    let targets = db.get_cp_targets("CPOUT_TGT").await;
+    assert_eq!(
+        targets.len(),
+        1,
+        "only the DBF_INLINK holder may subscribe; got {targets:?}"
+    );
+    assert_eq!(targets[0].record, "CPIN_HOLDER");
+    assert!(
+        !targets.iter().any(|t| t.record == "CPOUT_HOLDER"),
+        "an OUT link's CP modifier is discarded by C and must not register a CP trigger"
+    );
+
+    // The rest of the OUT link's modifiers survive the mask: ` PP` still
+    // processes the target (`dbDbLink.c:387-390`).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CPOUT_HOLDER", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        db.get_pv("CPOUT_TGT").await.is_ok(),
+        "the PP OUT link must still reach its target"
+    );
+}
+
 /// A CPP link registers as `passive_only` (distinct from CP). Collapsing
 /// CPP into CP loses C's `precord->scan == 0` gate (`dbCa.c:994`).
 #[tokio::test]

@@ -836,7 +836,7 @@ impl PvDatabase {
         };
         let (waitset, completion) = Self::new_put_notify();
         if !link_str.is_empty() {
-            let parsed = crate::server::record::parse_link_v2(link_str);
+            let parsed = crate::server::record::parse_output_link_v2(link_str);
             // Seed the cycle-guard with the source so a target linking back
             // does not re-process it, exactly as a top-level OUT-link write
             // does (`process_record_with_links_inner` inserts its own name).
@@ -3478,9 +3478,11 @@ impl PvDatabase {
                     // `TRIG`/`OUTL`); that field may resolve to a CA/PVA
                     // link, which C `dbPutLink` routes through the link
                     // set's `putValue` identically to a DB link
-                    // (dbLink.c:434-448).
-                    let parsed =
-                        crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
+                    // (dbLink.c:434-448). The field is a `DBF_OUTLINK`, so it
+                    // carries the OUT modifier mask (`dbStaticLib.c:2382-2387`).
+                    let parsed = crate::server::record::parse_output_link_v2(
+                        link_str.as_str_lossy().as_ref(),
+                    );
                     self.write_out_link_value(
                         &parsed,
                         value,
@@ -3561,8 +3563,11 @@ impl PvDatabase {
                     };
                     let (waitset, completion) = Self::new_put_notify();
                     if !link_str.is_empty() {
-                        let parsed =
-                            crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
+                        // `DBF_OUTLINK` field — OUT modifier mask applies
+                        // (`dbStaticLib.c:2382-2387`).
+                        let parsed = crate::server::record::parse_output_link_v2(
+                            link_str.as_str_lossy().as_ref(),
+                        );
                         self.write_out_link_value(
                             &parsed,
                             value,
@@ -4613,7 +4618,18 @@ impl PvDatabase {
             }
 
             let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
-            let siol_parsed = crate::server::record::parse_link_v2(siol.as_str_lossy().as_ref());
+            // SIOL is `DBF_INLINK` on an input record (`aiRecord.dbd.pod:492`)
+            // and `DBF_OUTLINK` on an output one (`aoRecord.dbd.pod:551`), so
+            // its modifier mask (`dbStaticLib.c:2380-2391`) follows the same
+            // direction split — CP/CPP is discarded on the output side.
+            let siol_parsed = crate::server::record::parse_link_field(
+                siol.as_str_lossy().as_ref(),
+                if is_input {
+                    crate::server::record::LinkFieldType::In
+                } else {
+                    crate::server::record::LinkFieldType::Out
+                },
+            );
 
             (
                 siml_parsed,

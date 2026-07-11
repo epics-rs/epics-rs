@@ -336,19 +336,31 @@ impl AxisRuntime {
 
     async fn poll_motor(&mut self) {
         let user = AsynUser::new(0);
-        match self.motor.poll(&user) {
-            Ok(status) => {
-                self.status_seq += 1;
-                self.latest_status = Some(status);
-                let _ = self.io_intr_tx.send(()).await;
-            }
+        // A failed poll must still publish a status. C drivers signal the
+        // failure by setting `motorStatusProblem_` + `motorStatusCommsError_`
+        // and calling `callParamCallbacks()` anyway before returning the error
+        // (smarActMCSMotorDriver.cpp:503-507, XPSAxis.cpp:756); the caller
+        // discards the returned status (asynMotorController.cpp:219-221 forced,
+        // :658 background), so the failure reaches the record only as MSTA
+        // bit 12 (COMM_ERR) → COMM/INVALID alarm (motorRecord.cc:3392-3398).
+        // Every field the failed poll never wrote keeps its previous value,
+        // which is what carrying `latest_status` forward reproduces.
+        let status = match self.motor.poll(&user) {
+            Ok(status) => status,
             Err(e) => {
                 let _ = self.event_tx.send(RuntimeEvent::Error {
                     port_name: format!("axis-{}", self.axis_id),
                     message: e.to_string(),
                 });
+                let mut status = self.latest_status.clone().unwrap_or_default();
+                status.comms_error = true;
+                status.problem = true;
+                status
             }
-        }
+        };
+        self.status_seq += 1;
+        self.latest_status = Some(status);
+        let _ = self.io_intr_tx.send(()).await;
     }
 }
 
@@ -486,6 +498,103 @@ mod tests {
         // Initial poll should trigger io_intr
         let result = tokio::time::timeout(Duration::from_millis(100), io_intr_rx.recv()).await;
         assert!(result.is_ok());
+
+        handle.shutdown().await;
+        let _ = rt_handle.await;
+    }
+
+    /// R6-50: a poll that fails must still publish a status carrying
+    /// COMM_ERR, not just log an event — otherwise MSTA never raises bit 12,
+    /// the record never processes, and the axis silently freezes on its last
+    /// good readback. C drivers set `motorStatusProblem_` +
+    /// `motorStatusCommsError_` and call `callParamCallbacks()` before
+    /// returning the error (smarActMCSMotorDriver.cpp:503-507, XPSAxis.cpp:756).
+    #[tokio::test]
+    async fn failed_poll_publishes_comms_error_status() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FlakyMotor {
+            offline: Arc<AtomicBool>,
+        }
+        impl AsynMotor for FlakyMotor {
+            fn move_absolute(
+                &mut self,
+                _user: &AsynUser,
+                _pos: f64,
+                _min_vel: f64,
+                _vel: f64,
+                _acc: f64,
+            ) -> AsynResult<()> {
+                Ok(())
+            }
+            fn home(
+                &mut self,
+                _user: &AsynUser,
+                _min_vel: f64,
+                _vel: f64,
+                _acc: f64,
+                _forward: bool,
+            ) -> AsynResult<()> {
+                Ok(())
+            }
+            fn stop(&mut self, _user: &AsynUser, _acc: f64) -> AsynResult<()> {
+                Ok(())
+            }
+            fn set_position(&mut self, _user: &AsynUser, _pos: f64) -> AsynResult<()> {
+                Ok(())
+            }
+            fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+                if self.offline.load(Ordering::SeqCst) {
+                    return Err(crate::error::AsynError::Status {
+                        status: crate::error::AsynStatus::Timeout,
+                        message: "controller not responding".into(),
+                    });
+                }
+                Ok(MotorStatus {
+                    position: 3.5,
+                    done: true,
+                    ..MotorStatus::default()
+                })
+            }
+        }
+
+        let offline = Arc::new(AtomicBool::new(false));
+        let (runtime, handle) = create_axis_runtime(
+            Box::new(FlakyMotor {
+                offline: offline.clone(),
+            }),
+            Duration::from_millis(5),
+            0,
+        );
+        let rt_handle = tokio::spawn(runtime.run());
+
+        // Healthy poll first, so the failure has a last-known status to carry
+        // forward (C's parameter library keeps every field the failed poll
+        // never wrote).
+        handle.start_polling().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let healthy = handle.get_status().await.expect("healthy status");
+        assert!(!healthy.comms_error);
+        assert_eq!(healthy.position, 3.5);
+
+        // Cut the link; the next poll fails.
+        offline.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let failed = handle.get_status().await.expect("status after failed poll");
+        assert!(
+            failed.comms_error,
+            "a failed poll must publish COMM_ERR (MSTA bit 12), not swallow the error"
+        );
+        assert!(
+            failed.problem,
+            "C sets motorStatusProblem_ alongside motorStatusCommsError_"
+        );
+        assert_eq!(
+            failed.position, 3.5,
+            "fields the failed poll never wrote keep their last-known value"
+        );
 
         handle.shutdown().await;
         let _ = rt_handle.await;

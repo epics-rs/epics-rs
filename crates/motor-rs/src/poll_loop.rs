@@ -74,24 +74,67 @@ impl MotorPollLoop {
     /// `force=false` and notifies only when the polled status differs from the
     /// last one delivered — the analogue of C's `statusChanged_` gate, so a
     /// settled, unchanging axis does not re-post DIFF/RDIF every idle period.
+    /// The status a *failed* poll posts.
+    ///
+    /// C parity: a driver's `poll()` failure path sets `motorStatusProblem_`
+    /// and `motorStatusCommsError_` and still calls `callParamCallbacks()`
+    /// before returning the error — e.g. `smarActMCSMotorDriver.cpp:503-507`,
+    /// `XPSAxis.cpp:756`. The asyn parameter library keeps the previous value
+    /// of every field the failed poll never wrote, so the posted status is the
+    /// last known one with exactly those two flags forced on. That is what
+    /// this reproduces: `MotorStatus::default()` only stands in for the very
+    /// first poll, before any status has been seen.
+    ///
+    /// `asynMotorController` never acts on the returned status itself — the
+    /// forced path captures it and discards it while forcing
+    /// `statusChanged_ = 1` (asynMotorController.cpp:219-221), and the
+    /// background poller ignores it outright (:658). Failure reaches the
+    /// record purely as MSTA bit 12 (`COMM_ERR`), which `alarm_sub` turns
+    /// into a COMM/INVALID alarm (motorRecord.cc:3392-3398).
+    fn comms_error_status(&self) -> MotorStatus {
+        let mut status = self.last_status.clone().unwrap_or_default();
+        status.comms_error = true;
+        status.problem = true;
+        status
+    }
+
     async fn poll_and_notify(&mut self, force: bool) {
         let user = AsynUser::new(0);
-        let status = {
-            let mut motor = match self.motor.lock() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            match motor.poll(&user) {
-                Ok(s) => s,
-                Err(_) => return,
+        // A transport failure — or a poisoned driver mutex, which leaves the
+        // motor just as unreachable — is the Rust spelling of the C driver
+        // poll that bails to its `commsError` label. It must still produce a
+        // status post, or MSTA never raises COMM_ERR, the record never
+        // processes, and a `STUP=BUSY` refresh latches forever waiting for a
+        // sequence that will not come (record/status_update.rs:48-58).
+        let polled = match self.motor.lock() {
+            Ok(mut motor) => motor.poll(&user).map_err(|e| {
+                tracing::warn!("motor poll failed, posting COMM_ERR: {e}");
+            }),
+            Err(e) => {
+                tracing::error!("motor mutex poisoned, posting COMM_ERR: {e}");
+                Err(())
             }
         };
+        let status = match polled {
+            Ok(s) => s,
+            Err(()) => self.comms_error_status(),
+        };
         // The poll rate decision (moving vs idle) always tracks the latest
-        // poll, independent of whether the record is notified.
+        // poll, independent of whether the record is notified. On a failed
+        // poll this carries the last known `moving` forward: C's
+        // `pAxis->poll(&moving)` leaves `*moving` untouched when the driver
+        // bails early, so the poller keeps the rate it was already using —
+        // reading the stale value is a C quirk, but "keep the last known
+        // rate" is its deterministic meaning.
         self.last_moving = status.moving;
         if !force && self.last_status.as_ref() == Some(&status) {
             // Autonomous idle poll, status unchanged → no record pass (C posts
-            // nothing when statusChanged_ stays 0).
+            // nothing when statusChanged_ stays 0). A *repeated* comms failure
+            // lands here too, and correctly so: the COMM_ERR flag is already
+            // set, no parameter changed, so C's `statusChanged_` stays 0 and
+            // `asynMotorAxis::callParamCallbacks` posts nothing
+            // (asynMotorAxis.cpp:316-322). The first failure — the one that
+            // flips the flag — always differs from the last status and posts.
             return;
         }
         self.last_status = Some(status.clone());

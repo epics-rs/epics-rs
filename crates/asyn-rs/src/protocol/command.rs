@@ -156,6 +156,11 @@ pub enum PortCommand {
     PushDelayInterpose {
         delay_secs: f64,
     },
+    /// Read back the driver's input EOS — C `pasynOctet->getInputEos`.
+    /// Appended last: the variant order is the wire encoding.
+    GetInputEos,
+    /// Read back the driver's output EOS — C `pasynOctet->getOutputEos`.
+    GetOutputEos,
 }
 
 #[cfg(test)]
@@ -223,6 +228,8 @@ mod tests {
             PortCommand::GetConnected,
             PortCommand::PushEchoInterpose,
             PortCommand::PushDelayInterpose { delay_secs: 0.001 },
+            PortCommand::GetInputEos,
+            PortCommand::GetOutputEos,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

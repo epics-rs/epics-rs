@@ -103,6 +103,8 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            RequestOp::GetInputEos => Self::GetInputEos,
+            RequestOp::GetOutputEos => Self::GetOutputEos,
         }
     }
 }
@@ -218,6 +220,8 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Report { level } => Self::Report { level: *level },
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            PortCommand::GetInputEos => Self::GetInputEos,
+            PortCommand::GetOutputEos => Self::GetOutputEos,
         }
     }
 }

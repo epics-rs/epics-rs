@@ -685,6 +685,22 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Read back the driver's input EOS bytes — C `pasynOctet->getInputEos`,
+    /// the read half asynRecord's `getEos` (asynRecord.c:1985-2026) runs after
+    /// every IEOS/OEOS put.
+    pub fn get_input_eos_blocking(&self) -> AsynResult<Vec<u8>> {
+        let user = AsynUser::default();
+        let result = self.submit_blocking(RequestOp::GetInputEos, user)?;
+        Ok(result.data.unwrap_or_default())
+    }
+
+    /// Read back the driver's output EOS bytes — C `pasynOctet->getOutputEos`.
+    pub fn get_output_eos_blocking(&self) -> AsynResult<Vec<u8>> {
+        let user = AsynUser::default();
+        let result = self.submit_blocking(RequestOp::GetOutputEos, user)?;
+        Ok(result.data.unwrap_or_default())
+    }
+
     pub async fn get_option(&self, key: &str) -> AsynResult<String> {
         let user = AsynUser::default();
         let result = self

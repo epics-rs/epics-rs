@@ -894,6 +894,16 @@ impl PortActor {
                 self.driver.set_output_eos(eos)?;
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::GetInputEos => {
+                let eos = self.driver.get_input_eos();
+                let n = eos.len();
+                Ok(RequestResult::octet_read(eos, n))
+            }
+            RequestOp::GetOutputEos => {
+                let eos = self.driver.get_output_eos();
+                let n = eos.len();
+                Ok(RequestResult::octet_read(eos, n))
+            }
         };
 
         // Attach alarm/timestamp metadata on successful reads

@@ -1046,6 +1046,20 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
 /// `AQR` request (asynRecord.c:398).
 const CANCELED_MSG: &str = "I/O request canceled";
 
+/// The fields C `getOptions` re-reads from the driver and POST_IF_NEWs
+/// (asynRecord.c:1834-1938: `REMEMBER_STATE` on each, then `POST_IF_NEW` after
+/// the `getOption` calls). Same set as [`AsynRecord::read_options_from_driver`]
+/// writes — the two must stay in step, or an option would be refreshed without
+/// its monitor firing.
+const OPTION_READBACK_FIELDS: &[&str] = &[
+    "BAUD", "LBAUD", "PRTY", "DBIT", "SBIT", "MCTL", "FCTL", "IXON", "IXOFF", "IXANY", "HOSTINFO",
+    "DRTO",
+];
+
+/// The fields C `getEos` re-reads and posts (asynRecord.c:2016-2024) — both
+/// EOS strings, whichever one was written.
+const EOS_READBACK_FIELDS: &[&str] = &["IEOS", "OEOS"];
+
 /// Build the asyn trace readback fields from the three trace masks — the
 /// single source of the mask→field mapping that C `monitorStatus`
 /// recomputes and posts (asynRecord.c:1066-1117). The bit assignments mirror
@@ -1889,8 +1903,18 @@ impl AsynRecord {
         }
     }
 
-    /// Read serial/IP options from the driver into record fields.
+    /// Read serial/IP options from the driver into record fields — C
+    /// `getOptions` (asynRecord.c:1834-1938). It is the *only* writer of the
+    /// [`OPTION_READBACK_FIELDS`] from the driver side, and it runs on every
+    /// option put (see [`Self::write_option`]) as well as on connect, so those
+    /// fields always show the driver's actual value rather than the requested
+    /// one.
     fn read_options_from_driver(&mut self, handle: &PortHandle) {
+        // C returns immediately when the port carries no asynOption interface
+        // (asynRecord.c:1843-1844) — the record keeps the values it had.
+        if self.optioniv == 0 {
+            return;
+        }
         // Baud rate
         if let Ok(val) = handle.get_option_blocking("baud") {
             self.lbaud = val.parse::<i32>().unwrap_or(0);
@@ -1978,7 +2002,92 @@ impl AsynRecord {
         }
     }
 
-    /// Write a serial/IP option to the driver via SetOption.
+    /// Read both EOS strings back from the driver into IEOS/OEOS — C `getEos`
+    /// (asynRecord.c:1985-2026). The single driver-side writer of
+    /// [`EOS_READBACK_FIELDS`], run after every EOS put (see the `IEOS`/`OEOS`
+    /// arms of `special`).
+    ///
+    /// C seeds both escaped buffers to `""` and overwrites a buffer only when
+    /// the corresponding `getInputEos`/`getOutputEos` succeeds *and* returns a
+    /// non-empty EOS, so a port with no asynOctet interface, a failing get, or
+    /// a driver holding no EOS all land as an empty field. The escaping is
+    /// `epicsStrSnPrintEscaped`, the same transform TINP uses
+    /// (`format_io_data` with `TraceIoMask::ESCAPE`) and the exact inverse of
+    /// the `translate_escape` the put path applies.
+    fn read_eos_from_driver(&mut self, handle: &PortHandle) {
+        let mut ieos = String::new();
+        let mut oeos = String::new();
+        if self.octetiv != 0 {
+            match handle.get_input_eos_blocking() {
+                Ok(bytes) if !bytes.is_empty() => {
+                    ieos = crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE);
+                }
+                _ => {}
+            }
+            match handle.get_output_eos_blocking() {
+                Ok(bytes) if !bytes.is_empty() => {
+                    oeos = crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE);
+                }
+                _ => {}
+            }
+        }
+        self.ieos = ieos;
+        self.oeos = oeos;
+    }
+
+    /// Snapshot the named fields' current values — C `REMEMBER_STATE`
+    /// (asynRecord.c:1850-1862, :1999-2000): the "before" half of a
+    /// driver-readback POST_IF_NEW. Feed the result to [`Self::post_if_new`]
+    /// after the readback has written the fields.
+    fn field_snapshot(&self, names: &[&str]) -> Vec<(String, EpicsValue)> {
+        names
+            .iter()
+            .filter_map(|name| self.get_field(name).map(|v| ((*name).to_string(), v)))
+            .collect()
+    }
+
+    /// Post the fields whose value changed across a driver readback — C
+    /// `POST_IF_NEW` (asynRecord.c:210-214) as `getOptions` / `getEos` use it.
+    ///
+    /// Posting is out of band (the record lock is held by the `special` caller,
+    /// and `post_fields` is async), matching the C `db_post_events` those two
+    /// functions issue from inside the callback rather than from `process`.
+    /// Without a database handle / runtime — a record driven outside a database,
+    /// as in the unit tests — the field values are still refreshed; only the
+    /// monitor post is unavailable.
+    fn post_if_new(&self, before: &[(String, EpicsValue)]) {
+        let changed: Vec<(String, EpicsValue)> = before
+            .iter()
+            .filter_map(|(field, old)| {
+                let new = self.get_field(field)?;
+                (new != *old).then(|| (field.clone(), new))
+            })
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let (Some((name, db)), Ok(rt)) = (
+            self.async_ctx.clone(),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
+        };
+        rt.spawn(async move {
+            let _ = db.post_fields(&name, changed).await;
+        });
+    }
+
+    /// Write a serial/IP option to the driver via SetOption, then re-read every
+    /// option back from the driver.
+    ///
+    /// C `asynCallbackSpecial` falls through `callbackSetOption` into
+    /// `callbackGetOption` (asynRecord.c:845-849, the `/* no break */`), so a
+    /// `setOption` is *always* followed by `getOptions` — even when the set
+    /// failed. That is what makes the option fields a readback of the driver
+    /// rather than a latch of the operator's request: a driver that rounds 9601
+    /// to 9600, or rejects the baud outright, snaps the field to what it really
+    /// holds. Skipping the re-read left the record advertising a line setting
+    /// the hardware never adopted.
     ///
     /// C `setOption` reports a failing `pasynOption->setOption` as
     /// `"Error setting option, %s"` with `pasynUser->errorMessage`
@@ -1986,11 +2095,43 @@ impl AsynRecord {
     /// record severity. The port invented `"set_option({key}): {e}"`, which
     /// also prefixed the Rust status debug onto the driver text.
     fn write_option(&mut self, key: &str, value: &str) {
-        if let Some(ref entry) = self.port_entry {
-            if let Err(e) = entry.handle.set_option_blocking(key, value) {
-                self.errs = format!("Error setting option, {}", e.message());
-            }
+        let Some(entry) = self.port_entry.clone() else {
+            return;
+        };
+        if let Err(e) = entry.handle.set_option_blocking(key, value) {
+            self.errs = format!("Error setting option, {}", e.message());
         }
+        let before = self.field_snapshot(OPTION_READBACK_FIELDS);
+        self.read_options_from_driver(&entry.handle);
+        self.post_if_new(&before);
+    }
+
+    /// Write one EOS string to the driver, then re-read *both* back — the
+    /// `callbackSetEos` → `callbackGetEos` fall-through (asynRecord.c:851-855).
+    /// Same invariant as [`Self::write_option`]: IEOS/OEOS show the driver's
+    /// EOS, not the requested one, whether or not the set succeeded.
+    ///
+    /// C `setEos` reports a failing `setOutputEos`/`setInputEos` as
+    /// `"Error setting output eos, %s"` / `"Error setting input eos, %s"` with
+    /// `pasynUser->errorMessage` (asynRecord.c:1968-1983).
+    fn write_eos(&mut self, output: bool) {
+        let Some(entry) = self.port_entry.clone() else {
+            return;
+        };
+        let field = if output { &self.oeos } else { &self.ieos };
+        let bytes = translate_escape(field);
+        let res = if output {
+            entry.handle.set_output_eos_blocking(&bytes)
+        } else {
+            entry.handle.set_input_eos_blocking(&bytes)
+        };
+        if let Err(e) = res {
+            let which = if output { "output" } else { "input" };
+            self.errs = format!("Error setting {which} eos, {}", e.message());
+        }
+        let before = self.field_snapshot(EOS_READBACK_FIELDS);
+        self.read_eos_from_driver(&entry.handle);
+        self.post_if_new(&before);
     }
 
     /// Refresh CNCT from the port's *transport* state — the single owner of
@@ -3136,25 +3277,10 @@ impl Record for AsynRecord {
             // trait hooks (`set_input_eos` / `set_output_eos`) so
             // the value reaches `PortDriverBase::input_eos /
             // output_eos`, which is what the EOS interpose reads.
-            // C `setEos` reports a failing setOutputEos/setInputEos as
-            // "Error setting output eos, %s" / "Error setting input eos, %s"
-            // with pasynUser->errorMessage (asynRecord.c:1968-1983).
-            "OEOS" => {
-                let bytes = translate_escape(&self.oeos);
-                if let Some(ref entry) = self.port_entry {
-                    if let Err(e) = entry.handle.set_output_eos_blocking(&bytes) {
-                        self.errs = format!("Error setting output eos, {}", e.message());
-                    }
-                }
-            }
-            "IEOS" => {
-                let bytes = translate_escape(&self.ieos);
-                if let Some(ref entry) = self.port_entry {
-                    if let Err(e) = entry.handle.set_input_eos_blocking(&bytes) {
-                        self.errs = format!("Error setting input eos, {}", e.message());
-                    }
-                }
-            }
+            // Both puts run the C set→get fall-through through the single
+            // `write_eos` owner (asynRecord.c:851-855).
+            "OEOS" => self.write_eos(true),
+            "IEOS" => self.write_eos(false),
 
             // --- UI32MASK change ---
             "UI32MASK" => {
@@ -4115,6 +4241,118 @@ mod tests {
         opt.oeos = "\\r".to_string();
         opt.special("OEOS", true).unwrap();
         assert_eq!(opt.errs, "Error setting output eos, oeos boom");
+        // The failed EOS sets fall through to the C `getEos` re-read (R9-47),
+        // which finds no EOS in this driver and empties both fields.
+        assert_eq!(opt.ieos, "");
+        assert_eq!(opt.oeos, "");
+    }
+
+    /// R9-47: C `asynCallbackSpecial` falls *through* `callbackSetOption` into
+    /// `callbackGetOption` (asynRecord.c:845-849) and `callbackSetEos` into
+    /// `callbackGetEos` (:851-855) — the `/* no break */` comments. So every
+    /// option / EOS put ends with `getOptions` (:1834) / `getEos` (:1985)
+    /// re-reading the driver's *actual* values into the record fields and
+    /// POST_IF_NEWing them, even when the set failed. The port set and never
+    /// re-read, so the record advertised the operator's request: a driver that
+    /// only runs at 9600 still showed LBAUD=115200, and a rejected EOS stayed
+    /// in IEOS as though the driver had taken it.
+    ///
+    /// `getEos` re-reads *both* EOS strings (:2003, :2009) whichever one was
+    /// written, so an IEOS put also refreshes OEOS — pinned below.
+    #[test]
+    fn option_and_eos_puts_fall_through_to_a_driver_re_read() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        /// A driver whose hardware ignores what it is told: the baud set is
+        /// accepted but the line stays at 9600, and both EOS sets are rejected
+        /// outright while the driver keeps its own terminators.
+        struct StubbornDriver(PortDriverBase);
+        impl PortDriver for StubbornDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn set_option(&mut self, _k: &str, _v: &str) -> crate::error::AsynResult<()> {
+                Ok(())
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                match key {
+                    "baud" => Ok("9600".to_string()),
+                    "parity" => Ok("even".to_string()),
+                    _ => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("unsupported option {key}"),
+                    }),
+                }
+            }
+            fn set_input_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "ieos boom".to_string(),
+                })
+            }
+            fn get_input_eos(&self) -> Vec<u8> {
+                b"\r\n".to_vec()
+            }
+            fn set_output_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "oeos boom".to_string(),
+                })
+            }
+            fn get_output_eos(&self) -> Vec<u8> {
+                b"\n".to_vec()
+            }
+        }
+
+        let port_name = "test_option_eos_reread";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(StubbornDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+
+        // The operator asks for 115200. The set succeeds; the driver stays at
+        // 9600. C's getOptions fall-through snaps LBAUD (and the BAUD menu
+        // index derived from it) back to what the port really runs at.
+        rec.lbaud = 115_200;
+        rec.special("LBAUD", true).unwrap();
+        assert_eq!(rec.lbaud, 9600, "LBAUD is a driver readback, not a latch");
+        assert_eq!(rec.baud, baud_rate_to_menu_index(9600));
+        assert_eq!(rec.errs, "", "the set succeeded — no ERRS");
+        // A field the driver refuses to report is left alone (C only overwrites
+        // what `getOption` filled in).
+        assert_eq!(rec.prty, 2, "parity readback: even");
+
+        // The EOS set fails. C reports it, then re-reads BOTH EOS strings and
+        // shows the driver's actual terminators — escaped, as `getEos` does
+        // with epicsStrSnPrintEscaped.
+        rec.ieos = "\\n".to_string();
+        rec.special("IEOS", true).unwrap();
+        assert_eq!(rec.errs, "Error setting input eos, ieos boom");
+        assert_eq!(rec.ieos, "\\r\\n", "IEOS snaps back to the driver's EOS");
+        assert_eq!(
+            rec.oeos, "\\n",
+            "an IEOS put re-reads the output EOS too (asynRecord.c:2009)"
+        );
     }
 
     /// R9-50: C `performOctetIO` calls the pre-write flush as a bare statement

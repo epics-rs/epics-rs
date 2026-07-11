@@ -250,6 +250,13 @@ pub enum RequestOp {
     SetOutputEos {
         eos: Vec<u8>,
     },
+    /// Read back the port's input EOS bytes — C `pasynOctet->getInputEos`.
+    /// asynRecord's `getEos` (asynRecord.c:1985-2026) calls it after every
+    /// IEOS/OEOS put so the record shows what the driver actually holds, not
+    /// what was requested. Returns the bytes in [`RequestResult::data`].
+    GetInputEos,
+    /// Read back the port's output EOS bytes — C `pasynOctet->getOutputEos`.
+    GetOutputEos,
     /// Query whether the port's *transport* is connected. C parity:
     /// `pasynManager->isConnected` — the state the driver publishes through
     /// `exceptionConnect`/`exceptionDisconnect`, not "is a record bound to

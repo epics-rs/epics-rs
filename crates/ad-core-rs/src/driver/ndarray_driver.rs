@@ -621,6 +621,18 @@ impl NDArrayDriverBase {
         Ok(full)
     }
 
+    /// Stamp `epicsTS` and the derived double `timeStamp` on `array`.
+    ///
+    /// C++ `asynNDArrayDriver::updateTimeStamps` (asynNDArrayDriver.cpp:832-836).
+    /// The time comes from the port's registered timestamp source, so a driver
+    /// with a hardware clock stamps from it (C `updateTimeStamp`), and
+    /// `timeStamp` is always derived from `epicsTS` — the two cannot disagree.
+    /// `NDArrayPool::alloc` sets neither; this is the only place that sets them
+    /// for a newly produced frame.
+    pub fn update_time_stamps(&self, array: &mut NDArray) {
+        array.update_time_stamps(self.port_base.current_timestamp().into());
+    }
+
     /// Check whether the `FILE_PATH` directory exists, normalizing the path.
     ///
     /// C++ `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-109): an

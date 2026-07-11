@@ -366,6 +366,33 @@ impl NDArray {
         }
     }
 
+    /// Stamp both timestamps from one time source.
+    ///
+    /// The single owner of the timestamp pair, mirroring C++
+    /// `asynNDArrayDriver::updateTimeStamps` (asynNDArrayDriver.cpp:832-836):
+    ///
+    /// ```text
+    /// updateTimeStamp(&pArray->epicsTS);
+    /// pArray->timeStamp = pArray->epicsTS.secPastEpoch + pArray->epicsTS.nsec/1.e9;
+    /// ```
+    ///
+    /// `timeStamp` is *derived* from `epicsTS`, so the two can never disagree.
+    /// Nothing else may write one without the other — `NDArrayPool::alloc` sets
+    /// neither, exactly as C does.
+    pub fn update_time_stamps(&mut self, epics_ts: EpicsTimestamp) {
+        self.timestamp = epics_ts;
+        self.time_stamp = epics_ts.as_f64();
+    }
+
+    /// Stamp both timestamps from the current wall clock.
+    ///
+    /// Convenience form of [`NDArray::update_time_stamps`] for drivers with no
+    /// custom time source (C++ `updateTimeStamp` falls back to
+    /// `epicsTimeGetCurrent` when no timestamp source is registered).
+    pub fn update_time_stamps_now(&mut self) {
+        self.update_time_stamps(EpicsTimestamp::now());
+    }
+
     /// Compute layout info for this array (matching C++ NDArray::getInfo).
     ///
     /// For 3D arrays, reads the `ColorMode` attribute to determine which

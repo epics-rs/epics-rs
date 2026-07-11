@@ -6,7 +6,6 @@ use parking_lot::Mutex;
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use crate::ndarray_handle::{NDArrayHandle, pooled_array};
-use crate::timestamp::EpicsTimestamp;
 
 /// If a free-list buffer is more than this ratio larger than needed, discard
 /// it and allocate fresh to avoid wasting memory.
@@ -253,7 +252,13 @@ impl NDArrayPool {
         };
 
         arr.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
-        arr.timestamp = EpicsTimestamp::now();
+        // The "Initialize fields" block of C++ NDArrayPool::alloc
+        // (NDArrayPool.cpp:187-204) sets neither `epicsTS` nor `timeStamp`: the
+        // driver owns both and stamps them together via
+        // asynNDArrayDriver::updateTimeStamps (asynNDArrayDriver.cpp:832-836).
+        // Stamping only `epicsTS` here left `timeStamp` at 0.0 (fresh buffer) or
+        // at the previous frame's value (reused buffer), so the two published
+        // timestamps disagreed. See NDArray::update_time_stamps.
         arr.pool_id = self.id;
         // `data_size` is already correct: a fresh `NDArray::new` sets it to
         // `needed_bytes`; the reuse branch keeps the buffer's larger size.
@@ -267,7 +272,11 @@ impl NDArrayPool {
         let data_type = source.data.data_type();
         let mut copy = self.alloc(dims, data_type)?;
         copy.data = source.data.clone();
+        // C++ NDArrayPool::copy carries BOTH stamps across (NDArrayPool.cpp:284-285).
+        // Copying only `time_stamp` left `timestamp` (epicsTS) at whatever the
+        // recycled buffer happened to hold.
         copy.time_stamp = source.time_stamp;
+        copy.timestamp = source.timestamp;
         copy.attributes = source.attributes.clone();
         copy.codec = source.codec.clone();
         Ok(copy)
@@ -706,6 +715,67 @@ mod tests {
             .unwrap();
         assert_eq!(a1.unique_id, 1);
         assert_eq!(a2.unique_id, 2);
+    }
+
+    #[test]
+    fn test_r6_65_alloc_stamps_neither_timestamp() {
+        // R6-65 / NDArrayPool.cpp:187-204 — alloc's "Initialize fields" block
+        // sets neither epicsTS nor timeStamp. Stamping only epicsTS left the two
+        // published timestamps disagreeing on every array.
+        let pool = NDArrayPool::new(1_000_000);
+        let fresh = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(fresh.timestamp, crate::timestamp::EpicsTimestamp::default());
+        assert_eq!(fresh.time_stamp, 0.0);
+
+        // Reuse path: C leaves the recycled buffer's stamps alone too, so
+        // whatever is there stays there — but the pair still agrees.
+        let mut used = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        used.update_time_stamps(crate::timestamp::EpicsTimestamp {
+            sec: 1000,
+            nsec: 250_000_000,
+        });
+        pool.release(used);
+        let reused = pool
+            .alloc(vec![NDDimension::new(10)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(reused.timestamp.sec, 1000);
+        assert_eq!(reused.time_stamp, 1000.25);
+    }
+
+    #[test]
+    fn test_r6_65_update_time_stamps_derives_the_double() {
+        // asynNDArrayDriver.cpp:832-836: timeStamp = epicsTS.secPastEpoch +
+        // epicsTS.nsec/1.e9 — derived, so the pair cannot disagree.
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.update_time_stamps(crate::timestamp::EpicsTimestamp {
+            sec: 42,
+            nsec: 500_000_000,
+        });
+        assert_eq!(arr.timestamp.sec, 42);
+        assert_eq!(arr.timestamp.nsec, 500_000_000);
+        assert_eq!(arr.time_stamp, 42.5);
+    }
+
+    #[test]
+    fn test_r6_65_alloc_copy_carries_both_stamps() {
+        // NDArrayPool.cpp:284-285 copies timeStamp AND epicsTS from the source.
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = pool
+            .alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
+            .unwrap();
+        src.update_time_stamps(crate::timestamp::EpicsTimestamp {
+            sec: 777,
+            nsec: 125_000_000,
+        });
+
+        let copy = pool.alloc_copy(&src).unwrap();
+        assert_eq!(copy.timestamp, src.timestamp);
+        assert_eq!(copy.time_stamp, src.time_stamp);
+        assert_eq!(copy.time_stamp, 777.125);
     }
 
     #[test]

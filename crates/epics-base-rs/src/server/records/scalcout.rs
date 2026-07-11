@@ -107,7 +107,11 @@ impl ScalcoutRecord {
         Self::default()
     }
 
-    fn build_inputs(&self) -> StringInputs {
+    /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
+    /// the `VAL` token (`FETCH_VAL`, sCalcPerform.c:921-925) pushes: for CALC
+    /// that is `&pcalc->val` (C `sCalcoutRecord.c:357`) and for OCAL it is
+    /// `&pcalc->oval` (`:768-769`) — in both cases the *previous* result.
+    fn build_inputs(&self, prev_val: f64) -> StringInputs {
         let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
@@ -116,6 +120,7 @@ impl ScalcoutRecord {
             // it lossily; the stored value round-trips verbatim regardless.
             inputs.str_vars[i] = self.str_vals[i].as_str_lossy().into_owned();
         }
+        inputs.prev_val = prev_val;
         inputs
     }
 
@@ -516,7 +521,8 @@ impl Record for ScalcoutRecord {
         let calc_failed = if self.calc.is_empty() {
             false
         } else if let Some(ref compiled) = self.compiled_calc {
-            let mut inputs = self.build_inputs();
+            // C `sCalcoutRecord.c:357` — presult = &pcalc->val.
+            let mut inputs = self.build_inputs(self.val);
             match scalc_eval(compiled, &mut inputs) {
                 Ok(result) => {
                     self.apply_result(&result);
@@ -583,7 +589,10 @@ impl Record for ScalcoutRecord {
                 // alarm.
                 if !self.ocal.is_empty() {
                     if let Some(ref compiled) = self.compiled_ocal {
-                        let mut inputs = self.build_inputs();
+                        // C `sCalcoutRecord.c:768-769` — presult = &pcalc->oval,
+                        // so the VAL token in OCAL reads the previous OVAL, not
+                        // the VAL this cycle just computed.
+                        let mut inputs = self.build_inputs(self.oval);
                         match scalc_eval(compiled, &mut inputs) {
                             Ok(result) => match &result {
                                 StackValue::Double(v) => {
@@ -892,6 +901,45 @@ mod tests {
         assert_eq!(rec.record_type(), "scalcout");
         assert_eq!(rec.val, 0.0);
         assert_eq!(rec.sval, "");
+    }
+
+    /// The CALC `VAL` token reads the previous VAL (C `sCalcoutRecord.c:357`
+    /// passes `presult = &pcalc->val`), so `CALC="VAL+1"` counts up.
+    #[test]
+    fn r5_2_sibling_calc_val_token_reads_previous_val() {
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("VAL+1".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 1.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, 2.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, 3.0);
+    }
+
+    /// The OCAL `VAL` token reads the previous OVAL, not the VAL this cycle just
+    /// computed (C `sCalcoutRecord.c:768-769` passes `presult = &pcalc->oval`).
+    #[test]
+    fn r5_2_sibling_ocal_val_token_reads_previous_oval() {
+        let mut rec = ScalcoutRecord::new();
+        // CALC pins VAL at 100 every cycle; if OCAL's VAL token read VAL, OVAL
+        // would be 101 forever.
+        rec.put_field("CALC", EpicsValue::String("100".into()))
+            .unwrap();
+        rec.put_field("OCAL", EpicsValue::String("VAL+1".into()))
+            .unwrap();
+        rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
+        rec.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
+
+        rec.process().unwrap();
+        assert_eq!(rec.val, 100.0);
+        assert_eq!(rec.oval, 1.0, "OCAL VAL token = previous OVAL (0) + 1");
+        rec.process().unwrap();
+        assert_eq!(rec.oval, 2.0, "previous OVAL (1) + 1");
+        rec.process().unwrap();
+        assert_eq!(rec.oval, 3.0, "previous OVAL (2) + 1");
+        assert_eq!(rec.val, 100.0, "VAL is untouched by OCAL");
     }
 
     #[test]

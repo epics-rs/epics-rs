@@ -1532,8 +1532,12 @@ fn polint(xa: &[f64], ya: &[f64], x: f64) -> Option<(f64, f64)> {
         d[i] = ya[i];
     }
 
+    // C is 1-based throughout (tableRecord.c:1918 `int i,m,ns=1;`): `ns` ends the
+    // search loop holding the 1-based index of the closest sample, and
+    // `*y=ya[ns--]` (:1934) then leaves it one lower. That post-decrement value
+    // is exactly the **0-based** index of the closest sample, so `ns` below is
+    // C's decremented `ns` with no further adjustment.
     let mut y = ya[ns];
-    ns = ns.saturating_sub(1);
     let mut dy = 0.0f64;
 
     for m in 1..n {
@@ -1549,14 +1553,18 @@ fn polint(xa: &[f64], ya: &[f64], x: f64) -> Option<(f64, f64)> {
             d[i] = hp * den;
             c[i] = ho * den;
         }
-        // Adjust ns for 0-based indexing: in the C code ns starts at 1-based
-        // and the test is `2*ns < (n-m)`.  Here ns is 0-based so the equivalent
-        // test becomes `2*(ns+1) < (n-m)`, i.e. `2*ns + 2 < n - m`.
-        dy = if 2 * (ns + 1) < n - m {
-            c[ns + 1]
+        // C: `*y += (*dy=(2*ns < (n-m) ? c[ns+1] : d[ns--]));` (:1945), with
+        // 1-based c/d — so C's `c[ns+1]` is 0-based `c[ns]` and C's `d[ns]` is
+        // 0-based `d[ns-1]`.
+        //
+        // The `d` branch cannot be reached at ns == 0: the test is then
+        // `0 < n-m`, and m only runs to n-1, so it always holds. (That is why C
+        // never reads its `d[0]`, which would alias the `c` half of `room[]`.)
+        dy = if 2 * ns < n - m {
+            c[ns]
         } else {
-            let v = d[ns];
-            ns = ns.saturating_sub(1);
+            let v = d[ns - 1];
+            ns -= 1;
             v
         };
         y += dy;
@@ -4202,6 +4210,65 @@ mod tests {
         let ya = [0.0, 1.0, 4.0, 9.0, 16.0];
         let (y, _dy) = polint(&xa, &ya, 2.5).unwrap();
         assert!((y - 6.25).abs() < 1e-10, "polint quadratic: got {}", y);
+    }
+
+    #[test]
+    fn test_r6_62_polint_matches_c_at_every_starting_sample() {
+        // R6-62 / tableRecord.c:1918,1934,1945. C's `ns` is 1-based and
+        // `*y=ya[ns--]` leaves it at the 0-based index of the closest sample.
+        // The port decremented a 0-based `ns` a second time and clamped it with
+        // saturating_sub, so the c/d walk took the wrong tableau entries — for a
+        // target nearest sample 0 (`ns` clamped at 0 instead of going negative),
+        // and again whenever the d-branch walked `ns` down to 0 with iterations
+        // still to run.
+        //
+        // Neville's algorithm reconstructs the interpolating polynomial exactly,
+        // so a cubic through 4 samples must come back exactly for every x. `dy`
+        // (the last correction taken) is path-dependent and pins the index walk:
+        // the expected values below are printed by the unmodified C `polint`
+        // called as FindLimit does, `polint(&motor[-1], &user[-1], n, ...)`
+        // (tableRecord.c:1986).
+        let f = |x: f64| 2.0 * x * x * x - 3.0 * x * x + x - 5.0;
+        let xa = [0.0, 1.0, 2.0, 3.0];
+        let ya = [f(0.0), f(1.0), f(2.0), f(3.0)];
+
+        // (x, dy from C)
+        let cases = [
+            (0.10, 0.342),                 // nearest sample 0 — the cited case
+            (0.25, 0.65625),               // nearest sample 0
+            (0.49, 0.754_698_000_000_001), // nearest sample 0, at the tie edge
+            (0.90, 0.198),                 // nearest sample 1
+            (1.10, -0.198),                // nearest sample 1
+            (1.60, -0.768),                // nearest sample 2
+            (2.40, 2.688),                 // nearest sample 2
+            (2.90, -0.342),                // nearest sample 3 (last)
+            (3.40, 2.688),                 // extrapolation above the last sample
+            (-0.50, -3.75),                // extrapolation below sample 0
+        ];
+
+        for (x, want_dy) in cases {
+            let (y, dy) = polint(&xa, &ya, x).unwrap();
+            assert!(
+                (y - f(x)).abs() < 1e-9,
+                "x={x}: y={y}, want {} (Neville must be exact on a cubic)",
+                f(x)
+            );
+            assert!(
+                (dy - want_dy).abs() < 1e-9,
+                "x={x}: dy={dy}, want {want_dy} (C takes a different tableau path)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_r6_62_polint_two_samples_nearest_first() {
+        // n == 2 with the target nearest sample 0: only m == 1 runs, the test is
+        // `2*0 < 2-1` -> true, so C adds c[0-based 0]. The pre-fix code evaluated
+        // `2*(0+1) < 1` -> false and took d[0] instead.
+        let xa = [0.0, 10.0];
+        let ya = [100.0, 200.0]; // y = 100 + 10x
+        let (y, _dy) = polint(&xa, &ya, 1.0).unwrap();
+        assert!((y - 110.0).abs() < 1e-9, "got {y}, want 110");
     }
 
     #[test]

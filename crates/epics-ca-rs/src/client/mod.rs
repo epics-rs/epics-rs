@@ -1657,7 +1657,13 @@ impl CaChannel {
             .map(|w| w.clone())
     }
 
-    fn build_read_notify_frame(sid: u32, data_type: u16, count: u32, ioid: u32) -> Vec<u8> {
+    fn build_read_notify_frame(
+        sid: u32,
+        data_type: u16,
+        count: u32,
+        ioid: u32,
+        peer_minor: u16,
+    ) -> CaResult<Vec<u8>> {
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
         hdr.data_type = data_type;
         hdr.cid = sid;
@@ -1666,13 +1672,17 @@ impl CaChannel {
         // `nElem >= 0xffff`, not just `> 0xffff`. Routing 0xFFFF
         // through the normal branch would wedge `count = 0xFFFF` into
         // `m_count` — which a strict peer interprets as an extended
-        // marker with missing annex bytes.
+        // marker with missing annex bytes. `set_payload_size` refuses
+        // the extended form for a pre-V49 peer (`comQueSend.cpp:299`
+        // `throw cacChannel::outOfBounds()`), which surfaces as
+        // ECA_TOLARGE without a byte reaching the wire.
         if count >= 0xFFFF {
-            hdr.set_payload_size(0, count);
+            hdr.set_payload_size(0, count, peer_minor)
+                .map_err(|_| CaError::TooLarge)?;
         } else {
             hdr.count = count as u16;
         }
-        hdr.to_bytes_extended()
+        Ok(hdr.to_bytes_extended())
     }
 
     fn decode_plain_read_reply(reply: ReadReply) -> CaResult<(DbFieldType, EpicsValue)> {
@@ -1697,7 +1707,8 @@ impl CaChannel {
         count: u32,
         ioid: Option<u32>,
         payload: Vec<u8>,
-    ) -> Vec<u8> {
+        peer_minor: u16,
+    ) -> CaResult<Vec<u8>> {
         let padded_len = align8(payload.len());
         let mut padded = payload;
         padded.resize(padded_len, 0);
@@ -1708,11 +1719,16 @@ impl CaChannel {
         if let Some(ioid) = ioid {
             hdr.available = ioid;
         }
-        hdr.set_payload_size(padded.len(), count);
+        // A payload or count that needs the extended header cannot be
+        // sent to a pre-V49 peer — libca throws `cacChannel::outOfBounds`
+        // out of `comQueSend::insertRequestHeader` (`comQueSend.cpp:299`)
+        // and the put fails locally with ECA_TOLARGE.
+        hdr.set_payload_size(padded.len(), count, peer_minor)
+            .map_err(|_| CaError::TooLarge)?;
 
         let mut frame = hdr.to_bytes_extended();
         frame.extend_from_slice(&padded);
-        frame
+        Ok(frame)
     }
 
     fn send_read_notify_fast(
@@ -1736,8 +1752,12 @@ impl CaChannel {
         }
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_read_notify_frame(
-                snap.sid, data_type, count, ioid,
-            ));
+                snap.sid,
+                data_type,
+                count,
+                ioid,
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1780,7 +1800,8 @@ impl CaChannel {
                 count,
                 Some(ioid),
                 payload,
-            ));
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1823,7 +1844,8 @@ impl CaChannel {
                 count,
                 None,
                 payload,
-            ));
+                snap.server_minor,
+            )?);
         }
 
         self.transport_tx
@@ -1939,12 +1961,23 @@ impl CaChannel {
                 // Refill the reusable Sender slot. The dispatcher takes
                 // this on response without removing the DashMap entry.
                 *cached.slot.lock() = Some(reply_tx);
-                let frame = Self::build_read_notify_frame(
+                let frame = match Self::build_read_notify_frame(
                     cached.sid,
                     cached.data_type,
                     cached.element_count,
                     cached.ioid,
-                );
+                    snap.server_minor,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Unframeable for this peer — drop the borrowed
+                        // warm entry so the next call starts cold, and
+                        // fail locally without touching the wire.
+                        ch.in_flight.reads.remove(&cached.ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let kind = PendingKind::Warm {
                     ioid: cached.ioid,
                     in_flight: ch.in_flight.clone(),
@@ -1962,12 +1995,20 @@ impl CaChannel {
                         reply_tx,
                     },
                 );
-                let frame = Self::build_read_notify_frame(
+                let frame = match Self::build_read_notify_frame(
                     snap.sid,
                     snap.native_type as u16,
                     snap.element_count,
                     ioid,
-                );
+                    snap.server_minor,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        ch.in_flight.reads.remove(&ioid);
+                        results[index] = Some(Err(e));
+                        continue;
+                    }
+                };
                 let kind = PendingKind::Cold {
                     ioid,
                     in_flight: ch.in_flight.clone(),
@@ -3598,6 +3639,19 @@ async fn run_coordinator(
                                         server_addr,
                                         access_rights: access,
                                         state: ChannelState::Connected,
+                                        // The circuit's VERSION frame is parsed
+                                        // (and its ServerVersion event queued)
+                                        // before the CREATE_CHAN_RESP that
+                                        // produced this event, so the map is
+                                        // populated for any compliant server.
+                                        // A server that never sent VERSION is
+                                        // treated as pre-V49 — C's `tcpiiu`
+                                        // starts from the same conservative
+                                        // minor version.
+                                        server_minor: server_minor_version
+                                            .get(&(server_addr, priority))
+                                            .copied()
+                                            .unwrap_or(0),
                                     },
                                 );
                             } else {
@@ -5417,7 +5471,9 @@ mod typed_string_put_tests {
             /* count */ 1,
             /* ioid */ None,
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(hdr.cmmd, CA_PROTO_WRITE, "command must be CA_PROTO_WRITE");
@@ -5442,7 +5498,9 @@ mod typed_string_put_tests {
             /* count */ 1,
             /* ioid */ Some(42),
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(hdr.data_type, native_double);
@@ -5478,7 +5536,9 @@ mod typed_string_put_tests {
             /* count */ values.len() as u32,
             /* ioid */ Some(7),
             payload,
-        );
+            CA_MINOR_VERSION,
+        )
+        .expect("modern peer accepts the frame");
         let (hdr, _consumed) =
             CaHeader::from_bytes_extended(&frame).expect("frame header must parse");
         assert_eq!(

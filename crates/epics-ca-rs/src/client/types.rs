@@ -133,6 +133,16 @@ pub(crate) struct ChannelSnapshotPublic {
     pub server_addr: SocketAddr,
     pub access_rights: AccessRights,
     pub state: ChannelState,
+    /// Minor protocol version of the server owning this channel's
+    /// circuit, as announced by its `CA_PROTO_VERSION` frame. Every
+    /// request framed for this channel needs it: libca's
+    /// `comQueSend::insertRequestHeader` takes `bool v49Ok` from
+    /// `CA_V49 ( minorProtocolVersion )` and only emits the extended
+    /// (24-byte) header when the peer speaks V49 — otherwise it throws
+    /// `cacChannel::outOfBounds` (`comQueSend.cpp:285-363`).
+    /// 0 until the circuit's VERSION frame is seen, i.e. pre-V49 —
+    /// the same conservative starting point as C's `tcpiiu`.
+    pub server_minor: u16,
 }
 
 /// Shared snapshot registry. Coordinator publishes; CaChannel reads.

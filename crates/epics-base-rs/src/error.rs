@@ -70,6 +70,16 @@ pub enum CaError {
     /// zeroed payload that travels with the frame.
     #[error("server reported ECA status {0:#06x}")]
     ServerError(u32),
+
+    /// Request cannot be framed for the peer: it needs the extended
+    /// (24-byte) CA header, and the peer's protocol version predates
+    /// CA_V49, or the element count exceeds what the peer can carry.
+    /// libca raises this locally — `comQueSend::insertRequestHeader`
+    /// throws `cacChannel::outOfBounds()` (`comQueSend.cpp:299,313`)
+    /// and `ca_array_get`/`ca_array_put` return `ECA_TOLARGE` — so no
+    /// byte reaches the wire.
+    #[error("request too large for the peer's CA protocol version (ECA_TOLARGE)")]
+    TooLarge,
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)
@@ -79,6 +89,7 @@ const ECA_PUTFAIL: u32 = 160; // defmsg(CA_K_WARNING, 20)
 const ECA_BADTYPE: u32 = 114; // defmsg(CA_K_ERROR, 14)
 const ECA_DISCONN: u32 = 192; // defmsg(CA_K_WARNING, 24)
 const ECA_PUTCBINPROG: u32 = 366; // defmsg(CA_K_ERROR, 45)
+const ECA_TOLARGE: u32 = 72; // defmsg(CA_K_WARNING, 9)
 
 impl CaError {
     pub fn to_eca_status(&self) -> u32 {
@@ -103,6 +114,7 @@ impl CaError {
             CaError::WriteFailed(code) => *code,
             CaError::PutCallbackInProgress(_) => ECA_PUTCBINPROG,
             CaError::ServerError(code) => *code,
+            CaError::TooLarge => ECA_TOLARGE,
             _ => ECA_PUTFAIL,
         }
     }

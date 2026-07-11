@@ -188,7 +188,8 @@ fn extended_header_for_large_payload() {
     // extended form: postsize=0xFFFF, count=0, then 8 trailing bytes
     // (extended_postsize u32 + extended_count u32). Total 24 bytes.
     let mut h = CaHeader::new(CA_PROTO_READ_NOTIFY);
-    h.set_payload_size(0x10_0000, 100_000); // 1 MiB, 100k elements
+    h.set_payload_size(0x10_0000, 100_000, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header"); // 1 MiB, 100k elements
     h.cid = 1;
     h.available = 0xDEAD;
     let bytes = h.to_bytes_extended();
@@ -310,7 +311,8 @@ fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
     //   m_available = mp->m_available
     // Total: 16 bytes, no payload.
     let mut resp = CaHeader::new(CA_PROTO_SEARCH);
-    resp.set_payload_size(0, 0);
+    resp.set_payload_size(0, 0, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     resp.data_type = 5064;
     resp.cid = u32::MAX;
     resp.available = 0x1234_5678;
@@ -435,7 +437,8 @@ fn header_round_trip_through_decoder() {
     assert_eq!(decoded.count, h.count);
 
     let mut h2 = CaHeader::new(CA_PROTO_READ_NOTIFY);
-    h2.set_payload_size(0x10_0000, 100_000);
+    h2.set_payload_size(0x10_0000, 100_000, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     let bytes2 = h2.to_bytes_extended();
     let (decoded2, size2) = CaHeader::from_bytes_extended(&bytes2).unwrap();
     assert_eq!(size2, 24);

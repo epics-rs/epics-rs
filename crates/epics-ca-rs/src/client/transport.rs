@@ -179,6 +179,13 @@ fn echo_idle_secs() -> u64 {
 struct ServerConnection {
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Peer's minor protocol version, published by `read_loop` when the
+    /// circuit's `CA_PROTO_VERSION` frame arrives. Request framing needs
+    /// it: libca hands `CA_V49 ( minorProtocolVersion )` to
+    /// `comQueSend::insertRequestHeader` as `v49Ok` and refuses the
+    /// extended (24-byte) header for older peers (`comQueSend.cpp:285-363`).
+    /// 0 (pre-V49) until the VERSION frame is seen, matching C's `tcpiiu`.
+    server_minor: std::sync::Arc<std::sync::atomic::AtomicU16>,
     /// Beacon-arrival channel into `read_loop`. `false` = healthy
     /// beacon (refresh idle watchdog deadline); `true` = anomaly
     /// classified by `beacon_monitor` (set the in-loop flag so
@@ -296,7 +303,7 @@ pub(crate) async fn run_transport_manager(
                 // handles the fan-out). It never starts or waits on a
                 // connect, so it skips the per-circuit queue entirely.
                 let Some(circuit) = cmd_circuit_key(&cmd) else {
-                    process_command(cmd, &mut connections, &server_writers, &event_tx);
+                    process_command(cmd, &mut connections, &server_writers, &in_flight, &event_tx);
                     continue;
                 };
 
@@ -376,7 +383,7 @@ pub(crate) async fn run_transport_manager(
                     }
                 }
 
-                process_command(cmd, &mut connections, &server_writers, &event_tx);
+                process_command(cmd, &mut connections, &server_writers, &in_flight, &event_tx);
             }
             Some(joined) = pending_connects.join_next() => {
                 let (circuit, result) = match joined {
@@ -411,6 +418,7 @@ pub(crate) async fn run_transport_manager(
                                 queued_cmd,
                                 &mut connections,
                                 &server_writers,
+                                &in_flight,
                                 &event_tx,
                             );
                         }
@@ -498,6 +506,7 @@ fn process_command(
     cmd: TransportCommand,
     connections: &mut HashMap<CircuitKey, ServerConnection>,
     server_writers: &DirectServerWriters,
+    in_flight: &InFlightOps,
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
 ) {
     match cmd {
@@ -530,15 +539,19 @@ fn process_command(
             server_addr,
             priority,
         } => {
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
             let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = ioid;
             // C parity (`comQueSend.cpp:285`): extended form for
             // `nElem >= 0xffff`. See `build_read_notify_frame` in
-            // client/mod.rs for the same boundary in the slow path.
+            // client/mod.rs for the same boundary in the fast path.
             if count >= 0xFFFF {
-                hdr.set_payload_size(0, count);
+                if hdr.set_payload_size(0, count, peer_minor).is_err() {
+                    dispatch_read_error(in_flight, ioid, epics_base_rs::error::CaError::TooLarge);
+                    return;
+                }
             } else {
                 hdr.count = count as u16;
             }
@@ -562,10 +575,28 @@ fn process_command(
             let mut padded = payload;
             padded.resize(padded_len, 0);
 
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
             let mut hdr = CaHeader::new(CA_PROTO_WRITE);
             hdr.data_type = data_type;
             hdr.cid = sid;
-            hdr.set_payload_size(padded.len(), count);
+            if hdr
+                .set_payload_size(padded.len(), count, peer_minor)
+                .is_err()
+            {
+                // No IOID on a fire-and-forget WRITE, so there is no
+                // waiter to fail — libca's `ca_array_put` would have
+                // returned ECA_TOLARGE to the caller synchronously
+                // (`comQueSend.cpp:313`). The channel-side gate does
+                // that; reaching here means the request slipped past
+                // it, so drop the frame rather than emit a header the
+                // peer cannot parse.
+                eprintln!(
+                    "CA: {server_addr}: dropping WRITE for sid {sid}: \
+                     extended header needed but peer speaks CA minor \
+                     {peer_minor} (< 9) — ECA_TOLARGE"
+                );
+                return;
+            }
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&padded);
@@ -590,11 +621,20 @@ fn process_command(
             let mut padded = payload;
             padded.resize(padded_len, 0);
 
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
             let mut hdr = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
             hdr.data_type = data_type;
             hdr.cid = sid;
             hdr.available = ioid;
-            hdr.set_payload_size(padded.len(), count);
+            if hdr
+                .set_payload_size(padded.len(), count, peer_minor)
+                .is_err()
+            {
+                if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
+                    let _ = reply_tx.send(Err(epics_base_rs::error::CaError::TooLarge));
+                }
+                return;
+            }
 
             let mut frame = hdr.to_bytes_extended();
             frame.extend_from_slice(&padded);
@@ -615,6 +655,7 @@ fn process_command(
             server_addr,
             priority,
         } => {
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
             let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
             hdr.postsize = 16;
             hdr.data_type = data_type;
@@ -623,7 +664,14 @@ fn process_command(
             // C parity (`comQueSend.cpp:285`): extended form for
             // `nElem >= 0xffff`. Same boundary as READ_NOTIFY above.
             if count >= 0xFFFF {
-                hdr.set_payload_size(16, count);
+                if hdr.set_payload_size(16, count, peer_minor).is_err() {
+                    eprintln!(
+                        "CA: {server_addr}: dropping EVENT_ADD for sid {sid}: \
+                         extended header needed but peer speaks CA minor \
+                         {peer_minor} (< 9) — ECA_TOLARGE"
+                    );
+                    return;
+                }
             } else {
                 hdr.count = count as u16;
             }
@@ -660,7 +708,17 @@ fn process_command(
             // the count to u16 and used `to_bytes()`, so a CANCEL
             // for a >= 65,535-element monitor lost the count and
             // diverged from libca byte-for-byte.
-            hdr.set_payload_size(0, count);
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            if hdr.set_payload_size(0, count, peer_minor).is_err() {
+                // Unreachable: the matching EVENT_ADD could not have
+                // been framed for this peer either.
+                eprintln!(
+                    "CA: {server_addr}: dropping EVENT_CANCEL for sid {sid}: \
+                     extended header needed but peer speaks CA minor \
+                     {peer_minor} (< 9) — ECA_TOLARGE"
+                );
+                return;
+            }
             hdr.cid = sid;
             hdr.available = subid;
             send_frame(
@@ -746,25 +804,47 @@ fn send_frame(
     }
 }
 
+/// Peer minor protocol version of an established circuit, or 0 (pre-V49)
+/// when the circuit is gone or has not yet announced its version.
+///
+/// Single reader of the per-circuit version published by `read_loop`, so
+/// every request framed by [`process_command`] gates the extended header
+/// on the same value libca feeds `insertRequestHeader` as `v49Ok`.
+fn peer_minor_of(connections: &HashMap<CircuitKey, ServerConnection>, circuit: CircuitKey) -> u16 {
+    connections
+        .get(&circuit)
+        .map(|c| c.server_minor.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// Build one CA identity frame — `CA_PROTO_CLIENT_NAME` (user name) or
 /// `CA_PROTO_HOST_NAME` (host name) — carrying `value` as a NUL-padded
 /// string payload.
 ///
 /// Single source of the on-wire identity-frame shape, used by the
-/// connect-time handshake ([`build_client_handshake`]). C
-/// `libca/tcpiiu.cpp::userNameSetRequest` / `hostNameSetRequest` route
-/// through `comQueSend::insertRequestHeader`; `set_payload_size` +
-/// `to_bytes_extended` reproduce its header, emitting the extended-size
-/// annex for payloads over 16 bits. In practice libca asserts
-/// `postSize < 0xffff` for these names and the IOC caps a name at 512
-/// bytes, so a real user/host never reaches the annex — the extended
-/// path is only defensive. The point of one shared builder is that the
-/// header encoding lives in exactly one place.
+/// connect-time handshake ([`build_client_handshake`]), which is queued
+/// before the peer's VERSION frame can have arrived — so its peer
+/// version is unknown by construction and no extended header may be
+/// emitted. C is in the same position and resolves it the same way:
+/// `userNameSetRequest` / `hostNameSetRequest`
+/// (`tcpiiu.cpp:1268,1303`) assert `postSize < 0xffff` before handing
+/// the frame to `comQueSend::insertRequestHeader`, i.e. an identity
+/// frame is always a plain 16-byte header. Names long enough to need
+/// the annex cannot occur (the IOC caps a name at 512 bytes); a caller
+/// that manages one anyway gets the payload clipped to the largest
+/// aligned size the 16-bit postsize can carry rather than a frame the
+/// peer cannot parse.
 pub(crate) fn build_identity_frame(cmd: u16, value: &str) -> Vec<u8> {
-    let payload = pad_string(value);
+    const MAX_IDENTITY_PAYLOAD: usize = 0xFFF8;
+    let mut payload = pad_string(value);
+    if payload.len() > MAX_IDENTITY_PAYLOAD {
+        payload.truncate(MAX_IDENTITY_PAYLOAD);
+        // keep the NUL terminator the receiver expects
+        payload[MAX_IDENTITY_PAYLOAD - 1] = 0;
+    }
     let mut hdr = CaHeader::new(cmd);
-    hdr.set_payload_size(payload.len(), 0);
-    let mut frame = hdr.to_bytes_extended();
+    hdr.postsize = payload.len() as u16;
+    let mut frame = hdr.to_bytes().to_vec();
     frame.extend_from_slice(&payload);
     frame
 }
@@ -866,6 +946,11 @@ async fn connect_server(
 
     let (write_tx, write_rx) = mpsc::unbounded_channel();
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Peer minor version: 0 (pre-V49) until this circuit's VERSION frame
+    // lands in `read_loop`. Shared with the transport manager so request
+    // framing can gate the extended header on it (C: `tcpiiu`'s
+    // `minorProtocolVersion` → `insertRequestHeader`'s `v49Ok`).
+    let server_minor = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     // C `tcpiiu::unresponsiveCircuit` (`tcpiiu.cpp:899-940`): a single
     // circuit-level flag shared by BOTH the send and receive watchdogs.
     // `sendTimeoutNotify` (send stall) and `receiveTimeoutNotify` /
@@ -957,6 +1042,7 @@ async fn connect_server(
             last_rx_at.clone(),
             unresponsive.clone(),
             bytes_pending_in_os.clone(),
+            server_minor.clone(),
         ));
         (read_task, write_task)
     } else {
@@ -981,6 +1067,7 @@ async fn connect_server(
             last_rx_at.clone(),
             unresponsive.clone(),
             bytes_pending_in_os.clone(),
+            server_minor.clone(),
         ));
         (read_task, write_task)
     };
@@ -1008,6 +1095,7 @@ async fn connect_server(
             last_rx_at.clone(),
             unresponsive.clone(),
             bytes_pending_in_os.clone(),
+            server_minor.clone(),
         ));
         (read_task, write_task)
     };
@@ -1015,6 +1103,7 @@ async fn connect_server(
     Some(ServerConnection {
         write_tx,
         pending_frames,
+        server_minor,
         beacon_arrival_tx,
         _read_task: read_task,
         _write_task: write_task,
@@ -1246,6 +1335,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     last_rx_at: super::types::ServerLastRxAt,
     unresponsive: std::sync::Arc<UnresponsiveGate>,
     bytes_pending_in_os: OsRecvQueueProbe,
+    server_minor: std::sync::Arc<std::sync::atomic::AtomicU16>,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used on idle
     // expiry, and again on echo timeout (C `unresponsiveCircuitNotify`
@@ -1664,6 +1754,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             match hdr.cmmd {
                 CA_PROTO_VERSION => {
                     server_minor_version = hdr.count;
+                    // Publish to the transport manager: request framing
+                    // gates the extended header on the peer's version
+                    // (C `insertRequestHeader`'s `v49Ok`).
+                    server_minor.store(hdr.count, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(TransportEvent::ServerVersion {
                         server_addr,
                         priority,
@@ -2188,6 +2282,7 @@ mod read_loop_tests {
             std::sync::Arc::new(dashmap::DashMap::new()),
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -2367,6 +2462,7 @@ mod server_connection_drop_tests {
         let (beacon_arrival_tx, _ba_rx) = mpsc::unbounded_channel::<bool>();
 
         let conn = ServerConnection {
+            server_minor: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             write_tx,
             pending_frames: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             beacon_arrival_tx,
@@ -2513,6 +2609,7 @@ mod malformed_header_close_tests {
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
         // 24-byte extended header: postsize=0xFFFF (extended marker),
@@ -2568,6 +2665,7 @@ mod malformed_header_close_tests {
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -2644,6 +2742,7 @@ mod flow_control_tests {
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
             probe,
+            Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
         Harness {
             client,
@@ -2810,6 +2909,7 @@ mod recv_watchdog_tests {
             last_rx_at,
             Arc::clone(&unresponsive),
             drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
         let idle = Duration::from_secs(echo_idle_secs());
@@ -2911,6 +3011,7 @@ mod recv_watchdog_tests {
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         ));
 
         drop(client_io);
@@ -3265,15 +3366,19 @@ mod priority_circuit_tests {
         }
     }
 
-    /// `build_identity_frame` must reproduce libca's extended-size annex:
-    /// a sub-0xFFFF payload stays in the 16-byte header with `postsize`
-    /// set directly; a payload at/over 0xFFFF pegs `postsize` to 0xFFFF
-    /// and appends the real size in the 8-byte annex. A builder writing
-    /// `len as u16` would truncate the size and desync the circuit — this
-    /// guards both the handshake and the runtime-rename broadcast that
-    /// share this builder.
+    /// R6-18: an identity frame is ALWAYS a plain 16-byte header.
+    ///
+    /// It is queued on connect, before the peer's VERSION frame can have
+    /// arrived, so its peer version is unknown and the extended (24-byte)
+    /// header — a CA_V49 feature — must never be emitted. C is in the
+    /// same position and closes it with an assertion:
+    /// `hostNameSetRequest` / `userNameSetRequest` both do
+    /// `assert ( postSize < 0xffff )` (`tcpiiu.cpp:1303`, `:1333`) before
+    /// handing the frame to `insertRequestHeader`. Pre-fix Rust emitted
+    /// the annex for an over-long name, which a pre-V49 peer reads as a
+    /// 65,535-byte body and de-syncs on.
     #[test]
-    fn identity_frame_uses_extended_annex_for_oversized_payload() {
+    fn identity_frame_never_uses_the_extended_annex() {
         let small = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, "operator");
         let (hdr, consumed) = CaHeader::from_bytes_extended(&small).expect("parse small frame");
         assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_CLIENT_NAME);
@@ -3281,13 +3386,22 @@ mod priority_circuit_tests {
         assert!(hdr.extended_postsize.is_none());
         assert_eq!(hdr.postsize as usize, small.len() - consumed);
 
+        // A name past the 16-bit postsize cannot occur (C asserts; the IOC
+        // caps a name at 512 bytes). If one is manufactured anyway, the
+        // payload is clipped to the largest aligned size the plain header
+        // can carry — never promoted to an annex.
         let big_value = "h".repeat(0x1_0000); // 65536 > 0xFFFF
         let big = build_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, &big_value);
         let (hdr, consumed) = CaHeader::from_bytes_extended(&big).expect("parse big frame");
         assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_HOST_NAME);
-        assert_eq!(consumed, 24, "oversized payload carries the 8-byte annex");
-        assert_eq!(hdr.postsize, 0xFFFF);
-        assert_eq!(hdr.extended_postsize, Some((big.len() - consumed) as u32));
+        assert_eq!(consumed, 16, "identity frames are never extended");
+        assert!(hdr.extended_postsize.is_none());
+        assert_eq!(
+            hdr.postsize, 0xFFF8,
+            "clipped to the largest 8-aligned size the plain header carries"
+        );
+        assert_eq!(hdr.postsize as usize, big.len() - consumed);
+        assert_eq!(big[big.len() - 1], 0, "payload stays NUL-terminated");
     }
 
     /// A rename written to the shared identity slot is reflected in the

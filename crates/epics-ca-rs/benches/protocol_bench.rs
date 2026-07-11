@@ -14,7 +14,8 @@ fn bench_header_encode(c: &mut Criterion) {
     c.bench_function("ca_header_to_bytes_extended", |b| {
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
         hdr.data_type = 20; // DBR_TIME_DOUBLE
-        hdr.set_payload_size(100_000, 12500);
+        hdr.set_payload_size(100_000, 12500, epics_ca_rs::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         b.iter(|| black_box(&hdr).to_bytes_extended())
     });
 }
@@ -28,7 +29,9 @@ fn bench_header_decode(c: &mut Criterion) {
     });
 
     let mut ext_hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-    ext_hdr.set_payload_size(100_000, 12500);
+    ext_hdr
+        .set_payload_size(100_000, 12500, epics_ca_rs::protocol::CA_MINOR_VERSION)
+        .expect("modern peer accepts the extended header");
     let ext_bytes = ext_hdr.to_bytes_extended();
 
     c.bench_function("ca_header_from_bytes_extended", |b| {

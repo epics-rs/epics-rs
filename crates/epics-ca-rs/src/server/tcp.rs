@@ -269,6 +269,10 @@ struct InFlightPutNotify {
     /// one ioid would get two replies (a success *and* an
     /// ECA_PUTCBINPROG).
     responded: Arc<AtomicBool>,
+    /// The WRITE_NOTIFY request header, echoed if this put-callback's reply
+    /// turns out to be unframeable for a pre-V49 client (C keeps `mp` and
+    /// hands it to `send_err`).
+    req_hdr: CaHeader,
     /// Reply shape echoed in the superseded request's ECA_PUTCBINPROG
     /// (C `putNotifyErrorReply(client, &pPutNotify->msg, …)` preserves
     /// the original `m_dataType`/`m_count`/ioid, `camessage.c:1703`).
@@ -325,6 +329,7 @@ impl PutNotifySlot {
 async fn supersede_put_notify<W: AsyncWrite + Unpin + Send + 'static>(
     prev: Option<InFlightPutNotify>,
     writer: &Arc<Mutex<BufWriter<W>>>,
+    client_minor: u16,
 ) -> CaResult<()> {
     if let Some(prev) = prev {
         prev.abort.abort();
@@ -335,6 +340,10 @@ async fn supersede_put_notify<W: AsyncWrite + Unpin + Send + 'static>(
                 prev.count,
                 ECA_PUTCBINPROG,
                 prev.ioid,
+                ReplyContext {
+                    req_hdr: prev.req_hdr,
+                    client_minor,
+                },
             )
             .await?;
         }
@@ -407,6 +416,25 @@ impl ChannelEntry {
     }
 }
 
+impl SubscriptionEntry {
+    /// C `pevext->msg` — the EVENT_ADD request header rsrv stores alongside
+    /// the subscription and echoes back on the error path (`read_reply`
+    /// `camessage.c:520`, `no_read_access_event` `camessage.c:450-480`).
+    /// Rebuilt from the fields the entry already keeps, so it is the header
+    /// the client actually sent.
+    fn request_header(&self) -> CaHeader {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = self.data_type;
+        h.cid = self.channel_sid;
+        h.available = self.sub_id;
+        // The client framed this request itself, so it is V49-capable by
+        // construction whenever the count needs the extended form.
+        h.set_payload_size(0, self.data_count, CA_MINOR_VERSION)
+            .expect("the client framed this very request");
+        h
+    }
+}
+
 struct SubscriptionEntry {
     target: ChannelTarget,
     channel_sid: u32,
@@ -473,6 +501,10 @@ struct ClientState {
     db: Arc<PvDatabase>,
     tcp_port: u16,
     client_minor_version: u16,
+    /// C `client->recvBytesToDrain` (`rsrv/camessage.c:2440`): bytes of
+    /// an already-rejected message still to arrive. They are discarded
+    /// on arrival rather than parsed as headers.
+    recv_bytes_to_drain: usize,
     flow_control: Arc<FlowControlGate>,
     /// One-shot flag — set when channels.len() crosses 90% of the
     /// per-client cap. Prevents log spam on every subsequent
@@ -543,6 +575,7 @@ impl ClientState {
             db,
             tcp_port,
             client_minor_version: 0,
+            recv_bytes_to_drain: 0,
             flow_control: Arc::new(FlowControlGate::default()),
             channel_limit_warned: false,
             peer: String::new(),
@@ -1451,6 +1484,18 @@ where
 
             accumulated.extend_from_slice(&buf[..n]);
 
+            // C `camessage.c:2380-2390` (`camessage`'s drain preamble):
+            // bytes belonging to a message already answered with
+            // ECA_DEFUNCT are thrown away before any header parsing.
+            if state.recv_bytes_to_drain > 0 {
+                let drop_now = state.recv_bytes_to_drain.min(accumulated.len());
+                accumulated.drain(..drop_now);
+                state.recv_bytes_to_drain -= drop_now;
+                if state.recv_bytes_to_drain > 0 {
+                    continue;
+                }
+            }
+
             // DoS guard: a malformed or hostile client could declare a huge
             // postsize and stream nothing more, growing this Vec unbounded.
             let accum_cap = max_accumulated();
@@ -1480,7 +1525,18 @@ where
                 // because their postsize is u16 (max 0xfffe < 16 MiB),
                 // so the check only triggers on extended frames.
                 let buf = &accumulated[offset..];
-                if buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                // Every extended-form step below — the ECA_TOLARGE
+                // pre-check, the partial-annex wait, and the annex parse
+                // itself — is gated on the peer speaking V49, exactly as
+                // C gates the whole branch on
+                // `CA_V49(client->minor_version_number)`
+                // (`camessage.c:2410`). A pre-V49 peer that sends
+                // `m_postsize == 0xffff` therefore keeps a 16-byte
+                // header with postsize 0xffff, and the alignment check
+                // below rejects it (0xffff + 16 is not 8-aligned) —
+                // `camessage.c:2452`.
+                let peer_v49 = crate::protocol::ca_v49(state.client_minor_version);
+                if peer_v49 && buf.len() >= 24 && buf[2] == 0xFF && buf[3] == 0xFF {
                     let ext_post =
                         u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
                     if ext_post > crate::protocol::max_payload_size() {
@@ -1496,6 +1552,7 @@ where
                             ECA_TOLARGE,
                             0xFFFF_FFFF,
                             "CAS: Server unable to load large request message",
+                            state.client_minor_version,
                         )
                         .await;
                         let _ = writer.lock().await.flush().await;
@@ -1516,14 +1573,50 @@ where
                 // below closes the connection on a benign TCP segment
                 // boundary. The ECA_TOLARGE pre-check above is gated on
                 // `buf.len() >= 24`, so it never masks this 16..24 window.
-                if buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
+                if peer_v49 && buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
                     break;
                 }
-                let (hdr, hdr_size) = match CaHeader::from_bytes_extended(&accumulated[offset..]) {
+                let (hdr, hdr_size) = match CaHeader::from_bytes_for_peer(
+                    &accumulated[offset..],
+                    state.client_minor_version,
+                ) {
                     Ok(v) => v,
                     Err(e) => break 'client_loop Err(e),
                 };
                 let actual_post = hdr.actual_postsize();
+
+                // C `camessage.c:2426-2445`: the "client version too old"
+                // gate runs BEFORE the alignment test at 2452, and it
+                // keeps the connection open — `send_err(ECA_DEFUNCT)`,
+                // then `client->recvBytesToDrain = msgsize - bytes_left`
+                // and `status = RSRV_OK`. Order matters now that a
+                // pre-V49 `m_postsize == 0xffff` falls through to the
+                // alignment test: a pre-V44 peer must still get
+                // ECA_DEFUNCT and keep its circuit, not the V44+ peer's
+                // ECA_INTERNAL disconnect.
+                if hdr.cmmd != CA_PROTO_VERSION
+                    && state.client_minor_version < CA_MINIMUM_SUPPORTED_VERSION
+                {
+                    let _ = send_ca_error(
+                        &writer,
+                        &hdr,
+                        ECA_DEFUNCT,
+                        0xFFFF_FFFF,
+                        &format!("CAS: Client version {} too old", state.client_minor_version),
+                        state.client_minor_version,
+                    )
+                    .await;
+                    let _ = writer.lock().await.flush().await;
+                    // Drain this message: C discards the whole recv
+                    // buffer and remembers how many of the declared
+                    // bytes have yet to arrive.
+                    let msg_len = hdr_size + actual_post;
+                    let buffered = accumulated.len() - offset;
+                    state.recv_bytes_to_drain = msg_len.saturating_sub(buffered);
+                    offset = accumulated.len();
+                    break;
+                }
+
                 // C `rsrv/camessage.c:2452` rejects misaligned payloads
                 // ("CAS: Missaligned protocol rejected") with an
                 // ECA_INTERNAL error and disconnects the client. Our
@@ -1544,6 +1637,7 @@ where
                         ECA_INTERNAL,
                         0xFFFF_FFFF,
                         "CAS: Missaligned protocol rejected",
+                        state.client_minor_version,
                     )
                     .await;
                     let _ = writer.lock().await.flush().await;
@@ -1755,35 +1849,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
     peer: SocketAddr,
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
 ) -> CaResult<()> {
-    // C dispatcher (camessage.c:2427-2440): any non-VERSION command
-    // from a client whose minor_version_number is below
-    // CA_MINIMUM_SUPPORTED_VERSION (= 4) gets ECA_DEFUNCT via
-    // send_err and the message is drained (status = RSRV_OK,
-    // connection stays open). The intent is "let new clients
-    // identify themselves but tell pre-V4.4 peers they're too old".
-    //
-    // Rust's `state.client_minor_version` defaults to 0 (set only
-    // by the VERSION handler). Pre-fix Rust would dispatch any
-    // non-VERSION command on a fresh connection with minor=0,
-    // bypassing the gate. The CREATE_CHAN / READ / WRITE wire
-    // formats may differ for ancient clients; the C IOC's
-    // ECA_DEFUNCT hint lets the client decide whether to upgrade.
-    //
-    // Note: TCP VERSION with minor<4 already disconnects via
-    // dbb4b28, so this gate only triggers on clients
-    // that skipped the VERSION handshake entirely OR on a peer
-    // explicitly identifying as pre-V4.4.
-    if hdr.cmmd != CA_PROTO_VERSION && state.client_minor_version < 4 {
-        send_ca_error(
-            writer,
-            hdr,
-            ECA_DEFUNCT,
-            0xFFFF_FFFF,
-            "CAS: Client version too old",
-        )
-        .await?;
-        return Ok(());
-    }
+    // The "client version too old" (ECA_DEFUNCT) gate lives in the
+    // framing loop, not here: C runs it at `camessage.c:2426` — before
+    // the alignment test at 2452 — and it needs the framing loop's
+    // drain bookkeeping (`client->recvBytesToDrain`) to swallow the
+    // rest of the rejected message. Keeping it here would have run it
+    // after alignment, giving a pre-V44 peer the V44+ peer's
+    // ECA_INTERNAL disconnect for the same bytes.
 
     match hdr.cmmd {
         CA_PROTO_VERSION => {
@@ -1794,7 +1866,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // VERSION handshake and proceed to CREATE_CHAN with a
             // wire format we no longer fully support — silently
             // diverging from C IOC behaviour.
-            const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
             if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
                 tracing::warn!(
                     peer = ?peer,
@@ -1859,6 +1930,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     0xFFFF_FFFF,
                     "attempts to use protocol to set host name \
                      after creating first channel ignored by server",
+                    state.client_minor_version,
                 )
                 .await?;
                 return Ok(());
@@ -1888,6 +1960,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     ECA_INTERNAL,
                     0xFFFF_FFFF,
                     "bad (very long) host name",
+                    state.client_minor_version,
                 )
                 .await?;
                 return Err(epics_base_rs::error::CaError::Protocol(
@@ -1943,6 +2016,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     0xFFFF_FFFF,
                     "attempts to use protocol to set user name \
                      after creating first channel ignored by server",
+                    state.client_minor_version,
                 )
                 .await?;
                 return Ok(());
@@ -1967,6 +2041,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     ECA_INTERNAL,
                     0xFFFF_FFFF,
                     "a very long user name was specified",
+                    state.client_minor_version,
                 )
                 .await?;
                 return Err(epics_base_rs::error::CaError::Protocol(
@@ -2106,8 +2181,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // a transient server saturation. Per `vsend_err`'s
                     // switch, CA_PROTO_CREATE_CHAN falls to `default`
                     // and uses `0xffffffff` for `m_cid`.
-                    send_ca_error(writer, hdr, ECA_ALLOCMEM, u32::MAX, "channel limit reached")
-                        .await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_ALLOCMEM,
+                        u32::MAX,
+                        "channel limit reached",
+                        state.client_minor_version,
+                    )
+                    .await?;
                     // C `claim_ciu_action` (camessage.c:1229-1240): when
                     // the server's channel-allocation pool is exhausted,
                     // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
@@ -2391,7 +2473,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 resp.data_type = dbr_type as u16;
                 resp.cid = client_cid;
                 resp.available = sid;
-                resp.set_payload_size(0, nelem);
+                resp.set_payload_size(0, nelem, state.client_minor_version)
+                    .expect("nelem is capped at 0xfffe for pre-V49 clients above");
 
                 let mut w = writer.lock().await;
                 w.write_all(&ar.to_bytes()).await?;
@@ -2481,8 +2564,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // `MPTOPCIU` returned NULL, `vsend_err` stamps
                     // cid=0xFFFFFFFF (camessage.c:163-167). So C emits one
                     // ECA_INTERNAL frame, then drops the connection.
-                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
-                        .await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_INTERNAL,
+                        0xFFFF_FFFF,
+                        "Bad Resource ID",
+                        state.client_minor_version,
+                    )
+                    .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "READ on unknown SID {} (matches C read_action logBadId + RSRV_ERROR)",
                         sid
@@ -2505,7 +2595,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         format!("{}.{}", record.read().await.name, field)
                     }
                 };
-                send_ca_error(writer, hdr, ECA_BADTYPE, entry.cid, &audit_pv).await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_BADTYPE,
+                    entry.cid,
+                    &audit_pv,
+                    state.client_minor_version,
+                )
+                .await?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "READ with unsupported DBR type {} > LAST_BUFFER_TYPE \
                      (matches C read_action INVALID_DB_REQ ECA_BADTYPE)",
@@ -2543,6 +2641,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             requested_count,
                             ioid,
                             denied.eca_code(),
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
                         )
                         .await?;
                     } else {
@@ -2561,7 +2663,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 format!("{}.{}", record.read().await.name, field)
                             }
                         };
-                        send_ca_error(writer, hdr, denied.eca_code(), entry.cid, &audit_pv).await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            denied.eca_code(),
+                            entry.cid,
+                            &audit_pv,
+                            state.client_minor_version,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
@@ -2599,6 +2709,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             requested_count,
                             ioid,
                             ECA_GETFAIL,
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
                         )
                         .await?;
                     } else {
@@ -2608,7 +2722,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 format!("{}.{}", record.read().await.name, field)
                             }
                         };
-                        send_ca_error(writer, hdr, ECA_GETFAIL, entry.cid, &audit_pv).await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            ECA_GETFAIL,
+                            entry.cid,
+                            &audit_pv,
+                            state.client_minor_version,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
@@ -2627,6 +2749,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         requested_count,
                         ioid,
                         ECA_BADCHID,
+                        ReplyContext {
+                            req_hdr: *hdr,
+                            client_minor: state.client_minor_version,
+                        },
                     )
                     .await?;
                 }
@@ -2718,8 +2844,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // READ path emits CA_PROTO_ERROR.
                     // outer cid is `pciu->cid`.
                     if !is_notify {
-                        send_ca_error(writer, hdr, ECA_BADTYPE, entry.cid, "bad READ data type")
-                            .await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            ECA_BADTYPE,
+                            entry.cid,
+                            "bad READ data type",
+                            state.client_minor_version,
+                        )
+                        .await?;
                     }
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "READ with unsupported DBR type {} (matches C read_action RSRV_ERROR)",
@@ -2860,8 +2993,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 r.cid = entry.cid;
                 r
             };
-            // C client TCP parser requires 8-byte aligned postsize
-            resp.set_payload_size(padded.len(), element_count);
+            // C client TCP parser requires 8-byte aligned postsize.
+            // C `read_action` (`camessage.c:625-631`): a reply needing the
+            // extended header for a pre-V49 client is not framed — the server
+            // answers ECA_16KARRAYCLIENT and keeps the circuit.
+            if resp
+                .set_payload_size(padded.len(), element_count, state.client_minor_version)
+                .is_err()
+            {
+                return send_16k_array_client_err(
+                    writer,
+                    hdr,
+                    entry.cid,
+                    state.client_minor_version,
+                )
+                .await;
+            }
             resp.data_type = requested_type;
             resp.available = ioid;
 
@@ -2903,8 +3050,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // ID" frame (cid=0xFFFFFFFF), flushed before the
                         // disconnect — same family as the EVENT_ADD bad-SID
                         // and the matching READ branch below.
-                        send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
-                            .await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            ECA_INTERNAL,
+                            0xFFFF_FFFF,
+                            "Bad Resource ID",
+                            state.client_minor_version,
+                        )
+                        .await?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE (ACKT/ACKS) on unknown SID {} \
                              (matches C write_action logBadId + RSRV_ERROR)",
@@ -2934,6 +3088,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 hdr.actual_count(),
                                 denied.eca_code(),
                                 ioid,
+                                ReplyContext {
+                                    req_hdr: *hdr,
+                                    client_minor: state.client_minor_version,
+                                },
                             )
                             .await?;
                         } else {
@@ -2950,8 +3108,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     format!("{}.{}", record.read().await.name, field)
                                 }
                             };
-                            send_ca_error(writer, hdr, denied.eca_code(), entry_cid, &audit_pv)
-                                .await?;
+                            send_ca_error(
+                                writer,
+                                hdr,
+                                denied.eca_code(),
+                                entry_cid,
+                                &audit_pv,
+                                state.client_minor_version,
+                            )
+                            .await?;
                         }
                         return Ok(());
                     }
@@ -2979,7 +3144,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // CA_PROTO_WRITE path is not serialised in C.
                 if is_notify {
                     let prev = entry.put_notify_slot.take();
-                    supersede_put_notify(prev, writer).await?;
+                    supersede_put_notify(prev, writer, state.client_minor_version).await?;
                 }
                 let result = match &entry.target {
                     ChannelTarget::RecordField { record, .. } => {
@@ -3005,8 +3170,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         Ok(()) => ECA_NORMAL,
                         Err(_) => ECA_PUTFAIL,
                     };
-                    send_put_notify_response(writer, hdr.data_type, hdr.actual_count(), eca, ioid)
-                        .await?;
+                    send_put_notify_response(
+                        writer,
+                        hdr.data_type,
+                        hdr.actual_count(),
+                        eca,
+                        ioid,
+                        ReplyContext {
+                            req_hdr: *hdr,
+                            client_minor: state.client_minor_version,
+                        },
+                    )
+                    .await?;
                 } else if let Err(e) = &result {
                     // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                     // DBR_PUT_ACKS must surface put failure via
@@ -3022,7 +3197,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         }
                     };
                     let eca = e.to_eca_status();
-                    send_ca_error(writer, hdr, eca, entry_cid, &audit_pv).await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        eca,
+                        entry_cid,
+                        &audit_pv,
+                        state.client_minor_version,
+                    )
+                    .await?;
                 }
                 return Ok(());
             }
@@ -3043,8 +3226,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // ACKT/ACKS branch above and the READ branch: an
                     // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
                     // is buffered then flushed ahead of the disconnect.
-                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
-                        .await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_INTERNAL,
+                        0xFFFF_FFFF,
+                        "Bad Resource ID",
+                        state.client_minor_version,
+                    )
+                    .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
                         sid
@@ -3113,6 +3303,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             hdr.actual_count(),
                             ECA_BADTYPE,
                             ioid,
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
                         )
                         .await?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
@@ -3134,6 +3328,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             hdr.actual_count(),
                             denied.eca_code(),
                             ioid,
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
                         )
                         .await?;
                         state.audit("caput", &audit_pv, "", "denied").await;
@@ -3152,7 +3350,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let write_grant = match state.lookup_access(sid).require_write() {
                     Ok(g) => g,
                     Err(denied) => {
-                        send_ca_error(writer, hdr, denied.eca_code(), entry_cid, &audit_pv).await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            denied.eca_code(),
+                            entry_cid,
+                            &audit_pv,
+                            state.client_minor_version,
+                        )
+                        .await?;
                         state.audit("caput", &audit_pv, "", "denied").await;
                         return Ok(());
                     }
@@ -3163,7 +3369,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let write_type = match DbFieldType::from_u16(hdr.data_type) {
                     Ok(t) => t,
                     Err(_) => {
-                        send_ca_error(writer, hdr, ECA_BADTYPE, entry_cid, "bad data type").await?;
+                        send_ca_error(
+                            writer,
+                            hdr,
+                            ECA_BADTYPE,
+                            entry_cid,
+                            "bad data type",
+                            state.client_minor_version,
+                        )
+                        .await?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
                             hdr.data_type
@@ -3201,7 +3415,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // serialised in C, so it is left untouched.
             if is_notify {
                 let prev = put_notify_slot.take();
-                supersede_put_notify(prev, writer).await?;
+                supersede_put_notify(prev, writer, state.client_minor_version).await?;
             }
 
             let count = hdr.actual_count() as usize;
@@ -3226,6 +3440,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             hdr.actual_count(),
                             ECA_BADTYPE,
                             ioid,
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
                         )
                         .await?;
                     } else {
@@ -3235,6 +3453,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ECA_BADTYPE,
                             entry_cid,
                             "bad WRITE payload bytes",
+                            state.client_minor_version,
                         )
                         .await?;
                     }
@@ -3371,7 +3590,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if !is_notify {
                 if let Err(e) = &write_result {
                     let eca = e.to_eca_status();
-                    send_ca_error(writer, hdr, eca, entry_cid, &audit_pv).await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        eca,
+                        entry_cid,
+                        &audit_pv,
+                        state.client_minor_version,
+                    )
+                    .await?;
                 }
             }
 
@@ -3419,6 +3646,11 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // on the superseded / torn-down put,
                     // `camessage.c:1700` / `:1620`).
                     let mut task_guard = trap_guard.take();
+                    // C keeps the WRITE_NOTIFY request (`mp`) and the client's
+                    // negotiated version alive for the deferred reply; capture
+                    // both by value so the task owns them.
+                    let req_hdr = *hdr;
+                    let client_minor = state.client_minor_version;
                     let join = tokio::spawn(async move {
                         // Wait indefinitely for record processing to complete,
                         // matching C EPICS rsrv behavior. RecvError means the
@@ -3462,6 +3694,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             write_count,
                             final_status,
                             ioid,
+                            ReplyContext {
+                                req_hdr,
+                                client_minor,
+                            },
                         )
                         .await;
                         let mut w = writer_c.lock().await;
@@ -3475,6 +3711,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // entry's `responded` is already `true`, so superseding
                     // it is a harmless no-op.
                     put_notify_slot.install(InFlightPutNotify {
+                        req_hdr: *hdr,
                         abort: join.abort_handle(),
                         responded,
                         ioid,
@@ -3500,6 +3737,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         write_count,
                         eca_status,
                         ioid,
+                        ReplyContext {
+                            req_hdr: *hdr,
+                            client_minor: state.client_minor_version,
+                        },
                     )
                     .await?;
                 }
@@ -3545,6 +3786,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         ECA_ALLOCMEM,
                         entry_cid,
                         "EVENT_ADD refused: per-channel subscription cap",
+                        state.client_minor_version,
                     )
                     .await?;
                     return Ok(());
@@ -3588,8 +3830,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     // missing-channel branch precedes the `db_add_event`
                     // NULL (select==0) path, so an unknown SID draws the
                     // ECA_INTERNAL frame regardless of mask.
-                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
-                        .await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_INTERNAL,
+                        0xFFFF_FFFF,
+                        "Bad Resource ID",
+                        state.client_minor_version,
+                    )
+                    .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
                         sid
@@ -3614,6 +3863,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     ECA_ALLOCMEM,
                     entry_cid,
                     &format!("EVENT_ADD invalid mask {mask}: must be 1..={}", u8::MAX),
+                    state.client_minor_version,
                 )
                 .await?;
                 return Err(epics_base_rs::error::CaError::Protocol(
@@ -3669,7 +3919,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // no-op. The libca peer
                 // otherwise silently swallows the refusal and
                 // waits forever for monitor updates.
-                send_ca_error(writer, hdr, ECA_BADMONID, entry.cid, "duplicate sub_id").await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_BADMONID,
+                    entry.cid,
+                    "duplicate sub_id",
+                    state.client_minor_version,
+                )
+                .await?;
                 return Ok(());
             }
             {
@@ -3701,6 +3959,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 ECA_ALLOCMEM,
                                 entry.cid,
                                 "EVENT_ADD refused: per-PV subscriber cap",
+                                state.client_minor_version,
                             )
                             .await?;
                             return Ok(());
@@ -3764,6 +4023,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     denied_count,
                                     sub_id,
                                     ECA_NORDACCESS,
+                                    ReplyContext {
+                                        req_hdr: *hdr,
+                                        client_minor: state.client_minor_version,
+                                    },
                                 )
                                 .await?;
                             }
@@ -3812,6 +4075,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         requested_type,
                                         requested_count,
                                         &snap,
+                                        ReplyContext {
+                                            req_hdr: *hdr,
+                                            client_minor: state.client_minor_version,
+                                        },
                                     )
                                     .await?;
                                     // Initial subscription value — C posts
@@ -3843,6 +4110,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             denied.clone(),
                             long_string_mode,
                             state.stats.clone(),
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
                         );
 
                         state.subscriptions.insert(
@@ -3893,6 +4164,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 ECA_ALLOCMEM,
                                 entry.cid,
                                 "EVENT_ADD refused: record-field subscriber cap",
+                                state.client_minor_version,
                             )
                             .await?;
                             return Ok(());
@@ -3999,6 +4271,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     denied_count,
                                     sub_id,
                                     ECA_NORDACCESS,
+                                    ReplyContext {
+                                        req_hdr: *hdr,
+                                        client_minor: state.client_minor_version,
+                                    },
                                 )
                                 .await?;
                             }
@@ -4015,6 +4291,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 requested_type,
                                 requested_count,
                                 &snap,
+                                ReplyContext {
+                                    req_hdr: *hdr,
+                                    client_minor: state.client_minor_version,
+                                },
                             )
                             .await?;
                             // Initial subscription value posted and
@@ -4036,6 +4316,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let denied = Arc::new(AtomicBool::new(access_denied));
                         let denied_for_task = denied.clone();
                         let stats_for_task = state.stats.clone();
+                        // C stores the EVENT_ADD request (`pevext->msg`) with
+                        // the subscription: every later delivery is framed for
+                        // this client's negotiated version, and echoes this
+                        // header if the frame turns out to be unbuildable.
+                        let client_minor = state.client_minor_version;
+                        let req_hdr = *hdr;
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
                             loop {
@@ -4147,12 +4433,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 let mut padded = payload_bytes;
                                 padded.resize(align8(padded.len()), 0);
 
-                                let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-                                // C client TCP parser requires 8-byte aligned postsize
-                                hdr.set_payload_size(padded.len(), element_count);
-                                hdr.data_type = requested_type;
-                                hdr.cid = 1; // ECA_NORMAL
-                                hdr.available = sub_id;
+                                let mut ev = CaHeader::new(CA_PROTO_EVENT_ADD);
+                                // C client TCP parser requires 8-byte aligned postsize.
+                                // C `read_reply` (`camessage.c:515-524`): a pre-V49
+                                // client that cannot parse the extended header gets
+                                // ECA_16KARRAYCLIENT instead of a de-syncing frame.
+                                if ev
+                                    .set_payload_size(padded.len(), element_count, client_minor)
+                                    .is_err()
+                                {
+                                    let _ = send_16k_array_client_err(
+                                        &writer_clone,
+                                        &req_hdr,
+                                        req_hdr.cid,
+                                        client_minor,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                ev.data_type = requested_type;
+                                ev.cid = 1; // ECA_NORMAL
+                                ev.available = sub_id;
 
                                 // Abort-safety: this monitor task can
                                 // be `task.abort()`ed mid-flight by
@@ -4166,7 +4467,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 // payload — a split there would leave
                                 // an orphan header in the shared
                                 // BufWriter and mis-frame the stream.
-                                let hdr_bytes = hdr.to_bytes_extended();
+                                let hdr_bytes = ev.to_bytes_extended();
                                 let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
                                 frame.extend_from_slice(&hdr_bytes);
                                 frame.extend_from_slice(&padded);
@@ -4234,8 +4535,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let (entry_cid, entry_pv_name) = match state.channels.get(&req_channel_sid) {
                 Some(entry) => (entry.cid, entry.pv_name.clone()),
                 None => {
-                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
-                        .await?;
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_INTERNAL,
+                        0xFFFF_FFFF,
+                        "Bad Resource ID",
+                        state.client_minor_version,
+                    )
+                    .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "EVENT_CANCEL on unknown SID {} (matches C event_cancel_reply \
                          logBadId + RSRV_ERROR)",
@@ -4269,7 +4577,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     sid = req_channel_sid,
                     "EVENT_CANCEL channel-mismatch (sub belongs to different channel); ECA_BADMONID"
                 );
-                send_ca_error(writer, hdr, ECA_BADMONID, entry_cid, &entry_pv_name).await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_BADMONID,
+                    entry_cid,
+                    &entry_pv_name,
+                    state.client_minor_version,
+                )
+                .await?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "EVENT_CANCEL sub-id {} channel-mismatch (requested sid {}; \
                      matches C event_cancel_reply 'not on this channel's eventq' RSRV_ERROR)",
@@ -4316,7 +4632,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // `sub.channel_sid` as the m_cid field.
                 let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
                 resp.data_type = sub.data_type;
-                resp.set_payload_size(0, sub.data_count);
+                resp.set_payload_size(0, sub.data_count, state.client_minor_version)
+                    .expect("the client framed this very EVENT_ADD count");
                 resp.cid = sub.channel_sid;
                 resp.available = sub_id;
                 let mut w = writer.lock().await;
@@ -4350,7 +4667,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     sid = req_sid,
                     "EVENT_CANCEL for unknown sub-id; replying ECA_BADMONID"
                 );
-                send_ca_error(writer, hdr, ECA_BADMONID, chan_cid, &diag).await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_BADMONID,
+                    chan_cid,
+                    &diag,
+                    state.client_minor_version,
+                )
+                .await?;
                 // C `event_cancel_reply` (camessage.c:2016-2021):
                 // after `send_err(ECA_BADMONID)`, return RSRV_ERROR
                 // which tears the connection down. Pre-fix Rust kept
@@ -4417,7 +4742,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // Preserve the request fields. set_payload_size handles
             // both the short and extended encodings transparently.
             resp.data_type = hdr.data_type;
-            resp.set_payload_size(hdr.actual_postsize(), hdr.actual_count());
+            resp.set_payload_size(
+                hdr.actual_postsize(),
+                hdr.actual_count(),
+                state.client_minor_version,
+            )
+            .expect("the client framed this very ECHO request");
             resp.cid = hdr.cid;
             resp.available = hdr.available;
             // Abort-safety: build header + echoed payload as ONE
@@ -4506,7 +4836,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // the reply is now byte-equivalent to the C softIoc.
                 let mut resp = CaHeader::new(CA_PROTO_SEARCH);
                 resp.data_type = state.tcp_port;
-                resp.set_payload_size(0, 0);
+                resp.set_payload_size(0, 0, state.client_minor_version)
+                    .expect("a zero-payload, zero-count reply is never extended");
                 resp.cid = u32::MAX; // ~0U — "use TCP peer addr"
                 resp.available = hdr.available;
 
@@ -4553,7 +4884,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // so a probing peer could send CLEAR_CHANNEL on random
             // SIDs indefinitely.
             if !state.channels.contains_key(&sid) {
-                send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID").await?;
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    0xFFFF_FFFF,
+                    "Bad Resource ID",
+                    state.client_minor_version,
+                )
+                .await?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "CLEAR_CHANNEL on unknown SID {} (matches C clear_channel_reply logBadId + RSRV_ERROR)",
                     sid
@@ -4636,7 +4975,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // commands and force one CA_PROTO_ERROR reply per
             // frame indefinitely.
             let error_msg = format!("Unsupported command {}", hdr.cmmd);
-            send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, &error_msg).await?;
+            send_ca_error(
+                writer,
+                hdr,
+                ECA_INTERNAL,
+                0xFFFF_FFFF,
+                &error_msg,
+                state.client_minor_version,
+            )
+            .await?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
                 "unsupported TCP command {} (matches C bad_tcp_cmd_action drop)",
                 hdr.cmmd
@@ -4705,7 +5052,9 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
     data_type: u16,
     requested_count: u32,
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
+    reply: ReplyContext,
 ) -> CaResult<()> {
+    let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     let data = encode_dbr(data_type, snapshot)?;
     // CA-268: DBR_CLASS_NAME wire payload is always one 40-byte
     // string regardless of underlying value count — and is never
@@ -4727,7 +5076,12 @@ async fn send_monitor_snapshot<W: AsyncWrite + Unpin + Send + 'static>(
 
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
     // C client TCP parser requires 8-byte aligned postsize
-    resp.set_payload_size(padded.len(), element_count);
+    if resp
+        .set_payload_size(padded.len(), element_count, client_minor)
+        .is_err()
+    {
+        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor).await;
+    }
     resp.data_type = data_type;
     resp.cid = 1; // ECA_NORMAL
     resp.available = sub_id;
@@ -4852,7 +5206,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // so the wire frame matches C byte-for-byte (the stored
             // request count drives the zero-fill).
             for sub_id in &affected {
-                let (data_type, sub_id_v, data_count, target) = {
+                let (data_type, sub_id_v, data_count, target, req_hdr) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
@@ -4862,6 +5216,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.sub_id,
                         sub.data_count,
                         sub.target.clone(),
+                        sub.request_header(),
                     )
                 };
                 // C posts the access-revoked event through
@@ -4907,6 +5262,10 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                     denied_count,
                     sub_id_v,
                     ECA_NORDACCESS,
+                    ReplyContext {
+                        req_hdr,
+                        client_minor: state.client_minor_version,
+                    },
                 )
                 .await?;
             }
@@ -4932,7 +5291,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // at the live `snapshot.value.count()`, only truncating
             // and never padding.
             for sub_id in &affected {
-                let (target, data_type, data_count, sub_id_val, sub_long_string_mode) = {
+                let (target, data_type, data_count, sub_id_val, sub_long_string_mode, req_hdr) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
@@ -4943,6 +5302,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.data_count,
                         sub.sub_id,
                         sub.long_string_mode,
+                        sub.request_header(),
                     )
                 };
                 if let Some(mut snap) = get_full_snapshot(&target).await {
@@ -4969,7 +5329,18 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                     // long-string boundary conversion (`$` → CHAR[40], or
                     // native record field → scalar DBR_STRING).
                     super::apply_long_string_mode(&mut snap, sub_long_string_mode);
-                    send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
+                    send_monitor_snapshot(
+                        writer,
+                        sub_id_val,
+                        data_type,
+                        data_count,
+                        &snap,
+                        ReplyContext {
+                            req_hdr,
+                            client_minor: state.client_minor_version,
+                        },
+                    )
+                    .await?;
                     // Access-restore post — C `db_event_enable` then
                     // `db_post_single_event` (`camessage.c:1086-1088`):
                     // one posted and one processed subscription event,
@@ -5003,12 +5374,16 @@ async fn send_put_notify_response<W: AsyncWrite + Unpin + Send + 'static>(
     count: u32,
     eca_status: u32,
     ioid: u32,
+    reply: ReplyContext,
 ) -> CaResult<()> {
+    let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     let mut resp = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
     resp.data_type = data_type;
     // postsize = 0 (WRITE_NOTIFY replies have no payload);
     // set_payload_size promotes to extended form when count >= 0xFFFF.
-    resp.set_payload_size(0, count);
+    if resp.set_payload_size(0, count, client_minor).is_err() {
+        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor).await;
+    }
     resp.cid = eca_status;
     resp.available = ioid;
     let mut w = writer.lock().await;
@@ -5063,13 +5438,20 @@ async fn send_no_read_access_event<W: AsyncWrite + Unpin + Send + 'static>(
     count: u32,
     available: u32,
     eca_status: u32,
+    reply: ReplyContext,
 ) -> CaResult<()> {
+    let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     let native = epics_base_rs::types::native_type_for_dbr(data_type)
         .unwrap_or(epics_base_rs::types::DbFieldType::Char);
     let payload_size = epics_base_rs::types::dbr_buffer_size(data_type, native, count as usize);
     let padded_size = align8(payload_size);
     let mut hdr = CaHeader::new(cmd);
-    hdr.set_payload_size(padded_size, count);
+    if hdr
+        .set_payload_size(padded_size, count, client_minor)
+        .is_err()
+    {
+        return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor).await;
+    }
     hdr.data_type = data_type;
     hdr.cid = eca_status;
     hdr.available = available;
@@ -5149,6 +5531,25 @@ fn pad_dbr_to_requested_count(
 /// `epicsVsnprintf`.
 const CA_PROTO_ERROR_MAX_DIAG_LEN: usize = 480;
 
+/// The two facts every reply needs about the request it answers, and they
+/// are never meaningful apart: the request header C keeps for the reply
+/// (`pevext->msg` for a subscription, the in-flight request for a
+/// one-shot) and the peer's minor protocol version, which decides whether
+/// the reply may use the extended (24-byte) header at all
+/// (`caserverio.c:266-270` — a pre-V49 peer gets ECA_16KARRAYCLIENT
+/// instead).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplyContext {
+    pub(crate) req_hdr: CaHeader,
+    pub(crate) client_minor: u16,
+}
+
+/// C `caProto.h:34` `CA_MINIMUM_SUPPORTED_VERSION`. A non-VERSION message
+/// from a peer below this minor version is answered with ECA_DEFUNCT and
+/// drained (`camessage.c:2426-2445`); a TCP VERSION below it is dropped
+/// (`tcp_version_action`, `camessage.c:366-369`).
+const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+
 /// On `CA_PROTO_CLEAR_CHANNEL`, abort any pending WRITE_NOTIFY
 /// completion task whose owning channel `sid` is being freed (C
 /// parity: `clear_channel_reply` calls `rsrvFreePutNotify` per
@@ -5190,21 +5591,69 @@ fn truncate_diag(message: &str) -> &str {
     &message[..end]
 }
 
-async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
+/// C `read_reply` (`camessage.c:515-524`) and `read_action`
+/// (`camessage.c:625-631`): when `cas_copy_in_header` refuses to frame a reply
+/// because the client is pre-CA_V49 and the payload/count needs the 24-byte
+/// extended header (`caserverio.c:266-270` returns `ECA_16KARRAYCLIENT`), the
+/// server does NOT put the frame on the wire. It answers CA_PROTO_ERROR with
+/// that status, echoing the request header, and keeps the circuit.
+pub(crate) async fn send_16k_array_client_err<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: &Arc<Mutex<BufWriter<W>>>,
+    request_hdr: &CaHeader,
+    chan_cid: u32,
+    client_minor: u16,
+) -> CaResult<()> {
+    send_ca_error(
+        writer,
+        request_hdr,
+        ECA_16KARRAYCLIENT,
+        chan_cid,
+        "server unable to load read (or subscription update) response into \
+         protocol buffer: client protocol revision does not support transfers \
+         exceeding 16k bytes",
+        client_minor,
+    )
+    .await
+}
+
+pub(crate) async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     writer: &Arc<Mutex<BufWriter<W>>>,
     original_hdr: &CaHeader,
     eca_status: u32,
     chan_cid: u32,
     message: &str,
+    client_minor: u16,
 ) -> CaResult<()> {
     let error_msg_bytes = pad_string(truncate_diag(message));
+    // C `vsend_err` (`rsrv/camessage.c:201-214`) gates the extended echo on
+    // `(m_postsize >= 0xffff || m_count >= 0xffff) && CA_V49(minor)`. A
+    // pre-V49 client gets the 16-byte form with the size/count fields
+    // truncated to u16 (`htons((ca_uint16_t) curp->m_postsize)`) — it has no
+    // code to parse the 8-byte annex, and a 24-byte echo would de-sync it.
+    let orig_bytes = if crate::protocol::ca_v49(client_minor) {
+        original_hdr.to_bytes_extended()
+    } else {
+        // C `vsend_err` else-branch (`camessage.c:215-221`) echoes the LOW
+        // 16 BITS of the request's real postsize / count —
+        // `htons((ca_uint16_t) curp->m_postsize)` — not the 0xffff extended
+        // marker, which is only a framing artefact of the request header.
+        let mut echo = *original_hdr;
+        echo.postsize = original_hdr.actual_postsize() as u16;
+        echo.count = original_hdr.actual_count() as u16;
+        echo.extended_postsize = None;
+        echo.extended_count = None;
+        echo.to_bytes().to_vec()
+    };
     // payload_size must use the echo header's ACTUAL byte length (16 or 24
-    // for extended), not the constant CaHeader::SIZE=16.  Compute orig_bytes first.
-    let orig_bytes = original_hdr.to_bytes_extended();
+    // for extended), not the constant CaHeader::SIZE=16.
     let payload_size = orig_bytes.len() + error_msg_bytes.len();
 
     let mut resp = CaHeader::new(CA_PROTO_ERROR);
-    resp.set_payload_size(payload_size, 0);
+    // A CA_PROTO_ERROR body is a header echo plus a bounded diagnostic
+    // string, so it can never reach 0xffff; `set_payload_size` cannot fail
+    // here for any peer version.
+    resp.set_payload_size(payload_size, 0, client_minor)
+        .expect("CA_PROTO_ERROR payload is bounded well below 0xffff");
     resp.cid = chan_cid;
     resp.available = eca_status;
 
@@ -5214,19 +5663,16 @@ async fn send_ca_error<W: AsyncWrite + Unpin + Send + 'static>(
     // cancel cannot leave a partial frame (orphan header) in the shared
     // BufWriter and mis-frame every following message.
     //
-    // The echoed request header is emitted in extended form when the
-    // original request used the extended layout. C `vsend_err`
-    // (`rsrv/camessage.c:201-214`) writes a 16-byte header with
-    // `m_postsize = 0xffff` plus an 8-byte annex carrying the full
-    // 32-bit postsize / count; libca `cac::exceptionRespAction`
-    // (`modules/ca/src/client/cac.cpp:1097-1107`) parses the annex
-    // first when it sees the 0xffff marker, then walks the diag
-    // string from the post-annex offset. `to_bytes_extended()`
-    // produces exactly that layout (24 bytes when `is_extended()`,
-    // 16 bytes otherwise), so an extended READ/WRITE error
-    // round-trips byte-for-byte with libca.
+    // For a V49 client the echoed request header is emitted in extended form
+    // when the original request used the extended layout: a 16-byte header
+    // with `m_postsize = 0xffff` plus an 8-byte annex carrying the full
+    // 32-bit postsize / count. libca `cac::exceptionRespAction`
+    // (`modules/ca/src/client/cac.cpp:1097-1107`) parses the annex first when
+    // it sees the 0xffff marker, then walks the diag string from the
+    // post-annex offset — so an extended READ/WRITE error round-trips
+    // byte-for-byte with libca. `orig_bytes` (computed above) already carries
+    // the version-correct 16- or 24-byte form.
     let resp_bytes = resp.to_bytes_extended();
-    // orig_bytes computed above (before payload_size).
     let mut frame = Vec::with_capacity(resp_bytes.len() + orig_bytes.len() + error_msg_bytes.len());
     frame.extend_from_slice(&resp_bytes);
     frame.extend_from_slice(&orig_bytes);
@@ -5381,6 +5827,7 @@ mod put_notify_supersede_tests {
             ioid,
             dbr_type: epics_base_rs::types::DBR_LONG,
             count: 1,
+            req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
         }
     }
 
@@ -5407,7 +5854,7 @@ mod put_notify_supersede_tests {
         let responded = Arc::new(AtomicBool::new(false));
         let prev = Some(inflight(0x1234, responded.clone()));
 
-        supersede_put_notify(prev, &writer)
+        supersede_put_notify(prev, &writer, crate::protocol::CA_MINOR_VERSION)
             .await
             .expect("supersede sends the superseded request its reply");
 
@@ -5439,7 +5886,7 @@ mod put_notify_supersede_tests {
         let responded = Arc::new(AtomicBool::new(true)); // completion already replied
         let prev = Some(inflight(0x55, responded.clone()));
 
-        supersede_put_notify(prev, &writer)
+        supersede_put_notify(prev, &writer, crate::protocol::CA_MINOR_VERSION)
             .await
             .expect("supersede of a completed put-callback is a no-op reply");
 
@@ -5467,7 +5914,9 @@ mod put_notify_supersede_tests {
         );
         // The superseding request now finds it already claimed.
         let prev = Some(inflight(0x99, responded.clone()));
-        supersede_put_notify(prev, &writer).await.unwrap();
+        supersede_put_notify(prev, &writer, crate::protocol::CA_MINOR_VERSION)
+            .await
+            .unwrap();
 
         let guard = writer.lock().await;
         assert!(
@@ -5537,8 +5986,9 @@ mod put_notify_supersede_tests {
             ioid: 0x77,
             dbr_type: epics_base_rs::types::DBR_LONG,
             count: 1,
+            req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
         });
-        supersede_put_notify(prev, &recording_writer())
+        supersede_put_notify(prev, &recording_writer(), crate::protocol::CA_MINOR_VERSION)
             .await
             .unwrap();
 
@@ -5761,6 +6211,328 @@ mod multi_nic_listener_tests {
 }
 
 #[cfg(test)]
+mod pre_v49_peer_tests {
+    //! R6-18 — the server must never speak the extended (24-byte) CA
+    //! header to a peer that has not announced CA_V49, in either
+    //! direction:
+    //!
+    //! * receive: `m_postsize == 0xffff` from a pre-V49 peer is NOT an
+    //!   extended marker. C reads it as a plain header with a 65,535-byte
+    //!   body (`camessage.c:2410` else-branch), so `msgsize = 65551` fails
+    //!   the `msgsize & 0x7` test at `camessage.c:2452` →
+    //!   ECA_INTERNAL "CAS: Missaligned protocol rejected" + disconnect.
+    //! * send: an error echo for a pre-V49 peer is the 16-byte form
+    //!   (`vsend_err`, `camessage.c:201-214`).
+    use super::single_write_all_framing_tests::recording_writer;
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The ACF-reload sender must outlive the handler: `handle_client`
+    /// treats a closed reload channel as "server shutting down" and exits
+    /// its read loop, so a dropped sender would end the session before the
+    /// first byte is parsed. Hand it back to the caller.
+    async fn spawn_handler() -> (
+        tokio::io::DuplexStream,
+        broadcast::Sender<()>,
+        tokio::task::JoinHandle<CaResult<()>>,
+    ) {
+        let db = Arc::new(PvDatabase::new());
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = "127.0.0.1:55987".parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        (client_io, acf_reload_tx, handle)
+    }
+
+    /// Read from `client` until a `CA_PROTO_ERROR` frame appears, and
+    /// return its ECA status. The server emits an unsolicited VERSION
+    /// greeting on connect plus a VERSION reply to ours, so the error
+    /// frame is never at a fixed offset — walk the header chain.
+    async fn read_until_error(
+        client: &mut tokio::io::DuplexStream,
+        peer_minor: u16,
+    ) -> Option<(u32, String)> {
+        let mut rx: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 512];
+        loop {
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= rx.len() {
+                let (hdr, consumed) =
+                    CaHeader::from_bytes_for_peer(&rx[offset..], CA_MINOR_VERSION)
+                        .expect("server frames parse");
+                if hdr.cmmd == CA_PROTO_ERROR {
+                    let body_start = offset + consumed;
+                    let body_end = body_start + hdr.actual_postsize();
+                    if body_end > rx.len() {
+                        break; // body still in flight
+                    }
+                    // Body = echoed request header (16 or 24 bytes) + the
+                    // NUL-terminated diagnostic string.
+                    let body = &rx[body_start..body_end];
+                    // The echoed request header is 24 bytes only for a V49
+                    // peer (`vsend_err`, camessage.c:201-214) — a pre-V49
+                    // echo is 16 bytes even when its truncated postsize
+                    // happens to read 0xffff, which is precisely why the
+                    // real client keys this off its own version, not off
+                    // the bytes.
+                    let echo_len = if crate::protocol::ca_v49(peer_minor) && body.len() >= 24 {
+                        24
+                    } else {
+                        16
+                    };
+                    let diag = String::from_utf8_lossy(&body[echo_len..])
+                        .trim_end_matches('\0')
+                        .to_string();
+                    return Some((hdr.available, diag));
+                }
+                let msg_len = consumed + hdr.actual_postsize();
+                if offset + msg_len > rx.len() {
+                    break;
+                }
+                offset += msg_len;
+            }
+            let n = match tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await
+            {
+                Ok(Ok(0)) | Err(_) => return None,
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => return None,
+            };
+            rx.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// A peer that identifies as CA minor 8 (V44+, so it is not the
+    /// "too old" ECA_DEFUNCT case, but pre-V49) sends a header with
+    /// `m_postsize == 0xffff`. C never treats that as an extended
+    /// marker for this peer, so it becomes a 65,535-byte body →
+    /// misaligned → ECA_INTERNAL + disconnect. Pre-fix Rust parsed the
+    /// annex unconditionally and happily accepted the frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_v49_extended_marker_rejected_as_misaligned() {
+        let (mut client, _acf_reload_tx, handle) = spawn_handler().await;
+
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = 8; // V44 <= 8 < V49
+        client
+            .write_all(&ver.to_bytes())
+            .await
+            .expect("write version");
+
+        // Extended-form READ_NOTIFY, exactly as a V49 peer would frame a
+        // 200,000-element read. All 24 bytes are present, so the only
+        // thing that can reject it is the version gate.
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.set_payload_size(0, 200_000, CA_MINOR_VERSION)
+            .expect("frame it as a V49 peer would");
+        client
+            .write_all(&hdr.to_bytes_extended())
+            .await
+            .expect("write extended header");
+        client.flush().await.expect("flush");
+
+        let (eca, diag) = read_until_error(&mut client, 8)
+            .await
+            .expect("server must reply CA_PROTO_ERROR");
+        assert_eq!(
+            diag, "CAS: Missaligned protocol rejected",
+            "C reads the pre-V49 0xffff postsize as a 65,551-byte message and \
+             rejects it at the alignment test (camessage.c:2452)"
+        );
+        assert_eq!(
+            eca, ECA_INTERNAL,
+            "C sends ECA_INTERNAL for a misaligned message"
+        );
+
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler exits")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "C disconnects the client after the misaligned rejection"
+        );
+    }
+
+    /// A V49 peer sending the SAME bytes is served normally — the
+    /// rejection above must be attributable to the version gate, not to
+    /// the frame itself. The read targets a non-existent channel, so the
+    /// reply is ECA_BADCHID / a channel error, never ECA_INTERNAL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v49_peer_extended_marker_accepted() {
+        let (mut client, _acf_reload_tx, handle) = spawn_handler().await;
+
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = CA_MINOR_VERSION;
+        client
+            .write_all(&ver.to_bytes())
+            .await
+            .expect("write version");
+
+        let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        hdr.set_payload_size(0, 200_000, CA_MINOR_VERSION)
+            .expect("V49 peer accepts the extended header");
+        client
+            .write_all(&hdr.to_bytes_extended())
+            .await
+            .expect("write extended header");
+        client.flush().await.expect("flush");
+
+        // The read targets a channel that was never created, so C answers
+        // with its bad-resource-id error and drops the circuit either way.
+        // What must differ is WHY: the V49 peer's header is parsed as an
+        // extended header, never rejected as a misaligned plain one.
+        let (_eca, diag) = read_until_error(&mut client, CA_MINOR_VERSION)
+            .await
+            .expect("server replies with an error for the unknown sid");
+        assert_ne!(
+            diag, "CAS: Missaligned protocol rejected",
+            "a V49 peer's extended header must be parsed, not rejected as misaligned"
+        );
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// C `vsend_err` (`camessage.c:201-214`) echoes the request header in
+    /// extended form only when `CA_V49(minor)`. For a pre-V49 peer the
+    /// echo is the plain 16-byte header — a 24-byte echo would de-sync a
+    /// client with no annex parser.
+    #[tokio::test]
+    async fn pre_v49_error_echo_is_sixteen_bytes() {
+        let writer = recording_writer();
+        let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        original
+            .set_payload_size(0, 0x1_0000, CA_MINOR_VERSION)
+            .expect("extended original");
+        assert!(original.is_extended());
+
+        send_ca_error(
+            &writer,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "boom",
+            8, // pre-V49 peer
+        )
+        .await
+        .expect("send_ca_error succeeds");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let diag = pad_string("boom");
+        assert_eq!(
+            frame.len(),
+            CaHeader::SIZE + 16 + diag.len(),
+            "pre-V49 echo must be the 16-byte header form"
+        );
+        let echo_postsize = u16::from_be_bytes([frame[18], frame[19]]);
+        assert_eq!(
+            echo_postsize, 0,
+            "the echoed 16-bit postsize is the truncated original \
+             (C: htons((ca_uint16_t) curp->m_postsize))"
+        );
+    }
+
+    /// The same error to a V49 peer keeps the 24-byte extended echo.
+    #[tokio::test]
+    async fn v49_error_echo_is_twenty_four_bytes() {
+        let writer = recording_writer();
+        let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        original
+            .set_payload_size(0, 0x1_0000, CA_MINOR_VERSION)
+            .expect("extended original");
+
+        send_ca_error(
+            &writer,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "boom",
+            CA_MINOR_VERSION,
+        )
+        .await
+        .expect("send_ca_error succeeds");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let diag = pad_string("boom");
+        assert_eq!(
+            frame.len(),
+            CaHeader::SIZE + 24 + diag.len(),
+            "V49 echo carries the 8-byte annex"
+        );
+    }
+
+    /// A response too large for the 16-bit header cannot be framed for a
+    /// pre-V49 peer. C `read_reply` / `read_action` answer with
+    /// `send_err(ECA_16KARRAYCLIENT)` (`camessage.c:~700`) rather than
+    /// emitting an extended header the peer cannot parse.
+    #[tokio::test]
+    async fn oversize_reply_to_pre_v49_peer_is_eca_16karrayclient() {
+        use epics_base_rs::server::snapshot::Snapshot;
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let writer = recording_writer();
+        // 20,000 LONG elements = 80,000 payload bytes → needs the
+        // extended header (>= 0xffff).
+        let values: Vec<i32> = vec![7; 20_000];
+        let snapshot = Snapshot::new(
+            EpicsValue::LongArray(values),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let req = CaHeader::new(CA_PROTO_READ_NOTIFY);
+
+        send_monitor_snapshot(
+            &writer,
+            9,
+            DBR_LONG,
+            20_000,
+            &snapshot,
+            ReplyContext {
+                req_hdr: req,
+                client_minor: 8,
+            },
+        )
+        .await
+        .expect("the error reply itself must succeed");
+
+        let guard = writer.lock().await;
+        let frame = &guard.get_ref().batches[0];
+        let cmmd = u16::from_be_bytes([frame[0], frame[1]]);
+        let eca = u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]);
+        assert_eq!(cmmd, CA_PROTO_ERROR, "pre-V49 peer gets an error, not data");
+        assert_eq!(
+            eca, ECA_16KARRAYCLIENT,
+            "C answers an unframeable large array with ECA_16KARRAYCLIENT"
+        );
+    }
+}
+
+#[cfg(test)]
 mod extended_header_split_tests {
     //! C-parity regression: a TCP segment that ends in the middle of an
     //! extended-form header (16..24 bytes, `m_postsize == 0xffff`) must
@@ -5821,6 +6593,17 @@ mod extended_header_split_tests {
         assert_eq!(prefix.len(), 20);
 
         let mut client = client_io;
+        // Identify as V49 first: C only parses the extended annex when
+        // `CA_V49(client->minor_version_number)` (`camessage.c:2410`), so
+        // the partial-annex wait is reachable only for a V49 peer. A
+        // pre-V49 peer sending the same bytes is rejected — see
+        // `pre_v49_extended_marker_rejected_as_misaligned`.
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = CA_MINOR_VERSION;
+        client
+            .write_all(&ver.to_bytes())
+            .await
+            .expect("write version");
         client.write_all(&prefix).await.expect("write prefix");
         client.flush().await.expect("flush prefix");
 
@@ -5882,7 +6665,8 @@ mod non_graceful_disconnect_teardown_tests {
         let mut h = CaHeader::new(CA_PROTO_CREATE_CHAN);
         h.cid = cid;
         h.available = CA_MINOR_VERSION as u32;
-        h.set_payload_size(name.len(), 0);
+        h.set_payload_size(name.len(), 0, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = h.to_bytes().to_vec();
         frame.extend_from_slice(&name);
         frame
@@ -5896,7 +6680,8 @@ mod non_graceful_disconnect_teardown_tests {
         h.count = 1;
         h.cid = sid;
         h.available = sub_id;
-        h.set_payload_size(16, 1);
+        h.set_payload_size(16, 1, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = h.to_bytes().to_vec();
         frame.extend_from_slice(&0f32.to_be_bytes());
         frame.extend_from_slice(&0f32.to_be_bytes());
@@ -6408,7 +7193,8 @@ mod write_gate_order_tests {
         h.count = 1;
         h.cid = sid;
         h.available = ioid;
-        h.set_payload_size(8, 1);
+        h.set_payload_size(8, 1, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = h.to_bytes().to_vec();
         frame.extend_from_slice(&0f64.to_be_bytes());
         frame
@@ -6617,7 +7403,8 @@ mod deprecated_read_autosize_tests {
         h.data_type = data_type;
         h.cid = sid;
         h.available = ioid;
-        h.set_payload_size(0, count);
+        h.set_payload_size(0, count, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         h.to_bytes_extended().to_vec()
     }
 
@@ -6810,8 +7597,8 @@ mod single_write_all_framing_tests {
     /// Mock `AsyncWrite` recording each `poll_write` batch. Wrapped in a
     /// zero-capacity `BufWriter`, batch count == `write_all` count.
     #[derive(Default)]
-    struct RecordingWriter {
-        batches: Vec<Vec<u8>>,
+    pub(super) struct RecordingWriter {
+        pub(super) batches: Vec<Vec<u8>>,
     }
 
     impl AsyncWrite for RecordingWriter {
@@ -6831,7 +7618,7 @@ mod single_write_all_framing_tests {
         }
     }
 
-    fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
+    pub(super) fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
         // Zero capacity: every write_all forwards straight through.
         Arc::new(Mutex::new(BufWriter::with_capacity(
             0,
@@ -6852,6 +7639,7 @@ mod single_write_all_framing_tests {
             ECA_INTERNAL,
             0xFFFF_FFFF,
             "CAS: Missaligned protocol rejected",
+            crate::protocol::CA_MINOR_VERSION,
         )
         .await
         .expect("send_ca_error succeeds");
@@ -6897,6 +7685,10 @@ mod single_write_all_framing_tests {
             requested_count,
             0x4242_4242, // ioid echoed into m_available
             ECA_GETFAIL,
+            ReplyContext {
+                req_hdr: CaHeader::new(CA_PROTO_READ_NOTIFY),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
         )
         .await
         .expect("send_no_read_access_event succeeds");
@@ -6955,7 +7747,9 @@ mod single_write_all_framing_tests {
         // Build an extended original header: set_payload_size triggers
         // extended form when count >= 0xFFFF.
         let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
-        original.set_payload_size(0, 0x1_0000); // count >= 0xFFFF → extended (24 bytes)
+        original
+            .set_payload_size(0, 0x1_0000, crate::protocol::CA_MINOR_VERSION)
+            .expect("V49 peer accepts the extended header"); // count >= 0xFFFF → extended (24 bytes)
         assert!(
             original.is_extended(),
             "test requires an extended original header"
@@ -6967,6 +7761,7 @@ mod single_write_all_framing_tests {
             ECA_INTERNAL,
             0xFFFF_FFFF,
             "Regression test",
+            crate::protocol::CA_MINOR_VERSION,
         )
         .await
         .expect("send_ca_error succeeds");
@@ -7010,9 +7805,19 @@ mod single_write_all_framing_tests {
         );
 
         // requested_count 0 = autosize: frame the live element count.
-        send_monitor_snapshot(&writer, 9, DBR_LONG, 0, &snapshot)
-            .await
-            .expect("send_monitor_snapshot succeeds");
+        send_monitor_snapshot(
+            &writer,
+            9,
+            DBR_LONG,
+            0,
+            &snapshot,
+            ReplyContext {
+                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .await
+        .expect("send_monitor_snapshot succeeds");
 
         let guard = writer.lock().await;
         let batches = &guard.get_ref().batches;
@@ -7046,9 +7851,19 @@ mod single_write_all_framing_tests {
         let requested_count = 8u32;
 
         let writer = recording_writer();
-        send_monitor_snapshot(&writer, 9, DBR_LONG, requested_count, &snapshot)
-            .await
-            .expect("send_monitor_snapshot succeeds");
+        send_monitor_snapshot(
+            &writer,
+            9,
+            DBR_LONG,
+            requested_count,
+            &snapshot,
+            ReplyContext {
+                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .await
+        .expect("send_monitor_snapshot succeeds");
 
         let guard = writer.lock().await;
         let batches = &guard.get_ref().batches;
@@ -7100,9 +7915,19 @@ mod single_write_all_framing_tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         let writer = recording_writer();
-        send_monitor_snapshot(&writer, 9, DBR_LONG, 2, &snapshot)
-            .await
-            .expect("send_monitor_snapshot succeeds");
+        send_monitor_snapshot(
+            &writer,
+            9,
+            DBR_LONG,
+            2,
+            &snapshot,
+            ReplyContext {
+                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .await
+        .expect("send_monitor_snapshot succeeds");
 
         let guard = writer.lock().await;
         let frame = &guard.get_ref().batches[0];
@@ -7124,9 +7949,19 @@ mod single_write_all_framing_tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         let writer = recording_writer();
-        send_monitor_snapshot(&writer, 9, DBR_LONG, 0, &snapshot)
-            .await
-            .expect("send_monitor_snapshot succeeds");
+        send_monitor_snapshot(
+            &writer,
+            9,
+            DBR_LONG,
+            0,
+            &snapshot,
+            ReplyContext {
+                req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
+                client_minor: crate::protocol::CA_MINOR_VERSION,
+            },
+        )
+        .await
+        .expect("send_monitor_snapshot succeeds");
 
         let guard = writer.lock().await;
         let frame = &guard.get_ref().batches[0];
@@ -7435,7 +8270,8 @@ mod r46_zero_mask_event_add_tests {
         h.count = 1;
         h.cid = sid;
         h.available = sub_id;
-        h.set_payload_size(16, 1);
+        h.set_payload_size(16, 1, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = h.to_bytes().to_vec();
         frame.extend_from_slice(&0f32.to_be_bytes());
         frame.extend_from_slice(&0f32.to_be_bytes());
@@ -7557,7 +8393,8 @@ mod r46_zero_mask_event_add_tests {
         h.count = 1;
         h.cid = sid;
         h.available = sub_id;
-        h.set_payload_size(16, 1);
+        h.set_payload_size(16, 1, crate::protocol::CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         let mut frame = h.to_bytes().to_vec();
         frame.extend_from_slice(&0f32.to_be_bytes());
         frame.extend_from_slice(&0f32.to_be_bytes());

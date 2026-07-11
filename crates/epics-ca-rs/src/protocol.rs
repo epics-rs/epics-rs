@@ -309,6 +309,48 @@ pub fn max_contiguous_frames() -> usize {
 /// Extra bytes consumed by extended header fields.
 pub const EXTENDED_EXTRA: usize = 8;
 
+/// C `CA_V49` (`caProto.h:47`) — the peer understands the 24-byte extended
+/// header (`m_postsize == 0xffff` + two trailing u32s).
+pub const fn ca_v49(minor: u16) -> bool {
+    minor >= 9
+}
+
+/// C `CA_V413` (`caProto.h:48`) — "Allow zero length in requests." Before
+/// this, a request with `m_count == 0` is a zero-element transfer, not a
+/// request for the channel's native count.
+pub const fn ca_v413(minor: u16) -> bool {
+    minor >= 13
+}
+
+/// The frame needs the 24-byte extended header, but the peer negotiated a
+/// pre-CA_V49 minor version and has no code to parse it. C never puts such a
+/// frame on the wire: the client throws `cacChannel::outOfBounds`
+/// (`comQueSend.cpp:313`) → `ECA_TOLARGE`, and the server returns
+/// `ECA_16KARRAYCLIENT` (`caserverio.c:266-270`) → `send_err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedHeaderUnsupported;
+
+/// C's pre-V49 element bound: the largest element count that still fits a
+/// request/reply body a 16-byte-header-only peer can frame.
+///
+/// `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1465-1471`) and
+/// `tcpiiu::subscriptionRequest` (`tcpiiu.cpp:1576-1584`) cap against
+/// `maxBytes = 0xfffffff0` on a V49 circuit and `MAX_TCP` on a pre-V49 one,
+/// then compute `maxElem = (maxBytes - dbr_size[type]) / dbr_value_size[type]`
+/// and reject `nElem > maxElem` with `msgBodyCacheTooSmall` → `ECA_TOLARGE`.
+///
+/// `meta_size` is C `dbr_size[dataType]` (the DBR header for the type) and
+/// `element_size` is C `dbr_value_size[dataType]`.
+pub fn max_request_elements(meta_size: usize, element_size: usize, peer_minor: u16) -> u64 {
+    let max_bytes: u64 = if ca_v49(peer_minor) {
+        0xffff_fff0
+    } else {
+        MAX_TCP as u64
+    };
+    let element_size = element_size.max(1) as u64;
+    max_bytes.saturating_sub(meta_size as u64) / element_size
+}
+
 /// 16-byte CA message header (big-endian), with optional extended fields.
 #[derive(Debug, Clone, Copy)]
 pub struct CaHeader {
@@ -380,8 +422,26 @@ impl CaHeader {
     /// Rust threshold (`count > 0xFFFF`) under-triggered for the exact
     /// `count == 0xFFFF` case, sending a normal-form header where C
     /// would have used extended — byte-mismatch on the wire.
-    pub fn set_payload_size(&mut self, size: usize, count: u32) {
+    /// `peer_minor` is the CA minor version the PEER negotiated — the version
+    /// of whoever will parse these bytes (the server's for a client request,
+    /// the client's for a server reply). The extended form did not exist
+    /// before CA_V49, so a pre-V49 peer would read the 24-byte header as 16
+    /// header bytes plus 8 bytes of payload and de-sync its TCP stream. C
+    /// refuses to build the frame at all in that case:
+    /// `comQueSend::insertRequestHeader` throws `cacChannel::outOfBounds`
+    /// (`comQueSend.cpp:313`) and `cas_copy_in_header` returns
+    /// `ECA_16KARRAYCLIENT` (`caserverio.c:266-270`). Callers map
+    /// [`ExtendedHeaderUnsupported`] to whichever of those their side owes.
+    pub fn set_payload_size(
+        &mut self,
+        size: usize,
+        count: u32,
+        peer_minor: u16,
+    ) -> Result<(), ExtendedHeaderUnsupported> {
         if size >= 0xFFFF || count >= 0xFFFF {
+            if !ca_v49(peer_minor) {
+                return Err(ExtendedHeaderUnsupported);
+            }
             self.postsize = 0xFFFF;
             self.count = 0;
             self.extended_postsize = Some(size as u32);
@@ -392,6 +452,7 @@ impl CaHeader {
             self.extended_postsize = None;
             self.extended_count = None;
         }
+        Ok(())
     }
 
     pub fn to_bytes(&self) -> [u8; 16] {
@@ -469,6 +530,26 @@ impl CaHeader {
         }
 
         Ok((hdr, consumed))
+    }
+
+    /// Parse a header received from a peer whose minor protocol version
+    /// is `peer_minor`.
+    ///
+    /// C `rsrv/camessage.c:2410` reads the extended annex only when
+    /// `CA_V49(client->minor_version_number) && msg.m_postsize ==
+    /// 0xffff`. A pre-V49 peer that sends `m_postsize == 0xffff` takes
+    /// the else branch, so `msgsize = 0xffff + 16 = 65551`, which fails
+    /// the `msgsize & 0x7` alignment test at `camessage.c:2452` and gets
+    /// "CAS: Missaligned protocol rejected" (ECA_INTERNAL) + disconnect.
+    /// Reproduce that by keeping `postsize = 0xFFFF` on the plain header
+    /// and letting the caller's alignment check reject it — never by
+    /// consuming an annex the peer did not send, which would de-sync the
+    /// stream by 8 bytes.
+    pub fn from_bytes_for_peer(buf: &[u8], peer_minor: u16) -> CaResult<(Self, usize)> {
+        if ca_v49(peer_minor) {
+            return Self::from_bytes_extended(buf);
+        }
+        Ok((Self::from_bytes(buf)?, 16))
     }
 }
 
@@ -580,7 +661,8 @@ mod tests {
         hdr.data_type = 6; // Double
         hdr.cid = 42;
         hdr.available = 100;
-        hdr.set_payload_size(100_000, 12500);
+        hdr.set_payload_size(100_000, 12500, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         assert!(hdr.is_extended());
         assert_eq!(hdr.actual_postsize(), 100_000);
         assert_eq!(hdr.actual_count(), 12500);
@@ -610,13 +692,15 @@ mod tests {
     fn test_set_payload_size_auto() {
         // Small payload — stays normal
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
-        hdr.set_payload_size(1000, 100);
+        hdr.set_payload_size(1000, 100, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         assert!(!hdr.is_extended());
         assert_eq!(hdr.postsize, 1000);
         assert_eq!(hdr.count, 100);
 
         // Large payload — auto-extends
-        hdr.set_payload_size(70_000, 8750);
+        hdr.set_payload_size(70_000, 8750, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         assert!(hdr.is_extended());
         assert_eq!(hdr.postsize, 0xFFFF);
         assert_eq!(hdr.count, 0);
@@ -630,7 +714,8 @@ mod tests {
         // C `comQueSend.cpp:285` uses `nElem < 0xffff` as the normal
         // threshold, so exact 0xFFFF must take the extended branch.
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-        hdr.set_payload_size(100, 100_000);
+        hdr.set_payload_size(100, 100_000, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         assert!(hdr.is_extended());
         assert_eq!(hdr.actual_postsize(), 100);
         assert_eq!(hdr.actual_count(), 100_000);
@@ -638,7 +723,8 @@ mod tests {
         // Exact 0xFFFF boundary — must trigger extended (regression
         // for the prior `count > 0xFFFF` under-trigger).
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
-        hdr.set_payload_size(100, 0xFFFF);
+        hdr.set_payload_size(100, 0xFFFF, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
         assert!(hdr.is_extended());
         assert_eq!(hdr.actual_count(), 0xFFFF);
     }

@@ -4037,53 +4037,16 @@ async fn run_coordinator(
                         handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
-                        // Single channel disconnect (CA_PROTO_SERVER_DISCONN).
-                        // Server is telling us this specific cid is gone —
-                        // wake any in-flight read/write waiters tied to it
-                        // so blocked `caget`/`caput` futures fail with
-                        // `Disconnected` instead of stalling until their
-                        // own outer timeout fires. Mirrors the bulk
-                        // `handle_disconnect` wake path used for
-                        // `TcpClosed` (mod.rs ~1877). Without this,
-                        // SERVER_DISCONN was structurally dead-letter:
-                        // we re-searched but never released callers who
-                        // were waiting on a response that the server
-                        // had just told us would never come.
-                        if let Some(ch) = channels.get_mut(&cid) {
-                            if ch.server_addr == Some(server_addr) {
-                                ch.state = ChannelState::Disconnected;
-                                snapshots.remove(&cid);
-                                let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-
-                                let pv_name = ch.pv_name.to_string();
-                                let cids = vec![cid];
-                                subscriptions.mark_disconnected(&cids);
-
-                                // Drain blocked read/write waiters for this cid.
-                                let mut affected = HashSet::with_capacity(1);
-                                affected.insert(cid);
-                                drain_waiters_for_cids(&affected, &in_flight);
-
-                                // Re-search
-                                let _ = search_tx.send(SearchRequest::Schedule {
-                                    cid,
-                                    pv_name: pv_name.clone(),
-                                    reason: SearchReason::Reconnect,
-                                });
-
-                                // CA-130: surface to per-client handler.
-                                types::dispatch_exception(
-                                    &exception_slot,
-                                    types::CaException {
-                                        kind: types::CaExceptionKind::ServerDisconnect,
-                                        message: "server-initiated channel close".to_string(),
-                                        server_addr: Some(server_addr),
-                                        pv_name: Some(pv_name),
-                                        status: None,
-                                    },
-                                );
-                            }
-                        }
+                        handle_server_disconnect(
+                            &mut channels,
+                            &mut subscriptions,
+                            &search_tx,
+                            cid,
+                            server_addr,
+                            &in_flight,
+                            &snapshots,
+                            &exception_slot,
+                        );
                     }
                     TransportEvent::CircuitUnresponsive { server_addr, priority } => {
                         diag.unresponsive_events.fetch_add(1, Ordering::Relaxed);
@@ -4114,41 +4077,24 @@ async fn run_coordinator(
                                 status: Some(crate::protocol::ECA_UNRESPTMO),
                             },
                         );
-                        let mut affected_cids: Vec<u32> = Vec::new();
-                        for ch in channels.values_mut() {
-                            if ch.server_addr == Some(server_addr)
-                                && ch.priority == priority
-                                && ch.state == ChannelState::Connected
-                            {
-                                ch.state = ChannelState::Unresponsive;
-                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
-                                    snap.state = ChannelState::Unresponsive;
-                                    snap.access_rights = AccessRights { read: false, write: false };
-                                }
-                                ch.access_rights = AccessRights { read: false, write: false };
-                                let _ = ch.conn_tx.send(ConnectionEvent::Unresponsive);
-                                let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                    read: false,
-                                    write: false,
-                                });
-                                affected_cids.push(ch.cid);
-                            }
-                        }
-                        // Fan ECA_DISCONN out to in-flight reads /
-                        // writes / subscriptions (libca
-                        // `disconnectAllIO` parity). This covers the
-                        // subscription side via mark_disconnected.
-                        if !affected_cids.is_empty() {
-                            let cid_set: HashSet<u32> = affected_cids.iter().copied().collect();
-                            drain_waiters_for_cids(&cid_set, &in_flight);
-                            // apply the flow-control delta. Earlier
-                            // this discarded the returned map, so the
-                            // forgotten channel items left the circuit
-                            // outstanding count high — EVENTS_ON could
-                            // stay stuck. Every disconnect path must
-                            // decrement by the cleared delta.
-                            subscriptions.mark_disconnected(&affected_cids);
-                        }
+                        // Same owner as the two circuit-gone paths: the
+                        // ECA_DISCONN fan-out to in-flight reads / writes /
+                        // subscriptions and the no-rights transition are the
+                        // shared part; only the terminal state and the
+                        // connection event differ.
+                        disconnect_channels(
+                            &mut channels,
+                            &mut subscriptions,
+                            &in_flight,
+                            &snapshots,
+                            DisconnectKind::Unresponsive,
+                            |ch| {
+                                ch.server_addr == Some(server_addr)
+                                    && ch.priority == priority
+                                    && ch.state == ChannelState::Connected
+                            },
+                            |_| {},
+                        );
                     }
                     TransportEvent::CircuitResponsive { server_addr, priority } => {
                         diag.record(DiagEvent::Responsive { server: server_addr });
@@ -4252,6 +4198,179 @@ async fn run_coordinator(
     }
 }
 
+/// Which way a channel leaves the connected set. The two variants differ
+/// only in the terminal [`ChannelState`], the snapshot treatment and the
+/// [`ConnectionEvent`] the subscriber sees — every other step of the
+/// transition is identical, which is exactly why they share
+/// [`disconnect_channels`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DisconnectKind {
+    /// The circuit is gone: the socket closed (`TcpClosed`,
+    /// C `tcpiiu::disconnectAllChannels`) or the server retired this cid
+    /// (`CA_PROTO_SERVER_DISCONN`, C `cac::disconnectChannel`).
+    CircuitGone,
+    /// Echo timeout: the socket is still up but the peer is silent.
+    /// C `tcpiiu::unresponsiveCircuitNotify`.
+    Unresponsive,
+}
+
+impl DisconnectKind {
+    fn terminal_state(self) -> ChannelState {
+        match self {
+            Self::CircuitGone => ChannelState::Disconnected,
+            Self::Unresponsive => ChannelState::Unresponsive,
+        }
+    }
+
+    fn connection_event(self) -> ConnectionEvent {
+        match self {
+            Self::CircuitGone => ConnectionEvent::Disconnected,
+            Self::Unresponsive => ConnectionEvent::Unresponsive,
+        }
+    }
+}
+
+/// THE owner of every "channel leaves the connected set" transition.
+///
+/// **Invariant (MUST):** a channel that leaves the connected set — by TCP
+/// close, by `CA_PROTO_SERVER_DISCONN`, or by echo timeout — has its
+/// pending get/put IOs and its subscriptions failed with `ECA_DISCONN`,
+/// its cached access rights reset to no-rights, and emits the connection
+/// event followed by `AccessRightsChanged { read: false, write: false }`.
+/// **MUST NOT:** any of those steps happen on one path and not another.
+///
+/// In C all three paths converge on `nciu::unresponsiveCircuitNotify`
+/// (`nciu.cpp:161-182`), reached from `tcpiiu::disconnectAllChannels`
+/// (`tcpiiu.cpp:1848-1855`), from `cac::disconnectChannel`
+/// (`cac.cpp:1185-1195`) and from the echo-timeout path — so they cannot
+/// disagree. Rust hand-rolled the transition three times and did disagree:
+/// only the echo-timeout path reset access rights, so after a socket close
+/// the cached rights stayed at their last value (possibly read+write) until
+/// reconnect (R8-17).
+///
+/// `select` picks the channels this transition covers; `per_channel` runs
+/// the path-specific extras (reconnect backoff, re-search scheduling) that
+/// emit no user-visible callback. Returns the affected cids.
+fn disconnect_channels(
+    channels: &mut HashMap<u32, ChannelInner>,
+    subscriptions: &mut SubscriptionRegistry,
+    in_flight: &types::InFlightOps,
+    snapshots: &ChannelSnapshots,
+    kind: DisconnectKind,
+    select: impl Fn(&ChannelInner) -> bool,
+    mut per_channel: impl FnMut(&mut ChannelInner),
+) -> Vec<u32> {
+    let affected: Vec<u32> = channels
+        .values()
+        .filter(|ch| select(ch))
+        .map(|ch| ch.cid)
+        .collect();
+    if affected.is_empty() {
+        return affected;
+    }
+
+    const NO_RIGHTS: AccessRights = AccessRights {
+        read: false,
+        write: false,
+    };
+
+    // Step 1 — `disconnectAllIO` (`nciu.cpp:168`), and it comes FIRST:
+    // every pending get/put IO of the channel fails with ECA_DISCONN and
+    // the subscriptions park the same status, all of it *before* the
+    // connection callback runs (`nciu.cpp:168-170` — disconnectAllIO, then
+    // disconnectNotify). libca hands the user the per-IO failures before it
+    // says "the channel is down", so a handler that reacts to the
+    // connection event never observes an IO of the dead channel still
+    // pending.
+    subscriptions.mark_disconnected(&affected);
+    let affected_set: HashSet<u32> = affected.iter().copied().collect();
+    drain_waiters_for_cids(&affected_set, in_flight);
+
+    for cid in &affected {
+        let Some(ch) = channels.get_mut(cid) else {
+            continue;
+        };
+        // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:183-195`)
+        // clears both permits as the channel leaves the circuit, before any
+        // callback runs, so a handler that reads the rights sees no-rights.
+        ch.state = kind.terminal_state();
+        ch.access_rights = NO_RIGHTS;
+        match kind {
+            DisconnectKind::CircuitGone => {
+                snapshots.remove(cid);
+            }
+            DisconnectKind::Unresponsive => {
+                if let Some(mut snap) = snapshots.get_mut(cid) {
+                    snap.state = ChannelState::Unresponsive;
+                    snap.access_rights = NO_RIGHTS;
+                }
+            }
+        }
+        // Steps 3 and 4 — C `disconnectNotify` then
+        // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
+        // order.
+        let _ = ch.conn_tx.send(kind.connection_event());
+        let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
+            read: false,
+            write: false,
+        });
+        per_channel(ch);
+    }
+
+    affected
+}
+
+/// `CA_PROTO_SERVER_DISCONN`: the server retired one cid.
+///
+/// C `cac::verifyAndDisconnectChan` → `cac::disconnectChannel`
+/// (`cac.cpp:1172-1195`) runs the SAME transition as a circuit close —
+/// `disconnectAllIO`, no-rights, `disconnectNotify`, `accessRightsNotify` —
+/// only scoped to one channel. It therefore crosses the same owner
+/// ([`disconnect_channels`]) as `TcpClosed` and the echo timeout.
+#[allow(clippy::too_many_arguments)]
+fn handle_server_disconnect(
+    channels: &mut HashMap<u32, ChannelInner>,
+    subscriptions: &mut SubscriptionRegistry,
+    search_tx: &mpsc::UnboundedSender<SearchRequest>,
+    cid: u32,
+    server_addr: SocketAddr,
+    in_flight: &types::InFlightOps,
+    snapshots: &ChannelSnapshots,
+    exception_slot: &types::CaExceptionSlot,
+) {
+    let mut pv_name = String::new();
+    let affected = disconnect_channels(
+        channels,
+        subscriptions,
+        in_flight,
+        snapshots,
+        DisconnectKind::CircuitGone,
+        |ch| ch.cid == cid && ch.server_addr == Some(server_addr),
+        |ch| {
+            pv_name = ch.pv_name.to_string();
+            let _ = search_tx.send(SearchRequest::Schedule {
+                cid: ch.cid,
+                pv_name: ch.pv_name.to_string(),
+                reason: SearchReason::Reconnect,
+            });
+        },
+    );
+    if affected.is_empty() {
+        return;
+    }
+    // CA-130: surface to per-client handler.
+    types::dispatch_exception(
+        exception_slot,
+        types::CaException {
+            kind: types::CaExceptionKind::ServerDisconnect,
+            message: "server-initiated channel close".to_string(),
+            server_addr: Some(server_addr),
+            pv_name: Some(pv_name),
+            status: None,
+        },
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_disconnect(
     channels: &mut HashMap<u32, ChannelInner>,
@@ -4264,22 +4383,23 @@ fn handle_disconnect(
     snapshots: &ChannelSnapshots,
 ) {
     let (server_addr, priority) = circuit;
-    let mut affected_cids = Vec::new();
     let now = std::time::Instant::now();
 
     // only channels on THIS circuit `(server_addr, priority)`
     // are torn down — a sibling circuit to the same server at another
     // priority keeps its channels connected.
-    for ch in channels.values_mut() {
-        if ch.server_addr == Some(server_addr)
-            && ch.priority == priority
-            && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
-        {
-            ch.state = ChannelState::Disconnected;
-            snapshots.remove(&ch.cid);
-            affected_cids.push(ch.cid);
-            let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-
+    let affected_cids = disconnect_channels(
+        channels,
+        subscriptions,
+        in_flight,
+        snapshots,
+        DisconnectKind::CircuitGone,
+        |ch| {
+            ch.server_addr == Some(server_addr)
+                && ch.priority == priority
+                && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
+        },
+        |ch| {
             // Reconnection backoff: if the connection was short-lived (<30s),
             // increment reconnect_count for exponential backoff. Sustained
             // connections reset the counter.
@@ -4301,8 +4421,8 @@ fn handle_disconnect(
                 pv_name: ch.pv_name.to_string(),
                 reason: SearchReason::Reconnect,
             });
-        }
-    }
+        },
+    );
     if !affected_cids.is_empty() {
         diag.disconnections.fetch_add(1, Ordering::Relaxed);
         diag.record(DiagEvent::Disconnected {
@@ -4321,12 +4441,6 @@ fn handle_disconnect(
     // Clean up stale server_channels entries so beacon anomaly
     // lookups don't reference disconnected channels.
     server_channels.remove(&circuit);
-    subscriptions.mark_disconnected(&affected_cids);
-
-    // Fail pending read/write waiters for affected channels so callers
-    // don't hang forever waiting for a response that will never arrive.
-    let affected: HashSet<u32> = affected_cids.into_iter().collect();
-    drain_waiters_for_cids(&affected, in_flight);
 }
 
 /// Drop every entry in the shared in-flight registry whose cid is in
@@ -5830,5 +5944,324 @@ mod monitor_pause_tests {
             matches!(got, Err(CaError::ServerError(192))),
             "ECA_DISCONN must bypass pause"
         );
+    }
+}
+
+#[cfg(test)]
+mod disconnect_transition_tests {
+    //! R8-17 / R8-20: the three paths that take a channel out of the
+    //! connected set — TCP close, `CA_PROTO_SERVER_DISCONN`, echo timeout —
+    //! all run the same transition in C, because all three converge on
+    //! `nciu::unresponsiveCircuitNotify` (`nciu.cpp:161-182`):
+    //! `disconnectAllIO` → no-rights → `disconnectNotify` →
+    //! `accessRightsNotify(noRights)`. Rust hand-rolled it three times and
+    //! only the echo-timeout path reset the access rights. These tests pin
+    //! the invariant on the owner, once per path.
+    use super::*;
+    use epics_base_rs::runtime::sync::broadcast;
+    use tokio::sync::oneshot;
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:5064".parse().unwrap()
+    }
+
+    /// A Connected channel holding read+write rights — the pre-condition
+    /// that makes the missing no-rights transition observable.
+    fn connected_channel(
+        cid: u32,
+        priority: u8,
+    ) -> (ChannelInner, broadcast::Receiver<ConnectionEvent>) {
+        let (conn_tx, conn_rx) = broadcast::channel(16);
+        let ch = ChannelInner {
+            cid,
+            pv_name: format!("TEST:PV{cid}"),
+            priority,
+            state: ChannelState::Connected,
+            sid: 7,
+            native_type: None,
+            element_count: 1,
+            server_addr: Some(addr()),
+            access_rights: AccessRights {
+                read: true,
+                write: true,
+            },
+            connect_waiters: Vec::new(),
+            conn_tx,
+            reconnect_count: 0,
+            last_connected_at: None,
+        };
+        (ch, conn_rx)
+    }
+
+    fn drain_events(rx: &mut broadcast::Receiver<ConnectionEvent>) -> Vec<ConnectionEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// TCP circuit close (C `tcpiiu::disconnectAllChannels`,
+    /// `tcpiiu.cpp:1848-1855`): the channel must drop to no-rights and the
+    /// subscriber must see `AccessRightsChanged { false, false }` after
+    /// `Disconnected`. Pre-fix the cached rights stayed read+write until
+    /// reconnect and no rights event was emitted at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_17_tcp_close_drops_the_channel_to_no_rights() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
+        let (search_tx, _search_rx) = mpsc::unbounded_channel();
+        let diag = CaDiagnostics::default();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        handle_disconnect(
+            &mut channels,
+            &mut subscriptions,
+            &mut server_channels,
+            &search_tx,
+            (addr(), 0),
+            &diag,
+            &in_flight,
+            &snapshots,
+        );
+
+        let ch = channels.get(&42).expect("channel stays registered");
+        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert!(
+            !ch.access_rights.read && !ch.access_rights.write,
+            "C `setServerAddressUnknown` clears both permits on circuit close"
+        );
+        assert_eq!(
+            drain_events(&mut conn_rx),
+            vec![
+                ConnectionEvent::Disconnected,
+                ConnectionEvent::AccessRightsChanged {
+                    read: false,
+                    write: false
+                },
+            ],
+            "C fires disconnectNotify then accessRightsNotify(noRights)"
+        );
+    }
+
+    /// `CA_PROTO_SERVER_DISCONN` (C `cac::disconnectChannel`,
+    /// `cac.cpp:1185-1195`) runs the identical transition, scoped to one
+    /// cid — and must not touch a sibling channel on the same circuit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_17_server_disconnect_drops_only_that_channel_to_no_rights() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        let (other, mut other_rx) = connected_channel(43, 0);
+        channels.insert(42u32, ch);
+        channels.insert(43u32, other);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+        let (search_tx, mut search_rx) = mpsc::unbounded_channel();
+        let exception_slot: types::CaExceptionSlot = Default::default();
+
+        handle_server_disconnect(
+            &mut channels,
+            &mut subscriptions,
+            &search_tx,
+            42,
+            addr(),
+            &in_flight,
+            &snapshots,
+            &exception_slot,
+        );
+        assert!(
+            matches!(
+                search_rx.try_recv(),
+                Ok(SearchRequest::Schedule { cid: 42, .. })
+            ),
+            "SERVER_DISCONN re-searches the retired channel"
+        );
+
+        let ch = channels.get(&42).unwrap();
+        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert!(
+            !ch.access_rights.read && !ch.access_rights.write,
+            "SERVER_DISCONN must reset access rights (C disconnectChannel)"
+        );
+        assert_eq!(
+            drain_events(&mut conn_rx),
+            vec![
+                ConnectionEvent::Disconnected,
+                ConnectionEvent::AccessRightsChanged {
+                    read: false,
+                    write: false
+                },
+            ]
+        );
+
+        let other = channels.get(&43).unwrap();
+        assert_eq!(other.state, ChannelState::Connected);
+        assert!(
+            other.access_rights.read && other.access_rights.write,
+            "a sibling cid on the same circuit is untouched"
+        );
+        assert!(drain_events(&mut other_rx).is_empty());
+    }
+
+    /// The echo-timeout path was already correct; it must stay correct now
+    /// that it shares the owner (terminal state `Unresponsive`, event
+    /// `Unresponsive`, same no-rights transition).
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_17_unresponsive_keeps_its_own_state_and_event() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        disconnect_channels(
+            &mut channels,
+            &mut subscriptions,
+            &in_flight,
+            &snapshots,
+            DisconnectKind::Unresponsive,
+            |ch| ch.state == ChannelState::Connected,
+            |_| {},
+        );
+
+        let ch = channels.get(&42).unwrap();
+        assert_eq!(ch.state, ChannelState::Unresponsive);
+        assert!(!ch.access_rights.read && !ch.access_rights.write);
+        assert_eq!(
+            drain_events(&mut conn_rx),
+            vec![
+                ConnectionEvent::Unresponsive,
+                ConnectionEvent::AccessRightsChanged {
+                    read: false,
+                    write: false
+                },
+            ]
+        );
+    }
+
+    /// R8-20: the IO failures must be delivered BEFORE the connection
+    /// event. C `nciu::unresponsiveCircuitNotify` (`nciu.cpp:168-170`) calls
+    /// `disconnectAllIO` and only then `disconnectNotify`, so an application
+    /// reacting to "channel down" never finds an IO of that channel still
+    /// pending.
+    ///
+    /// Observing the order: both consumers park on their channels before the
+    /// transition runs, and the transition runs on the `block_on` future of a
+    /// `current_thread` runtime — so the two wakes land on the scheduler's
+    /// injection queue in send order and the tasks run in that order. The
+    /// recorded sequence is therefore the send sequence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r8_20_io_failures_are_delivered_before_the_disconnect_event() {
+        let mut channels = HashMap::new();
+        let (ch, mut conn_rx) = connected_channel(42, 0);
+        channels.insert(42u32, ch);
+        let mut subscriptions = SubscriptionRegistry::new();
+        let in_flight = types::InFlightOps::new();
+        let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+        let (rtx, rrx) = oneshot::channel();
+        in_flight.reads.insert(
+            1,
+            types::ReadWaiter::OneShot {
+                cid: 42,
+                mode: types::ReadReplyMode::Raw,
+                reply_tx: rtx,
+            },
+        );
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let io_order = order.clone();
+        let io_task = tokio::spawn(async move {
+            let got = rrx.await.expect("read waiter must be woken");
+            assert!(matches!(got, Err(CaError::Disconnected)));
+            io_order.lock().unwrap().push("io");
+        });
+        let conn_order = order.clone();
+        let conn_task = tokio::spawn(async move {
+            let ev = conn_rx.recv().await.expect("connection event");
+            assert_eq!(ev, ConnectionEvent::Disconnected);
+            conn_order.lock().unwrap().push("conn");
+        });
+
+        // Let both consumers park on their awaits.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "nothing may be delivered before the transition runs"
+        );
+
+        disconnect_channels(
+            &mut channels,
+            &mut subscriptions,
+            &in_flight,
+            &snapshots,
+            DisconnectKind::CircuitGone,
+            |ch| ch.cid == 42,
+            |_| {},
+        );
+
+        io_task.await.unwrap();
+        conn_task.await.unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["io", "conn"],
+            "C fails the channel's pending IOs (disconnectAllIO) before it \
+             signals the disconnect (disconnectNotify)"
+        );
+    }
+
+    /// Pending IOs still fail with `Disconnected` on every path through the
+    /// owner — the fan-out must not be lost in the refactor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_fails_pending_ios_on_every_path() {
+        for kind in [DisconnectKind::CircuitGone, DisconnectKind::Unresponsive] {
+            let mut channels = HashMap::new();
+            let (ch, _rx) = connected_channel(42, 0);
+            channels.insert(42u32, ch);
+            let mut subscriptions = SubscriptionRegistry::new();
+            let in_flight = types::InFlightOps::new();
+            let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+            let (rtx, rrx) = oneshot::channel();
+            let (wtx, wrx) = oneshot::channel();
+            in_flight.reads.insert(
+                1,
+                types::ReadWaiter::OneShot {
+                    cid: 42,
+                    mode: types::ReadReplyMode::Raw,
+                    reply_tx: rtx,
+                },
+            );
+            in_flight.writes.insert(2, (42, wtx));
+
+            disconnect_channels(
+                &mut channels,
+                &mut subscriptions,
+                &in_flight,
+                &snapshots,
+                kind,
+                |ch| ch.cid == 42,
+                |_| {},
+            );
+
+            assert!(
+                matches!(rrx.await, Ok(Err(CaError::Disconnected))),
+                "{kind:?}: pending read must fail with Disconnected"
+            );
+            assert!(
+                matches!(wrx.await, Ok(Err(CaError::Disconnected))),
+                "{kind:?}: pending write must fail with Disconnected"
+            );
+        }
     }
 }

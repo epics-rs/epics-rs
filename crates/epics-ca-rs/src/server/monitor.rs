@@ -124,6 +124,74 @@ impl FlowControlGate {
     }
 }
 
+/// Per-subscription view of the circuit's EVENTS_OFF gate, and the single
+/// owner of the "may this update be suspended?" decision. Both monitor
+/// delivery loops — `spawn_monitor_sender` and the record-field loop in
+/// `tcp.rs` — run every update through [`MonitorFlow::admit`], so the two
+/// cannot disagree about what a pause does.
+///
+/// C `event_read` (`dbEvent.c:944-950`) suspends the event task only when
+/// `flowCtrlMode && nDuplicates == 0`. `nDuplicates` counts queue entries
+/// beyond the first for a given monitor (`dbEvent.c:836-840`), so an update
+/// still queued behind the one in hand IS a duplicate — and duplicates are
+/// drained, not suspended: `event_read`'s drain loop empties the whole queue
+/// without re-checking `flowCtrlMode`, so those already-queued distinct
+/// updates reach the client as their own EVENT_ADD frames even while
+/// EVENTS_OFF is in effect. Only once the queue is down to a single entry
+/// does the next `event_read` suspend — and from then on a post *replaces*
+/// that entry's value in place (`db_queue_event_log`, `dbEvent.c:808-820`)
+/// rather than appending, which is the collapse-to-latest
+/// [`FlowControlGate::coalesce_while_paused`] implements.
+pub(crate) struct MonitorFlow {
+    gate: Arc<FlowControlGate>,
+    /// True while C's drain loop would still be running: it emptied the
+    /// queue in one pass, so once the decision to drain is taken it is not
+    /// re-taken per entry.
+    draining: bool,
+}
+
+impl MonitorFlow {
+    pub(crate) fn new(gate: Arc<FlowControlGate>) -> Self {
+        Self {
+            gate,
+            draining: false,
+        }
+    }
+
+    /// Returns the event to deliver, blocking until EVENTS_ON only when C
+    /// would have suspended. `None` means the producer channel closed.
+    pub(crate) async fn admit<F, Fut>(
+        &mut self,
+        rx: &mut mpsc::Receiver<MonitorEvent>,
+        event: MonitorEvent,
+        pop_overflow: F,
+    ) -> Option<MonitorEvent>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<MonitorEvent>>,
+    {
+        if self.draining {
+            // C's drain loop runs to `EVENTQEMPTY`; this is its last entry.
+            self.draining = !rx.is_empty();
+            return Some(event);
+        }
+        if !self.gate.is_paused() {
+            return Some(event);
+        }
+        if !rx.is_empty() {
+            // npend >= 2 ⇒ nDuplicates > 0 ⇒ C does not suspend: it drains
+            // the queue, this entry included.
+            self.draining = true;
+            return Some(event);
+        }
+        // npend == 1 ⇒ nDuplicates == 0 ⇒ C suspends holding this entry,
+        // and every post arriving during the pause replaces its value.
+        self.gate
+            .coalesce_while_paused(rx, event, pop_overflow)
+            .await
+    }
+}
+
 /// Spawn a task that forwards monitor events from a PV subscription to the client TCP stream.
 /// Returns a handle that can be used to cancel the subscription.
 ///
@@ -164,6 +232,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     epics_base_rs::runtime::task::spawn(async move {
+        let mut flow = MonitorFlow::new(flow_control);
         loop {
             // Block on the queue front, then fold the producer's coalesce
             // overflow slot. When the queue filled while we were busy the
@@ -175,16 +244,14 @@ where
             // first, and no newest-then-old replay of the stale backlog.
             let Some(queued) = rx.recv().await else { break };
             let coalesced = pv.pop_coalesced(sub_id).await;
-            let mut event = coalesce_consume(&mut rx, queued, coalesced);
-            if flow_control.is_paused() {
-                let Some(coalesced) = flow_control
-                    .coalesce_while_paused(&mut rx, event, || pv.pop_coalesced(sub_id))
-                    .await
-                else {
-                    break;
-                };
-                event = coalesced;
-            }
+            let event = coalesce_consume(&mut rx, queued, coalesced);
+            // EVENTS_OFF decision — see `MonitorFlow`.
+            let Some(event) = flow
+                .admit(&mut rx, event, || pv.pop_coalesced(sub_id))
+                .await
+            else {
+                break;
+            };
             // One subscription update committed for delivery this cycle
             // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
             // see `ServerStats::subscription_events_posted`. Counted
@@ -751,6 +818,135 @@ mod tests {
                 .unwrap()
                 .expect("resume delivers the held value");
             assert_eq!(value_of(&got), 5);
+        }
+
+        /// R8-21 boundary: a backlog that was ALREADY queued when EVENTS_OFF
+        /// arrived must be drained — each queued distinct update goes out as
+        /// its own frame, even while paused. C `event_read`
+        /// (`dbEvent.c:944-950`) suspends only when `nDuplicates == 0`, and
+        /// an update queued behind the one in hand is a duplicate; the drain
+        /// loop then empties the whole queue without re-checking
+        /// `flowCtrlMode`. Pre-fix Rust collapsed the three updates into one
+        /// latest-value frame.
+        #[tokio::test]
+        async fn r8_21_prepause_backlog_is_drained_not_collapsed() {
+            let gate = Arc::new(FlowControlGate::default());
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
+            // Three updates queued BEFORE the pause: one in hand + two in rx.
+            tx.send(ev(2)).await.unwrap();
+            tx.send(ev(3)).await.unwrap();
+            gate.pause();
+
+            let mut flow = MonitorFlow::new(gate.clone());
+            let mut delivered = Vec::new();
+            // First update is the one already dequeued by the task loop.
+            let mut in_hand = Some(ev(1));
+            for _ in 0..3 {
+                let event = match in_hand.take() {
+                    Some(e) => e,
+                    None => rx.recv().await.expect("queued update"),
+                };
+                // Every admit must return without waiting for EVENTS_ON —
+                // the gate is still paused for the whole loop.
+                let got = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    flow.admit(&mut rx, event, || async { None }),
+                )
+                .await
+                .expect("a queued duplicate must not suspend the subscription")
+                .expect("channel open");
+                delivered.push(value_of(&got));
+            }
+            assert!(gate.is_paused(), "the drain happens while EVENTS_OFF holds");
+            assert_eq!(
+                delivered,
+                vec![1, 2, 3],
+                "each already-queued distinct update goes out as its own frame"
+            );
+        }
+
+        /// The other side of the same boundary: once the queue is down to a
+        /// single entry (`nDuplicates == 0`) C suspends, and posts arriving
+        /// during the pause REPLACE that entry's value
+        /// (`db_queue_event_log`, `dbEvent.c:808-820`) instead of appending.
+        /// So a during-pause burst still collapses to one latest-value frame.
+        #[tokio::test]
+        async fn r8_21_posts_during_the_pause_still_collapse_to_latest() {
+            let gate = Arc::new(FlowControlGate::default());
+            gate.pause();
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
+            let g2 = gate.clone();
+            let task = epics_base_rs::runtime::task::spawn(async move {
+                let mut flow = MonitorFlow::new(g2);
+                flow.admit(&mut rx, ev(1), || async { None }).await
+            });
+            // Let the subscription park on the held entry FIRST — that is what
+            // makes the posts below "arrive during the pause" (C: npend == 1,
+            // nDuplicates == 0, so each post replaces the queued entry).
+            tokio::task::yield_now().await;
+            for v in [2i32, 3] {
+                tx.send(ev(v)).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            gate.resume();
+            let got = task.await.unwrap().expect("resume delivers the held entry");
+            assert_eq!(
+                value_of(&got),
+                3,
+                "during-pause posts replace the held entry — one frame, latest value"
+            );
+        }
+
+        /// After the pre-pause backlog has drained, the subscription is back
+        /// to `nDuplicates == 0` and the NEXT update must suspend again — the
+        /// drain is one pass over the queue, not a permanent bypass of the
+        /// pause.
+        #[tokio::test]
+        async fn r8_21_drain_does_not_disable_the_pause_for_later_updates() {
+            let gate = Arc::new(FlowControlGate::default());
+            let (tx, mut rx) = mpsc::channel::<MonitorEvent>(8);
+            tx.send(ev(2)).await.unwrap();
+            gate.pause();
+
+            let mut flow = MonitorFlow::new(gate.clone());
+            // Backlog of two (one in hand + one queued) drains.
+            let first = flow
+                .admit(&mut rx, ev(1), || async { None })
+                .await
+                .expect("open");
+            assert_eq!(value_of(&first), 1);
+            let queued = rx.recv().await.unwrap();
+            let second = flow
+                .admit(&mut rx, queued, || async { None })
+                .await
+                .expect("open");
+            assert_eq!(value_of(&second), 2, "the last queued entry is drained too");
+
+            // Queue is empty now: the next update must be held until resume.
+            tx.send(ev(9)).await.unwrap();
+            let queued = rx.recv().await.unwrap();
+            let held = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                flow.admit(&mut rx, queued, || async { None }),
+            )
+            .await;
+            assert!(
+                held.is_err(),
+                "with the queue drained, a further update must suspend under EVENTS_OFF"
+            );
+        }
+
+        /// Not paused → `admit` is a pass-through (no drain state, no wait).
+        #[tokio::test]
+        async fn admit_passes_through_when_not_paused() {
+            let gate = Arc::new(FlowControlGate::default());
+            let (_tx, mut rx) = mpsc::channel::<MonitorEvent>(1);
+            let mut flow = MonitorFlow::new(gate);
+            let got = flow
+                .admit(&mut rx, ev(7), || async { None })
+                .await
+                .expect("open");
+            assert_eq!(value_of(&got), 7);
         }
 
         /// `wait_until_resumed` (used by external callers of the gate)

@@ -549,6 +549,38 @@ struct IoOutcome {
     alarm: Option<(u16, AlarmSeverity)>,
 }
 
+impl IoOutcome {
+    /// C `reportError(pasynRec, status, format, ...)` (asynRecord.c:2028-2049)
+    /// — the single formatter every `performIO` diagnostic passes through, and
+    /// the only writer of `ERRS` on the I/O path.
+    ///
+    /// C `strncpy`s the formatted text *over* `ERRS`, so within one cycle the
+    /// **last** `reportError` wins; the recorders below therefore call this in
+    /// C's own source order (read status before overflow, asynRecord.c:1593-1615)
+    /// rather than in whatever order reads more naturally.
+    ///
+    /// Every C `reportError` format ends in `%s` = `pasynUser->errorMessage`,
+    /// the driver's own diagnostic. [`AsynError::message`] is its port analogue
+    /// — it reads *through* the `PartialRead`/`PartialWrite` carriers to the
+    /// underlying driver text — so it, not `Display`, is what belongs in that
+    /// tail.
+    fn report_error(&mut self, msg: String) {
+        self.errs = Some(msg);
+    }
+}
+
+/// The status word C splices into the final octet read-error message
+/// (asynRecord.c:1594-1596): `asynTimeout` -> `timeout`, `asynOverflow` ->
+/// `overflow`, everything else -> `error`.
+fn c_read_status_word(e: &crate::error::AsynError) -> &'static str {
+    use crate::error::AsynStatus;
+    match e.status() {
+        AsynStatus::Timeout => "timeout",
+        AsynStatus::Overflow => "overflow",
+        _ => "error",
+    }
+}
+
 /// Raise `(stat, sevr)` into an [`IoOutcome`] mirroring `recGblSetSevr`
 /// (recGbl.c:258, [`rec_gbl_set_sevr`]): a new severity replaces the pending
 /// alarm only when it is **strictly higher**, so an equal-severity later call
@@ -685,7 +717,7 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
         // (asynRecord.c:1377-1381 / 1413-1417 / 1449-1453). These handlers have
         // no byte count, so they never touch NAWT.
         if let Err(e) = res {
-            out.errs = Some(format!("write: {e}"));
+            out.report_error(format!("write: {e}"));
             raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
         }
         return;
@@ -710,11 +742,17 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
     // branch raises NO record severity — only the message — so unlike the
     // register writes above it sets no alarm.
     if err.is_some() || nawt != plan.octet_out_len {
+        // The `%s` tail is C's `pasynUser->errorMessage` — the driver's own
+        // text, which `AsynError::message()` reads through the PartialWrite
+        // carrier. (`Display` would prefix it with the Rust status debug, which
+        // C's ERRS never carries.) A short write that reported success has no
+        // driver message at all; C leaves the stale `errorMessage` there, so
+        // state what actually happened instead of pretending to a driver text.
         let detail = match &err {
-            Some(e) => e.to_string(),
+            Some(e) => e.message(),
             None => format!("wrote {} of {} chars", nawt, plan.octet_out_len),
         };
-        out.errs = Some(format!("Write error, nout={nawt}, {detail}"));
+        out.report_error(format!("Write error, nout={nawt}, {detail}"));
     }
 }
 
@@ -753,11 +791,16 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 }
             };
 
+            // C `nbytesTransfered` — the count every read-side diagnostic and
+            // field assignment below is built from. Taken before `data` is
+            // moved into the IFMT-selected input field.
+            let nread = data.len();
+
             out.eomr = Some(eom as i32);
             // NORD is the raw transfer count (C `nord = nbytesTransfered`,
             // asynRecord.c:1627) — independent of the overflow
             // NUL-truncation below and of UTF-8-lossy expansion.
-            out.nord = Some(data.len() as i32);
+            out.nord = Some(nread as i32);
             // C performOctetIO's overflow tests (asynRecord.c:1602-1621) are
             // plain length compares against the IFMT-selected buffer capacity
             // `inlen`, with no end-of-message condition: a read that filled the
@@ -797,25 +840,42 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 }
                 out.binp = Some(data);
             }
-            if overflow {
-                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
-            }
-            if let Some(e) = err {
-                out.errs = Some(format!("read: {e}"));
+            // C's two read-side diagnostics, in C's own order: the status
+            // failure first (asynRecord.c:1593-1599), the overflow check after
+            // (:1602-1621). Both go through `reportError`, which overwrites
+            // ERRS, so on a read that both failed *and* overflowed the overflow
+            // text is what the operator sees. The severities compose the other
+            // way round — `recGblSetSevr` keeps the strictly higher — so the
+            // MAJOR from the failure survives the MINOR from the overflow.
+            if let Some(e) = &err {
+                // C: reportError(status, "%s  nread %d %s", <status word>,
+                // nbytesTransfered, pasynUser->errorMessage) — two spaces after
+                // the status word, verbatim from the C format string. (The
+                // earlier `"Error %s"` at :1583 is overwritten by this one and
+                // never reaches the operator.)
+                out.report_error(format!(
+                    "{}  nread {} {}",
+                    c_read_status_word(e),
+                    nread,
+                    e.message()
+                ));
                 // C performOctetIO read error -> recGblSetSevr(READ_ALARM,
                 // MAJOR) (asynRecord.c:1599).
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
+            }
+            if overflow {
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
             }
         }
         InterfaceType::Int32 => match res {
             Ok(result) => match result.int_val {
                 Some(v) => out.i32inp = Some(v),
-                None => out.errs = Some("read: int32 read returned no value".to_string()),
+                None => out.report_error("read: int32 read returned no value".to_string()),
             },
             // C performInt32IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
             // (asynRecord.c:1393).
             Err(e) => {
-                out.errs = Some(format!("read: {e}"));
+                out.report_error(format!("read: {e}"));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
         },
@@ -828,19 +888,19 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             // C performUInt32DigitalIO read error -> recGblSetSevr(READ_ALARM,
             // MAJOR) (asynRecord.c:1431).
             Err(e) => {
-                out.errs = Some(format!("read: {e}"));
+                out.report_error(format!("read: {e}"));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
         },
         InterfaceType::Float64 => match res {
             Ok(result) => match result.float_val {
                 Some(v) => out.f64inp = Some(v),
-                None => out.errs = Some("read: float64 read returned no value".to_string()),
+                None => out.report_error("read: float64 read returned no value".to_string()),
             },
             // C performFloat64IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
             // (asynRecord.c:1465).
             Err(e) => {
-                out.errs = Some(format!("read: {e}"));
+                out.report_error(format!("read: {e}"));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
         },
@@ -860,7 +920,7 @@ fn record_phase_result(
     match phase {
         IoPhase::Flush => {
             if let Err(e) = res {
-                out.errs = Some(format!("flush: {e}"));
+                out.report_error(format!("flush: {e}"));
             }
         }
         IoPhase::Write => record_write_result(plan, out, res),
@@ -881,7 +941,7 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
     let mut out = IoOutcome::default();
 
     if cancel.is_cancelled() {
-        out.errs = Some(CANCELED_MSG.to_string());
+        out.report_error(CANCELED_MSG.to_string());
         return out;
     }
 
@@ -904,7 +964,7 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
             }
         };
         if cancel.is_cancelled() {
-            out.errs = Some(CANCELED_MSG.to_string());
+            out.report_error(CANCELED_MSG.to_string());
             return out;
         }
         record_phase_result(&plan, &mut out, phase, res);
@@ -3830,6 +3890,97 @@ mod tests {
         assert_eq!(writer.nawt, 0, "failed write must reset NAWT to 0");
     }
 
+    /// R8-56: the octet read-error ERRS is C's `"%s  nread %d %s"` with the
+    /// status word ∈ {timeout, overflow, error}, the transferred count, and the
+    /// driver's `pasynUser->errorMessage` (asynRecord.c:1593-1598 — it
+    /// overwrites the earlier `"Error %s"` at :1583, which never reaches the
+    /// operator). The port emitted `"read: {e}"`, which carries neither the
+    /// status word nor the count and prefixes the Rust status debug onto the
+    /// driver text.
+    #[test]
+    fn octet_read_error_errs_matches_c_report_error() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interpose::{EomReason, PartialOctetRead};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        /// One read per status word C distinguishes; the third read carries a
+        /// partial transfer so the `%d` count is not trivially zero.
+        struct StatusDriver {
+            base: PortDriverBase,
+            n: usize,
+        }
+        impl PortDriver for StatusDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                _buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                self.n += 1;
+                match self.n {
+                    1 => Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    }),
+                    2 => Err(AsynError::Status {
+                        status: AsynStatus::Overflow,
+                        message: "buffer full".into(),
+                    }),
+                    _ => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "device fault".into(),
+                    }
+                    .with_partial_read(PartialOctetRead {
+                        data: b"xy".to_vec(),
+                        eom_reason: EomReason::empty(),
+                    })),
+                }
+            }
+        }
+
+        let port_name = "test_octet_read_errs_text";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(StatusDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                n: 0,
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.ifmt = ASYN_FMT_ASCII;
+
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "timeout  nread 0 read timeout");
+
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "overflow  nread 0 buffer full");
+
+        rec.process().unwrap();
+        assert_eq!(
+            rec.errs, "error  nread 2 device fault",
+            "the count is the bytes the failing read did deliver"
+        );
+    }
+
     /// R7-46: a device that emits a partial line and then goes quiet reaches
     /// the record as `asynTimeout` **plus** the bytes it did send. C
     /// `performOctetIO` assigns `eomr`/`nord`/`inptr`/`tinp` from
@@ -3911,7 +4062,10 @@ mod tests {
         assert_eq!(rec.nord, 3, "NORD = nbytesTransfered (C :1627)");
         assert_eq!(rec.eomr, 0, "no EOS matched, buffer never filled (C :1591)");
         assert_eq!(rec.tinp, "abc", "TINP is posted for the failed read too");
-        assert!(!rec.errs.is_empty(), "the timeout still reports into ERRS");
+        assert_eq!(
+            rec.errs, "timeout  nread 3 read timeout",
+            "C :1593-1598 \"%s  nread %d %s\" with the transferred count"
+        );
 
         let mut c = CommonFields::default();
         rec.check_alarms(&mut c);

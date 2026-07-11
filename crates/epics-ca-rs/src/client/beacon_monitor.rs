@@ -358,7 +358,10 @@ async fn run_beacon_monitor_inner(
                     );
                     tries_msg_shown = true;
                 }
-                let _ = send_repeater_registration(&socket).await;
+                // C passes the attempt number into the registration
+                // (`repeaterSubscribeTimer.cpp:83` `repeaterRegistrationMessage
+                // (this->attempts)`) — it selects the odd/even address form.
+                let _ = send_repeater_registration(&socket, attempts).await;
                 attempts = attempts.saturating_add(1);
                 continue;
             }
@@ -914,35 +917,42 @@ fn handle_beacon(
 // Repeater registration
 // ---------------------------------------------------------------------------
 
-/// Send one `CA_PROTO_REPEATER_REGISTER` to the local repeater.
+/// Send one `CA_PROTO_REPEATER_REGISTER` for attempt number `attempt`.
 ///
-/// C `caRepeaterRegistrationMessage` (`udpiiu.cpp:465-520`) — a bare
+/// C `caRepeaterRegistrationMessage` (`udpiiu.cpp:465-535`) — a bare
 /// `sendto`, no waiting. Confirmation arrives asynchronously as
 /// `CA_PROTO_REPEATER_CONFIRM` on the same socket and is handled by the
 /// monitor's receive loop (C `udpiiu::repeaterAckAction`). This function
 /// deliberately does NOT read the socket: doing so would consume beacons
 /// destined for the monitor.
-async fn send_repeater_registration(socket: &AsyncUdpV4) -> Result<(), ()> {
-    // We bound to a single loopback NIC, so `local_addrs()` gives the
-    // one ephemeral port we want to announce.
-    let local_ip = socket
-        .local_addrs()
-        .into_iter()
-        .find_map(|sa| match sa {
-            SocketAddr::V4(v4) => Some(*v4.ip()),
-            _ => None,
-        })
-        .unwrap_or(Ipv4Addr::LOCALHOST);
+///
+/// The registration ALTERNATES its address across retries
+/// (`udpiiu.cpp:494-519`): on an odd `attempt` C uses `osiLocalAddr()` — the
+/// first up, non-loopback interface — and on an even one the loopback address.
+/// One `osiSockAddr` serves as both the `sendto` destination and the announced
+/// `m_available`, so both alternate together. The reason is compatibility: a
+/// repeater from 3.13 beta 11 or earlier called `local_addr()` to decide which
+/// registrations to accept and rejected everything from a different address,
+/// and which of the two addresses that was depended on the release. Alternating
+/// means one of every two attempts is always acceptable to any repeater vintage
+/// (`udpiiu.cpp:476-493`). Both the C repeater (`repeater.cpp:115-117`) and this
+/// port's (`repeater.rs:103`) bind `INADDR_ANY`, so both destinations reach it.
+async fn send_repeater_registration(socket: &AsyncUdpV4, attempt: u32) -> Result<(), ()> {
+    let addr = if attempt & 1 == 1 {
+        crate::server::addr_list::osi_local_addr()
+    } else {
+        Ipv4Addr::LOCALHOST
+    };
 
     let mut hdr = CaHeader::new(CA_PROTO_REPEATER_REGISTER);
-    hdr.available = u32::from_be_bytes(local_ip.octets());
+    hdr.available = u32::from_be_bytes(addr.octets());
 
     // Honour `EPICS_CA_REPEATER_PORT` so the beacon monitor and the
     // daemon agree when operators override the default — without this
     // the monitor would silently fail to re-register every 5 min
     // against a non-default repeater. libca `udpiiu.cpp:168` resolves
     // the same env var.
-    let repeater_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port()));
+    let repeater_addr = SocketAddr::V4(SocketAddrV4::new(addr, repeater_port()));
     socket
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await
@@ -990,9 +1000,13 @@ mod repeater_registration_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn registration_retries_every_second_until_confirm_then_stops() {
-        let repeater = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        // `INADDR_ANY`, like the real repeater (C `repeater.cpp:115-117`,
+        // `repeater.rs:103`). A loopback-only bind would miss the odd-numbered
+        // attempts, which C addresses to `osiLocalAddr()` — see
+        // `registration_alternates_loopback_and_local_addr_across_attempts`.
+        let repeater = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
-            .expect("bind fake repeater");
+            .expect("bind fake repeater on INADDR_ANY");
         let port = repeater.local_addr().unwrap().port();
 
         let saved = std::env::var("EPICS_CA_REPEATER_PORT").ok();
@@ -1040,6 +1054,81 @@ mod repeater_registration_tests {
                 None => std::env::remove_var("EPICS_CA_REPEATER_PORT"),
             }
         }
+    }
+
+    /// R6-22 residual — the registration address ALTERNATES across retries.
+    ///
+    /// C `caRepeaterRegistrationMessage` (`udpiiu.cpp:494-519`): an odd
+    /// `attemptNumber` registers from `osiLocalAddr()` (first up, non-loopback
+    /// interface), an even one from the loopback address, and the chosen
+    /// `osiSockAddr` is BOTH the `sendto` destination and the announced
+    /// `m_available`. A pre-3.13-beta-12 repeater accepted registrations from
+    /// only one of those two addresses — which one depended on the release —
+    /// so alternating keeps one of every two attempts acceptable to any
+    /// vintage. The port always announced (and always sent to) loopback.
+    ///
+    /// The fake repeater binds `INADDR_ANY` like the real one
+    /// (`repeater.cpp:115-117`, `repeater.rs:103`), so it receives BOTH
+    /// destination forms — asserting on the 4 datagrams' `m_available` pins
+    /// the alternation and proves the odd-attempt datagram is still delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn registration_alternates_loopback_and_local_addr_across_attempts() {
+        let repeater = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("bind fake repeater on INADDR_ANY");
+        let port = repeater.local_addr().unwrap().port();
+
+        let saved = std::env::var("EPICS_CA_REPEATER_PORT").ok();
+        // SAFETY: serial_test::serial serialises env mutation; restored below.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string()) };
+
+        let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
+        let (_ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        let monitor = tokio::spawn(run_beacon_monitor(coord_tx, ctrl_rx));
+
+        // Attempts 0..=3 at ~1 s apart (the repeater never CONFIRMs).
+        let mut announced: Vec<Ipv4Addr> = Vec::new();
+        let mut buf = [0u8; 64];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(3600);
+        while announced.len() < 4 {
+            match tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf)).await {
+                Ok(Ok((n, _src))) if n >= CaHeader::SIZE => {
+                    if let Ok(h) = CaHeader::from_bytes(&buf[..n]) {
+                        if h.cmmd == CA_PROTO_REPEATER_REGISTER {
+                            announced.push(Ipv4Addr::from(h.available.to_be_bytes()));
+                        }
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        monitor.abort();
+        // SAFETY: see above.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CA_REPEATER_PORT", v),
+                None => std::env::remove_var("EPICS_CA_REPEATER_PORT"),
+            }
+        }
+
+        assert_eq!(
+            announced.len(),
+            4,
+            "expected 4 registrations in 3.6 s (1 s retry period); the odd-attempt \
+             datagram must still reach an INADDR_ANY-bound repeater"
+        );
+        // C's rule verbatim: even → loopback, odd → osiLocalAddr(). On a
+        // loopback-only host `osi_local_addr()` IS loopback and C sends
+        // loopback for both — the expectation below still holds.
+        let local = crate::server::addr_list::osi_local_addr();
+        assert_eq!(
+            announced,
+            vec![Ipv4Addr::LOCALHOST, local, Ipv4Addr::LOCALHOST, local],
+            "attempt N must announce loopback for even N and osiLocalAddr() for odd N \
+             (udpiiu.cpp:494-519); got {announced:?}"
+        );
     }
 }
 

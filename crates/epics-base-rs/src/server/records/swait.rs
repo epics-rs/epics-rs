@@ -87,6 +87,11 @@ impl SwaitRecord {
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
     /// the `VAL` token (`FETCH_VAL`, sCalcPerform.c:451-453) pushes — for swait
     /// that is `&pwait->val` (C `swaitRecord.c:409`), i.e. the *previous* VAL.
+    ///
+    /// `prev_sval` is deliberately left empty: swait evaluates its CALC with the
+    /// *numeric* `calcPerform(&pwait->a, &pwait->val, pwait->rpcl)`
+    /// (`swaitRecord.c:409`), which takes no `psresult` — swait has no SVAL
+    /// field and the numeric `postfix()` element table has no SVAL token.
     fn build_inputs(&self, prev_val: f64) -> StringInputs {
         let mut inputs = StringInputs::new();
         for i in 0..12 {

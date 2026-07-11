@@ -1732,19 +1732,50 @@ impl RecordInstance {
             // swait-specific: OUTN is the output link name for swait records.
             // Mirrors to common.out so the processing framework dispatches it.
             "OUTN" => {
-                if self.record.record_type() == "swait" {
-                    if let EpicsValue::String(s) = value {
-                        self.common.out = s.as_str_lossy().into_owned();
-                        // Bare OUT link is NPP — see the "OUT" arm.
-                        self.parsed_out = parse_output_link_v2(&self.common.out);
-                    }
+                if self.record.record_type() != "swait" {
+                    // No OUTN field on any other record type — the same
+                    // `S_dbLib_fieldNotFound` the catch-all below reports.
+                    return Err(self.unknown_field_error(name));
+                }
+                if let EpicsValue::String(s) = value {
+                    self.common.out = s.as_str_lossy().into_owned();
+                    // Bare OUT link is NPP — see the "OUT" arm.
+                    self.parsed_out = parse_output_link_v2(&self.common.out);
                 }
             }
-            _ => {}
+            // C `dbNameToAddr` (dbAccess.c:660-676) resolves the field part
+            // with `dbFindFieldPart`, then falls back to `dbGetAttributePart`.
+            // A name that is neither a record field, nor a dbCommon field, nor
+            // an attribute resolves to nothing (`S_dbLib_fieldNotFound`), so
+            // `dbPutField` is never reached and the caller reports the error —
+            // `dbpf` prints "PV '%s' not found" and returns -1 (dbTest.c:787-795).
+            // Returning success here made a put to a misspelled field a silent
+            // no-op.
+            _ => return Err(self.unknown_field_error(name)),
         }
         self.record.on_put(&name);
         let _ = self.record.special(&name, true);
         Ok(CommonFieldPutResult::NoChange)
+    }
+
+    /// The error C reports for a write to a field name that
+    /// [`Self::put_common_field`] does not own.
+    ///
+    /// Two C outcomes, split by whether the name resolves at all:
+    ///
+    /// - A record *attribute* (`NAME`, `RTYP`) resolves — `dbGetAttributePart`
+    ///   succeeds — but the write is refused: `NAME` is `special(SPC_NOMOD)`
+    ///   (dbCommon.dbd:13-17) so `dbPutSpecial` pass 0 returns `S_db_noMod`
+    ///   (dbAccess.c:123-124), and an attribute address carries
+    ///   `special == SPC_ATTRIBUTE`, which `dbPutField` rejects with the same
+    ///   `S_db_noMod` (dbAccess.c:1252-1253).
+    /// - Anything else does not resolve: `S_dbLib_fieldNotFound`.
+    fn unknown_field_error(&self, name: String) -> CaError {
+        if self.get_virtual_field(&name).is_some() {
+            CaError::ReadOnlyField(name)
+        } else {
+            CaError::FieldNotFound(name)
+        }
     }
 
     /// Get virtual fields (NAME, RTYP).

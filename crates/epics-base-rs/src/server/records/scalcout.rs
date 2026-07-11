@@ -107,11 +107,13 @@ impl ScalcoutRecord {
         Self::default()
     }
 
-    /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
-    /// the `VAL` token (`FETCH_VAL`, sCalcPerform.c:921-925) pushes: for CALC
-    /// that is `&pcalc->val` (C `sCalcoutRecord.c:357`) and for OCAL it is
-    /// `&pcalc->oval` (`:768-769`) — in both cases the *previous* result.
-    fn build_inputs(&self, prev_val: f64) -> StringInputs {
+    /// Build the calc inputs. `prev_val` / `prev_sval` are the cells C passes as
+    /// `presult` / `psresult`, which the `VAL` (`FETCH_VAL`,
+    /// sCalcPerform.c:921-925) and `SVAL` (`FETCH_SVAL`, :927-932) tokens push:
+    /// for CALC those are `&pcalc->val, pcalc->sval` (C `sCalcoutRecord.c:357`)
+    /// and for OCAL `&pcalc->oval, pcalc->osv` (`:768-769`) — in every case the
+    /// *previous* result.
+    fn build_inputs(&self, prev_val: f64, prev_sval: &PvString) -> StringInputs {
         let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
@@ -121,6 +123,7 @@ impl ScalcoutRecord {
             inputs.str_vars[i] = self.str_vals[i].as_str_lossy().into_owned();
         }
         inputs.prev_val = prev_val;
+        inputs.prev_sval = prev_sval.as_str_lossy().into_owned();
         inputs
     }
 
@@ -521,8 +524,10 @@ impl Record for ScalcoutRecord {
         let calc_failed = if self.calc.is_empty() {
             false
         } else if let Some(ref compiled) = self.compiled_calc {
-            // C `sCalcoutRecord.c:357` — presult = &pcalc->val.
-            let mut inputs = self.build_inputs(self.val);
+            // C `sCalcoutRecord.c:357-359` — presult = &pcalc->val,
+            // psresult = pcalc->sval: VAL/SVAL both read this cycle's
+            // pre-evaluation values (captured in prev_val/prev_sval above).
+            let mut inputs = self.build_inputs(self.val, &self.sval);
             match scalc_eval(compiled, &mut inputs) {
                 Ok(result) => {
                     self.apply_result(&result);
@@ -589,10 +594,11 @@ impl Record for ScalcoutRecord {
                 // alarm.
                 if !self.ocal.is_empty() {
                     if let Some(ref compiled) = self.compiled_ocal {
-                        // C `sCalcoutRecord.c:768-769` — presult = &pcalc->oval,
-                        // so the VAL token in OCAL reads the previous OVAL, not
-                        // the VAL this cycle just computed.
-                        let mut inputs = self.build_inputs(self.oval);
+                        // C `sCalcoutRecord.c:768-770` — presult = &pcalc->oval,
+                        // psresult = pcalc->osv, so the VAL/SVAL tokens in OCAL
+                        // read the previous OVAL/OSV, not the VAL/SVAL this
+                        // cycle just computed.
+                        let mut inputs = self.build_inputs(self.oval, &self.osv);
                         match scalc_eval(compiled, &mut inputs) {
                             Ok(result) => match &result {
                                 StackValue::Double(v) => {

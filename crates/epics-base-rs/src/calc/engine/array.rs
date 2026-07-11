@@ -46,6 +46,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // C FETCH_VAL pushes *presult (the record's previous result).
                     stack.push(ArrayStackValue::Double(inputs.prev_val));
                 }
+                CoreOp::FetchSval => {
+                    // aCalc has no SVAL: `aCalcPostfix`'s element table never
+                    // emits FETCH_SVAL and `aCalcPerform` has no string result
+                    // to push. Reachable only through the port's shared
+                    // tokenizer, and rejected like the other string-only opcodes.
+                    return Err(CalcError::Internal);
+                }
 
                 // Type-aware arithmetic via zip_map
                 CoreOp::Add => {

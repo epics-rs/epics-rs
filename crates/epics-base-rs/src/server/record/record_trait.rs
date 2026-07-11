@@ -488,20 +488,17 @@ pub trait Record: Send + Sync + 'static {
     /// ai, Long→Enum for bi/mbbi). This prevents silent failures when
     /// asyn device support provides Int32 values to Enum-typed records.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        // Soft-channel INP/DOL delivery into the record's value field is
+        // internal delivery, so it takes the same single owner every other
+        // link target takes — `put_field_internal`. It was a parallel path
+        // (put_field, then a `TypeMismatch`-triggered `convert_to` off the
+        // *current* value's type), which silently dropped a shape the typed
+        // arm rejected and `convert_to` could not fix: an array source into a
+        // scalar VAL stayed an array and never landed. C's link layer asks for
+        // one element (`dbGetLink(..., nRequest = NULL)`), so a waveform INP
+        // into an `ai.VAL` delivers `wf[0]`.
         let field = self.primary_field();
-        match self.put_field(field, value.clone()) {
-            Ok(()) => Ok(()),
-            Err(crate::error::CaError::TypeMismatch(_)) => {
-                // Auto-coerce: determine target type from current VAL
-                let target_type = self
-                    .get_field(field)
-                    .map(|v| v.db_field_type())
-                    .unwrap_or(DbFieldType::Double);
-                let coerced = value.convert_to(target_type);
-                self.put_field(field, coerced)
-            }
-            Err(e) => Err(e),
-        }
+        self.put_field_internal(field, value)
     }
 
     /// Whether this record implements the `DTYP="Raw Soft Channel"`
@@ -1125,6 +1122,24 @@ pub trait Record: Send + Sync + 'static {
             .find(|f| f.name.eq_ignore_ascii_case(name))
             .map(|f| f.dbf_type)
             .or_else(|| self.get_field(name).map(|v| v.db_field_type()));
+        // An array source into a SCALAR destination delivers element 0. C's
+        // link layer asks for exactly one element (`dbGetLink(..., nRequest =
+        // NULL)`), so `dbGet` converts the field at offset 0 and the record
+        // sees a scalar — a waveform INP into an `ai.VAL` lands `wf[0]`, it is
+        // not dropped. Without the reduction the array reached the record's
+        // typed `put_field` arm, which rejected it and left the field at its
+        // stale value. Same clamp as `field_io::dbput_request` (C `dbPut`
+        // `nRequest -> no_elements`), through the same primitive; a `CharArray`
+        // into a `DBF_STRING` field is likewise exempt — that shape is the
+        // dbChannel `$` char view of a string field, decoded by `convert_to`.
+        let dest_is_array = self.get_field(name).is_some_and(|v| v.is_array());
+        let is_char_string_view =
+            matches!(value, EpicsValue::CharArray(_)) && target_type == Some(DbFieldType::String);
+        let value = if !dest_is_array && value.is_array() && !is_char_string_view {
+            value.first_element().unwrap_or(value)
+        } else {
+            value
+        };
         let is_enum_carrier = matches!(value, EpicsValue::EnumWithChoices { .. });
         let value = match target_type {
             Some(target)

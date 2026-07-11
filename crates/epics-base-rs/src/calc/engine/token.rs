@@ -92,6 +92,10 @@ pub enum Token {
     Rndm,
     Nrndm,
     FetchVal,
+    /// `SVAL` — the previous *string* result (C `FETCH_SVAL`,
+    /// sCalcPostfix.c:188). String-calc only: the numeric `postfix()` and
+    /// `aCalcPostfix()` element tables have no such token.
+    FetchSval,
 
     StringLiteral(String),
 
@@ -237,6 +241,8 @@ impl<'a> Tokenizer<'a> {
             (b"LOGE", Token::Func(FuncName::LogE)),
             (b"LOG2", Token::Func(FuncName::Log2)),
             (b"RNDM", Token::Rndm),
+            // C sCalcPostfix.c:188 `{"SVAL", 0, 0, 1, OPERAND, FETCH_SVAL}`.
+            (b"SVAL", Token::FetchSval),
             (b"VAL", Token::FetchVal),
             (b"ABS", Token::Func(FuncName::Abs)),
             (b"SQR", Token::Func(FuncName::Sqr)),

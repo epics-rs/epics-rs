@@ -808,11 +808,16 @@ impl ClientState {
 /// Tries to bind to the configured port first; falls back to an ephemeral port
 /// (port 0) if the configured port is already in use.
 ///
-/// Notifies `beacon_reset` on each client connect/disconnect so the beacon
-/// emitter restarts its fast beacon cycle. This is a Rust enhancement, NOT
-/// C parity: C `rsrv` resets the beacon interval only on `ctlPause`, never
-/// on connect/disconnect. The extra fast beacons are benign and help
-/// clients notice server state changes promptly.
+/// The TCP path does NOT touch the beacon ramp. C `rsrv` sets the ramp's
+/// initial period once, when `rsrv_online_notify_task` starts
+/// (`online_notify.c:68` `delay = 0.02`), and restarts it in exactly one other
+/// place: the `beacon_ctl == ctlPause` wait loop (`online_notify.c:126-129`).
+/// A client connect or disconnect never restarts it — accepting a connection
+/// is not a server state change other clients need to hear about. This port has
+/// no `ctlPause` equivalent (no `iocPause` lifecycle), so the ramp's only reset
+/// is its own start, and the beacon-reset signal is reachable solely through
+/// [`CaServer::trigger_beacon_anomaly`](super::ca_server::CaServer::trigger_beacon_anomaly)
+/// — the ca-gateway's `generateBeaconAnomaly` analogue.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tcp_listener(
     db: Arc<PvDatabase>,
@@ -820,7 +825,6 @@ pub async fn run_tcp_listener(
     acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
     acf_reload_tx: broadcast::Sender<()>,
     tcp_port_tx: tokio::sync::oneshot::Sender<u16>,
-    beacon_reset: std::sync::Arc<tokio::sync::Notify>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     audit: Option<crate::audit::AuditLogger>,
     drain: Arc<std::sync::atomic::AtomicBool>,
@@ -965,7 +969,6 @@ pub async fn run_tcp_listener(
         let db_t = db.clone();
         let acf_t = acf.clone();
         let acf_reload_tx_t = acf_reload_tx.clone();
-        let beacon_reset_t = beacon_reset.clone();
         let conn_events_t = conn_events.clone();
         let audit_t = audit.clone();
         let drain_t = drain.clone();
@@ -982,7 +985,6 @@ pub async fn run_tcp_listener(
                 db_t,
                 acf_t,
                 acf_reload_tx_t,
-                beacon_reset_t,
                 conn_events_t,
                 audit_t,
                 drain_t,
@@ -1032,7 +1034,6 @@ async fn accept_loop(
     db: Arc<PvDatabase>,
     acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
     acf_reload_tx: broadcast::Sender<()>,
-    beacon_reset: std::sync::Arc<tokio::sync::Notify>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     audit: Option<crate::audit::AuditLogger>,
     drain: Arc<std::sync::atomic::AtomicBool>,
@@ -1087,12 +1088,6 @@ async fn accept_loop(
         metrics::gauge!("ca_server_clients_active").increment(1.0);
         let db = db.clone();
         let acf = acf.clone();
-        let beacon_reset = beacon_reset.clone();
-        // Rust enhancement (NOT C parity): C `rsrv` never resets the
-        // beacon interval on connect — only on `ctlPause`. We restart
-        // the fast beacon cycle here so clients notice the new server
-        // state quickly; the extra beacons are benign.
-        beacon_reset.notify_one();
         if let Some(tx) = &conn_events {
             let _ = tx.send(ServerConnectionEvent::Connected(peer));
         }
@@ -1265,11 +1260,6 @@ async fn accept_loop(
                     .await
                 }
             };
-            // Rust enhancement (NOT C parity): C `rsrv` never resets
-            // the beacon interval on disconnect — only on `ctlPause`.
-            // Restarting the fast beacon cycle here is a deliberate,
-            // benign addition.
-            beacon_reset.notify_one();
             if let Some(tx) = &conn_events {
                 let _ = tx.send(ServerConnectionEvent::Disconnected(peer));
             }
@@ -6070,7 +6060,7 @@ mod multi_nic_listener_tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::net::TcpStream;
-    use tokio::sync::{Notify, broadcast, oneshot};
+    use tokio::sync::{broadcast, oneshot};
 
     /// Spawn `run_tcp_listener` against a per-test database, return the
     /// (port, abort-handle). Honours whatever EPICS_CAS_INTF_ADDR_LIST
@@ -6080,7 +6070,6 @@ mod multi_nic_listener_tests {
         let acf = Arc::new(tokio::sync::RwLock::new(None));
         let (acf_reload_tx, _) = broadcast::channel::<()>(4);
         let (tcp_tx, tcp_rx) = oneshot::channel::<u16>();
-        let beacon_reset = Arc::new(Notify::new());
         let drain = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(async move {
             let _ = run_tcp_listener(
@@ -6089,7 +6078,6 @@ mod multi_nic_listener_tests {
                 acf,
                 acf_reload_tx,
                 tcp_tx,
-                beacon_reset,
                 None,
                 None,
                 drain,

@@ -116,6 +116,21 @@ const BEACON_STALE_THRESHOLD: Duration = Duration::from_secs(180);
 /// with the repeater in case it restarted.
 const REREGISTER_INTERVAL: Duration = Duration::from_secs(300);
 
+/// C `repeaterSubscribeTimerPeriod` (`repeaterSubscribeTimer.cpp:31`).
+///
+/// While the repeater has not CONFIRMed, libca re-sends `REPEATER_REGISTER`
+/// on every expiry and returns `expireStatus(restart, 1.0)`
+/// (`repeaterSubscribeTimer.cpp:84-90`) — it never gives up. `registered` is
+/// set by exactly one thing: `confirmNotify`, called from
+/// `udpiiu::repeaterAckAction` (`udpiiu.cpp:793`) when a
+/// `CA_PROTO_REPEATER_CONFIRM` datagram arrives. A successful `sendto` proves
+/// nothing: the repeater may not be bound yet.
+const REPEATER_SUBSCRIBE_PERIOD: Duration = Duration::from_secs(1);
+
+/// C `nTriesToMsg` (`repeaterSubscribeTimer.cpp:70`) — after this many
+/// unconfirmed attempts libca prints a one-shot diagnostic and keeps trying.
+const REPEATER_TRIES_TO_MSG: u32 = 50;
+
 pub(crate) async fn run_beacon_monitor(
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     control_rx: mpsc::UnboundedReceiver<BeaconControl>,
@@ -175,15 +190,25 @@ async fn run_beacon_monitor_inner(
     }
     let mut prev_drops_beacon: u32 = 0;
 
-    // Initial registration with retry
-    for attempt in 0..3u32 {
-        if register_with_repeater(&socket).await.is_ok() {
-            break;
-        }
-        if attempt < 2 {
-            tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
-        }
-    }
+    // Repeater registration state, mirroring C `repeaterSubscribeTimer`
+    // (`repeaterSubscribeTimer.cpp`). `registered` flips only on a
+    // `CA_PROTO_REPEATER_CONFIRM` (C `confirmNotify`), and while it is false
+    // the 1 s ticker below re-sends `REPEATER_REGISTER` forever. The old
+    // three-attempt loop gave up after ~2 s and then left the client without
+    // beacon fan-out until the 5-minute silence timer — a repeater that came
+    // up late (cold start, repeater restart) was never registered with.
+    //
+    // The CONFIRM is recognised by the main receive loop, not by a private
+    // recv inside the sender: the old `register_with_repeater` drained the
+    // socket for 500 ms looking for its CONFIRM and silently discarded every
+    // beacon that arrived in that window.
+    let mut registered = false;
+    let mut attempts: u32 = 0;
+    let mut tries_msg_shown = false;
+    // `interval` fires its first tick immediately, so the initial
+    // registration still goes out at startup rather than one period later.
+    let mut subscribe_tick = tokio::time::interval(REPEATER_SUBSCRIBE_PERIOD);
+    subscribe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // When `verifier` is set, this map remembers which
     // (server_ip, server_port, beacon_id) tuples have been
@@ -227,6 +252,27 @@ async fn run_beacon_monitor_inner(
             socket.recv_with_meta_with_drops(&mut buf),
         );
         let (meta, drops) = tokio::select! {
+            // C `repeaterSubscribeTimer::expire` (`repeaterSubscribeTimer.cpp:66-91`):
+            // send a registration on every expiry and reschedule at 1 s for as
+            // long as the repeater has not confirmed. Disabled once it has,
+            // exactly like C's `noRestart`.
+            _ = subscribe_tick.tick(), if !registered => {
+                if attempts > REPEATER_TRIES_TO_MSG && !tries_msg_shown {
+                    // C prints this once and keeps trying
+                    // (`repeaterSubscribeTimer.cpp:70-80`).
+                    tracing::warn!(
+                        target: "epics_ca_rs::client::beacon_monitor",
+                        tries = REPEATER_TRIES_TO_MSG,
+                        "CA client library is unable to contact CA repeater after \
+                         {REPEATER_TRIES_TO_MSG} tries. Silence this message by \
+                         starting a CA repeater daemon."
+                    );
+                    tries_msg_shown = true;
+                }
+                let _ = send_repeater_registration(&socket).await;
+                attempts = attempts.saturating_add(1);
+                continue;
+            }
             ctrl = control_rx.recv(), if control_rx_open => {
                 match ctrl {
                     Some(BeaconControl::ResetServer { server_addr }) => {
@@ -243,8 +289,13 @@ async fn run_beacon_monitor_inner(
                     Ok(Ok(v)) => v,
                     Ok(Err(_)) => continue,
                     Err(_) => {
-                        // No beacons for 5 minutes — repeater may have restarted
-                        let _ = register_with_repeater(&socket).await;
+                        // No beacons for 5 minutes — the repeater may have
+                        // restarted and forgotten us. Drop back into the
+                        // unregistered state so the 1 s ticker above resumes
+                        // until a fresh CONFIRM arrives, instead of firing one
+                        // unverified datagram every 5 minutes.
+                        registered = false;
+                        attempts = 0;
                         continue;
                     }
                 }
@@ -374,6 +425,22 @@ async fn run_beacon_monitor_inner(
                 continue;
             }
 
+            // C `udpiiu::repeaterAckAction` (`udpiiu.cpp:790-795`) — the ONLY
+            // thing that marks the client registered. Handled here, on the
+            // socket's one reader, so a CONFIRM can never be swallowed by a
+            // private recv and a beacon can never be swallowed while we wait
+            // for one.
+            if hdr.cmmd == CA_PROTO_REPEATER_CONFIRM {
+                if !registered {
+                    tracing::debug!(
+                        target: "epics_ca_rs::client::beacon_monitor",
+                        attempts,
+                        "CA repeater confirmed our registration"
+                    );
+                }
+                registered = true;
+                continue;
+            }
             if hdr.cmmd != CA_PROTO_RSRV_IS_UP {
                 continue;
             }
@@ -789,8 +856,15 @@ fn handle_beacon(
 // Repeater registration
 // ---------------------------------------------------------------------------
 
-/// Register our socket with the CA repeater at localhost:5065.
-async fn register_with_repeater(socket: &AsyncUdpV4) -> Result<(), ()> {
+/// Send one `CA_PROTO_REPEATER_REGISTER` to the local repeater.
+///
+/// C `caRepeaterRegistrationMessage` (`udpiiu.cpp:465-520`) — a bare
+/// `sendto`, no waiting. Confirmation arrives asynchronously as
+/// `CA_PROTO_REPEATER_CONFIRM` on the same socket and is handled by the
+/// monitor's receive loop (C `udpiiu::repeaterAckAction`). This function
+/// deliberately does NOT read the socket: doing so would consume beacons
+/// destined for the monitor.
+async fn send_repeater_registration(socket: &AsyncUdpV4) -> Result<(), ()> {
     // We bound to a single loopback NIC, so `local_addrs()` gives the
     // one ephemeral port we want to announce.
     let local_ip = socket
@@ -815,35 +889,99 @@ async fn register_with_repeater(socket: &AsyncUdpV4) -> Result<(), ()> {
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await
         .map_err(|_| ())?;
+    Ok(())
+}
 
-    // Wait for REPEATER_CONFIRM.
-    let mut buf = [0u8; 64];
-    let result = tokio::time::timeout(Duration::from_millis(500), async {
+#[cfg(test)]
+mod repeater_registration_tests {
+    //! R6-22: libca re-sends `REPEATER_REGISTER` every second until the
+    //! repeater CONFIRMs, and never gives up
+    //! (`repeaterSubscribeTimer.cpp:84-90`; `registered` is set only by
+    //! `confirmNotify` ← `udpiiu::repeaterAckAction`, `udpiiu.cpp:793`). The
+    //! pre-fix client tried three times over ~2 s and then went quiet until a
+    //! 5-minute silence timer, so a repeater that was not yet bound at client
+    //! start-up never got a registration — no beacon fan-out for 5 minutes.
+    use super::*;
+    use std::time::Duration;
+
+    async fn drain_registers(
+        repeater: &tokio::net::UdpSocket,
+        window: Duration,
+    ) -> (usize, Option<SocketAddr>) {
+        let mut buf = [0u8; 64];
+        let mut registers = 0usize;
+        let mut client = None;
+        let deadline = tokio::time::Instant::now() + window;
         loop {
-            // Brief CONFIRM wait — drop counter is monitored by the
-            // long-running run_beacon_monitor_inner loop on the same
-            // socket. Here we reuse `recv_with_meta_with_drops` for
-            // pattern consistency but ignore drops (the long loop is
-            // already tracking).
-            let (meta, _drops) = socket
-                .recv_with_meta_with_drops(&mut buf)
-                .await
-                .map_err(|_| ())?;
-            let len = meta.n;
-            if len >= CaHeader::SIZE {
-                if let Ok(resp) = CaHeader::from_bytes(&buf[..len]) {
-                    if resp.cmmd == CA_PROTO_REPEATER_CONFIRM {
-                        return Ok::<(), ()>(());
+            match tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf)).await {
+                Ok(Ok((n, src))) if n >= CaHeader::SIZE => {
+                    if let Ok(h) = CaHeader::from_bytes(&buf[..n]) {
+                        if h.cmmd == CA_PROTO_REPEATER_REGISTER {
+                            registers += 1;
+                            client = Some(src);
+                        }
                     }
                 }
+                Ok(Ok(_)) | Ok(Err(_)) => continue,
+                Err(_) => break, // window closed
             }
         }
-    })
-    .await;
+        (registers, client)
+    }
 
-    match result {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(()),
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn registration_retries_every_second_until_confirm_then_stops() {
+        let repeater = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake repeater");
+        let port = repeater.local_addr().unwrap().port();
+
+        let saved = std::env::var("EPICS_CA_REPEATER_PORT").ok();
+        // SAFETY: serial_test::serial serialises env mutation; restored below.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string()) };
+
+        let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
+        let (_ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        let monitor = tokio::spawn(run_beacon_monitor(coord_tx, ctrl_rx));
+
+        // ~3.5 s of an unresponsive repeater: C would have sent one
+        // registration per second, so at least 4 (t ≈ 0, 1, 2, 3). The old
+        // three-attempt loop could never produce a 4th.
+        let (registers, client) = drain_registers(&repeater, Duration::from_millis(3500)).await;
+        assert!(
+            registers >= 4,
+            "an unconfirmed registration must retry every second forever \
+             (C repeaterSubscribeTimer); got only {registers} in 3.5 s"
+        );
+        let client = client.expect("registration datagrams carry a source address");
+
+        // CONFIRM (C `repeaterAckAction` → `confirmNotify`) must stop it.
+        let confirm = CaHeader::new(CA_PROTO_REPEATER_CONFIRM);
+        repeater
+            .send_to(&confirm.to_bytes(), client)
+            .await
+            .expect("send CONFIRM");
+
+        // One registration may already be in flight from a tick that fired
+        // before the CONFIRM landed; give it 400 ms to settle, then require
+        // silence for 2.2 s (C returns `noRestart` once registered).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (after, _) = drain_registers(&repeater, Duration::from_millis(2200)).await;
+        assert_eq!(
+            after, 0,
+            "registration must stop on CONFIRM (C `expire` returns noRestart \
+             once `registered`); saw {after} more"
+        );
+
+        monitor.abort();
+        // SAFETY: see above.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CA_REPEATER_PORT", v),
+                None => std::env::remove_var("EPICS_CA_REPEATER_PORT"),
+            }
+        }
     }
 }
 

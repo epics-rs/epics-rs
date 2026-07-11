@@ -1136,45 +1136,29 @@ impl PortDriver for DrvAsynSerialPort {
                 "N"
             }
             .to_string()),
-            "ixon" => {
-                if self.io.fd.is_some() {
-                    let t = self.get_current_termios()?;
-                    Ok(if t.c_iflag & libc::IXON != 0 {
-                        "Y"
-                    } else {
-                        "N"
-                    }
-                    .to_string())
-                } else {
-                    Ok("N".to_string())
-                }
+            // The iflag family reads back from the same cache as the cflags —
+            // C getOption (drvAsynSerialPort.c:181-201) answers ixon/ixany/
+            // ixoff from `tty->termios.c_iflag` on every POSIX target; the
+            // hard-coded 'N' for ixany/ixoff there is inside `#ifdef vxWorks`,
+            // where the flags genuinely have no termios home.
+            "ixon" => Ok(if self.termios.c_iflag & libc::IXON != 0 {
+                "Y"
+            } else {
+                "N"
             }
-            "ixoff" => {
-                if self.io.fd.is_some() {
-                    let t = self.get_current_termios()?;
-                    Ok(if t.c_iflag & libc::IXOFF != 0 {
-                        "Y"
-                    } else {
-                        "N"
-                    }
-                    .to_string())
-                } else {
-                    Ok("N".to_string())
-                }
+            .to_string()),
+            "ixoff" => Ok(if self.termios.c_iflag & libc::IXOFF != 0 {
+                "Y"
+            } else {
+                "N"
             }
-            "ixany" => {
-                if self.io.fd.is_some() {
-                    let t = self.get_current_termios()?;
-                    Ok(if t.c_iflag & libc::IXANY != 0 {
-                        "Y"
-                    } else {
-                        "N"
-                    }
-                    .to_string())
-                } else {
-                    Ok("N".to_string())
-                }
+            .to_string()),
+            "ixany" => Ok(if self.termios.c_iflag & libc::IXANY != 0 {
+                "Y"
+            } else {
+                "N"
             }
+            .to_string()),
             // C getOption (drvAsynSerialPort.c:204-207): "break" is a momentary
             // line action, so a read always reports "off" rather than erroring.
             "break" => Ok("off".to_string()),
@@ -2202,6 +2186,80 @@ mod tests {
         let live = drv.get_current_termios().unwrap();
         assert_ne!(live.c_cflag & libc::CLOCAL, 0);
         assert_eq!(drv.get_option("clocal").unwrap(), "Y");
+    }
+
+    /// R7-49: the `ixon`/`ixoff`/`ixany` iflags read back from the cache, per
+    /// flag, exactly like the cflag family.
+    ///
+    /// C `getOption` answers all three from `tty->termios.c_iflag`
+    /// (drvAsynSerialPort.c:181-201) — the hard-coded 'N' for ixany/ixoff
+    /// lives inside `#ifdef vxWorks`. This port read the *live* termios when
+    /// connected and returned a flat "N" when not, so on a closed port every
+    /// one of them read "N" no matter what had been set, and there was no
+    /// per-flag state at all: the three flags shared `SerialConfig`'s single
+    /// `FlowControl` enum, which cannot express "ixon without ixoff" or ixany.
+    #[test]
+    fn iflag_family_reads_back_per_flag_from_the_cache() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+
+        // Default (no flow control in the configure string): all three off.
+        assert_eq!(drv.get_option("ixon").unwrap(), "N");
+        assert_eq!(drv.get_option("ixoff").unwrap(), "N");
+        assert_eq!(drv.get_option("ixany").unwrap(), "N");
+
+        // Set two of the three while the line is DOWN. Each flag is
+        // independent — ixon on, ixoff still off, ixany on.
+        drv.set_option("ixon", "Y").unwrap();
+        drv.set_option("ixany", "Y").unwrap();
+        assert_eq!(
+            drv.get_option("ixon").unwrap(),
+            "Y",
+            "a disconnected readback must report the cache, not a flat N"
+        );
+        assert_eq!(drv.get_option("ixoff").unwrap(), "N");
+        assert_eq!(
+            drv.get_option("ixany").unwrap(),
+            "Y",
+            "ixany is a real cached flag on POSIX (C hard-codes N only on vxWorks)"
+        );
+
+        // They land on the device at connect, still per flag.
+        drv.connect(&AsynUser::default()).unwrap();
+        let live = drv.get_current_termios().unwrap();
+        assert_ne!(live.c_iflag & libc::IXON, 0);
+        assert_eq!(live.c_iflag & libc::IXOFF, 0);
+        assert_ne!(live.c_iflag & libc::IXANY, 0);
+
+        // Set the third while connected, then take the line down and back up:
+        // the cache is the owner, so the readback and the device both hold.
+        drv.set_option("ixoff", "Y").unwrap();
+        assert_eq!(drv.get_option("ixoff").unwrap(), "Y");
+        drv.disconnect(&AsynUser::default()).unwrap();
+        assert_eq!(drv.get_option("ixoff").unwrap(), "Y");
+        assert_eq!(drv.get_option("ixon").unwrap(), "Y");
+        drv.connect(&AsynUser::default()).unwrap();
+        let live = drv.get_current_termios().unwrap();
+        assert_ne!(live.c_iflag & libc::IXOFF, 0);
+        assert_ne!(live.c_iflag & libc::IXON, 0);
+
+        // And clearing one clears only that one.
+        drv.set_option("ixon", "N").unwrap();
+        assert_eq!(drv.get_option("ixon").unwrap(), "N");
+        assert_eq!(drv.get_option("ixoff").unwrap(), "Y");
+        assert_eq!(drv.get_option("ixany").unwrap(), "Y");
+        let live = drv.get_current_termios().unwrap();
+        assert_eq!(live.c_iflag & libc::IXON, 0);
+        assert_ne!(live.c_iflag & libc::IXOFF, 0);
     }
 
     /// R7-48 (migration guard, not the regression pin): the rest of the cflag

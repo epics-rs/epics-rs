@@ -19,18 +19,15 @@ impl std::error::Error for ProtocolError {}
 
 impl From<crate::error::AsynError> for ProtocolError {
     fn from(e: crate::error::AsynError) -> Self {
-        use crate::error::AsynError;
-        // Take the status from the single owner (`AsynError::status()`), not
-        // from a variant match: every status-carrying variant — including
-        // `PartialRead`, which reports a genuine timeout/disconnect alongside
-        // the bytes already transferred — must reach the wire with its real
-        // status, not a flattened `Error`.
-        let status = e.status().into();
-        let message = match e {
-            AsynError::Status { message, .. } | AsynError::PartialRead { message, .. } => message,
-            other => other.to_string(),
-        };
-        Self { status, message }
+        // Take the status and the message from their single owners
+        // (`AsynError::status()` / `AsynError::message()`), not from a variant
+        // match: the partial carriers wrap a genuine timeout/disconnect
+        // alongside the bytes already transferred, and both must reach the
+        // wire as themselves rather than as a flattened `Error`.
+        Self {
+            status: e.status().into(),
+            message: e.message(),
+        }
     }
 }
 

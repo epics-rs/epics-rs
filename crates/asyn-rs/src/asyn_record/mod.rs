@@ -679,29 +679,42 @@ fn io_read_op(plan: &IoPlan) -> RequestOp {
 /// branch (asynRecord.c:1524-1556 octet, :1442-1453 register). A write
 /// failure reports `ERRS` but, like C, does not skip the read phase.
 fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
-    match res {
-        Ok(_) => {
-            if plan.iface == InterfaceType::Octet {
-                out.nawt = Some(plan.octet_out_len as i32);
-            }
-        }
-        Err(e) => {
+    if plan.iface != InterfaceType::Octet {
+        // C performInt32IO/performUInt32DigitalIO/performFloat64IO write error
+        // -> reportError + recGblSetSevr(WRITE_ALARM, MAJOR)
+        // (asynRecord.c:1377-1381 / 1413-1417 / 1449-1453). These handlers have
+        // no byte count, so they never touch NAWT.
+        if let Err(e) = res {
             out.errs = Some(format!("write: {e}"));
-            if plan.iface == InterfaceType::Octet {
-                // C performOctetIO assigns `nawt = nbytesTransfered`
-                // unconditionally (asynRecord.c:1547) — before the error check
-                // at :1551. A failed write moved no bytes, so land NAWT=0
-                // rather than leaving the prior write's count. The octet write
-                // branch (:1551-1555) raises NO record severity — only a
-                // reportError — so unlike register writes it sets no alarm.
-                out.nawt = Some(0);
-            } else {
-                // C performInt32IO/performUInt32DigitalIO/performFloat64IO
-                // write error -> recGblSetSevr(WRITE_ALARM, MAJOR)
-                // (asynRecord.c:1380/1416/1452).
-                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
-            }
+            raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
         }
+        return;
+    }
+
+    // C performOctetIO write branch (asynRecord.c:1524-1556). `nbytesTransfered`
+    // is what the *device* took: C seeds it to 0 (:1526), the octet chain writes
+    // it out on success and on failure alike, and the record commits it —
+    // `nawt = nbytesTransfered` (:1547) runs *before* the status test at :1551.
+    // So both arms report a real count: the reply's `nbytes` on success, and the
+    // failure's `PartialWrite` carrier on error (absent => the layer moved
+    // nothing, which is exactly C's untouched seed of 0).
+    let (nawt, err) = match res {
+        Ok(result) => (result.nbytes, None),
+        Err(e) => (e.partial_write().unwrap_or(0), Some(e)),
+    };
+    out.nawt = Some(nawt as i32);
+
+    // C :1551-1555 — "Something is wrong if we couldn't write everything": the
+    // diagnostic fires on a failing status *or* a short write that reported
+    // success, and lands in ERRS via reportError (:2028-2048). The octet write
+    // branch raises NO record severity — only the message — so unlike the
+    // register writes above it sets no alarm.
+    if err.is_some() || nawt != plan.octet_out_len {
+        let detail = match &err {
+            Some(e) => e.to_string(),
+            None => format!("wrote {} of {} chars", nawt, plan.octet_out_len),
+        };
+        out.errs = Some(format!("Write error, nout={nawt}, {detail}"));
     }
 }
 
@@ -3796,6 +3809,124 @@ mod tests {
         bin.process().unwrap();
         assert_eq!(bin.binp, b"abc".to_vec(), "partial bytes reach BINP too");
         assert_eq!(bin.nord, 3);
+    }
+
+    /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`
+    /// (asynRecord.c:1524-1556) seeds `nbytesTransfered = 0`, hands it to the
+    /// octet chain — which fills it in on success and on failure alike
+    /// (`drvAsynSerialPort.c:849` writes `numchars - nleft` on the timeout
+    /// break) — and commits it with `nawt = nbytesTransfered` (:1547) *before*
+    /// testing the status (:1551). The short-write diagnostic then fires
+    /// whenever the status failed **or** fewer bytes went out than were asked
+    /// for, landing "Write error, nout=%d, %s" in ERRS via reportError.
+    ///
+    /// Before the fix, the Ok arm published the *planned* length (ignoring the
+    /// reply's real count), the Err arm hard-coded 0, and a success-status
+    /// short write raised nothing at all.
+    #[test]
+    fn octet_write_reports_the_transferred_count_on_both_arms() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+        use tokio::sync::mpsc;
+
+        /// A port that takes `accept` bytes of every write and then reports
+        /// `outcome` — the shape of a device whose buffer filled mid-command.
+        struct ShortWriteDriver {
+            base: PortDriverBase,
+            accept: usize,
+            fail: bool,
+        }
+        impl PortDriver for ShortWriteDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                _data: &[u8],
+            ) -> crate::error::AsynResult<usize> {
+                if self.fail {
+                    Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "serial write timeout".into(),
+                    }
+                    .with_partial_write(self.accept))
+                } else {
+                    Ok(self.accept)
+                }
+            }
+        }
+
+        fn writer(port_name: &'static str, accept: usize, fail: bool) -> AsynRecord {
+            let interrupts = Arc::new(InterruptManager::new(256));
+            let (tx, rx) = mpsc::channel(256);
+            let actor = PortActor::new(
+                Box::new(ShortWriteDriver {
+                    base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                    accept,
+                    fail,
+                }),
+                rx,
+            );
+            std::thread::spawn(move || actor.run());
+            let handle = PortHandle::new(tx, port_name.into(), interrupts);
+            register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device();
+            rec.iface = 0; // asynOctet
+            rec.tmod = TransferMode::Write as i32;
+            rec.ofmt = ASYN_FMT_ASCII;
+            rec.aout = "hello".to_string(); // nwrite = 5
+            rec.nawt = 99; // stale count from a previous cycle
+            rec
+        }
+
+        // Failing write that moved bytes first: NAWT is the count the device
+        // took, not 0, and ERRS carries C's nout diagnostic.
+        let mut partial = writer("test_short_write_err", 3, true);
+        partial.process().unwrap();
+        assert_eq!(partial.nawt, 3, "NAWT = nbytesTransfered (C :1547)");
+        assert!(
+            partial.errs.starts_with("Write error, nout=3,"),
+            "C :1552 reportError text, got {:?}",
+            partial.errs
+        );
+        // C's octet write branch reports but raises NO severity (:1551-1555) —
+        // unlike the register writes, which recGblSetSevr(WRITE_ALARM, MAJOR).
+        let mut c = CommonFields::default();
+        partial.check_alarms(&mut c);
+        assert_eq!(
+            c.nsev,
+            AlarmSeverity::NoAlarm,
+            "octet write error raises no record severity"
+        );
+
+        // Short write that reported *success*: C still fires the diagnostic
+        // (`nbytesTransfered != nwrite`), and NAWT is the driver's real count,
+        // not the planned length.
+        let mut short_ok = writer("test_short_write_ok", 2, false);
+        short_ok.process().unwrap();
+        assert_eq!(short_ok.nawt, 2, "NAWT comes from the reply, not from OPTR");
+        assert!(
+            short_ok.errs.starts_with("Write error, nout=2,"),
+            "C :1551 fires on a short write even with asynSuccess, got {:?}",
+            short_ok.errs
+        );
+
+        // Whole message accepted: NAWT = nwrite and no diagnostic.
+        let mut full = writer("test_full_write", 5, false);
+        full.process().unwrap();
+        assert_eq!(full.nawt, 5);
+        assert!(full.errs.is_empty(), "a complete write reports nothing");
     }
 
     /// C `performIO` raises a record alarm severity for every I/O failure via

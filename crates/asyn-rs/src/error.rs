@@ -40,14 +40,61 @@ pub enum AsynError {
     /// being handed everything the device did send. Build this with
     /// [`AsynError::with_partial_read`] rather than by hand, and read it back
     /// with [`AsynError::partial_read`].
-    #[error("asyn: {status:?} - {message} (after {} partial bytes)", partial.nbytes_transferred())]
+    ///
+    /// The carrier **wraps** the failure it decorates instead of copying its
+    /// status and message out of it: flattening would erase which *kind* of
+    /// failure it was, and callers legitimately ask that question — the
+    /// drivers' fatal-transport test ([`AsynError::is_fatal_transport`]) tears
+    /// the link down for a real errno ([`AsynError::Io`]) but leaves it up for
+    /// a timeout, so a flattened `Io` (a `recv` that returned `ECONNRESET`
+    /// after the EOS interpose had already buffered half a line) would silently
+    /// stop disconnecting. Every question about the underlying failure —
+    /// [`AsynError::status`], [`AsynError::message`],
+    /// [`AsynError::is_transport_io`] — is answered *through* the carrier.
+    #[error("{source} (after {} partial bytes)", partial.nbytes_transferred())]
     PartialRead {
-        status: AsynStatus,
-        message: String,
+        /// The failure that ended the transfer, intact.
+        source: Box<AsynError>,
         /// The bytes transferred before the failure and the end-of-message
         /// reason accumulated up to that point — the `*nbytesTransfered` /
         /// `*eomReason` pair C writes out alongside the error.
         partial: crate::interpose::PartialOctetRead,
+    },
+
+    /// An octet write that failed *after* the device accepted bytes.
+    ///
+    /// C parity: `asynOctet::write` reports `*nbytesTransfered` **together
+    /// with** a failing `asynStatus`, at every layer of the write chain —
+    /// `drvAsynSerialPort.c::writeIt` (`:849`) assigns
+    /// `*nbytesTransfered = numchars - nleft` on the way out of the loop no
+    /// matter whether it broke on `asynTimeout` or on a fatal `write()` errno;
+    /// `asynInterposeEcho.c::writeIt` (`:88`) and `asynInterposeDelay.c` (`:52`)
+    /// assign `*nbytesTransfered = transfered` on every break; and
+    /// `asynInterposeEos.c::writeIt` (`:196`) clamps the lower layer's count to
+    /// the caller's `numchars` and returns it beside the status. `asynRecord`
+    /// commits the result unconditionally — `nawt = nbytesTransfered`
+    /// (asynRecord.c:1547) runs *before* the status check at `:1551` — so a
+    /// half-written command lands `NAWT=3` next to its `Write error, nout=3`
+    /// diagnostic.
+    ///
+    /// [`AsynError::Status`] alone cannot express that: `?` on a partially
+    /// accepted write discards the count, and every hop above the driver
+    /// (`port_actor` → `PortHandle` → record/device support) only sees the
+    /// status. This is the write-side twin of [`AsynError::PartialRead`], for
+    /// the same reason: carrying the count *in* the error makes the transfer
+    /// and the status one value, so a consumer cannot take the failure without
+    /// being handed how far the device got. Build it with
+    /// [`AsynError::with_partial_write`] and read it back with
+    /// [`AsynError::partial_write`]. Like [`AsynError::PartialRead`] it wraps
+    /// the underlying failure rather than flattening it, so the transport
+    /// classifiers still see the errno.
+    #[error("{source} (after {nbytes} partial bytes written)")]
+    PartialWrite {
+        /// The failure that ended the write, intact.
+        source: Box<AsynError>,
+        /// The bytes the device accepted before the failure — C's
+        /// `*nbytesTransfered` on the error path.
+        nbytes: usize,
     },
 
     #[error("port not found: {0}")]
@@ -132,9 +179,61 @@ impl AsynError {
     /// `asynStatusToEpicsAlarm` default branch (asynEpicsUtils.c:234-266).
     pub fn status(&self) -> AsynStatus {
         match self {
-            AsynError::Status { status, .. } | AsynError::PartialRead { status, .. } => *status,
+            AsynError::Status { status, .. } => *status,
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.status()
+            }
             _ => AsynStatus::Error,
         }
+    }
+
+    /// The driver/interpose diagnostic behind this error — C's
+    /// `pasynUser->errorMessage`, which every `reportError` call site splices
+    /// into `ERRS`. Reads *through* the partial carriers, so a failed transfer
+    /// reports the same text whether or not it moved bytes first.
+    pub fn message(&self) -> String {
+        match self {
+            AsynError::Status { message, .. } => message.clone(),
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.message()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// True when the failure came from the OS transport itself — a real errno
+    /// on the fd/socket, not a timeout and not a higher-layer complaint.
+    ///
+    /// C's drivers decide this at the errno itself, calling `closeConnection`
+    /// right where `read`/`write` failed (drvAsynIPPort.c:642-651,
+    /// drvAsynSerialPort.c:836-845) while returning `asynTimeout` with the link
+    /// intact on a poll expiry. Rust re-derives the decision one layer up, in
+    /// [`AsynError::is_fatal_transport`], so the errno has to survive the trip:
+    /// ask *through* the partial carriers rather than matching
+    /// [`AsynError::Io`] by variant, or a half-transferred `ECONNRESET` reads
+    /// as non-fatal and leaves a dead socket reporting `connected` forever.
+    pub fn is_transport_io(&self) -> bool {
+        match self {
+            AsynError::Io(_) => true,
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.is_transport_io()
+            }
+            _ => false,
+        }
+    }
+
+    /// This failure means the link is dead and the driver must tear the
+    /// connection down — C's `closeConnection` contract: a real errno on the
+    /// fd/socket, or an explicit disconnect, but **not** a timeout (C returns
+    /// `asynTimeout` with the link intact and lets the next transfer retry).
+    ///
+    /// The single owner of that test for every octet driver (`drvAsynIPPort`,
+    /// `drvAsynSerialPort`, its Win32 twin), which each used to keep a private
+    /// copy — and each copy independently proxied "real errno" through
+    /// `matches!(e, AsynError::Io(_))`, a variant match that the
+    /// partial-transfer carriers defeat.
+    pub fn is_fatal_transport(&self) -> bool {
+        matches!(self.status(), AsynStatus::Disconnected) || self.is_transport_io()
     }
 
     /// The partial octet transfer delivered before this error, if any —
@@ -153,26 +252,53 @@ impl AsynError {
         }
     }
 
-    /// Attach a partial octet transfer to a failing read, preserving the
-    /// status. This is the only way to build [`AsynError::PartialRead`], so
-    /// the status can never be lost in the conversion: a non-status variant
-    /// (e.g. [`AsynError::Io`]) folds into C's generic `asynError` with its
-    /// `Display` text as the message.
+    /// Attach a partial octet transfer to a failing read. This is the only way
+    /// to build [`AsynError::PartialRead`], so the underlying failure can never
+    /// be lost in the conversion — it is wrapped, not copied.
     ///
-    /// Re-attaching overwrites: in a stacked interpose chain the outermost
-    /// layer is the one that filled the caller's buffer, so its count is the
-    /// authoritative `*nbytesTransfered`.
+    /// Re-attaching overwrites the count: in a stacked interpose chain the
+    /// outermost layer is the one that filled the caller's buffer, so its count
+    /// is the authoritative `*nbytesTransfered`. The original source is kept —
+    /// re-wrapping must not bury it one layer deeper each hop.
     pub fn with_partial_read(self, partial: crate::interpose::PartialOctetRead) -> Self {
-        let status = self.status();
-        let message = match self {
-            AsynError::Status { message, .. } | AsynError::PartialRead { message, .. } => message,
-            other => other.to_string(),
+        let source = match self {
+            AsynError::PartialRead { source, .. } => source,
+            other => Box::new(other),
         };
-        AsynError::PartialRead {
-            status,
-            message,
-            partial,
+        AsynError::PartialRead { source, partial }
+    }
+
+    /// The bytes the device accepted before this write failed — C's
+    /// `*nbytesTransfered` on a failing `asynOctet::write`. `None` means the
+    /// layer reported no transfer, which is C's pre-call
+    /// `nbytesTransfered = 0` (asynRecord.c:1526) left untouched: zero bytes.
+    ///
+    /// Every consumer of an octet write MUST consult this on the error path:
+    /// C `asynRecord::performOctetIO` publishes `nawt = nbytesTransfered`
+    /// before it looks at the status (asynRecord.c:1547-1551), so an error
+    /// branch that reports only "0 written" contradicts what the device
+    /// actually received.
+    pub fn partial_write(&self) -> Option<usize> {
+        match self {
+            AsynError::PartialWrite { nbytes, .. } => Some(*nbytes),
+            _ => None,
         }
+    }
+
+    /// Attach the accepted-byte count to a failing write. This is the only way
+    /// to build [`AsynError::PartialWrite`], so the underlying failure can
+    /// never be lost in the conversion — it is wrapped, not copied.
+    ///
+    /// Re-attaching overwrites the count: in a stacked interpose chain the
+    /// outermost layer is the one that owns the caller's `numchars` (the EOS
+    /// interpose must not report its appended terminator bytes), so its count
+    /// is the authoritative `*nbytesTransfered`. The original source is kept.
+    pub fn with_partial_write(self, nbytes: usize) -> Self {
+        let source = match self {
+            AsynError::PartialWrite { source, .. } => source,
+            other => Box::new(other),
+        };
+        AsynError::PartialWrite { source, nbytes }
     }
 }
 

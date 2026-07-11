@@ -257,9 +257,19 @@ impl OctetInterpose for EosInterpose {
         let mut buf = Vec::with_capacity(data.len() + self.config.output_eos.len());
         buf.extend_from_slice(data);
         buf.extend_from_slice(&self.config.output_eos);
-        let actual = next.write(user, &buf)?;
-        // Report only user data bytes, not EOS bytes (C parity)
-        Ok(actual.min(data.len()))
+        // C `asynInterposeEos.c::writeIt` (:189-197) runs one common tail
+        // regardless of status: `*nbytesTransfered = min(nbytesActual,
+        // numchars); return status`. So the clamp — never report the appended
+        // terminator bytes as caller payload — applies to the failure path too,
+        // and a lower layer that stalled part-way through the *user* bytes has
+        // that count published beside its error.
+        match next.write(user, &buf) {
+            Ok(actual) => Ok(actual.min(data.len())),
+            Err(e) => {
+                let transferred = e.partial_write().unwrap_or(0).min(data.len());
+                Err(e.with_partial_write(transferred))
+            }
+        }
     }
 
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
@@ -808,6 +818,64 @@ mod tests {
         assert!(
             err.to_string().contains("cable yanked"),
             "the underlying cause must survive the fold, got {err}"
+        );
+        // R8-48: the carrier must not hide *which kind* of failure it wraps.
+        // The drivers tear the link down on a real errno and leave it up on a
+        // timeout; a hangup that arrives mid-line — wrapped — is still a
+        // hangup, and asking through `is_fatal_transport` is what keeps it one.
+        assert!(
+            err.is_fatal_transport(),
+            "an errno behind the partial carrier must still disconnect, got {err:?}"
+        );
+    }
+
+    /// R8-48: C `asynInterposeEos.c::writeIt` (:189-197) runs one tail on every
+    /// path — `*nbytesTransfered = min(nbytesActual, numchars); return status` —
+    /// so a lower layer that stalled part-way reports its count *through* the
+    /// interpose, clamped to the caller's payload. The appended terminator must
+    /// never be counted as user bytes, on the error path either.
+    #[test]
+    fn partial_write_through_the_eos_interpose_clamps_to_the_caller_bytes() {
+        /// Takes `accept` bytes of the (payload + EOS) buffer, then times out.
+        struct StallingBase {
+            accept: usize,
+        }
+        impl OctetNext for StallingBase {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                unreachable!("write-only test")
+            }
+            fn write(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "serial write timeout".into(),
+                }
+                .with_partial_write(self.accept))
+            }
+            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut interpose = EosInterpose::new(EosConfig {
+            input_eos: vec![],
+            output_eos: vec![b'\r', b'\n'],
+        });
+        let mut user = AsynUser::default();
+
+        // Stalled inside the payload: the caller learns 3 of its 5 bytes went.
+        let mut base = StallingBase { accept: 3 };
+        let err = interpose.write(&mut user, b"hello", &mut base).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "status is untouched");
+        assert_eq!(err.partial_write(), Some(3));
+
+        // Stalled inside the *terminator*: every payload byte reached the
+        // device, so the clamp reports 5 — not 6 (C: `nbytesActual > numchars`).
+        let mut base = StallingBase { accept: 6 };
+        let err = interpose.write(&mut user, b"hello", &mut base).unwrap_err();
+        assert_eq!(
+            err.partial_write(),
+            Some(5),
+            "the appended EOS is never counted as caller payload"
         );
     }
 

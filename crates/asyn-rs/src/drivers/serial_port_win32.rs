@@ -171,17 +171,6 @@ fn io_err() -> AsynError {
     AsynError::Io(std::io::Error::last_os_error())
 }
 
-/// A transport error meaning the serial line is broken and the connection must
-/// be torn down (vs a timeout, which leaves it open). Mirrors the unix
-/// backend's predicate and C `closeConnection`-on-fatal-error contract.
-///
-/// Classify by the carried status, not by the variant — the EOS interpose
-/// (installed by `configure`, as on unix) wraps a lower-layer hangup as
-/// `AsynError::PartialRead`, which a variant match reads as non-fatal.
-fn is_fatal_transport_error(e: &AsynError) -> bool {
-    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
-}
-
 // --- I/O state ---
 
 struct SerialIoStateWin32 {
@@ -315,6 +304,10 @@ impl OctetNext for SerialIoStateWin32 {
         // C writeIt's single pre-loop timer), while WriteFile's own comm
         // timeout bounds each call.
         let deadline = Instant::now() + user.timeout;
+        // C parity (drvAsynSerialPortWin32.c writeIt, drvAsynSerialPort.c:849):
+        // the bytes the port accepted are reported alongside the failing status,
+        // never dropped — carry `total` out on the error via
+        // `with_partial_write` so `asynRecord`'s NAWT can show it.
         let mut total = 0usize;
         while total < data.len() {
             let chunk = &data[total..];
@@ -330,7 +323,7 @@ impl OctetNext for SerialIoStateWin32 {
                 )
             };
             if ok == 0 {
-                return Err(io_err());
+                return Err(io_err().with_partial_write(total));
             }
             total += n_written as usize;
             self.n_written += n_written as u64;
@@ -343,7 +336,8 @@ impl OctetNext for SerialIoStateWin32 {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "serial write timeout".into(),
-                });
+                }
+                .with_partial_write(total));
             }
         }
         Ok(total)
@@ -620,7 +614,7 @@ impl PortDriver for DrvAsynSerialPort {
         {
             Ok(r) => r,
             Err(e) => {
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -658,7 +652,7 @@ impl PortDriver for DrvAsynSerialPort {
         {
             Ok(n) => Ok(n),
             Err(e) => {
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,

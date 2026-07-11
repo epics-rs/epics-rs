@@ -50,10 +50,19 @@ impl OctetInterpose for EchoInterpose {
         data: &[u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
+        // C `asynInterposeEcho.c::writeIt` (:53-90) counts a byte as transferred
+        // only once its echo has come back and matched — `transfered++` sits at
+        // the bottom of the loop, after the echo check — and publishes that
+        // count on *every* break (`*nbytesTransfered = transfered`, :88). So a
+        // half-echoed command reports the bytes the device confirmed, and each
+        // failure exit here carries `total` out with it.
         let mut total = 0;
         for byte in data {
             // Write one byte
-            let n = next.write(user, std::slice::from_ref(byte))?;
+            let n = match next.write(user, std::slice::from_ref(byte)) {
+                Ok(n) => n,
+                Err(e) => return Err(e.with_partial_write(total)),
+            };
             if n != 1 {
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
@@ -61,9 +70,9 @@ impl OctetInterpose for EchoInterpose {
                         "echo: write (0x{:02X}) returned {} bytes, expected 1",
                         byte, n
                     ),
-                });
+                }
+                .with_partial_write(total));
             }
-            total += n;
 
             // Read back echo
             let mut echo_buf = [0u8; 1];
@@ -86,13 +95,15 @@ impl OctetInterpose for EchoInterpose {
                             "echo: write/read (0x{:02X}) -- no echo - Loss of communication?",
                             byte
                         ),
-                    });
+                    }
+                    .with_partial_write(total));
                 }
                 Err(e) => {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: format!("echo: write/read (0x{:02X}) -- read failed: {}", byte, e),
-                    });
+                    }
+                    .with_partial_write(total));
                 }
             };
 
@@ -103,7 +114,8 @@ impl OctetInterpose for EchoInterpose {
                         "echo: write/read (0x{:02X}) -- read count {}",
                         byte, echo_result.nbytes_transferred
                     ),
-                });
+                }
+                .with_partial_write(total));
             }
             if echo_buf[0] != *byte {
                 return Err(AsynError::Status {
@@ -113,8 +125,12 @@ impl OctetInterpose for EchoInterpose {
                         escape_byte(*byte),
                         escape_byte(echo_buf[0])
                     ),
-                });
+                }
+                .with_partial_write(total));
             }
+            // C `transfered++` (:86) — after the echo matched, not after the
+            // write.
+            total += n;
         }
         Ok(total)
     }
@@ -216,13 +232,13 @@ mod tests {
         let err = stack
             .dispatch_write(&mut user, b"A", &mut base)
             .unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => {
-                assert!(message.contains("expected"));
-                assert!(message.contains("got"));
-            }
-            other => panic!("expected echo mismatch error, got {other:?}"),
-        }
+        let message = err.message();
+        assert!(message.contains("expected"), "got {err:?}");
+        assert!(message.contains("got"), "got {err:?}");
+        // C `asynInterposeEcho.c:88` publishes `*nbytesTransfered = transfered`
+        // on the mismatch break — the byte was sent but never confirmed, so it
+        // does not count as transferred.
+        assert_eq!(err.partial_write(), Some(0));
     }
 
     #[test]
@@ -253,14 +269,11 @@ mod tests {
             .dispatch_write(&mut user, b"A", &mut base)
             .unwrap_err();
         // C parity: timeout is converted to Error with "Loss of communication?" message
-        match err {
-            AsynError::Status { status, message } => {
-                assert_eq!(status, AsynStatus::Error);
-                assert!(message.contains("no echo"));
-                assert!(message.contains("Loss of communication"));
-            }
-            other => panic!("expected loss-of-comm error, got {other:?}"),
-        }
+        assert_eq!(err.status(), AsynStatus::Error);
+        let message = err.message();
+        assert!(message.contains("no echo"), "got {err:?}");
+        assert!(message.contains("Loss of communication"), "got {err:?}");
+        assert_eq!(err.partial_write(), Some(0));
     }
 
     #[test]

@@ -237,25 +237,35 @@ enum IpIoInner {
 }
 
 /// Write all data with retry on WouldBlock/Interrupted, enforcing a deadline.
+/// Write `data` to the stream, retrying short writes until the deadline.
+///
+/// Returns the bytes the peer accepted. C parity
+/// (`drvAsynIPPort.c::writeRaw`, like `drvAsynSerialPort.c:849`): a write that
+/// stalls part-way reports `*nbytesTransfered` **together with** its
+/// `asynTimeout`/`asynError` status, so a failure here carries the accepted
+/// count in [`AsynError::with_partial_write`] rather than dropping it — that
+/// count is what `asynRecord` publishes as NAWT (asynRecord.c:1547).
 fn write_with_retry(
     stream: &mut impl Write,
     data: &[u8],
     deadline: std::time::Instant,
-) -> AsynResult<()> {
+) -> AsynResult<usize> {
     let mut offset = 0;
     while offset < data.len() {
         if std::time::Instant::now() > deadline {
             return Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "write timeout".into(),
-            });
+            }
+            .with_partial_write(offset));
         }
         match stream.write(&data[offset..]) {
             Ok(0) => {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "write returned 0 bytes".into(),
-                });
+                }
+                .with_partial_write(offset));
             }
             Ok(n) => offset += n,
             Err(ref e)
@@ -264,10 +274,10 @@ fn write_with_retry(
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => return Err(AsynError::Io(e)),
+            Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
         }
     }
-    Ok(())
+    Ok(offset)
 }
 
 struct IpIoState {
@@ -391,24 +401,28 @@ impl OctetNext for IpIoState {
         // through. socket_poll_timeout is a no-op for any positive timeout, so
         // this only affects the `timeout == 0` case.
         let deadline = std::time::Instant::now() + socket_poll_timeout(user.timeout);
+        // C writeRaw reports what the socket took (`*nbytesTransfered`) on
+        // success and on failure alike; return the real count rather than
+        // assuming the whole buffer went out.
         match inner {
             IpIoInner::Tcp(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)?;
+                write_with_retry(stream, data, deadline)
             }
             IpIoInner::Udp(socket, peer) => {
                 socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
-                // remote on the unconnected socket.
-                socket.send_to(data, *peer)?;
+                // remote on the unconnected socket. A datagram is all-or-
+                // nothing, so a failed sendto transferred zero bytes and needs
+                // no partial-write carrier.
+                Ok(socket.send_to(data, *peer)?)
             }
             #[cfg(unix)]
             IpIoInner::Unix(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)?;
+                write_with_retry(stream, data, deadline)
             }
         }
-        Ok(data.len())
     }
 
     /// Base-layer flush — C parity with `drvAsynIPPort.c::flushIt`,
@@ -541,20 +555,6 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
     } else {
         AsynError::Io(e)
     }
-}
-
-/// A transport error meaning the socket is broken and the connection must
-/// be torn down (vs a timeout / would-block, which leaves it intact). C
-/// parity: `drvAsynIPPort.c` calls `closeConnection` on any real
-/// `recv`/`send` error but returns `asynTimeout` with the socket intact on
-/// a poll/timeout expiry.
-fn is_fatal_transport_error(e: &AsynError) -> bool {
-    // Classify by the carried status, not by the variant: a read that timed
-    // out or dropped *after* delivering partial bytes arrives as
-    // `AsynError::PartialRead` (C `asynInterposeEos.c:242-253` returns the
-    // status together with the bytes), and a variant match would have read
-    // that as non-fatal and left a dead socket reporting `connected`.
-    matches!(e.status(), AsynStatus::Disconnected) || matches!(e, AsynError::Io(_))
 }
 
 /// Map an `AsynUser` timeout to the socket-level receive/send timeout,
@@ -691,7 +691,7 @@ impl DrvAsynIPPort {
                 let should_disconnect = (self.disconnect_on_read_timeout
                     && is_timeout
                     && user.timeout > Duration::ZERO)
-                    || is_fatal_transport_error(&e);
+                    || e.is_fatal_transport();
                 if should_disconnect && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
@@ -1059,7 +1059,7 @@ impl PortDriver for DrvAsynIPPort {
                 // fatal error; without the symmetric write-side teardown a
                 // wedged socket reports `connected` forever and never
                 // self-heals.
-                if is_fatal_transport_error(&e) && self.base.connected {
+                if e.is_fatal_transport() && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -1477,17 +1477,27 @@ mod tests {
         // DRV-5/DRV-31 family: a broken-socket error tears the connection
         // down; a timeout leaves it intact (the actor reconnects on the
         // next request only when `connected` flips to false).
-        assert!(is_fatal_transport_error(&AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "EOF".into(),
-        }));
-        assert!(is_fatal_transport_error(&AsynError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst")
-        )));
-        assert!(!is_fatal_transport_error(&AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }));
+        assert!(
+            AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "EOF".into(),
+            }
+            .is_fatal_transport()
+        );
+        assert!(
+            AsynError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "rst"
+            ))
+            .is_fatal_transport()
+        );
+        assert!(
+            !AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }
+            .is_fatal_transport()
+        );
     }
 
     #[test]
@@ -1924,14 +1934,14 @@ mod tests {
                 other => panic!("{kind:?} must map to a non-fatal Timeout, got {other:?}"),
             }
             assert!(
-                !is_fatal_transport_error(&classify_read_error(Error::from(kind))),
+                !classify_read_error(Error::from(kind)).is_fatal_transport(),
                 "{kind:?} must not be a fatal transport error"
             );
         }
         // A genuine transport failure stays fatal (Io) → teardown.
         let reset = classify_read_error(Error::from(ErrorKind::ConnectionReset));
         assert!(matches!(reset, AsynError::Io(_)));
-        assert!(is_fatal_transport_error(&reset));
+        assert!(reset.is_fatal_transport());
     }
 
     #[test]

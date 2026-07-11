@@ -18,7 +18,7 @@ pub use engine::opcodes::ArrayOp;
 ///
 /// Tokens outside `postfix.c`'s element table (`SVAL`, string literals and
 /// sCalc string functions, aCalc array functions, `UNTIL`, `AA`..`UU`, `>?`,
-/// `<?`, `NRNDM`) are rejected here with `CalcError::Syntax` — C's
+/// `<?`, `NRNDM`, `INT`) are rejected here with `CalcError::Syntax` — C's
 /// `CALC_ERR_SYNTAX`, raised at compile time (`CLCV != 0`), not at first
 /// evaluation.
 pub fn compile(expr: &str) -> CalcResult<CompiledExpr> {

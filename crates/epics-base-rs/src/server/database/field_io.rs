@@ -29,34 +29,33 @@ fn check_put_disabled(
     Ok(())
 }
 
-/// Coerce a write `value` to a record field's stored `target` type. A
-/// `DBR_STRING` write to a `DBF_MENU` field resolves the label against THAT
-/// field's own menu first (C `dbConvert` `putStringMenu`: an exact label,
-/// then a numeric index) — never the field-blind global table that
-/// `EpicsValue::convert_to` would otherwise consult, which mis-maps a
-/// menu-specific label (e.g. `SELM "Specified"`). Every other value, and a
-/// string that names no choice, falls through to the single value-coercion
-/// owner `EpicsValue::convert_to`.
+/// Coerce a write `value` to a record field's stored `target` type.
+///
+/// A `DBR_STRING` write to a `DBF_MENU` field belongs to ONE converter — C
+/// `dbConvert.c::putStringMenu` (an exact label, else an index below
+/// `nChoice`), ported in `resolve_menu_field_string`. That converter's failure
+/// is `S_db_badChoice` and it FAILS the put; it must not fall through to
+/// `EpicsValue::convert_to`, which is field-blind and would both mis-map a
+/// menu-specific label (`SELM "Specified"`) and turn any unrecognised string
+/// into index 0 (`to_f64().unwrap_or(0.0) as u16`) — C stores nothing at all.
+/// Every non-menu field, and every already-typed value, goes to the single
+/// value-coercion owner `EpicsValue::convert_to`.
 fn coerce_write_value(
     record: &dyn crate::server::record::Record,
     field: &str,
     target: crate::types::DbFieldType,
     value: EpicsValue,
-) -> EpicsValue {
+) -> CaResult<EpicsValue> {
     if let EpicsValue::String(s) = &value {
         if let Some(choices) = record
             .menu_field_choices(field)
             .or_else(|| crate::server::record::shared_menu_choices(field))
         {
             let s = s.as_str_lossy();
-            if let Some(resolved) =
-                crate::server::record::resolve_menu_field_string(choices, target, &s)
-            {
-                return resolved;
-            }
+            return crate::server::record::resolve_menu_field_string(field, choices, target, &s);
         }
     }
-    value.convert_to(target)
+    Ok(value.convert_to(target))
 }
 
 /// What a `dbPut` of a given value means for a given field — the single owner
@@ -93,10 +92,10 @@ fn dbput_request(
     record: &dyn crate::server::record::Record,
     field: &str,
     value: EpicsValue,
-) -> PutRequest {
+) -> CaResult<PutRequest> {
     let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
     if value.is_empty_array() && !dest_is_array {
-        return PutRequest::EmptyIntoScalar;
+        return Ok(PutRequest::EmptyIntoScalar);
     }
     let target = record
         .field_list()
@@ -129,10 +128,10 @@ fn dbput_request(
     };
 
     match target {
-        Some(target) if value.db_field_type() != target => {
-            PutRequest::Write(coerce_write_value(record, field, target, value))
-        }
-        _ => PutRequest::Write(value),
+        Some(target) if value.db_field_type() != target => Ok(PutRequest::Write(
+            coerce_write_value(record, field, target, value)?,
+        )),
+        _ => Ok(PutRequest::Write(value)),
     }
 }
 
@@ -289,7 +288,7 @@ impl PvDatabase {
             };
             let mut instance = rec.write().await;
 
-            let request = dbput_request(&*instance.record, &field, value);
+            let request = dbput_request(&*instance.record, &field, value)?;
 
             // Capture the pre-put value so the metadata-cache
             // invalidation (and the downstream `DBE_PROPERTY`
@@ -311,7 +310,14 @@ impl PvDatabase {
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
-                            let _ = instance.record.special(&field, true);
+                            // C `dbPut` (dbAccess.c:1399-1405) keeps the value
+                            // it already stored but RETURNS the after-put
+                            // `dbPutSpecial(paddr, 1)` status, skipping the
+                            // field's monitor post and (in `dbPutField`) the
+                            // `pp(TRUE)` process. `calcRecord::special` uses
+                            // that to refuse an uncompilable CALC with
+                            // S_db_badField, so the status must not be dropped.
+                            instance.record.special(&field, true)?;
                             CommonFieldPutResult::NoChange
                         }
                         Err(CaError::FieldNotFound(_)) => {
@@ -498,7 +504,7 @@ impl PvDatabase {
 
             let mut instance = rec.write().await;
 
-            let request = dbput_request(&*instance.record, &field, value);
+            let request = dbput_request(&*instance.record, &field, value)?;
 
             let old_value = instance.record.get_field(&field);
             let old_stat = instance.common.stat;
@@ -524,7 +530,11 @@ impl PvDatabase {
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
-                            let _ = instance.record.special(&field, true);
+                            // C returns the after-put special() status from
+                            // `dbPut` (dbAccess.c:1399-1405) — before the UDF
+                            // clear and the monitor post below, both of which
+                            // `goto done` skips on a non-zero status.
+                            instance.record.special(&field, true)?;
                             // Clear UDF/UDF_ALARM on primary field write
                             if field == instance.record.primary_field() {
                                 instance.common.udf = false;
@@ -910,7 +920,7 @@ impl PvDatabase {
             // Coerce value to the field's native DBR type (e.g. String → Double for ao.VAL).
             // This matches C EPICS db_put_field() which converts from the CA client's type
             // to the record field's native type.
-            let request = dbput_request(&*instance.record, &field, value);
+            let request = dbput_request(&*instance.record, &field, value)?;
 
             // SPC_NOMOD: reject writes to read-only fields (C EPICS S_db_noMod)
             let is_read_only = instance
@@ -953,7 +963,13 @@ impl PvDatabase {
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
-                            let _ = instance.record.special(&field, true);
+                            // C returns the after-put special() status from
+                            // `dbPut` (dbAccess.c:1399-1405); `if (status)
+                            // goto done` then skips both the UDF clear below
+                            // and the field's monitor post, and `dbPutField`
+                            // skips the process. Propagating the error here
+                            // reproduces all three.
+                            instance.record.special(&field, true)?;
                             // C `dbAccess.c::dbPut:1410-1411` clears
                             // `precord->udf = FALSE` synchronously when the
                             // put target is the record-type's primary value

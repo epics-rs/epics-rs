@@ -1,3 +1,4 @@
+use super::calc_compile;
 use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, classify_link};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
@@ -134,6 +135,13 @@ pub struct CalcoutRecord {
     // Cached compiled expressions (RPCL/ORPC equivalents)
     rpcl: Option<crate::calc::CompiledExpr>,
     orpc: Option<crate::calc::CompiledExpr>,
+    // CLCV/OCLV — `DBF_LONG` expression-validity fields
+    // (calcoutRecord.dbd.pod:729,1049). C stores `postfix()`'s RETURN VALUE
+    // here (`prec->clcv = postfix(...)`, calcoutRecord.c:327,338), i.e. 0 when
+    // the expression compiled and -1 when it did not — not the CALC_ERR_* code,
+    // which only reaches the errlog line.
+    pub clcv: i32,
+    pub oclv: i32,
     // Per-input link connection status INAV..INUV and the OUT-link status
     // OUTV, menu(calcoutINAV). C `calcoutRecord.c::init_record`
     // (calcoutRecord.c:160-189) classifies each INPA..INPU input link and
@@ -250,6 +258,8 @@ impl Default for CalcoutRecord {
             calc_alarm: false,
             rpcl: None,
             orpc: None,
+            clcv: 0,
+            oclv: 0,
             // C `init_record` leaves an empty/unconfigured link CON
             // (calcoutRecord.c:166-167); the refresh re-classifies once the
             // async context exists.
@@ -477,6 +487,18 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "OCAL",
         dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    // calcoutRecord.dbd.pod:729 / :1049 — `field(CLCV,DBF_LONG)`,
+    // `field(OCLV,DBF_LONG)`, plain writable fields (no special(), no asl).
+    FieldDesc {
+        name: "CLCV",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OCLV",
+        dbf_type: DbFieldType::Long,
         read_only: false,
     },
     FieldDesc {
@@ -988,11 +1010,23 @@ impl Record for CalcoutRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            // C `calcoutRecord.c::init_record:190-205` — `clcv = postfix(...)`
+            // and `oclv = postfix(...)`, both at init, both logged but never
+            // fatal. An empty CALC/OCAL is CALC_ERR_NULL_ARG in base postfix,
+            // so C's own default `field(OCAL,"")` record already inits with
+            // OCLV = -1; the port only compiles a non-empty expression, so its
+            // CLCV/OCLV stay 0 there. Preserving that: only a *put* to
+            // CALC/OCAL (special) can land a non-zero validity code, which is
+            // the field's observable contract.
             if !self.calc.is_empty() {
-                self.rpcl = crate::calc::compile(&self.calc).ok();
+                let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+                self.clcv = compiled.status;
+                self.rpcl = compiled.program;
             }
             if !self.ocal.is_empty() {
-                self.orpc = crate::calc::compile(&self.ocal).ok();
+                let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+                self.oclv = compiled.status;
+                self.orpc = compiled.program;
             }
             self.pval = self.val;
             self.mlst = self.val;
@@ -1145,6 +1179,8 @@ impl Record for CalcoutRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
+            "CLCV" => Some(EpicsValue::Long(self.clcv)),
+            "OCLV" => Some(EpicsValue::Long(self.oclv)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
@@ -1252,14 +1288,31 @@ impl Record for CalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // C `dbPut` stores the string, then `special()` compiles it and
+            // records the postfix() status in CLCV — see `Self::special`.
             "CALC" => match value {
                 EpicsValue::String(s) => {
-                    self.rpcl = crate::calc::compile(&s.as_str_lossy()).ok();
                     self.calc = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CALC".into())),
             },
+            // Plain DBF_LONG fields in C (calcoutRecord.dbd.pod:729,1049) — a
+            // client may write them; the next CALC/OCAL put overwrites them.
+            "CLCV" => {
+                self.clcv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("CLCV".into()))?
+                    as i32;
+                Ok(())
+            }
+            "OCLV" => {
+                self.oclv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OCLV".into()))?
+                    as i32;
+                Ok(())
+            }
             "EGU" => match value {
                 EpicsValue::String(s) => {
                     self.egu = s;
@@ -1354,7 +1407,6 @@ impl Record for CalcoutRecord {
             },
             "OCAL" => match value {
                 EpicsValue::String(s) => {
-                    self.orpc = crate::calc::compile(&s.as_str_lossy()).ok();
                     self.ocal = s.as_str_lossy().into_owned();
                     Ok(())
                 }
@@ -1676,6 +1728,29 @@ impl Record for CalcoutRecord {
         if !after {
             return Ok(());
         }
+        // C `calcoutRecord.c::special:326-345` — CALC/OCAL recompile into
+        // RPCL/ORPC and store postfix()'s RETURN STATUS in CLCV/OCLV (0 or -1),
+        // post DBE_VALUE for the validity field, and return 0: the put is
+        // ACCEPTED even when the expression is garbage. This is the opposite
+        // disposition from calcRecord (which returns S_db_badField and fails
+        // the put, R8-1) — both run off the one compile owner, and C's
+        // asymmetry is deliberate: calcout carries the error in a field,
+        // calc carries it in the put status.
+        match field {
+            "CALC" => {
+                let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+                self.clcv = compiled.status;
+                self.rpcl = compiled.program;
+                return Ok(());
+            }
+            "OCAL" => {
+                let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+                self.oclv = compiled.status;
+                self.orpc = compiled.program;
+                return Ok(());
+            }
+            _ => {}
+        }
         // A put to an INP link re-classifies the link diagnostics: C
         // `calcoutRecord.c::special` (SPC_MOD) re-runs `checkLinks`. The INP
         // string the put just stored is re-read by `refresh_link_status`.
@@ -1685,6 +1760,22 @@ impl Record for CalcoutRecord {
             self.refresh_link_status();
         }
         Ok(())
+    }
+
+    /// C posts the validity field explicitly from `special()`
+    /// (`db_post_events(prec, &prec->clcv, DBE_VALUE)`, calcoutRecord.c:335,344)
+    /// — CLCV/OCLV are not `pp(TRUE)`, so nothing else would post them.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match put_field {
+            "CALC" => &["CLCV"],
+            "OCAL" => &["OCLV"],
+            _ => &[],
+        }
+    }
+
+    /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        &["CLCV", "OCLV"]
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {

@@ -1,3 +1,4 @@
+use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
@@ -659,11 +660,33 @@ impl Record for CalcRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 && !self.calc.is_empty() {
-            // Compile CALC expression and cache it (like C's RPCL)
-            self.rpcl = crate::calc::compile(&self.calc).ok();
+            // C `calcRecord.c::init_record:105-110` — postfix() into RPCL; a
+            // failure is logged (errlog + recGblRecordError) but does NOT abort
+            // the record's init (`return 0`). Only `special()` refuses.
+            self.rpcl = calc_compile::postfix(self.record_type(), "CALC", &self.calc).program;
             self.mlst = self.val;
             self.alst = self.val;
             self.lalm = self.val;
+        }
+        Ok(())
+    }
+
+    /// C `calcRecord.c::special` (lines 139-155). `SPC_CALC` re-compiles RPCL
+    /// from the CALC string `dbPut` has already stored, and on failure returns
+    /// `S_db_badField` — so the client's write FAILS while the bad expression
+    /// stays stored and RPCL is left empty. calcout/scalcout/acalcout make the
+    /// opposite choice (store the status in CLCV, accept the put); both
+    /// dispositions run off the one compile owner, [`calc_compile`].
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after || !field.eq_ignore_ascii_case("CALC") {
+            return Ok(());
+        }
+        let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+        let failed = compiled.failed_to_compile();
+        self.rpcl = compiled.program;
+        if failed {
+            // C `recGblRecordError(S_db_badField, prec, "calc: Illegal CALC field")`
+            return Err(CaError::BadField("calc: Illegal CALC field".into()));
         }
         Ok(())
     }
@@ -841,12 +864,14 @@ impl Record for CalcRecord {
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // C `dbPut` stores the string first and only then runs
+            // `special(SPC_CALC)`, which is what re-compiles RPCL and decides
+            // whether the put is accepted. `Self::special` owns both — a bad
+            // expression must still be stored here (C stores it) so that
+            // `caget calc.CALC` reads back what the client wrote.
             "CALC" => match value {
                 EpicsValue::String(s) => {
-                    let s = s.as_str_lossy().into_owned();
-                    // Recompile on CALC change (like C special SPC_CALC)
-                    self.rpcl = crate::calc::compile(&s).ok();
-                    self.calc = s;
+                    self.calc = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CALC".into())),

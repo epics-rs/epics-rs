@@ -175,11 +175,13 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
     let mut good = SwaitRecord::default();
     good.put_field("CALC", EpicsValue::String("3+4".into()))
         .unwrap();
+    good.special("CALC", true).unwrap();
     db.add_record("SW_NUM", Box::new(good)).await.unwrap();
 
     let mut bad = SwaitRecord::default();
     bad.put_field("CALC", EpicsValue::String("'42'".into()))
         .unwrap();
+    bad.special("CALC", true).unwrap();
     db.add_record("SW_STR", Box::new(bad)).await.unwrap();
 
     for name in ["SW_NUM", "SW_STR"] {
@@ -216,6 +218,7 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("SVAL+'x'".into()))
         .unwrap();
+    sc.special("CALC", true).unwrap();
     db.add_record("SC_SVAL", Box::new(sc)).await.unwrap();
 
     for expected in ["x", "xx", "xxx"] {
@@ -245,8 +248,10 @@ async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {
     // CALC parks a constant, distinctive SVAL for this cycle.
     sc.put_field("CALC", EpicsValue::String("'abc'".into()))
         .unwrap();
+    sc.special("CALC", true).unwrap();
     sc.put_field("OCAL", EpicsValue::String("SVAL+'Z'".into()))
         .unwrap();
+    sc.special("OCAL", true).unwrap();
     sc.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use_OVAL
     sc.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
     db.add_record("SC_OSV", Box::new(sc)).await.unwrap();

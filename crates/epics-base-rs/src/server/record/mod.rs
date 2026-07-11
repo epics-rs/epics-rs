@@ -21,7 +21,7 @@ pub use link::{
 pub use menu_choices::{
     MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
     MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, resolve_menu_field_string,
-    shared_menu_choices,
+    resolve_menu_field_string_db_load, shared_menu_choices,
 };
 pub use pini::PiniMode;
 pub use record_instance::{NotifyWaitSet, RecordInstance};
@@ -31,4 +31,4 @@ pub use record_trait::{
     FieldMetadataOverride, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record,
     RecordProcessResult, SubroutineFn, ValuePostGate,
 };
-pub use scan::ScanType;
+pub use scan::{ScanType, SimModeScan};

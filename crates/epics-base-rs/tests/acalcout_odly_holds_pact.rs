@@ -84,6 +84,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("42".into()))
         .unwrap();
+    a.special("CALC", true).unwrap();
     a.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     a.put_field("OUT", EpicsValue::String("PROBE".into()))
         .unwrap();
@@ -178,6 +179,7 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("1/0".into()))
         .unwrap();
+    a.special("CALC", true).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
     a.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
     a.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
@@ -253,6 +255,7 @@ async fn acalcout_odly_dont_drive_still_defers() {
     let mut a = AcalcoutRecord::default();
     a.put_field("CALC", EpicsValue::String("1/0".into()))
         .unwrap();
+    a.special("CALC", true).unwrap();
     a.put_field("IVOA", EpicsValue::Short(1)).unwrap();
     a.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     a.put_field("OUT", EpicsValue::String("PROBE".into()))

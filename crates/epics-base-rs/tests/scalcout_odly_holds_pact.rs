@@ -39,6 +39,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("42".into()))
         .unwrap();
+    sc.special("CALC", true).unwrap();
     sc.oopt = 0;
     sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     sc.put_field("OUT", EpicsValue::String("TGT".into()))

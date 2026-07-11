@@ -1,5 +1,3 @@
-use crate::error::{CaError, CaResult};
-
 /// Scan types matching EPICS base SCAN field menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 #[repr(u16)]
@@ -31,30 +29,6 @@ impl ScanType {
             8 => Self::Sec02,
             9 => Self::Sec01,
             _ => Self::Passive,
-        }
-    }
-
-    pub fn from_str(s: &str) -> CaResult<Self> {
-        let s = s.trim();
-        let lower = s.to_ascii_lowercase();
-        match lower.as_str() {
-            "passive" => Ok(Self::Passive),
-            "event" => Ok(Self::Event),
-            "i/o intr" | "iointr" => Ok(Self::IoIntr),
-            "10 second" => Ok(Self::Sec10),
-            "5 second" => Ok(Self::Sec5),
-            "2 second" => Ok(Self::Sec2),
-            "1 second" => Ok(Self::Sec1),
-            ".5 second" | "0.5 second" => Ok(Self::Sec05),
-            ".2 second" | "0.2 second" => Ok(Self::Sec02),
-            ".1 second" | "0.1 second" => Ok(Self::Sec01),
-            other => {
-                if let Ok(v) = other.parse::<u16>() {
-                    Ok(Self::from_u16(v))
-                } else {
-                    Err(CaError::InvalidValue(format!("unknown scan type: '{s}'")))
-                }
-            }
         }
     }
 
@@ -102,16 +76,6 @@ impl SimModeScan {
             0..=9 => Self::Scan(ScanType::from_u16(v)),
             _ => Self::DoNotUse,
         }
-    }
-
-    pub fn from_str(s: &str) -> CaResult<Self> {
-        let s = s.trim();
-        // A numeric form (including "65535") resolves through `from_u16`
-        // so the sentinel round-trips; otherwise it is a menuScan label.
-        if let Ok(v) = s.parse::<u16>() {
-            return Ok(Self::from_u16(v));
-        }
-        Ok(Self::Scan(ScanType::from_str(s)?))
     }
 
     /// The `DBR_ENUM`/wire index: a real choice's menuScan index, or the
@@ -164,12 +128,8 @@ mod sim_mode_scan_tests {
     }
 
     #[test]
-    fn sentinel_round_trips_through_u16_and_str() {
+    fn sentinel_round_trips_through_u16() {
         assert_eq!(SimModeScan::from_u16(65535), SimModeScan::DoNotUse);
-        assert_eq!(
-            SimModeScan::from_str("65535").unwrap(),
-            SimModeScan::DoNotUse
-        );
         assert_eq!(SimModeScan::DoNotUse.to_u16(), 65535);
     }
 
@@ -182,11 +142,18 @@ mod sim_mode_scan_tests {
             );
             assert_eq!(SimModeScan::from_u16(v).to_u16(), v);
         }
-        // A menuScan label resolves to the matching choice.
-        assert_eq!(
-            SimModeScan::from_str(".1 second").unwrap(),
-            SimModeScan::Scan(ScanType::Sec01)
-        );
+    }
+
+    /// The labels this type renders are `menuScan`'s, so the one menu
+    /// converter (which owns every string→menu-index put, see
+    /// `tests/menu_common_field_scan_pini.rs`) and this type agree on every
+    /// choice — including the `".5 second"` spellings that the deleted
+    /// `ScanType::from_str` used to accept a `"0.5 second"` alias for.
+    #[test]
+    fn labels_match_the_shared_menu_table() {
+        for (i, label) in super::super::menu_choices::MENU_SCAN.iter().enumerate() {
+            assert_eq!(ScanType::from_u16(i as u16).to_string(), *label);
+        }
     }
 
     #[test]

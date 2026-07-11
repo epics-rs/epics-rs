@@ -9220,6 +9220,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     let mut src = CalcoutRecord::default();
     src.put_field("CALC", EpicsValue::String("A".into()))
         .unwrap();
+    src.special("CALC", true).unwrap();
     src.put_field("A", EpicsValue::Double(42.0)).unwrap();
     src.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
     db.add_record("CO6_SRC", Box::new(src)).await.unwrap();

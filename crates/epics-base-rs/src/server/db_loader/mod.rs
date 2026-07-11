@@ -1111,12 +1111,12 @@ pub fn apply_fields(
                 .menu_field_choices(&upper_name)
                 .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
             {
-                crate::server::record::resolve_menu_field_string(choices, dbf_type, value_str)
-                    .ok_or_else(|| {
-                        CaError::InvalidValue(format!(
-                            "field {upper_name}: '{value_str}' is not a valid menu choice"
-                        ))
-                    })?
+                crate::server::record::resolve_menu_field_string_db_load(
+                    &upper_name,
+                    choices,
+                    dbf_type,
+                    value_str,
+                )?
             } else {
                 EpicsValue::parse(dbf_type, value_str).map_err(|e| {
                     CaError::InvalidValue(format!(
@@ -1367,6 +1367,9 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        // C compiles CALC in special(SPC_CALC), never in the field write —
+        // dbPut always runs both, so drive the same pair here.
+        rec.special("CALC", true).unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.process().unwrap();
@@ -1384,6 +1387,7 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap(); // On Change
         rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
 
@@ -1404,8 +1408,12 @@ mod tests {
         let mut rec = CalcoutRecord::default();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        // C compiles CALC in special(SPC_CALC), never in the field write —
+        // dbPut always runs both, so drive the same pair here.
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("A*B".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();

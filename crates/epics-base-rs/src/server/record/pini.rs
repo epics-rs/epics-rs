@@ -1,5 +1,3 @@
-use crate::error::{CaError, CaResult};
-
 /// `PINI` — `DBF_MENU`, `menu(menuPini)`
 /// (`dbCommon.dbd.pod:169`; `menuPini.dbd.pod:59-65`).
 ///
@@ -47,25 +45,6 @@ impl PiniMode {
         }
     }
 
-    /// Resolve a `menuPini` label (`"RUN"`) or a bare menu index (`"2"`),
-    /// matching C `dbPutStringNum` (exact label first, then `epicsParseUInt16`).
-    pub fn from_str(s: &str) -> CaResult<Self> {
-        let s = s.trim();
-        match s {
-            "NO" => return Ok(Self::No),
-            "YES" => return Ok(Self::Yes),
-            "RUN" => return Ok(Self::Run),
-            "RUNNING" => return Ok(Self::Running),
-            "PAUSE" => return Ok(Self::Pause),
-            "PAUSED" => return Ok(Self::Paused),
-            _ => {}
-        }
-        match s.parse::<u16>() {
-            Ok(v) if v <= 5 => Ok(Self::from_u16(v)),
-            _ => Err(CaError::InvalidValue(format!("unknown PINI choice: '{s}'"))),
-        }
-    }
-
     /// The `DBR_ENUM` / stored menu index.
     pub fn to_u16(self) -> u16 {
         self as u16
@@ -96,26 +75,17 @@ mod tests {
         }
     }
 
+    /// The label⇄index mapping this type renders is `menuPini`'s, so the one
+    /// menu converter (`menu_choices::resolve_menu_field_string`, which owns
+    /// every string→menu-index put — see `tests/menu_field_put_bad_choice.rs`
+    /// and `tests/menu_common_field_scan_pini.rs`) and this type agree on
+    /// every choice.
     #[test]
-    fn labels_resolve_and_round_trip() {
-        assert_eq!(PiniMode::from_str("RUN").unwrap(), PiniMode::Run);
-        assert_eq!(PiniMode::from_str("RUNNING").unwrap(), PiniMode::Running);
-        assert_eq!(PiniMode::from_str("PAUSED").unwrap(), PiniMode::Paused);
-        // Bare index, as C `epicsParseUInt16` accepts.
-        assert_eq!(PiniMode::from_str("2").unwrap(), PiniMode::Run);
+    fn labels_match_the_shared_menu_table() {
+        for (i, label) in super::super::menu_choices::MENU_PINI.iter().enumerate() {
+            assert_eq!(PiniMode::from_u16(i as u16).to_string(), *label);
+        }
         assert_eq!(PiniMode::Run.to_string(), "RUN");
         assert_eq!(PiniMode::default(), PiniMode::No);
-    }
-
-    #[test]
-    fn out_of_menu_text_is_an_error_not_a_silent_no() {
-        // C `dbPutStringNum` returns S_db_badChoice; the old `bool` field
-        // silently turned every unrecognised string into `pini = false`.
-        assert!(PiniMode::from_str("MAYBE").is_err());
-        assert!(PiniMode::from_str("6").is_err());
-        // "true"/"1" were the pre-fix port-only spellings; only the C-legal
-        // numeric index survives.
-        assert!(PiniMode::from_str("true").is_err());
-        assert_eq!(PiniMode::from_str("1").unwrap(), PiniMode::Yes);
     }
 }

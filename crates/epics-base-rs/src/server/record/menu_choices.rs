@@ -35,6 +35,7 @@
 //! `.dbd` exactly: the index↔string mapping is wire-visible to clients.
 //! Each table cites its source.
 
+use crate::error::{CaError, CaResult};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
@@ -172,9 +173,13 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         // records but `menuYesNo` (NO/YES) elsewhere — so it is resolved by
         // each record's `menu_field_choices`, not here.
         "OLDSIMM" => Some(MENU_SIMM),
-        // Simulation-mode scan rate (`menuScan`); `.SCAN` itself is served
-        // by the common-field path.
-        "SSCN" => Some(MENU_SCAN),
+        // Scan mechanism and its simulation-mode twin, both `menu(menuScan)`
+        // (`dbCommon.dbd.pod:66`, `SSCN` on the 21 records that carry it).
+        // Their values live in `CommonFields`, not in a record's field list,
+        // but the menu is the same shared table every other menu field uses —
+        // for the string→index put converter AND for the DBR_ENUM choice
+        // labels served with a GET/MONITOR of `.SCAN`.
+        "SCAN" | "SSCN" => Some(MENU_SCAN),
         // Output mode select (`menuOmsl`).
         "OMSL" => Some(MENU_OMSL),
         // Invalid-output action (`menuIvoa`).
@@ -194,31 +199,193 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// Resolve a `DBF_MENU` field's textual value — a `.db` field directive or a
-/// `DBR_STRING` write — against THAT field's own choice table, exactly like C
-/// `dbStaticLib` `dbPutStringNum` and `dbConvert` `putStringMenu`: an exact,
-/// case-sensitive label match first (`dbGetMenuIndexFromString`'s `strcmp`),
-/// then a bare numeric index (`epicsParseUInt16`). The resolved index is typed
-/// to the field's stored `dbf_type` so it lands in the record's `put_field`
-/// without a second coercion.
+/// C `strtoul(str, &end, 0)` — the parse `epicsParseULong` runs
+/// (`epicsStdlib.c:57-79`) with `dbConvertBase`, which is 0 unless
+/// `EPICS_DB_CONVERT_DECIMAL_ONLY=YES` (`epicsConvert.c:37`, `iocInit.c:140`).
+/// Base 0 means: leading whitespace, optional sign, `0x`/`0X` hex, leading-`0`
+/// octal, else decimal. A `-` negates modulo 2^64, exactly as C's `strtoul`
+/// does — `"-65534"` is a *valid* parse producing 0xFFFF…0002.
 ///
-/// Returns `None` when the text is neither a known label nor a numeric index —
-/// the caller then reports the C `S_db_badChoice` error rather than guessing.
+/// Returns `(value, rest)`; `None` is C's `S_stdlib_noConversion` /
+/// `S_stdlib_overflow`.
+fn c_strtoul_base0(s: &str) -> Option<(u64, &str)> {
+    fn c_isspace(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && c_isspace(b[i]) {
+        i += 1;
+    }
+    let mut negate = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        negate = b[i] == b'-';
+        i += 1;
+    }
+
+    let mut base: u64 = 10;
+    if i < b.len() && b[i] == b'0' {
+        if i + 1 < b.len() && (b[i + 1] | 0x20) == b'x' {
+            if i + 2 < b.len() && b[i + 2].is_ascii_hexdigit() {
+                base = 16;
+                i += 2;
+            } else {
+                // C strtoul consumes the leading "0" and stops at the 'x'.
+                return Some((0, &s[i + 1..]));
+            }
+        } else {
+            base = 8;
+        }
+    }
+
+    let start = i;
+    let mut acc: u64 = 0;
+    while i < b.len() {
+        let digit = match b[i] {
+            c @ b'0'..=b'9' => u64::from(c - b'0'),
+            c @ b'a'..=b'f' => u64::from(c - b'a') + 10,
+            c @ b'A'..=b'F' => u64::from(c - b'A') + 10,
+            _ => break,
+        };
+        if digit >= base {
+            break;
+        }
+        // C reports ERANGE, which epicsParseULong turns into an error return.
+        acc = acc.checked_mul(base)?.checked_add(digit)?;
+        i += 1;
+    }
+    if i == start {
+        return None; // S_stdlib_noConversion
+    }
+    let value = if negate { acc.wrapping_neg() } else { acc };
+    Some((value, &s[i..]))
+}
+
+/// C `epicsParseUInt16(str, &val, dbConvertBase, NULL)` (`epicsStdlib.c:229-243`).
+///
+/// Whitespace is legal *around* the number (strtoul skips leading, the
+/// `units == NULL` tail check skips trailing) but any other trailing character
+/// is `S_stdlib_extraneous`. The range check is C's, verbatim: a value that
+/// wrapped through the negative side (`> ~0xffff`) is NOT an overflow — it
+/// truncates to its low 16 bits.
+fn epics_parse_uint16(s: &str) -> Option<u16> {
+    let (value, rest) = c_strtoul_base0(s)?;
+    if !rest
+        .bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    {
+        return None; // S_stdlib_extraneous
+    }
+    if value > 0xffff && value <= !0xffff_u64 {
+        return None; // S_stdlib_overflow
+    }
+    Some(value as u16)
+}
+
+/// Resolve a `DBF_MENU` field's `DBR_STRING` write against THAT field's own
+/// choice table — C `dbConvert.c::putStringMenu` (lines 1206-1229), the
+/// converter every runtime `dbPut` of a string into a menu field goes through.
+///
+/// C's rule, exactly:
+/// 1. `strcmp` against each choice — EXACT and case-sensitive. No trimming:
+///    `"Passive "` is not `"Passive"`.
+/// 2. Otherwise `epicsParseUInt16` (base 0 — hex/octal accepted, whitespace
+///    around the digits accepted) and the index must be `< nChoice`.
+/// 3. Otherwise `S_db_badChoice`.
+///
+/// The port used to `trim()` before the label match and to accept ANY parsable
+/// index, so `caput fanout.SELM "99"` stored 99 — an enum index no branch of
+/// the record handles — where C refuses the put.
+///
+/// Returns [`CaError::BadChoice`] for C's `S_db_badChoice`. The error is the
+/// whole point of the signature: a menu field's string put has exactly one
+/// resolver, and a miss must FAIL the put — the caller may not fall back to a
+/// field-blind numeric coercion, which is how `"Bogus"` used to land as index
+/// 0 (`EpicsValue::convert_to`: `to_f64().unwrap_or(0.0) as u16`).
+///
 /// A menu label is menu-*specific*, so resolution MUST use the field's own
-/// `choices` (this function's argument), never a cross-menu global table: the
-/// same label can name different indices in different menus (e.g. "Specified"
-/// is index 1 of `menuFanout` but index 0 of `selSELM`).
+/// `choices` (this argument), never a cross-menu global table: the same label
+/// names different indices in different menus (e.g. "Specified" is index 1 of
+/// `menuFanout` but index 0 of `selSELM`).
 pub fn resolve_menu_field_string(
+    field: &str,
     choices: &[&str],
     dbf_type: DbFieldType,
     s: &str,
-) -> Option<EpicsValue> {
-    let trimmed = s.trim();
-    let index = match choices.iter().position(|c| *c == trimmed) {
-        Some(i) => i as i64,
-        None => trimmed.parse::<i64>().ok()?,
+) -> CaResult<EpicsValue> {
+    resolve_menu_field_string_bounded(field, choices, dbf_type, s, MenuBound::DbPut)
+}
+
+/// C `S_db_badChoice` ("Illegal choice", `dbAccessDefs.h:183`) — the status
+/// `putStringMenu`/`dbPutStringNum` hand back to `dbPut`, which aborts before
+/// storing anything (`dbAccess.c:1362` `if (status) goto done`), so the field
+/// keeps its previous value and the record is not processed.
+fn bad_choice(field: &str, choices: &[&str], s: &str) -> CaError {
+    CaError::BadChoice(format!(
+        "{field}: '{s}' is not one of {choices:?} nor an index below {}",
+        choices.len()
+    ))
+}
+
+/// Resolve a `DBF_MENU` field's `.db` value — C `dbStaticRun.c::dbPutStringNum`
+/// (lines 485-512), which is the *loader's* converter and does NOT share
+/// `putStringMenu`'s bound.
+///
+/// Same exact-label / `epicsParseUInt16` front end, then C's own out-of-menu
+/// test: `if (value > nChoice && nChoice > 0 && value < USHRT_MAX)` → reject.
+/// So the loader accepts `value == nChoice` (one past the last choice) and
+/// accepts `65535`, which is how a dbd `initial("65535")` sentinel (SSCN) can
+/// load at all while `caput .SSCN "65535"` is refused at runtime. Keeping the
+/// two bounds distinct is the only way both C behaviours hold.
+pub fn resolve_menu_field_string_db_load(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+) -> CaResult<EpicsValue> {
+    resolve_menu_field_string_bounded(field, choices, dbf_type, s, MenuBound::DbLoad)
+}
+
+/// The one string→menu-index converter. Both public entry points are this
+/// function with their C converter's bound; a caller that already knows which
+/// converter it is (`RecordInstance::put_common_field` vs its `_db_load` twin)
+/// passes the bound directly.
+pub(crate) fn resolve_menu_field_string_bounded(
+    field: &str,
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+    bound: MenuBound,
+) -> CaResult<EpicsValue> {
+    let index =
+        menu_index_from_string(choices, s, bound).ok_or_else(|| bad_choice(field, choices, s))?;
+    Ok(menu_index_value(dbf_type, index))
+}
+
+/// Which C converter's out-of-menu bound applies.
+#[derive(Clone, Copy)]
+pub(crate) enum MenuBound {
+    /// `dbConvert.c::putStringMenu` — `val < nChoice`. Every runtime `dbPut`.
+    DbPut,
+    /// `dbStaticRun.c::dbPutStringNum` — `!(val > nChoice && nChoice > 0 && val < 65535)`.
+    /// The `.db`/dbd loader only.
+    DbLoad,
+}
+
+/// The shared front end of both C converters: exact label, else a base-0
+/// `epicsParseUInt16` index, then the caller's bound.
+fn menu_index_from_string(choices: &[&str], s: &str, bound: MenuBound) -> Option<i64> {
+    if let Some(i) = choices.iter().position(|c| *c == s) {
+        return Some(i as i64);
+    }
+    let value = epics_parse_uint16(s)?;
+    let n_choice = choices.len() as u16;
+    let in_range = match bound {
+        MenuBound::DbPut => value < n_choice,
+        MenuBound::DbLoad => !(value > n_choice && n_choice > 0 && value < u16::MAX),
     };
-    Some(menu_index_value(dbf_type, index))
+    in_range.then_some(i64::from(value))
 }
 
 /// Type a resolved menu index to the field's stored `dbf_type`. A `DBF_MENU`
@@ -329,5 +496,59 @@ mod tests {
         // the registry maps the name, the value-type gate at the snapshot
         // boundary protects the string case.
         assert_eq!(shared_menu_choices("OSV"), Some(MENU_ALARM_SEVR));
+    }
+
+    /// R8-3: the runtime converter's bound is `val < nChoice`
+    /// (`dbConvert.c:1228`); the loader's is
+    /// `!(val > nChoice && nChoice > 0 && val < USHRT_MAX)`
+    /// (`dbStaticRun.c::dbPutStringNum`). They differ at exactly two points —
+    /// `val == nChoice` and `val == 65535` — and both must hold: the 65535
+    /// case is how a dbd `initial("65535")` menu sentinel loads at all.
+    #[test]
+    fn db_put_and_db_load_bounds_differ_where_c_says_they_do() {
+        const N: usize = MENU_PRIORITY.len(); // 3
+        assert_eq!(
+            menu_index_from_string(MENU_PRIORITY, "2", MenuBound::DbPut),
+            Some(2)
+        );
+        assert_eq!(
+            menu_index_from_string(MENU_PRIORITY, &N.to_string(), MenuBound::DbPut),
+            None
+        );
+        assert_eq!(
+            menu_index_from_string(MENU_PRIORITY, &N.to_string(), MenuBound::DbLoad),
+            Some(N as i64)
+        );
+        assert_eq!(
+            menu_index_from_string(MENU_PRIORITY, "65535", MenuBound::DbPut),
+            None
+        );
+        assert_eq!(
+            menu_index_from_string(MENU_PRIORITY, "65535", MenuBound::DbLoad),
+            Some(65535)
+        );
+        // Both refuse a value that is neither a label nor a number.
+        assert_eq!(
+            menu_index_from_string(MENU_PRIORITY, "HIGH ", MenuBound::DbLoad),
+            None
+        );
+    }
+
+    /// `epicsParseUInt16` = `strtoul(str, &end, 0)` + a tail check + C's own
+    /// range test (`epicsStdlib.c:229-243`).
+    #[test]
+    fn epics_parse_uint16_is_c_strtoul_base_0() {
+        assert_eq!(epics_parse_uint16("10"), Some(10));
+        assert_eq!(epics_parse_uint16(" 0x1f\t"), Some(31));
+        assert_eq!(epics_parse_uint16("010"), Some(8));
+        assert_eq!(epics_parse_uint16("65535"), Some(65535));
+        assert_eq!(epics_parse_uint16("65536"), None); // S_stdlib_overflow
+        assert_eq!(epics_parse_uint16("12abc"), None); // S_stdlib_extraneous
+        assert_eq!(epics_parse_uint16(""), None); // S_stdlib_noConversion
+        assert_eq!(epics_parse_uint16("abc"), None);
+        // C's range test spares the wrapped negatives: strtoul("-1") is
+        // 0xFFFF_FFFF_FFFF_FFFF, which is `> ~0xffff` is false, so it
+        // truncates to 0xffff instead of erroring.
+        assert_eq!(epics_parse_uint16("-1"), Some(0xffff));
     }
 }

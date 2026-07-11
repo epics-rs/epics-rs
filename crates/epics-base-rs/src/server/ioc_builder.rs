@@ -274,7 +274,10 @@ impl IocBuilder {
             if let Some(rec_arc) = db.get_record(&def.name).await {
                 let mut instance = rec_arc.write().await;
                 for (name, value) in common_fields {
-                    match instance.put_common_field(&name, value) {
+                    // `.db` load: C's loader converter, whose menu bound
+                    // differs from a runtime dbPut's
+                    // (`dbStaticRun.c::dbPutStringNum` vs `putStringMenu`).
+                    match instance.put_common_field_db_load(&name, value) {
                         Ok(record::CommonFieldPutResult::ScanChanged {
                             old_scan,
                             new_scan,

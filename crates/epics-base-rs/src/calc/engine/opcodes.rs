@@ -47,7 +47,6 @@ pub enum CoreOp {
     Exp,
     Log10,
     LogE,
-    Log2,
     Sin,
     Cos,
     Tan,

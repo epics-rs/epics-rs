@@ -56,6 +56,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     let mut sc = ScalcoutRecord::default();
     sc.put_field("CALC", EpicsValue::String("5".into()))
         .unwrap();
+    sc.special("CALC", true).unwrap();
     sc.put_field("INPA", EpicsValue::String("SRC MS".into()))
         .unwrap();
     sc.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();

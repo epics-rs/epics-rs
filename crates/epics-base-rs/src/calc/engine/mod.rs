@@ -1,3 +1,4 @@
+pub mod cast;
 pub mod error;
 pub mod numeric;
 pub mod opcodes;

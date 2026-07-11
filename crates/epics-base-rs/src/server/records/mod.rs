@@ -8,6 +8,7 @@ pub mod bi;
 pub mod bo;
 pub mod busy;
 pub mod calc;
+pub(crate) mod calc_compile;
 pub mod calcout;
 pub mod compress;
 pub mod dfanout;

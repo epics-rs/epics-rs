@@ -1,3 +1,4 @@
+use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
@@ -6,7 +7,7 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
-use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
+use crate::calc::{CompiledExpr, scalc_eval};
 
 /// Scalcout record — string calc with output.
 ///
@@ -19,6 +20,12 @@ pub struct ScalcoutRecord {
     pub sval: PvString,
     pub calc: String,
     compiled_calc: Option<CompiledExpr>,
+    /// CLCV/OCLV — `DBF_LONG` expression-validity fields
+    /// (sCalcoutRecord.dbd:75,438). C stores `sCalcPostfix()`'s RETURN VALUE
+    /// (`pcalc->clcv = sCalcPostfix(...)`, sCalcoutRecord.c:464,475): 0 when the
+    /// expression compiled, -1 when it did not (sCalcPostfix.c:873-881).
+    pub clcv: i32,
+    pub oclv: i32,
     pub oopt: i16, // 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
     pub dopt: i16, // 0=Use CALC, 1=Use OCAL
     pub ocal: String,
@@ -76,6 +83,8 @@ impl Default for ScalcoutRecord {
             sval: PvString::new(),
             calc: String::new(),
             compiled_calc: None,
+            clcv: 0,
+            oclv: 0,
             oopt: 0,
             dopt: 0,
             ocal: String::new(),
@@ -152,20 +161,22 @@ impl ScalcoutRecord {
         }
     }
 
+    /// C `sCalcoutRecord.c::special:463-471` (and the same two lines in
+    /// `init_record`): compile into RPCL and store `sCalcPostfix()`'s return
+    /// status in CLCV. An empty CALC compiles to an empty program with status 0
+    /// (sCalcPostfix.c:432-434) — unlike base `postfix()`, which calls it
+    /// CALC_ERR_NULL_ARG.
     fn recompile_calc(&mut self) {
-        self.compiled_calc = if self.calc.is_empty() {
-            None
-        } else {
-            scalc_compile(&self.calc).ok()
-        };
+        let compiled = calc_compile::scalc_postfix("scalcout", "CALC", &self.calc);
+        self.clcv = compiled.status;
+        self.compiled_calc = compiled.program;
     }
 
+    /// C `sCalcoutRecord.c::special:474-482` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self) {
-        self.compiled_ocal = if self.ocal.is_empty() {
-            None
-        } else {
-            scalc_compile(&self.ocal).ok()
-        };
+        let compiled = calc_compile::scalc_postfix("scalcout", "OCAL", &self.ocal);
+        self.oclv = compiled.status;
+        self.compiled_ocal = compiled.program;
     }
 
     fn var_index(name: &str) -> Option<usize> {
@@ -208,6 +219,17 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "CALC",
         dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    // sCalcoutRecord.dbd:75,438 — `field(CLCV,DBF_LONG)` / `field(OCLV,DBF_LONG)`.
+    FieldDesc {
+        name: "CLCV",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OCLV",
+        dbf_type: DbFieldType::Long,
         read_only: false,
     },
     FieldDesc {
@@ -478,6 +500,52 @@ impl Record for ScalcoutRecord {
         "scalcout"
     }
 
+    /// C `scalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
+    /// stores the postfix status in CLCV/OCLV (sCalcoutRecord.c:245-261) —
+    /// the load-time half of the compile owner. A put goes through
+    /// `special()` instead; `put_field` only stores the string, as C's dbPut
+    /// does.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.recompile_calc();
+            self.recompile_ocal();
+        }
+        Ok(())
+    }
+
+    /// C `sCalcoutRecord.c::special:462-482` — a put to CALC/OCAL recompiles
+    /// into RPCL/ORPC, stores `sCalcPostfix()`'s return status in CLCV/OCLV,
+    /// posts DBE_VALUE for it, and returns 0: the put is ACCEPTED even for a
+    /// garbage expression (unlike calcRecord, which refuses it — R8-1).
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        match field {
+            "CALC" => self.recompile_calc(),
+            "OCAL" => self.recompile_ocal(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// C posts the validity field explicitly from `special()`
+    /// (`db_post_events(pcalc, &pcalc->clcv, DBE_VALUE)`,
+    /// sCalcoutRecord.c:470,481); CLCV/OCLV are not `pp(TRUE)`, so nothing
+    /// else would post them.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match put_field {
+            "CALC" => &["CLCV"],
+            "OCAL" => &["OCLV"],
+            _ => &[],
+        }
+    }
+
+    /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        &["CLCV", "OCLV"]
+    }
+
     // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
     // for string output side, but OUT writeback only reads OVAL).
     //
@@ -670,6 +738,8 @@ impl Record for ScalcoutRecord {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
+            "CLCV" => Some(EpicsValue::Long(self.clcv)),
+            "OCLV" => Some(EpicsValue::Long(self.oclv)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
@@ -714,14 +784,31 @@ impl Record for ScalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SVAL".into())),
             },
+            // C `dbPut` stores the string; `special()` compiles it and records
+            // the sCalcPostfix() status in CLCV (see `Self::special`).
             "CALC" => match value {
                 EpicsValue::String(s) => {
                     self.calc = s.as_str_lossy().into_owned();
-                    self.recompile_calc();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("CALC".into())),
             },
+            // Plain DBF_LONG fields in C — writable; the next CALC/OCAL put
+            // overwrites them.
+            "CLCV" => {
+                self.clcv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("CLCV".into()))?
+                    as i32;
+                Ok(())
+            }
+            "OCLV" => {
+                self.oclv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OCLV".into()))?
+                    as i32;
+                Ok(())
+            }
             "OOPT" => match value {
                 EpicsValue::Short(v) => {
                     self.oopt = v;
@@ -739,7 +826,6 @@ impl Record for ScalcoutRecord {
             "OCAL" => match value {
                 EpicsValue::String(s) => {
                     self.ocal = s.as_str_lossy().into_owned();
-                    self.recompile_ocal();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OCAL".into())),
@@ -916,6 +1002,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("VAL+1".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 1.0);
         rec.process().unwrap();
@@ -933,8 +1020,10 @@ mod tests {
         // would be 101 forever.
         rec.put_field("CALC", EpicsValue::String("100".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("VAL+1".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every Time
 
@@ -955,6 +1044,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A+B".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0);
     }
@@ -968,6 +1058,7 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("AA+BB".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.sval, "hello world");
     }
@@ -977,6 +1068,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("42".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, 42.0);
@@ -987,6 +1079,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
 
         // First process — value changes from 0 to 5
@@ -1006,8 +1099,10 @@ mod tests {
         rec.put_field("A", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("A*2".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 10.0); // CALC result
@@ -1039,8 +1134,10 @@ mod tests {
             .unwrap();
         rec.put_field("CALC", EpicsValue::String("1".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("OCAL", EpicsValue::String("AA".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.osv, "hi");
@@ -1136,12 +1233,14 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 7.0, "good calc seeds VAL");
         // Now break the CALC: a bare binary operator underflows the stack.
         rec.put_field("CALC", EpicsValue::String("+".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, -1.0, "calc-fail forces VAL=-1 (C:361)");
         assert_eq!(rec.sval, "***ERROR***", "calc-fail forces SVAL (C:363)");
@@ -1156,16 +1255,19 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         rec.put_field("CALC", EpicsValue::String("A".into()))
             .unwrap();
+        rec.special("CALC", true).unwrap();
         rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
         rec.put_field("OCAL", EpicsValue::String("5".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, 5.0, "good OCAL seeds OVAL");
         assert_eq!(rec.val, 3.0, "CALC side is unaffected");
         // Break OCAL: a bare binary operator underflows the stack.
         rec.put_field("OCAL", EpicsValue::String("+".into()))
             .unwrap();
+        rec.special("OCAL", true).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.oval, -1.0, "OCAL-fail forces OVAL=-1 (C:771)");
         assert_eq!(rec.osv, "***ERROR***", "OCAL-fail forces OSV (C:772)");

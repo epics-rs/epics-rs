@@ -276,10 +276,9 @@ impl PortDriverBase {
     ///
     /// Uses monotonic [`Instant`], not wall clock: the throttle is purely
     /// internal timing, never serialised, so it must be immune to NTP
-    /// steps. `addr` selects the per-device anchor on multi-device ports;
-    /// single-device ports use the port-level anchor.
+    /// steps. `addr` selects the anchor via [`Self::is_device_addr`].
     pub fn auto_connect_throttle_ok(&self, addr: i32, now: Instant) -> bool {
-        let last = if self.flags.multi_device {
+        let last = if self.is_device_addr(addr) {
             self.device_states
                 .get(&addr)
                 .and_then(|d| d.last_connect_disconnect)
@@ -292,13 +291,30 @@ impl PortDriverBase {
         }
     }
 
+    /// Does `addr` name a *device* on this port, or the port itself?
+    ///
+    /// C `findDpCommon` resolves a `pasynUser` to `&pdevice->dpc` only when
+    /// the port is multi-device AND the user is bound to a real address;
+    /// otherwise to `&pport->dpc` (a connectDevice with `addr < 0` leaves
+    /// `pdevice` null). This is the one owner of that resolution, so the
+    /// throttle read [`Self::auto_connect_throttle_ok`] and the throttle
+    /// write [`Self::stamp_auto_connect_attempt`] can never disagree about
+    /// which anchor an address refers to. Keying on the address (rather than
+    /// on `multi_device` alone) is what lets a multi-device port hold a
+    /// *port-level* anchor at `addr = -1`: the old form sent `-1` into
+    /// `device_states`, inventing a phantom device whose anchor no
+    /// disconnect ever stamped.
+    pub fn is_device_addr(&self, addr: i32) -> bool {
+        self.flags.multi_device && addr >= 0
+    }
+
     /// Single owner for the post-attempt throttle stamp. C
     /// `autoConnectDevice` stamps `lastConnectDisconnect` immediately after
     /// every `connectAttempt`, success or failure (asynManager.c:718,
     /// 735), so the window restarts from the end of the attempt — a failed
     /// reconnect is not retried until the throttle elapses again.
     pub fn stamp_auto_connect_attempt(&mut self, addr: i32, now: Instant) {
-        if self.flags.multi_device {
+        if self.is_device_addr(addr) {
             self.device_state(addr).last_connect_disconnect = Some(now);
         } else {
             self.last_connect_disconnect = Some(now);

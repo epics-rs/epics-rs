@@ -2543,6 +2543,51 @@ impl PvDatabase {
                 false
             };
 
+            // Output-time input links (swait DOL). C
+            // `swaitRecord.c::execOutput` (763-772) fetches DOL through
+            // `recDynLinkGet` at OUTPUT time — not in the input-fetch phase —
+            // and only on a cycle whose output actually fires, so DOLD carries
+            // the value the link holds at the moment of the write (ODLY
+            // delay-end included) and a non-firing cycle neither refreshes nor
+            // posts it. Run here, after the IVOA veto and before the OUT stage
+            // composes `out_info`, so the fresh value is the one written and
+            // the changed field still reaches this cycle's snapshot.
+            //
+            // The write lock is released across the read (the link may target
+            // another record) and re-taken, the same way the pre-process
+            // `ReadDbLink` stage above does it; the record stays claimed by the
+            // `processing` guard meanwhile.
+            let out_time_links = instance.record.output_time_input_links();
+            if !skip_out && !out_time_links.is_empty() && instance.record.should_output() {
+                let reads: Vec<(String, &'static str)> = out_time_links
+                    .iter()
+                    .filter_map(|(link_field, value_field)| {
+                        let link = match instance.record.get_field(link_field) {
+                            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                            _ => return None,
+                        };
+                        (!link.is_empty()).then_some((link, *value_field))
+                    })
+                    .collect();
+                if !reads.is_empty() {
+                    drop(instance);
+                    let mut fetched: Vec<(&'static str, EpicsValue)> = Vec::new();
+                    for (link, value_field) in reads {
+                        // A bare read, no `process_passive_db_source`: C's DOL
+                        // is a `recDynLink` (CA-style) input, which never
+                        // process-passives its source.
+                        let parsed = crate::server::record::parse_link_v2(&link);
+                        if let (Some(value), _) = self.read_link_with_alarm(&parsed).await {
+                            fetched.push((value_field, value));
+                        }
+                    }
+                    instance = rec.write().await;
+                    for (field, value) in fetched {
+                        let _ = instance.record.put_field(field, value);
+                    }
+                }
+            }
+
             // OEVT: queue the output event when the output fires — the
             // event-subsystem twin of the OUT write, gated by the SAME IVOA
             // Don't_drive veto (`skip_out`). C
@@ -2584,9 +2629,7 @@ impl PvDatabase {
                 // soft OUT link (DB or external ca://`/`pva://`).
                 // Write OVAL to OUT when the record says should_output().
                 if record_should_output && instance.parsed_out.is_writable_out_link() {
-                    let oval = instance.record.get_field("OVAL");
-                    let val = instance.record.val();
-                    let out_val = oval.or(val);
+                    let out_val = instance.record.output_link_value();
                     out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
@@ -2600,10 +2643,7 @@ impl PvDatabase {
                     // write without disturbing alarms / monitors.
                     None
                 } else if instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance
-                        .record
-                        .get_field("OVAL")
-                        .or_else(|| instance.record.val());
+                    let out_val = instance.record.output_link_value();
                     out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
@@ -4111,20 +4151,14 @@ impl PvDatabase {
                 // Non-output records (calcout, etc.) with soft OUT link
                 // (DB or external `ca://`/`pva://`).
                 if record_should_output && instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance
-                        .record
-                        .get_field("OVAL")
-                        .or_else(|| instance.record.val());
+                    let out_val = instance.record.output_link_value();
                     out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
                 }
             } else if is_soft_out {
                 if instance.parsed_out.is_writable_out_link() {
-                    let out_val = instance
-                        .record
-                        .get_field("OVAL")
-                        .or_else(|| instance.record.val());
+                    let out_val = instance.record.output_link_value();
                     out_val.map(|v| (instance.parsed_out.clone(), v))
                 } else {
                     None
@@ -4573,9 +4607,9 @@ impl PvDatabase {
         if skip_out || !siol.is_writable_out_link() {
             return;
         }
-        // Post-body OVAL (RAW: RVAL), falling back to VAL — matching C
-        // `writeValue` (`&prec->oval`) and the soft OUT-link `OVAL.or(VAL)`
-        // selection.
+        // The record's own OUT value (RAW: RVAL) — matching C `writeValue`
+        // (`dbPutLink(&prec->siol, ..., &prec->oval)`), so the SIOL redirect
+        // sends exactly what the real OUT link would have.
         let value = {
             let instance = rec.read().await;
             if *raw_mode {
@@ -4584,10 +4618,7 @@ impl PvDatabase {
                     .get_field("RVAL")
                     .or_else(|| instance.record.val())
             } else {
-                instance
-                    .record
-                    .get_field("OVAL")
-                    .or_else(|| instance.record.val())
+                instance.record.output_link_value()
             }
         };
         if let Some(value) = value {

@@ -17,7 +17,19 @@ pub struct SwaitRecord {
     compiled_calc: Option<CompiledExpr>,
     pub oopt: i16,
     pub dopt: i16,
+    // DOLN ("DOL PV Name", C `swaitRecord.dbd:150`, DBF_STRING/SPC_MOD) and
+    // DOLD ("Desired Output Data", :466). With DOPT="Use DOL", C `execOutput`
+    // (swaitRecord.c:763-772) fetches DOLN's PV into DOLD at OUTPUT time and
+    // writes DOLD to OUT; see [`Record::output_time_input_links`]. With DOLN
+    // unset (C `dolv == NO_PV`) the get is skipped and DOLD keeps whatever was
+    // written to it (an operator/client put, or the init value).
+    pub doln: String,
     pub dold: f64,
+    // OVAL ("Old Value", C `swaitRecord.dbd:440`): the VAL of the PREVIOUS
+    // cycle. C sets it at `swaitRecord.c:471` (`pwait->oval = pwait->val`,
+    // after the OOPT test that reads it) and never posts it or writes it out —
+    // its only consumer is the OOPT comparison (:432-446). It is NOT an output
+    // staging cell: `execOutput` composes the output value from VAL or DOLD.
     pub oval: f64,
     // OEVT ("Output Event") — C `swaitRecord.c` `pwait->oevt` (DBF_USHORT).
     // When output fires and `oevt > 0`, `execOutput` posts the numeric
@@ -39,7 +51,6 @@ pub struct SwaitRecord {
     pub inp_passive: [i16; 12],  // INAP..INLP
     // numeric input values A-L
     pub num_vals: [f64; 12],
-    prev_val: f64,
     cached_should_output: bool,
     // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
     // no DLYA database field, unlike scalcout). `output_wait` marks that the
@@ -58,6 +69,7 @@ impl Default for SwaitRecord {
             compiled_calc: None,
             oopt: 0,
             dopt: 0,
+            doln: String::new(),
             dold: 0.0,
             oval: 0.0,
             oevt: 0,
@@ -67,7 +79,6 @@ impl Default for SwaitRecord {
             inp_names: Default::default(),
             inp_passive: [0; 12],
             num_vals: [0.0; 12],
-            prev_val: 0.0,
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
@@ -96,14 +107,17 @@ impl SwaitRecord {
         inputs
     }
 
-    fn eval_should_output(&self) -> bool {
+    /// C `swaitRecord.c:425-450` — the OOPT switch, whose "old value" operand
+    /// is `pwait->oval` (the previous cycle's VAL), passed in as `old` because
+    /// C reads it BEFORE `:471` overwrites it with the new VAL.
+    fn eval_should_output(&self, old: f64) -> bool {
         match self.oopt {
             0 => true,
-            1 => self.val != self.prev_val,
+            1 => self.val != old,
             2 => self.val == 0.0,
             3 => self.val != 0.0,
-            4 => self.prev_val != 0.0 && self.val == 0.0,
-            5 => self.prev_val == 0.0 && self.val != 0.0,
+            4 => old != 0.0 && self.val == 0.0,
+            5 => old == 0.0 && self.val != 0.0,
             _ => false,
         }
     }
@@ -157,6 +171,11 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     FieldDesc {
         name: "DOPT",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOLN",
+        dbf_type: DbFieldType::String,
         read_only: false,
     },
     FieldDesc {
@@ -434,7 +453,10 @@ impl Record for SwaitRecord {
             return Ok(ProcessOutcome::complete());
         }
 
-        self.prev_val = self.val;
+        // C `swaitRecord.c:432-446` compares against `pwait->oval`, which still
+        // holds the PREVIOUS cycle's VAL at this point; `:471` advances it after
+        // the OOPT decision.
+        let old_val = self.oval;
 
         if let Some(ref compiled) = self.compiled_calc {
             let mut inputs = self.build_inputs(self.val);
@@ -446,10 +468,12 @@ impl Record for SwaitRecord {
         }
 
         // Cache before framework calls should_output() via trait dispatch.
-        self.cached_should_output = self.eval_should_output();
-        if self.cached_should_output {
-            self.oval = if self.dopt == 1 { self.dold } else { self.val };
-        }
+        self.cached_should_output = self.eval_should_output(old_val);
+        // C `swaitRecord.c:471`: `pwait->oval = pwait->val;` — unconditional,
+        // after the OOPT test. OVAL is the old-value tracker, NOT the output
+        // value: `execOutput` composes the output from VAL/DOLD at write time
+        // (see `output_link_value`).
+        self.oval = self.val;
 
         // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
         // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
@@ -493,6 +517,37 @@ impl Record for SwaitRecord {
         self.cached_should_output
     }
 
+    /// C `swaitRecord.c::execOutput` (761-774): the value written to OUT is
+    /// composed at output time, not staged during `process()` —
+    /// `outValue = pwait->dopt ? pwait->dold : pwait->val`. With DOPT="Use DOL"
+    /// the DOLD it reads is the one the framework just refreshed from the DOL
+    /// link (see [`Record::output_time_input_links`]).
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Double(if self.dopt == 1 {
+            self.dold
+        } else {
+            self.val
+        }))
+    }
+
+    /// DOL is read at OUTPUT time, and only under DOPT="Use DOL" — C
+    /// `execOutput` (763-772) guards the `recDynLinkGet` with
+    /// `if (pwait->dopt)`. With DOPT="Use VAL" the link is never read, so DOLD
+    /// keeps its client-put value.
+    fn output_time_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        if self.dopt == 1 {
+            &[("DOLN", "DOLD")]
+        } else {
+            &[]
+        }
+    }
+
+    /// C `execOutput` posts the refreshed DOLD with `DBE_VALUE` alone
+    /// (swaitRecord.c:770), not the framework default `DBE_VALUE | DBE_LOG`.
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        &["DOLD"]
+    }
+
     /// `OEVT` ("Output Event"): post the numeric output event when output
     /// fires. C `swaitRecord.c` `execOutput` runs `if (pwait->oevt > 0)
     /// post_event((int)pwait->oevt);` (swaitRecord.c:797) right after the OUT
@@ -518,6 +573,7 @@ impl Record for SwaitRecord {
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
+            "DOLN" => Some(EpicsValue::String(self.doln.clone().into())),
             "DOLD" => Some(EpicsValue::Double(self.dold)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
@@ -562,6 +618,13 @@ impl Record for SwaitRecord {
             "DOPT" => {
                 if let EpicsValue::Short(v) = value {
                     self.dopt = v;
+                }
+            }
+            "DOLN" => {
+                if let EpicsValue::String(s) = value {
+                    self.doln = s.as_str_lossy().into_owned();
+                } else {
+                    return Err(CaError::TypeMismatch("DOLN".into()));
                 }
             }
             "DOLD" => {

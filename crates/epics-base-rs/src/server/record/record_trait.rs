@@ -1174,6 +1174,50 @@ pub trait Record: Send + Sync + 'static {
         InputFetchPolicy::ReadAll
     }
 
+    /// Input links this record reads at OUTPUT time instead of during the
+    /// input-fetch phase: `(link_name_field, value_field)` pairs. The framework
+    /// reads each configured link immediately before the OUT write, and ONLY on
+    /// a cycle where the output actually fires ([`Self::should_output`] and no
+    /// IVOA veto), then writes the value into `value_field` via
+    /// [`Self::put_field`]; a failed read leaves the field alone.
+    ///
+    /// C `swaitRecord.c::execOutput` (763-772) does exactly this for `DOL`:
+    ///
+    /// ```c
+    /// if (pwait->dopt) {                    /* DOPT = "Use DOL" */
+    ///     if (!pwait->dolv) {               /* DOL PV connected */
+    ///         oldDold = pwait->dold;
+    ///         recDynLinkGet(&pcbst->caLinkStruct[DOL_INDEX], &(pwait->dold), ...);
+    ///         if (pwait->dold != oldDold)
+    ///             db_post_events(pwait, &pcbst->pwait->dold, DBE_VALUE);
+    ///     }
+    ///     outValue = pwait->dold;
+    /// }
+    /// ```
+    ///
+    /// The timing is the point: the value written out is the one the link holds
+    /// at output time (ODLY delay-end included), and a cycle whose output does
+    /// not fire never refreshes — or posts — the field. Fetching such a link in
+    /// the normal input phase would do both. Default: none.
+    fn output_time_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// The value the framework writes to the OUT link. The single owner of
+    /// "what goes out", shared by the soft-OUT write, the async-completion
+    /// write and the simulated SIOL redirect.
+    ///
+    /// The default is the C staging convention: the record computed the output
+    /// into `OVAL` during `process()` (`calcout`/`ao`/`bo`/...), falling back to
+    /// `VAL` for records that have no `OVAL`. Override when the record's C
+    /// composes the output value at *output* time rather than staging it — e.g.
+    /// swait, whose `execOutput` (`swaitRecord.c:763-772`) picks between `VAL`
+    /// and the just-fetched `DOLD` and whose `OVAL` field is C's "Old Value"
+    /// (the previous VAL, used only by the OOPT test), not an output stage.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        self.get_field("OVAL").or_else(|| self.val())
+    }
+
     /// Return multi-output link field pairs: (link_field, value_field).
     /// Override in transform to return OUTA..OUTP → A..P mappings.
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {

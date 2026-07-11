@@ -348,6 +348,79 @@ async fn kill_keystroke_signals_child() {
     server_task.abort();
 }
 
+/// R7-17: the kill key pressed while the child is *down* must restart it
+/// AND still broadcast "@@@ Got a kill command".
+///
+/// C `clientFactory.cc::processInput` is a cascade of independent `if`
+/// blocks, not a switch: the `!processClass::exists()` block calls
+/// `restartOnce()` (`:207-213`), and the separate, un-`else`d kill block
+/// (`:236-240`) still runs `SendToAll("\n@@@ Got a kill command\n")` +
+/// `processFactorySendSignal(killSig)` — the signal being a no-op with no
+/// running child. Pre-fix the port returned one action per byte and
+/// stopped at the restart, so monitoring clients scripting against the
+/// console marker saw it under C but not under procserv-rs.
+///
+/// Order matters and is asserted: C's kill broadcast happens inside
+/// `processInput`, while `restartOnce()` only zeroes `_restartTime` and
+/// the actual relaunch (with its `@@@ Restarting child` banner) waits for
+/// the next poll-loop iteration.
+#[tokio::test]
+async fn kill_key_on_a_dead_child_restarts_it_and_still_broadcasts() {
+    let port = pick_port().await;
+    let cfg = cat_config(port); // RestartMode::Disabled — no auto-respawn
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect: {e}"),
+            }
+        }
+    };
+    let _ = read_for(&mut conn, Duration::from_millis(300)).await; // banner
+
+    // First Ctrl-X: kills the live child. Wait for the reaper line so the
+    // supervisor has definitely cleared its child slot.
+    conn.write_all(&[0x18]).await.unwrap();
+    let first = read_until(&mut conn, "Received a sigChild", Duration::from_secs(3)).await;
+    assert!(
+        first.contains("Received a sigChild"),
+        "child should have been reaped after the first kill key, got: {first:?}"
+    );
+
+    // Second Ctrl-X, now with no child running. C restarts it and still
+    // broadcasts the kill notice.
+    conn.write_all(&[0x18]).await.unwrap();
+    let out = read_until(&mut conn, "Restarting child", Duration::from_secs(3)).await;
+
+    assert!(
+        out.contains("Got a kill command"),
+        "kill key on a dead child must still broadcast '@@@ Got a kill command' \
+         (C clientFactory.cc:236-240 is not an else-branch), got: {out:?}"
+    );
+    assert!(
+        out.contains("Restarting child"),
+        "kill key on a dead child must also restart it \
+         (C clientFactory.cc:207-213), got: {out:?}"
+    );
+    let kill_at = out.find("Got a kill command").unwrap();
+    let restart_at = out.find("Restarting child").unwrap();
+    assert!(
+        kill_at < restart_at,
+        "C broadcasts the kill notice inside processInput and defers the relaunch \
+         to the next poll iteration, so the kill marker precedes the restart banner; \
+         got: {out:?}"
+    );
+
+    server_task.abort();
+}
+
 #[tokio::test]
 async fn server_messages_are_written_to_the_log() {
     // C `SendToAll` logs every message whose sender is NULL or the

@@ -68,6 +68,23 @@ impl InterfaceType {
             _ => Self::Octet,
         }
     }
+
+    /// The interface's name as C splices it into the register-handler ERRS
+    /// diagnostics — `"Int32 write error, %s"` (asynRecord.c:1378) and its five
+    /// siblings at :1391/:1414/:1429/:1450/:1463. C writes `UInt32`, not
+    /// `UInt32Digital`.
+    ///
+    /// The octet handlers have their own formats (`"Write error, nout=%d, %s"`,
+    /// `"%s  nread %d %s"`, `"Overflow nread %d %s"`) and never reach this, so
+    /// the `Octet` arm exists only to keep the match total.
+    fn c_errs_name(self) -> &'static str {
+        match self {
+            Self::Octet => "Octet",
+            Self::Int32 => "Int32",
+            Self::UInt32Digital => "UInt32",
+            Self::Float64 => "Float64",
+        }
+    }
 }
 
 // ===== Baud rate menu mapping =====
@@ -717,7 +734,16 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
         // (asynRecord.c:1377-1381 / 1413-1417 / 1449-1453). These handlers have
         // no byte count, so they never touch NAWT.
         if let Err(e) = res {
-            out.report_error(format!("write: {e}"));
+            // C: reportError(status, "<Iface> write error, %s",
+            // pasynUser->errorMessage) — per interface and direction
+            // (asynRecord.c:1378 Int32, :1414 UInt32, :1450 Float64). The
+            // generic "write: {e}" lost which interface failed and prefixed the
+            // Rust status debug onto the driver text.
+            out.report_error(format!(
+                "{} write error, {}",
+                plan.iface.c_errs_name(),
+                e.message()
+            ));
             raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
         }
         return;
@@ -887,7 +913,14 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             // C performInt32IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
             // (asynRecord.c:1393).
             Err(e) => {
-                out.report_error(format!("read: {e}"));
+                // C: reportError(status, "<Iface> read error, %s",
+                // pasynUser->errorMessage) — asynRecord.c:1391 Int32, :1429
+                // UInt32, :1463 Float64.
+                out.report_error(format!(
+                    "{} read error, {}",
+                    plan.iface.c_errs_name(),
+                    e.message()
+                ));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
         },
@@ -900,7 +933,14 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             // C performUInt32DigitalIO read error -> recGblSetSevr(READ_ALARM,
             // MAJOR) (asynRecord.c:1431).
             Err(e) => {
-                out.report_error(format!("read: {e}"));
+                // C: reportError(status, "<Iface> read error, %s",
+                // pasynUser->errorMessage) — asynRecord.c:1391 Int32, :1429
+                // UInt32, :1463 Float64.
+                out.report_error(format!(
+                    "{} read error, {}",
+                    plan.iface.c_errs_name(),
+                    e.message()
+                ));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
         },
@@ -912,7 +952,14 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             // C performFloat64IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
             // (asynRecord.c:1465).
             Err(e) => {
-                out.report_error(format!("read: {e}"));
+                // C: reportError(status, "<Iface> read error, %s",
+                // pasynUser->errorMessage) — asynRecord.c:1391 Int32, :1429
+                // UInt32, :1463 Float64.
+                out.report_error(format!(
+                    "{} read error, {}",
+                    plan.iface.c_errs_name(),
+                    e.message()
+                ));
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
         },
@@ -1932,10 +1979,16 @@ impl AsynRecord {
     }
 
     /// Write a serial/IP option to the driver via SetOption.
+    ///
+    /// C `setOption` reports a failing `pasynOption->setOption` as
+    /// `"Error setting option, %s"` with `pasynUser->errorMessage`
+    /// (asynRecord.c:1825-1828) — it never names the key, and it raises no
+    /// record severity. The port invented `"set_option({key}): {e}"`, which
+    /// also prefixed the Rust status debug onto the driver text.
     fn write_option(&mut self, key: &str, value: &str) {
         if let Some(ref entry) = self.port_entry {
             if let Err(e) = entry.handle.set_option_blocking(key, value) {
-                self.errs = format!("set_option({key}): {e}");
+                self.errs = format!("Error setting option, {}", e.message());
             }
         }
     }
@@ -3083,11 +3136,14 @@ impl Record for AsynRecord {
             // trait hooks (`set_input_eos` / `set_output_eos`) so
             // the value reaches `PortDriverBase::input_eos /
             // output_eos`, which is what the EOS interpose reads.
+            // C `setEos` reports a failing setOutputEos/setInputEos as
+            // "Error setting output eos, %s" / "Error setting input eos, %s"
+            // with pasynUser->errorMessage (asynRecord.c:1968-1983).
             "OEOS" => {
                 let bytes = translate_escape(&self.oeos);
                 if let Some(ref entry) = self.port_entry {
                     if let Err(e) = entry.handle.set_output_eos_blocking(&bytes) {
-                        self.errs = format!("set_output_eos: {e}");
+                        self.errs = format!("Error setting output eos, {}", e.message());
                     }
                 }
             }
@@ -3095,7 +3151,7 @@ impl Record for AsynRecord {
                 let bytes = translate_escape(&self.ieos);
                 if let Some(ref entry) = self.port_entry {
                     if let Err(e) = entry.handle.set_input_eos_blocking(&bytes) {
-                        self.errs = format!("set_input_eos: {e}");
+                        self.errs = format!("Error setting input eos, {}", e.message());
                     }
                 }
             }
@@ -3910,6 +3966,155 @@ mod tests {
         writer.process().unwrap();
         assert!(!writer.errs.is_empty(), "write error must set ERRS");
         assert_eq!(writer.nawt, 0, "failed write must reset NAWT to 0");
+    }
+
+    /// R9-48: each C register handler reports its own diagnostic —
+    /// "Int32 write error, %s" / "Int32 read error, %s" (asynRecord.c:1378,
+    /// :1391) and the UInt32 / Float64 twins (:1414/:1429, :1450/:1463) — with
+    /// `pasynUser->errorMessage` as the tail. The port emitted a generic
+    /// "write: {e}" / "read: {e}", which told the operator neither which
+    /// interface failed nor what the driver said (`{e}` Display prefixes the
+    /// Rust status debug onto the driver text).
+    ///
+    /// The same C `reportError` anchor covers the option and EOS puts:
+    /// `setOption` reports "Error setting option, %s" (:1826) and `setEos`
+    /// reports "Error setting input eos, %s" / "Error setting output eos, %s"
+    /// (:1971, :1979); the port invented "set_option(baud): ..." /
+    /// "set_input_eos: ...".
+    #[test]
+    fn register_and_option_errors_use_the_c_errs_text() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        fn boom(what: &str) -> AsynError {
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{what} boom"),
+            }
+        }
+
+        /// Every register read/write, the option set and both EOS sets fail
+        /// with a driver message.
+        struct AllFailDriver(PortDriverBase);
+        impl PortDriver for AllFailDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn write_int32(&mut self, _u: &mut AsynUser, _v: i32) -> crate::error::AsynResult<()> {
+                Err(boom("i32w"))
+            }
+            fn read_int32(&mut self, _u: &AsynUser) -> crate::error::AsynResult<i32> {
+                Err(boom("i32r"))
+            }
+            fn write_uint32_digital(
+                &mut self,
+                _u: &mut AsynUser,
+                _v: u32,
+                _m: u32,
+            ) -> crate::error::AsynResult<()> {
+                Err(boom("u32w"))
+            }
+            fn read_uint32_digital(
+                &mut self,
+                _u: &AsynUser,
+                _m: u32,
+            ) -> crate::error::AsynResult<u32> {
+                Err(boom("u32r"))
+            }
+            fn write_float64(
+                &mut self,
+                _u: &mut AsynUser,
+                _v: f64,
+            ) -> crate::error::AsynResult<()> {
+                Err(boom("f64w"))
+            }
+            fn read_float64(&mut self, _u: &AsynUser) -> crate::error::AsynResult<f64> {
+                Err(boom("f64r"))
+            }
+            fn set_option(&mut self, _k: &str, _v: &str) -> crate::error::AsynResult<()> {
+                Err(boom("opt"))
+            }
+            fn set_input_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+                Err(boom("ieos"))
+            }
+            fn set_output_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+                Err(boom("oeos"))
+            }
+        }
+
+        let port_name = "test_register_errs_text";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(AllFailDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let reg = |iface: InterfaceType, tmod: TransferMode| -> String {
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device();
+            rec.iface = iface as i32;
+            rec.tmod = tmod as i32;
+            rec.process().unwrap();
+            rec.errs.clone()
+        };
+
+        assert_eq!(
+            reg(InterfaceType::Int32, TransferMode::Write),
+            "Int32 write error, i32w boom"
+        );
+        assert_eq!(
+            reg(InterfaceType::Int32, TransferMode::Read),
+            "Int32 read error, i32r boom"
+        );
+        assert_eq!(
+            reg(InterfaceType::UInt32Digital, TransferMode::Write),
+            "UInt32 write error, u32w boom",
+            "C writes UInt32, not UInt32Digital"
+        );
+        assert_eq!(
+            reg(InterfaceType::UInt32Digital, TransferMode::Read),
+            "UInt32 read error, u32r boom"
+        );
+        assert_eq!(
+            reg(InterfaceType::Float64, TransferMode::Write),
+            "Float64 write error, f64w boom"
+        );
+        assert_eq!(
+            reg(InterfaceType::Float64, TransferMode::Read),
+            "Float64 read error, f64r boom"
+        );
+
+        // Option / EOS puts — the same C reportError anchor.
+        let mut opt = AsynRecord::default();
+        opt.port = port_name.to_string();
+        opt.connect_device();
+        opt.lbaud = 9600;
+        opt.special("LBAUD", true).unwrap();
+        assert_eq!(opt.errs, "Error setting option, opt boom");
+
+        opt.ieos = "\\n".to_string();
+        opt.special("IEOS", true).unwrap();
+        assert_eq!(opt.errs, "Error setting input eos, ieos boom");
+
+        opt.oeos = "\\r".to_string();
+        opt.special("OEOS", true).unwrap();
+        assert_eq!(opt.errs, "Error setting output eos, oeos boom");
     }
 
     /// R9-50: C `performOctetIO` calls the pre-write flush as a bare statement

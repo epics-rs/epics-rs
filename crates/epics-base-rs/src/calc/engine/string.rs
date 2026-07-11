@@ -1,3 +1,4 @@
+use super::cast::{c_int, c_long, d2ui};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
 use super::value::StackValue;
@@ -8,6 +9,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     let code = &expr.code;
     let mut pc = 0;
     let mut loop_count: usize = 0;
+    // C compiles the USES_STRING marker into the postfix and `sCalcPerform`
+    // switches on it ONCE (`sCalcPerform.c:399`) to pick a whole evaluator.
+    let string_path = uses_string(code);
 
     while pc < code.len() {
         let op = &code[pc];
@@ -104,13 +108,26 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Mod => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    // C: itop = (epicsInt32)den; if(itop) (epicsInt32)num % itop else NaN
-                    let den = d2i(b);
-                    if den == 0 {
-                        stack.push(StackValue::Double(f64::NAN));
+                    // sCalc, not base: a zero divisor is an ERROR
+                    // (`return(-1)`), never NaN, and the operands take a plain
+                    // C cast whose WIDTH depends on which evaluator C picked
+                    // for this program (see `uses_string`):
+                    //   no-string path (sCalcPerform.c:558-563): `(int)`
+                    //   string path    (sCalcPerform.c:1102-1110): `(long)`
+                    let value = if string_path {
+                        let den = c_long(b);
+                        if den == 0 {
+                            return Err(CalcError::DivisionByZero);
+                        }
+                        c_long(a).wrapping_rem(den) as f64
                     } else {
-                        stack.push(StackValue::Double((d2i(a).wrapping_rem(den)) as f64));
-                    }
+                        let den = c_int(b);
+                        if den == 0 {
+                            return Err(CalcError::DivisionByZero);
+                        }
+                        c_int(a).wrapping_rem(den) as f64
+                    };
+                    stack.push(StackValue::Double(value));
                 }
                 CoreOp::Neg => {
                     let a = pop1_f64(&mut stack)?;
@@ -208,31 +225,39 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(if a == 0.0 { 1.0 } else { 0.0 }));
                 }
 
-                // Bitwise - use C's d2i/d2ui conversion (wrap-on-overflow 32-bit)
+                // Bitwise. sCalc has no `d2i`: every operand takes a plain
+                // `(long)` cast (sCalcPerform.c:575-591, :623-631, :725-727),
+                // so these are 64-bit ops, not base's 32-bit ones. The shift
+                // count is not masked in C either — x86-64 `shl`/`sar` mask it
+                // to 6 bits for a 64-bit operand, which is the observable.
                 CoreOp::BitAnd => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((d2i(a) & d2i(b)) as f64));
+                    stack.push(StackValue::Double((c_long(a) & c_long(b)) as f64));
                 }
                 CoreOp::BitOr => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((d2i(a) | d2i(b)) as f64));
+                    stack.push(StackValue::Double((c_long(a) | c_long(b)) as f64));
                 }
                 CoreOp::BitXor => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((d2i(a) ^ d2i(b)) as f64));
+                    stack.push(StackValue::Double((c_long(a) ^ c_long(b)) as f64));
                 }
                 CoreOp::BitNot => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(!d2i(a) as f64));
+                    stack.push(StackValue::Double(!c_long(a) as f64));
                 }
                 CoreOp::Shl => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((d2i(a) << (d2i(b) & 31)) as f64));
+                    stack.push(StackValue::Double((c_long(a) << (c_long(b) & 63)) as f64));
                 }
                 CoreOp::Shr => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((d2i(a) >> (d2i(b) & 31)) as f64));
+                    stack.push(StackValue::Double((c_long(a) >> (c_long(b) & 63)) as f64));
                 }
+                // `>>>` (RIGHT_SHIFT_LOGIC) is a BASE opcode: sCalcPostfix has
+                // no such element, so a C sCalc expression can never contain
+                // one and there is no sCalc semantics to match. Base's is kept
+                // for the shared `CoreOp`; the grammar is what must refuse it.
                 CoreOp::ShrLogical => {
                     let (a, b) = pop2_f64(&mut stack)?;
                     stack.push(StackValue::Double((d2ui(a) >> (d2ui(b) & 31)) as f64));
@@ -321,9 +346,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Nint => {
                     let a = pop1_f64(&mut stack)?;
-                    // C: *ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)
+                    // C `sCalcPerform.c:716-719`:
+                    //   *pd = (double)(long)(d >= 0 ? d+0.5 : d-0.5)
                     let pre = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
-                    stack.push(StackValue::Double(f64_to_i32_wrap(pre) as f64));
+                    stack.push(StackValue::Double(c_long(pre) as f64));
                 }
                 CoreOp::IsNan(nargs) => {
                     let n = *nargs as usize;
@@ -952,43 +978,47 @@ fn format_double(d: f64) -> String {
     }
 }
 
-/// C `d2i` macro: positive doubles route through `epicsUInt32` first; negative
-/// doubles cast directly. Wraps modulo 2^32 on overflow.
-#[inline]
-fn d2i(x: f64) -> i32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x)
-    } else {
-        f64_to_u32_wrap(x) as i32
-    }
-}
-
-/// C `d2ui` macro.
-#[inline]
-fn d2ui(x: f64) -> u32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x) as u32
-    } else {
-        f64_to_u32_wrap(x)
-    }
-}
-
-/// `(epicsInt32)x` with C wrap-on-overflow semantics (Rust `as` saturates).
-#[inline]
-fn f64_to_i32_wrap(x: f64) -> i32 {
-    if x.is_nan() {
-        return 0;
-    }
-    (x.trunc().rem_euclid(4294967296.0) as u64 as u32) as i32
-}
-
-/// `(epicsUInt32)x` with C wrap-on-overflow semantics.
-#[inline]
-fn f64_to_u32_wrap(x: f64) -> u32 {
-    if x.is_nan() {
-        return 0;
-    }
-    x.trunc().rem_euclid(4294967296.0) as u64 as u32
+/// Whether `sCalcPostfix` would have stamped this program `USES_STRING`
+/// (`sCalcPostfix.c:447-475`), which is what makes `sCalcPerform` run its
+/// string evaluator (`:2057`) instead of the plain double one (`:399`).
+///
+/// The two evaluators differ arithmetically in exactly one place — MODULO's
+/// cast width, `(int)` vs `(long)` — so the marker is not cosmetic.
+///
+/// C's list is an opcode allowlist, and it is narrower than "mentions a
+/// string": `TO_DOUBLE` (`DBL`), `BYTE`, `SUBLAST` (`|-`) and the string-var
+/// STORES (`A_SSTORE`, i.e. `AA:=`) are all absent from it, so an expression
+/// using only those keeps the no-string evaluator. That asymmetry is C's, and
+/// this list mirrors it case for case.
+fn uses_string(code: &[Opcode]) -> bool {
+    code.iter().any(|op| match op {
+        // FETCH_SVAL — the only Core opcode in C's list.
+        Opcode::Core(CoreOp::FetchSval) => true,
+        Opcode::String(s) => match s {
+            StringOp::PushStringVar(_)   // FETCH_AA..FETCH_LL
+            | StringOp::ToString         // TO_STRING
+            | StringOp::Printf           // PRINTF
+            | StringOp::BinWrite         // BIN_WRITE
+            | StringOp::Sscanf           // SSCANF
+            | StringOp::BinRead          // BIN_READ
+            | StringOp::PushString(_)    // LITERAL_STRING
+            | StringOp::Subrange         // SUBRANGE
+            | StringOp::Replace          // REPLACE
+            | StringOp::TrEsc            // TR_ESC
+            | StringOp::Esc              // ESC
+            | StringOp::Crc16            // CRC16
+            | StringOp::Crc16Append      // MODBUS
+            | StringOp::Lrc              // LRC
+            | StringOp::LrcAppend        // AMODBUS
+            | StringOp::Xor8             // XOR8
+            | StringOp::Xor8Append       // ADD_XOR8
+            | StringOp::Len => true,     // LEN
+            // Absent from C's list, deliberately:
+            StringOp::ToDouble | StringOp::Byte | StringOp::SubLast
+            | StringOp::StoreStringVar(_) => false,
+        },
+        _ => false,
+    })
 }
 
 fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {

@@ -1,3 +1,4 @@
+use super::cast::{c_int, d2i, d2ui};
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode};
 use super::{CompiledExpr, NumericInputs};
@@ -71,12 +72,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Mod => {
                     let (a, b) = pop2(&mut stack)?;
-                    // C: itop = (epicsInt32)den; if(itop) (epicsInt32)num % itop else NaN
-                    let den = d2i(b);
+                    // C `calcPerform.c:161-167`:
+                    //   itop = (epicsInt32) *ptop--;
+                    //   if (itop) *ptop = (epicsInt32) *ptop % itop;
+                    //   else      *ptop = epicsNAN;
+                    // A PLAIN cast, not `d2i` — `d2i`/`d2ui` (:324-325) exist
+                    // only for the bitwise/shift ops below.
+                    let den = c_int(b);
                     if den == 0 {
                         stack.push(f64::NAN);
                     } else {
-                        stack.push((d2i(a).wrapping_rem(den)) as f64);
+                        stack.push(c_int(a).wrapping_rem(den) as f64);
                     }
                 }
                 CoreOp::Neg => {
@@ -244,9 +250,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
-                    // C: *ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)
+                    // C `calcPerform.c:290-293`:
+                    //   *ptop = (epicsInt32)(top >= 0 ? top+0.5 : top-0.5)
+                    // A plain cast, like MODULO — not `d2i`.
                     let pre = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
-                    stack.push(f64_to_i32_wrap(pre) as f64);
+                    stack.push(c_int(pre) as f64);
                 }
 
                 // Test functions
@@ -377,54 +385,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
     Ok(stack[0])
 }
 
-/// C `d2i` macro: positive doubles route through `epicsUInt32` first so that
-/// values with bit 31 set become the corresponding signed (negative) pattern;
-/// negative doubles cast directly. Wraps modulo 2^32 on overflow.
-#[inline]
-fn d2i(x: f64) -> i32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x)
-    } else {
-        f64_to_u32_wrap(x) as i32
-    }
-}
-
-/// C `d2ui` macro: negative doubles cast to `epicsInt32` then reinterpreted
-/// as `epicsUInt32`; non-negative doubles cast directly.
-#[inline]
-fn d2ui(x: f64) -> u32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x) as u32
-    } else {
-        f64_to_u32_wrap(x)
-    }
-}
-
-/// `(epicsInt32)x` — C cast of a double to a 32-bit signed integer with
-/// wrap-on-overflow semantics (matching x86 behavior; Rust `as` saturates).
-#[inline]
-fn f64_to_i32_wrap(x: f64) -> i32 {
-    if x.is_nan() {
-        return 0;
-    }
-    let t = x.trunc();
-    // Reduce modulo 2^32 then reinterpret the low 32 bits as signed.
-    let m = t.rem_euclid(4294967296.0);
-    (m as u64 as u32) as i32
-}
-
-/// `(epicsUInt32)x` — C cast of a double to a 32-bit unsigned integer with
-/// wrap-on-overflow semantics.
-#[inline]
-fn f64_to_u32_wrap(x: f64) -> u32 {
-    if x.is_nan() {
-        return 0;
-    }
-    let t = x.trunc();
-    let m = t.rem_euclid(4294967296.0);
-    m as u64 as u32
-}
-
 fn pop1(stack: &mut Vec<f64>) -> Result<f64, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
@@ -491,7 +451,7 @@ fn simple_random() -> f64 {
 #[cfg(test)]
 mod parity_tests {
     //! C-parity regression tests for calc engine fixes (doc/parity-review/01-calc.md).
-    use super::{d2i, d2ui, f64_to_i32_wrap};
+    use crate::calc::engine::cast::{d2i, d2ui};
     use crate::calc::engine::error::calc_error_str;
     use crate::calc::{
         ArrayInputs, CalcError, NumericInputs, acalc, acalc_compile, calc, compile, eval,
@@ -638,11 +598,15 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    // nint uses 32-bit wrap, not i64 saturation.
+    // NINT is a plain `(epicsInt32)` cast (calcPerform.c:292), NOT `d2i`.
     #[test]
-    fn h3_nint_wraps_at_32bit() {
-        // 3e9 rounds to 3000000000, wrapping into a negative epicsInt32.
-        assert_eq!(run("NINT(3000000000)"), -1294967296.0);
+    fn h3_nint_out_of_range_is_the_c_cast_not_a_wrap() {
+        // 3e9+0.5 is out of epicsInt32 range, so C's cast is undefined and the
+        // IOC gets whatever the ISA's convert gives: x86-64 `cvttsd2si` answers
+        // with the indefinite value INT32_MIN. Verified against gcc -O2 on
+        // x86-64. The old expectation here (-1294967296) was `d2i`'s
+        // uint32-reinterpretation, which NINT never performs.
+        assert_eq!(run("NINT(3000000000)"), i32::MIN as f64);
     }
 
     #[test]
@@ -652,11 +616,15 @@ mod parity_tests {
         assert_eq!(run("NINT(2.4)"), 2.0);
     }
 
-    // MODULO uses epicsInt32 truncation and zero detection.
+    // MODULO uses a plain epicsInt32 cast (calcPerform.c:162-164).
     #[test]
-    fn h4_mod_large_denominator_is_int32_zero() {
-        // 4294967296 == 2^32 truncates to epicsInt32 0 -> NaN.
-        assert!(run("5 % 4294967296").is_nan());
+    fn h4_mod_large_denominator_is_the_c_cast() {
+        // 2^32 is out of epicsInt32 range: C's cast gives INT32_MIN (x86-64
+        // cvttsd2si), which is NON-zero, so C takes the modulo branch and
+        // `5 % INT32_MIN` == 5. The old expectation (NaN) came from modelling
+        // the cast as `(epicsUInt32)` truncation, i.e. 2^32 -> 0 -> divide by
+        // zero. Verified against gcc -O2 on x86-64.
+        assert_eq!(run("5 % 4294967296"), 5.0);
     }
 
     #[test]
@@ -678,7 +646,6 @@ mod parity_tests {
         assert_eq!(d2ui(3_000_000_000.0), 3_000_000_000);
         assert_eq!(d2i(-1.0), -1);
         assert_eq!(d2ui(-1.0), 0xFFFF_FFFF);
-        assert_eq!(f64_to_i32_wrap(f64::NAN), 0);
     }
 
     // nested ternary branch selection matches C cond_search.

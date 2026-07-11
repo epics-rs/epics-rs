@@ -1,8 +1,15 @@
 use super::array_value::{ArrayStackValue, zip_map};
+use super::cast::{c_int, c_long, d2ui};
 use super::error::CalcError;
 use super::opcodes::{ArrayOp, CoreOp, Opcode};
 use super::{ArrayInputs, CompiledExpr};
 use crate::calc::math::{derivative, fitting, stats};
+
+/// C `myMAXFLOAT` (`aCalcPerform.c:49`): `((float)1e+35)`, widened back to a
+/// double when it lands in the stack cell — so it is the f32-rounded value,
+/// not `1e35` exactly. aCalc's MODULO uses it for a zero divisor where base
+/// uses NaN and sCalc returns an error.
+const MY_MAXFLOAT: f64 = 1e35f32 as f64;
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
     let mut stack: Vec<ArrayStackValue> = Vec::with_capacity(20);
@@ -82,13 +89,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Mod => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    // C: itop = (epicsInt32)den; if(itop) (epicsInt32)num % itop else NaN
+                    // aCalc, not base (`aCalcPerform.c:645-652`, :669-677,
+                    // :697-703): plain `(int)` casts, and a zero divisor is
+                    // neither NaN nor an error — it is `myMAXFLOAT`.
                     stack.push(zip_map(a, b, |x, y| {
-                        let den = d2i(y);
+                        let den = c_int(y);
                         if den == 0 {
-                            f64::NAN
+                            MY_MAXFLOAT
                         } else {
-                            d2i(x).wrapping_rem(den) as f64
+                            c_int(x).wrapping_rem(den) as f64
                         }
                     })?);
                 }
@@ -182,36 +191,44 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     stack.push(a.map(|x| if x == 0.0 { 1.0 } else { 0.0 }));
                 }
 
-                // Bitwise (element-wise) - C d2i/d2ui conversion (wrap-on-overflow 32-bit)
+                // Bitwise (element-wise). aCalc has no `d2i`: every operand
+                // takes a plain `(int)` cast (`aCalcPerform.c:907`,
+                // :1355-1357, :1380-1382, :1407-1409, :1424-1427). The shift
+                // count is unmasked in C — x86-64 `shl`/`sar` mask it to 5
+                // bits for a 32-bit operand, which is the observable.
                 CoreOp::BitAnd => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (d2i(x) & d2i(y)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) & c_int(y)) as f64)?);
                 }
                 CoreOp::BitOr => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (d2i(x) | d2i(y)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) | c_int(y)) as f64)?);
                 }
                 CoreOp::BitXor => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (d2i(x) ^ d2i(y)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) ^ c_int(y)) as f64)?);
                 }
                 CoreOp::BitNot => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| !d2i(x) as f64));
+                    stack.push(a.map(|x| !c_int(x) as f64));
                 }
                 CoreOp::Shl => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (d2i(x) << (d2i(y) & 31)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) << (c_int(y) & 31)) as f64)?);
                 }
                 CoreOp::Shr => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (d2i(x) >> (d2i(y) & 31)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) >> (c_int(y) & 31)) as f64)?);
                 }
+                // `>>>` (RIGHT_SHIFT_LOGIC) is a BASE opcode; aCalcPostfix has
+                // no such element, so no aCalc expression can contain one and
+                // there is no aCalc semantics to match. Base's is kept for the
+                // shared `CoreOp`; the grammar is what must refuse it.
                 CoreOp::ShrLogical => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
@@ -301,10 +318,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
-                    // C: *ptop = (epicsInt32)(top>=0 ? top+0.5 : top-0.5)
+                    // C `aCalcPerform.c:827-830` (array) and :1085 (scalar):
+                    //   (double)(long)(x >= 0 ? x+0.5 : x-0.5)
+                    // `(long)`, not base's `(epicsInt32)`.
                     stack.push(a.map(|x| {
                         let pre = if x >= 0.0 { x + 0.5 } else { x - 0.5 };
-                        f64_to_i32_wrap(pre) as f64
+                        c_long(pre) as f64
                     }));
                 }
 
@@ -662,45 +681,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         .last()
         .cloned()
         .unwrap_or(ArrayStackValue::Double(0.0)))
-}
-
-/// C `d2i` macro: positive doubles route through `epicsUInt32` first; negative
-/// doubles cast directly. Wraps modulo 2^32 on overflow.
-#[inline]
-fn d2i(x: f64) -> i32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x)
-    } else {
-        f64_to_u32_wrap(x) as i32
-    }
-}
-
-/// C `d2ui` macro.
-#[inline]
-fn d2ui(x: f64) -> u32 {
-    if x < 0.0 {
-        f64_to_i32_wrap(x) as u32
-    } else {
-        f64_to_u32_wrap(x)
-    }
-}
-
-/// `(epicsInt32)x` with C wrap-on-overflow semantics (Rust `as` saturates).
-#[inline]
-fn f64_to_i32_wrap(x: f64) -> i32 {
-    if x.is_nan() {
-        return 0;
-    }
-    (x.trunc().rem_euclid(4294967296.0) as u64 as u32) as i32
-}
-
-/// `(epicsUInt32)x` with C wrap-on-overflow semantics.
-#[inline]
-fn f64_to_u32_wrap(x: f64) -> u32 {
-    if x.is_nan() {
-        return 0;
-    }
-    x.trunc().rem_euclid(4294967296.0) as u64 as u32
 }
 
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {

@@ -556,13 +556,16 @@ fn test_full_a_to_u_sum() {
 
 #[test]
 fn test_double_letter_uu_parses() {
-    // The lexer's doubled-letter variant (e.g. UU) must compile after
-    // #655 widened the legal range from A..L to A..U. Doubled letters are
-    // sCalc string args / aCalc array args — epics-base `postfix.c` has no
-    // doubled-letter operands at all, so they compile only in those engines.
-    assert!(scalc_compile("UU").is_ok(), "UU should be a valid token");
-    assert!(scalc_compile("MM").is_ok(), "MM should be a valid token");
-    assert!(scalc_compile("VV").is_err(), "VV must remain rejected");
+    // Doubled letters are sCalc string args / aCalc array args, and BOTH C
+    // tables stop at LL: `FETCH_AA`..`FETCH_LL` (sCalcPostfix.c:118-186,
+    // aCalcPostfix.c:108-190). base #655 widened the SINGLE letters to A..U;
+    // it added no doubled-letter operand, and it did not touch synApps. The
+    // compiled sCalcPostfix.c answers CALC_ERR_SYNTAX (11) for MM and UU —
+    // this case used to assert they compile, which no C table supports.
+    assert!(scalc_compile("LL").is_ok(), "sCalc has FETCH_LL");
+    assert!(scalc_compile("MM").is_err(), "sCalc's table stops at LL");
+    assert!(scalc_compile("UU").is_err(), "sCalc's table stops at LL");
+    assert!(scalc_compile("VV").is_err());
 
     assert_eq!(compile("UU").unwrap_err(), CalcError::Syntax);
     assert!(compile("VV").is_err());

@@ -57,6 +57,15 @@ fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
     }
 }
 
+fn arg_f64(args: &[ArgValue], i: usize) -> Option<f64> {
+    match args.get(i) {
+        Some(ArgValue::Double(v)) => Some(*v),
+        Some(ArgValue::Int(v)) => Some(*v as f64),
+        Some(ArgValue::String(s)) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn arg_str(args: &[ArgValue], i: usize) -> Option<String> {
     match args.get(i) {
         Some(ArgValue::String(s)) => Some(s.clone()),
@@ -402,6 +411,74 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         }
                     }
                     Err(_) => ctx.println(&format!("{port} interposeInterface failed.")),
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynInterposeDelay portName addr delay(sec) --------------------------
+    //
+    // C `asynInterposeDelay.c:221-234` registers this 3-arg command; nothing
+    // else installs the layer (no driver configure command pushes it), so
+    // without the registrar a startup script cannot reach a device that needs
+    // an inter-character write delay at all. C prints
+    // "%s interposeInterface asynOctetType failed." and returns -1 when the
+    // interposeInterface call fails (:186-190).
+    //
+    // As with `asynInterposeEcho`, the Rust interpose stack is port-wide, so
+    // the C `addr` is accepted for command-line compatibility but not routed.
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynInterposeDelay",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "delay(sec)",
+                    arg_type: ArgType::Double,
+                    optional: false,
+                },
+            ],
+            "asynInterposeDelay portName addr delay(sec) - install the delay \
+             interpose (one write per character, delay after each)",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port = arg_str(args, 0)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "portName required".to_string())?;
+                let _addr = arg_int(args, 1).unwrap_or(0);
+                // C takes the delay as a `double` seconds and stores it
+                // verbatim (`pvt->delay = delay`, asynInterposeDelay.c:214).
+                // `Duration::from_secs_f64` panics on a negative or NaN value,
+                // which iocsh can supply, so refuse those rather than abort the
+                // shell — C's `epicsThreadSleep` treats a non-positive delay as
+                // "no delay", which is the zero Duration here.
+                let secs = arg_f64(args, 2).unwrap_or(0.0);
+                let delay = if secs.is_finite() && secs > 0.0 {
+                    std::time::Duration::from_secs_f64(secs)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                match mgr_r.find_port_handle(&port) {
+                    Ok(handle) => {
+                        if let Err(e) = handle.push_delay_interpose_blocking(delay) {
+                            ctx.println(&format!(
+                                "{port} interposeInterface asynOctetType failed: {e}"
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        ctx.println(&format!("{port} interposeInterface asynOctetType failed."))
+                    }
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -963,10 +1040,10 @@ mod tests {
         // succeeds) — we count one CommandDef per C-side function.
         assert_eq!(
             cmds.len(),
-            9,
+            10,
             "asyn iocsh command set: asynReport, asynSetOption, \
-             asynOctetSet{{Input,Output}}Eos, asynInterposeEcho, and the four \
-             trace mutators"
+             asynOctetSet{{Input,Output}}Eos, asynInterposeEcho, \
+             asynInterposeDelay, and the four trace mutators"
         );
         assert!(set_trace_mask.args.len() == 3);
 
@@ -994,6 +1071,7 @@ mod tests {
             "asynOctetSetInputEos",
             "asynOctetSetOutputEos",
             "asynInterposeEcho",
+            "asynInterposeDelay",
             "asynSetTraceMask",
             "asynSetTraceIOMask",
             "asynSetTraceInfoMask",
@@ -1240,6 +1318,124 @@ mod tests {
         echo_cmd
             .handler
             .call(&[ArgValue::String("no_such_port".to_string())], &ctx)
+            .expect("unknown port is reported, not an Err");
+    }
+
+    /// R8-58: C registers `asynInterposeDelay` with iocsh
+    /// (`asynInterposeDelay.c:221-234`); like the echo layer nothing else
+    /// installs it, so without the registrar the ported `DelayInterpose` is
+    /// unreachable from a startup script. Drive the command against a
+    /// registered port and prove the port's octet write goes from one 3-byte
+    /// link write to three 1-byte writes (C `writeIt`, :41-52).
+    #[test]
+    fn iocsh_interpose_delay_installs_the_layer_on_a_registered_port() {
+        use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+        use crate::request::RequestOp;
+
+        /// The link under the interpose stack: records the size of each write.
+        struct CountingLink {
+            sizes: Arc<Mutex<Vec<usize>>>,
+        }
+        impl OctetNext for CountingLink {
+            fn read(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                Ok(OctetReadResult {
+                    nbytes_transferred: 0,
+                    eom_reason: EomReason::empty(),
+                })
+            }
+            fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.sizes.lock().unwrap().push(data.len());
+                Ok(data.len())
+            }
+            fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        struct InterposedDriver {
+            base: PortDriverBase,
+            link: CountingLink,
+        }
+        impl PortDriver for InterposedDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.base
+                    .interpose_octet
+                    .dispatch_write(user, data, &mut self.link)
+            }
+        }
+
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port(InterposedDriver {
+            base: PortDriverBase::new("delay_port", 1, PortFlags::default()),
+            link: CountingLink {
+                sizes: sizes.clone(),
+            },
+        })
+        .unwrap();
+        let handle = mgr.find_port_handle("delay_port").unwrap();
+
+        // Before the command: no delay layer, so the link sees one 3-byte write.
+        handle
+            .submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"ABC".to_vec(),
+                },
+                AsynUser::default(),
+            )
+            .expect("plain write succeeds");
+        assert_eq!(sizes.lock().unwrap().as_slice(), &[3]);
+
+        let ctx = make_ctx();
+        let cmds = build_asyn_commands(mgr.clone());
+        let delay_cmd = cmds
+            .iter()
+            .find(|c| c.name == "asynInterposeDelay")
+            .expect("asynInterposeDelay must be registered");
+        delay_cmd
+            .handler
+            .call(
+                &[
+                    ArgValue::String("delay_port".to_string()),
+                    ArgValue::Int(0),
+                    ArgValue::Double(0.001),
+                ],
+                &ctx,
+            )
+            .expect("handler returns Ok");
+
+        handle
+            .submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"ABC".to_vec(),
+                },
+                AsynUser::default(),
+            )
+            .expect("delayed write succeeds");
+        assert_eq!(
+            sizes.lock().unwrap().as_slice(),
+            &[3, 1, 1, 1],
+            "asynInterposeDelay must install the delay layer on the live port"
+        );
+
+        // An unknown port is C's `interposeInterface asynOctetType failed.`
+        // (:186-190) — reported, not a panic and not a silent success.
+        delay_cmd
+            .handler
+            .call(
+                &[
+                    ArgValue::String("no_such_port".to_string()),
+                    ArgValue::Int(0),
+                    ArgValue::Double(0.001),
+                ],
+                &ctx,
+            )
             .expect("unknown port is reported, not an Err");
     }
 

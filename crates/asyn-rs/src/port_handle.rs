@@ -685,6 +685,22 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Read back the driver's input EOS bytes — C `pasynOctet->getInputEos`,
+    /// the read half asynRecord's `getEos` (asynRecord.c:1985-2026) runs after
+    /// every IEOS/OEOS put.
+    pub fn get_input_eos_blocking(&self) -> AsynResult<Vec<u8>> {
+        let user = AsynUser::default();
+        let result = self.submit_blocking(RequestOp::GetInputEos, user)?;
+        Ok(result.data.unwrap_or_default())
+    }
+
+    /// Read back the driver's output EOS bytes — C `pasynOctet->getOutputEos`.
+    pub fn get_output_eos_blocking(&self) -> AsynResult<Vec<u8>> {
+        let user = AsynUser::default();
+        let result = self.submit_blocking(RequestOp::GetOutputEos, user)?;
+        Ok(result.data.unwrap_or_default())
+    }
+
     pub async fn get_option(&self, key: &str) -> AsynResult<String> {
         let user = AsynUser::default();
         let result = self
@@ -801,6 +817,34 @@ impl PortHandle {
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
+    /// Async twins of the three port-state queries above. An `asynRecord`
+    /// exception callback runs on the *port actor thread* (the driver announces
+    /// the exception from inside its own op), so it cannot use the `_blocking`
+    /// forms — a round trip to the actor from the actor would deadlock. The
+    /// callback spawns the refresh onto the runtime instead and awaits these.
+    pub async fn is_enabled(&self) -> AsynResult<bool> {
+        let result = self
+            .submit_async(RequestOp::GetEnable, AsynUser::new(0))
+            .await?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Async twin of [`Self::is_auto_connect_blocking`].
+    pub async fn is_auto_connect(&self) -> AsynResult<bool> {
+        let result = self
+            .submit_async(RequestOp::GetAutoConnect, AsynUser::new(0))
+            .await?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
+    /// Async twin of [`Self::is_connected_blocking`].
+    pub async fn is_connected(&self) -> AsynResult<bool> {
+        let result = self
+            .submit_async(RequestOp::GetConnected, AsynUser::new(0))
+            .await?;
+        Ok(result.int_val.unwrap_or(0) != 0)
+    }
+
     /// Connect the port's transport (blocking) — C `pasynCommon->connect`.
     pub fn connect_blocking(&self) -> AsynResult<()> {
         self.submit_blocking(RequestOp::Connect, AsynUser::new(0))?;
@@ -817,6 +861,13 @@ impl PortHandle {
     /// `asynInterposeEcho(portName, addr)`.
     pub fn push_echo_interpose_blocking(&self) -> AsynResult<()> {
         self.submit_blocking(RequestOp::PushEchoInterpose, AsynUser::new(0))?;
+        Ok(())
+    }
+
+    /// Install the delay interpose on the port (blocking) — C
+    /// `asynInterposeDelay(portName, addr, delay)`.
+    pub fn push_delay_interpose_blocking(&self, delay: std::time::Duration) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::PushDelayInterpose { delay }, AsynUser::new(0))?;
         Ok(())
     }
 }

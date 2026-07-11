@@ -85,6 +85,9 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::GetAutoConnect => Self::GetAutoConnect,
             RequestOp::GetConnected => Self::GetConnected,
             RequestOp::PushEchoInterpose => Self::PushEchoInterpose,
+            RequestOp::PushDelayInterpose { delay } => Self::PushDelayInterpose {
+                delay_secs: delay.as_secs_f64(),
+            },
             RequestOp::BlockProcess => Self::BlockProcess,
             RequestOp::UnblockProcess => Self::UnblockProcess,
             RequestOp::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
@@ -100,6 +103,8 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            RequestOp::GetInputEos => Self::GetInputEos,
+            RequestOp::GetOutputEos => Self::GetOutputEos,
         }
     }
 }
@@ -187,6 +192,16 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::GetAutoConnect => Self::GetAutoConnect,
             PortCommand::GetConnected => Self::GetConnected,
             PortCommand::PushEchoInterpose => Self::PushEchoInterpose,
+            // A negative / non-finite wire value would panic
+            // `Duration::from_secs_f64`; clamp to "no delay", which is what C's
+            // `epicsThreadSleep` does with a non-positive argument.
+            PortCommand::PushDelayInterpose { delay_secs } => Self::PushDelayInterpose {
+                delay: if delay_secs.is_finite() && *delay_secs > 0.0 {
+                    std::time::Duration::from_secs_f64(*delay_secs)
+                } else {
+                    std::time::Duration::ZERO
+                },
+            },
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,
             PortCommand::DrvUserCreate { drv_info, addr } => Self::DrvUserCreate {
@@ -205,6 +220,8 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Report { level } => Self::Report { level: *level },
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
+            PortCommand::GetInputEos => Self::GetInputEos,
+            PortCommand::GetOutputEos => Self::GetOutputEos,
         }
     }
 }

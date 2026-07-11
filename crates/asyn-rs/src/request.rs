@@ -250,6 +250,13 @@ pub enum RequestOp {
     SetOutputEos {
         eos: Vec<u8>,
     },
+    /// Read back the port's input EOS bytes — C `pasynOctet->getInputEos`.
+    /// asynRecord's `getEos` (asynRecord.c:1985-2026) calls it after every
+    /// IEOS/OEOS put so the record shows what the driver actually holds, not
+    /// what was requested. Returns the bytes in [`RequestResult::data`].
+    GetInputEos,
+    /// Read back the port's output EOS bytes — C `pasynOctet->getOutputEos`.
+    GetOutputEos,
     /// Query whether the port's *transport* is connected. C parity:
     /// `pasynManager->isConnected` — the state the driver publishes through
     /// `exceptionConnect`/`exceptionDisconnect`, not "is a record bound to
@@ -267,6 +274,14 @@ pub enum RequestOp {
     /// `SetOption` / `SetInputEos` are requests. Installing from the shell
     /// thread would race every in-flight transfer.
     PushEchoInterpose,
+    /// Install the delay interpose on top of the port's octet stack. C parity:
+    /// `asynInterposeDelay(portName, addr, delay)`
+    /// (`asynInterposeDelay.c:176-215`), registered with iocsh at
+    /// `asynInterposeDelay.c:221-234`. Same actor-ownership reason as
+    /// [`RequestOp::PushEchoInterpose`].
+    PushDelayInterpose {
+        delay: std::time::Duration,
+    },
 }
 
 /// Result returned by the worker after executing a request.

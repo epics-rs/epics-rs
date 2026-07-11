@@ -52,8 +52,8 @@ use crate::procserv::menu::{Action, scan as menu_scan};
 use crate::procserv::messages;
 use crate::procserv::restart::{RestartMode, RestartTracker};
 use crate::procserv::sidecar::{
-    InfoSnapshot, LogFile, remove_pid_file, render_procserv_info_env, stamp_lines, write_info_file,
-    write_pid_file,
+    InfoSnapshot, LogFile, remove_info_file, remove_pid_file, render_procserv_info_env,
+    stamp_lines, write_info_file, write_pid_file,
 };
 
 /// Top-level handle. Construct via [`Self::new`], drive with [`Self::run`].
@@ -1137,6 +1137,15 @@ fn remaining_holdoff(
 
 impl Drop for SupervisorState {
     fn drop(&mut self) {
+        // C `main` cleans up BOTH side-car files after the main loop —
+        // `unlink(infofile)` then `unlink(pidFile)` (procServ.cc:696-699).
+        // The info file is what `manage-procs` reads to find a live
+        // procServ's control endpoint, so leaving it behind on a clean
+        // shutdown advertises a dead pid and a socket nobody is listening
+        // on. Same order as C.
+        if let Some(p) = &self.config.logging.info_path {
+            remove_info_file(p);
+        }
         if let Some(p) = &self.config.logging.pid_path {
             remove_pid_file(p);
         }

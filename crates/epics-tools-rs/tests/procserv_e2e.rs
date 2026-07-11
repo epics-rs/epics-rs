@@ -1136,3 +1136,39 @@ async fn banner_precedes_telnet_negotiation() {
 
     server_task.abort();
 }
+
+/// R8-18: C `main` unlinks the info file AND the pid file after the main
+/// loop (`procServ.cc:696-699`). The info file's presence is how
+/// `manage-procs` finds a live procServ, so a stale one left behind after a
+/// clean shutdown names a dead pid and a control endpoint nobody is
+/// listening on. Pre-fix Rust removed only the pid file.
+#[tokio::test]
+async fn clean_shutdown_removes_both_the_info_and_pid_files() {
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    let dir = tempfile::tempdir().unwrap();
+    let info = dir.path().join("ioc.info");
+    let pid = dir.path().join("ioc.pid");
+    cfg.logging.info_path = Some(info.clone());
+    cfg.logging.pid_path = Some(pid.clone());
+    // One-shot: the child exits, the supervisor exits, `run()` resolves —
+    // a real clean shutdown, so the teardown path runs to completion.
+    cfg.child.program = PathBuf::from("/bin/sh");
+    cfg.child.args = vec!["-c".into(), "exit 0".into()];
+    cfg.restart_mode = RestartMode::OneShot;
+
+    let server = ProcServ::new(cfg).expect("build");
+    timeout(Duration::from_secs(5), server.run())
+        .await
+        .expect("one-shot supervisor should exit promptly")
+        .expect("run ok");
+
+    assert!(
+        !info.exists(),
+        "clean shutdown must unlink the info file (C: unlink(infofile))"
+    );
+    assert!(
+        !pid.exists(),
+        "clean shutdown must unlink the pid file (C: unlink(pidFile))"
+    );
+}

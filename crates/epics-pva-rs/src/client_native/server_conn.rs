@@ -1125,6 +1125,21 @@ fn handle_control_frame(
     // last_rx implicitly; no further action.
 }
 
+/// A server frame pvxs would refuse to process: its handler hits
+/// `!M.good()` (or an explicit `M.fault()`) and the connection is torn down
+/// (`bev.reset()` at each client handler, or the `catch` around the command
+/// switch in `conn.cpp:277-281`). The reason is log-only, exactly as in pvxs.
+#[derive(Debug)]
+struct FrameFault(String);
+
+/// Route one server frame, tearing the circuit down on a protocol fault.
+///
+/// **Invariant:** a frame whose routing key or payload cannot be decoded MUST
+/// NOT be swallowed — pvxs disconnects (`clientconn.cpp:334-338,417-421,
+/// 454-455`, `clientget.cpp:490-494`), so the port must too, or a
+/// non-conforming server keeps a half-understood circuit alive. This function
+/// is the single owner of that teardown; every handler below signals the fault
+/// by returning [`FrameFault`] and never cancels on its own.
 #[allow(clippy::too_many_arguments)]
 fn route_frame(
     frame: Frame,
@@ -1137,6 +1152,37 @@ fn route_frame(
     writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
     cancel: &CancellationToken,
 ) {
+    let cmd = frame.header.command;
+    if let Err(FrameFault(reason)) = route_frame_checked(
+        frame,
+        by_ioid,
+        by_cid,
+        by_sid_close,
+        ioid_to_sid,
+        ioid_to_cmd,
+        chan_stats,
+        writer_tx,
+    ) {
+        tracing::warn!(
+            cmd,
+            reason,
+            "PVA client router: server sent an invalid frame, closing circuit"
+        );
+        cancel.cancel();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_frame_checked(
+    frame: Frame,
+    by_ioid: &Arc<DashMap<u32, IoidSlot>>,
+    by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
+    by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
+    ioid_to_sid: &Arc<DashMap<u32, u32>>,
+    ioid_to_cmd: &Arc<DashMap<u32, u8>>,
+    chan_stats: &Arc<DashMap<u32, ChanStat>>,
+    writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<(), FrameFault> {
     let cmd = frame.header.command;
     // pvxs attributes the received frame's wire length to the owning
     // channel's `statRx` at op reply decode (clientget.cpp:496,
@@ -1155,15 +1201,23 @@ fn route_frame(
     // miss the slot, misroute, or trip the command-mismatch close path.
     let order = frame.order();
 
-    // CMD_MESSAGE — log server diagnostic, don't route by IOID.
+    // CMD_MESSAGE — log server diagnostic, don't route by IOID. A frame
+    // that does not decode is a fault: pvxs `handle_MESSAGE` throws on
+    // `!M.good()` (clientconn.cpp:454-455) and the catch resets the bev.
     if cmd == Command::Message.code() {
-        log_server_message(&frame.payload, order);
-        return;
+        return log_server_message(&frame.payload, order);
     }
 
     // CMD_DESTROY_CHANNEL from server.
     if cmd == Command::DestroyChannel.code() {
-        if let Some(sid) = peek_u32(&frame.payload, 0, order) {
+        let Some(sid) = peek_u32(&frame.payload, 0, order) else {
+            // pvxs clientconn.cpp:417-421 — invalid DESTROY_CHANNEL,
+            // "Disconnecting...".
+            return Err(FrameFault(
+                "DESTROY_CHANNEL payload too short for SID".into(),
+            ));
+        };
+        {
             let mut dropped_ioids = 0usize;
             // Collect matching ioids first, then remove.
             let matching: Vec<u32> = ioid_to_sid
@@ -1210,12 +1264,19 @@ fn route_frame(
             // this closes the last bypass.
             chan_stats.remove(&sid);
         }
-        return;
+        return Ok(());
     }
 
     // CREATE_CHANNEL responses route by CID.
     if cmd == Command::CreateChannel.code() {
-        if let Some(cid) = peek_u32(&frame.payload, 0, order) {
+        let Some(cid) = peek_u32(&frame.payload, 0, order) else {
+            // pvxs clientconn.cpp:334-338 — invalid CREATE_CHANNEL,
+            // "Disconnecting...".
+            return Err(FrameFault(
+                "CREATE_CHANNEL payload too short for CID".into(),
+            ));
+        };
+        {
             if let Some((_, tx)) = by_cid.remove(&cid) {
                 // even when we have a waiter, the receiver
                 // might have already been dropped (timeout race).
@@ -1227,7 +1288,7 @@ fn route_frame(
                 if let Err(rejected_frame) = tx.send(frame) {
                     maybe_destroy_stale_create_channel(&rejected_frame, cid, writer_tx, order);
                 }
-                return;
+                return Ok(());
             }
             // no waiter at all — the caller timed out,
             // dropped its receiver, and CID was already evicted.
@@ -1236,12 +1297,27 @@ fn route_frame(
             // the frame and left the server-side channel open until
             // TCP close.
             maybe_destroy_stale_create_channel(&frame, cid, writer_tx, order);
-            return;
+            return Ok(());
         }
     }
 
     // Application op responses (GET/PUT/MONITOR/RPC/GET_FIELD) route by IOID.
-    if let Some(ioid) = peek_u32(&frame.payload, 0, order) {
+    // Every one of those pvxs handlers reads the IOID off the wire first and
+    // disconnects when the payload cannot carry it (`!M.good()` →
+    // "sends invalid op%02x. Disconnecting...", clientget.cpp:490-494;
+    // clientmon.cpp / clientintrospect.cpp do the same). Any OTHER command
+    // stays ignorable: pvxs's dispatch switch drains an unexpected command's
+    // body and continues, for forward compatibility (conn.cpp:250-252).
+    let Some(ioid) = peek_u32(&frame.payload, 0, order) else {
+        return if is_op_reply(cmd) {
+            Err(FrameFault(format!(
+                "op reply payload too short for IOID (cmd {cmd})"
+            )))
+        } else {
+            Ok(())
+        };
+    };
+    {
         // Attribute this reply's wire length to the owning channel's
         // receive counter (pvxs `chan->statRx += rxlen`). The IOID→SID map
         // resolves the channel; unmapped IOIDs (already torn down) just
@@ -1260,14 +1336,9 @@ fn route_frame(
         // satisfy a GET with a MONITOR-shaped frame.
         if let Some(expected) = ioid_to_cmd.get(&ioid).map(|r| *r.value()) {
             if expected != cmd {
-                tracing::warn!(
-                    ioid,
-                    expected_cmd = expected,
-                    actual_cmd = cmd,
-                    "PVA client router: frame command mismatch for IOID, closing"
-                );
-                cancel.cancel();
-                return;
+                return Err(FrameFault(format!(
+                    "frame command {cmd} does not match IOID {ioid}'s command {expected}"
+                )));
             }
         }
         // Try to dispatch. For TwoShot, pop the first available oneshot.
@@ -1298,20 +1369,47 @@ fn route_frame(
             }
         }
     }
-    // Otherwise: drop silently. (Beacons/SearchResponse are handled
-    // out-of-band by the search engine, not here.)
+    // An IOID with no dispatch slot drops silently (the op completed or was
+    // cancelled; Beacons/SearchResponse are handled out-of-band by the search
+    // engine, not here).
+    Ok(())
+}
+
+/// Commands whose client-side pvxs handler routes by a leading IOID and
+/// disconnects on a decode fault. Anything else the server sends is
+/// forward-compatible filler that pvxs drains and ignores (conn.cpp:250-252).
+fn is_op_reply(cmd: u8) -> bool {
+    cmd == Command::Get.code()
+        || cmd == Command::Put.code()
+        || cmd == Command::PutGet.code()
+        || cmd == Command::Monitor.code()
+        || cmd == Command::Rpc.code()
+        || cmd == Command::GetField.code()
 }
 
 /// Log a server-side CMD_MESSAGE at the level matching its mtype.
 /// Payload layout: `ioid:u32 + mtype:u8 + message:PVA-string`.
-fn log_server_message(payload: &[u8], order: ByteOrder) {
+///
+/// pvxs decodes all three fields and throws when any is short or malformed
+/// (`handle_MESSAGE`, clientconn.cpp:442-455) — the message is diagnostic, but
+/// a server that cannot frame it has corrupted the stream, so the circuit
+/// goes down rather than serving on.
+fn log_server_message(payload: &[u8], order: ByteOrder) -> Result<(), FrameFault> {
     let mut cur = std::io::Cursor::new(payload);
-    let Ok(ioid) = cur.get_u32(order) else { return };
-    let Ok(mtype) = cur.get_u8() else { return };
-    let msg = decode_string(&mut cur, order)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let Ok(ioid) = cur.get_u32(order) else {
+        return Err(FrameFault("MESSAGE payload too short for IOID".into()));
+    };
+    let Ok(mtype) = cur.get_u8() else {
+        return Err(FrameFault("MESSAGE payload too short for mtype".into()));
+    };
+    // `from_wire(M, msg)` — a truncated or oversized string length faults
+    // `M`; a null string (0xFF) is not valid here either (pvxs's
+    // `from_wire(std::string&)` faults on it), so both are decode errors.
+    let Ok(Some(msg)) = decode_string(&mut cur, order) else {
+        return Err(FrameFault(
+            "MESSAGE payload carries no decodable string".into(),
+        ));
+    };
     // pvxs `handle_MESSAGE` maps the level through `mtype2level`
     // (pvaproto.h:704-712, clientconn.cpp:457): 0 -> Info, 1 -> Warn,
     // 2 -> Err, and default (Fatal=3 and every unknown value) -> Crit.
@@ -1329,6 +1427,7 @@ fn log_server_message(payload: &[u8], order: ByteOrder) {
             tracing::error!(ioid, mtype = other, msg, "server MESSAGE")
         }
     }
+    Ok(())
 }
 
 fn peek_u32(payload: &[u8], offset: usize, order: ByteOrder) -> Option<u32> {
@@ -1597,18 +1696,29 @@ mod tests {
                 99, // unknown
             ] {
                 let payload = build_message_payload(order, 0xCAFEBABE, mtype, "hello world");
-                log_server_message(&payload, order);
+                log_server_message(&payload, order).expect("well-formed MESSAGE must decode");
             }
         }
     }
 
+    /// pvxs `handle_MESSAGE` decodes ioid, mtype and the string, and throws on
+    /// `!M.good()` (clientconn.cpp:454-455) — the dispatch catch then resets
+    /// the bev. Every truncation is a decode fault, not something to swallow.
     #[test]
-    fn log_server_message_handles_truncated_payload() {
-        // Empty / too-short / no string body — must not panic.
-        log_server_message(&[], ByteOrder::Little);
-        log_server_message(&[0x01], ByteOrder::Little);
-        log_server_message(&[0u8; 4], ByteOrder::Little); // ioid only, no mtype
-        log_server_message(&[0u8; 5], ByteOrder::Little); // ioid + mtype but no string
+    fn log_server_message_faults_on_truncated_payload() {
+        for payload in [
+            &[][..],
+            &[0x01][..],
+            &[0u8; 4][..],                 // ioid only, no mtype
+            &[0u8; 5][..],                 // ioid + mtype but no string
+            &[0, 0, 0, 0, 1, 9, b'a'][..], // string claims 9 bytes, 1 follows
+            &[0, 0, 0, 0, 1, 0xFF][..],    // null-string marker: faults in pvxs too
+        ] {
+            assert!(
+                log_server_message(payload, ByteOrder::Little).is_err(),
+                "a MESSAGE that does not decode must fault the circuit: {payload:?}"
+            );
+        }
     }
 
     /// Client half.
@@ -1644,7 +1754,7 @@ mod tests {
                 99u8, // unknown
             ] {
                 let payload = build_message_payload(order, 0xCAFEBABE, mtype, "m");
-                log_server_message(&payload, order);
+                log_server_message(&payload, order).expect("well-formed MESSAGE must decode");
             }
         });
 
@@ -2097,6 +2207,92 @@ mod tests {
         assert!(
             !cancel.is_cancelled(),
             "correct per-frame routing must not trip the command-mismatch close path"
+        );
+    }
+
+    /// pvxs tears the circuit down for every server frame it cannot decode:
+    /// `handle_MESSAGE` throws on `!M.good()` (clientconn.cpp:454-455) and the
+    /// dispatch catch calls `bev.reset()` (conn.cpp:277-281); CREATE_CHANNEL
+    /// (:334-338), DESTROY_CHANNEL (:417-421) and the op handlers
+    /// (clientget.cpp:490-494) call `bev.reset()` directly. The port used to
+    /// swallow all of them and keep serving a peer that had already corrupted
+    /// the stream. An *unknown* command stays ignorable — pvxs drains its body
+    /// for forward compatibility (conn.cpp:250-252).
+    #[test]
+    fn malformed_server_frames_are_circuit_fatal() {
+        let order = ByteOrder::Little;
+        let route = |cmd: u8, payload: Vec<u8>| {
+            let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+                fresh_router();
+            let header = PvaHeader::application(true, order, cmd, payload.len() as u32);
+            route_frame(
+                Frame { header, payload },
+                &by_ioid,
+                &by_cid,
+                &by_sid_close,
+                &ioid_to_sid,
+                &ioid_to_cmd,
+                &Arc::new(DashMap::new()),
+                &writer_tx,
+                &cancel,
+            );
+            cancel.is_cancelled()
+        };
+
+        // CMD_MESSAGE: string length runs past the end of the payload.
+        let mut truncated_msg = Vec::new();
+        truncated_msg.put_u32(7, order);
+        truncated_msg.put_u8(MessageType::Warning as u8);
+        truncated_msg.put_u8(9); // claims a 9-byte string...
+        truncated_msg.extend_from_slice(b"abc"); // ...but only 3 bytes follow
+        assert!(
+            route(Command::Message.code(), truncated_msg),
+            "a MESSAGE whose string is truncated must close the circuit"
+        );
+
+        // CMD_MESSAGE: payload cannot even carry the IOID.
+        assert!(
+            route(Command::Message.code(), vec![0x01, 0x02]),
+            "a MESSAGE too short for its IOID must close the circuit"
+        );
+
+        // Control: a well-formed MESSAGE is logged and the circuit survives.
+        assert!(
+            !route(
+                Command::Message.code(),
+                build_message_payload(order, 7, MessageType::Info as u8, "hello")
+            ),
+            "a well-formed MESSAGE must be logged, not fatal"
+        );
+
+        // Sibling handlers: the routing key must decode or the circuit closes.
+        assert!(
+            route(Command::DestroyChannel.code(), vec![0x00, 0x01]),
+            "a DESTROY_CHANNEL too short for its SID must close the circuit"
+        );
+        assert!(
+            route(Command::CreateChannel.code(), vec![0x00]),
+            "a CREATE_CHANNEL too short for its CID must close the circuit"
+        );
+        for cmd in [
+            Command::Get.code(),
+            Command::Put.code(),
+            Command::PutGet.code(),
+            Command::Monitor.code(),
+            Command::Rpc.code(),
+            Command::GetField.code(),
+        ] {
+            assert!(
+                route(cmd, vec![0x00, 0x00, 0x00]),
+                "an op reply (cmd {cmd}) too short for its IOID must close the circuit"
+            );
+        }
+
+        // Forward compatibility: an unknown command with a short payload is
+        // drained and ignored, exactly as pvxs's dispatch default does.
+        assert!(
+            !route(Command::MultipleData.code(), vec![0x00]),
+            "an unhandled command must stay ignorable, not close the circuit"
         );
     }
 

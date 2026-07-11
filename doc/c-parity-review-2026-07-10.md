@@ -425,6 +425,25 @@ Category E (ad-plugins-rs / ad-core-rs / optics-rs / epics-base-rs):
 - R6-70: FIXED 447e2ba1 + 4076fa0b (same finding; second commit is example-driver fallout) — constructor seeds only what ADDriver.cpp:180-191 seeds.
 - R5-2 sibling (carryover): FIXED d76dcd64 — `prev_val` seeded from C's `presult` cell (swait VAL; scalcout VAL/OVAL per phase; transform per-channel); `build_inputs` takes the result cell as a parameter so call sites cannot forget it.
 
+### Fix wave 2 (2026-07-12): categories A + C — merged into review/parity-r6, verified by main (workspace clippy -D warnings clean, nextest 7506/7506 passed, doctests clean)
+
+Category A (epics-base-rs, + epics-ca-rs test respell):
+- R6-1: FIXED a795ed72 — dbCommon DBF_MENU fields served as DBR_ENUM via the existing shared_menu_choices owner (STAT/NSTA→menuAlarmStat, SEVR/NSEV/ACKS/DISS/UDFS→menuAlarmSevr, ACKT→menuYesNo, PINI→menuPini); widened to NSTA/NSEV; deleted a wrong field-blind menuPini table.
+- R6-2: FIXED 0d663892 — link field-name guard matches C dbNameToAddr (record name ends at first '.', remainder a C identifier); `MBBOD.B0`/`sseq.DO1` resolve as DB links.
+- R6-3: FIXED 6b261c71 — C's else-if precedence chains (NPP,CPP,PP,CA,CP / NMS,MSI,MSS,MS), exactly one process class; two epics-ca-rs tests that spelled `CP CA` respelled to bare `CP`.
+- R6-4: FIXED d6814e88 — per-link-field-type modifier mask (OUT discards CP/CPP, FWDLINK masks to CA); cited site was 1 of 6, all routed through the mask; warning moved to the put/load boundary.
+- R6-5: FIXED eb7f8de6 — PINI is the 6-choice menuPini; single pass owner `PvDatabase::pini_process(mode)`; RUN/RUNNING wired at AtIocRun/AfterIocRunning.
+- R6-6: FIXED 39952331 — pini_process runs C's do-while PHAS sweep with live reads (iocInit.c:614-619).
+- R6-7: FIXED b1f381e1 — empty array into scalar: accept, leave field, LINK/INVALID alarm, return 0; three duplicated coercion blocks replaced by one owner (`dbput_request`) keyed on request count + destination.
+- R6-8: FIXED 07d41f33 — unusable I/O Intr demotes SCAN to Passive with a logged error; IocBuilder duplicate wiring loop routed through the same owner.
+
+Category C (epics-pva-rs / epics-bridge-rs / epics-base-rs):
+- R6-31: FIXED 590bc47f — Q:time:tag parses byte-exactly like pvxs (case-sensitive prefix, epicsParseInt32 port, no clamp); single owner `apply_nsec_mask(mask)`.
+- R6-32: FIXED faa37315 — RPC INIT never runs request_to_mask.
+- R6-33: FIXED ea8a4b11 — NULL (0xFF) pvRequest descriptor at INIT = all-fields wildcard, not connection-fatal; one owner `decode_init_pv_request` used by all INIT sites.
+- R6-34: FIXED 2d59ae6c — `RpcReply` enum (Empty | Value) models both pvxs ExecOp::reply() overloads end-to-end (server emit, client decode, gateway relay). PUBLIC API CHANGE: ChannelSource::rpc*/SharedPV::rpc*/PvaClient::pvrpc* carry RpcReply; Into<RpcReply> keeps existing handlers compiling.
+- R6-35: FIXED 8d5daedf — MONITOR FINISH trailing update decoded and delivered before stream end; single owner `monitor_finish_body` consulted by typed, marker-flattening, and raw-gateway paths.
+
 ## Open Findings — surfaced during fix wave 1 (reported by fixers, pending independent verify)
 
 ### R6-51: prologix read error drops bytes accumulated in `acc`; C retains them for the next call
@@ -451,6 +470,24 @@ Rust: `crates/optics-rs/src/snl/pf4.rs` — `FilterMaterial.density: f32`.
 C reference: `pf4.st` — `matdensity[]` double.
 Impact: ~5e-8 relative difference in absorption length; below current test tolerance but a real numeric deviation.
 
+### R6-9: `put_common_field` silently accepts an unknown field name
+Severity: Medium (REPORTED by fixer-A while testing R6-7)
+Rust: `put_common_field` returns `Ok(NoChange)` for an unknown field.
+C reference: `dbNameToAddr`/`dbPutField` return `S_db_badField`.
+Impact: a caput to a nonexistent field reports success to the client instead of an error.
+
+### R6-10: multi-element array into a scalar field errors; C converts element 0 and succeeds
+Severity: Medium (REPORTED by fixer-A, adjacent to but distinct from R6-7)
+Rust: the scalar-destination coercion path rejects `nRequest > 1`.
+C reference: `dbAccess.c:1373-1388` — converts the first element and returns success.
+Impact: `caput -a` of a multi-element array to a scalar fails on the port, succeeds (with element 0) on C.
+
+## Known residuals / notes (fix waves 1-2)
+- PINI=PAUSE/PAUSED passes absent: the port has no iocPause lifecycle (`InitHookState` lacks AtIocPause/AfterIocPaused). Values store and serve correctly (R6-5); only the passes are missing. Feature gap, needs a lifecycle decision — not silently inventable.
+- `put_pv` posts no monitor events by its documented contract (caller's job); R6-7's empty-request path on that entry point does not itself post DBE_VALUE|DBE_LOG. General audit of that contract is a separate question.
+- Pre-existing (not touched): `cargo build -p epics-base-rs --all-features` fails at `tests/client_server.rs:148` (`WallTime` vs `SystemTime`), gated behind the `ca-server-tls-test` feature; present since before this round (at 70b4a74b).
+- Flaky under load (not root-caused): `epics-pva-rs::stability` `pva_fr_8_pause_holds_latest_then_resume_delivers` and `array_concurrent_subop_replies_error_not_silent` each failed once in runs launched right after a rebuild, pass in isolation and on a quiet machine (fixer-A report); both passed in main's post-merge workspace runs.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -475,3 +512,9 @@ Impact: ~5e-8 relative difference in absorption length; below current test toler
   OPEN pending independent verify. A (R6-1..8), B (R6-16..29), C (R6-31..35)
   still in flight. Deferred-by-sign-off carryovers (DRV-16/17, DRV-53, motor
   R60/R64) deliberately excluded from fixer scope — awaiting user decision.
+- Fix wave 2 (2026-07-12): A (R6-1..8) and C (R6-31..35) finished — all 13 FIXED,
+  merged into review/parity-r6 and verified by main: workspace clippy -D warnings
+  clean, nextest 7506 passed / 0 failed / 2 skipped, doctests clean. Notable: R6-34
+  is a public API change (RpcReply); R6-3 respelled two epics-ca-rs tests that
+  encoded the wrong `CP CA` semantics. 2 new findings (R6-9, R6-10) + residual
+  notes recorded. B (R6-16..29) still in flight.

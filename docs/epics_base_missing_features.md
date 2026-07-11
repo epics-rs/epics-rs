@@ -433,7 +433,7 @@ KEEP 판정된 422개 커밋을 분류하여, 러스트 채택으로 자동 해�
 
 ### 9-D. `ca-rs` — 네트워크 라우팅 (Network-Routing)
 
-- **`rsrv`: 클라이언트 공급 호스트명 대신 검증된 IP 주소 사용** (`530eba1`, high) — ⏭️ **ALREADY**: `EPICS_CAS_USE_HOST_NAMES=NO` 기본값으로 peer IP를 권위로 사용; `=YES`일 때 `host_resolves_to_peer`로 forward-DNS 검증.
+- **`rsrv`: 클라이언트 공급 호스트명 대신 검증된 IP 주소 사용** (`530eba1`, high) — ✅ **DONE (R7-16)**: C와 동일하게 `asCheckClientIP` 전역 플래그로 구현. 기본값 0 = C 기본값(클라이언트가 보낸 호스트명을 그대로 신뢰, HAG는 이름으로 매칭), `asCheckClientIP 1` = peer IP를 권위로 사용하고 ACF 로드 시 HAG 항목을 IP로 해석. 이전 기록의 `EPICS_CAS_USE_HOST_NAMES`는 epics-base에 존재하지 않는 변수였고, 그 "기본값이 C와 같다"는 서술도 틀렸음.
 - **`RSRV_SERVER_PORT` 9999 초과 포트 번호에서 잘림** (`772c10d`, high) — ⚠️ **N/A**: Rust의 `u16` 사용으로 0..=65535 전 범위 안전.
 - **SO_REUSEPORT + SO_REUSEADDR 함께 설정 (Linux)** (`5064931`, medium) — ⏭️ **ALREADY**: `AsyncUdpV4::bind_one_at`이 양 옵션 설정 (`set_reuse_address` + `set_reuse_port`).
 - **BSD에서 `SO_REUSEADDR`만으로는 부족 — `SO_REUSEPORT` 필요** (`65ef6e9`, medium) — ⏭️ **ALREADY**: 위와 동일.

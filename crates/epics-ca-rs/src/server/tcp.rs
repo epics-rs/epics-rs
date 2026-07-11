@@ -128,31 +128,6 @@ mod cap_parse_tests {
     }
 }
 
-/// Forward-DNS verification for `EPICS_CAS_USE_HOST_NAMES=YES`.
-///
-/// Resolve `claimed` (the client-supplied hostname) to a list of IPs
-/// and require `peer` (the actual TCP peer IP) to appear among them.
-/// Returns `true` only when a match is found, `false` on resolution
-/// failure or mismatch — fail closed.
-///
-/// Done via `tokio::net::lookup_host` which dispatches to the
-/// platform resolver (getaddrinfo), so honours `/etc/hosts`, NIS,
-/// LDAP, etc. The DNS lookup is per-HOST_NAME-message so the cost
-/// is paid once per CA client connection, not per put / per
-/// channel.
-async fn host_resolves_to_peer(claimed: &str, peer: std::net::IpAddr) -> bool {
-    if claimed.is_empty() {
-        return false;
-    }
-    // `lookup_host` requires a port — a sentinel `:0` is fine since
-    // we discard everything except the IP.
-    let target = format!("{claimed}:0");
-    match tokio::net::lookup_host(target).await {
-        Ok(mut iter) => iter.any(|sa| sa.ip() == peer),
-        Err(_) => false,
-    }
-}
-
 /// Per-socket send timeout. Without this, a client that stops
 /// reading (frozen GUI, dead viewer holding the socket open) causes
 /// every server `write` to block once the kernel send buffer fills,
@@ -481,7 +456,10 @@ struct ClientState {
     /// (LIFO) so the most-recently-freed SID is reused first —
     /// keeps the active set's SIDs clustered near the low end.
     free_sids: Vec<u32>,
-    hostname: String,
+    /// This circuit's access-security host identity. See [`HostIdentity`]
+    /// — the variant, not a runtime check at the write site, decides
+    /// whether `CA_PROTO_HOST_NAME` may replace it.
+    hostname: HostIdentity,
     username: String,
     /// Authentication method for ACF `METHOD()` clause matching.
     /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
@@ -554,6 +532,66 @@ struct ClientState {
     stats: Option<Arc<super::ca_server::ServerStats>>,
 }
 
+/// The access-security host identity of one CA circuit, and — by
+/// construction — whether the client may still set it.
+///
+/// C keeps this in `client->pHostName` and decides at accept time, from
+/// the global `asCheckClientIP` (`asLibRoutines.c:34`, default 0), which
+/// of two things that pointer means:
+///
+/// * `asCheckClientIP == 0` (**C's default**) — `create_tcp_client` leaves
+///   it NULL and `host_name_action` stores whatever name the client sends
+///   in `CA_PROTO_HOST_NAME`, unconditionally (`camessage.c:845-875`).
+///   Until then the identity is `""` (`camessage.c:770` passes
+///   `pHostName ? pHostName : ""` to `asAddClient`), which matches no HAG.
+///   HAG entries are host *names* in this mode, so this is the identity
+///   `HOST(...)` rules are written against.
+/// * `asCheckClientIP == 1` — `create_tcp_client` fills it with the peer's
+///   dotted-quad IP (`caservertask.c:1425-1437`) and `host_name_action`
+///   returns early without storing the claimed name
+///   (`camessage.c:839-843`).
+///
+/// The port adds a third source with no C counterpart: an mTLS-verified
+/// certificate identity, which likewise cannot be overwritten by a
+/// client-supplied name.
+///
+/// Modelling this as two variants rather than a `String` plus an "is it
+/// allowed to change?" check at the write site is what makes the illegal
+/// transition unrepresentable: [`Self::claim`] is the only writer, and it
+/// is a no-op on a [`Self::Pinned`] identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostIdentity {
+    /// C's default: the name the client claims. Empty until
+    /// `CA_PROTO_HOST_NAME` arrives.
+    Claimed(String),
+    /// Derived from the connection itself — the peer IP under
+    /// `asCheckClientIP`, or an mTLS-verified cert identity. A
+    /// client-supplied name never replaces it.
+    Pinned(String),
+}
+
+impl HostIdentity {
+    /// The identity string ACF/HAG matching runs against.
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Claimed(h) | Self::Pinned(h) => h,
+        }
+    }
+
+    /// Apply a `CA_PROTO_HOST_NAME` claim. Returns whether it was taken —
+    /// `false` on a [`Self::Pinned`] identity, which is C's
+    /// `host_name_action` early return under `asCheckClientIP`.
+    fn claim(&mut self, name: String) -> bool {
+        match self {
+            Self::Claimed(h) => {
+                *h = name;
+                true
+            }
+            Self::Pinned(_) => false,
+        }
+    }
+}
+
 /// What [`ClientState::refuse_message`] left for the parse loop to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refused {
@@ -579,7 +617,7 @@ impl ClientState {
             channel_trap: HashMap::new(),
             next_sid: AtomicU32::new(1),
             free_sids: Vec::new(),
-            hostname: String::new(),
+            hostname: HostIdentity::Claimed(String::new()),
             username: String::new(),
             auth_method: String::new(),
             auth_authority: String::new(),
@@ -642,7 +680,7 @@ impl ClientState {
                     event,
                     peer: &self.peer,
                     user: &self.username,
-                    host: &self.hostname,
+                    host: self.hostname.as_str(),
                     pv,
                     value,
                     result,
@@ -744,7 +782,7 @@ impl ClientState {
         };
         cfg.compute_for_name(
             asg_name,
-            &self.hostname,
+            self.hostname.as_str(),
             &self.username,
             &[],
             asl,
@@ -767,7 +805,7 @@ impl ClientState {
                 // access. The gateway audits/traps writes in its own
                 // write hook, so no TRAPWRITE rule resolves here.
                 if let Some(hook) = pv.access_hook() {
-                    let decision = hook(&self.username, &self.hostname);
+                    let decision = hook(&self.username, self.hostname.as_str());
                     let bits = match (decision.read, decision.write) {
                         (_, true) => 3,
                         (true, false) => 1,
@@ -1387,10 +1425,23 @@ where
         state.cap_token_verifier = cap_token_verifier;
         state.tls_channel_binding = tls_channel_binding;
     }
-    // Default hostname: verified TLS identity if present, otherwise the
-    // peer IP. Matches C rsrv default with EPICS_CAS_USE_HOST_NAMES=NO,
-    // upgraded transparently when mTLS is in effect.
-    state.hostname = initial_hostname.unwrap_or_else(|| peer.ip().to_string());
+    // The circuit's ACF host identity is decided once, here — C decides it
+    // in `create_tcp_client` (`caservertask.c:1425-1437`) for exactly the
+    // same reason. See `HostIdentity`.
+    state.hostname = match initial_hostname {
+        // Port extension, no C counterpart: an mTLS-verified cert identity
+        // outranks both of C's modes and no client-supplied name replaces
+        // it (doc/11-tls-design.md).
+        Some(verified) => HostIdentity::Pinned(verified),
+        // C `asCheckClientIP == 1`: the peer's address is the identity and
+        // CA_PROTO_HOST_NAME is ignored.
+        None if epics_base_rs::server::access_security::as_check_client_ip() => {
+            HostIdentity::Pinned(peer.ip().to_string())
+        }
+        // C's default: NULL `pHostName` — i.e. `""` to `asAddClient` —
+        // until the client claims a name over CA_PROTO_HOST_NAME.
+        None => HostIdentity::Claimed(String::new()),
+    };
     // PR #641: surface the mTLS authentication context to the ACF
     // check. Plaintext peers stay with empty fields — every legacy
     // rule (no METHOD/AUTHORITY clause) ignores them.
@@ -2025,40 +2076,36 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 ));
             }
 
-            // EPICS_CAS_USE_HOST_NAMES (default NO) controls whether we
-            // trust the client-supplied hostname for ACF matching. When NO,
-            // the peer IP set during accept() is authoritative.
-            let trust_client_hostname =
-                epics_base_rs::runtime::env::get_or("EPICS_CAS_USE_HOST_NAMES", "NO")
-                    .eq_ignore_ascii_case("YES");
-            if trust_client_hostname {
-                let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
-
-                // Forward-DNS verification: resolve the client-supplied
-                // hostname back to IPs and require one of them to match
-                // the actual peer address. Without this check a hostile
-                // client could spoof an arbitrary hostname (e.g. that
-                // of a privileged operator console) and gain whatever
-                // ACF rights the ACL grants to that host. C rsrv has
-                // historically deferred this verification to operators
-                // (relying on USE_HOST_NAMES=NO in untrusted networks);
-                // we fail closed here for stricter defaults.
-                let verified = host_resolves_to_peer(&claimed, peer.ip()).await;
-                if verified {
-                    state.hostname = claimed;
-                    // Re-evaluate access rights for all existing channels
-                    reeval_access_rights(state, writer).await?;
-                } else {
-                    tracing::warn!(
-                        peer = %peer,
-                        claimed_host = %claimed,
-                        "CAS_USE_HOST_NAMES: forward-DNS mismatch, ignoring HOST_NAME"
-                    );
-                    state.audit("host_name", "", &claimed, "dns_mismatch").await;
-                    // Keep state.hostname as the peer IP fallback set
-                    // at accept(); ACL rules continue to evaluate
-                    // against the IP rather than the spoofed hostname.
-                }
+            // C `host_name_action` (`camessage.c:845-875`) stores the
+            // client-supplied name **unconditionally** — the whole of C's
+            // gating is the `asCheckClientIP` early return above it
+            // (`:839-843`), which this port models as a pinned identity.
+            // So: hand the claim to `HostIdentity`, which takes it only if
+            // the identity is not pinned to the peer address or an
+            // mTLS-verified cert.
+            //
+            // This is C's trust model, quirk included: rsrv believes the
+            // name and leaves verification to the operator, who is expected
+            // to set `asCheckClientIP=1` on an untrusted network. A HOST()
+            // rule in an .acf therefore grants exactly what it grants under
+            // C. Pre-R7-16 the port defaulted to the peer IP behind a
+            // fictitious `EPICS_CAS_USE_HOST_NAMES` knob (no such variable
+            // exists anywhere in epics-base), so a `HOST(node)` HAG that
+            // granted WRITE under C granted nothing here.
+            let claimed = String::from_utf8_lossy(&payload[..end]).to_string();
+            if state.hostname.claim(claimed.clone()) {
+                // Re-evaluate access rights for all existing channels.
+                reeval_access_rights(state, writer).await?;
+            } else {
+                tracing::debug!(
+                    peer = %peer,
+                    claimed_host = %claimed,
+                    identity = state.hostname.as_str(),
+                    "HOST_NAME ignored: identity is pinned (asCheckClientIP or mTLS)"
+                );
+                state
+                    .audit("host_name", "", &claimed, "ignored_pinned")
+                    .await;
             }
         }
 
@@ -3565,7 +3612,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     epics_base_rs::server::access_security::TrapWriteFields {
                         pv_name: audit_pv.clone(),
                         user: state.username.clone(),
-                        host: state.hostname.clone(),
+                        host: state.hostname.as_str().to_string(),
                         peer: state.peer.clone(),
                         value_str: display_value.clone(),
                         dbr_type: write_type as u16,
@@ -3587,7 +3634,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     if let Some(hook) = pv.write_hook() {
                         let ctx = epics_base_rs::server::pv::WriteContext {
                             user: state.username.clone(),
-                            host: state.hostname.clone(),
+                            host: state.hostname.as_str().to_string(),
                             peer: state.peer.clone(),
                         };
                         hook(new_value, ctx).await.map(|()| None)
@@ -6681,6 +6728,97 @@ mod extended_header_split_tests {
         assert!(
             res.is_ok(),
             "clean EOF after partial extended header must be Ok, got {res:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_identity_tests {
+    //! R7-16: the ACF host identity of a circuit.
+    //!
+    //! C rsrv's default (`asCheckClientIP == 0`, `asLibRoutines.c:34`) is to
+    //! store the hostname the client claims over `CA_PROTO_HOST_NAME`
+    //! unconditionally (`camessage.c:845-875`) and match HAGs against that
+    //! name (`asLibRoutines.c:1223`). The port instead keyed ACF on the peer
+    //! IP unless a fictitious `EPICS_CAS_USE_HOST_NAMES=YES` was set — a
+    //! variable that does not exist anywhere in epics-base — so a
+    //! `HOST(node)` rule that granted WRITE under C granted nothing here.
+    use super::*;
+
+    #[test]
+    fn claimed_identity_takes_the_client_supplied_name() {
+        // C's default path: `create_tcp_client` leaves pHostName NULL, so
+        // the identity is "" until the client claims one.
+        let mut id = HostIdentity::Claimed(String::new());
+        assert_eq!(
+            id.as_str(),
+            "",
+            "no claim yet — C passes \"\" to asAddClient"
+        );
+
+        assert!(id.claim("opi-01.lab".into()), "a claimed identity takes it");
+        assert_eq!(
+            id.as_str(),
+            "opi-01.lab",
+            "C stores the client-supplied name unconditionally (camessage.c:845-875)"
+        );
+    }
+
+    #[test]
+    fn pinned_identity_ignores_the_client_supplied_name() {
+        // C's `asCheckClientIP == 1` path: the peer IP is the identity and
+        // `host_name_action` returns early without storing the claim
+        // (camessage.c:839-843). The port's mTLS identity is pinned the
+        // same way.
+        let mut id = HostIdentity::Pinned("10.0.0.7".into());
+        assert!(
+            !id.claim("privileged-console".into()),
+            "a pinned identity refuses the claim"
+        );
+        assert_eq!(
+            id.as_str(),
+            "10.0.0.7",
+            "a client cannot spoof its way past a pinned identity"
+        );
+    }
+
+    /// The connection-setup decision, made where C makes it
+    /// (`create_tcp_client`, `caservertask.c:1425-1437`). Reproduces the
+    /// same three-way match `handle_client` runs, pinning the mapping from
+    /// (mTLS identity, asCheckClientIP) to variant.
+    #[test]
+    fn identity_source_is_decided_once_at_connection_setup() {
+        use epics_base_rs::server::access_security::{as_check_client_ip, set_as_check_client_ip};
+
+        let peer: SocketAddr = "192.168.4.9:44321".parse().unwrap();
+        let decide = |verified: Option<String>| match verified {
+            Some(v) => HostIdentity::Pinned(v),
+            None if as_check_client_ip() => HostIdentity::Pinned(peer.ip().to_string()),
+            None => HostIdentity::Claimed(String::new()),
+        };
+
+        // C default: claimable, empty until CA_PROTO_HOST_NAME.
+        set_as_check_client_ip(false);
+        assert_eq!(decide(None), HostIdentity::Claimed(String::new()));
+
+        // asCheckClientIP=1: pinned to the peer's dotted-quad address.
+        set_as_check_client_ip(true);
+        assert_eq!(
+            decide(None),
+            HostIdentity::Pinned("192.168.4.9".into()),
+            "C fills pHostName with the peer IP (caservertask.c:1432)"
+        );
+
+        // An mTLS-verified identity outranks both modes.
+        assert_eq!(
+            decide(Some("CN=alice".into())),
+            HostIdentity::Pinned("CN=alice".into())
+        );
+        set_as_check_client_ip(false);
+        assert_eq!(
+            decide(Some("CN=alice".into())),
+            HostIdentity::Pinned("CN=alice".into()),
+            "the cert identity is pinned regardless of asCheckClientIP"
         );
     }
 }

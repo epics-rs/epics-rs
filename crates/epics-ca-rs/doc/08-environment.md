@@ -163,16 +163,41 @@ behaviour.
 Used by some `softIoc` configurations. `epics-ca-rs` itself uses
 `EPICS_CA_SERVER_PORT` for the `--port` default.
 
-### `EPICS_CAS_USE_HOST_NAMES` (libca)
+### `asCheckClientIP` — an iocsh knob, not an environment variable
 
-`NO` (default) → ignore the client-supplied `CA_PROTO_HOST_NAME`
-message; use the TCP peer IP for ACF rule matching.
+There is **no** `EPICS_CAS_USE_HOST_NAMES` variable. Earlier revisions of
+this document, `04-server.md` and `09-libca-parity.md` described one and
+claimed it matched C's default; it exists nowhere in epics-base and the
+port no longer reads it (R7-16).
 
-`YES` → trust whatever the client sends. Required when ACF rules
-match on hostnames rather than IP addresses, but allows clients to
-spoof identity. Use only when `HAG`/`UAG` rules need it.
+What C actually has is the global `asCheckClientIP`
+(`asLibRoutines.c:34`), default `0`, set from the shell:
 
-The default matches C rsrv. See `tcp.rs:296`.
+* **`0` (default)** — rsrv stores the hostname the client sends in
+  `CA_PROTO_HOST_NAME` unconditionally (`camessage.c:845-875`) and
+  `HAG` entries are host *names* (`asHagAddHost` lowercases them). This
+  is what a `HOST(node)` rule in a facility `.acf` is written against.
+  rsrv does not verify the claim — the trust model assumes a controlled
+  subnet.
+* **`1`** — rsrv fills the client's host with the peer's dotted-quad IP
+  at accept time (`caservertask.c:1425-1437`), ignores
+  `CA_PROTO_HOST_NAME`, and resolves every `HAG` entry to an IP when the
+  ACF is loaded. Use this when the network is not trusted.
+
+C sets it with an iocsh *variable* (`var asCheckClientIP 1`). This port
+has no iocsh variable mechanism, so the same knob is an iocsh **command**:
+
+```
+asCheckClientIP 1     # before asInit — the HAG storage form is chosen at parse time
+asSetFilename /path/to/facility.acf
+asInit
+```
+
+With no argument it prints the current setting. Both halves — HAG storage
+and client identity — read the one flag, so they can never disagree.
+
+Under mTLS the identity comes from the verified client certificate and
+neither mode applies; see `11-tls-design.md`.
 
 ### `EPICS_CAS_INACTIVITY_TMO` (rust-only)
 

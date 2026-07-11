@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
+use crate::interpose::com::{ComInterpose, ComPortOptions};
 use crate::interpose::{EomReason, OctetNext, OctetReadResult};
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
@@ -48,6 +49,16 @@ pub enum IpProtocol {
     /// HTTP: TCP with connect-per-transaction (C parity:
     /// `FLAG_CONNECT_PER_TRANSACTION` from line 368-371).
     Http,
+    /// `COM` — a remote serial port on a terminal server, reached over plain
+    /// TCP and configured by RFC 2217 telnet COM-port-option negotiation.
+    ///
+    /// C parity (`drvAsynIPPort.c:364-367`): the token sets `isCom` and leaves
+    /// `socketType = SOCK_STREAM`, so the transport is exactly TCP. What it
+    /// changes is that `drvAsynIPPortConfigure` then installs
+    /// `asynInterposeCOM` on the port (:1061) — the layer that IAC-escapes the
+    /// data stream and carries baud/bits/parity/stop/flow to the server. See
+    /// [`crate::interpose::com`].
+    Com,
 }
 
 /// Configuration for an IP port connection.
@@ -168,24 +179,14 @@ fn protocol_from_token(token: &str) -> AsynResult<IpProtocol> {
         "udp&" => Ok(IpProtocol::UdpReusePort),
         "udp*" => Ok(IpProtocol::UdpBroadcast),
         "udp*&" => Ok(IpProtocol::UdpBroadcastReusePort),
-        // C (:364-367) accepts `com`, sets `isCom`, and on that basis installs
-        // `asynInterposeCOM` (:1061) — the 856-line RFC 2217 telnet
-        // COM-port-option negotiator (`asynInterposeCom.c`) that carries
-        // baud/parity/stop-bits/flow-control to a terminal server and decodes
-        // its modem/line-state notifications. asyn-rs has not ported that layer.
-        //
-        // Connecting `host:port COM` as a plain TCP stream would be wrong on the
-        // wire in both directions: the device never receives its serial-line
-        // negotiation, and the server's IAC/subnegotiation bytes would be
-        // delivered to the record as device data. So the configuration is
-        // refused outright rather than silently degraded — an IOC that asked for
-        // COM must not come up talking raw TCP.
-        "com" => Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "COM interpose not supported: 'host:port COM' requires the RFC 2217 \
-                      asynInterposeCOM layer, which asyn-rs has not ported"
-                .into(),
-        }),
+        // C (:364-367) accepts `com` and sets `isCom`, which makes
+        // `drvAsynIPPortConfigure` install `asynInterposeCOM` (:1061).
+        // `DrvAsynIPPort::new` does the same (R8-57); until that layer existed
+        // this token was refused outright (R8-50), because a `COM` port run as a
+        // plain TCP stream is wrong on the wire in both directions — the device
+        // never receives its serial-line negotiation, and the server's
+        // IAC/subnegotiation bytes reach the record as device data.
+        "com" => Ok(IpProtocol::Com),
         // C prints the token as `sscanf` read it — original case, truncated to
         // five characters (:389).
         _ => Err(AsynError::Status {
@@ -550,6 +551,17 @@ pub struct DrvAsynIPPort {
     /// `getOption("hostInfo")` returns it verbatim. Kept so the IP driver's
     /// `get_option` can echo the live endpoint instead of the generic map.
     host_info: String,
+    /// The RFC 2217 negotiation state, present exactly when the configure
+    /// string's protocol token was `COM` — C's `tty->isCom` (`drvAsynIPPort.c`
+    /// :113, :364-365) and the `asynInterposeCOM` install it gates (:1061).
+    ///
+    /// This is the *option* half of C's COM interpose. It lives on the driver
+    /// rather than in the interpose stack because C's `setOption`/`getOption`
+    /// negotiate against `pasynOctetDrv` — the octet driver *below* the
+    /// interpose (`asynInterposeCom.c:339`, :430) — which here is `self.io`,
+    /// reached directly. The octet half (IAC stuffing) *is* in the stack, as
+    /// [`crate::interpose::com::ComInterpose`].
+    com: Option<ComPortOptions>,
 }
 
 /// True for a socket read error that C `readRaw` treats as a non-fatal
@@ -764,6 +776,17 @@ impl DrvAsynIPPort {
         base.connected = false;
         base.auto_connect = true;
 
+        // C `drvAsynIPPortConfigure` (:1061): `if (tty->isCom) asynInterposeCOM(...)`
+        // — the COM layer is installed at configure time, before the port ever
+        // connects, so the very first byte of the very first transfer is already
+        // IAC-escaped. Both halves go in together (R8-57).
+        let com = if config.protocol == IpProtocol::Com {
+            base.push_octet_interpose(Box::new(ComInterpose::new()));
+            Some(ComPortOptions::new())
+        } else {
+            None
+        };
+
         Ok(Self {
             base,
             config,
@@ -771,7 +794,34 @@ impl DrvAsynIPPort {
             disconnect_on_read_timeout: false,
             // C parseHostInfo: tty->IPDeviceName = epicsStrDup(hostInfo).
             host_info: config_str.to_string(),
+            com,
         })
+    }
+
+    /// Run the RFC 2217 handshake against the freshly-connected server.
+    ///
+    /// C wires this to `asynExceptionConnect` (`asynInterposeCom.c:763-774`):
+    /// every time the port connects — including after a terminal server reboots
+    /// — the negotiation is replayed so the serial line comes back up with the
+    /// settings the IOC last asked for. Its failure is reported and *swallowed*,
+    /// exactly as C's `exceptionHandler` does (`asynPrint(ASYN_TRACE_ERROR)`,
+    /// :770-772): a terminal server that refuses the negotiation still leaves a
+    /// usable TCP link, and failing the connect here would instead put the port
+    /// into an endless reconnect loop.
+    fn restore_com_settings(&mut self) {
+        let Some(com) = self.com.as_mut() else {
+            return;
+        };
+        if let Err(e) = com.restore_settings(&mut self.io) {
+            asyn_trace!(
+                Some(self.base.trace),
+                &self.base.port_name,
+                TraceMask::ERROR,
+                "Unable to restore parameters for port {}: {}",
+                self.base.port_name,
+                e.message()
+            );
+        }
     }
 
     /// Push an interpose layer onto the octet I/O stack.
@@ -964,7 +1014,10 @@ impl PortDriver for DrvAsynIPPort {
             });
         }
         match self.config.protocol {
-            IpProtocol::Tcp | IpProtocol::TcpReusePort => {
+            // C :364-367 — `com` leaves `socketType = SOCK_STREAM` and sets no
+            // flags, so its transport is plain TCP; the whole of what `COM` adds
+            // rides in the interpose, not the socket.
+            IpProtocol::Tcp | IpProtocol::TcpReusePort | IpProtocol::Com => {
                 let stream = self.connect_tcp()?;
                 if self.config.no_delay {
                     stream.set_nodelay(true)?;
@@ -1037,6 +1090,10 @@ impl PortDriver for DrvAsynIPPort {
             self.config.port,
             self.config.protocol
         );
+        // C `asynInterposeCom.c::exceptionHandler` (:763-774) runs the RFC 2217
+        // handshake on `asynExceptionConnect` — which `set_connected(true)` just
+        // fired. No-op unless this is a COM port.
+        self.restore_com_settings();
         Ok(())
     }
 
@@ -1137,6 +1194,18 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+        // C interposes `asynInterposeCOM`'s asynOption interface *above* the IP
+        // driver's (`asynInterposeCom.c:809-824`), so a COM port's option writes
+        // hit the negotiation first and only an unclaimed key reaches the driver
+        // below (`setOption`'s trailing else, :645-652). Same order here: the
+        // seven serial keys negotiate, `hostInfo`/`disconnectOnReadTimeout` fall
+        // through to the IP chain — which is why this is one dispatch and not two
+        // independent option maps.
+        if let Some(com) = self.com.as_mut() {
+            if ComPortOptions::owns_key(key) {
+                return com.set_option(&mut self.io, key, value);
+            }
+        }
         // C `drvAsynIPPort.c::setOption`/`getOption` compare option keys
         // with `epicsStrCaseCmp` (case-insensitive). Match that here: the
         // asynRecord writes the IP keys lowercase (`hostinfo`, see
@@ -1250,6 +1319,15 @@ impl PortDriver for DrvAsynIPPort {
     /// never populate, so the asynRecord could never read back the live
     /// `HOSTINFO`/`DRTO`. Unknown keys fall through to the generic map.
     fn get_option(&self, key: &str) -> AsynResult<String> {
+        // Same interposed order as `set_option`. C's COM `getOption` (:657-725)
+        // answers from cached state and touches the wire not at all, so this
+        // needs no `&mut self` — the settings it reports are what the *server*
+        // last acknowledged, refreshed on every `set_option` and reconnect.
+        if let Some(com) = self.com.as_ref() {
+            if ComPortOptions::owns_key(key) {
+                return com.get_option(key);
+            }
+        }
         if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
             Ok(if self.disconnect_on_read_timeout {
                 "Y"
@@ -1598,6 +1676,174 @@ mod tests {
         assert!(n1 <= 5);
 
         handle.join().unwrap();
+    }
+
+    /// R8-57 end-to-end over a real socket: connecting a `COM` port must run C's
+    /// RFC 2217 handshake (`asynInterposeCom.c::restoreSettings`, :729-758) on
+    /// the wire, and the data path that follows must be IAC-escaped in both
+    /// directions (`writeIt`/`readIt`, :136-245).
+    ///
+    /// The fake terminal server below answers the handshake with the standard
+    /// echoes, then behaves like a device: it receives one IAC-stuffed write and
+    /// sends back one IAC-stuffed reply.
+    #[test]
+    fn com_port_negotiates_rfc2217_on_connect_and_escapes_the_data_path() {
+        use crate::interpose::com::{IAC, SB, SE};
+
+        const COM_PORT_OPTION: u8 = 44;
+        const WILL_B: u8 = 251;
+        const DO_B: u8 = 253;
+        /// The server's acknowledgement of subcommand `n`: `IAC SB 44 n+100 …`.
+        fn ack(subcmd: u8, values: &[u8]) -> Vec<u8> {
+            let mut v = vec![IAC, SB, COM_PORT_OPTION, subcmd + 100];
+            v.extend_from_slice(values);
+            v.extend_from_slice(&[IAC, SE]);
+            v
+        }
+        /// A client subnegotiation: `IAC SB 44 <payload> IAC SE`.
+        fn sb(payload: &[u8]) -> Vec<u8> {
+            let mut v = vec![IAC, SB, COM_PORT_OPTION];
+            v.extend_from_slice(payload);
+            v.extend_from_slice(&[IAC, SE]);
+            v
+        }
+
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            // Blast the whole handshake reply first — the client drives the
+            // exchange step by step, reading each answer before sending the next,
+            // so queueing all the answers up front is what keeps this from
+            // deadlocking. In C's order: DO BINARY -> WILL, WILL BINARY -> DO,
+            // WILL COM-PORT-OPTION -> DO, then SET-MODEMSTATE-MASK and the six
+            // settings, each echoed back at its default.
+            let mut reply = vec![IAC, WILL_B, 0, IAC, DO_B, 0, IAC, DO_B, COM_PORT_OPTION];
+            reply.extend_from_slice(&ack(11, &[0])); // SET-MODEMSTATE-MASK
+            reply.extend_from_slice(&ack(1, &[0x00, 0x00, 0x25, 0x80])); // 9600 baud
+            reply.extend_from_slice(&ack(2, &[8])); // 8 data bits
+            reply.extend_from_slice(&ack(3, &[1])); // parity none
+            reply.extend_from_slice(&ack(4, &[1])); // 1 stop bit
+            reply.extend_from_slice(&ack(5, &[1])); // crtscts -> NOFLOW
+            reply.extend_from_slice(&ack(5, &[1])); // ixon    -> NOFLOW
+            stream.write_all(&reply).unwrap();
+            stream.flush().unwrap();
+
+            // What the client must have put on the wire, byte for byte: C
+            // `restoreSettings` (asynInterposeCom.c:740-756) on a default port.
+            let mut want = vec![
+                IAC,
+                DO_B,
+                0, // :740  IAC DO  BINARY
+                IAC,
+                WILL_B,
+                0, // :742  IAC WILL BINARY
+                IAC,
+                WILL_B,
+                COM_PORT_OPTION, // :744  IAC WILL COM-PORT-OPTION
+            ];
+            want.extend_from_slice(&sb(&[11, 0])); // SET-MODEMSTATE-MASK 0
+            want.extend_from_slice(&sb(&[1, 0x00, 0x00, 0x25, 0x80])); // 9600, big-endian
+            want.extend_from_slice(&sb(&[2, 8]));
+            want.extend_from_slice(&sb(&[3, 1]));
+            want.extend_from_slice(&sb(&[4, 1]));
+            want.extend_from_slice(&sb(&[5, 1])); // crtscts "N" -> current mode
+            want.extend_from_slice(&sb(&[5, 1])); // ixon    "N" -> current mode
+            let mut got = vec![0u8; want.len()];
+            stream.read_exact(&mut got).unwrap();
+            assert_eq!(got, want, "connect must emit C's RFC 2217 handshake");
+
+            // Now the device write. The caller sent 3 bytes containing one IAC,
+            // so 4 must arrive: the IAC is doubled on the wire.
+            let mut got = [0u8; 4];
+            stream.read_exact(&mut got).unwrap();
+            assert_eq!(got, [b'A', IAC, IAC, b'B'], "device write must be stuffed");
+
+            // Reply with a stuffed IAC of our own.
+            stream.write_all(&[b'X', IAC, IAC, b'Y']).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut drv = DrvAsynIPPort::new("comtest", &format!("127.0.0.1:{port} COM")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+
+        // The handshake ran and the server's echoes landed in the cached state.
+        assert_eq!(drv.get_option("baud").unwrap(), "9600");
+        assert_eq!(drv.get_option("bits").unwrap(), "8");
+        assert_eq!(drv.get_option("parity").unwrap(), "none");
+        assert_eq!(drv.get_option("stop").unwrap(), "1");
+
+        // Data path out: 3 caller bytes, one of them an IAC. The interpose
+        // reports the caller's count, not the 4 bytes it put on the wire.
+        let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let n = drv.write_octet(&mut wuser, &[b'A', IAC, b'B']).unwrap();
+        assert_eq!(n, 3);
+
+        // Data path in: 4 wire bytes unstuff to 3.
+        let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        let mut buf = [0u8; 16];
+        let n = drv.read_octet(&ruser, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[b'X', IAC, b'Y']);
+
+        server.join().unwrap();
+    }
+
+    /// R8-57: an option write on a live COM port must reach the wire as a
+    /// COM-PORT-OPTION subnegotiation — C routes `setOption` through the
+    /// interposed asynOption interface (asynInterposeCom.c:809-824), not into
+    /// the IP driver's option map.
+    #[test]
+    fn set_option_on_a_live_com_port_negotiates_with_the_server() {
+        use crate::interpose::com::{IAC, SB, SE};
+
+        let (listener, port) = start_echo_server();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            // Refuse the opening handshake so connect() takes the "report and
+            // carry on" path (C exceptionHandler, :770-772) and the link stays
+            // up — this test is about the later setOption, not the handshake.
+            stream.write_all(&[IAC, 252, 0]).unwrap(); // IAC WONT BINARY
+            stream.flush().unwrap();
+
+            // Drain the one handshake frame the client got out before the
+            // refusal stopped it: IAC DO BINARY.
+            let mut hs = [0u8; 3];
+            stream.read_exact(&mut hs).unwrap();
+            assert_eq!(hs, [IAC, 253, 0]);
+
+            // Now answer one SET-BAUDRATE with the rate applied.
+            let mut req = [0u8; 10];
+            stream.read_exact(&mut req).unwrap();
+            assert_eq!(
+                req,
+                [IAC, SB, 44, 1, 0x00, 0x01, 0xC2, 0x00, IAC, SE],
+                "115200 baud must go out as a big-endian SET-BAUDRATE"
+            );
+            let mut ack = vec![IAC, SB, 44, 101, 0x00, 0x01, 0xC2, 0x00];
+            ack.extend_from_slice(&[IAC, SE]);
+            stream.write_all(&ack).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut drv = DrvAsynIPPort::new("comtest2", &format!("127.0.0.1:{port} COM")).unwrap();
+        let user = AsynUser::default();
+        // A refused handshake does not fail the connect — C only prints.
+        drv.connect(&user).unwrap();
+        assert!(drv.base.is_connected());
+
+        drv.set_option("baud", "115200").unwrap();
+        assert_eq!(drv.get_option("baud").unwrap(), "115200");
+
+        server.join().unwrap();
     }
 
     #[test]
@@ -2319,28 +2565,62 @@ mod tests {
         );
     }
 
-    /// R8-50: `host:port COM` is a protocol C accepts (drvAsynIPPort.c:364-367
-    /// sets `isCom`, :1061 installs `asynInterposeCOM`). asyn-rs has not ported
-    /// the RFC 2217 layer, and the suffix whitelist used to leave the token
-    /// glued to the port number — so the IOC got "invalid port number: '5000
-    /// COM'", a message that names the wrong thing. Refuse the configuration
-    /// with the real reason instead. Connecting as plain TCP is not an option:
-    /// C negotiates the serial line over the wire, so a raw stream is a
-    /// different conversation with the terminal server.
+    /// R8-57 (superseding R8-50): `host:port COM` is now accepted, because the
+    /// RFC 2217 layer it needs exists (`interpose::com`). C parses the token
+    /// case-insensitively (`epicsStrCaseCmp`, drvAsynIPPort.c:364).
+    ///
+    /// R8-50 refused the token outright — correctly, while the layer was
+    /// missing, since a COM port run as a raw TCP stream is a different
+    /// conversation with the terminal server. That refusal is now gone; this
+    /// test is what stops it coming back as a "safe" default.
     #[test]
-    fn com_protocol_is_refused_by_name_not_misreported_as_a_bad_port() {
+    fn com_protocol_is_accepted_case_insensitively() {
         for spec in ["1.2.3.4:5000 COM", "1.2.3.4:5000 com", "host:23 Com"] {
-            let err = IpPortConfig::parse(spec).unwrap_err();
-            let msg = err.message();
-            assert!(
-                msg.contains("COM interpose not supported"),
-                "{spec}: expected the COM diagnostic, got {msg:?}"
-            );
-            assert!(
-                !msg.contains("invalid port"),
-                "{spec}: must not blame the port number, got {msg:?}"
-            );
+            let cfg = IpPortConfig::parse(spec).unwrap();
+            assert_eq!(cfg.protocol, IpProtocol::Com, "{spec}");
         }
+        // C :364-367 leaves socketType = SOCK_STREAM, so the port number parses
+        // out of the address exactly as it does for TCP.
+        let cfg = IpPortConfig::parse("1.2.3.4:5000 COM").unwrap();
+        assert_eq!(cfg.host, "1.2.3.4");
+        assert_eq!(cfg.port, 5000);
+    }
+
+    /// R8-57: `isCom` is what gates the interpose install (C drvAsynIPPort.c
+    /// :1061), so a COM port must come up with the IAC layer already on its
+    /// octet stack — before the first transfer, not lazily at connect — and a
+    /// TCP port must not.
+    #[test]
+    fn com_port_installs_the_iac_interpose_at_configure_time() {
+        let com = DrvAsynIPPort::new("comport", "1.2.3.4:5000 COM").unwrap();
+        assert_eq!(com.base.interpose_octet.len(), 1);
+        assert!(com.com.is_some());
+
+        let tcp = DrvAsynIPPort::new("tcpport", "1.2.3.4:5000 TCP").unwrap();
+        assert_eq!(tcp.base.interpose_octet.len(), 0);
+        assert!(tcp.com.is_none());
+    }
+
+    /// R8-57: C interposes the COM asynOption interface *above* the IP driver's
+    /// (asynInterposeCom.c:809-824), so the seven serial keys are answered by the
+    /// negotiation and everything else falls through to the driver below
+    /// (:710-717). Reading `baud` off a COM port must not reach the IP driver's
+    /// option map, and reading `hostInfo` must still reach it.
+    #[test]
+    fn com_option_interface_is_layered_over_the_ip_drivers() {
+        let com = DrvAsynIPPort::new("comport", "1.2.3.4:5000 COM").unwrap();
+        // Answered by the interpose, from the defaults C installs (:837-841).
+        assert_eq!(com.get_option("baud").unwrap(), "9600");
+        assert_eq!(com.get_option("parity").unwrap(), "none");
+        assert_eq!(com.get_option("crtscts").unwrap(), "N");
+        // Not the interpose's key: falls through to the IP driver.
+        assert_eq!(com.get_option("hostInfo").unwrap(), "1.2.3.4:5000 COM");
+        assert_eq!(com.get_option("disconnectOnReadTimeout").unwrap(), "N");
+
+        // A plain TCP port has no COM layer, so the serial keys are unknown to it
+        // — the same asynError C's IP driver returns for an unsupported key.
+        let tcp = DrvAsynIPPort::new("tcpport", "1.2.3.4:5000 TCP").unwrap();
+        assert!(tcp.get_option("baud").is_err());
     }
 
     /// R8-50: the token classification is exhaustive, so an unknown protocol is

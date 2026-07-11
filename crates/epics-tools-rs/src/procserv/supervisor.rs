@@ -249,6 +249,44 @@ impl SupervisorState {
                 "procserv-rs: unable to write PID file; continuing without it"
             );
         }
+
+        // Publish the supervisor's identity + control endpoints ONCE, here at
+        // startup, before the main loop and before any child exists — C calls
+        // `setEnvVar()` then `writeInfoFile(infofile)` at `procServ.cc:559-563`,
+        // between `writePidFile` and the poll loop, with no dependency on the
+        // child ever being spawned. Both values (supervisor pid, listening
+        // addresses) are fixed for the supervisor's lifetime, so startup is the
+        // only moment they need to be published.
+        //
+        // Publishing this on the child-spawn path instead left the info file
+        // absent for the whole `--wait` window: under manual start there is no
+        // initial spawn, so a manager had no file to read the control endpoint
+        // from — and reading that endpoint is how it would issue the manual
+        // start. Chicken-and-egg.
+        let info = InfoSnapshot {
+            // C `writeInfoFile` / `setEnvVar` emit `getpid()` — the supervisor
+            // pid, which manage-procs probes for liveness (procServ.cc:938,946),
+            // NOT the child's.
+            procserv_pid: std::process::id() as i32,
+            addresses: super::sidecar::listen_addresses(&config.listen),
+        };
+        // SAFETY: PROCSERV_INFO is process-wide. Setting env in a running
+        // multi-threaded program is racy on POSIX; we accept that risk because
+        // (a) this is the single writer, and it runs once at startup before any
+        // child is spawned, (b) the child gets a fresh copy via execvp at fork
+        // time, so a torn read in another supervisor thread is harmless.
+        unsafe { std::env::set_var("PROCSERV_INFO", render_procserv_info_env(&info)) };
+        if let Some(p) = &config.logging.info_path
+            && let Err(e) = write_info_file(p, &info)
+        {
+            // Same "warn and run anyway" contract as the pid file above.
+            tracing::error!(
+                path = %p.display(),
+                error = %e,
+                "procserv-rs: unable to write info file; continuing without it"
+            );
+        }
+
         let log = if let Some(p) = &config.logging.log_path {
             // The LOG uses `stamp_log` + `stamp_format` (raw line prefix),
             // not the banner-facing `time_format`. With `stamp_log` off
@@ -672,28 +710,15 @@ impl SupervisorState {
         }
     }
 
-    /// Spawn the configured child and store the handle. Updates
-    /// info-file + `PROCSERV_INFO` env var.
+    /// Spawn the configured child and store the handle.
     ///
-    /// Both carry supervisor identity (pid) + listening addresses, which are
-    /// fixed for the supervisor's lifetime — C writes them once at startup
-    /// (`procServ.cc:560-563`) and neither holds the child pid. We set the env
-    /// BEFORE `ChildHandle::spawn` so the child inherits it via `execvp`; the
-    /// info-file rewrite per respawn is idempotent (same bytes).
+    /// The info file and `PROCSERV_INFO` are NOT written here: both carry
+    /// supervisor identity (pid) + listening addresses, which are fixed for the
+    /// supervisor's lifetime, and C publishes them once at startup
+    /// (`procServ.cc:559-563`) independently of any child. `bootstrap` is that
+    /// single publish site — it runs before the first spawn, so the child still
+    /// inherits `PROCSERV_INFO` via `execvp`.
     async fn respawn_child(&mut self) -> ProcServResult<()> {
-        let info = InfoSnapshot {
-            // C writeInfoFile/setEnvVar emit getpid() — the supervisor pid,
-            // which manage-procs probes for liveness (procServ.cc:938,946).
-            procserv_pid: std::process::id() as i32,
-            addresses: super::sidecar::listen_addresses(&self.config.listen),
-        };
-        // SAFETY: PROCSERV_INFO is process-wide. Setting env in a
-        // running multi-threaded program is racy on POSIX; we accept
-        // that risk because (a) only this supervisor task touches it,
-        // (b) the child gets a fresh copy via execvp at fork time, so
-        // a torn read in another supervisor thread is harmless.
-        unsafe { std::env::set_var("PROCSERV_INFO", render_procserv_info_env(&info)) };
-
         // C `processFactory` announces the (re)launch BEFORE forking
         // (processFactory.cc:66-72), naming the executable when it differs
         // from the display name. C prints this on the first launch too,
@@ -726,10 +751,6 @@ impl SupervisorState {
             child_exec: self.config.child.child_exec.clone(),
         };
         let (handle, rx) = ChildHandle::spawn(&spec)?;
-
-        if let Some(p) = &self.config.logging.info_path {
-            let _ = write_info_file(p, &info);
-        }
 
         // A child is now running, so any holdoff that was waiting to
         // relaunch one is satisfied — clear it here (the single owner of

@@ -1172,3 +1172,62 @@ async fn clean_shutdown_removes_both_the_info_and_pid_files() {
         "clean shutdown must unlink the pid file (C: unlink(pidFile))"
     );
 }
+
+/// R8-19: C writes the info file at startup — `setEnvVar()` then
+/// `writeInfoFile(infofile)` at `procServ.cc:559-563`, between the pid file
+/// and the poll loop, with no dependency on the child ever being spawned.
+/// Rust wrote it on the child-spawn path, so under `--wait` (manual start,
+/// no initial spawn) the file was absent for the whole wait window: a
+/// manager had nothing to read the control endpoint from, and reading that
+/// endpoint is how it would issue the manual start.
+#[tokio::test]
+async fn info_file_is_published_at_startup_even_under_wait_for_manual_start() {
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    let dir = tempfile::tempdir().unwrap();
+    let info = dir.path().join("ioc.info");
+    cfg.logging.info_path = Some(info.clone());
+    cfg.wait_for_manual_start = true; // --wait: no initial child spawn
+
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // The control port is up (the manager's other discovery path), so the
+    // info file must already be there — that is the whole point of writing
+    // it before the main loop.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => break,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+            Err(e) => panic!("could not connect: {e}"),
+        }
+    }
+
+    let body = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(&info) {
+                Ok(s) if !s.is_empty() => break s,
+                _ if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
+                _ => panic!(
+                    "info file must exist while --wait blocks the initial spawn \
+                     (C writes it at startup, before the main loop)"
+                ),
+            }
+        }
+    };
+
+    assert!(
+        body.contains(&format!("pid:{}", std::process::id())),
+        "info file must carry the supervisor pid; got: {body:?}"
+    );
+    assert!(
+        body.contains(&format!("tcp:127.0.0.1:{port}")),
+        "info file must carry the control endpoint the manager connects to; got: {body:?}"
+    );
+
+    server_task.abort();
+}

@@ -722,13 +722,23 @@ impl NDPluginProcess for CircularBuffProcessor {
             self.buffer
                 .set_flush_on_soft_trigger(params.value.as_i32() != 0);
         } else if Some(reason) == self.params.soft_trigger {
-            if params.value.as_i32() != 0 {
-                self.buffer.trigger();
-                // C writeInt32(SoftTrigger) posts the trigger flag straight from
-                // the write (NDPluginCircularBuff.cpp:270) — the flushing frames
-                // that follow never touch it again.
-                if let Some(idx) = self.params.triggered {
-                    updates.push(ParamUpdate::int32(idx, 1));
+            // C writeInt32(NDCircBuffSoftTrigger) (NDPluginCircularBuff.cpp:266-278)
+            // does NOT look at `value`: it stores it, then latches
+            // NDCircBuffTriggered = 1 unconditionally (:271). `caput SoftTrigger 0`
+            // therefore triggers on C exactly like `caput SoftTrigger 1` — the
+            // written value only decides whether processCallbacks re-asserts the
+            // latch on each frame (:124), and the latch is already set either way.
+            self.buffer.trigger();
+            if let Some(idx) = self.params.triggered {
+                updates.push(ParamUpdate::int32(idx, 1));
+            }
+            // C `:273-277`: when FlushOnSoftTrig > 0 the pre-buffer is flushed
+            // from the write itself, not lazily on the next frame — the ring
+            // reaches the downstream plugins before any post-trigger frame.
+            if self.buffer.flush_on_soft_trigger {
+                let flushed = self.buffer.flush_pre_buffer();
+                if !flushed.is_empty() {
+                    return ParamChangeResult::combined(flushed, updates);
                 }
             }
         } else if Some(reason) == self.params.trigger_a {
@@ -1532,6 +1542,93 @@ mod tests {
         let r = p.process_array(&frame(), &pool);
         assert!(int32s(&r).contains(&(16, 1)));
         assert!(int32s(&r).contains(&(13, 0)));
+    }
+
+    #[test]
+    fn test_soft_trigger_write_latches_for_any_value_and_flushes() {
+        // R8-72. C writeInt32(NDCircBuffSoftTrigger) (NDPluginCircularBuff.cpp:266-278)
+        // ignores `value` when latching: it sets NDCircBuffTriggered = 1
+        // unconditionally (:271), so `caput SoftTrigger 0` triggers too; and when
+        // FlushOnSoftTrig > 0 it calls flushPreBuffer() from the write itself
+        // (:276-277) rather than waiting for the next frame.
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+
+        let soft_trigger_write = |p: &mut CircularBuffProcessor, value: i32| {
+            let reason = p.params.soft_trigger.unwrap();
+            p.on_param_change(
+                reason,
+                &PluginParamSnapshot {
+                    enable_callbacks: true,
+                    reason,
+                    addr: 0,
+                    value: ParamChangeValue::Int32(value),
+                },
+            )
+        };
+        let processor = |flush_on_soft_trig: bool| {
+            let mut p = CircularBuffProcessor::new(3, 2, TriggerCondition::External, 100);
+            p.params.soft_trigger = Some(20);
+            p.params.triggered = Some(21);
+            p.buffer.set_flush_on_soft_trigger(flush_on_soft_trig);
+            let pool = NDArrayPool::new(0);
+            // Two frames into the pre-buffer.
+            for id in 1..=2 {
+                let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+                a.unique_id = id;
+                p.process_array(&a, &pool);
+            }
+            assert_eq!(p.buffer().pre_buffer_len(), 2);
+            p
+        };
+
+        // FlushOnSoftTrig = 0: value 0 still latches the trigger, and the ring
+        // stays put (it flushes lazily with the first post-trigger frame).
+        let mut p = processor(false);
+        let r = soft_trigger_write(&mut p, 0);
+        assert!(
+            p.buffer().is_triggered(),
+            "C latches Triggered=1 for value 0"
+        );
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 21,
+                value: 1,
+                ..
+            }
+        )));
+        assert!(
+            r.output_arrays.is_empty(),
+            "no flush when FlushOnSoftTrig = 0"
+        );
+        assert_eq!(p.buffer().pre_buffer_len(), 2);
+
+        // FlushOnSoftTrig = 1: the write itself flushes the pre-buffer, in order.
+        let mut p = processor(true);
+        let r = soft_trigger_write(&mut p, 0);
+        assert!(p.buffer().is_triggered());
+        let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids, vec![1, 2], "pre-buffer flushed from the write");
+        assert_eq!(p.buffer().pre_buffer_len(), 0);
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 21,
+                value: 1,
+                ..
+            }
+        )));
+
+        // The next frame is the first post-trigger frame; the ring is already
+        // drained, so C's second flushPreBuffer() (:165) is a no-op and only the
+        // new frame is forwarded.
+        let pool = NDArrayPool::new(0);
+        let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        a.unique_id = 3;
+        let r = p.process_array(&a, &pool);
+        let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+        assert_eq!(ids, vec![3], "pre-buffer already flushed, not re-emitted");
     }
 
     #[test]

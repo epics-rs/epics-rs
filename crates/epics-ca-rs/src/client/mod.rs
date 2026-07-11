@@ -2633,10 +2633,10 @@ impl CaChannel {
     /// indices should still go through [`Self::put`] with
     /// [`EpicsValue::Enum`].
     ///
-    /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so `value` is
-    /// truncated to 39 bytes + NUL on the wire (same fixed-buffer limit
-    /// as C `caput`). ENUM menu names are well within this; callers
-    /// writing longer strings should expect silent truncation.
+    /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so a `value` of 40
+    /// bytes or more is REJECTED (`ECA_STRTOBIG`), not truncated — libca
+    /// `nciu::stringVerify` refuses it before the request is queued (R6-29).
+    /// ENUM menu names are well within the 39-byte cap.
     pub async fn put_string(&self, value: &str) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, 1)?;
@@ -2681,9 +2681,9 @@ impl CaChannel {
     ///
     /// This is the ENUM-waveform-by-name path: C `caput -a` on a
     /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
-    /// **server** resolves each menu string. Each element is subject to
-    /// the same fixed 40-byte field truncation (39 bytes + NUL) as
-    /// [`Self::put_string`].
+    /// **server** resolves each menu string. Each element is subject to the
+    /// same 39-byte cap as [`Self::put_string`]: an over-long element is
+    /// rejected with `ECA_STRTOBIG`, not truncated.
     pub async fn put_string_array(&self, values: &[String]) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, values.len() as u32)?;

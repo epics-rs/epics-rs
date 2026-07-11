@@ -986,3 +986,45 @@ fn p1_empty_array_all_dbr_types_round_trip() {
         assert_eq!(back, *expected, "round-trip {t:?}");
     }
 }
+
+/// R6-74 — the server's DBR_STRING reply of an over-long stored string must
+/// TRUNCATE and succeed, not error.
+///
+/// C `getStringString` (`dbConvert.c:132-154`) is the read-side conversion for
+/// a `DBF_STRING` field: it caps the copy at `MAX_STRING_SIZE - 1 = 39` bytes,
+/// force-NUL-terminates, and returns 0. A `DESC` field is `size(41)`, so a C
+/// IOC really can hold 40 chars and really does serve them as 39 + NUL — no
+/// `ECA_BADCOUNT`, which is raised only on the libca *put* side
+/// (`nciu::stringVerify`, already enforced by `validate_put_strings` on every
+/// client put entry point).
+///
+/// This test pins the boundary so the truncation is not "fixed" into an error:
+/// on the reply path, truncating IS the C behaviour.
+#[test]
+fn r6_74_server_string_reply_truncates_to_39_bytes_and_nul_like_c_getstringstring() {
+    // 39 bytes — the longest string that survives intact.
+    let exact = "a".repeat(39);
+    let bytes = EpicsValue::String(exact.clone().into()).to_bytes();
+    assert_eq!(bytes.len(), 40, "DBR_STRING is a fixed 40-byte field");
+    assert_eq!(&bytes[..39], exact.as_bytes());
+    assert_eq!(bytes[39], 0, "byte 39 must be the NUL terminator");
+
+    // 40 and 45 bytes — C copies 39 and NUL-terminates (strncpy + pdst[39] = 0).
+    for len in [40usize, 45] {
+        let long = "b".repeat(len);
+        let bytes = EpicsValue::String(long.clone().into()).to_bytes();
+        assert_eq!(bytes.len(), 40, "the field stays 40 bytes wide");
+        assert_eq!(
+            &bytes[..39],
+            &long.as_bytes()[..39],
+            "the first 39 bytes are copied verbatim"
+        );
+        assert_eq!(bytes[39], 0, "byte 39 must be the NUL terminator");
+        // …and it decodes back to the 39-byte prefix, exactly what a C client
+        // of a C IOC would see.
+        match EpicsValue::from_bytes(DbFieldType::String, &bytes).unwrap() {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), &long.as_bytes()[..39]),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+}

@@ -557,3 +557,142 @@ async fn monitor_dbe_recognized_token_emits_no_message() {
         "an honored DBE selection must draw no CMD_MESSAGE"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R7-33 — record._options.process with an unsupported value
+// ---------------------------------------------------------------------------
+
+/// Run a single-record PUT INIT + PUT with `record._options.process` set
+/// to `value`, and return every frame up to and including the PUT reply.
+fn put_with_process(
+    c: &mut FrameReader,
+    codec: &PvaCodec,
+    sid: u32,
+    ioid: u32,
+    value: PvField,
+) -> Vec<Frame> {
+    let req = pv_request_with_options(&[("process", value)]);
+    c.send(&codec.build_put_init(sid, ioid, &req));
+    let desc = put_init_desc(c, ioid);
+    put_all_marked(c, codec, sid, ioid, &desc);
+
+    let mut frames = Vec::new();
+    for _ in 0..4 {
+        let f = c.read();
+        let is_reply = f.header.command == CMD_PUT;
+        frames.push(f);
+        if is_reply {
+            return frames;
+        }
+    }
+    panic!("no PUT reply within 4 frames");
+}
+
+/// pvxs `iocsource.cpp:436-447`: `record._options.process` is read with
+/// `as<bool>`; a value that fails that AND is not the literal `"passive"`
+/// is "unsupported" — processing stays at the passive default and pvxs
+/// names the option and its value to the client. Rust collapsed it into a
+/// silent passive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_unsupported_process_option_warns_over_the_wire() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 61;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let frames = put_with_process(
+        &mut c,
+        &codec,
+        sid,
+        ioid,
+        PvField::Scalar(ScalarValue::String("bogus".into())),
+    );
+
+    let messages: Vec<_> = frames
+        .iter()
+        .filter(|f| f.header.command == Command::Message.code())
+        .map(parse_message_frame)
+        .collect();
+    assert_eq!(messages.len(), 1, "one diagnostic owed, got {messages:?}");
+    let (msg_ioid, mtype, text) = &messages[0];
+    assert_eq!(*msg_ioid, ioid, "the diagnostic carries the PUT's ioid");
+    assert_eq!(*mtype, MessageType::Warning as u8);
+    // pvxs streams the offending Value through its default (tree)
+    // formatter — `SB()<<proc` yields `string = "bogus"` plus the
+    // formatter's trailing newline (datafmt.cpp:187-211).
+    assert_eq!(
+        text, "Ignoring unsupported record._options.process: string = \"bogus\"\n",
+        "the message names the option AND renders its value like pvxs"
+    );
+
+    // The diagnostic does not change the outcome: the PUT still lands.
+    let reply = frames.last().expect("PUT reply");
+    assert_eq!(reply.header.command, CMD_PUT);
+    let mut cur = reply.cursor();
+    assert_eq!(cur.get_u32(ORDER).unwrap(), ioid);
+    let _subcmd = cur.get_u8().unwrap();
+    let st = Status::decode(&mut cur, ORDER).unwrap();
+    assert!(st.is_success(), "PUT still succeeds: {st:?}");
+}
+
+/// The distinction R7-33 restores: an explicit `"passive"` is a SUPPORTED
+/// spelling of the default (pvxs `iocsource.cpp:440-443` returns before
+/// the log) and must stay silent, even though it maps to the same
+/// ProcessMode as the unsupported value above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_explicit_passive_process_option_emits_no_message() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 62;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let frames = put_with_process(
+        &mut c,
+        &codec,
+        sid,
+        ioid,
+        PvField::Scalar(ScalarValue::String("passive".into())),
+    );
+    assert_eq!(
+        frames.len(),
+        1,
+        "explicit \"passive\" is supported — the PUT reply must be the only frame"
+    );
+    assert_eq!(frames[0].header.command, CMD_PUT);
+}
+
+/// Control: a value `as<bool>` accepts (here a bool-typed `true`) is
+/// honored, not warned about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_bool_process_option_emits_no_message() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 63;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let frames = put_with_process(
+        &mut c,
+        &codec,
+        sid,
+        ioid,
+        PvField::Scalar(ScalarValue::Boolean(true)),
+    );
+    assert_eq!(
+        frames.len(),
+        1,
+        "an as<bool>-convertible process option draws no CMD_MESSAGE"
+    );
+    assert_eq!(frames[0].header.command, CMD_PUT);
+}

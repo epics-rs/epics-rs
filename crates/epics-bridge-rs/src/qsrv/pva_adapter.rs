@@ -449,8 +449,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 _ => None,
             };
             let opts = match init_req {
-                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log),
+                None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
             };
             let channel = provider
                 .create_channel_with_creds(&name, ctx_to_creds(&ctx))
@@ -543,8 +543,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => PvStructure::new(""),
                     };
                     let opts = match init_req {
-                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                        Some(req) => {
+                            crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
+                        }
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
                     };
                     let atomic_override = match init_req {
                         Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
@@ -574,8 +576,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         }
                     };
                     let opts = match init_req {
-                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                        Some(req) => {
+                            crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
+                        }
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
                     };
                     single
                         .put_with_options(&pv, opts)

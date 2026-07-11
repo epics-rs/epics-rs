@@ -1810,7 +1810,7 @@ impl super::provider::Channel for GroupChannel {
         // carry per-operation options inside the data-phase structure.
         // The native PVA wire path uses `put_with_options` instead so
         // INIT-pvRequest options are honored — see that method.
-        let opts = super::channel::PutOptions::from_pv_request(value);
+        let opts = super::channel::PutOptions::from_pv_request(value, &RemoteLog::default());
         let atomic_override = super::channel::atomic_from_pv_request(value);
         // In-process callers have no client connection: pvxs's
         // `logRemote` diagnostics have nowhere to go, so the sink is a

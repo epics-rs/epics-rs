@@ -1359,10 +1359,12 @@ fn test_bumpless_edge_emits_outl_readback_for_db_link() {
             a,
             ProcessAction::ReadDbLink {
                 link_field: "OUTL",
-                target_field: "I"
+                target_field: "__OUTL_SEED"
             }
         )),
-        "bumpless OFF->ON edge with a DB OUTL must read OUTL into I"
+        "bumpless OFF->ON edge with a DB OUTL must read OUTL — into the \
+         internal staging cell, since C only commits it to I inside do_pid, \
+         past the MDT gate (devEpidSoft.c:125,155), got {actions:?}"
     );
 }
 
@@ -1687,23 +1689,86 @@ fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
             a,
             ProcessAction::ReadDbLink {
                 link_field: "OUTL",
-                target_field: "OVAL"
+                target_field: "__OUTL_SEED"
             }
         )),
-        "MaxMin bumpless OFF->ON edge with a DB OUTL must read OUTL into \
-         OVAL (devEpidSoft.c:181 reads into &oval), got {actions:?}"
+        "MaxMin bumpless OFF->ON edge with a DB OUTL must read OUTL into the \
+         internal staging cell, got {actions:?}"
     );
-    // The MaxMin edge must NOT seed the integral term I (that is the
-    // PID-mode target — devEpidSoft.c:155 reads into &i).
+    // The readback must not be committed to ANY CA-visible field before
+    // `do_pid` runs — C reads OUTL inside do_pid, past the MDT gate.
     assert!(
         !actions.iter().any(|a| matches!(
             a,
             ProcessAction::ReadDbLink {
-                target_field: "I",
+                target_field: "I" | "OVAL",
                 ..
             }
         )),
-        "MaxMin edge must NOT read OUTL into I — that is PID-mode only"
+        "the pre-process read must not land in I or OVAL, got {actions:?}"
+    );
+
+    // `do_pid` is where C routes the seed by FMOD: MaxMin (fmod==1) puts it in
+    // OVAL (devEpidSoft.c:181 reads into &oval), never in I (:155, PID-only).
+    rec.mdt = 0.0;
+    rec.i = 0.0;
+    rec.oval = 0.0;
+    rec.drvh = 100.0;
+    rec.drvl = -100.0;
+    rec.inp = "SENSOR".to_string();
+    rec.put_field_internal("__OUTL_SEED", EpicsValue::Double(7.0))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+    assert!(
+        (rec.oval - 7.0).abs() < 1e-9,
+        "MaxMin edge seeds OVAL from the OUTL readback, got {}",
+        rec.oval
+    );
+    assert_eq!(rec.i, 0.0, "MaxMin edge must not touch I");
+}
+
+/// R7-64: C `devEpidSoft.c:125` — `if (dt < pepid->mdt) return(1);` runs
+/// BEFORE the OUTL seed (`:150-158`). On a sub-MDT cycle the staged readback
+/// must NOT reach `.I`, and FBOP must stay 0 so the edge survives to the next
+/// cycle that actually computes.
+#[test]
+fn test_bumpless_seed_is_gated_by_mdt() {
+    let mut rec = EpidRecord::default();
+    rec.inp = "SENSOR".to_string();
+    rec.fmod = 0; // PID
+    rec.kp = 1.0;
+    rec.ki = 0.5;
+    rec.drvh = 100.0;
+    rec.drvl = -100.0;
+    rec.fbon = 1;
+    rec.fbop = 0; // OFF -> ON edge
+    rec.i = 0.0;
+    // A long minimum delta-t: this cycle is sub-MDT.
+    rec.mdt = 100.0;
+
+    // The framework stages the OUTL readback before process().
+    rec.put_field_internal("__OUTL_SEED", EpicsValue::Double(7.0))
+        .unwrap();
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+
+    assert_eq!(
+        rec.i, 0.0,
+        "a sub-MDT cycle must not commit the OUTL readback to I"
+    );
+    assert_eq!(
+        rec.fbop, 0,
+        "a sub-MDT cycle commits nothing, so the OFF->ON edge survives"
+    );
+
+    // Same staged value, now on a cycle that clears the MDT gate: seeded.
+    rec.mdt = 0.0;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut rec);
+    assert!(
+        (rec.i - 7.0).abs() < 1e-9,
+        "the post-MDT cycle seeds I from the OUTL readback, got {}",
+        rec.i
     );
 }
 

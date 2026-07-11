@@ -21,6 +21,14 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 const EPID_FMOD_CHOICES: &[&str] = &["PID", "Max/Min"];
 const EPID_FBSTATE_CHOICES: &[&str] = &["Off", "On"];
 
+/// `ReadDbLink` target for the bumpless-transfer OUTL readback.
+///
+/// Deliberately NOT a `.dbd` field: it names the internal staging cell
+/// [`EpidRecord::outl_seed`], not a CA-visible one. C reads OUTL inside
+/// `do_pid`, after the MDT gate, so the value must not be observable (nor
+/// monitor-posted) on a cycle C would have gated — see `pre_process_actions`.
+const OUTL_SEED_FIELD: &str = "__OUTL_SEED";
+
 /// Feedback mode for the epid record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i16)]
@@ -227,6 +235,20 @@ pub struct EpidRecord {
     /// only on this success — a STPL that is empty, or a DB/CA link
     /// whose fetch failed, leaves `udf` set.
     stpl_resolved: bool,
+    /// The OUTL readback captured for THIS cycle's bumpless turn-on, or
+    /// `None` if OUTL was not read.
+    ///
+    /// C reads OUTL *inside* `do_pid`, after the `if (dt<pepid->mdt)
+    /// return(1);` gate (`devEpidSoft.c:125`), and lands the value straight in
+    /// `do_pid`'s local `i` / `oval` (`:150-158`, `:178-184`) — a sub-MDT (or
+    /// UDF-gated) cycle therefore never reads OUTL and never touches `.I` /
+    /// `.OVAL`. The framework's `ReadDbLink` can only run *before* `process()`,
+    /// so it lands here instead of in the CA-visible field: this cell is the
+    /// staging slot, written only by that pre-process read and consumed only
+    /// by `do_pid` at C's line. A gated cycle simply leaves it unconsumed —
+    /// no field write, no monitor, and FBOP stays 0 so the next full cycle
+    /// re-reads and seeds for real.
+    pub(crate) outl_seed: Option<f64>,
     /// Framework-owned `dbCommon.dtyp`, pushed by the framework via
     /// [`Record::set_process_context`] before the input-link fetch.
     /// C device support for the epid record lives in two distinct
@@ -340,6 +362,7 @@ impl Default for EpidRecord {
             compute_skipped: false,
             outl_write: false,
             stpl_resolved: false,
+            outl_seed: None,
             // C `epidRecord.c` init: `udf` starts TRUE and is cleared
             // only by the two clear-conditions — see `value_undefined`.
             value_undefined: true,
@@ -739,25 +762,32 @@ impl Record for EpidRecord {
     ///     readback lands in the output value `OVAL`.
     ///
     /// The Rust framework's `ReadDbLink` pre-process action performs
-    /// exactly that synchronous read of the DB link's target value into
-    /// a record field, executed BEFORE `process()` / `do_pid` runs.
+    /// exactly that synchronous read of the DB link's target value, but it
+    /// can only run BEFORE `process()` / `do_pid`, whereas C reads OUTL
+    /// *after* the `dt < MDT` gate (`devEpidSoft.c:125`) and the record's
+    /// UDF gate (`epidRecord.c:195`). So the read does NOT land in `.I` /
+    /// `.OVAL` here — it lands in [`EpidRecord::outl_seed`], and `do_pid`
+    /// consumes it at C's line. A cycle that C would have gated leaves the
+    /// staged value unconsumed: no field write, no monitor, and FBOP stays
+    /// 0 so the next ungated cycle re-reads and seeds for real.
     ///
     /// `FBOP` still holds the *previous* cycle's `FBON` at this point
     /// (it is committed at the end of `do_pid`), so the edge is
     /// detectable here. The action is emitted only for a non-CONSTANT
     /// `OUTL` link, mirroring C's `outl.type != CONSTANT` guard — for a
-    /// CONSTANT/empty `OUTL` the seeded field keeps its prior value.
+    /// CONSTANT/empty `OUTL` nothing is staged and the seeded field keeps
+    /// its prior value.
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        // The staged readback is per-cycle: whatever a previous cycle left
+        // behind must not be mistaken for this cycle's OUTL value.
+        self.outl_seed = None;
         let edge = self.fbon != 0 && self.fbop == 0;
         if edge {
-            // PID seeds `I` from OUTL (devEpidSoft.c:153-158);
-            // MaxMin seeds `OVAL` from OUTL (devEpidSoft.c:178-184).
-            let target_field = if self.fmod == 0 { "I" } else { "OVAL" };
             match link_field_type(&self.outl) {
                 LinkType::Db | LinkType::Ca => {
                     return vec![ProcessAction::ReadDbLink {
                         link_field: "OUTL",
-                        target_field,
+                        target_field: OUTL_SEED_FIELD,
                     }];
                 }
                 _ => {}
@@ -1373,6 +1403,16 @@ impl Record for EpidRecord {
         // Bypass read-only checks for framework-internal writes (ReadDbLink).
         // This allows the framework to write to CVAL, OVAL, etc. from link resolution.
         match name {
+            // The bumpless-transfer OUTL readback. Staged, not committed:
+            // `do_pid` moves it into `I` (PID) or `OVAL` (MaxMin) at C's line,
+            // after the MDT gate. See `OUTL_SEED_FIELD`.
+            OUTL_SEED_FIELD => match value {
+                EpicsValue::Double(v) => {
+                    self.outl_seed = Some(v);
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
             "CVAL" => match value {
                 EpicsValue::Double(v) => {
                     self.cval = v;

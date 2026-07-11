@@ -85,10 +85,6 @@ pub struct ProcessConfig {
     pub enable_filter: bool,
     pub filter: FilterConfig,
     pub output_type: Option<NDDataType>,
-    /// One-shot flag: save current input as background on next process().
-    pub save_background: bool,
-    /// One-shot flag: save current input as flat field on next process().
-    pub save_flat_field: bool,
     /// One-shot flag: compute offset/scale automatically from the next input
     /// array (C++ `NDPluginProcessAutoOffsetScale`). Cleared after it runs.
     pub auto_offset_scale_pending: bool,
@@ -116,13 +112,19 @@ impl Default for ProcessConfig {
             enable_filter: false,
             filter: FilterConfig::default(),
             output_type: None,
-            save_background: false,
-            save_flat_field: false,
             auto_offset_scale_pending: false,
             valid_background: false,
             valid_flat_field: false,
         }
     }
+}
+
+/// C++ `pNDArrayPool->convert(pArray, &pOut, NDFloat64)` reduced to what the
+/// background / flat-field buffers actually need: the elements as f64.
+fn elements_as_f64(array: &NDArray) -> Vec<f64> {
+    (0..array.data.len())
+        .map(|i| array.data.get_as_f64(i).unwrap_or(0.0))
+        .collect()
 }
 
 /// State for the process plugin (holds background, flat field, and filter state).
@@ -145,6 +147,19 @@ pub struct ProcessState {
     /// parameter at NDPluginProcess.cpp:73 and cleared at :91-93). Consumed by
     /// [`ProcessState::process`], which is the only owner allowed to act on it.
     reset_filter_pending: bool,
+    /// C++ `this->pArrays[0]`: the plugin's most recent **output** array, cached
+    /// by `NDPluginDriver::endProcessCallbacks` (NDPluginDriver.cpp:262-277) —
+    /// fully processed and already in the output data type, NOT the raw input.
+    ///
+    /// This is what SaveBackground/SaveFlatField copy
+    /// (NDPluginProcess.cpp:292, :301), so it must exist as real state; there is
+    /// no way to answer "save the current array" from an input frame.
+    ///
+    /// Invariant: written only by [`ProcessState::process`], and only on the path
+    /// that actually emits an array — a filter-suppressed frame leaves C's
+    /// `doCallbacks = 0`, so `endProcessCallbacks` never runs and `pArrays[0]`
+    /// keeps the previous output.
+    last_output: Option<NDArray>,
 }
 
 impl ProcessState {
@@ -156,29 +171,48 @@ impl ProcessState {
             filter_state: None,
             num_filtered: 0,
             reset_filter_pending: false,
+            last_output: None,
         }
     }
 
-    /// Save the current array as background.
-    pub fn save_background(&mut self, array: &NDArray) {
-        let n = array.data.len();
-        let mut bg = vec![0.0f64; n];
-        for i in 0..n {
-            bg[i] = array.data.get_as_f64(i).unwrap_or(0.0);
-        }
-        self.background = Some(bg);
-        self.config.valid_background = true;
+    /// The plugin's last output array — C++ `this->pArrays[0]`. `None` until the
+    /// first frame is emitted.
+    pub fn last_output(&self) -> Option<&NDArray> {
+        self.last_output.as_ref()
     }
 
-    /// Save the current array as flat field.
-    pub fn save_flat_field(&mut self, array: &NDArray) {
-        let n = array.data.len();
-        let mut ff = vec![0.0f64; n];
-        for i in 0..n {
-            ff[i] = array.data.get_as_f64(i).unwrap_or(0.0);
-        }
-        self.flat_field = Some(ff);
-        self.config.valid_flat_field = true;
+    /// C++ `NDPluginProcess::writeInt32(NDPluginProcessSaveBackground)`
+    /// (NDPluginProcess.cpp:287-298), performed **synchronously on the parameter
+    /// write**, not deferred to the next frame:
+    ///
+    /// ```text
+    /// setIntegerParam(SaveBackground, 0);
+    /// if (pBackground) pBackground->release();
+    /// pBackground = NULL;
+    /// setIntegerParam(ValidBackground, 0);
+    /// if (pArrays[0]) {
+    ///     convert(pArrays[0], &pBackground, NDFloat64);
+    ///     nBackgroundElements = arrayInfo.nElements;
+    ///     setIntegerParam(ValidBackground, 1);
+    /// }
+    /// ```
+    ///
+    /// So the old buffer is dropped and ValidBackground cleared even when there
+    /// is no array to save from, and the source is the last OUTPUT array — the
+    /// one this plugin already emitted, in the output data type.
+    pub fn save_background(&mut self) {
+        let saved = self.last_output.as_ref().map(elements_as_f64);
+        self.config.valid_background = saved.is_some();
+        self.background = saved;
+    }
+
+    /// C++ `NDPluginProcess::writeInt32(NDPluginProcessSaveFlatField)`
+    /// (NDPluginProcess.cpp:299-310) — the SaveBackground sequence above, on the
+    /// flat-field buffer.
+    pub fn save_flat_field(&mut self) {
+        let saved = self.last_output.as_ref().map(elements_as_f64);
+        self.config.valid_flat_field = saved.is_some();
+        self.flat_field = saved;
     }
 
     /// Auto-calculate offset and scale matching C++ NDPluginProcess.
@@ -357,16 +391,7 @@ impl ProcessState {
         let reset_requested = self.reset_filter_pending;
         self.reset_filter_pending = false;
 
-        // 0. Save background/flat field (one-shot flags)
-        if self.config.save_background {
-            self.save_background(src);
-            self.config.save_background = false;
-        }
-        if self.config.save_flat_field {
-            self.save_flat_field(src);
-            self.config.save_flat_field = false;
-        }
-        // 0b. Auto offset/scale (one-shot): C MEASURES this frame's min/max and
+        // Auto offset/scale (one-shot): C MEASURES this frame's min/max and
         // ARMS scale/offset + clipping for the NEXT frame — the trigger frame
         // itself is emitted with the pre-existing config, NOT the derived scale
         // (NDPluginProcess.cpp:164-178 only updates min/max; 238-250 arms the
@@ -564,6 +589,12 @@ impl ProcessState {
             self.auto_offset_scale(src);
         }
 
+        // C `endProcessCallbacks` caches the emitted array in pArrays[0]
+        // (NDPluginDriver.cpp:262-277). It runs only on this path — a
+        // filter-suppressed frame returned above and leaves the previous output
+        // in place. This is the ONLY writer of `last_output`.
+        self.last_output = Some(arr.clone());
+
         Some(arr)
     }
 }
@@ -669,13 +700,10 @@ impl NDPluginProcess for ProcessProcessor {
                 .param_updates
                 .push(ParamUpdate::int32(idx, self.state.num_filtered as i32));
         }
-        // Reset save_background/save_flat_field readback to 0 (one-shot)
-        if let Some(idx) = self.params.save_background {
-            result.param_updates.push(ParamUpdate::int32(idx, 0));
-        }
-        if let Some(idx) = self.params.save_flat_field {
-            result.param_updates.push(ParamUpdate::int32(idx, 0));
-        }
+        // SaveBackground/SaveFlatField are NOT touched here: C clears those PVs in
+        // writeInt32 (:288, :300), where the save itself happens. processCallbacks
+        // never writes them.
+        //
         // C clears the ResetFilter PV inside processCallbacks (:91-93), not on
         // the parameter write.
         if let Some(idx) = self.params.reset_filter {
@@ -798,14 +826,23 @@ impl NDPluginProcess for ProcessProcessor {
                 NDDataType::from_ordinal(v as u8)
             };
         } else if Some(reason) == p.save_background {
-            if params.value.as_i32() != 0 {
-                s.config.save_background = true;
+            // C `writeInt32` (:287-298) acts on ANY write to SaveBackground,
+            // including a 0 — there is no value test — and does the whole save
+            // right here: clear the PV, drop the old buffer, then copy pArrays[0]
+            // (the last OUTPUT array) if one exists and latch ValidBackground.
+            s.save_background();
+            updates.push(ParamUpdate::int32(reason, 0));
+            if let Some(idx) = p.valid_background {
+                updates.push(ParamUpdate::int32(idx, s.config.valid_background as i32));
             }
         } else if Some(reason) == p.enable_background {
             s.config.enable_background = params.value.as_i32() != 0;
         } else if Some(reason) == p.save_flat_field {
-            if params.value.as_i32() != 0 {
-                s.config.save_flat_field = true;
+            // C `writeInt32` (:299-310), same shape as SaveBackground above.
+            s.save_flat_field();
+            updates.push(ParamUpdate::int32(reason, 0));
+            if let Some(idx) = p.valid_flat_field {
+                updates.push(ParamUpdate::int32(idx, s.config.valid_flat_field as i32));
             }
         } else if Some(reason) == p.enable_flat_field {
             s.config.enable_flat_field = params.value.as_i32() != 0;
@@ -937,6 +974,19 @@ mod tests {
         arr
     }
 
+    /// Put `arr` in C's `pArrays[0]` and write SaveBackground — the only route by
+    /// which C ever fills pBackground (NDPluginProcess.cpp:293-297).
+    fn seed_background(state: &mut ProcessState, arr: &NDArray) {
+        state.last_output = Some(arr.clone());
+        state.save_background();
+    }
+
+    /// Same for the flat field (NDPluginProcess.cpp:304-308).
+    fn seed_flat_field(state: &mut ProcessState, arr: &NDArray) {
+        state.last_output = Some(arr.clone());
+        state.save_flat_field();
+    }
+
     fn make_f64_array(vals: &[f64]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
@@ -954,7 +1004,7 @@ mod tests {
             enable_background: true,
             ..Default::default()
         });
-        state.save_background(&bg_arr);
+        seed_background(&mut state, &bg_arr);
 
         let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
@@ -976,7 +1026,7 @@ mod tests {
             enable_background: true,
             ..Default::default()
         });
-        state.save_background(&bg_arr);
+        seed_background(&mut state, &bg_arr);
         assert!(state.config.valid_background); // set at save time (C writeInt32)
 
         let result = state.process(&input).unwrap();
@@ -1002,7 +1052,7 @@ mod tests {
             scale_flat_field: 100.0,
             ..Default::default()
         });
-        state.save_flat_field(&ff_arr);
+        seed_flat_field(&mut state, &ff_arr);
 
         let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
@@ -1026,7 +1076,7 @@ mod tests {
             scale_flat_field: 0.0,
             ..Default::default()
         });
-        state.save_flat_field(&ff_arr);
+        seed_flat_field(&mut state, &ff_arr);
         let result = state.process(&input).unwrap();
         if let NDDataBuffer::U8(ref v) = result.data {
             assert_eq!(v, &[0, 0, 0]);
@@ -1321,76 +1371,137 @@ mod tests {
     }
 
     #[test]
-    fn test_save_background_one_shot() {
+    fn test_r9_68_save_background_copies_the_last_output_synchronously() {
+        // R9-68. C's writeInt32(SaveBackground) (NDPluginProcess.cpp:287-298) saves
+        // `this->pArrays[0]` — the plugin's last OUTPUT array — on the spot and
+        // latches ValidBackground=1 there. The port armed a one-shot flag and saved
+        // the next frame's INPUT instead, so the background was a different array
+        // (unprocessed, and one frame late).
+        //
+        // This test replaces test_save_background_one_shot, which pinned that
+        // invented deferred-input behaviour.
         let mut state = ProcessState::new(ProcessConfig {
-            save_background: true,
+            enable_offset_scale: true,
+            offset: 0.0,
+            scale: 2.0,
+            output_type: Some(NDDataType::Float64),
             ..Default::default()
         });
 
-        assert!(!state.config.valid_background);
+        // No frame yet: C's pArrays[0] is NULL, so the save leaves the background
+        // empty and ValidBackground at 0 (:291-292 clear unconditionally, :293
+        // guards the copy).
+        state.save_background();
         assert!(state.background.is_none());
+        assert!(!state.config.valid_background);
 
-        // Process with save_background=true: should capture and clear flag
-        let input = make_array(&[10, 20, 30]);
-        let _ = state.process(&input);
+        // One frame through: input 10,20,30 → output (x + 0) * 2 = 20,40,60.
+        let out = state.process(&make_array(&[10, 20, 30])).unwrap();
+        assert_eq!(out.data.get_as_f64(0), Some(20.0));
 
-        assert!(
-            !state.config.save_background,
-            "save_background should be cleared"
-        );
+        // SaveBackground now copies THAT OUTPUT (20,40,60), not the input and not
+        // the next frame.
+        state.save_background();
         assert!(
             state.config.valid_background,
-            "valid_background should be set"
+            "ValidBackground latches at once"
         );
-        assert!(state.background.is_some());
-
         let bg = state.background.as_ref().unwrap();
-        assert_eq!(bg.len(), 3);
-        assert!((bg[0] - 10.0).abs() < 1e-9);
-        assert!((bg[1] - 20.0).abs() < 1e-9);
-        assert!((bg[2] - 30.0).abs() < 1e-9);
-
-        // Process again: flag should remain cleared, background should persist
-        let input2 = make_array(&[40, 50, 60]);
-        let _ = state.process(&input2);
-
-        assert!(
-            !state.config.save_background,
-            "save_background stays cleared"
+        assert_eq!(
+            bg.as_slice(),
+            &[20.0, 40.0, 60.0],
+            "background is the OUTPUT array"
         );
-        // Background unchanged
-        let bg2 = state.background.as_ref().unwrap();
-        assert!((bg2[0] - 10.0).abs() < 1e-9);
+
+        // The next frame must not overwrite the background — the old one-shot did.
+        let _ = state.process(&make_array(&[1, 2, 3]));
+        assert_eq!(
+            state.background.as_ref().unwrap().as_slice(),
+            &[20.0, 40.0, 60.0]
+        );
     }
 
     #[test]
-    fn test_save_flat_field_one_shot() {
+    fn test_r9_68_save_flat_field_copies_the_last_output_synchronously() {
+        // Same contract on the flat-field buffer (NDPluginProcess.cpp:299-310).
         let mut state = ProcessState::new(ProcessConfig {
-            save_flat_field: true,
+            enable_offset_scale: true,
+            offset: 1.0,
+            scale: 1.0,
+            output_type: Some(NDDataType::Float64),
             ..Default::default()
         });
 
-        assert!(!state.config.valid_flat_field);
+        state.save_flat_field();
         assert!(state.flat_field.is_none());
+        assert!(!state.config.valid_flat_field);
 
-        let input = make_array(&[50, 100, 150]);
-        let _ = state.process(&input);
+        // Output = (input + 1) * 1 → 51, 101, 151.
+        let _ = state.process(&make_array(&[50, 100, 150])).unwrap();
+        state.save_flat_field();
 
-        assert!(
-            !state.config.save_flat_field,
-            "save_flat_field should be cleared"
+        assert!(state.config.valid_flat_field);
+        assert_eq!(
+            state.flat_field.as_ref().unwrap().as_slice(),
+            &[51.0, 101.0, 151.0],
+            "flat field is the OUTPUT array, not the input"
         );
-        assert!(
-            state.config.valid_flat_field,
-            "valid_flat_field should be set"
-        );
-        assert!(state.flat_field.is_some());
 
-        let ff = state.flat_field.as_ref().unwrap();
-        assert_eq!(ff.len(), 3);
-        assert!((ff[0] - 50.0).abs() < 1e-9);
-        assert!((ff[1] - 100.0).abs() < 1e-9);
-        assert!((ff[2] - 150.0).abs() < 1e-9);
+        let _ = state.process(&make_array(&[7, 7, 7]));
+        assert_eq!(
+            state.flat_field.as_ref().unwrap().as_slice(),
+            &[51.0, 101.0, 151.0]
+        );
+    }
+
+    #[test]
+    fn test_r9_68_save_background_write_of_zero_still_saves() {
+        // C's writeInt32 branches on the FUNCTION, never on the value
+        // (NDPluginProcess.cpp:287): a caput of 0 to SaveBackground runs the same
+        // release-and-resave sequence. The port gated on `value != 0`.
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        let mut proc = ProcessProcessor::new(ProcessConfig {
+            output_type: Some(NDDataType::Float64),
+            ..Default::default()
+        });
+
+        let mut base = PortDriverBase::new("R9_68", 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+        let pool = NDArrayPool::new(1_000_000);
+        let _ = proc.process_array(&make_array(&[4, 5, 6]), &pool);
+
+        let reason = proc.params.save_background.unwrap();
+        let valid = proc.params.valid_background.unwrap();
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason,
+            addr: 0,
+            value: ParamChangeValue::Int32(0),
+        };
+        let result = proc.on_param_change(reason, &snapshot);
+
+        assert_eq!(
+            proc.state.background.as_ref().unwrap().as_slice(),
+            &[4.0, 5.0, 6.0],
+            "a 0 write saves the background too"
+        );
+        // The PV self-clears and ValidBackground is published from the same write.
+        let int_update = |r: usize| {
+            result.param_updates.iter().find_map(|u| match u {
+                ParamUpdate::Int32 {
+                    reason: ur, value, ..
+                } if *ur == r => Some(*value),
+                _ => None,
+            })
+        };
+        assert_eq!(int_update(reason), Some(0), "SaveBackground echoes 0");
+        assert_eq!(
+            int_update(valid),
+            Some(1),
+            "ValidBackground latches on the write"
+        );
     }
 
     #[test]

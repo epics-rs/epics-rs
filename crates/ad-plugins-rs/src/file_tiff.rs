@@ -165,26 +165,20 @@ impl TiffWriter {
         Self { current_path: None }
     }
 
-    fn array_color_mode(array: &NDArray) -> NDColorMode {
-        array
-            .attributes
-            .get("ColorMode")
-            .and_then(|attr| attr.value.as_i64())
-            .map(|v| NDColorMode::from_i32(v as i32))
-            .unwrap_or_else(|| match array.dims.as_slice() {
-                [a, _, _] if a.size == 3 => NDColorMode::RGB1,
-                [_, b, _] if b.size == 3 => NDColorMode::RGB2,
-                [_, _, c] if c.size == 3 => NDColorMode::RGB3,
-                _ => NDColorMode::Mono,
-            })
-    }
-
     /// C's `openFile` structure switch (NDFileTIFF.cpp:180-224). Note the two
     /// RGB planar layouts: RGB2 gets `rowsPerStrip = 1` because its rows
     /// interleave the three planes, RGB3 keeps `rowsPerStrip = sizeY` because
     /// each plane is already contiguous. Both are `PLANARCONFIG_SEPARATE`.
     fn layout(array: &NDArray) -> ADResult<TiffLayout> {
-        let color_mode = Self::array_color_mode(array);
+        // The ColorMode *attribute* is the only source of truth, defaulting to
+        // Mono when it is absent — C `int colorMode = NDColorModeMono;` (:81)
+        // overwritten only by the attribute (:135-136). `info().color_mode` is
+        // that rule's single owner. Inferring a colour layout from the dimensions
+        // instead made a 3-D array with no ColorMode attribute look like RGB1 and
+        // write a file, where C matches none of its 3-D branches (each requires
+        // the attribute, :196/:204/:212), falls through to the else, and returns
+        // asynError (:220-224).
+        let color_mode = array.info().color_mode;
         let mono = |width: usize, height: usize| TiffLayout {
             width,
             height,
@@ -667,6 +661,62 @@ mod tests {
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("adcore_test_{}_{}.tif", prefix, n))
+    }
+
+    /// R8-75: a 3-D array whose ColorMode attribute is absent is an error in C.
+    ///
+    /// C defaults `colorMode` to Mono (NDFileTIFF.cpp:81) and overwrites it only
+    /// from the attribute (:135-136). Each of the three 3-D branches requires the
+    /// attribute to name the layout (:196, :204, :212), so a 3-D array without it
+    /// matches none of them, falls to the else, and returns asynError (:220-224).
+    /// The port inferred RGB1 from `dims[0] == 3` and wrote a file.
+    #[test]
+    fn test_r8_75_3d_without_colormode_attribute_is_an_error() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        let rgb1_dims = || {
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ]
+        };
+
+        // No ColorMode attribute → C's colorMode stays Mono → asynError.
+        let arr = NDArray::new(rgb1_dims(), NDDataType::UInt8);
+        let path = temp_path("tiff_3d_no_colormode");
+        let mut writer = TiffWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        let err = writer.write_file(&arr).unwrap_err();
+        assert!(
+            matches!(err, ADError::InvalidDimensions(_)),
+            "3-D without ColorMode must be rejected, got {err:?}"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // Positive control: the same dims WITH ColorMode=RGB1 write normally, so
+        // the rejection is keyed on the attribute, not on the shape.
+        let mut arr = NDArray::new(rgb1_dims(), NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+        let path = temp_path("tiff_3d_rgb1");
+        let mut writer = TiffWriter::new();
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        writer
+            .write_file(&arr)
+            .expect("3-D WITH ColorMode=RGB1 must still write");
+        writer.close_file().ok();
+        assert!(path.exists());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -49,30 +49,32 @@ impl NDFileWriter for JpegWriter {
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
 
-        // Detect color mode and convert RGB2/RGB3 to RGB1 if needed
-        let color_mode = array
-            .attributes
-            .get("ColorMode")
-            .and_then(|attr| attr.value.as_i64())
-            .map(|v| NDColorMode::from_i32(v as i32))
-            .unwrap_or_else(|| {
-                if array.dims.len() == 3 {
-                    let d0 = array.dims[0].size;
-                    let d1 = array.dims[1].size;
-                    let d2 = array.dims[2].size;
-                    if d0 == 3 {
-                        NDColorMode::RGB1
-                    } else if d1 == 3 {
-                        NDColorMode::RGB2
-                    } else if d2 == 3 {
-                        NDColorMode::RGB3
-                    } else {
-                        NDColorMode::Mono
-                    }
-                } else {
-                    NDColorMode::Mono
-                }
-            });
+        // The ColorMode *attribute* is the only source of truth, defaulting to
+        // Mono when it is absent — C `int colorMode = NDColorModeMono;`
+        // (NDFileJPEG.cpp:29) overwritten only by the attribute (:52-53).
+        // `info().color_mode` is that rule's single owner.
+        let color_mode = array.info().color_mode;
+
+        // C's `openFile` structure chain (NDFileJPEG.cpp:55-84). Each 3-D branch
+        // requires the *attribute* to name the layout, so a 3-D array with no
+        // ColorMode attribute (colorMode stays Mono) matches nothing and C returns
+        // asynError (:79-84). Inferring the layout from the dimensions instead
+        // made such an array look like RGB1 and write a file.
+        //
+        // C also takes `this->colorMode` from the branch it took, not from the
+        // attribute: the 2-D branch forces Mono (:60). And unlike NDFileTIFF
+        // (:180) there is no ndims == 1 branch here — a 1-D array is an error.
+        let color_mode = match array.dims.as_slice() {
+            [_, _] => NDColorMode::Mono,
+            [c, _, _] if c.size == 3 && color_mode == NDColorMode::RGB1 => NDColorMode::RGB1,
+            [_, c, _] if c.size == 3 && color_mode == NDColorMode::RGB2 => NDColorMode::RGB2,
+            [_, _, c] if c.size == 3 && color_mode == NDColorMode::RGB3 => NDColorMode::RGB3,
+            _ => {
+                return Err(ADError::InvalidDimensions(
+                    "unsupported array structure".into(),
+                ));
+            }
+        };
 
         let is_rgb = matches!(
             color_mode,
@@ -239,6 +241,71 @@ mod tests {
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("adcore_test_{}_{}.jpg", prefix, n))
+    }
+
+    /// R8-75, JPEG writer: same defect as the cited TIFF site. C defaults
+    /// `colorMode` to Mono (NDFileJPEG.cpp:29), overwrites it only from the
+    /// attribute (:52-53), and each 3-D branch requires the attribute (:61, :67,
+    /// :73) — so a 3-D array without ColorMode returns asynError (:79-84). The
+    /// port inferred RGB1 from the dims. A 1-D array is an error here too: C has
+    /// no ndims == 1 branch in this writer.
+    #[test]
+    fn test_r8_75_3d_without_colormode_attribute_is_an_error() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        let rgb1_dims = || {
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ]
+        };
+
+        let arr = NDArray::new(rgb1_dims(), NDDataType::UInt8);
+        let path = temp_path("jpeg_3d_no_colormode");
+        let mut writer = JpegWriter::new(90);
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        let err = writer.write_file(&arr).unwrap_err();
+        assert!(
+            matches!(err, ADError::InvalidDimensions(_)),
+            "3-D without ColorMode must be rejected, got {err:?}"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // C has no ndims == 1 branch (unlike NDFileTIFF.cpp:180).
+        let arr = NDArray::new(vec![NDDimension::new(16)], NDDataType::UInt8);
+        let path = temp_path("jpeg_1d");
+        let mut writer = JpegWriter::new(90);
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        assert!(matches!(
+            writer.write_file(&arr).unwrap_err(),
+            ADError::InvalidDimensions(_)
+        ));
+        std::fs::remove_file(&path).ok();
+
+        // Positive control: WITH ColorMode=RGB1 the same array writes.
+        let mut arr = NDArray::new(rgb1_dims(), NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+        let path = temp_path("jpeg_3d_rgb1");
+        let mut writer = JpegWriter::new(90);
+        writer
+            .open_file(&path, NDFileMode::Single, &arr)
+            .expect("open");
+        writer
+            .write_file(&arr)
+            .expect("3-D WITH ColorMode=RGB1 must still write");
+        assert!(path.exists());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

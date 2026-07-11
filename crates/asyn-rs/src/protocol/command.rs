@@ -148,6 +148,14 @@ pub enum PortCommand {
     GetConnected,
     /// Install the echo interpose — C `asynInterposeEcho(portName, addr)`.
     PushEchoInterpose,
+    /// Install the delay interpose — C
+    /// `asynInterposeDelay(portName, addr, delay)`. The delay travels as
+    /// seconds, the C `double` argument's own unit
+    /// (asynInterposeDelay.c:223). Appended last: the variant order is the
+    /// wire encoding.
+    PushDelayInterpose {
+        delay_secs: f64,
+    },
 }
 
 #[cfg(test)]
@@ -214,6 +222,7 @@ mod tests {
             },
             PortCommand::GetConnected,
             PortCommand::PushEchoInterpose,
+            PortCommand::PushDelayInterpose { delay_secs: 0.001 },
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

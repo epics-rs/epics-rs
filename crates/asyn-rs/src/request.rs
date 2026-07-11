@@ -267,6 +267,14 @@ pub enum RequestOp {
     /// `SetOption` / `SetInputEos` are requests. Installing from the shell
     /// thread would race every in-flight transfer.
     PushEchoInterpose,
+    /// Install the delay interpose on top of the port's octet stack. C parity:
+    /// `asynInterposeDelay(portName, addr, delay)`
+    /// (`asynInterposeDelay.c:176-215`), registered with iocsh at
+    /// `asynInterposeDelay.c:221-234`. Same actor-ownership reason as
+    /// [`RequestOp::PushEchoInterpose`].
+    PushDelayInterpose {
+        delay: std::time::Duration,
+    },
 }
 
 /// Result returned by the worker after executing a request.

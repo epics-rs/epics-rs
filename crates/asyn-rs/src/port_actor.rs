@@ -274,6 +274,7 @@ impl PortActor {
                 | RequestOp::GetAutoConnect
                 | RequestOp::GetConnected
                 | RequestOp::PushEchoInterpose
+                | RequestOp::PushDelayInterpose { .. }
                 | RequestOp::BlockProcess
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
@@ -625,6 +626,16 @@ impl PortActor {
                 self.driver
                     .base_mut()
                     .push_octet_interpose(Box::new(crate::interpose::echo::EchoInterpose::new()));
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::PushDelayInterpose { delay } => {
+                // C `asynInterposeDelay` (asynInterposeDelay.c:176-215) pushes
+                // the per-character write delay onto the port's octet interface
+                // from the iocsh command (:221-234), after configure. Same
+                // actor-owned install point as the echo layer above.
+                self.driver.base_mut().push_octet_interpose(Box::new(
+                    crate::interpose::delay::DelayInterpose::new(*delay),
+                ));
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetConnected => {

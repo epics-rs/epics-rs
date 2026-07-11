@@ -819,6 +819,13 @@ impl PortHandle {
         self.submit_blocking(RequestOp::PushEchoInterpose, AsynUser::new(0))?;
         Ok(())
     }
+
+    /// Install the delay interpose on the port (blocking) — C
+    /// `asynInterposeDelay(portName, addr, delay)`.
+    pub fn push_delay_interpose_blocking(&self, delay: std::time::Duration) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::PushDelayInterpose { delay }, AsynUser::new(0))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

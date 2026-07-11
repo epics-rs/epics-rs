@@ -146,15 +146,19 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(a.powf(b)));
                 }
 
-                // Type-aware comparison.
-                // C calcPerform.c:373-393 compares doubles with exact IEEE
-                // operators; the numeric evaluator does the same, so the string
-                // evaluator must not apply an epsilon.
+                // Type-aware comparison. sCalc does NOT compare doubles exactly:
+                // every numeric comparison goes through `SMALL` (= 1e-11,
+                // `sCalcPerform.c:46`) on both evaluator paths — :595-620
+                // (no-string) and :1161-1255 (string), which are the same six
+                // formulas. Two strings are compared with `strcmp` (:1167-1169).
+                // The exact IEEE operators these arms used to apply are base's
+                // (`calcPerform.c:369-393`) and aCalc's, not sCalc's.
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x == y,
+                        // C: fabs(a-b) < SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() < SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x == y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -164,7 +168,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x != y,
+                        // C: fabs(a-b) > SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() > SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x != y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -174,7 +179,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x < y,
+                        // C: (b - a) > SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (y - x) > SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x < y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -184,7 +190,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x <= y,
+                        // C: (fabs(a-b) < SMALL) || (a < b)
+                        (StackValue::Double(x), StackValue::Double(y)) => {
+                            (x - y).abs() < SMALL || x < y
+                        }
                         (StackValue::Str(x), StackValue::Str(y)) => x <= y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -194,7 +203,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x > y,
+                        // C: (a - b) > SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y) > SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x > y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -204,7 +214,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x >= y,
+                        // C: (fabs(a-b) < SMALL) || (a > b)
+                        (StackValue::Double(x), StackValue::Double(y)) => {
+                            (x - y).abs() < SMALL || x > y
+                        }
                         (StackValue::Str(x), StackValue::Str(y)) => x >= y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -734,6 +747,10 @@ fn to_double(v: &StackValue) -> f64 {
     }
 }
 
+/// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
+/// are written around. It is sCalc's alone: base and aCalc compare exactly.
+const SMALL: f64 = 1e-11;
+
 const MAX_LOOP_ITERATIONS: usize = 1000;
 
 fn translate_escapes(s: &str) -> String {
@@ -1135,21 +1152,27 @@ mod parity_tests {
         }
     }
 
-    // `==` compares doubles exactly, not within an epsilon.
+    // R9-1: these two cases pinned EXACT comparison on the string engine, on
+    // the belief (taken from base's `calcPerform.c`) that no calc engine has an
+    // epsilon. sCalc has one — `SMALL` = 1e-11 (`sCalcPerform.c:46`), used by
+    // all six numeric comparisons (:595-620, :1161-1255) — so the compiled C
+    // evaluator answers the opposite of what was pinned here. The values below
+    // are its output.
     #[test]
-    fn h6_eq_is_exact() {
-        // 1e-12 is not equal to 0 under exact IEEE comparison.
-        assert_eq!(run_num("1e-12 == 0"), 0.0);
-        assert_eq!(run_num("1e-12 # 0"), 1.0); // `#` is the NE operator
-        assert_eq!(run_num("0 == 0"), 1.0);
+    fn h6_eq_is_within_small() {
+        assert_eq!(run_num("1e-12 == 0"), 1.0); // C: d=1 (|1e-12| < SMALL)
+        assert_eq!(run_num("1e-12 # 0"), 0.0); // C: d=0. `#` is the NE operator
+        assert_eq!(run_num("0 == 0"), 1.0); // C: d=1
+        assert_eq!(run_num("0.1+0.2 == 0.3"), 1.0); // C: d=1 — SMALL absorbs the ULP
     }
 
     #[test]
-    fn h6_inequalities_exact() {
-        // 1e-12 < 1e-11 must be true (epsilon would have hidden it).
-        assert_eq!(run_num("1e-12 < 1e-11"), 1.0);
-        assert_eq!(run_num("1 >= 1"), 1.0);
-        assert_eq!(run_num("2 > 1"), 1.0);
+    fn h6_inequalities_are_within_small() {
+        // C: d=0 — the difference (9e-12) does not exceed SMALL, so `<` is false
+        // even though 1e-12 is genuinely below 1e-11.
+        assert_eq!(run_num("1e-12 < 1e-11"), 0.0);
+        assert_eq!(run_num("1 >= 1"), 1.0); // C: d=1
+        assert_eq!(run_num("2 > 1"), 1.0); // C: d=1
     }
 
     // R8-7: this case used to pin base's IEEE divide (`1/0` = +Inf) onto the

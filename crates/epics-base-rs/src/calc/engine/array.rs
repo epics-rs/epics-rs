@@ -118,60 +118,42 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     stack.push(zip_map(a, b, |x, y| x.powf(y))?);
                 }
 
-                // Comparison (element-wise for arrays)
+                // Comparison (element-wise for arrays). aCalc compares EXACTLY —
+                // C's operators are the bare C ones in all three operand shapes
+                // (`aCalcPerform.c:1345-1350` array/array, :1370-1375
+                // array/scalar, :1397-1402 scalar/scalar) and aCalcPerform has
+                // no epsilon anywhere. The 1e-11 these arms used to apply is
+                // sCalc's `SMALL` (`sCalcPerform.c:46`), which belongs to the
+                // string engine and nowhere else.
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        if (x - y).abs() < 1e-11 { 1.0 } else { 0.0 }
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x == y)))?);
                 }
                 CoreOp::Ne => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        if (x - y).abs() > 1e-11 { 1.0 } else { 0.0 }
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x != y)))?);
                 }
                 CoreOp::Lt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(
-                        a,
-                        b,
-                        |x, y| if (y - x) > 1e-11 { 1.0 } else { 0.0 },
-                    )?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x < y)))?);
                 }
                 CoreOp::Le => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        if (x - y).abs() < 1e-11 || x < y {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x <= y)))?);
                 }
                 CoreOp::Gt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(
-                        a,
-                        b,
-                        |x, y| if (x - y) > 1e-11 { 1.0 } else { 0.0 },
-                    )?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x > y)))?);
                 }
                 CoreOp::Ge => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| {
-                        if (x - y).abs() < 1e-11 || x > y {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    })?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x >= y)))?);
                 }
 
                 // Logical

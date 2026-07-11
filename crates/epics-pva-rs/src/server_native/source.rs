@@ -4,11 +4,77 @@
 //! public surface.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+use crate::proto::MessageType;
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
+
+/// One pvxs `RemoteLogger::logRemote()` diagnostic recorded by a source
+/// while serving an operation. The wire layer turns each into an
+/// IOID-tagged `CMD_MESSAGE` frame (`serverconn.cpp:146-160`:
+/// `ioid:u32 + messageType:u8 + message:string`), so `level` is the
+/// PVA `messageType` byte (`level2mtype`, `pvaproto.h:715`): pvxs
+/// `Level::Warn` → [`MessageType::Warning`] (1), `Level::Crit` →
+/// [`MessageType::Fatal`] (3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLogMessage {
+    pub level: MessageType,
+    pub message: String,
+}
+
+/// pvxs `server::RemoteLogger` (`src/pvxs/srvcommon.h:97`) — the
+/// source→client diagnostic channel every pvxs operation handle
+/// (`ConnectOp`, `ExecOp`, `MonitorSetupOp`) implements.
+///
+/// A source records a diagnostic while it serves an operation; the wire
+/// layer drains this sink once the source call returns and emits one
+/// IOID-tagged `CMD_MESSAGE` Warning/Fatal frame per message *before*
+/// that operation's reply (see `tcp.rs` `flush_remote_log`). This is the
+/// only path by which a source can talk to the client outside the
+/// operation's own status/value — pvxs's IOC source layer uses it for
+/// "present but unusable option" diagnostics that do NOT change the
+/// negotiated outcome (`ioc/groupsource.cpp:560`,
+/// `ioc/singlesource.cpp:129`, `ioc/iocsource.cpp:447`).
+///
+/// Cheap to clone (one `Arc`); every clone of a [`ChannelContext`] shares
+/// the same sink, so a source may hand the context down through its own
+/// layers and still have its diagnostics reach the connection that owns
+/// the IOID. Messages recorded on a context that belongs to no operation
+/// (channel lifecycle / watermark edges, where pvAccess has no IOID to
+/// tag and pvxs correspondingly exposes no `RemoteLogger`) are never
+/// drained and are dropped with the context.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteLog {
+    queued: Arc<Mutex<Vec<RemoteLogMessage>>>,
+}
+
+impl RemoteLog {
+    /// pvxs `logRemote(Level::Warn, msg)` — a `messageType=1` frame.
+    pub fn warn(&self, message: impl Into<String>) {
+        self.push(MessageType::Warning, message.into());
+    }
+
+    /// pvxs `logRemote(Level::Crit, msg)` — a `messageType=3` frame.
+    pub fn crit(&self, message: impl Into<String>) {
+        self.push(MessageType::Fatal, message.into());
+    }
+
+    fn push(&self, level: MessageType, message: String) {
+        self.queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(RemoteLogMessage { level, message });
+    }
+
+    /// Drain every recorded diagnostic, in the order the source recorded
+    /// them. The wire layer is the single caller; a source never drains
+    /// its own sink.
+    pub fn take(&self) -> Vec<RemoteLogMessage> {
+        std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 /// Per-operation context surfaced to [`ChannelSource`] implementors
 /// that need the downstream peer's identity (audit, ACL, gateway
@@ -59,6 +125,13 @@ pub struct ChannelContext {
     /// decoder could not parse it. Sources that don't need per-op options
     /// can ignore the field.
     pub pv_request: Option<PvField>,
+    /// pvxs `RemoteLogger` for this operation ([`RemoteLog`]). A source
+    /// records "present but unusable option" diagnostics here; the wire
+    /// layer drains them and emits IOID-tagged `CMD_MESSAGE` frames
+    /// before the operation's reply. Contexts for edges with no IOID
+    /// (channel open/close, watermark) carry a sink that is never
+    /// drained — pvxs exposes no `RemoteLogger` there either.
+    pub log: RemoteLog,
 }
 
 /// Event-affecting options decoded from a downstream MONITOR INIT

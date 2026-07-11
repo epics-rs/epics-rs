@@ -1818,15 +1818,25 @@ fn spawn_monitor_subscriber(
             .await;
 
         // ---------------- RAW FAST PATH ----------------
-        if raw_path_eligible
-            && let Some(seed_raw) = src
-                .subscribe_raw_seeded(
-                    mon_checked.clone(),
-                    mon_ctx.clone(),
-                    monitor_options.clone(),
-                )
-                .await
-        {
+        let raw_seed = if raw_path_eligible {
+            src.subscribe_raw_seeded(
+                mon_checked.clone(),
+                mon_ctx.clone(),
+                monitor_options.clone(),
+            )
+            .await
+        } else {
+            None
+        };
+        // Emit whatever the source recorded while opening the subscription
+        // (pvxs `singlesource.cpp:129` — `record._options.DBE` selecting an
+        // empty mask), whether or not it produced a seed. pvxs logs from
+        // inside `onSubscribe`, i.e. before its `connect()` INIT reply; here
+        // the INIT reply is enqueued by the read loop that spawned this task,
+        // so the frame follows that reply. Same ioid, level and text — only
+        // the position relative to the INIT reply differs.
+        flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
+        if let Some(seed_raw) = raw_seed {
             let crate::server_native::source::SubscriptionSeed {
                 initial: seed_raw_initial,
                 updates: mut rx_raw,
@@ -1982,14 +1992,19 @@ fn spawn_monitor_subscriber(
         }
 
         // ---------------- DECODED PATH ----------------
-        let Some(seed) = src
+        let seed = src
             .subscribe_seeded(
                 mon_checked.clone(),
                 mon_ctx.clone(),
                 monitor_options.clone(),
             )
-            .await
-        else {
+            .await;
+        // Same source-diagnostic drain as the raw path above: the source may
+        // have recorded a `record._options` warning while opening this
+        // subscription, and it must reach the client even when the
+        // subscription itself failed to open.
+        flush_remote_log(&mon_ctx.log, ioid, order_now(), &tx_clone).await;
+        let Some(seed) = seed else {
             return;
         };
         let crate::server_native::source::SubscriptionSeed {
@@ -4424,6 +4439,7 @@ async fn handle_put_get(
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: init_pv_request,
+        log: Default::default(),
     };
 
     let src = source.clone();
@@ -4455,6 +4471,9 @@ async fn handle_put_get(
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
+        // The source's `RemoteLogger` sink for this op, kept alive past the
+        // moves below so its diagnostics can be flushed before the reply.
+        let op_log = ctx.log.clone();
 
         // putGet (0x00) is the atomic WRITE+READ round trip; getGet/getPut
         // (read-only) carry no put payload and only read back. The default
@@ -4506,6 +4525,8 @@ async fn handle_put_get(
                     .await;
                 catch_handler_panic(src.get_value_checked(read_checked, ctx)).await
             };
+
+        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
         match read_value {
             Ok(Some(v)) => {
@@ -4757,6 +4778,7 @@ async fn handle_process(
         // — and a gateway forwarding createChannelProcess(..., pvRequest)
         // — can inspect `record._options`.
         pv_request: init_pv_request,
+        log: Default::default(),
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();
@@ -4797,10 +4819,12 @@ async fn handle_process(
             .await;
         // a panic in the user PROCESS handler becomes an error
         // reply instead of skipping the reply below.
+        let op_log = ctx.log.clone();
         let result = catch_handler_panic(src.process_checked(checked, ctx))
             .await
             .map_err(|e| OpError::failed(e))
             .and_then(|r| r);
+        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
@@ -4985,6 +5009,7 @@ async fn handle_channel_array(
             authority: cred.authority.clone(),
             roles: cred.roles.clone(),
             pv_request: req_value.clone(),
+            log: Default::default(),
         };
         // INIT resolves the array field's introspection (or refuses). No
         // access check here — pvAccessCPP gates per sub-op, not at create.
@@ -5104,6 +5129,7 @@ async fn handle_channel_array(
         roles: cred.roles.clone(),
         // INIT pvRequest re-supplied so the source knows the bound field.
         pv_request: init_pv_request,
+        log: Default::default(),
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();
@@ -5153,6 +5179,7 @@ async fn handle_channel_array(
             .await;
         // A panic in the (user / gateway) source handler becomes an error
         // reply instead of a skipped reply.
+        let op_log = ctx.log.clone();
         let result: Result<ChannelArrayReply, OpError> = match sub_op {
             ChannelArraySubOp::Get {
                 offset,
@@ -5187,6 +5214,7 @@ async fn handle_channel_array(
                     .map(ChannelArrayReply::Length)
             }
         };
+        flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
@@ -5482,6 +5510,7 @@ fn channel_lifecycle_ctx(
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: None,
+        log: Default::default(),
     }
 }
 
@@ -6492,6 +6521,7 @@ async fn handle_op(
                     authority: cred.authority.clone(),
                     roles: cred.roles.clone(),
                     pv_request: s.pv_request.clone(),
+                    log: Default::default(),
                 };
                 MonitorSubscriberArgs {
                     sid,
@@ -6652,6 +6682,7 @@ async fn handle_op(
                     authority: cred_authority,
                     roles: cred_roles,
                     pv_request: init_pv_request_t,
+                    log: Default::default(),
                 };
                 let checked = src
                     .access_gate()
@@ -6666,7 +6697,10 @@ async fn handle_op(
                     .await;
                 // a panic in the user GET handler becomes a
                 // data-phase error reply instead of skipping the reply below.
-                let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await {
+                let op_log = ctx.log.clone();
+                let got = catch_handler_panic(src.get_value_checked(checked, ctx)).await;
+                flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+                let value = match got {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         let _ = send_chan_op_error(
@@ -6785,6 +6819,7 @@ async fn handle_op(
                         authority: cred_authority,
                         roles: cred_roles,
                         pv_request: init_pv_request_t,
+                        log: Default::default(),
                     };
                     let checked = src
                         .access_gate()
@@ -6800,8 +6835,10 @@ async fn handle_op(
                     // a panic in the user GET (PUT readback)
                     // handler becomes a data-phase error reply instead of
                     // skipping the reply below.
-                    let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await
-                    {
+                    let op_log = ctx.log.clone();
+                    let got = catch_handler_panic(src.get_value_checked(checked, ctx)).await;
+                    flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+                    let value = match got {
                         Ok(Some(v)) => v,
                         Ok(None) => {
                             let _ = send_chan_op_error(
@@ -6932,7 +6969,13 @@ async fn handle_op(
                     authority: cred_authority,
                     roles: cred_roles,
                     pv_request: init_pv_request_t,
+                    log: Default::default(),
                 };
+                // The source's `RemoteLogger` sink for this PUT, drained onto
+                // the wire below before the reply (pvxs
+                // `groupsource.cpp:560` / `iocsource.cpp:447` warn from
+                // inside the PUT and reply afterwards).
+                let op_log = ctx.log.clone();
                 let result = {
                     let checked = src
                         .access_gate()
@@ -6958,6 +7001,7 @@ async fn handle_op(
                     .map_err(|e| OpError::failed(e))
                     .and_then(|r| r)
                 };
+                flush_remote_log(&op_log, ioid, order, &tx_clone).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
                 payload.put_u8(subcmd);
@@ -6988,9 +7032,10 @@ async fn handle_op(
                             // a panic in the user GET (PUT_GET
                             // readback) handler becomes an error reply instead
                             // of skipping the reply below.
-                            match catch_handler_panic(src.get_value_checked(read_checked, ctx))
-                                .await
-                            {
+                            let readback =
+                                catch_handler_panic(src.get_value_checked(read_checked, ctx)).await;
+                            flush_remote_log(&op_log, ioid, order, &tx_clone).await;
+                            match readback {
                                 Ok(Some(v)) => {
                                     Status::ok().write_into(order, &mut payload);
                                     let bits = BitSet::all_set(intro_t.total_bits());
@@ -7170,6 +7215,7 @@ async fn handle_op(
                         authority: cred.authority.clone(),
                         roles: cred.roles.clone(),
                         pv_request: None,
+                        log: Default::default(),
                     };
                     source.notify_watermark(
                         &ch.name,
@@ -7259,6 +7305,7 @@ async fn handle_op(
                 // above. A source (or gateway) can now inspect the
                 // create-time request (pvxs serverget.cpp:388-391).
                 pv_request: init_pv_request.clone(),
+                log: Default::default(),
             };
             // ignore a second RPC EXEC while the first call is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
@@ -7294,6 +7341,7 @@ async fn handle_op(
                     .await;
                 // a panic in the user RPC handler becomes an error
                 // reply instead of skipping the reply below.
+                let op_log = rpc_ctx_val.log.clone();
                 let result = catch_handler_panic(src.rpc_checked(
                     rpc_checked,
                     req_desc,
@@ -7303,6 +7351,7 @@ async fn handle_op(
                 .await
                 .map_err(|e| OpError::failed(e))
                 .and_then(|r| r);
+                flush_remote_log(&op_log, ioid, order, &tx_clone).await;
 
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -7471,6 +7520,7 @@ async fn handle_get_field(
         authority: cred.authority.clone(),
         roles: cred.roles.clone(),
         pv_request: None,
+        log: Default::default(),
     };
     // The immutable borrow of `chan` ends here (all needed values cloned),
     // so we can take the mutable borrow to reserve the IOID.
@@ -7616,7 +7666,8 @@ fn build_op_error_frame(
 /// client decoder [`crate::client_native::server_conn`] (and is
 /// `ioid:u32 + mtype:u8 + message:string`); the client logs `Warning`
 /// (1) at `warn!` and `Fatal` (3) at `error!`. Used by the MONITOR INIT
-/// owner to surface [`MonitorOptionDiag`] negotiation diagnostics.
+/// owner to surface [`MonitorOptionDiag`] negotiation diagnostics, and
+/// by [`flush_remote_log`] to surface source-layer ones.
 fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrder) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
@@ -7627,6 +7678,36 @@ fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrde
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
     buf
+}
+
+/// Drain a source's per-operation [`RemoteLog`] onto the wire as
+/// IOID-tagged `CMD_MESSAGE` frames — the Rust half of pvxs
+/// `RemoteLogger::logRemote()` (`serverconn.cpp:146-160`), which the
+/// pvxs IOC source layer uses for "present but unusable option"
+/// diagnostics (`ioc/groupsource.cpp:560`, `ioc/singlesource.cpp:129`,
+/// `ioc/iocsource.cpp:447`).
+///
+/// The single owner of that transition: a source records, the
+/// connection emits. Called immediately after EVERY `ChannelSource` op
+/// call that carries an IOID and BEFORE that op's reply frame is
+/// enqueued, so a diagnostic always precedes the reply it qualifies —
+/// the order pvxs produces, where `logRemote` runs inside the source
+/// callback and the reply is sent when it returns.
+async fn flush_remote_log(
+    log: &crate::server_native::source::RemoteLog,
+    ioid: u32,
+    order: ByteOrder,
+    tx: &ChannelTx,
+) {
+    for m in log.take() {
+        if tx
+            .send(build_message_frame(ioid, m.level, &m.message, order))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 #[allow(unused_imports)]
@@ -8187,6 +8268,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         // Dropping the guard fires exactly one Withdraw scoped to op 42.
@@ -9950,6 +10032,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 
@@ -15185,6 +15268,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         // Delta marking only field `b` (bit 2) -> 99.
@@ -15556,6 +15640,7 @@ mod tests {
                 authority: String::new(),
                 roles: Vec::new(),
                 pv_request: None,
+                log: Default::default(),
             };
 
             let src_a = Arc::clone(&source);
@@ -17808,6 +17893,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 

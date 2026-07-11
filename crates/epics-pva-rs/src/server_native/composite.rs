@@ -1761,6 +1761,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let token = AccessGate::open()
             .check("PVX", "h", "alice", "ca", "")
@@ -1804,6 +1805,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
 
         let comp = CompositeSource::new();

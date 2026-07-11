@@ -2056,6 +2056,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         }
     }
 
@@ -2685,6 +2686,7 @@ ASG(DEFAULT) {
             authority: "Lab Root CA".to_string(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let client = src.upstream_client_for(&ctx);
         let asserted = client

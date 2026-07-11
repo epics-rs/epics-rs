@@ -13,6 +13,7 @@ use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionAct
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::types::{DbFieldType, dbf_link_class};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
+use epics_pva_rs::server_native::source::RemoteLog;
 
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
 use super::monitor::BridgeMonitor;
@@ -1365,12 +1366,36 @@ impl GroupChannel {
         value: &PvStructure,
         opts: super::channel::PutOptions,
         atomic_override: Option<bool>,
+        log: &RemoteLog,
     ) -> BridgeResult<()> {
         if !self.access.can_write(&self.def.name) {
             return Err(BridgeError::PutRejected(format!(
                 "write denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
             )));
+        }
+
+        // pvxs `putGroupField` (groupsource.cpp:554-561) computes
+        // `marked && !putable` per group field and, when the client marked a
+        // field the group cannot write (`+putorder` absent ⇒ `putOrder ==
+        // int64_t::min()`, the not-putable sentinel), tells the client so with
+        // a Warn `logRemote` naming the field before dropping the write. The
+        // apply below drops those members silently (they never enter
+        // `ordered`), so the diagnostic must be raised here, from the same
+        // marked-set test the apply uses.
+        //
+        // `putable` is the ONLY thing tested — pvxs warns for a marked Proc
+        // member without `+putorder` too (it still post-processes it). What it
+        // cannot warn for is a member with no `dbChannel` (`field.value` null ⇒
+        // `marked` false): Structure and Const members, whose `channel` is
+        // empty here.
+        for m in &self.def.members {
+            if m.put_order.is_none()
+                && !m.channel.is_empty()
+                && get_nested_field(value, &m.field_name).is_some()
+            {
+                log.warn(format!("{}: no putorder, ignore write", m.field_name));
+            }
         }
 
         // pvRequest can override the group default atomicity
@@ -1787,7 +1812,11 @@ impl super::provider::Channel for GroupChannel {
         // INIT-pvRequest options are honored — see that method.
         let opts = super::channel::PutOptions::from_pv_request(value);
         let atomic_override = super::channel::atomic_from_pv_request(value);
-        self.put_with_options(value, opts, atomic_override).await
+        // In-process callers have no client connection: pvxs's
+        // `logRemote` diagnostics have nowhere to go, so the sink is a
+        // discard (nothing drains it).
+        self.put_with_options(value, opts, atomic_override, &RemoteLog::default())
+            .await
     }
 
     async fn get_field(&self) -> BridgeResult<FieldDesc> {
@@ -4784,6 +4813,7 @@ mod tests {
                 &partial,
                 super::super::channel::PutOptions::default(),
                 Some(false),
+                &RemoteLog::default(),
             )
             .await
             .expect("partial PUT to writable a must not be blocked by unwritable unmarked b");
@@ -4800,6 +4830,7 @@ mod tests {
                 &full,
                 super::super::channel::PutOptions::default(),
                 Some(false),
+                &RemoteLog::default(),
             )
             .await;
         assert!(
@@ -4877,6 +4908,7 @@ mod tests {
                 &put,
                 super::super::channel::PutOptions::default(),
                 Some(false),
+                &RemoteLog::default(),
             )
             .await
             .expect("group PUT must succeed: a write-denied proc member is not write-ACF checked");

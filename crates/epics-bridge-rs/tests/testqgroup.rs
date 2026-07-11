@@ -276,7 +276,7 @@ async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
             block: false,
         };
         let err = ch
-            .put_with_options(&put, opts, None)
+            .put_with_options(&put, opts, None, &Default::default())
             .await
             .expect_err("DISP=1 member must reject the whole group PUT");
         let msg = format!("{err}").to_ascii_lowercase();

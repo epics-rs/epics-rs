@@ -469,7 +469,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => crate::qsrv::channel::atomic_from_pv_request(&pv),
                     };
                     group
-                        .put_with_options(&pv, opts, atomic_override)
+                        .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }
@@ -549,7 +549,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         None => crate::qsrv::channel::atomic_from_pv_request(&pv),
                     };
                     group
-                        .put_with_options(&pv, opts, atomic_override)
+                        .put_with_options(&pv, opts, atomic_override, &ctx.log)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }
@@ -1859,6 +1859,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let checked = AccessGate::open()
@@ -1939,6 +1940,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let got = store
@@ -1980,6 +1982,7 @@ mod tests {
             authority: String::new(),
             roles: vec!["operators".into(), "experts".into()],
             pv_request: None,
+            log: Default::default(),
         };
         let creds = ctx_to_creds(&ctx);
         assert_eq!(
@@ -2110,6 +2113,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("FLNK:a", "127.0.0.1", "anonymous", "anonymous", "")
@@ -2290,6 +2294,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
         };
 
         let checked = AccessGate::open()
@@ -2393,6 +2398,7 @@ mod tests {
                 authority: String::new(),
                 roles: Vec::new(),
                 pv_request: Some(PvField::Structure(req)),
+                log: Default::default(),
             };
             let checked = AccessGate::open()
                 .check(group_pv, "127.0.0.1", "anonymous", "anonymous", "")
@@ -2532,6 +2538,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("BR120:grp", "127.0.0.1", "anonymous", "anonymous", "")
@@ -2640,6 +2647,7 @@ mod tests {
             authority: String::new(),
             roles: Vec::new(),
             pv_request: None,
+            log: Default::default(),
         };
         let checked = AccessGate::open()
             .check("BR120E:grp", "127.0.0.1", "anonymous", "anonymous", "")

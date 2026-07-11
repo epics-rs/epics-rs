@@ -3799,6 +3799,301 @@ async fn test_udf_cleared_by_process_with_links() {
     assert!(!rec.read().await.common.udf);
 }
 
+/// R6-5 — `PINI` is the 6-choice `menuPini` (`menuPini.dbd:11-18`), and C
+/// matches the menu index **exactly** (`iocInit.c:598`
+/// `if (precord->pini != pphase->pini) return;`). Each choice therefore selects
+/// a disjoint pass: `YES` runs at `initialProcess()`, `RUN` at
+/// `initHookAtIocRun`, `RUNNING` at `initHookAfterIocRunning`. A `PINI=RUN`
+/// record must not be dragged into the `YES` pass, and must not be dropped
+/// entirely (the pre-fix `bool` did both: `"RUN"` parsed to `false`).
+///
+/// UDF is the "did it process" probe — `process_record_with_links` clears it
+/// (see `test_udf_cleared_by_process_with_links`).
+#[tokio::test]
+async fn test_pini_passes_select_disjoint_menu_choices() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    for name in ["PINI_YES", "PINI_RUN", "PINI_RUNNING", "PINI_NO"] {
+        db.add_record(name, Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+    }
+    // Set each record's PINI the way a `.db` file / caput does — through the
+    // field put, by label — not by poking `common.pini`.
+    for (name, label) in [
+        ("PINI_YES", "YES"),
+        ("PINI_RUN", "RUN"),
+        ("PINI_RUNNING", "RUNNING"),
+        ("PINI_NO", "NO"),
+    ] {
+        let rec = db.get_record(name).await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String(label.into()))
+            .unwrap_or_else(|e| panic!("PINI={label} must be accepted: {e:?}"));
+    }
+    // The stored value is the menu index, so `caget REC.PINI` reports RUN as 2
+    // (the pre-fix bool reported 0 — indistinguishable from NO).
+    assert_eq!(
+        db.get_record("PINI_RUN")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .common
+            .pini,
+        PiniMode::Run
+    );
+
+    // Pass 1: initialProcess() — YES only.
+    db.pini_process(PiniMode::Yes).await;
+    let udf = |n: &'static str| {
+        let db = &db;
+        async move { db.get_record(n).await.unwrap().read().await.common.udf }
+    };
+    assert!(
+        !udf("PINI_YES").await,
+        "PINI=YES processes at initialProcess"
+    );
+    assert!(
+        udf("PINI_RUN").await,
+        "PINI=RUN must NOT run in the YES pass"
+    );
+    assert!(
+        udf("PINI_RUNNING").await,
+        "PINI=RUNNING must NOT run in the YES pass"
+    );
+    assert!(udf("PINI_NO").await, "PINI=NO never processes");
+
+    // Pass 2: initHookAtIocRun — RUN only.
+    db.pini_process(PiniMode::Run).await;
+    assert!(!udf("PINI_RUN").await, "PINI=RUN processes at iocRun");
+    assert!(udf("PINI_RUNNING").await, "PINI=RUNNING is a later pass");
+    assert!(udf("PINI_NO").await);
+
+    // Pass 3: initHookAfterIocRunning — RUNNING only.
+    db.pini_process(PiniMode::Running).await;
+    assert!(
+        !udf("PINI_RUNNING").await,
+        "PINI=RUNNING processes after iocRunning"
+    );
+    assert!(udf("PINI_NO").await, "PINI=NO is in no pass at all");
+}
+
+/// R6-7 — `caput -a REC.VAL 0` (a zero-element array into a scalar field). C
+/// `dbPut` (`dbAccess.c:1370-1372`, commit `12cfd418d`) **accepts** the put,
+/// leaves the field unchanged and raises `LINK_ALARM`/`INVALID_ALARM` on the
+/// record; `status` stays 0, so `dbPut` returns success. The port rejected the
+/// put with an error, so the client saw a write failure and the record's alarm
+/// state was never touched.
+#[tokio::test]
+async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    db.add_record("EMPTYPUT", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+    // Process once so VAL is committed and UDF is clear — the baseline the
+    // empty put must not disturb.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("EMPTYPUT", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let result = db
+        .put_record_field_from_ca("EMPTYPUT", "VAL", EpicsValue::DoubleArray(vec![]))
+        .await;
+    assert!(
+        result.is_ok(),
+        "C dbPut accepts a zero-element request; the client must not see an error: {result:?}"
+    );
+
+    // The field is untouched…
+    match db.get_pv("EMPTYPUT.VAL").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 5.0).abs() < 1e-10,
+            "the empty request must not overwrite VAL (silent zero was the bug 12cfd418d fixed)"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+    // …and the record is driven to LINK/INVALID, committed by the process cycle
+    // the CA put triggers.
+    let inst = db.get_record("EMPTYPUT").await.unwrap();
+    let inst = inst.read().await;
+    assert_eq!(inst.common.stat, alarm_status::LINK_ALARM);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+}
+
+/// R6-7 — the same zero-element request into an **array** field is an ordinary
+/// no-op success: C takes the `no_elements > 1` branch (`dbAccess.c:1345`),
+/// clamps `nRequest` to 0 and converts nothing — no alarm. Only the *scalar*
+/// destination alarms. This is the boundary the fix turns on.
+#[tokio::test]
+async fn test_empty_array_into_array_field_is_a_silent_no_op() {
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let db = PvDatabase::new();
+    let mut wf = epics_base_rs::server::records::waveform::WaveformRecord::default();
+    wf.nelm = 4;
+    wf.ftvl = 6; // DOUBLE
+    db.add_record("EMPTYWF", Box::new(wf)).await.unwrap();
+
+    let result = db
+        .put_record_field_from_ca("EMPTYWF", "VAL", EpicsValue::DoubleArray(vec![]))
+        .await;
+    assert!(result.is_ok(), "empty array into a waveform must succeed");
+
+    let inst = db.get_record("EMPTYWF").await.unwrap();
+    let inst = inst.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "an array destination must NOT take the scalar empty-request alarm branch"
+    );
+    assert_ne!(
+        inst.common.nsta,
+        epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+        "no LINK_ALARM may even be pending on an array destination"
+    );
+}
+
+/// R6-6 — C `piniProcess` (`iocInit.c:608-627`) sweeps the database once per
+/// distinct `PHAS`, ascending, so PINI records process in phase order; within a
+/// phase the order is database load order (`doRecordPini` under
+/// `iterateRecords`). The port processed them in `HashMap` iteration order and
+/// never read `PHAS` at all.
+///
+/// The probe: every PINI record drives a shared `SINK` through an OUT link, so
+/// `SINK` ends up holding the value of whichever record processed **last** —
+/// which under ascending-PHAS order is the highest-PHAS one. The records are
+/// added in descending phase order so that load order alone gives the wrong
+/// answer.
+#[tokio::test]
+async fn test_pini_records_process_in_ascending_phas_order() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    db.add_record("PHAS_SINK", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    for (name, val, phas) in [
+        ("PHAS_C", 30.0, 30i16),
+        ("PHAS_A", 10.0, 10),
+        ("PHAS_B", 20.0, 20),
+    ] {
+        db.add_record(name, Box::new(AoRecord::new(val)))
+            .await
+            .unwrap();
+        let rec = db.get_record(name).await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+            .unwrap();
+        inst.put_common_field("PHAS", EpicsValue::Short(phas))
+            .unwrap();
+        inst.put_common_field("OUT", EpicsValue::String("PHAS_SINK".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    db.pini_process(PiniMode::Yes).await;
+
+    match db.get_pv("PHAS_SINK").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 30.0).abs() < 1e-10,
+            "PINI must process in ascending PHAS order (PHAS_C last); SINK={v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+}
+
+/// R6-6 — the sweep re-reads `PHAS` on every pass, which is why C re-scans
+/// rather than sorting once: "PHAS fields can be changed at runtime, so we have
+/// to look for the lowest value of PHAS each time" (`iocInit.c:614-619`). A
+/// record moved out of the phase currently being processed must still be picked
+/// up by the pass for its new phase, not dropped.
+#[tokio::test]
+async fn test_pini_sweep_covers_every_phase_present() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    // Phases far apart and not contiguous — the sweep must find each next
+    // lowest PHAS rather than stepping one at a time or stopping at the first.
+    for (name, phas) in [
+        ("SWEEP_MIN", i16::MIN),
+        ("SWEEP_ZERO", 0),
+        ("SWEEP_MAX", i16::MAX),
+    ] {
+        db.add_record(name, Box::new(AoRecord::new(1.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record(name).await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+            .unwrap();
+        inst.put_common_field("PHAS", EpicsValue::Short(phas))
+            .unwrap();
+    }
+
+    db.pini_process(PiniMode::Yes).await;
+
+    for name in ["SWEEP_MIN", "SWEEP_ZERO", "SWEEP_MAX"] {
+        assert!(
+            !db.get_record(name).await.unwrap().read().await.common.udf,
+            "{name} must be processed by the pass for its own phase"
+        );
+    }
+}
+
+/// R6-5 — a `caput REC.PINI RUN` must store RUN, and an out-of-menu string must
+/// be rejected rather than silently landing on NO. The pre-fix bool accepted
+/// only `"YES"`/`"1"`/`"true"` and mapped everything else — including the four
+/// real menu choices — to `false`, so `caput REC.PINI RUN` *disabled* PINI.
+#[tokio::test]
+async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
+    use epics_base_rs::server::record::PiniMode;
+
+    let db = PvDatabase::new();
+    db.add_record("PREC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("PREC").await.unwrap();
+    for (label, expect) in [
+        ("NO", PiniMode::No),
+        ("YES", PiniMode::Yes),
+        ("RUN", PiniMode::Run),
+        ("RUNNING", PiniMode::Running),
+        ("PAUSE", PiniMode::Pause),
+        ("PAUSED", PiniMode::Paused),
+    ] {
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::String(label.into()))
+            .unwrap();
+        assert_eq!(inst.common.pini, expect, "PINI={label}");
+    }
+    // Numeric puts index the menu (DBR_ENUM write from a CA client).
+    {
+        let mut inst = rec.write().await;
+        inst.put_common_field("PINI", EpicsValue::Short(2)).unwrap();
+        assert_eq!(inst.common.pini, PiniMode::Run);
+    }
+    // A string outside the menu is an error, not a silent demotion to NO.
+    {
+        let mut inst = rec.write().await;
+        assert!(
+            inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
+                .is_err(),
+            "an out-of-menu PINI string must be rejected"
+        );
+        assert_eq!(
+            inst.common.pini,
+            PiniMode::Run,
+            "the rejected put must not change PINI"
+        );
+    }
+}
+
 /// An asyn int32 readback delivers its value via `apply_raw_readback`
 /// (sets VAL, requests skip-convert), then the record processes. C
 /// `devAsynInt32.c::processAo` sets `pr->udf = isnan(value)` *inside* the
@@ -4051,6 +4346,99 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
             "NPP multi-input link must NOT process source: expected 0, got {v}"
         ),
         other => panic!("expected Double(0.0), got {other:?}"),
+    }
+}
+
+/// R6-2 — a link whose target field name carries a digit (`B0`, `DO1`,
+/// `LNK1`) is a plain local DB link. C `dbNameToAddr` (`dbAccess.c:667-671`)
+/// terminates the record name at the first `.` and matches the remainder
+/// against the record type's field table — no character-class restriction.
+/// Pre-fix the port required the field part to be all-`is_ascii_uppercase`, so
+/// `'0'` failed the guard and `INP="DIRECT.B0"` parsed as a link to a *record*
+/// literally named `"DIRECT.B0"`: it never resolved locally and was re-routed
+/// as an external CA channel, losing lock-set atomicity and PP/MS semantics.
+#[tokio::test]
+async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
+    use epics_base_rs::server::record::{DbLink, LinkProcessPolicy, MonitorSwitch, ParsedLink};
+    use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
+
+    // Parse boundary: the field part is a C identifier, so digits and `_` are
+    // legal and the old 4-character cap is gone (dbCommon has `OLDSIMM`).
+    assert_eq!(
+        epics_base_rs::server::record::parse_link_v2("DIRECT.B0 NPP MS"),
+        ParsedLink::Db(DbLink {
+            record: "DIRECT".to_string(),
+            field: "B0".to_string(),
+            policy: LinkProcessPolicy::NoProcess,
+            monitor_switch: MonitorSwitch::Maximize,
+        })
+    );
+    for (link, field) in [
+        ("SEQ.DO1", "DO1"),
+        ("SEQ.LNK1", "LNK1"),
+        ("SEQ.LNKA", "LNKA"),
+        ("REC.OLDSIMM", "OLDSIMM"),
+        ("REC._X1", "_X1"),
+    ] {
+        match epics_base_rs::server::record::parse_link_v2(link) {
+            ParsedLink::Db(db) => assert_eq!(db.field, field, "link {link}"),
+            other => panic!("link {link} must be a Db link, got {other:?}"),
+        }
+    }
+    // A remainder that is NOT a field name (leading digit) is C's "absent
+    // field name" case: the whole string stays the record/PV name, which is
+    // what preserves a dotted remote PV for the CA fallback.
+    match epics_base_rs::server::record::parse_link_v2("OTHER:PV.1:X") {
+        ParsedLink::Db(db) => {
+            assert_eq!(db.record, "OTHER:PV.1:X");
+            assert_eq!(db.field, "VAL");
+        }
+        other => panic!("expected a whole-name Db link, got {other:?}"),
+    }
+    // The record name terminates at the FIRST `.`, not the last.
+    match epics_base_rs::server::record::parse_link_v2("A.B.C") {
+        ParsedLink::Db(db) => {
+            assert_eq!(db.record, "A.B.C", "'B.C' is not a field name");
+            assert_eq!(db.field, "VAL");
+        }
+        other => panic!("expected a whole-name Db link, got {other:?}"),
+    }
+
+    // End to end: an ai whose INP names `DIRECT.B0` reads the B0 bit out of
+    // the local mbboDirect record, not a nonexistent record "DIRECT.B0".
+    let db = PvDatabase::new();
+    let mut direct = MbboDirectRecord::default();
+    direct.put_field("B0", EpicsValue::Short(1)).unwrap();
+    db.add_record("DIRECT", Box::new(direct)).await.unwrap();
+    db.add_record("SINK", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("SINK").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("DIRECT.B0".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SINK", &mut visited, 0)
+        .await
+        .unwrap();
+
+    match db.get_pv("SINK").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 1.0).abs() < 1e-10,
+            "SINK.INP=DIRECT.B0 must read the B0 bit (1), got {v}"
+        ),
+        other => panic!("expected Double(1.0), got {other:?}"),
+    }
+    // The link resolved locally, so the record is NOT in LINK/INVALID alarm.
+    if let Some(rec) = db.get_record("SINK").await {
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            epics_base_rs::server::record::AlarmSeverity::NoAlarm,
+            "a resolvable local link must not raise LINK_ALARM"
+        );
     }
 }
 
@@ -5062,6 +5450,62 @@ async fn test_dol_cp_link_triggers_processing() {
         EpicsValue::Double(v) => assert!((v - 10.0).abs() < 1e-10),
         other => panic!("expected Double(10.0), got {:?}", other),
     }
+}
+
+/// R6-4 — an `OUT` link is a `DBF_OUTLINK`, and C's `dbParseLink` discards its
+/// CP/CPP modifier before the link is ever built
+/// (`dbStaticLib.c:2382-2387` — `modifiers &= ~(pvlOptCPP|pvlOptCP)`, with a
+/// startup warning). It must therefore never enter the CP trigger registry:
+/// registering it would make the holder reprocess on every target change,
+/// which — since the holder *writes* that target — is a processing loop that
+/// does not exist on a C IOC. The same text on an `INP` (`DBF_INLINK`) does
+/// register, which is the boundary this pins.
+#[tokio::test]
+async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
+    let db = PvDatabase::new();
+    db.add_record("CPOUT_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("CPOUT_HOLDER", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("CPIN_HOLDER", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("CPOUT_HOLDER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("CPOUT_TGT PP CP".into()))
+            .unwrap();
+    }
+    if let Some(rec) = db.get_record("CPIN_HOLDER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("CPOUT_TGT CP".into()))
+            .unwrap();
+    }
+    db.setup_cp_links().await;
+
+    let targets = db.get_cp_targets("CPOUT_TGT").await;
+    assert_eq!(
+        targets.len(),
+        1,
+        "only the DBF_INLINK holder may subscribe; got {targets:?}"
+    );
+    assert_eq!(targets[0].record, "CPIN_HOLDER");
+    assert!(
+        !targets.iter().any(|t| t.record == "CPOUT_HOLDER"),
+        "an OUT link's CP modifier is discarded by C and must not register a CP trigger"
+    );
+
+    // The rest of the OUT link's modifiers survive the mask: ` PP` still
+    // processes the target (`dbDbLink.c:387-390`).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CPOUT_HOLDER", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        db.get_pv("CPOUT_TGT").await.is_ok(),
+        "the PP OUT link must still reach its target"
+    );
 }
 
 /// A CPP link registers as `passive_only` (distinct from CP). Collapsing

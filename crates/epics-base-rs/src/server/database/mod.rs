@@ -198,7 +198,7 @@ struct PvDatabaseInner {
     /// [`CpTarget`]).
     cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
     /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
-    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP CA"`)
+    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
     /// → holder edges to process when that remote PV changes. The local
     /// [`Self::cp_links`] index is keyed by a local source RECORD that
     /// processes here; a cross-IOC source never processes locally, so its
@@ -785,15 +785,25 @@ impl PvDatabase {
         };
         let inst = rec.read().await;
         let mut out = Vec::new();
-        let push = |field: &str, raw: &str, out: &mut Vec<_>| {
+        // Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
+        // passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`),
+        // which then masks the modifiers by that type (`dbStaticLib.c:2380-2391`).
+        // `OUT` is `DBF_OUTLINK`, so its CP/CPP is discarded here rather than
+        // reaching `setup_cp_links` — an `OUT` link must never be registered as
+        // a CP holder.
+        let push = |field: &str,
+                    raw: &str,
+                    ftype: crate::server::record::LinkFieldType,
+                    out: &mut Vec<_>| {
             if raw.is_empty() {
                 return;
             }
-            let parsed = crate::server::record::parse_link_v2(raw);
+            let parsed = crate::server::record::parse_link_field(raw, ftype);
             if !matches!(parsed, crate::server::record::ParsedLink::None) {
                 out.push((field.to_string(), raw.to_string(), parsed));
             }
         };
+        use crate::server::record::LinkFieldType;
         // Canonical link-bearing fields stored on `CommonFields` as raw
         // String. These do NOT appear as `DbFieldType::String` entries in
         // `field_list()`: an `ai`'s `INP` / an `ao`'s `OUT` carry
@@ -805,10 +815,10 @@ impl PvDatabase {
         // is the single owner of "which fields on a record are links",
         // shared by `setup_cp_links` (CA CP/CPP) and the pvalink install
         // scan (PVA CP/CPP).
-        push("INP", &inst.common.inp, &mut out);
-        push("OUT", &inst.common.out, &mut out);
-        push("TSEL", &inst.common.tsel, &mut out);
-        push("SDIS", &inst.common.sdis, &mut out);
+        push("INP", &inst.common.inp, LinkFieldType::In, &mut out);
+        push("OUT", &inst.common.out, LinkFieldType::Out, &mut out);
+        push("TSEL", &inst.common.tsel, LinkFieldType::In, &mut out);
+        push("SDIS", &inst.common.sdis, LinkFieldType::In, &mut out);
         // Record-specific multi-input links (INPA..INPL for
         // calc/calcout/sel/sub) and the CP-capable input link fields
         // (DOL family, NVL, SELL, SGNL).
@@ -821,7 +831,7 @@ impl PvDatabase {
         field_names.extend_from_slice(crate::server::database::links::CP_INPUT_LINK_FIELDS);
         for field in field_names {
             if let Some(EpicsValue::String(s)) = inst.record.get_field(field) {
-                push(field, &s.as_str_lossy(), &mut out);
+                push(field, &s.as_str_lossy(), LinkFieldType::In, &mut out);
             }
         }
         out

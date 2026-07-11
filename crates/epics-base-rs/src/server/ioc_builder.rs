@@ -416,63 +416,11 @@ impl IocBuilder {
             }
         }
 
-        // 5. I/O Intr setup
-        let all_names = db.all_record_names().await;
-        let io_intr_recs: Vec<(
-            String,
-            Arc<crate::runtime::sync::RwLock<record::RecordInstance>>,
-        )> = {
-            let mut recs = Vec::new();
-            for name in &all_names {
-                if let Some(arc) = db.get_record(name).await {
-                    recs.push((name.clone(), arc));
-                }
-            }
-            recs
-        };
-
-        for (name, rec_arc) in io_intr_recs {
-            let mut inst = rec_arc.write().await;
-            // Wire poll feedback when the record is on I/O Intr scan, OR when
-            // the device drives processing from its own callback independently
-            // of the SCAN menu (motorRecord statusCallback; asyn readback
-            // records, PRs #60/#208). The device's decision is authoritative —
-            // the SCAN check alone would suppress callbacks for a
-            // SCAN="Passive" motor, breaking the pp(TRUE) dbPutField gate.
-            let independent = inst
-                .device
-                .as_ref()
-                .is_some_and(|d| d.io_intr_scan_independent());
-            if inst.common.scan == record::ScanType::IoIntr || independent {
-                if let Some(mut dev) = inst.device.take() {
-                    if let Some(mut intr_rx) = dev.io_intr_receiver() {
-                        let db_clone = db.clone();
-                        let rec_name = name.clone();
-                        let rec_arc_clone = rec_arc.clone();
-                        crate::runtime::task::spawn(async move {
-                            while intr_rx.recv().await.is_some() {
-                                let process = independent || {
-                                    let inst = rec_arc_clone.read().await;
-                                    inst.common.scan == record::ScanType::IoIntr
-                                };
-                                if !process {
-                                    continue;
-                                }
-                                let mut visited = std::collections::HashSet::new();
-                                // Driver-callback cycle: an output
-                                // (`asyn:READBACK`) record reads the value back
-                                // into VAL and skips the device write; input
-                                // records are unaffected.
-                                let _ = db_clone
-                                    .process_record_readback(&rec_name, &mut visited, 0)
-                                    .await;
-                            }
-                        });
-                    }
-                    inst.device = Some(dev);
-                }
-            }
-        }
+        // 5. I/O Intr setup — through the single owner shared with the
+        // `IocApplication` iocInit path, so C `scanAdd`'s failure exits
+        // (`dbScan.c:266-297`: no DSET / no interrupt source → log and demote
+        // SCAN to Passive) apply on both startup routes.
+        let _ = crate::server::ioc_app::setup_io_intr(db.clone()).await;
 
         // 6. Out-of-band PROPERTY-post setup (asyn enum-string runtime
         // re-propagation). Independent of SCAN, so it is a separate pass

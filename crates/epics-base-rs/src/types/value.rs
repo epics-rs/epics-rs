@@ -709,6 +709,29 @@ impl EpicsValue {
         }
     }
 
+    /// True iff this value is an array variant, whatever its length.
+    ///
+    /// The port's stand-in for C's `no_elements > 1` destination test
+    /// (`dbAccess.c:1345`): a record's array-valued field reads back as an
+    /// array variant, a scalar field as a scalar variant.
+    pub fn is_array(&self) -> bool {
+        matches!(
+            self,
+            Self::ShortArray(_)
+                | Self::FloatArray(_)
+                | Self::EnumArray(_)
+                | Self::DoubleArray(_)
+                | Self::LongArray(_)
+                | Self::Int64Array(_)
+                | Self::UInt64Array(_)
+                | Self::UShortArray(_)
+                | Self::ULongArray(_)
+                | Self::UCharArray(_)
+                | Self::CharArray(_)
+                | Self::StringArray(_)
+        )
+    }
+
     /// Get the element count for this value.
     pub fn count(&self) -> u32 {
         match self {
@@ -1226,11 +1249,14 @@ impl EpicsValue {
             ".5 second" => Some(7),
             ".2 second" => Some(8),
             ".1 second" => Some(9),
-            // menuPini (NO=0, YES=1 already handled via menuYesNo)
-            "RUNNING" => Some(2),
-            "RUNNING_NOT_CA" => Some(3),
-            "PAUSED" => Some(4),
-            "PAUSED_NOT_CA" => Some(5),
+            // menuPini is deliberately absent. Its real choice order is
+            // NO,YES,RUN,RUNNING,PAUSE,PAUSED (`menuPini.dbd.pod:59-65`) — the
+            // entries that used to live here (`RUNNING=2`, `PAUSED=4`, plus two
+            // invented `*_NOT_CA` choices) named the wrong indices. `PINI`
+            // resolves against its own menu via
+            // `crate::server::record::PiniMode::from_str`, which is what this
+            // field-blind table cannot do: the same label names different
+            // indices in different menus.
             _ => None,
         }
     }

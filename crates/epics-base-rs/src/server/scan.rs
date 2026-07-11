@@ -46,15 +46,10 @@ impl ScanScheduler {
         let is_first = self.db.try_claim_scan_start();
 
         if is_first {
-            // Process PINI records at startup (with full link chain)
-            let pini_records = self.db.pini_records().await;
-            for name in &pini_records {
-                let mut visited = HashSet::new();
-                let _ = self
-                    .db
-                    .process_record_with_links(name, &mut visited, 0)
-                    .await;
-            }
+            // C `initialProcess()` (iocInit.c:653-657) — the PINI=YES pass.
+            self.db
+                .pini_process(crate::server::record::PiniMode::Yes)
+                .await;
             // Release non-owner schedulers so they can run their hooks now.
             self.db.mark_pini_done();
         } else {

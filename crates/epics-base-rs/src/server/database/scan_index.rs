@@ -1,4 +1,4 @@
-use crate::server::record::ScanType;
+use crate::server::record::{PiniMode, RecordInstance, ScanType};
 
 use super::PvDatabase;
 
@@ -94,7 +94,14 @@ impl PvDatabase {
             .unwrap_or_default()
     }
 
-    /// Get all record names that have PINI=true.
+    /// Get all record names whose `PINI` is **exactly** `mode`.
+    ///
+    /// C matches the menu index with `!=` (`iocInit.c:598`
+    /// `if (precord->pini != pphase->pini) return;`), so each `menuPini`
+    /// choice selects a disjoint set of records driven by a *different* pass:
+    /// `YES` at `initialProcess()` (`iocInit.c:656`), `RUN`/`RUNNING`/`PAUSE`/
+    /// `PAUSED` from `piniProcessHook` (`iocInit.c:629-646`). A `PINI=RUN`
+    /// record must NOT be processed by the `YES` pass.
     ///
     /// Snapshot the records map under the outer
     /// read lock, then drop it before fanning out per-record reads.
@@ -103,7 +110,31 @@ impl PvDatabase {
     /// `add_record` (which now takes the registration_mutex →
     /// records.write()), startup could stall while every PINI
     /// record was inspected serially.
-    pub async fn pini_records(&self) -> Vec<String> {
+    pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
+        let mut result = Vec::new();
+        for (name, rec) in self.records_in_load_order().await {
+            if rec.read().await.common.pini == mode {
+                result.push(name);
+            }
+        }
+        result
+    }
+
+    /// Every record, in database **load order** — the port's analogue of C's
+    /// `iterateRecords`, which walks the record-type / record-instance lists in
+    /// the order the `.db` declared them. That order is what makes two
+    /// same-`PHAS` records process deterministically; `load_order` is already
+    /// the `scan_index` secondary sort key for the same reason
+    /// (`database/mod.rs:184`).
+    ///
+    /// Snapshots the map under the records read lock and releases it before the
+    /// caller takes any per-record lock.
+    async fn records_in_load_order(
+        &self,
+    ) -> Vec<(
+        String,
+        std::sync::Arc<crate::runtime::sync::RwLock<RecordInstance>>,
+    )> {
         let snapshot: Vec<_> = {
             let records = self.inner.records.read().await;
             records
@@ -111,14 +142,72 @@ impl PvDatabase {
                 .map(|(n, r)| (n.clone(), r.clone()))
                 .collect()
         };
-        let mut result = Vec::new();
-        for (name, rec) in snapshot {
-            let instance = rec.read().await;
-            if instance.common.pini {
-                result.push(name);
+        let mut keyed: Vec<_> = {
+            let load_order = self.inner.load_order.read().await;
+            snapshot
+                .into_iter()
+                .map(|(name, rec)| (load_order.get(&name).copied().unwrap_or(0), name, rec))
+                .collect()
+        };
+        keyed.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        keyed
+            .into_iter()
+            .map(|(_seq, name, rec)| (name, rec))
+            .collect()
+    }
+
+    /// C `piniProcess` (`iocInit.c:608-627`) — process every record whose
+    /// `PINI` is exactly `mode`, **in ascending `PHAS` order**, each with its
+    /// full link chain.
+    ///
+    /// The single owner of "run a PINI pass": `initialProcess()` calls it with
+    /// [`PiniMode::Yes`], and the `initHook` lifecycle calls it with
+    /// [`PiniMode::Run`] / [`PiniMode::Running`]. Every driver goes through
+    /// here, so neither the pass selection nor the phase ordering can diverge
+    /// between them.
+    ///
+    /// The sweep is C's, not a pre-sorted list: each pass over the database
+    /// processes the records at the current phase and, while doing so, finds
+    /// the *next* lowest `PHAS` still ahead of it. C spells this out
+    /// (`iocInit.c:614-619`) — "PHAS fields can be changed at runtime, so we
+    /// have to look for the lowest value of PHAS each time" — so a record whose
+    /// phase is raised by an earlier PINI record's processing is still picked
+    /// up in the correct later pass, which a snapshot-and-sort would miss.
+    pub async fn pini_process(&self, mode: PiniMode) {
+        // C `dbScan.h:34-35`: MAX_PHASE = SHRT_MAX, MIN_PHASE = SHRT_MIN. The
+        // phase cursors are `int` (`phaseData_t`), so `MAX_PHASE + 1` — the
+        // "no further phase found" sentinel — does not overflow.
+        const MIN_PHASE: i32 = i16::MIN as i32;
+        const NO_NEXT_PHASE: i32 = i16::MAX as i32 + 1;
+
+        let mut next = MIN_PHASE;
+        loop {
+            let this = next;
+            next = NO_NEXT_PHASE;
+            // `doRecordPini` (`iocInit.c:592-606`) over the record list. PINI
+            // and PHAS are read at the moment the record is visited, not
+            // snapshotted up front, so a PHAS that an earlier record's
+            // processing changed is honoured — the reason C re-scans rather
+            // than sorting once.
+            for (name, rec) in self.records_in_load_order().await {
+                let (pini, phas) = {
+                    let instance = rec.read().await;
+                    (instance.common.pini, i32::from(instance.common.phas))
+                };
+                if pini != mode {
+                    continue;
+                }
+                if phas == this {
+                    let mut visited = std::collections::HashSet::new();
+                    let _ = self.process_record_with_links(&name, &mut visited, 0).await;
+                } else if phas > this && phas < next {
+                    next = phas;
+                }
+            }
+            if next == NO_NEXT_PHASE {
+                return;
             }
         }
-        result
     }
 
     /// Process all records with `SCAN=Event`, regardless of `EVNT`.

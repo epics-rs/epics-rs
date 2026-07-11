@@ -1662,8 +1662,10 @@ fn common_field_dbf_type(field: &str) -> Option<crate::types::DbFieldType> {
         "SCAN" => Some(DbFieldType::String),
         "DTYP" => Some(DbFieldType::String),
         "INP" | "OUT" | "FLNK" | "ASG" => Some(DbFieldType::String),
-        "SEVR" | "STAT" => Some(DbFieldType::Short),
-        "UDF" | "PINI" | "TPRO" => Some(DbFieldType::Char),
+        // The dbCommon `DBF_MENU` fields carry a menu index (served as
+        // `DBR_ENUM`); `UDF`/`TPRO` are the genuine `DBF_UCHAR` flags.
+        "SEVR" | "STAT" | "PINI" => Some(DbFieldType::Short),
+        "UDF" | "TPRO" => Some(DbFieldType::Char),
         "HIHI" | "HIGH" | "LOW" | "LOLO" => Some(DbFieldType::Double),
         "HHSV" | "HSV" | "LSV" | "LLSV" => Some(DbFieldType::Short),
         _ => None,

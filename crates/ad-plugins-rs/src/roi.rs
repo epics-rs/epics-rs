@@ -128,20 +128,34 @@ pub fn extract_roi(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     extract_roi_2d(src, config)
 }
 
-/// Resolve one ROI axis to C's clamped `(offset, size)` — C++ `NDPluginROI`
-/// (`NDPluginROI.cpp:84-103`):
-///   offset  = MAX(offset, 0); offset = MIN(offset, dimSize-1);
-///   size    = autoSize ? dimSize : size;
-///   size    = MAX(size, 1);   size   = MIN(size, dimSize - offset);
-/// A disabled dimension is the whole axis, unbinned.
-fn resolve_axis(cfg: &ROIDimConfig, dim_size: usize) -> (usize, usize) {
+/// Resolve one ROI axis to C's clamped `(offset, size, binning)` — C++
+/// `NDPluginROI` (`NDPluginROI.cpp:85-103`).
+///
+/// C decides all THREE values in one branch, keyed on that axis's Enable flag:
+///
+/// * enabled (`:87-97`):
+///   `offset = MAX(offset, 0); offset = MIN(offset, dimSize-1);`
+///   `size = autoSize ? dimSize : size;`
+///   `size = MAX(size, 1); size = MIN(size, dimSize - offset);`
+///   `binning = MAX(binning, 1); binning = MIN(binning, size);`
+/// * disabled (`:98-102`): `offset = 0; size = dimSize; binning = 1;`
+///
+/// The binning belongs to that same decision, so it is resolved here and nowhere
+/// else. Deriving it separately in the callers is what let a *disabled* axis keep
+/// a stale `DimNBin > 1` and emit a shrunken axis of bin-sums where C outputs the
+/// full-resolution axis (R9-66).
+fn resolve_axis(cfg: &ROIDimConfig, dim_size: usize) -> (usize, usize, usize) {
     if !cfg.enable || dim_size == 0 {
-        return (0, dim_size);
+        return (0, dim_size, 1);
     }
     let offset = cfg.min.min(dim_size - 1);
     let size = if cfg.auto_size { dim_size } else { cfg.size };
     let size = size.max(1).min(dim_size - offset);
-    (offset, size)
+    // C++: binning = MAX(binning, 1); binning = MIN(binning, size). A bin larger
+    // than the ROI is clamped to the ROI size, yielding a 1-pixel output rather
+    // than collapsing to an empty (sink) result.
+    let binning = cfg.bin.max(1).min(size);
+    (offset, size, binning)
 }
 
 /// Run C's ROI extraction: `pNDArrayPool->convert()` with the ROI's
@@ -209,13 +223,10 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         return None;
     }
 
-    let (x_min, x_roi) = resolve_axis(&config.dims[0], src_x);
-    let (y_min, y_roi) = resolve_axis(&config.dims[1], src_y);
-    let (c_min, c_roi) = resolve_axis(&config.dims[2], src_c);
+    let (x_min, x_roi, bin_x) = resolve_axis(&config.dims[0], src_x);
+    let (y_min, y_roi, bin_y) = resolve_axis(&config.dims[1], src_y);
+    let (c_min, c_roi, bin_c) = resolve_axis(&config.dims[2], src_c);
 
-    let bin_x = config.dims[0].bin.max(1).min(x_roi);
-    let bin_y = config.dims[1].bin.max(1).min(y_roi);
-    let bin_c = config.dims[2].bin.max(1).min(c_roi);
     let (out_x, out_y, out_c) = (x_roi / bin_x, y_roi / bin_y, c_roi / bin_c);
     if out_x == 0 || out_y == 0 || out_c == 0 {
         return None;
@@ -292,8 +303,8 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     let src_x = src.dims[0].size;
     let src_y = src.dims[1].size;
 
-    let (eff_x_min, eff_x_size) = resolve_axis(&config.dims[0], src_x);
-    let (eff_y_min, eff_y_size) = resolve_axis(&config.dims[1], src_y);
+    let (eff_x_min, eff_x_size, bin_x) = resolve_axis(&config.dims[0], src_x);
+    let (eff_y_min, eff_y_size, bin_y) = resolve_axis(&config.dims[1], src_y);
 
     // Apply autocenter: shift ROI min so that the ROI is centered on the
     // centroid or peak, keeping the effective size the same.
@@ -325,11 +336,6 @@ pub fn extract_roi_2d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         return None;
     }
 
-    // C++: binning = MAX(binning, 1); binning = MIN(binning, size).
-    // A bin larger than the ROI is clamped to the ROI size, yielding a
-    // 1-pixel output rather than collapsing to an empty (sink) result.
-    let bin_x = config.dims[0].bin.max(1).min(eff_x_size);
-    let bin_y = config.dims[1].bin.max(1).min(eff_y_size);
     if eff_x_size / bin_x == 0 || eff_y_size / bin_y == 0 {
         return None;
     }
@@ -645,6 +651,118 @@ mod tests {
             }
         }
         arr
+    }
+
+    #[test]
+    fn test_r9_66_disabled_dimension_is_not_binned() {
+        // R9-66. C's per-axis loop decides offset/size/binning together from the
+        // Enable flag, and the DISABLED branch forces all three
+        // (NDPluginROI.cpp:98-102): offset = 0, size = the full axis, binning = 1.
+        // A leftover DimNBin > 1 on a disabled axis is therefore ignored by C. The
+        // port resolved offset/size through resolve_axis but re-derived the binning
+        // outside it, straight from the config, so a disabled axis was still binned:
+        // a shrunken axis of bin-sums instead of the full-resolution axis.
+        let arr = make_4x4_u8();
+        let mut config = ROIConfig::default();
+        // Dim0 disabled, but with stale min/size/bin left over from an earlier ROI.
+        config.dims[0] = ROIDimConfig {
+            min: 2,
+            size: 1,
+            bin: 2,
+            reverse: false,
+            enable: false,
+            auto_size: false,
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 0,
+            size: 4,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+
+        let roi = extract_roi_2d(&arr, &config).unwrap();
+        // Disabled → the whole 4-wide axis at full resolution, NOT 4/2 == 2 bins,
+        // and the stale min = 2 is ignored.
+        assert_eq!(roi.dims[0].size, 4, "disabled axis keeps its full size");
+        assert_eq!(roi.dims[1].size, 4);
+        if let NDDataBuffer::U8(ref v) = roi.data {
+            // Row 0 of the source, unbinned and unoffset: 0,1,2,3.
+            assert_eq!(&v[0..4], &[0, 1, 2, 3], "disabled axis must not bin-sum");
+        } else {
+            panic!("expected U8");
+        }
+
+        // Boundary: the SAME stale bin on an ENABLED axis must still bin (C :96-97),
+        // so the fix is keyed on Enable and has not simply dropped binning.
+        config.dims[0].enable = true;
+        config.dims[0].min = 0;
+        config.dims[0].auto_size = true; // size = full axis, bin = 2
+        let roi = extract_roi_2d(&arr, &config).unwrap();
+        assert_eq!(
+            roi.dims[0].size, 2,
+            "enabled axis with bin=2 halves the axis"
+        );
+        if let NDDataBuffer::U8(ref v) = roi.data {
+            // Row 0 binned by 2: 0+1 = 1, 2+3 = 5.
+            assert_eq!(&v[0..2], &[1, 5], "enabled axis bin-sums");
+        } else {
+            panic!("expected U8");
+        }
+    }
+
+    #[test]
+    fn test_r9_66_disabled_color_axis_is_not_binned() {
+        // The 3-D path took the binning from the config too (roi.rs:216-218).
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use ad_core_rs::color::NDColorMode;
+
+        // RGB1: dims are [color, x, y].
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(NDColorMode::RGB1 as i32),
+        ));
+        let mut config = ROIConfig::default();
+        // Dim2 is the COLOR axis (userDims[2] = colorDim): disabled, stale bin = 3.
+        config.dims[2] = ROIDimConfig {
+            min: 0,
+            size: 3,
+            bin: 3,
+            reverse: false,
+            enable: false,
+            auto_size: false,
+        };
+        for i in 0..2 {
+            config.dims[i] = ROIDimConfig {
+                min: 0,
+                size: 0,
+                bin: 1,
+                reverse: false,
+                enable: true,
+                auto_size: true,
+            };
+        }
+
+        let roi = extract_roi_3d(&arr, &config).unwrap();
+        // Disabled colour axis: all 3 planes survive, unbinned. With the stale
+        // bin = 3 applied it would have collapsed to a single summed plane.
+        assert_eq!(
+            roi.dims[0].size, 3,
+            "disabled colour axis keeps all 3 planes"
+        );
+        assert_eq!(roi.dims[1].size, 4);
+        assert_eq!(roi.dims[2].size, 2);
     }
 
     #[test]

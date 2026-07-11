@@ -25,7 +25,7 @@
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::pv::MonitorEvent;
+use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -37,7 +37,7 @@ const ALL: u16 = 0x07; // DBE_VALUE | DBE_LOG | DBE_ALARM
 
 /// Subscribe to `REC.A` with every event class, so the post's own mask decides
 /// what arrives.
-async fn subscribe_a(db: &PvDatabase, rec: &str) -> tokio::sync::mpsc::Receiver<MonitorEvent> {
+async fn subscribe_a(db: &PvDatabase, rec: &str) -> EventReader {
     let inst = db.get_record(rec).await.unwrap();
     let mut g = inst.write().await;
     g.add_subscriber("A", 1, DbFieldType::Double, ALL)
@@ -72,12 +72,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 /// (C seeds them in `init_record`); the deadbands only decide anything from the
 /// second cycle on. Drains the priming posts so the caller reads the post it
 /// is actually testing.
-async fn prime_then_move(
-    db: &PvDatabase,
-    rec: &str,
-    rx: &mut tokio::sync::mpsc::Receiver<MonitorEvent>,
-    to: f64,
-) {
+async fn prime_then_move(db: &PvDatabase, rec: &str, rx: &mut EventReader, to: f64) {
     process(db, rec).await;
     while rx.try_recv().is_ok() {}
     db.put_pv("SRC", EpicsValue::Double(to)).await.unwrap();

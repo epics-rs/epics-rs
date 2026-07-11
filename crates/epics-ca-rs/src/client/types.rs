@@ -700,8 +700,9 @@ pub(crate) enum TransportCommand {
     /// receive watchdog. `anomaly = false` for healthy beacons (mirrors
     /// libca `tcpRecvWatchdog::beaconArrivalNotify` — pet the watchdog
     /// so a quiet circuit isn't probed unnecessarily). `anomaly = true`
-    /// when the monitor classified the beacon as a real restart signal
-    /// (`IdMismatch` / `PeriodCollapse`); the read loop only sets a
+    /// when the monitor classified the beacon as anomalous — a fresh
+    /// sequence (`IdMismatch`) or an off-band period (libca
+    /// `bhe.cpp:226-262`); the read loop only sets a
     /// flag (mirrors libca `beaconAnomalyNotify`) and lets the existing
     /// idle watchdog expire on its own schedule rather than firing an
     /// immediate echo probe — under load that immediate probe was the
@@ -801,7 +802,7 @@ pub(crate) enum TransportEvent {
     /// to the beacon monitor (libca `bhe.cpp` "new client connect"
     /// EMA reset) so a stale steady-state period estimate doesn't
     /// misclassify the server's `online_notify_task` ramp-up as a
-    /// `PeriodCollapse` cascade after reconnect. Emitted exactly once
+    /// short-period anomaly cascade after reconnect. Emitted exactly once
     /// per circuit, before any other event for that circuit.
     ServerConnected {
         server_addr: SocketAddr,

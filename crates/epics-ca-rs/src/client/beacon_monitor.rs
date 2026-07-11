@@ -43,22 +43,83 @@ pub(crate) enum BeaconControl {
 /// treatment (search wake-up + EchoProbe to operational circuits, so
 /// a half-dead TCP gets surfaced fast).
 ///
-/// `PeriodCollapse` is retired: see the `handle_beacon` classify
-/// chain. In practice every site that would have produced it was the
-/// IOC's `beacon_emitter` ramp-up cascade after some peer's TCP
-/// accept, NOT a real restart. Real restarts reset beacon_id and trip
-/// `IdMismatch`; circuits that dropped for the restart receive
-/// `BeaconControl::ResetServer` from the coordinator before the
-/// cascade arrives. The variant remains for the retained match-arm
-/// shape in negative-assertion tests and in case a future
-/// distinguishing signature lets us reintroduce a different
-/// PeriodCollapse trigger; it is intentionally never produced today.
+/// `LongPeriod` / `ShortPeriod` are libca's two beacon-period bands
+/// (`bhe.cpp:226-262`). They only label the search wake-up; the
+/// per-circuit watchdog flag is carried by the separate
+/// `CoordRequest::BeaconArrival` path, exactly as in libca, where
+/// `bhe::beaconAnomalyNotify` (circuit watchdog) and `updatePeriod`'s
+/// `netChange` return value (search timer) are independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BeaconAnomalyKind {
     FirstSighting,
     IdMismatch,
-    #[allow(dead_code)]
-    PeriodCollapse,
+    /// `currentPeriod >= averagePeriod * 3.25` — libca's "3 contiguous
+    /// missing beacons" band (`bhe.cpp:232-238`): the server was
+    /// unreachable and is back, so unresolved channels re-search.
+    LongPeriod,
+    /// `currentPeriod <= averagePeriod * 0.80` — libca's IOC-reboot
+    /// band (`bhe.cpp:255-259`): beacons come faster right after a
+    /// reboot because rsrv's `online_notify_task` restarts its 0.02 s
+    /// ramp-up (`online_notify.c:66`).
+    ShortPeriod,
+}
+
+/// libca `bhe.cpp:226` — `currentPeriod >= averagePeriod * 1.25` means
+/// at least one beacon went missing: flag the circuit watchdog.
+const BEACON_LONG_PERIOD_FACTOR: f64 = 1.25;
+
+/// libca `bhe.cpp:232` — `>= averagePeriod * 3.25` means ~3 contiguous
+/// beacons went missing: additionally wake the search engine
+/// (`netChange`).
+const BEACON_NET_CHANGE_FACTOR: f64 = 3.25;
+
+/// libca `bhe.cpp:255` — `currentPeriod <= averagePeriod * 0.80`: the
+/// IOC is beaconing faster than its running average, i.e. it rebooted
+/// into the ramp-up phase. Flags the watchdog AND wakes searches.
+const BEACON_SHORT_PERIOD_FACTOR: f64 = 0.80;
+
+/// What one beacon must trigger, mirroring libca's two independent
+/// notifications in `bhe::updatePeriod` (`bhe.cpp:186-266`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BeaconAction {
+    /// `Some(kind)` ⇔ `updatePeriod` returned `netChange`, so
+    /// `cac::beaconNotify` (`cac.cpp:500`) calls
+    /// `udpiiu::beaconAnomalyNotify` and the search timer restarts for
+    /// unresolved channels. `kind` only labels the log line.
+    rescan: Option<BeaconAnomalyKind>,
+    /// `Some(true)` ⇔ `bhe::beaconAnomalyNotify` (sticky flag on the
+    /// per-circuit receive watchdog); `Some(false)` ⇔
+    /// `tcpiiu::beaconArrivalNotify` (healthy beacon — push the
+    /// receive deadline forward); `None` ⇔ neither.
+    watchdog: Option<bool>,
+}
+
+/// libca `bhe::updatePeriod` (`bhe.cpp:226-262`) period classification,
+/// for a server whose running average is already established.
+///
+/// The bands are checked against the average as it stood *before* this
+/// sample is blended in — C updates `averagePeriod` only after the
+/// `if/else if/else` chain (`bhe.cpp:267`).
+fn classify_period(average: Duration, current: Duration) -> BeaconAction {
+    let avg = average.as_secs_f64();
+    let cur = current.as_secs_f64();
+    if cur >= avg * BEACON_LONG_PERIOD_FACTOR {
+        BeaconAction {
+            rescan: (cur >= avg * BEACON_NET_CHANGE_FACTOR)
+                .then_some(BeaconAnomalyKind::LongPeriod),
+            watchdog: Some(true),
+        }
+    } else if cur <= avg * BEACON_SHORT_PERIOD_FACTOR {
+        BeaconAction {
+            rescan: Some(BeaconAnomalyKind::ShortPeriod),
+            watchdog: Some(true),
+        }
+    } else {
+        BeaconAction {
+            rescan: None,
+            watchdog: Some(false),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,67 +781,59 @@ fn handle_beacon(
         }
     }
 
-    // Anomaly: beacon_id not monotonically increasing (IOC restarted
-    // with a fresh sequence), OR period suddenly dropped below 1/3 of
-    // the estimated steady-state period (IOC restarted and is in its
-    // fast-beacon initial phase). Also: first time we've seen this
-    // server — libca treats unknown-server beacons as a hint to
-    // re-search immediately so channels still in `Searching` wake up
-    // on the new IOC instead of waiting their full bucket cycle.
+    // Classify. Priority order: FirstSighting wins because there is no
+    // prior `last_id` / `period_estimate` to make the other checks
+    // meaningful. IdMismatch beats the period bands because a fresh
+    // beacon sequence is the dispositive restart signal even when the
+    // interval also happens to be off-period.
     //
-    // Floor the period-collapse check at 50 ms — multi-NIC duplicate
-    // beacons that happen to use the next sequence id (rare but
-    // possible if the network reorders) would otherwise still
-    // satisfy `actual_interval < period_estimate / 3` for any
-    // nonzero period. 50 ms safely separates "duplicate" from
-    // "legitimate fast-beacon initial phase" (real IOCs send
-    // every 100-500 ms during startup).
-    const MIN_PERIOD_COLLAPSE_INTERVAL: Duration = Duration::from_millis(50);
-    // Classify in priority order: FirstSighting wins because there's
-    // no prior `last_id` / `period_estimate` to make the other two
-    // checks meaningful. IdMismatch beats the period-collapse branch
-    // because a real restart (id reset to 1) is the dispositive
-    // signal even if the inter-beacon interval also happens to be
-    // sub-period.
+    // Everything else is libca `bhe::updatePeriod` (`bhe.cpp:226-262`),
+    // reproduced in `classify_period`: one band for "beacons went
+    // missing" (>= 1.25x average, >= 3.25x also wakes searches), one
+    // for "beacons sped up, so the IOC rebooted" (<= 0.80x average),
+    // and a healthy arrival otherwise. The bands replace the local
+    // `actual_interval < period_estimate / 3` self-reset heuristic,
+    // which reported nothing to either consumer.
     //
-    // The period-collapse branch (id monotonic + interval suddenly
-    // dropped below `period_estimate / 3`) does NOT fire
-    // `PeriodCollapse` any more. That signature in practice
-    // identifies the IOC's `rsrv online_notify_task` ramp-up restart
-    // (`server/beacon.rs:124`, `tcp.rs:450`: `beacon_reset.notify_one`
-    // on every TCP accept/disconnect), NOT a real server restart.
-    // Real restarts reset beacon_id to 0 and trip `IdMismatch` above;
-    // any client whose own circuit broke for the restart also gets a
-    // `BeaconControl::ResetServer` from the coordinator
-    // (`apply_reset_server`) which clears the EMA pre-emptively. The
-    // remaining cases the period-collapse heuristic used to catch
-    // were ALL false positives: another client on the network
-    // connected to the same IOC and our beacon_monitor saw the
-    // resulting ramp-up cascade against our mature ~15 s EMA. That
-    // produced a stream of `tracing::warn!("IOC may have restarted")`
-    // + transport-watchdog sticky flags + reconnect cascades for
-    // healthy circuits.
-    //
-    // Self-reset path: clear `period_estimate` and `count` so the
-    // ramp-up cascade reseeds the EMA from the live cadence (same
-    // post-condition as `apply_reset_server`). The state-update
-    // block below runs unchanged.
-    let anomaly_kind = if first_sighting {
-        Some(BeaconAnomalyKind::FirstSighting)
+    // A false trigger on a live server is *not* damaging, and libca
+    // says so explicitly at `bhe.cpp:216-221` / `bhe.cpp:248-253`:
+    // "It may be possible to get false triggers here if the client is
+    // busy, but this does not cause problems because the echo response
+    // will tell us that the server is available". Our receive watchdog
+    // now behaves the same way (echo timeout marks the circuit
+    // unresponsive and KEEPS the socket, recovering on the next byte —
+    // `transport.rs` `tcpRecvWatchdog::expire` parity), so an anomaly
+    // on a healthy circuit costs one echo round-trip, not a disconnect.
+    let action = if first_sighting {
+        // Divergence from libca, deliberate: C creates the `bhe` and
+        // returns without any notify (`cac.cpp:480-496`) — it waits for
+        // the 2nd beacon. We wake the search engine immediately (a
+        // channel stuck in `Searching` should not wait a whole beacon
+        // period), but we do NOT flag the circuit watchdog, since by
+        // definition an operational circuit for this server is already
+        // receiving from it.
+        BeaconAction {
+            rescan: Some(BeaconAnomalyKind::FirstSighting),
+            watchdog: None,
+        }
     } else if beacon_id != expected_next_id {
-        Some(BeaconAnomalyKind::IdMismatch)
-    } else if entry.count > 3
-        && actual_interval > MIN_PERIOD_COLLAPSE_INTERVAL
-        && entry
-            .period_estimate
-            .is_some_and(|est| actual_interval < est / 3)
-    {
-        entry.period_estimate = None;
-        entry.count = 0;
-        None
+        BeaconAction {
+            rescan: Some(BeaconAnomalyKind::IdMismatch),
+            watchdog: Some(true),
+        }
     } else {
-        None
+        match entry.period_estimate {
+            // 2nd beacon: no average yet, so no band applies. C seeds
+            // `averagePeriod = currentPeriod` here (`bhe.cpp:199`); the
+            // seeding happens in the state-update block below.
+            None => BeaconAction {
+                rescan: None,
+                watchdog: Some(false),
+            },
+            Some(average) => classify_period(average, actual_interval),
+        }
     };
+    let anomaly_kind = action.rescan;
 
     // Update state.
     entry.last_id = beacon_id;
@@ -809,42 +862,27 @@ fn handle_beacon(
         }
     }
 
-    // Search-engine wake-up (libca `udpiiu::beaconAnomalyNotify`):
-    // ONLY on a classified anomaly. The earlier "soft poke on every
-    // beacon" code amplified normal beacon traffic into a permanent
-    // fast-tick search storm whenever multiple IOCs beaconed within
-    // the engine's revolution window — keep that path lean.
+    // Search-engine wake-up: libca `cac::beaconNotify` (`cac.cpp:500`)
+    // calls `udpiiu::beaconAnomalyNotify` exactly when
+    // `bhe::updatePeriod` returned `netChange`. The earlier "soft poke
+    // on every beacon" code amplified normal beacon traffic into a
+    // permanent fast-tick search storm whenever multiple IOCs beaconed
+    // within the engine's revolution window — keep that path lean.
     if let Some(kind) = anomaly_kind {
         let _ = coord_tx.send(CoordRequest::ForceRescanServer { server_addr, kind });
     }
 
-    // Transport-watchdog notification (libca `tcpRecvWatchdog::
-    // beaconArrivalNotify` / `beaconAnomalyNotify`). Routed via the
-    // coordinator to the per-circuit read loop, where it either
-    // pushes the deadline forward (healthy beacon) or sets a sticky
-    // anomaly flag (id-mismatch / period-collapse) that suppresses
-    // subsequent healthy-beacon refreshes until the next data
-    // arrival or echo response.
+    // Transport-watchdog notification (libca `bhe::beaconAnomalyNotify`
+    // → `tcpRecvWatchdog::beaconAnomalyNotify`, vs `beaconArrivalNotify`
+    // for a healthy beacon). Routed via the coordinator to the
+    // per-circuit read loop, where it either pushes the deadline
+    // forward or sets a sticky anomaly flag that suppresses subsequent
+    // healthy-beacon refreshes until the next data arrival or echo
+    // response.
     //
-    // FirstSighting is intentionally skipped — and this is a
-    // deliberate divergence from libca, worth being honest about.
-    // libca's `bhe.cpp:137` path (BHE freshly created via the
-    // TCP-connect search-reply route, then first beacon arrives)
-    // calls `beaconAnomalyNotify` as a precaution, setting the
-    // tcpRecvWatchdog flag. We don't, on the reasoning that:
-    //   * the next healthy beacon (≤ one beacon period) will
-    //     refresh the deadline naturally, and
-    //   * if the server actually restarted in that one-period
-    //     gap, the existing 30 s idle-timeout echo handles it.
-    // This keeps the FirstSighting path purely a search-engine
-    // concern and avoids per-CaClient false flags on startup,
-    // which was the original disconnect-storm trigger.
-    let arrival_anomaly = match anomaly_kind {
-        None => Some(false),
-        Some(BeaconAnomalyKind::IdMismatch | BeaconAnomalyKind::PeriodCollapse) => Some(true),
-        Some(BeaconAnomalyKind::FirstSighting) => None,
-    };
-    if let Some(anomaly) = arrival_anomaly {
+    // `watchdog: None` (FirstSighting) is a deliberate divergence: see
+    // the classify chain above.
+    if let Some(anomaly) = action.watchdog {
         let _ = coord_tx.send(CoordRequest::BeaconArrival {
             server_addr,
             anomaly,
@@ -1079,32 +1117,79 @@ mod tests {
         );
     }
 
-    /// Period collapse with monotonic ids (id continues normally
-    /// while the inter-beacon interval drops far below the EMA — the
-    /// signature of the IOC's `rsrv online_notify_task` `beacon_reset`
-    /// being notified on a TCP accept/disconnect, NOT of a real
-    /// restart) must NOT fire `PeriodCollapse` any more. Instead, the
-    /// monitor self-resets `period_estimate` + `count` so the
-    /// resulting ramp-up cascade reseeds the EMA from the live
-    /// cadence, exactly like `apply_reset_server` does when the
-    /// coordinator routes a `BeaconControl::ResetServer` for our own
-    /// circuit. Real ID-preserving restart hypothesis: if our circuit
-    /// broke for the restart, the transport-event path issues
-    /// ResetServer pre-emptively (see
-    /// `reset_on_connect_breaks_period_collapse_cascade_after_reconnect`
-    /// below). The case that remained — another client on the
-    /// network connecting and triggering OUR beacon_monitor's
-    /// PeriodCollapse against a stale EMA — is silently absorbed
-    /// here.
+    /// libca `bhe.cpp:226-262` band boundaries, exercised on the pure
+    /// classifier so the thresholds are pinned exactly rather than
+    /// approximately. One case per boundary, both sides of each.
     #[test]
-    fn monotonic_id_sub_period_clears_ema_no_anomaly() {
+    fn period_bands_match_the_libca_thresholds() {
+        let avg = Duration::from_secs(1);
+        let band = |ms: u64| classify_period(avg, Duration::from_millis(ms));
+
+        // Healthy interior: neither band. (`bhe.cpp:260` →
+        // `beaconArrivalNotify`.)
+        for ms in [810u64, 1000, 1240] {
+            assert_eq!(
+                band(ms),
+                BeaconAction {
+                    rescan: None,
+                    watchdog: Some(false)
+                },
+                "{ms} ms against a 1 s average is inside libca's healthy band"
+            );
+        }
+
+        // `>= 1.25 * average` — one missing beacon: flag the circuit
+        // watchdog, but do NOT wake searches (`bhe.cpp:226-231`).
+        for ms in [1250u64, 3249] {
+            assert_eq!(
+                band(ms),
+                BeaconAction {
+                    rescan: None,
+                    watchdog: Some(true)
+                },
+                "{ms} ms is in the 1.25x..3.25x band: anomaly, no netChange"
+            );
+        }
+
+        // `>= 3.25 * average` — ~3 missing beacons: netChange too
+        // (`bhe.cpp:232-238`).
+        for ms in [3250u64, 60_000] {
+            assert_eq!(
+                band(ms),
+                BeaconAction {
+                    rescan: Some(BeaconAnomalyKind::LongPeriod),
+                    watchdog: Some(true)
+                },
+                "{ms} ms is past 3.25x: anomaly + netChange"
+            );
+        }
+
+        // `<= 0.80 * average` — IOC reboot ramp-up: anomaly +
+        // netChange (`bhe.cpp:255-259`).
+        for ms in [800u64, 20] {
+            assert_eq!(
+                band(ms),
+                BeaconAction {
+                    rescan: Some(BeaconAnomalyKind::ShortPeriod),
+                    watchdog: Some(true)
+                },
+                "{ms} ms is at or below 0.80x: anomaly + netChange"
+            );
+        }
+    }
+
+    /// End-to-end through `handle_beacon`: a monotonic-id beacon whose
+    /// interval collapsed far below the running average is libca's
+    /// IOC-reboot signature (`bhe.cpp:255`) — it wakes searches AND
+    /// flags the circuit watchdog. The previous implementation
+    /// swallowed this case (self-reset of the EMA, no notification to
+    /// either consumer).
+    #[test]
+    fn sub_period_beacon_fires_the_short_period_band() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
 
         let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
-        // Pre-seed a steady-state entry: 15-s period_estimate, 10
-        // beacons in, last_seen far enough back that
-        // actual_interval > 50 ms but < 5 s = period_estimate / 3.
         servers.insert(
             server,
             BeaconState {
@@ -1120,64 +1205,106 @@ mod tests {
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         hdr.cid = 100; // monotonic — rules out IdMismatch
         handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
-        // No `ForceRescanServer` — the cascade is server-side reset,
-        // not a restart. `BeaconArrival { anomaly: false }` IS emitted
-        // (healthy-beacon refresh path) and that is fine.
+
+        let mut saw_rescan = false;
+        let mut saw_anomaly_arrival = false;
         while let Ok(msg) = rx.try_recv() {
-            if let CoordRequest::ForceRescanServer { kind, .. } = msg {
-                panic!(
-                    "monotonic-id, sub-period interval must NOT fire \
-                     ForceRescanServer ({kind:?}) — it is the IOC's \
-                     `beacon_reset` ramp-up cascade triggered by some \
-                     peer's TCP accept, not a real restart"
-                );
+            match msg {
+                CoordRequest::ForceRescanServer {
+                    kind: BeaconAnomalyKind::ShortPeriod,
+                    ..
+                } => saw_rescan = true,
+                CoordRequest::BeaconArrival { anomaly: true, .. } => saw_anomaly_arrival = true,
+                _ => {}
             }
         }
-        // EMA + count cleared so the subsequent ramp-up beacons
-        // reseed the estimate from the live cadence. Mirrors
-        // `apply_reset_server`'s post-condition.
+        assert!(
+            saw_rescan,
+            "200 ms against a 15 s average is <= 0.80x — libca returns netChange"
+        );
+        assert!(
+            saw_anomaly_arrival,
+            "the short-period band also calls bhe::beaconAnomalyNotify"
+        );
+
+        // C blends the sample into the average regardless of band
+        // (`bhe.cpp:267`) — it never resets the estimate here.
         let s = servers.get(&server).expect("entry");
         assert!(
-            s.period_estimate.is_none(),
-            "self-reset must clear period_estimate"
+            s.period_estimate
+                .is_some_and(|e| e < Duration::from_secs(15)),
+            "the anomalous sample still updates the running average"
         );
+        assert_eq!(s.count, 11, "count keeps advancing");
+        assert_eq!(s.last_id, 100);
+    }
+
+    /// The long-period band is the finding this test was written for:
+    /// an interval *longer* than the running average had no branch at
+    /// all before. `bhe.cpp:226` flags the circuit watchdog from 1.25x,
+    /// and only past 3.25x (`bhe.cpp:232`) does it also wake searches.
+    #[test]
+    fn long_period_beacon_flags_the_watchdog_before_it_wakes_searches() {
+        let seed = |interval: Duration| {
+            let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
+            let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+            servers.insert(
+                server,
+                BeaconState {
+                    last_id: 99,
+                    last_seen: Instant::now() - interval,
+                    period_estimate: Some(Duration::from_secs(1)),
+                    count: 10,
+                },
+            );
+            let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+            let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+            hdr.count = 5064;
+            hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
+            hdr.cid = 100;
+            handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
+            let (mut rescan, mut arrival_anomaly) = (false, false);
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    CoordRequest::ForceRescanServer { .. } => rescan = true,
+                    CoordRequest::BeaconArrival { anomaly, .. } => arrival_anomaly = anomaly,
+                    _ => {}
+                }
+            }
+            (rescan, arrival_anomaly)
+        };
+
+        // 2x the average: one beacon went missing. Watchdog only.
         assert_eq!(
-            s.count, 1,
-            "self-reset zeros count, then +1 for this beacon"
+            seed(Duration::from_millis(2000)),
+            (false, true),
+            "1.25x..3.25x must flag the watchdog without waking searches"
         );
+        // 4x the average: netChange as well.
         assert_eq!(
-            s.last_id, 100,
-            "last_id advanced normally — the beacon was accepted"
+            seed(Duration::from_millis(4000)),
+            (true, true),
+            ">= 3.25x must additionally wake searches (netChange)"
         );
     }
 
-    /// Legitimate fast-beacon (e.g. 200 ms cadence) with monotonically
-    /// increasing ids must NOT trip the period-collapse branch — only
-    /// the `first_sighting = true` path on the very first beacon. This
-    /// tests that the 50 ms floor doesn't fire spurious anomalies on
-    /// Regression guard: rsrv `online_notify_task` ramp-up beacons
-    /// (20 ms doubling to 15 s — same pattern epics-ca-rs's own
-    /// `server/beacon.rs` emits) must NOT fire a stream of
-    /// `PeriodCollapse` anomalies on the FIRST sighting of a
-    /// freshly-started IOC. Pre-fix the per-server initial
-    /// `period_estimate = Duration::from_secs(15)` placeholder
-    /// caused every ramp-up beacon past the 50 ms floor (so the
-    /// 4th beacon onwards) to satisfy
-    /// `actual_interval < 15 s / 3 = 5 s` and trip
-    /// `PeriodCollapse`. Mini-beamline IOC users observed this as
-    /// 5-s `get_with_metadata(timeout=2.0)` failures driven by the
-    /// transport watchdog flag → echo probe → reconnect cascade
-    /// downstream. Fix mirrors libca `bhe.cpp:51,199` where
-    /// `averagePeriod = -DBL_MAX` until the first measured
-    /// `currentPeriod` defines it.
+    /// Watching a freshly-started IOC ramp up (rsrv
+    /// `online_notify.c:66,116-120`: 20 ms doubling to 15 s — the same
+    /// pattern `epics-ca-rs/src/server/beacon.rs` emits) must never
+    /// classify as `ShortPeriod`: every interval is *longer* than the
+    /// last, so the running average only ever trails the sample, and
+    /// libca's `<= 0.80x` reboot band cannot be reached. The
+    /// stretching intervals do legitimately land in the long-period
+    /// band (`bhe.cpp:226`) — that is libca's behaviour and is what
+    /// makes an IOC coming online wake pending searches.
     ///
-    /// We reproduce the standard rsrv ramp-up: 20 ms, 40 ms,
-    /// 80 ms, 160 ms, 320 ms, 640 ms, 1.28 s, 2.56 s, 5.12 s,
-    /// 10.24 s, then capped at 15 s. Only the very first beacon
-    /// should fire (FirstSighting). All subsequent ramp-up
-    /// beacons must classify as steady-state (no anomaly).
+    /// The pre-fix implementation seeded `period_estimate` with a
+    /// hardcoded 15 s, so the FIRST sighting of a ramping IOC read as
+    /// a period collapse; seeding from the first measured interval
+    /// (libca `bhe.cpp:51,199`, `averagePeriod = -DBL_MAX` until the
+    /// first `currentPeriod`) is what makes this hold.
     #[test]
-    fn rsrv_rampup_beacons_do_not_fire_period_collapse() {
+    fn rsrv_rampup_beacons_never_classify_as_short_period() {
         // Drive `handle_beacon` directly with a controlled
         // BeaconState so we can advance `last_seen` artificially —
         // the real implementation uses `Instant::now()` and we'd
@@ -1219,16 +1346,16 @@ mod tests {
             hdr.cid = (i as u32) + 1;
             handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
 
-            // Inspect every emitted CoordRequest; PeriodCollapse
-            // would surface as a `ForceRescanServer { kind:
-            // PeriodCollapse, .. }` here — and that's the bug.
+            // A `ShortPeriod` here would be the "IOC may have
+            // restarted" misclassification — the ramp-up is the IOC
+            // *starting*, and every interval is growing.
             while let Ok(msg) = rx.try_recv() {
                 if let CoordRequest::ForceRescanServer { kind, .. } = msg {
                     assert_ne!(
                         kind,
-                        BeaconAnomalyKind::PeriodCollapse,
+                        BeaconAnomalyKind::ShortPeriod,
                         "ramp-up beacon #{} (interval={} ms) must not classify \
-                         as PeriodCollapse — see BeaconState::period_estimate doc",
+                         as a period collapse — see BeaconState::period_estimate doc",
                         i + 2,
                         ms
                     );
@@ -1237,23 +1364,30 @@ mod tests {
         }
     }
 
-    /// healthy fast cadences.
+    /// A steady cadence with monotonically increasing ids must classify
+    /// as healthy: libca `bhe.cpp:260` refreshes the receive watchdog
+    /// and returns no `netChange`, so the only search wake-up is the
+    /// first sighting.
     #[test]
-    fn fast_cadence_monotonic_ids_does_not_fire_spurious_anomaly() {
+    fn steady_cadence_monotonic_ids_does_not_fire_spurious_anomaly() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
         let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
         hdr.count = 5064;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
 
-        // Five monotonically increasing beacons (ids 100..105). First
-        // is first_sighting → ForceRescanServer fires once. Rest must
-        // not fire any ForceRescanServer (they will, however, fire
-        // BeaconArrival{anomaly=false} — that's the libca-style
-        // healthy-beacon watchdog refresh and is correct here).
+        // Five monotonically increasing beacons (ids 100..105) at a
+        // fixed 1-s cadence. First is first_sighting →
+        // ForceRescanServer fires once. The rest must not fire any
+        // ForceRescanServer (they do fire BeaconArrival{anomaly=false}
+        // — the libca healthy-beacon watchdog refresh).
         for id in 100..105 {
             hdr.cid = id;
+            if let Some(s) = servers.get_mut(&server) {
+                s.last_seen = Instant::now() - Duration::from_secs(1);
+            }
             handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         }
         let mut search_wakes = 0;
@@ -1370,13 +1504,20 @@ mod tests {
     fn small_forward_advance_is_dropped_not_classified() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
+        let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
         let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
         hdr.count = 5064;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
-        // Establish steady-state beacons (ids 100..103).
+        // Establish steady-state beacons (ids 100..103) at a fixed 1-s
+        // cadence — the period bands (`bhe.cpp:226-262`) classify
+        // against the running average, so the intervals have to be
+        // realistic, not the ~0 s of a back-to-back test loop.
         for id in 100..103 {
             hdr.cid = id;
+            if let Some(s) = servers.get_mut(&server) {
+                s.last_seen = Instant::now() - Duration::from_secs(1);
+            }
             handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         }
         while rx.try_recv().is_ok() {}
@@ -1397,6 +1538,8 @@ mod tests {
         // last_id should now be 107 (drop path still updates it).
         // The next monotonic beacon (108 = advance=1) is healthy.
         hdr.cid = 108;
+        servers.get_mut(&server).expect("entry").last_seen =
+            Instant::now() - Duration::from_secs(1);
         handle_beacon(hdr, &mut servers, &tx, &std::collections::HashSet::new());
         let mut saw_arrival_healthy = false;
         let mut saw_anomaly = false;
@@ -1488,14 +1631,15 @@ mod tests {
     /// Regression for the archiver-rs reconnect noise: a long-lived
     /// CA client that has built a steady-state EMA (e.g. 15 s) for
     /// some server, then loses + re-establishes its TCP circuit while
-    /// the server is in `online_notify_task` ramp-up, must NOT log a
-    /// stream of `PeriodCollapse` warnings against its stale
-    /// estimate. `BeaconControl::ResetServer` (issued by the
-    /// coordinator on `TransportEvent::ServerConnected`, libca
-    /// `bhe.cpp` "new client connect" parity) clears the EMA so the
-    /// next beacon reseeds `period_estimate` from the live cadence.
+    /// the server is in `online_notify_task` ramp-up, must NOT report a
+    /// stream of short-period anomalies against its stale estimate.
+    /// `BeaconControl::ResetServer` (issued by the coordinator on
+    /// `TransportEvent::ServerConnected`, libca `bhe.cpp` "new client
+    /// connect" parity) clears the EMA so the next beacon reseeds
+    /// `period_estimate` from the live cadence — after which the
+    /// growing ramp-up intervals can only reach the long-period band.
     #[test]
-    fn reset_on_connect_breaks_period_collapse_cascade_after_reconnect() {
+    fn reset_on_connect_breaks_the_short_period_cascade_after_reconnect() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
         let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
@@ -1528,17 +1672,16 @@ mod tests {
 
         // Standard rsrv ramp-up: 20, 40, 80, 160, 320, 640, 1280,
         // 2560, 5120, 10240 ms — same pattern as the
-        // `rsrv_rampup_beacons_do_not_fire_period_collapse` test, but
-        // arriving on top of the previously-pre-existing entry.
+        // `rsrv_rampup_beacons_never_classify_as_short_period` test,
+        // but arriving on top of the previously-pre-existing entry.
         let intervals_ms = [20u64, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
         let mut hdr = CaHeader::new(CA_PROTO_RSRV_IS_UP);
         hdr.count = 5064;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
         // Server preserved its beacon counter across restart — ids
-        // continue monotonically from 1000. This is the case
-        // PeriodCollapse was supposed to catch, but the cascade
-        // would otherwise spam every ramp-up beacon past the 50 ms
-        // floor against the stale 15-s EMA.
+        // continue monotonically from 1000, so `IdMismatch` cannot
+        // fire and the stale 15-s EMA is the only thing that could
+        // misclassify these beacons.
         for (i, &ms) in intervals_ms.iter().enumerate() {
             let s = servers.get_mut(&server).expect("entry");
             s.last_seen = Instant::now() - Duration::from_millis(ms);
@@ -1549,9 +1692,9 @@ mod tests {
                 if let CoordRequest::ForceRescanServer { kind, .. } = msg {
                     assert_ne!(
                         kind,
-                        BeaconAnomalyKind::PeriodCollapse,
+                        BeaconAnomalyKind::ShortPeriod,
                         "ramp-up beacon #{} (interval={} ms) after \
-                         ResetServer must not classify as PeriodCollapse \
+                         ResetServer must not classify as a period collapse \
                          — the cascade is the archiver-rs reconnect noise \
                          this fix targets",
                         i + 1,
@@ -1562,23 +1705,24 @@ mod tests {
         }
     }
 
-    /// Peer-client-triggered cascade: an existing CA client with a
-    /// mature steady-state EMA (~15 s) must NOT fire a stream of
-    /// `PeriodCollapse` warnings when a DIFFERENT client on the
-    /// network connects to the same IOC. The peer's TCP accept fires
-    /// the IOC's `beacon_reset` notify (`server/tcp.rs:450`), which
-    /// restarts the `beacon_emitter` ramp-up cycle. Our circuit
-    /// stayed up the whole time, so the coordinator does NOT issue
-    /// `BeaconControl::ResetServer` for us. Before the
-    /// `handle_beacon` self-reset fix, every ramp-up beacon past the
-    /// 50 ms floor satisfied `actual_interval < 15 s / 3 = 5 s` and
-    /// fired a WARN log + transport-watchdog sticky flag + search
-    /// rescan — the symptom the user reported. After the fix the
-    /// monitor recognises the signature (id monotonic + interval
-    /// suddenly << EMA) as a server-side reset cascade, clears its
-    /// own EMA, and stays silent.
+    /// The first beacon of a sped-up cadence classifies as
+    /// `ShortPeriod` against a mature EMA — libca `bhe.cpp:255`, and it
+    /// is unconditional: C has no "was this really a reboot?" guard,
+    /// only the comment at `bhe.cpp:248-253` that a false trigger costs
+    /// nothing because the echo response proves the server is alive.
+    ///
+    /// Concretely this fires when a *peer* client connects to an
+    /// `epics-ca-rs` server: our `server/tcp.rs` notifies `beacon_reset`
+    /// on every accept, restarting the 20 ms ramp-up, while our own
+    /// circuit stays up (so no `BeaconControl::ResetServer` for us).
+    /// That reset-on-accept is itself a divergence — rsrv restarts the
+    /// beacon ramp only at startup and after `ctlPause`
+    /// (`online_notify.c:66,128`), never on connect — and it is what
+    /// makes this benign-but-noisy path reachable at all against an
+    /// all-Rust deployment. The client side follows C here; the
+    /// server-side reset-on-accept is tracked separately.
     #[test]
-    fn peer_connect_ramp_up_does_not_fire_period_collapse() {
+    fn peer_connect_ramp_up_fires_the_short_period_band() {
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CoordRequest>();
         let server: SocketAddr = "127.0.0.1:5064".parse().unwrap();
@@ -1606,6 +1750,7 @@ mod tests {
         hdr.count = 5064;
         hdr.available = u32::from_be_bytes([127, 0, 0, 1]);
 
+        let mut short_period_kinds = 0;
         for (i, &ms) in intervals_ms.iter().enumerate() {
             let s = servers.get_mut(&server).expect("entry");
             s.last_seen = Instant::now() - Duration::from_millis(ms);
@@ -1616,27 +1761,31 @@ mod tests {
                 if let CoordRequest::ForceRescanServer { kind, .. } = msg {
                     assert_ne!(
                         kind,
-                        BeaconAnomalyKind::PeriodCollapse,
-                        "peer-connect ramp-up beacon #{} (interval={} ms) \
-                         must NOT classify as PeriodCollapse — \
-                         the self-reset path in handle_beacon absorbs it",
+                        BeaconAnomalyKind::IdMismatch,
+                        "peer-connect ramp-up beacon #{} (interval={} ms): the \
+                         beacon sequence is monotonic, so this is not a restart",
                         i + 1,
                         ms
                     );
+                    if kind == BeaconAnomalyKind::ShortPeriod {
+                        short_period_kinds += 1;
+                    }
                 }
             }
         }
+        assert!(
+            short_period_kinds >= 1,
+            "the first sped-up beacon (20 ms vs a 15 s average) is <= 0.80x — \
+             libca `bhe.cpp:255` calls beaconAnomalyNotify and returns netChange"
+        );
 
-        // After the cascade, the EMA has been reseeded from the
-        // ramp-up. It must be > 0 (we processed beacons) and the
-        // last_id must reflect the latest beacon. The exact value
-        // depends on alpha=0.25 over the doubling sequence; assert
-        // structural correctness, not a numeric tolerance.
+        // The EMA tracked the cascade down; ids advanced normally.
         let s = servers.get(&server).expect("entry");
         assert_eq!(s.last_id, 1009, "last_id must track ramp-up ids");
         assert!(
-            s.period_estimate.is_some(),
-            "EMA must be reseeded after the cascade"
+            s.period_estimate
+                .is_some_and(|e| e < Duration::from_secs(15)),
+            "the running average must follow the sped-up cadence down"
         );
     }
 

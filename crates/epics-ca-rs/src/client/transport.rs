@@ -1365,8 +1365,8 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // overwrites it before the wall-clock skip is consulted.
     let mut last_loop_at;
     // libca `tcpRecvWatchdog::beaconAnomaly` flag. Set when the
-    // beacon monitor classifies a beacon as a real restart signal
-    // (`IdMismatch` / `PeriodCollapse`); suppresses subsequent
+    // beacon monitor classifies a beacon as anomalous — fresh sequence
+    // or off-band period (`bhe.cpp:226-262`); suppresses subsequent
     // healthy-beacon watchdog refreshes so the deadline expires on
     // its own schedule. Cleared on any data arrival from the server.
     let mut beacon_anomaly = false;

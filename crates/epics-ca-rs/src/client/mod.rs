@@ -520,8 +520,9 @@ enum CoordRequest {
     /// Beacon arrival notification for the per-circuit receive
     /// watchdog. `anomaly = false` for healthy beacons (libca
     /// `beaconArrivalNotify` — refresh watchdog deadline);
-    /// `anomaly = true` for `IdMismatch` / `PeriodCollapse` (libca
-    /// `beaconAnomalyNotify` — set sticky flag, no immediate echo).
+    /// `anomaly = true` for `IdMismatch` and for the two libca period
+    /// bands (`LongPeriod` / `ShortPeriod`, `bhe.cpp:226-262`) — libca
+    /// `beaconAnomalyNotify`: set sticky flag, no immediate echo.
     /// `FirstSighting` deliberately does NOT generate this message:
     /// either we don't yet have a virtual circuit to the server, in
     /// which case the watchdog is irrelevant, or we do (we just
@@ -3574,20 +3575,30 @@ async fn run_coordinator(
                         // it as a warning every time a fresh CaClient
                         // hears its first beacon was misleading and
                         // would over-promote a benign condition.
-                        // Reserve the warn-level "IOC may have
-                        // restarted" message for real restart signals.
-                        let is_real_restart = matches!(
-                            kind,
-                            beacon_monitor::BeaconAnomalyKind::IdMismatch
-                                | beacon_monitor::BeaconAnomalyKind::PeriodCollapse
-                        );
-                        if is_real_restart {
+                        // Reserve the warn-level message for the
+                        // classifications libca counts as anomalies
+                        // (`cac.cpp:498` `beaconAnomalyCount++`).
+                        let anomaly_msg = match kind {
+                            beacon_monitor::BeaconAnomalyKind::FirstSighting => None,
+                            beacon_monitor::BeaconAnomalyKind::IdMismatch => {
+                                Some("beacon sequence restarted — IOC may have restarted")
+                            }
+                            beacon_monitor::BeaconAnomalyKind::ShortPeriod => Some(
+                                "beacon period collapsed below 0.80x of the running average \
+                                 — IOC may have restarted",
+                            ),
+                            beacon_monitor::BeaconAnomalyKind::LongPeriod => Some(
+                                "beacon period exceeded 3.25x of the running average \
+                                 — server was unreachable and is back",
+                            ),
+                        };
+                        if let Some(msg) = anomaly_msg {
                             diag.beacon_anomalies.fetch_add(1, Ordering::Relaxed);
                             diag.record(DiagEvent::BeaconAnomaly { server: server_addr });
                             tracing::warn!(
                                 server = %server_addr,
                                 ?kind,
-                                "beacon anomaly detected — IOC may have restarted"
+                                "{msg}"
                             );
                             metrics::counter!(
                                 "ca_client_beacon_anomalies_total",
@@ -4243,7 +4254,7 @@ async fn run_coordinator(
                         // the live cadence. Without this, an archiver
                         // that reconnects to a server in the middle of
                         // its `online_notify_task` ramp-up would log a
-                        // PeriodCollapse cascade against its stale
+                        // short-period anomaly cascade against its stale
                         // steady-state estimate.
                         let _ = beacon_ctrl_tx.send(
                             beacon_monitor::BeaconControl::ResetServer { server_addr },

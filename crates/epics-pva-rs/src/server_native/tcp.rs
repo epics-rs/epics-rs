@@ -32,7 +32,7 @@ use crate::pvdata::encode::{
     EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
     encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
@@ -7312,7 +7312,22 @@ async fn handle_op(
                 // `ServerGPR::doReply` cleans up a last_request RPC only after
                 // success and otherwise returns it to Idle (serverget.cpp:86-116).
                 let replied_ok = match result {
-                    Ok((resp_desc, resp_value)) => {
+                    // pvxs `serverget.cpp:105-109`:
+                    //     auto type = Value::Helper::desc(value);
+                    //     to_wire(R, type);
+                    //     if(value) to_wire_full(R, value);
+                    // — the descriptor is ALWAYS written, the value body only
+                    // when the reply carries one. `ExecOp::reply()` (the
+                    // no-argument overload, `srvcommon.h:108`) replies with a
+                    // default-constructed `Value`, so `desc()` is `nullptr`
+                    // and `to_wire(Buf&, const FieldDesc*)` writes the single
+                    // `0xFF` NULL type code (`dataencode.cpp:29-33`).
+                    Ok(RpcReply::Empty) => {
+                        Status::ok().write_into(order, &mut payload);
+                        payload.put_u8(crate::pvdata::encode::TAG_NULL);
+                        true
+                    }
+                    Ok(RpcReply::Value(resp_desc, resp_value)) => {
                         Status::ok().write_into(order, &mut payload);
                         // Spawned task cannot hold &mut EncodeTypeCache; use inline
                         // encode_type_desc (no cache) for RPC responses.

@@ -725,7 +725,9 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc};
 
-    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use epics_pva_rs::pvdata::{
+        FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue,
+    };
     use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
     /// RPC service: takes `{ a: double, b: double }` and returns
@@ -781,8 +783,7 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
             _name: &str,
             _request_desc: FieldDesc,
             request_value: PvField,
-        ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send
-        {
+        ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
             async move {
                 let mut a = 0.0f64;
                 let mut b = 0.0f64;
@@ -801,7 +802,7 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
                 let mut s = PvStructure::new("");
                 s.fields
                     .push(("result".into(), PvField::Scalar(ScalarValue::Double(a + b))));
-                Ok((result_desc, PvField::Structure(s)))
+                Ok((result_desc, PvField::Structure(s)).into())
             }
         }
     }

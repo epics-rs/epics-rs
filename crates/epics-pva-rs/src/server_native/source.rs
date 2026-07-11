@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, RpcReply};
 pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
 
 /// Per-operation context surfaced to [`ChannelSource`] implementors
@@ -1036,13 +1036,18 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Dispatch an RPC. The default impl returns "RPC not supported";
     /// implementors can override to provide actual RPC behaviour.
     ///
-    /// Returns the response (FieldDesc, PvField) on success.
+    /// Returns an [`RpcReply`] on success — pvxs's two `ExecOp::reply()`
+    /// overloads (`pvxs/srvcommon.h:108`): `RpcReply::Value(desc, value)` for
+    /// `reply(Value)`, and `RpcReply::Empty` for the no-argument `reply()`,
+    /// which puts a bare `0xFF` NULL type code on the wire with no value body
+    /// (`serverget.cpp:105-109`, `dataencode.cpp:29-33`). A
+    /// `(FieldDesc, PvField)` pair converts into the former via `.into()`.
     fn rpc(
         &self,
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let _ = (name, request_desc, request_value);
         async move { Err(OpError::failed("RPC not supported by this source")) }
     }
@@ -1056,7 +1061,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         async move {
             if !checked.allows_read() {
                 return Err(OpError::denied(format!(
@@ -1723,9 +1728,7 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state RPC.
     fn rpc_checked<'a>(
         &'a self,
@@ -1733,9 +1736,7 @@ pub trait ChannelSourceObj: Send + Sync {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
     fn process<'a>(
         &'a self,
         name: &'a str,
@@ -2062,9 +2063,8 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>
+    {
         Box::pin(<Self as ChannelSource>::rpc(
             self,
             name,
@@ -2078,9 +2078,8 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>
+    {
         Box::pin(<Self as ChannelSource>::rpc_checked(
             self,
             checked,

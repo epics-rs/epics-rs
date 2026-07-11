@@ -139,7 +139,9 @@ async fn pva_service_dispatch_round_trip() {
     )
     .await
     .expect("rpc timeout")
-    .expect("rpc err");
+    .expect("rpc err")
+    .into_value()
+    .expect("value reply");
     let result = match resp {
         PvField::Structure(s) => match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Double(v))) => *v,
@@ -157,7 +159,9 @@ async fn pva_service_dispatch_round_trip() {
     )
     .await
     .expect("add timeout")
-    .expect("add err");
+    .expect("add err")
+    .into_value()
+    .expect("value reply");
     let v1 = match resp {
         PvField::Structure(s) => match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
@@ -174,7 +178,9 @@ async fn pva_service_dispatch_round_trip() {
     )
     .await
     .expect("add2 timeout")
-    .expect("add2 err");
+    .expect("add2 err")
+    .into_value()
+    .expect("value reply");
     let v2 = match resp {
         PvField::Structure(s) => match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
@@ -228,7 +234,9 @@ async fn pva_service_method_err_surfaces_as_rpc_error() {
     )
     .await
     .expect("rpc timeout")
-    .expect("an explicit Ok(Status) is a successful RPC");
+    .expect("an explicit Ok(Status) is a successful RPC")
+    .into_value()
+    .expect("value reply");
     match resp {
         PvField::Structure(s) => {
             assert!(
@@ -258,7 +266,9 @@ async fn pva_service_method_err_surfaces_as_rpc_error() {
     )
     .await
     .expect("rpc timeout")
-    .expect("an aliased-Result Ok is a successful RPC");
+    .expect("an aliased-Result Ok is a successful RPC")
+    .into_value()
+    .expect("value reply");
     match resp {
         PvField::Structure(s) => assert!(matches!(
             s.get_field("value"),
@@ -327,7 +337,9 @@ async fn pva_service_accepts_direct_struct_request() {
     )
     .await
     .expect("rpc timeout")
-    .expect("rpc err");
+    .expect("rpc err")
+    .into_value()
+    .expect("value reply");
     let result = match resp {
         PvField::Structure(s) => match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Double(v))) => *v,
@@ -345,7 +357,9 @@ async fn pva_service_accepts_direct_struct_request() {
     )
     .await
     .expect("add timeout")
-    .expect("add err");
+    .expect("add err")
+    .into_value()
+    .expect("value reply");
     let v = match resp {
         PvField::Structure(s) => match s.get_field("value") {
             Some(PvField::Scalar(ScalarValue::Long(v))) => *v,

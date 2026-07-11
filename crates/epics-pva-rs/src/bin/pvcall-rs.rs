@@ -157,20 +157,27 @@ async fn main() {
         .build();
 
     match client.pvrpc(&pv_name, &desc, &value).await {
-        Ok((resp_desc, resp_value)) => match args.mode.as_str() {
-            "json" => {
-                let s = epics_pva_rs::format::format_json(&pv_name, &resp_value);
-                println!("{s}");
+        // pvxs `pvxcall` prints the reply only when it carries a Value
+        // (`if(val) std::cout<<val;`, tools/call.cpp:132-133); a no-value
+        // reply prints nothing and still exits 0.
+        Ok(reply) => {
+            if let Some((resp_desc, resp_value)) = reply.into_value() {
+                match args.mode.as_str() {
+                    "json" => {
+                        let s = epics_pva_rs::format::format_json(&pv_name, &resp_value);
+                        println!("{s}");
+                    }
+                    "raw" => {
+                        let s = epics_pva_rs::format::format_raw(&pv_name, &resp_desc, &resp_value);
+                        println!("{s}");
+                    }
+                    _ => {
+                        let s = epics_pva_rs::format::format_nt(&pv_name, &resp_desc, &resp_value);
+                        println!("{s}");
+                    }
+                }
             }
-            "raw" => {
-                let s = epics_pva_rs::format::format_raw(&pv_name, &resp_desc, &resp_value);
-                println!("{s}");
-            }
-            _ => {
-                let s = epics_pva_rs::format::format_nt(&pv_name, &resp_desc, &resp_value);
-                println!("{s}");
-            }
-        },
+        }
         Err(e) => {
             eprintln!("pvcall-rs: RPC failed: {e}");
             std::process::exit(1);

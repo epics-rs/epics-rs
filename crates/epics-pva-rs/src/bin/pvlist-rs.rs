@@ -237,7 +237,11 @@ async fn query_server(client: &PvaClient, raw: &str, addr: SocketAddr, info: boo
     let op = if info { "info" } else { "channels" };
     let (desc, value) = build_server_query(op);
     match client.pvrpc_from("server", addr, &desc, &value).await {
-        Ok((_resp_desc, resp_value)) => {
+        Ok(reply) => {
+            // A server may answer with the pvxs no-value reply shape
+            // (`ExecOp::reply()`, a bare NULL type code); treat it as an
+            // empty response rather than a failure.
+            let resp_value = reply.into_value().map_or(PvField::Null, |(_, v)| v);
             if info {
                 let mut line = raw.to_string();
                 if let PvField::Structure(s) = &resp_value {

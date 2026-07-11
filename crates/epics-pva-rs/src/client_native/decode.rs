@@ -483,11 +483,23 @@ pub fn decode_op_response_cached(
                 status,
             }));
         }
-        let resp_desc = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
-            .map_err(|e| PvaError::Decode(e.to_string()))?;
-        let resp_value =
-            crate::pvdata::encode::decode_pv_field_cached(&resp_desc, &mut cur, order, type_cache)
+        // The reply type may be the NULL (`0xFF`) code: pvxs's no-argument
+        // `ExecOp::reply()` (`srvcommon.h:108`) writes exactly that, with no
+        // value body (`serverget.cpp:105-109`, `dataencode.cpp:29-33`), and
+        // its own client accepts it — `from_wire_type(M, rxRegistry, data);
+        // if(data) from_wire_full(...)` (`clientget.cpp:415-421`) leaves
+        // `data` an empty `Value`. Decoding the value body only when the
+        // descriptor is present mirrors that `if(data)` guard.
+        let resp_desc =
+            crate::pvdata::encode::decode_type_desc_cached_opt(&mut cur, order, type_cache)
                 .map_err(|e| PvaError::Decode(e.to_string()))?;
+        let resp_value = match &resp_desc {
+            Some(desc) => {
+                crate::pvdata::encode::decode_pv_field_cached(desc, &mut cur, order, type_cache)
+                    .map_err(|e| PvaError::Decode(e.to_string()))?
+            }
+            None => PvField::Null,
+        };
         let mut all = BitSet::new();
         all.set(0);
         return Ok(OpResponse::Data(OpDataResponse {
@@ -498,7 +510,10 @@ pub fn decode_op_response_cached(
             value: resp_value,
             // RPC responses carry no overrun bitset.
             overrun: BitSet::new(),
-            response_desc: Some(resp_desc),
+            // `None` is the empty reply — kept distinct from
+            // `Some(FieldDesc::Variant)` + `PvField::Null`, which is a
+            // *present* `any` field holding nothing.
+            response_desc: resp_desc,
         }));
     }
 
@@ -1013,6 +1028,43 @@ mod tests {
                 }
             }
             other => panic!("expected init, got {other:?}"),
+        }
+    }
+
+    /// A pvxs server answering an RPC with the no-argument `ExecOp::reply()`
+    /// (`srvcommon.h:108`) sends `ioid + subcmd + Status` followed by a bare
+    /// NULL type code and NO value body (`serverget.cpp:105-109` +
+    /// `dataencode.cpp:29-33`). Its own client accepts that — `from_wire_type`
+    /// leaves an invalid `Value` and the `if(data)` guard skips the body
+    /// (`clientget.cpp:415-421`). Decoding it must succeed with no value, not
+    /// fail on the `0xFF` type code.
+    #[test]
+    fn rpc_reply_with_a_null_type_code_decodes_to_no_value() {
+        use crate::proto::WriteExt;
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(11, order); // ioid
+        payload.put_u8(0x00); // subcmd = EXEC (not INIT)
+        Status::ok().write_into(order, &mut payload);
+        payload.put_u8(crate::pvdata::encode::TAG_NULL); // null desc, no body
+
+        let header = PvaHeader::application(true, order, Command::Rpc.code(), payload.len() as u32);
+        let mut frame_bytes = Vec::new();
+        header.write_into(&mut frame_bytes);
+        frame_bytes.extend_from_slice(&payload);
+
+        let (frame, _) = try_parse_frame(&frame_bytes).unwrap().unwrap();
+        match decode_op_response(&frame, None).expect("a NULL-typed RPC reply must decode") {
+            OpResponse::Data(d) => {
+                assert_eq!(d.ioid, 11);
+                assert!(
+                    d.response_desc.is_none(),
+                    "no descriptor accompanies the pvxs no-value reply"
+                );
+                assert_eq!(d.value, PvField::Null);
+            }
+            other => panic!("expected an RPC data response, got {other:?}"),
         }
     }
 

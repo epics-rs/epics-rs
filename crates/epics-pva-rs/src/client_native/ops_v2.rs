@@ -32,7 +32,7 @@ use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, Wri
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
 use crate::pvdata::encode::{encode_pv_field, encode_pv_field_with_bitset, encode_type_desc};
 use crate::pvdata::{
-    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
+    FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue, UnionItem, VariantValue,
 };
 
 use super::channel::Channel;
@@ -3259,7 +3259,7 @@ pub async fn op_rpc(
     request_value: &PvField,
     arg: RpcArg<'_>,
     op_timeout: Duration,
-) -> PvaResult<(FieldDesc, PvField)> {
+) -> PvaResult<RpcReply> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -3331,8 +3331,15 @@ pub async fn op_rpc(
     let result = match decode_op_or_reset(&server, &resp_frame, None)? {
         OpResponse::Data(d) => {
             if d.status.is_success() {
-                let desc = d.response_desc.unwrap_or(FieldDesc::Variant);
-                Ok((desc, d.value))
+                // An RPC DATA response carries its own type descriptor, so
+                // `response_desc == None` here means the server sent the NULL
+                // (`0xFF`) type code — pvxs's no-argument `ExecOp::reply()`,
+                // which its client decodes to an empty `Value`
+                // (`clientget.cpp:415-421`).
+                Ok(match d.response_desc {
+                    Some(desc) => RpcReply::Value(desc, d.value),
+                    None => RpcReply::Empty,
+                })
             } else {
                 Err(PvaError::Protocol(format!("RPC: {:?}", d.status)))
             }

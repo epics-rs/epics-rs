@@ -25,7 +25,7 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 #[cfg(test)]
 use epics_base_rs::server::access_security::AccessLevel;
 use epics_pva_rs::client::{AssertedIdentity, PvaClient};
-use epics_pva_rs::pvdata::{FieldDesc, PvField};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
     AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, WatermarkEvent,
@@ -1451,7 +1451,7 @@ impl ChannelSource for GatewayChannelSource {
         name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         // No monitor-gated preflight (see `put_value`): the RPC forwards
         // through the shared client, which connects on demand and surfaces
         // the upstream error itself.
@@ -1488,7 +1488,7 @@ impl ChannelSource for GatewayChannelSource {
         request_desc: FieldDesc,
         request_value: PvField,
         ctx: ChannelContext,
-    ) -> Result<(FieldDesc, PvField), OpError> {
+    ) -> Result<RpcReply, OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),

@@ -78,7 +78,9 @@ async fn rpc_init_with_field_selector_is_not_masked() {
     )
     .await
     .expect("rpc with field(value) pvRequest timed out")
-    .expect("rpc with field(value) pvRequest must succeed — pvxs never masks an RPC");
+    .expect("rpc with field(value) pvRequest must succeed — pvxs never masks an RPC")
+    .into_value()
+    .expect("value reply");
 
     match resp {
         PvField::Structure(s) => match s.get_field("value") {
@@ -109,7 +111,9 @@ async fn rpc_init_with_nonexistent_field_selector_still_runs() {
     )
     .await
     .expect("rpc with field(noSuchField) pvRequest timed out")
-    .expect("an RPC pvRequest is never masked, so no selector can empty-mask it");
+    .expect("an RPC pvRequest is never masked, so no selector can empty-mask it")
+    .into_value()
+    .expect("value reply");
 
     match resp {
         PvField::Structure(s) => match s.get_field("value") {

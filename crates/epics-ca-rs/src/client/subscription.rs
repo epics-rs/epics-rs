@@ -522,6 +522,12 @@ impl SubscriptionRegistry {
         element_count: u32,
         native_changed: bool,
         server_addr: std::net::SocketAddr,
+        // Minor protocol version of the circuit this restore rides. C
+        // resolves the wire count per request from it
+        // (`subscr.getCount(guard, CA_V413(minorProtocolVersion))`,
+        // `tcpiiu.cpp:1573`), so a reconnect to a peer with a different
+        // version re-resolves rather than replaying the old wire count.
+        peer_minor: u16,
         transport_tx: &mpsc::UnboundedSender<TransportCommand>,
     ) -> (u32, u32) {
         let mut restored = 0u32;
@@ -584,7 +590,15 @@ impl SubscriptionRegistry {
                 let _ = transport_tx.send(TransportCommand::Subscribe {
                     sid: new_sid,
                     data_type,
-                    count,
+                    // The cached `rec.count` is C's `netSubscription::count`
+                    // (the user's cap); the wire count is derived from it per
+                    // request via `getCount(allow_zero = CA_V413(minor))`
+                    // (`netIO.h:241-251`).
+                    count: crate::protocol::subscription_wire_count(
+                        count,
+                        element_count,
+                        peer_minor,
+                    ),
                     subid: rec.subid,
                     mask: rec.mask,
                     server_addr,
@@ -751,17 +765,81 @@ mod tests {
         // First connect: native type DBR_SHORT(1), count 1.
         // data_type derives to STS-class 1 + 14 = 15. This record has no
         // `-#` cap, so the wire count is 0 (autosize) regardless of native.
-        let (restored, failed) = reg.restore_for_channel(100, 7, 1, 1, false, addr(), &tx);
+        let (restored, failed) = reg.restore_for_channel(
+            100,
+            7,
+            1,
+            1,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!((restored, failed), (1, 0));
         assert_eq!(drained_type(&mut rx), (15, 0));
 
         // IOC redefines the record: reconnect with native type
         // DBR_DOUBLE(6), count 3, native_changed = true.
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
-        let (restored, failed) = reg.restore_for_channel(100, 8, 6, 3, true, addr(), &tx);
+        let (restored, failed) = reg.restore_for_channel(
+            100,
+            8,
+            6,
+            3,
+            true,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!((restored, failed), (1, 0));
         // data_type must re-derive to 6 + 14 = 20; count stays 0 (autosize).
         assert_eq!(drained_type(&mut rx), (20, 0));
+    }
+
+    /// The cached `rec.count` is C's `netSubscription::count` (the user's
+    /// cap); the WIRE count is re-resolved per request from the circuit's
+    /// minor version (`subscr.getCount(guard, CA_V413(minor))`,
+    /// `tcpiiu.cpp:1573`). So the same registry, restored onto a pre-V413
+    /// circuit, must put the native count on the wire where a V413 circuit
+    /// gets the bare 0 — and the cached cap must not be rewritten by either.
+    #[test]
+    fn restore_resolves_the_wire_count_from_the_peer_version() {
+        let mut reg = SubscriptionRegistry::new();
+        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        reg.add(rec); // no `-#` cap ⇒ cached count resolves to 0 (autosize)
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Pre-V413 peer: the autosize 0 has no meaning there, so the
+        // channel's native count (4) goes on the wire instead.
+        let (restored, _) = reg.restore_for_channel(100, 7, 1, 4, false, addr(), 12, &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx).1, 4);
+        // The cached cap itself is untouched — only the wire count changed.
+        assert_eq!(reg.get(1).unwrap().count, Some(0));
+
+        // Same registry, reconnect onto a V413 peer: the 0 travels verbatim.
+        reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
+        let (restored, _) = reg.restore_for_channel(100, 8, 1, 4, false, addr(), 13, &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx).1, 0);
+    }
+
+    /// `getCount`'s second collapse (`netIO.h:249`): a cap above the native
+    /// count resolves to the native count on the wire, on every peer version
+    /// — the cached cap is what the user asked for, not what is sent.
+    #[test]
+    fn restore_clamps_an_over_large_cap_to_native_on_the_wire() {
+        let mut reg = SubscriptionRegistry::new();
+        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ true);
+        rec.data_type = Some(19);
+        rec.count = Some(99); // user asked for more elements than the record has
+        reg.add(rec);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let (restored, _) = reg.restore_for_channel(100, 7, 1, 4, false, addr(), 13, &tx);
+        assert_eq!(restored, 1);
+        assert_eq!(drained_type(&mut rx), (19, 4));
+        assert_eq!(reg.get(1).unwrap().count, Some(99));
     }
 
     /// A subscription created with an explicit user-chosen type keeps
@@ -776,7 +854,16 @@ mod tests {
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let (restored, _) = reg.restore_for_channel(100, 8, 6, 5, true, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            8,
+            6,
+            5,
+            true,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         // User-supplied type/count survive the native-type change.
         assert_eq!(drained_type(&mut rx), (19, 2));
@@ -795,7 +882,16 @@ mod tests {
         rec.req_count = Some(2);
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (restored, _) = reg.restore_for_channel(100, 7, 6, 5, false, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            7,
+            6,
+            5,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 2, "cap below native ⇒ cap");
 
@@ -805,7 +901,16 @@ mod tests {
         rec2.req_count = Some(4);
         reg2.add(rec2);
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        let (restored, _) = reg2.restore_for_channel(200, 9, 6, 1, false, addr(), &tx2);
+        let (restored, _) = reg2.restore_for_channel(
+            200,
+            9,
+            6,
+            1,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx2,
+        );
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx2).1, 1, "cap above native ⇒ native");
     }
@@ -822,12 +927,30 @@ mod tests {
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
         // First connect: native count 5, cap 4 ⇒ request 4.
-        let (restored, _) = reg.restore_for_channel(100, 7, 1, 5, false, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            7,
+            1,
+            5,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 4, "cap below native ⇒ cap");
         // Native-type change, array now 2 elements: cap 4 > native 2 ⇒ 2.
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
-        let (restored, _) = reg.restore_for_channel(100, 8, 6, 2, true, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            8,
+            6,
+            2,
+            true,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 2, "native change re-clamps cap");
     }
@@ -868,7 +991,16 @@ mod tests {
         assert_eq!(rec.req_count, None);
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (restored, _) = reg.restore_for_channel(100, 7, 6, 4, false, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            7,
+            6,
+            4,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 0, "no cap ⇒ autosize (wire 0)");
     }
@@ -1371,13 +1503,31 @@ mod tests {
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let (restored, _) = reg.restore_for_channel(100, 7, 1, 1, false, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            7,
+            1,
+            1,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         // No `-#` cap → count is autosize (0); type derives to 15.
         assert_eq!(drained_type(&mut rx), (15, 0));
 
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
-        let (restored, _) = reg.restore_for_channel(100, 8, 6, 3, false, addr(), &tx);
+        let (restored, _) = reg.restore_for_channel(
+            100,
+            8,
+            6,
+            3,
+            false,
+            addr(),
+            crate::protocol::CA_MINOR_VERSION,
+            &tx,
+        );
         assert_eq!(restored, 1);
         // native_changed = false → type stays at the first-connect value;
         // count stays autosize (0).

@@ -351,6 +351,41 @@ pub fn max_request_elements(meta_size: usize, element_size: usize, peer_minor: u
     max_bytes.saturating_sub(meta_size as u64) / element_size
 }
 
+/// Wire element count for a `CA_PROTO_READ_NOTIFY` framed for `peer_minor`.
+///
+/// C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1476`):
+/// `if (nElem == 0 && !CA_V413(minorProtocolVersion)) nElem = chan.getcount();`
+///
+/// Zero means "send whatever the record currently holds" (autosize), a
+/// contract introduced in CA V4.13 (`caProto.h:48`, "Allow zero length in
+/// requests") and implemented server-side at `rsrv/camessage.c:507`. A peer
+/// below V413 has no such code and would resolve `m_count == 0` to a
+/// zero-element transfer, so libca substitutes the channel's native count.
+pub fn read_notify_wire_count(requested: u32, native: u32, peer_minor: u16) -> u32 {
+    if requested == 0 && !ca_v413(peer_minor) {
+        native
+    } else {
+        requested
+    }
+}
+
+/// Wire element count for a `CA_PROTO_EVENT_ADD` framed for `peer_minor`.
+///
+/// C `tcpiiu::subscriptionRequest` (`tcpiiu.cpp:1573`) calls
+/// `subscr.getCount(guard, CA_V413(minorProtocolVersion))`, and
+/// `netSubscription::getCount` (`netIO.h:241-251`) is:
+/// `if ((count == 0 && !allow_zero) || count > nativeCount) return nativeCount;`
+///
+/// So a subscription differs from a read in one extra respect: an
+/// over-large cap also collapses to the native count, on every peer version.
+pub fn subscription_wire_count(requested: u32, native: u32, peer_minor: u16) -> u32 {
+    if (requested == 0 && !ca_v413(peer_minor)) || requested > native {
+        native
+    } else {
+        requested
+    }
+}
+
 /// 16-byte CA message header (big-endian), with optional extended fields.
 #[derive(Debug, Clone, Copy)]
 pub struct CaHeader {
@@ -571,6 +606,39 @@ pub fn pad_string(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero (autosize) read is only legal from CA_V413 on
+    /// (`caProto.h:48`). C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1476`)
+    /// substitutes the channel's native count below that; at and above it
+    /// the zero travels to the wire so the server sizes the reply itself.
+    #[test]
+    fn read_notify_zero_count_substitutes_native_below_v413() {
+        assert_eq!(read_notify_wire_count(0, 42, 12), 42);
+        assert_eq!(read_notify_wire_count(0, 42, 13), 0);
+        // The V413 boundary is the only gate: a non-zero request is never
+        // rewritten by `readNotifyRequest`, not even one above the native
+        // count (the server clamps that itself).
+        assert_eq!(read_notify_wire_count(7, 42, 12), 7);
+        assert_eq!(read_notify_wire_count(99, 42, 13), 99);
+        // CA_MINIMUM_SUPPORTED_VERSION peers get the substitution too.
+        assert_eq!(read_notify_wire_count(0, 1, 4), 1);
+    }
+
+    /// `netSubscription::getCount` (`netIO.h:241-251`) adds a second
+    /// collapse a read does not have: a cap above the native count also
+    /// resolves to the native count, on every peer version.
+    #[test]
+    fn subscription_wire_count_applies_both_getcount_collapses() {
+        // zero-count collapse, gated on CA_V413
+        assert_eq!(subscription_wire_count(0, 42, 12), 42);
+        assert_eq!(subscription_wire_count(0, 42, 13), 0);
+        // over-large cap collapse, ungated
+        assert_eq!(subscription_wire_count(99, 42, 12), 42);
+        assert_eq!(subscription_wire_count(99, 42, 13), 42);
+        // a cap at or below the native count travels verbatim
+        assert_eq!(subscription_wire_count(42, 42, 13), 42);
+        assert_eq!(subscription_wire_count(7, 42, 12), 7);
+    }
 
     #[test]
     fn test_header_roundtrip() {

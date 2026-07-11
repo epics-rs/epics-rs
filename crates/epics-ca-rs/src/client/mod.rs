@@ -1750,6 +1750,12 @@ impl CaChannel {
                  nciu::read ECA_NORDACCESS); ioid {ioid}"
             )));
         }
+        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1476`) substitutes the
+        // channel's native element count for a zero (autosize) request when
+        // the peer predates CA_V413 — those servers have no zero-count
+        // autosize contract and would read `m_count == 0` as "no elements".
+        let count =
+            crate::protocol::read_notify_wire_count(count, snap.element_count, snap.server_minor);
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_read_notify_frame(
                 snap.sid,
@@ -3270,6 +3276,17 @@ async fn run_coordinator(
                             let count = ch
                                 .native_type
                                 .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));
+                            // C keeps the user's cap in `netSubscription::count`
+                            // and resolves the WIRE count per request via
+                            // `getCount(guard, CA_V413(minor))` (`netIO.h:241-251`)
+                            // — so the zero-count autosize contract is only used
+                            // with a peer that implements it.
+                            let peer_minor = ch
+                                .server_addr
+                                .and_then(|addr| {
+                                    server_minor_version.get(&(addr, ch.priority)).copied()
+                                })
+                                .unwrap_or(0);
 
                             // allocate the subid here, where the
                             // live subscription table lives, so the wrap
@@ -3312,7 +3329,11 @@ async fn run_coordinator(
                                 let _ = transport_tx.send(TransportCommand::Subscribe {
                                     sid: ch.sid,
                                     data_type: data_type.expect("connected channel has native type"),
-                                    count: count.expect("connected channel has element count"),
+                                    count: crate::protocol::subscription_wire_count(
+                                        count.expect("connected channel has element count"),
+                                        ch.element_count,
+                                        peer_minor,
+                                    ),
                                     subid,
                                     mask,
                                     server_addr,
@@ -3330,12 +3351,27 @@ async fn run_coordinator(
                             if let Some(ch) = channels.get(&cid) {
                                 if ch.state == ChannelState::Connected {
                                     if let Some(data_type) = rec.data_type {
+                                        let server_addr = ch.server_addr.unwrap();
+                                        // C `tcpiiu::subscriptionCancelRequest`
+                                        // (`tcpiiu.cpp:1659`) re-resolves the wire
+                                        // count through the same
+                                        // `getCount(CA_V413(minor))` gate the
+                                        // EVENT_ADD used, so the cancel echoes the
+                                        // count the server was given.
+                                        let peer_minor = server_minor_version
+                                            .get(&(server_addr, ch.priority))
+                                            .copied()
+                                            .unwrap_or(0);
                                         let _ = transport_tx.send(TransportCommand::Unsubscribe {
                                             sid: ch.sid,
                                             subid,
                                             data_type,
-                                            count: rec.count.unwrap_or(0),
-                                            server_addr: ch.server_addr.unwrap(),
+                                            count: crate::protocol::subscription_wire_count(
+                                                rec.count.unwrap_or(0),
+                                                ch.element_count,
+                                                peer_minor,
+                                            ),
+                                            server_addr,
                                             priority: ch.priority,
                                         });
                                     }
@@ -3352,12 +3388,21 @@ async fn run_coordinator(
                                 if let Some(ch) = channels.get(&cid) {
                                     if ch.state == ChannelState::Connected {
                                         if let Some(data_type) = rec.data_type {
+                                            let server_addr = ch.server_addr.unwrap();
+                                            let peer_minor = server_minor_version
+                                                .get(&(server_addr, ch.priority))
+                                                .copied()
+                                                .unwrap_or(0);
                                             let _ = transport_tx.send(TransportCommand::Unsubscribe {
                                                 sid: ch.sid,
                                                 subid,
                                                 data_type,
-                                                count: rec.count.unwrap_or(0),
-                                                server_addr: ch.server_addr.unwrap(),
+                                                count: crate::protocol::subscription_wire_count(
+                                                    rec.count.unwrap_or(0),
+                                                    ch.element_count,
+                                                    peer_minor,
+                                                ),
+                                                server_addr,
                                                 priority: ch.priority,
                                             });
                                         }
@@ -3729,6 +3774,10 @@ async fn run_coordinator(
                                 element_count,
                                 native_changed,
                                 server_addr,
+                                server_minor_version
+                                    .get(&(server_addr, ch.priority))
+                                    .copied()
+                                    .unwrap_or(0),
                                 &transport_tx,
                             );
                             diag.connections.fetch_add(1, Ordering::Relaxed);
@@ -4075,11 +4124,19 @@ async fn run_coordinator(
                                     {
                                         if let Some(ch) = channels.get(&cid) {
                                             if let Some(addr) = ch.server_addr {
+                                                let peer_minor = server_minor_version
+                                                    .get(&(addr, ch.priority))
+                                                    .copied()
+                                                    .unwrap_or(0);
                                                 let _ =
                                                     transport_tx.send(TransportCommand::ReadNotify {
                                                         sid: ch.sid,
                                                         data_type,
-                                                        count: rec.count.unwrap_or(0),
+                                                        count: crate::protocol::read_notify_wire_count(
+                                                            rec.count.unwrap_or(0),
+                                                            ch.element_count,
+                                                            peer_minor,
+                                                        ),
                                                         ioid: in_flight.alloc_ioid(),
                                                         server_addr: addr,
                                                         priority: ch.priority,

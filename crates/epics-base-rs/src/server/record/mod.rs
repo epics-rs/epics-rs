@@ -2,6 +2,7 @@ mod alarm;
 mod common_fields;
 mod link;
 mod menu_choices;
+mod pini;
 mod process_passive;
 mod record_instance;
 mod record_trait;
@@ -17,9 +18,11 @@ pub use link::{
     parse_link, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
 };
 pub use menu_choices::{
-    MENU_ALARM_SEVR, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_POST, MENU_PRIORITY,
-    MENU_SCAN, MENU_SIMM, MENU_YES_NO, resolve_menu_field_string, shared_menu_choices,
+    MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
+    MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, resolve_menu_field_string,
+    shared_menu_choices,
 };
+pub use pini::PiniMode;
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,

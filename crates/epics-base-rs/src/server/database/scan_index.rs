@@ -94,7 +94,13 @@ impl PvDatabase {
             .unwrap_or_default()
     }
 
-    /// Get all record names that have PINI=true.
+    /// Get all record names whose `PINI` selects the `initialProcess()` pass
+    /// (`menuPiniYES` — C `iocInit.c:656` `piniProcess(menuPiniYES)`).
+    ///
+    /// C matches the menu index exactly (`iocInit.c:598`
+    /// `if (precord->pini != pphase->pini) return;`), so `RUN`/`RUNNING`/
+    /// `PAUSE`/`PAUSED` records are NOT in this pass — they belong to their
+    /// own lifecycle hook.
     ///
     /// Snapshot the records map under the outer
     /// read lock, then drop it before fanning out per-record reads.
@@ -114,7 +120,7 @@ impl PvDatabase {
         let mut result = Vec::new();
         for (name, rec) in snapshot {
             let instance = rec.read().await;
-            if instance.common.pini {
+            if instance.common.pini == crate::server::record::PiniMode::Yes {
                 result.push(name);
             }
         }

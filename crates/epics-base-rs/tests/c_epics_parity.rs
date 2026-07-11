@@ -1921,6 +1921,7 @@ async fn process_record_clears_udf() {
 #[tokio::test]
 async fn pini_flag() {
     use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::record::PiniMode;
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
@@ -1931,14 +1932,17 @@ async fn pini_flag() {
     // Set PINI
     if let Some(rec) = db.get_record("pini_rec").await {
         let mut inst = rec.write().await;
-        inst.common.pini = true;
+        inst.common.pini = PiniMode::Yes;
     }
 
-    // Verify PINI flag is set
+    // Verify PINI is set
     if let Some(rec) = db.get_record("pini_rec").await {
         let inst = rec.read().await;
-        assert!(inst.common.pini, "PINI should be set");
+        assert_eq!(inst.common.pini, PiniMode::Yes, "PINI should be YES");
     }
+    // `pini_records()` is the `piniProcess(menuPiniYES)` pass — it selects the
+    // exact menu index, so only YES records are in it.
+    assert_eq!(db.pini_records().await, vec!["pini_rec".to_string()]);
 }
 
 // ============================================================

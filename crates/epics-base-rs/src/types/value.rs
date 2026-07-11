@@ -1226,11 +1226,14 @@ impl EpicsValue {
             ".5 second" => Some(7),
             ".2 second" => Some(8),
             ".1 second" => Some(9),
-            // menuPini (NO=0, YES=1 already handled via menuYesNo)
-            "RUNNING" => Some(2),
-            "RUNNING_NOT_CA" => Some(3),
-            "PAUSED" => Some(4),
-            "PAUSED_NOT_CA" => Some(5),
+            // menuPini is deliberately absent. Its real choice order is
+            // NO,YES,RUN,RUNNING,PAUSE,PAUSED (`menuPini.dbd.pod:59-65`) — the
+            // entries that used to live here (`RUNNING=2`, `PAUSED=4`, plus two
+            // invented `*_NOT_CA` choices) named the wrong indices. `PINI`
+            // resolves against its own menu via
+            // `crate::server::record::PiniMode::from_str`, which is what this
+            // field-blind table cannot do: the same label names different
+            // indices in different menus.
             _ => None,
         }
     }

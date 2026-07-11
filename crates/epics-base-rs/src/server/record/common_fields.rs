@@ -1,6 +1,7 @@
 use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
+use super::pini::PiniMode;
 use super::scan::{ScanType, SimModeScan};
 use crate::types::PvString;
 
@@ -31,7 +32,9 @@ pub struct CommonFields {
     // SSCN's dbd default is the out-of-range sentinel 65535 ("use SCAN"),
     // unrepresentable in `ScanType`; see [`SimModeScan`].
     pub sscn: SimModeScan,
-    pub pini: bool,
+    /// `PINI` is `DBF_MENU`/`menu(menuPini)` — a six-choice lifecycle
+    /// selector, not a flag. See [`PiniMode`].
+    pub pini: PiniMode,
     pub tpro: bool,
     pub bkpt: u8,
     // Links (raw strings)
@@ -129,7 +132,7 @@ impl Default for CommonFields {
             // C dbd `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`:
             // the default is the out-of-range "use SCAN" sentinel, not Passive.
             sscn: SimModeScan::DoNotUse,
-            pini: false,
+            pini: PiniMode::No,
             tpro: false,
             bkpt: 0,
             flnk: String::new(),

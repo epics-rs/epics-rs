@@ -2137,6 +2137,115 @@ fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
     );
 }
 
+// R6-1 — every dbCommon DBF_MENU field is served as DBR_ENUM with its menu's
+// choice strings, not as a bare SHORT/CHAR. C `dbAccess.c:1074`
+// (`mapDBFToDBR[DBF_MENU] == DBR_ENUM`) + `:167-175` (`get_enum_strs` serves
+// the menu's `papChoiceValue[]`). Pre-fix `caget REC.SEVR` returned DBR_SHORT
+// 2 with no strings where a C IOC returns DBR_ENUM 2 + "MAJOR".
+#[test]
+fn test_snapshot_dbcommon_menu_fields_serve_as_enum() {
+    use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
+
+    let mut inst = RecordInstance::new("COMMON:MENU".into(), AiRecord::new(1.0));
+    inst.common.sevr = AlarmSeverity::Major; // menuAlarmSevr index 2
+    inst.common.stat = 14; // menuAlarmStat LINK
+    inst.common.nsev = AlarmSeverity::Minor;
+    inst.common.nsta = 17; // UDF
+    inst.common.acks = AlarmSeverity::Invalid;
+    inst.common.ackt = false;
+    inst.common.diss = AlarmSeverity::Minor;
+    inst.common.udfs = AlarmSeverity::Invalid;
+    inst.common.pini = PiniMode::Run;
+
+    let sevr = inst.snapshot_for_field("SEVR").unwrap();
+    assert_eq!(sevr.value, EpicsValue::Enum(2));
+    assert_eq!(
+        sevr.enums.as_ref().unwrap().strings,
+        vec!["NO_ALARM", "MINOR", "MAJOR", "INVALID"]
+    );
+
+    let stat = inst.snapshot_for_field("STAT").unwrap();
+    assert_eq!(stat.value, EpicsValue::Enum(14));
+    let stat_strings = &stat.enums.as_ref().unwrap().strings;
+    assert_eq!(stat_strings.len(), 22);
+    assert_eq!(stat_strings[14], "LINK");
+
+    let nsev = inst.snapshot_for_field("NSEV").unwrap();
+    assert_eq!(nsev.value, EpicsValue::Enum(1));
+    let nsta = inst.snapshot_for_field("NSTA").unwrap();
+    assert_eq!(nsta.value, EpicsValue::Enum(17));
+    assert_eq!(nsta.enums.as_ref().unwrap().strings[17], "UDF");
+
+    let acks = inst.snapshot_for_field("ACKS").unwrap();
+    assert_eq!(acks.value, EpicsValue::Enum(3));
+    assert_eq!(acks.enums.as_ref().unwrap().strings[3], "INVALID");
+
+    // ACKT/PINI were served as DBR_CHAR (a 1-byte payload) where C sends a
+    // 2-byte DBR_ENUM.
+    let ackt = inst.snapshot_for_field("ACKT").unwrap();
+    assert_eq!(ackt.value, EpicsValue::Enum(0));
+    assert_eq!(ackt.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
+
+    let pini = inst.snapshot_for_field("PINI").unwrap();
+    assert_eq!(pini.value, EpicsValue::Enum(2));
+    assert_eq!(
+        pini.enums.as_ref().unwrap().strings,
+        vec!["NO", "YES", "RUN", "RUNNING", "PAUSE", "PAUSED"]
+    );
+
+    let diss = inst.snapshot_for_field("DISS").unwrap();
+    assert_eq!(diss.value, EpicsValue::Enum(1));
+    assert_eq!(diss.enums.as_ref().unwrap().strings[1], "MINOR");
+
+    let udfs = inst.snapshot_for_field("UDFS").unwrap();
+    assert_eq!(udfs.value, EpicsValue::Enum(3));
+    assert_eq!(udfs.enums.as_ref().unwrap().strings[3], "INVALID");
+}
+
+// R6-1 (put half) — a DBR_STRING / `.db` write to a dbCommon DBF_MENU field
+// resolves the label against THAT field's own menu (C `dbPutStringNum`: exact
+// label, then a numeric index). Pre-fix `field(DISS,"MAJOR")` was dropped
+// silently (the arm bound only `Short`) and `field(PINI,"RUN")` set the flag
+// to false.
+#[test]
+fn test_put_dbcommon_menu_field_resolves_label() {
+    use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
+
+    let mut inst = RecordInstance::new("COMMON:PUT".into(), AiRecord::new(1.0));
+    inst.put_common_field("DISS", EpicsValue::String("MAJOR".into()))
+        .unwrap();
+    assert_eq!(inst.common.diss, AlarmSeverity::Major);
+
+    inst.put_common_field("UDFS", EpicsValue::String("MINOR".into()))
+        .unwrap();
+    assert_eq!(inst.common.udfs, AlarmSeverity::Minor);
+
+    inst.put_common_field("PINI", EpicsValue::String("RUN".into()))
+        .unwrap();
+    assert_eq!(inst.common.pini, PiniMode::Run);
+    // Bare menu index, as C `epicsParseUInt16` accepts.
+    inst.put_common_field("PINI", EpicsValue::String("3".into()))
+        .unwrap();
+    assert_eq!(inst.common.pini, PiniMode::Running);
+    // "NO" is a real choice — index 0, not a parse failure.
+    inst.put_common_field("PINI", EpicsValue::String("NO".into()))
+        .unwrap();
+    assert_eq!(inst.common.pini, PiniMode::No);
+    // A string naming no choice is C `S_db_badChoice`, not a silent NO.
+    assert!(
+        inst.put_common_field("PINI", EpicsValue::String("MAYBE".into()))
+            .is_err()
+    );
+
+    // ACKT is menu(menuYesNo), not a truthiness flag.
+    inst.put_common_field("ACKT", EpicsValue::String("NO".into()))
+        .unwrap();
+    assert!(!inst.common.ackt);
+    inst.put_common_field("ACKT", EpicsValue::String("YES".into()))
+        .unwrap();
+    assert!(inst.common.ackt);
+}
+
 // MPST/APST on lsi are menu(menuPost): On Change (0), Always (1). The value
 // order is wire-visible; the array records' POST menus reverse it, which is
 // why MPST/APST are resolved per record rather than globally.

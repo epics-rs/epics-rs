@@ -40,6 +40,39 @@ use crate::types::{DbFieldType, EpicsValue};
 /// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
 pub const MENU_ALARM_SEVR: &[&str] = &["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
 
+/// `menu(menuAlarmStat)` — `menuAlarmStat.dbd.pod:87-109`. The index order is
+/// `alarm.h`'s `epicsAlarmCondition`, which `recGblSetSevr` stores in
+/// `STAT`/`NSTA`.
+pub const MENU_ALARM_STAT: &[&str] = &[
+    "NO_ALARM",
+    "READ",
+    "WRITE",
+    "HIHI",
+    "HIGH",
+    "LOLO",
+    "LOW",
+    "STATE",
+    "COS",
+    "COMM",
+    "TIMEOUT",
+    "HWLIMIT",
+    "CALC",
+    "SCAN",
+    "LINK",
+    "SOFT",
+    "BAD_SUB",
+    "UDF",
+    "DISABLE",
+    "SIMM",
+    "READ_ACCESS",
+    "WRITE_ACCESS",
+];
+
+/// `menu(menuPini)` — `menuPini.dbd.pod:59-65`. See
+/// [`PiniMode`](crate::server::record::PiniMode) for the lifecycle point each
+/// choice selects.
+pub const MENU_PINI: &[&str] = &["NO", "YES", "RUN", "RUNNING", "PAUSE", "PAUSED"];
+
 /// `menu(menuSimm)` — `menuSimm.dbd.pod:20-22`.
 pub const MENU_SIMM: &[&str] = &["NO", "YES", "RAW"];
 
@@ -118,9 +151,22 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         // severities, the bi/bo/mbbi/mbbo state severities, the change-of-
         // state severity, the sub/aSub bad-return severity, and the
         // simulation-mode alarm severity all share one menu.
-        "HHSV" | "HSV" | "LSV" | "LLSV" | "ZSV" | "OSV" | "COSV" | "UNSV" | "BRSV" | "ZRSV"
-        | "ONSV" | "TWSV" | "THSV" | "FRSV" | "FVSV" | "SXSV" | "SVSV" | "EISV" | "NISV"
-        | "TESV" | "ELSV" | "TVSV" | "TTSV" | "FTSV" | "FFSV" | "SIMS" => Some(MENU_ALARM_SEVR),
+        //
+        // The dbCommon severities belong to the same menu and are therefore
+        // served as `DBR_ENUM` with these labels, exactly like every other
+        // `DBF_MENU`: `SEVR` (`dbCommon.dbd.pod:302`), `NSEV` (`:318`),
+        // `ACKS` (`:329`), `DISS` (`:343`), `UDFS` (`:556`).
+        "SEVR" | "NSEV" | "ACKS" | "DISS" | "UDFS" | "HHSV" | "HSV" | "LSV" | "LLSV" | "ZSV"
+        | "OSV" | "COSV" | "UNSV" | "BRSV" | "ZRSV" | "ONSV" | "TWSV" | "THSV" | "FRSV"
+        | "FVSV" | "SXSV" | "SVSV" | "EISV" | "NISV" | "TESV" | "ELSV" | "TVSV" | "TTSV"
+        | "FTSV" | "FFSV" | "SIMS" => Some(MENU_ALARM_SEVR),
+        // dbCommon alarm status (`menuAlarmStat`) — `dbCommon.dbd.pod:296`
+        // (`STAT`) and `:312` (`NSTA`).
+        "STAT" | "NSTA" => Some(MENU_ALARM_STAT),
+        // dbCommon alarm-ack transient (`menuYesNo`) — `dbCommon.dbd.pod:335`.
+        "ACKT" => Some(MENU_YES_NO),
+        // dbCommon process-at-init (`menuPini`) — `dbCommon.dbd.pod:169`.
+        "PINI" => Some(MENU_PINI),
         // Saved simulation mode (`menuSimm`, always). The live `SIMM` field
         // is *not* shared — `menuSimm` (NO/YES/RAW) on analog/binary/multibit
         // records but `menuYesNo` (NO/YES) elsewhere — so it is resolved by
@@ -241,6 +287,38 @@ mod tests {
         assert_eq!(shared_menu_choices("SIMM"), None);
         assert_eq!(shared_menu_choices("MPST"), None);
         assert_eq!(shared_menu_choices("APST"), None);
+    }
+
+    #[test]
+    fn dbcommon_menu_fields_resolve_to_their_menu() {
+        // Every `DBF_MENU` field of dbCommon is served as `DBR_ENUM` with its
+        // menu's choice strings (dbAccess.c:1074 `mapDBFToDBR`,
+        // dbAccess.c:167-175 `get_enum_strs`) — not as a bare SHORT/CHAR.
+        assert_eq!(shared_menu_choices("SEVR"), Some(MENU_ALARM_SEVR));
+        assert_eq!(shared_menu_choices("NSEV"), Some(MENU_ALARM_SEVR));
+        assert_eq!(shared_menu_choices("ACKS"), Some(MENU_ALARM_SEVR));
+        assert_eq!(shared_menu_choices("DISS"), Some(MENU_ALARM_SEVR));
+        assert_eq!(shared_menu_choices("UDFS"), Some(MENU_ALARM_SEVR));
+        assert_eq!(shared_menu_choices("STAT"), Some(MENU_ALARM_STAT));
+        assert_eq!(shared_menu_choices("NSTA"), Some(MENU_ALARM_STAT));
+        assert_eq!(shared_menu_choices("ACKT"), Some(MENU_YES_NO));
+        assert_eq!(shared_menu_choices("PINI"), Some(MENU_PINI));
+    }
+
+    #[test]
+    fn alarm_stat_and_pini_orders_match_the_dbd() {
+        // menuAlarmStat index order is `alarm.h` epicsAlarmCondition, which
+        // `recGblSetSevr` stores into STAT/NSTA — wire-visible.
+        assert_eq!(MENU_ALARM_STAT.len(), 22);
+        assert_eq!(MENU_ALARM_STAT[0], "NO_ALARM");
+        assert_eq!(MENU_ALARM_STAT[14], "LINK");
+        assert_eq!(MENU_ALARM_STAT[17], "UDF");
+        assert_eq!(MENU_ALARM_STAT[21], "WRITE_ACCESS");
+        // menuPini has six choices; RUN is 2 and RUNNING is 3.
+        assert_eq!(
+            MENU_PINI,
+            &["NO", "YES", "RUN", "RUNNING", "PAUSE", "PAUSED"]
+        );
     }
 
     #[test]

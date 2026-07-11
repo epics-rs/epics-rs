@@ -13,6 +13,7 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
 use super::link::{ParsedLink, parse_link_v2, parse_output_link_v2};
+use super::pini::PiniMode;
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
@@ -200,16 +201,28 @@ fn coerce_common_field_string(name: &str, value: EpicsValue) -> EpicsValue {
         _ => return value,
     };
     // Canonical DBF type per numeric/menu common field, chosen to match the
-    // variant its `put_common_field` arm binds (e.g. ACKT/UDFS resolve their
-    // menu labels through the `Short` branch's `resolve_menu_string`).
+    // variant its `put_common_field` arm binds. `PINI`/`SCAN`/`SSCN` are absent
+    // on purpose: their arms consume the raw `String` through their own
+    // `from_str`.
     let dbf = match name {
-        "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" => {
-            DbFieldType::Short
-        }
+        "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
+        | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
         "DISP" | "UDF" => DbFieldType::Char,
         _ => return value,
     };
-    match EpicsValue::parse(dbf, s.as_str_lossy().trim()) {
+    let text = s.as_str_lossy();
+    let text = text.trim();
+    // A `DBF_MENU` common field resolves its label against THAT field's own
+    // menu (C `dbPutStringNum`: exact label, then numeric index) — the same
+    // rule the record-specific menu fields already follow in `coerce_write_value`
+    // / the db loader. The field-blind `EpicsValue::parse` table below cannot
+    // do this: the same label names different indices in different menus.
+    if let Some(choices) = super::menu_choices::shared_menu_choices(name) {
+        if let Some(resolved) = super::menu_choices::resolve_menu_field_string(choices, dbf, text) {
+            return resolved;
+        }
+    }
+    match EpicsValue::parse(dbf, text) {
         Ok(parsed) => parsed,
         Err(_) => value,
     }
@@ -1146,12 +1159,17 @@ impl RecordInstance {
             "AMSG" => Some(EpicsValue::String(self.common.amsg.clone().into())),
             "NAMSG" => Some(EpicsValue::String(self.common.namsg.clone().into())),
             "ACKS" => Some(EpicsValue::Short(self.common.acks as i16)),
-            "ACKT" => Some(EpicsValue::Char(if self.common.ackt { 1 } else { 0 })),
+            // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
+            // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
+            // index, which `promote_menu_value` lifts to `DBR_ENUM` with the
+            // menu's choice strings. Storing them as `Short` is what makes
+            // them eligible for that promotion — see `promote_menu_value`.
+            "ACKT" => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
             "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
             "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
             "SCAN" => Some(EpicsValue::Enum(self.common.scan as u16)),
             "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
-            "PINI" => Some(EpicsValue::Char(if self.common.pini { 1 } else { 0 })),
+            "PINI" => Some(EpicsValue::Short(self.common.pini.to_u16() as i16)),
             "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
             "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
@@ -1360,12 +1378,20 @@ impl RecordInstance {
                 };
                 self.common.sscn = new_sscn;
             }
+            // `PINI` is `menu(menuPini)` — the six choices NO/YES/RUN/RUNNING/
+            // PAUSE/PAUSED (`menuPini.dbd.pod:59-65`). Resolved exactly like
+            // `SCAN`: a menu label or a bare index, never a truthiness test.
+            // The pre-fix `bool` arm collapsed `RUN` (index 2) to `false`, so
+            // `caput REC.PINI RUN` *disabled* PINI instead of selecting the
+            // iocRun pass.
             "PINI" => {
-                if let EpicsValue::Char(v) = value {
-                    self.common.pini = v != 0;
-                } else if let EpicsValue::String(s) = &value {
-                    self.common.pini = s == "YES" || s == "1" || s == "true";
-                }
+                self.common.pini = match &value {
+                    EpicsValue::Short(v) => PiniMode::from_u16(*v as u16),
+                    EpicsValue::Char(v) => PiniMode::from_u16(*v as u16),
+                    EpicsValue::Enum(v) => PiniMode::from_u16(*v),
+                    EpicsValue::String(s) => PiniMode::from_str(s.as_str_lossy().as_ref())?,
+                    _ => return Ok(CommonFieldPutResult::NoChange),
+                };
             }
             "TPRO" => {
                 if let EpicsValue::Char(v) = value {

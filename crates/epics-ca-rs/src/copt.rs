@@ -149,6 +149,40 @@ pub fn scan_double(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
+/// The outcome of C's `-0<base>` / `-l<base>` getopt case: the base that
+/// survived the loop, and WHICH occurrence put it there.
+///
+/// The two travel together because C ties them together — the same
+/// `if (outType != dec)` guard that assigns `outTypeI` also assigns
+/// `type = DBR_LONG` (`caget.c:493-495`). A caller that wants to know when
+/// `-0` last touched `type` must therefore ask about the last VALID
+/// occurrence, never the last occurrence; keeping the answer inside the fold
+/// that decides validity is what stops the caller from asking the wrong
+/// question (R13-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Base {
+    /// C's `outTypeI` / `outTypeF` after the whole getopt loop.
+    pub style: IntStyle,
+    /// Ordinal, within the occurrence list, of the last occurrence that
+    /// scanned VALID. `None` when none did — C's guard then never ran.
+    valid: Option<usize>,
+}
+
+impl Base {
+    /// The clap argument index of the occurrence that last assigned, i.e. the
+    /// getopt position at which `-0` last wrote `type` — what a competing
+    /// option (`caget -d`) must be compared against. `None` when no
+    /// occurrence scanned valid, because C never wrote `type` at all.
+    ///
+    /// `id` must be the clap id whose occurrences produced this `Base`;
+    /// clap yields `indices_of` in command-line order, the same order the
+    /// fold walked.
+    pub fn valid_index(self, matches: &clap::ArgMatches, id: &str) -> Option<usize> {
+        let n = self.valid?;
+        matches.indices_of(id)?.nth(n)
+    }
+}
+
 /// The tool's own name, used to stamp C's `('<tool> -h' for help.)` suffix
 /// into every warning. Each binary constructs exactly one.
 #[derive(Debug, Clone, Copy)]
@@ -376,20 +410,32 @@ impl CTool {
     ///   `if (outType != dec)`, so `-0x -0q` warns and still prints hex.
     ///
     /// `occurrences` is every `-0` (or every `-l`) argument in command-line
-    /// order. The return is C's `outTypeI` (`opt == '0'`) or `outTypeF`
-    /// (`opt == 'l'`) after the whole getopt loop.
-    pub fn base(self, opt: char, occurrences: &[String]) -> IntStyle {
+    /// order. The return carries C's `outTypeI` (`opt == '0'`) / `outTypeF`
+    /// (`opt == 'l'`) after the whole getopt loop, PLUS which occurrence last
+    /// performed the assignment — see [`Base::valid_index`].
+    pub fn base(self, opt: char, occurrences: &[String]) -> Base {
         let _ = self.0;
-        let mut style = IntStyle::Dec;
-        for a in occurrences {
-            match a.chars().next() {
-                Some('x') => style = IntStyle::Hex,
-                Some('b') => style = IntStyle::Bin,
-                Some('o') => style = IntStyle::Oct,
-                _ => eprintln!("Invalid argument '{a}' for option '-{opt}' - ignored."),
-            }
+        let mut base = Base {
+            style: IntStyle::Dec,
+            valid: None,
+        };
+        for (n, a) in occurrences.iter().enumerate() {
+            base.style = match a.chars().next() {
+                Some('x') => IntStyle::Hex,
+                Some('b') => IntStyle::Bin,
+                Some('o') => IntStyle::Oct,
+                // C's `default:` arm sets `outType = dec`, and the two
+                // assignments below it are guarded by `if (outType != dec)` —
+                // so an invalid base warns, assigns NOTHING, and leaves both
+                // the base and `type` as an earlier occurrence left them.
+                _ => {
+                    eprintln!("Invalid argument '{a}' for option '-{opt}' - ignored.");
+                    continue;
+                }
+            };
+            base.valid = Some(n);
         }
-        style
+        base
     }
 
     /// C's usage-error contract, shared by all four tools: ONE line on
@@ -509,16 +555,25 @@ mod tests {
     ///   `caget -0q PV`     → warns, prints `200`
     #[test]
     fn invalid_base_does_not_reset_a_valid_one() {
+        let base = |v: &[&str]| CAGET.base('0', &many(v));
         assert_eq!(
-            CAGET.base('0', &["x".into(), "q".into()]),
+            base(&["x", "q"]).style,
             IntStyle::Hex,
             "C guards the assignment with `if (outType != dec)`"
         );
-        assert_eq!(CAGET.base('0', &["xyz".into()]), IntStyle::Hex);
-        assert_eq!(CAGET.base('0', &["q".into()]), IntStyle::Dec);
-        assert_eq!(CAGET.base('0', &["".into()]), IntStyle::Dec);
-        assert_eq!(CAGET.base('0', &[]), IntStyle::Dec);
-        assert_eq!(CAGET.base('0', &["x".into(), "b".into()]), IntStyle::Bin);
+        assert_eq!(base(&["xyz"]).style, IntStyle::Hex);
+        assert_eq!(base(&["q"]).style, IntStyle::Dec);
+        assert_eq!(base(&[""]).style, IntStyle::Dec);
+        assert_eq!(base(&[]).style, IntStyle::Dec);
+        assert_eq!(base(&["x", "b"]).style, IntStyle::Bin);
+
+        // R13-16: the SAME guard decides which occurrence last assigned, so
+        // the fold reports it — a trailing invalid base is not "the last one".
+        assert_eq!(base(&["x", "q"]).valid, Some(0), "`q` assigned nothing");
+        assert_eq!(base(&["x", "b"]).valid, Some(1));
+        assert_eq!(base(&["q"]).valid, None);
+        assert_eq!(base(&[]).valid, None);
+        assert_eq!(base(&["q", "x"]).valid, Some(1));
     }
 
     /// The three C conversions differ, and the difference is observable.

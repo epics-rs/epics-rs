@@ -3,14 +3,14 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG, WallTime};
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, IntStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
+    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
     ca_error_marker, dbr_value_field_type, format_c_g, format_value, sevr_to_str, stat_to_str,
     zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
 };
-use epics_ca_rs::copt::{CTool, scan_i32};
+use epics_ca_rs::copt::{self, CTool, scan_i32};
 use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
@@ -109,35 +109,40 @@ fn resolve_format(matches: &clap::ArgMatches) -> (OutputMode, Option<u16>) {
 /// ```
 ///
 /// clap has no notion of that sequence, so the winner is recovered from the
-/// argument indices — the same mechanism `resolve_format` uses. An
-/// invalid base (`-0q`) never reaches the assignment in C (it is guarded by
-/// `if (outType != dec)`), which is why the caller passes the ALREADY
-/// RESOLVED [`IntStyle`] rather than the raw argument.
+/// argument indices — the same mechanism `resolve_format` uses.
+///
+/// Only a VALID `-0` enters the race (R13-16). C's assignment sits under
+/// `if (outType != dec)` (`caget.c:497-503`), so `-0q` warns and touches
+/// NOTHING: neither the base nor `type`. The position that raced `-d` is
+/// therefore the last VALID occurrence, which is why the caller hands over a
+/// [`copt::Base`] — the fold that decided validity — instead of a raw index:
+///
+/// ```text
+/// caget -0x -d DBR_DOUBLE -0q TST:AO  →  Request type: DBR_DOUBLE
+/// ```
+///
+/// (`-0q` is the last `-0`, but the last one that ASSIGNED is `-0x`, which
+/// lost to `-d`.)
 ///
 /// The type only reaches the wire under `specifiedDbr`
 /// (`caget.c:175`), so `-0x` on its own still gets the native TIME type.
 fn resolve_dbr_type(
     matches: &clap::ArgMatches,
-    int_style: IntStyle,
+    int_base: copt::Base,
     dbr_type: Option<u16>,
 ) -> Option<u16> {
-    use clap::parser::ValueSource;
-    if int_style == IntStyle::Dec {
-        return dbr_type; // no valid `-0<base>`: `type` was never forced
-    }
-    let idx = |id| {
-        (matches.value_source(id) == Some(ValueSource::CommandLine))
-            .then(|| matches.index_of(id))
-            .flatten()
+    // No valid `-0<base>`: C never ran the guard, so `type` was never forced.
+    let Some(base) = int_base.valid_index(matches, "int_base") else {
+        return dbr_type;
     };
-    // `-0` may repeat; C re-assigns on each valid occurrence, so the LAST
-    // one is the one racing `-d`. `indices_of` yields them in order.
-    let last_base = matches
-        .indices_of("int_base")
-        .and_then(|mut i| i.next_back())
-        .unwrap_or(0);
-    match idx("dbr_type") {
-        Some(d) if d > last_base => dbr_type,
+    // `-d` may repeat too, and EVERY occurrence assigns `type` in C (an
+    // out-of-range one leaves it invalid and falls back to `plain`, where the
+    // type is never used) — so the LAST `-d` is the one racing.
+    let last_d = matches
+        .indices_of("dbr_type")
+        .and_then(|mut i| i.next_back());
+    match last_d {
+        Some(d) if d > base => dbr_type,
         _ => Some(DBR_LONG),
     }
 }
@@ -297,7 +302,10 @@ impl Args {
     /// Build a [`ValueFormat`] from the CLI flags. Every C-scanned argument
     /// goes through [`TOOL`], which warns and falls back exactly like C's
     /// getopt loop — nothing here can fail the program.
-    fn value_format(&self, matches: &clap::ArgMatches) -> ValueFormat {
+    /// `int_base` is passed in already folded because C's `-0` case writes TWO
+    /// things — the integer base AND `type` — and both callers must see the
+    /// same fold (and its warnings, printed exactly once).
+    fn value_format(&self, matches: &clap::ArgMatches, int_base: copt::Base) -> ValueFormat {
         let mut fmt = ValueFormat::default();
         // W10-B2. `-e`/`-f`/`-g` are ONE getopt case writing ONE `dblFormatStr`
         // (`caget.c:470-484`), so the LAST VALID occurrence across the three letters wins
@@ -320,8 +328,8 @@ impl Args {
         // C `caget.c:485-499` writes exactly ONE of the two base globals per
         // occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
         // `outTypeF` (floats, via round-to-long). They never cross.
-        fmt.int_style = TOOL.base('0', &self.int_base);
-        fmt.float_style = TOOL.base('l', &self.float_base);
+        fmt.int_style = int_base.style;
+        fmt.float_style = TOOL.base('l', &self.float_base).style;
         fmt.enum_as_number = self.enum_as_number > 0;
         fmt.char_array_as_string = self.char_array_as_string > 0;
         fmt.req_elems = TOOL.req_elems_int(&self.max_elements);
@@ -789,9 +797,11 @@ async fn main() {
     // two below, every C-scanned argument in this tool is resolved here, once.
     let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
     let priority = TOOL.priority(&args.priority);
-    // Built ONCE: `value_format` is what scans the `-0`/`-l` base arguments,
-    // so calling it twice would double every "Invalid argument" warning.
-    let fmt = args.value_format(&matches);
+    // Folded ONCE: C's `-0` case scans the base and, on success only, forces
+    // `type` — so the base fold and the `type` race must see the SAME result,
+    // and the "Invalid argument" warnings must print exactly once.
+    let int_base = TOOL.base('0', &args.int_base);
+    let fmt = args.value_format(&matches, int_base);
     // Resolve `-t`/`-a`/`-d` in command-line order — C's getopt loop writes
     // `format` and `type` from the same three cases, and an invalid `-d`
     // reverts `format` to plain (`caget.c:369-375,416-434`). `-0<base>` never
@@ -838,7 +848,7 @@ async fn main() {
     // `-0<base>` assigns the SAME `int type` as `-d` (`caget.c:493`), racing
     // it in getopt order. The type only reaches the wire under
     // `specifiedDbr`, which is why `mode` is settled first.
-    let req_dbr_type = resolve_dbr_type(&matches, fmt.int_style, d_type);
+    let req_dbr_type = resolve_dbr_type(&matches, int_base, d_type);
     // Only `all` needs the DBR_TIME class for its native readback; the
     // enum/float substitutions below use `want_time` to pick the TIME
     // vs plain string form (C `caget.c:176-187`).
@@ -1146,7 +1156,7 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, caget_req_count,
+        Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, TOOL, caget_req_count,
         dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,
         resolve_format, specified_dbr_report,
     };
@@ -1197,10 +1207,16 @@ mod tests {
 
         let m = Args::command().get_matches_from(["caget", "-0x", "PV"]);
         let a = Args::from_arg_matches(&m).expect("parses");
-        assert_eq!(a.value_format(&m).int_style, IntStyle::Hex);
+        assert_eq!(
+            a.value_format(&m, TOOL.base('0', &a.int_base)).int_style,
+            IntStyle::Hex
+        );
         let m = Args::command().get_matches_from(["caget", "-lb", "PV"]);
         let a = Args::from_arg_matches(&m).expect("parses");
-        assert_eq!(a.value_format(&m).float_style, IntStyle::Bin);
+        assert_eq!(
+            a.value_format(&m, TOOL.base('0', &a.int_base)).float_style,
+            IntStyle::Bin
+        );
     }
 
     /// R12-20. C's `-0<base>` assigns the SAME `int type` as `-d`
@@ -1216,7 +1232,7 @@ mod tests {
             let m = Args::command().get_matches_from(argv);
             let a = Args::from_arg_matches(&m).expect("parsed");
             let d = resolve_format(&m).1;
-            resolve_dbr_type(&m, a.value_format(&m).int_style, d)
+            resolve_dbr_type(&m, TOOL.base('0', &a.int_base), d)
         };
         assert_eq!(resolve(&["caget", "-0x", "PV"]), Some(DBR_LONG));
         assert_eq!(
@@ -1243,6 +1259,54 @@ mod tests {
             resolve(&["caget", "-lx", "PV"]),
             None,
             "-l sets outTypeF only; it never touches `type`"
+        );
+    }
+
+    /// R13-16. Only a VALID `-0` re-enters the `type` race: C's assignment is
+    /// guarded by `if (outType != dec)` (`caget.c:497-503`), so a trailing
+    /// invalid `-0` warns, assigns nothing, and CANNOT reclaim `type` from a
+    /// `-d` that beat the last valid `-0`. Boundary cases of "which occurrence
+    /// last assigned":
+    #[test]
+    fn only_a_valid_zero_base_re_enters_the_dbr_type_race() {
+        let resolve = |argv: &[&str]| {
+            let m = Args::command().get_matches_from(argv);
+            let a = Args::from_arg_matches(&m).expect("parsed");
+            let d = resolve_format(&m).1;
+            resolve_dbr_type(&m, TOOL.base('0', &a.int_base), d)
+        };
+        // The invalid `-0q` is the LAST `-0` but not the last one to ASSIGN.
+        assert_eq!(
+            resolve(&["caget", "-0x", "-d", "DBR_DOUBLE", "-0q", "PV"]),
+            Some(DBR_DOUBLE),
+            "`-0q` never wrote `type`, so `-d` still holds it"
+        );
+        // ... and a valid one after `-d` does reclaim it.
+        assert_eq!(
+            resolve(&["caget", "-0x", "-d", "DBR_DOUBLE", "-0b", "PV"]),
+            Some(DBR_LONG),
+            "`-0b` assigned after `-d`"
+        );
+        // An invalid `-0` BEFORE the valid one changes nothing.
+        assert_eq!(
+            resolve(&["caget", "-0q", "-0x", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE)
+        );
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0q", "-0x", "PV"]),
+            Some(DBR_LONG)
+        );
+        // No occurrence ever assigned: `type` is untouched by `-0` entirely.
+        assert_eq!(resolve(&["caget", "-0q", "PV"]), None);
+        assert_eq!(
+            resolve(&["caget", "-0q", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE)
+        );
+        // `-d` repeats too, and the LAST `-d` is the one racing.
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0x", "-d", "DBR_STRING", "PV"]),
+            Some(0),
+            "DBR_STRING == 0, assigned after the valid `-0`"
         );
     }
 

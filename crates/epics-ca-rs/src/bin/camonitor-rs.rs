@@ -168,8 +168,9 @@ impl Args {
         // C `camonitor.c:325-340` writes exactly ONE of the two base globals
         // per occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>`
         // sets `outTypeF` (floats, via round-to-long). They never cross.
-        fmt.int_style = TOOL.base('0', &self.int_base);
-        fmt.float_style = TOOL.base('l', &self.float_base);
+        // camonitor has no `-d`, so nothing races the `type` these also set.
+        fmt.int_style = TOOL.base('0', &self.int_base).style;
+        fmt.float_style = TOOL.base('l', &self.float_base).style;
         fmt.enum_as_number = self.enum_as_number > 0;
         fmt.char_array_as_string = self.char_array_as_string > 0;
         fmt.req_elems = TOOL.req_elems_ulong(&self.max_elements);

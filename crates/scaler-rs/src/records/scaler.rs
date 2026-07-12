@@ -136,12 +136,17 @@ pub struct ScalerRecord {
     /// as the true pre-guard baseline for `count_start_finalize_tp`.
     pub(crate) reqstart_old_pr1: u32,
 
-    /// Set by `special("CNT")` to request a `COUTP` link fire. C
-    /// `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)`
-    /// inside `special()` itself, before the CNT-triggered `scanOnce()`.
-    /// `special()` here cannot emit `ProcessAction`s, so it raises this
-    /// flag and the CNT-triggered `process()` emits the `WriteDbLink`
-    /// and clears it.
+    /// Carries C's `special()` COUTP put — and only that one.
+    ///
+    /// C `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)` inside
+    /// `special()` itself, before the CNT-triggered `scanOnce()`. `special()`
+    /// here cannot emit `ProcessAction`s, so it raises this flag and the
+    /// CNT-triggered `process()` emits that put at the head of the cycle and
+    /// clears it.
+    ///
+    /// It is NOT the record's "should COUTP fire" state: C's other COUTP put
+    /// (`:463`, on the finish edge) is independent and is emitted on its own, so
+    /// a user stop writes the link twice. Never merge the two.
     coutp_pending: bool,
 
     /// The forward-link decision C makes *inside* `process()`.
@@ -676,7 +681,22 @@ impl Record for ScalerRecord {
         let mut just_finished_user_count = false;
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
-        let mut fire_coutp = false;
+
+        // C scalerRecord.c:623-624 — `special("CNT")` puts to COUTP itself, and
+        // it runs to completion on the CA put BEFORE the CNT-triggered process()
+        // starts. `special()` has no action channel here, so the put is deferred
+        // to the front of this cycle — the earliest point it can land, and ahead
+        // of every put process() makes below. It is C's FIRST COUTP put; the one
+        // at :463 (below, on the finish edge) is a second, independent put, not
+        // this one arriving late.
+        if self.coutp_pending {
+            self.coutp_pending = false;
+            actions.push(ProcessAction::WriteDbLink {
+                link_field: "COUTP",
+                value: EpicsValue::Short(self.cnt),
+            });
+        }
+
         // C scalerRecord.c:346 — dbPutNotify completions also force the
         // long autocount hold time. The port has no putNotify plumbing
         // yet, so this stays false; kept named for C-structure parity.
@@ -784,27 +804,24 @@ impl Record for ScalerRecord {
             actions.push(ProcessAction::ReprocessAfter(reprocess));
         }
 
-        // COUT/COUTP
+        // C scalerRecord.c:455-468 — COUT on either edge, then a SECOND COUTP put
+        // on the finish edge, `dbPutLink(&pscal->coutp, ...)` at :463. C does not
+        // coalesce it with special()'s put at :624: a user stop (CNT 1->0) runs
+        // special() — which puts 0 to COUTP — and then process(), which puts 0 to
+        // COUTP again, so the link is written TWICE and a record wired to it is
+        // processed twice. A user start reaches only special()'s put, because
+        // :463 is guarded by justFinishedUserCount.
         if just_started_user_count || just_finished_user_count {
             actions.push(ProcessAction::WriteDbLink {
                 link_field: "COUT",
                 value: EpicsValue::Short(self.cnt),
             });
             if just_finished_user_count {
-                fire_coutp = true;
+                actions.push(ProcessAction::WriteDbLink {
+                    link_field: "COUTP",
+                    value: EpicsValue::Short(self.cnt),
+                });
             }
-        }
-        // C scalerRecord.c:623-624 — `special("CNT")` fires COUTP on every
-        // CNT write; `special()` deferred it to this CNT-triggered process.
-        if self.coutp_pending {
-            self.coutp_pending = false;
-            fire_coutp = true;
-        }
-        if fire_coutp {
-            actions.push(ProcessAction::WriteDbLink {
-                link_field: "COUTP",
-                value: EpicsValue::Short(self.cnt),
-            });
         }
 
         // C scalerRecord.c:470-481 — "done counting?": while ss==IDLE,

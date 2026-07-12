@@ -6,8 +6,8 @@ use crate::server::record::{
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
-use crate::calc::engine::value::{ScalcString, StackValue};
-use crate::calc::{CompiledExpr, ExprKind, scalc_eval, scalc_result};
+use crate::calc::engine::value::ScalcString;
+use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
 
 /// Scalcout record — string calc with output.
 ///
@@ -189,13 +189,12 @@ impl ScalcoutRecord {
     }
 
     /// C `sCalcoutRecord.c:357-359` — `sCalcPerform(..., &pcalc->val,
-    /// pcalc->sval, ...)`: the record hands the engine the two cells and the
-    /// engine fills both ([`scalc_result`]). VAL and SVAL are two views of ONE
-    /// result, not two computations.
-    fn apply_result(&mut self, result: &StackValue) {
-        let (val, sval) = scalc_result(result);
-        self.val = val;
-        self.sval = PvString::from_bytes(sval.as_bytes());
+    /// pcalc->sval, ..., pcalc->prec)`: the record hands the engine the two
+    /// cells and the engine fills both ([`scalc_perform`]). VAL and SVAL are
+    /// two views of ONE result, not two computations.
+    fn apply_result(&mut self, result: &ScalcResult) {
+        self.val = result.val;
+        self.sval = PvString::from_bytes(result.sval.as_bytes());
     }
 
     /// C `sCalcoutRecord.c:374-395` — the OOPT switch. "On Change" is the
@@ -791,7 +790,7 @@ impl Record for ScalcoutRecord {
             // pre-evaluation VAL/SVAL, i.e. the cells the results are about to
             // overwrite. (PVAL/PSVL are a different pair — see their docs.)
             let mut inputs = self.build_inputs(self.val, &self.sval);
-            match scalc_eval(&self.compiled_calc, &mut inputs) {
+            match scalc_perform(&self.compiled_calc, &mut inputs, self.prec) {
                 Ok(result) => {
                     self.apply_result(&result);
                     false
@@ -861,15 +860,14 @@ impl Record for ScalcoutRecord {
                 // read the previous OVAL/OSV, not the VAL/SVAL this
                 // cycle just computed.
                 let mut inputs = self.build_inputs(self.oval, &self.osv);
-                match scalc_eval(&self.compiled_ocal, &mut inputs) {
+                match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
                     Ok(result) => {
                         // The OCAL-side mirror of `apply_result`: C passes
-                        // `&pcalc->oval, pcalc->osv` to the same sCalcPerform
-                        // (`sCalcoutRecord.c:768-769`), so the same epilogue
-                        // fills both cells.
-                        let (oval, osv) = scalc_result(&result);
-                        self.oval = oval;
-                        self.osv = PvString::from_bytes(osv.as_bytes());
+                        // `&pcalc->oval, pcalc->osv` and the SAME `pcalc->prec`
+                        // to the same sCalcPerform (`sCalcoutRecord.c:768-770`),
+                        // so the same epilogue fills both cells.
+                        self.oval = result.val;
+                        self.osv = PvString::from_bytes(result.sval.as_bytes());
                     }
                     Err(_) => {
                         // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):

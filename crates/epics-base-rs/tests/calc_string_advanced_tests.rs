@@ -93,6 +93,11 @@ fn test_printf_hex_upper() {
 }
 
 // --- SSCANF ---
+//
+// Every value below is what compiled sCalc answers (`sCalcPerform.c:1635`,
+// `drv "SSCANF('<in>','<fmt>')"`). C hands the user's format to the C library's
+// `sscanf` with ONE output object, so the whole of scanf is in scope, and
+// `if (i != 1) return(-1)` makes a failed conversion an ERROR — never a 0.
 
 #[test]
 fn test_sscanf_int() {
@@ -100,10 +105,18 @@ fn test_sscanf_int() {
     assert_eq!(result, StackValue::Double(42.0));
 }
 
+/// C's object for a bare `%f` is a `float`, not a double: 3.15 comes back as
+/// the f32 rounding of itself. Only `%lf` gets a double.
 #[test]
-fn test_sscanf_float() {
-    let result = eval_str(r#"SSCANF("3.15", "%f")"#);
-    assert_eq!(result, StackValue::Double(3.15));
+fn test_sscanf_bare_percent_f_is_a_float() {
+    assert_eq!(
+        eval_str(r#"SSCANF("3.15", "%f")"#),
+        StackValue::Double(3.1500000953674316)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("3.15", "%lf")"#),
+        StackValue::Double(3.15)
+    );
 }
 
 #[test]
@@ -112,31 +125,223 @@ fn test_sscanf_string() {
     assert_eq!(result, StackValue::Str("hello".into()));
 }
 
-// --- CRC16 ---
-
+/// The port used to answer `Double(0.0)` with a healthy record for every
+/// conversion its hand-rolled subset did not know, and for every failed one.
 #[test]
-fn test_crc16() {
-    let result = eval_str(r#"CRC16("123456789")"#);
-    assert_eq!(result, StackValue::Double(0x4B37 as f64));
-}
-
-#[test]
-fn test_modbus_append() {
-    // MODBUS appends CRC16 bytes to the string
+fn test_sscanf_failed_conversion_is_an_error() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#"MODBUS("AB")"#, &mut inputs).unwrap();
-    match result {
-        StackValue::Str(s) => {
-            // First two chars are "AB"
-            assert!(s.as_bytes().starts_with(b"AB"));
-            // Followed by two CRC chars (may be multi-byte in UTF-8)
-            assert!(s.len() > 2);
-        }
-        _ => panic!("expected string"),
+    for expr in [
+        r#"SSCANF("abc", "%d")"#,    // no digits
+        r#"SSCANF("", "%d")"#,       // empty input
+        r#"SSCANF("", "%s")"#,       // empty input
+        r#"SSCANF("zab", "%[^z]")"#, // scanset matches nothing
+        r#"SSCANF("y=42", "x=%d")"#, // literal mismatch
+        r#"SSCANF("abc", "%*d%s")"#, // the SUPPRESSED conversion fails
+        r#"SSCANF("abc", "xyz")"#,   // no conversion at all
+        r#"SSCANF("abc", "%p")"#,    // C refuses p/w/n/$ outright
+    ] {
+        assert!(scalc(expr, &mut inputs).is_err(), "{expr} must alarm");
     }
 }
 
-// --- LRC ---
+/// `%x`/`%o`/`%u`/`%i`/`%c`/`%[` were simply unimplemented — all six answered 0.
+#[test]
+fn test_sscanf_integer_bases() {
+    assert_eq!(eval_str(r#"SSCANF("ff", "%x")"#), StackValue::Double(255.0));
+    assert_eq!(
+        eval_str(r#"SSCANF("0x1f", "%x")"#),
+        StackValue::Double(31.0)
+    );
+    assert_eq!(eval_str(r#"SSCANF("017", "%o")"#), StackValue::Double(15.0));
+    assert_eq!(eval_str(r#"SSCANF("017", "%i")"#), StackValue::Double(15.0));
+    assert_eq!(
+        eval_str(r#"SSCANF("-0x10", "%i")"#),
+        StackValue::Double(-16.0)
+    );
+}
+
+/// The output object's type is picked from the conversion char and `s[-1]`, so
+/// the value is narrowed before it is widened to a double: `unsigned short` for
+/// `%h[oux]`, `unsigned int` for a bare one, `unsigned long` for `%l[oux]`.
+#[test]
+fn test_sscanf_narrows_through_the_output_object() {
+    assert_eq!(
+        eval_str(r#"SSCANF("-5", "%u")"#),
+        StackValue::Double(4294967291.0)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("70000", "%hd")"#),
+        StackValue::Double(4464.0)
+    );
+    // `%lx` still parses HEX digits: 0x4294967295.
+    assert_eq!(
+        eval_str(r#"SSCANF("4294967295", "%lx")"#),
+        StackValue::Double(285960729237.0)
+    );
+}
+
+#[test]
+fn test_sscanf_char_and_scanset() {
+    // `%c` takes the character as-is — no leading-whitespace skip.
+    assert_eq!(
+        eval_str(r#"SSCANF("  abc", "%c")"#),
+        StackValue::Str(" ".into())
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("ff12 xy", "%5c")"#),
+        StackValue::Str("ff12 ".into())
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("hello", "%[a-l]")"#),
+        StackValue::Str("hell".into())
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("hello", "%[^l]")"#),
+        StackValue::Str("he".into())
+    );
+    // `[]a-z]`: a leading `]` is a plain member of the set.
+    assert_eq!(
+        eval_str(r#"SSCANF("ab1", "%*[]a-z]%d")"#),
+        StackValue::Double(1.0)
+    );
+}
+
+/// `findConversionIndicator` (`sCalcPerform.c:105`) decides the format, and it
+/// is stricter than scanf: its `%%` skip is GREEDY (it jumps past a `%%` found
+/// anywhere ahead, losing any conversion in front of it) and it refuses a
+/// second conversion that would be assigned.
+#[test]
+fn test_sscanf_rejects_a_second_live_conversion() {
+    let mut inputs = StringInputs::new();
+    assert!(scalc(r#"SSCANF("1 2", "%d%d")"#, &mut inputs).is_err());
+    assert!(scalc(r#"SSCANF("abc def", "%s %s")"#, &mut inputs).is_err());
+    // A trailing `%%` swallows the `%d` in front of it.
+    assert!(scalc(r#"SSCANF("100%", "%d%%")"#, &mut inputs).is_err());
+
+    // Suppressed conversions are fine — there is still only one assignment.
+    assert_eq!(
+        eval_str(r#"SSCANF("1 2", "%d %*d")"#),
+        StackValue::Double(1.0)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("1 2", "%*d%d")"#),
+        StackValue::Double(2.0)
+    );
+    // A `%%` AHEAD of the conversion is just a literal `%`.
+    assert_eq!(
+        eval_str(r#"SSCANF("%42", "%%%d")"#),
+        StackValue::Double(42.0)
+    );
+}
+
+/// BIN_READ shares `findConversionIndicator`, so it inherits both rules — it
+/// used to accept `%d%%` and answer 42.
+#[test]
+fn test_bin_read_shares_the_conversion_scanner() {
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = r"*\0\0\0".into(); // escaped text for the four bytes of 42
+    inputs.str_vars[1] = "%d".into();
+    assert_eq!(
+        scalc("READ(AA,BB)", &mut inputs).unwrap(),
+        StackValue::Double(42.0)
+    );
+    inputs.str_vars[1] = "%d%%".into();
+    assert!(scalc("READ(AA,BB)", &mut inputs).is_err());
+    inputs.str_vars[1] = "%d %d".into();
+    assert!(scalc("READ(AA,BB)", &mut inputs).is_err());
+}
+
+// --- CRC16 / MODBUS / XOR8 / ADD_XOR8 ---
+//
+// The digest is ESCAPED TEXT, not raw bytes. C's helpers end with a literal
+// `sprintf(output, "\\x%02x\\x%02x", crc&0xff, (crc&0xff00)>>8)`
+// (`sCalcPerform.c:227`, `:281`), so the frame stays escaped all the way to the
+// octet layer — which is the thing that translates it. CRC16 and XOR8 REPLACE
+// the operand with the digest; MODBUS and ADD_XOR8 APPEND it.
+
+/// Compiled sCalc: `CRC16("123456789")` = `\x37\x4b` — the standard 0x4B37
+/// MODBUS CRC, low byte first, as eight characters of escaped text. This test
+/// used to pin `Double(0x4B37)`, which is not a value C can produce here.
+#[test]
+fn test_crc16_is_escaped_text_low_byte_first() {
+    assert_eq!(
+        eval_str(r#"CRC16("123456789")"#),
+        StackValue::Str(r"\x37\x4b".into())
+    );
+    assert_eq!(
+        eval_str(r#"CRC16("AB")"#),
+        StackValue::Str(r"\xb1\xd1".into())
+    );
+}
+
+/// Compiled sCalc: `MODBUS("AB")` = `AB\xb1\xd1`, ten characters.
+#[test]
+fn test_modbus_appends_the_escaped_crc() {
+    assert_eq!(
+        eval_str(r#"MODBUS("AB")"#),
+        StackValue::Str(r"AB\xb1\xd1".into())
+    );
+    assert_eq!(eval_str(r#"LEN(MODBUS("AB"))"#), StackValue::Double(10.0));
+}
+
+/// Compiled sCalc: `XOR8("AB")` = `\x03`, `ADD_XOR8("AB")` = `AB\x03` (six
+/// characters). A PRINTABLE digest byte is escaped too — `XOR8("A")` = `\x41`,
+/// never `A` — because C's sprintf is unconditional, not the escape table.
+#[test]
+fn test_xor8_is_escaped_text() {
+    assert_eq!(eval_str(r#"XOR8("AB")"#), StackValue::Str(r"\x03".into()));
+    assert_eq!(eval_str(r#"XOR8("A")"#), StackValue::Str(r"\x41".into()));
+    assert_eq!(
+        eval_str(r#"ADD_XOR8("AB")"#),
+        StackValue::Str(r"AB\x03".into())
+    );
+    assert_eq!(eval_str(r#"LEN(ADD_XOR8("AB"))"#), StackValue::Double(6.0));
+}
+
+/// The operand is ESCAPED text: the digest is taken over what `dbTranslateEscape`
+/// makes of it (`sCalcPerform.c:198`, `:264`), not over its own characters.
+/// Compiled sCalc: `CRC16("\x01\x03")` = `\x40\x21` — a CRC of TWO bytes, not of
+/// the eight characters that spell them.
+#[test]
+fn test_checksum_operand_is_translated_first() {
+    assert_eq!(
+        eval_str(r#"CRC16("\x01\x03")"#),
+        StackValue::Str(r"\x40\x21".into())
+    );
+    // XOR of the RAW bytes 0x01^0x02^0x03 = 0x00.
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = vec![0x01u8, 0x02, 0x03].into();
+    assert_eq!(
+        scalc("XOR8(AA)", &mut inputs).unwrap(),
+        StackValue::Str(r"\x00".into())
+    );
+}
+
+/// C guards every checksum with `if (isString(ps))` and then with
+/// `if (chk(...) == 0)`, and neither guard raises an error: a DOUBLE operand and
+/// an operand that translates to nothing are both left EXACTLY as they are, with
+/// st=0. The port raised `TypeMismatch` on the first and had no path for the
+/// second. Compiled sCalc: `CRC16(4)` = 4, `MODBUS(4)` = 4, `CRC16(AA)` = "" for
+/// an empty AA — all st=0.
+#[test]
+fn test_checksum_guards_are_not_errors() {
+    assert_eq!(eval_str("CRC16(4)"), StackValue::Double(4.0));
+    assert_eq!(eval_str("MODBUS(4)"), StackValue::Double(4.0));
+    assert_eq!(eval_str("XOR8(4)"), StackValue::Double(4.0));
+    assert_eq!(eval_str("ADD_XOR8(4)"), StackValue::Double(4.0));
+
+    for expr in ["CRC16(AA)", "MODBUS(AA)", "XOR8(AA)", "ADD_XOR8(AA)"] {
+        let mut inputs = StringInputs::new();
+        inputs.str_vars[0] = "".into();
+        assert_eq!(
+            scalc(expr, &mut inputs).unwrap(),
+            StackValue::Str("".into()),
+            "{expr}"
+        );
+    }
+}
+
+// --- LRC / AMODBUS ---
 
 #[test]
 fn test_lrc() {
@@ -144,41 +349,59 @@ fn test_lrc() {
     assert_eq!(result, StackValue::Str("FA".into()));
 }
 
+/// AMODBUS PREPENDS the ASCII-MODBUS start delimiter `:` as well as appending the
+/// LRC (`sCalcPerform.c:1846-1850`). The port dropped it, so every frame it built
+/// was missing its start character. Compiled sCalc:
+///
+///   AMODBUS("010203")        :010203FA        (9 chars)
+///   AMODBUS("F7031389000A")  :F7031389000A60  (15 chars — the example in C's own
+///                                              comment at `:1834`)
 #[test]
-fn test_amodbus_append() {
-    // AMODBUS appends LRC hex string (2 chars)
-    let result = eval_str(r#"LEN(AMODBUS("010203"))"#);
-    // "010203" is 6 chars, plus "FA" = 8
-    assert_eq!(result, StackValue::Double(8.0));
+fn test_amodbus_prepends_the_start_delimiter() {
+    assert_eq!(
+        eval_str(r#"AMODBUS("010203")"#),
+        StackValue::Str(":010203FA".into())
+    );
+    assert_eq!(
+        eval_str(r#"LEN(AMODBUS("010203"))"#),
+        StackValue::Double(9.0)
+    );
+    assert_eq!(
+        eval_str(r#"AMODBUS("F7031389000A")"#),
+        StackValue::Str(":F7031389000A60".into())
+    );
 }
 
-// --- XOR8 ---
-
+/// The 39-byte value bound bites the LRC, not the frame: C copies `":" + operand`
+/// in first (`strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE)`) and appends only what of
+/// the LRC still fits. Compiled sCalc, with a 38-character operand: 39 characters
+/// out, and the LRC entirely crowded out.
+///
+///   AMODBUS("0102030405060708090A0B0C0D0E0F10111213")
+///     = :0102030405060708090A0B0C0D0E0F10111213     (39 chars, no LRC)
+///   AMODBUS("0102030405060708090A0B0C0D0E0F1011")
+///     = :0102030405060708090A0B0C0D0E0F101167       (37 chars, LRC "67" fits)
 #[test]
-fn test_xor8() {
-    // XOR of 0x01, 0x02, 0x03 = 0x00
+fn test_amodbus_long_operand_crowds_out_the_lrc() {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = vec![0x01u8, 0x02, 0x03].into();
-    let result = scalc("XOR8(AA)", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(0.0));
-}
+    inputs.str_vars[0] = "0102030405060708090A0B0C0D0E0F10111213".into(); // 38
+    let r = scalc("AMODBUS(AA)", &mut inputs).unwrap();
+    assert_eq!(
+        r,
+        StackValue::Str(":0102030405060708090A0B0C0D0E0F10111213".into())
+    );
+    match r {
+        StackValue::Str(s) => assert_eq!(s.len(), 39),
+        _ => panic!("expected a string"),
+    }
 
-#[test]
-fn test_xor8_ascii() {
+    // Four characters shorter, and the LRC fits.
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "AB".into(); // 0x41 ^ 0x42 = 0x03
-    let result = scalc("XOR8(AA)", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(3.0));
-}
-
-#[test]
-fn test_add_xor8_append() {
-    // ADD_XOR8 appends XOR8 as one byte
-    let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "AB".into();
-    let result = scalc("LEN(ADD_XOR8(AA))", &mut inputs).unwrap();
-    // "AB" is 2 bytes + 1 XOR8 byte = 3
-    assert_eq!(result, StackValue::Double(3.0));
+    inputs.str_vars[0] = "0102030405060708090A0B0C0D0E0F1011".into(); // 34
+    assert_eq!(
+        scalc("AMODBUS(AA)", &mut inputs).unwrap(),
+        StackValue::Str(":0102030405060708090A0B0C0D0E0F101167".into())
+    );
 }
 
 // --- Subrange [] ---
@@ -297,12 +520,100 @@ fn test_until_with_an_assignment_body() {
     assert_eq!(inputs.num_vars[0], 4.0, "the body ran");
 }
 
+/// `UNTIL(body; ... ; condition)` — the form the record documentation uses
+/// (`aCalcoutRecord.md:405`, `:578`) and the only one that loops. C compiles
+/// `UNTIL_END` from the OPERATOR stack, so the `;` INSIDE the parentheses cannot
+/// close the loop: everything up to the `)` is the body and the last value is the
+/// condition.
+///
+/// Compiled sCalcPerform, verbatim:
+///   `UNTIL(1)`                    -> st=0, VAL=1
+///   `B:=10;UNTIL(B:=B-1;B<1)`     -> st=0, VAL=1
+///   `A:=0;UNTIL(A:=A+1;A>3)`      -> st=0, VAL=1, A=4
+///   `UNTIL(1)+UNTIL(1)`           -> st=0, VAL=2
 #[test]
-fn test_until_loop_limit() {
-    // Condition always false, body is a legal store -> the loop never exits.
+fn test_until_parenthesised_loop() {
     let mut inputs = StringInputs::new();
-    let result = scalc("UNTIL 0; A:=1", &mut inputs);
-    assert!(matches!(result, Err(CalcError::LoopLimitExceeded)));
+    assert_eq!(
+        scalc("UNTIL(1)", &mut inputs).unwrap(),
+        StackValue::Double(1.0)
+    );
+
+    let mut inputs = StringInputs::new();
+    let r = scalc("B:=10;UNTIL(B:=B-1;B<1)", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(1.0), "the condition value");
+    assert_eq!(inputs.num_vars[1], 0.0, "B counted down to 0");
+
+    let mut inputs = StringInputs::new();
+    let r = scalc("A:=0;UNTIL(A:=A+1;A>3)", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(1.0));
+    assert_eq!(inputs.num_vars[0], 4.0, "the body ran until A>3");
+
+    let mut inputs = StringInputs::new();
+    assert_eq!(
+        scalc("UNTIL(1)+UNTIL(1)", &mut inputs).unwrap(),
+        StackValue::Double(2.0)
+    );
+}
+
+/// Running out of iterations is NOT an error in sCalc. C `sCalcPerform.c:1997`:
+///
+/// ```c
+/// if (++loopsDone > sCalcLoopMax) break;   /* out of the switch, not the perform */
+/// ```
+///
+/// so the loop simply stops, the perform returns 0, and the value is the last
+/// condition it evaluated (which is false, or it would have exited on its own).
+/// Compiled sCalcPerform, with the shipped `sCalcLoopMax` = 1000:
+///   `A:=0;UNTIL(A:=A+1;0)`        -> st=0, VAL=0, A=1001
+///   `A:=0;UNTIL(A:=A+1;A>2000)`   -> st=0, VAL=0, A=1001
+///   `UNTIL 0; A:=1`               -> st=0, VAL=0, A=1
+///
+/// A=1001, not 1000: `loopsDone` is incremented on ARRIVAL at UNTIL_END, so the
+/// body has already run one more time than the loop-back count.
+#[test]
+fn test_until_loop_max_stops_without_an_error() {
+    let mut inputs = StringInputs::new();
+    let r = scalc("A:=0;UNTIL(A:=A+1;0)", &mut inputs).unwrap();
+    assert_eq!(
+        r,
+        StackValue::Double(0.0),
+        "the last condition, not an error"
+    );
+    assert_eq!(inputs.num_vars[0], 1001.0);
+
+    let mut inputs = StringInputs::new();
+    let r = scalc("A:=0;UNTIL(A:=A+1;A>2000)", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(0.0));
+    assert_eq!(inputs.num_vars[0], 1001.0);
+
+    // The un-parenthesised form: the loop body is the bare `0`, and `A:=1` sits
+    // AFTER the UNTIL_END, so it runs exactly once, after the loop gives up.
+    let mut inputs = StringInputs::new();
+    let r = scalc("UNTIL 0; A:=1", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(0.0));
+    assert_eq!(inputs.num_vars[0], 1.0);
+}
+
+/// C `until_scratch[10]` with `if (i>9) {printf("too many UNTILs"); return(-1);}`
+/// (`sCalcPerform.c:356-360`). Compiled sCalc: nine `UNTIL(1)` terms perform
+/// (VAL=9); the tenth fails the perform.
+#[test]
+fn test_until_count_ceiling_is_nine() {
+    let nine = ["UNTIL(1)"; 9].join("+");
+    let mut inputs = StringInputs::new();
+    assert_eq!(
+        scalc(&nine, &mut inputs).unwrap(),
+        StackValue::Double(9.0),
+        "nine UNTILs perform"
+    );
+
+    let ten = ["UNTIL(1)"; 10].join("+");
+    let mut inputs = StringInputs::new();
+    assert!(
+        scalc(&ten, &mut inputs).is_err(),
+        "the tenth fails the perform"
+    );
 }
 
 // --- READ / WRITE (C `BIN_READ` / `BIN_WRITE` opcodes) ---
@@ -316,11 +627,29 @@ fn test_until_loop_limit() {
 
 // --- Edge cases ---
 
+/// A checksum NEVER fails the perform. C's call site is
+/// `if (lrc(tmpstr10, ps->s) == 0) { ...write... }` (`sCalcPerform.c:1843`), so
+/// the helper's `return(-1)` just means "write nothing" — the operand survives
+/// and st stays 0. This test pinned `Err(InvalidFormat)`, which no sCalc path
+/// produces.
+///
+/// C's `hex()` (`:232`) reads a non-hex character as 0 and its loop ignores a
+/// trailing odd one, so LRC has no failure mode at all. Compiled sCalc, and now
+/// the port (R12-9).
 #[test]
-fn test_lrc_invalid() {
-    let mut inputs = StringInputs::new();
-    let result = scalc(r#"LRC("0G")"#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::InvalidFormat)));
+fn test_lrc_accepts_every_operand_c_accepts() {
+    assert_eq!(eval_str(r#"LRC("0G")"#), StackValue::Str("00".into()));
+    assert_eq!(eval_str(r#"LRC("010")"#), StackValue::Str("FF".into()));
+    assert_eq!(eval_str(r#"LRC("0")"#), StackValue::Str("00".into()));
+    // AMODBUS runs the same helper, so it inherits both.
+    assert_eq!(
+        eval_str(r#"AMODBUS("0G")"#),
+        StackValue::Str(":0G00".into())
+    );
+    assert_eq!(
+        eval_str(r#"AMODBUS("010203")"#),
+        StackValue::Str(":010203FA".into())
+    );
 }
 
 #[test]
@@ -337,4 +666,68 @@ fn test_printf_percent_escape() {
     // conversion sends the format through snprintf — see tests/scalc_printf.rs.)
     let result = eval_str(r#"PRINTF("100%%", 0)"#);
     assert_eq!(result, StackValue::Str("100%%".into()));
+}
+
+// --- the `toString` operands (R12-7) ---
+//
+// C `LEN` (`sCalcPerform.c:1520`) and `REPLACE` (`:1903`) open by coercing their
+// operands with `toString(ps)` — the same macro TO_STRING, SUBRANGE and a string
+// store use. The port demanded a string and answered 0 / TypeMismatch instead.
+
+/// Compiled C: `LEN(4)` is 10 — the width of "4.00000000", the double's string
+/// form at the precision `to_string` hardcodes. The port answered 0.
+#[test]
+fn test_len_of_a_double_measures_its_string_form() {
+    assert_eq!(eval_str("LEN(4)"), StackValue::Double(10.0));
+    assert_eq!(eval_str("LEN(0)"), StackValue::Double(10.0));
+    assert_eq!(eval_str("LEN(3.14159265358979)"), StackValue::Double(10.0));
+    assert_eq!(eval_str(r#"LEN("abc")"#), StackValue::Double(3.0));
+    assert_eq!(eval_str(r#"LEN("")"#), StackValue::Double(0.0));
+}
+
+/// REPLACE (`{`) coerces ALL THREE operands, so a double in any position is
+/// legal. Compiled C: `4{"4","x"}` is "x.00000000", `"a4c"{"4",4}` is
+/// "a4.00000000c". The port raised TypeMismatch for every one of them.
+#[test]
+fn test_replace_coerces_every_operand() {
+    assert_eq!(
+        eval_str(r#"4{"4","x"}"#),
+        StackValue::Str("x.00000000".into())
+    );
+    assert_eq!(
+        eval_str(r#""a4c"{"4",4}"#),
+        StackValue::Str("a4.00000000c".into())
+    );
+    // The find text is coerced too, so "4.00000000" is what is looked for —
+    // and it is not in "a4c", which is therefore returned unchanged.
+    assert_eq!(eval_str(r#""a4c"{4,"x"}"#), StackValue::Str("a4c".into()));
+    // Only the first occurrence goes (C `strstr`).
+    assert_eq!(
+        eval_str(r#""hello"{"l","LL"}"#),
+        StackValue::Str("heLLlo".into())
+    );
+}
+
+/// The USES_STRING marker (`sCalcPostfix.c:447-475`) picks the whole evaluator,
+/// and C's list opens with FETCH_AA..FETCH_LL — so merely reading `AA` marks the
+/// program. The port's marker named an opcode its own compiler never emits
+/// (`StringOp::PushStringVar`; `AA` compiles to `CoreOp::PushDoubleVar`), so no
+/// `AA`-reading program was marked.
+///
+/// The two evaluators differ arithmetically in exactly one place, MODULO's cast
+/// width — `(int)` in the string evaluator, `(long)` in the numeric one — which
+/// is how the marker is observable without a string in sight. Compiled sCalc,
+/// with 2147483648 (2^31):
+///
+///     2147483648 % 7    -2      (numeric evaluator: the int cast overflows)
+///     AA % 7             2      (string evaluator, AA = "2147483648")
+#[test]
+fn test_fetch_aa_marks_the_program_uses_string() {
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = "2147483648".into();
+    assert_eq!(scalc("AA%7", &mut inputs).unwrap(), StackValue::Double(2.0));
+    assert_eq!(
+        scalc("2147483648 % 7", &mut inputs).unwrap(),
+        StackValue::Double(-2.0)
+    );
 }

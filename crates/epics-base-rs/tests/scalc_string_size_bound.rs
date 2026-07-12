@@ -7,6 +7,12 @@
 //!
 //! The bound is tested at its boundary — 39 in, 39 out; 40 in, 39 out — not by
 //! narrative.
+//!
+//! R12-8: there are TWO bounds, not one. `strNcpy(dest, src, N)` copies while
+//! `ii < N-1` (`sCalcPerform.c:68-74`), so `strNcpy(..., SCALC_STRING_SIZE-1)`
+//! yields **38** bytes, one fewer than `strNcpy(..., SCALC_STRING_SIZE)` and the
+//! `strncat`/LITERAL_STRING sites. R11-2 made the bound structural, which was
+//! right, but made it uniformly 39, which lost that distinction.
 
 use epics_base_rs::calc::{SCALC_STRING_MAX, StackValue, StringInputs, scalc};
 
@@ -105,4 +111,26 @@ fn a_nul_terminates_a_value_as_it_does_in_c() {
     inp.str_vars[0] = vec![b'a', b'b', 0u8, b'c'].into();
     assert_eq!(len_of("LEN(AA)", &mut inp), 2.0);
     assert_eq!(bytes_of(&eval("AA", &mut inp)), b"ab".to_vec());
+}
+
+/// The eight opcodes that build their result in C's `tmpstr` scratch buffer copy
+/// it back with `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)` — a THIRTY-EIGHT
+/// byte result. Compiled sCalc, with a 39-byte AA: every one of these is 38,
+/// while AA itself and `AA+""` (a `strncat`) stay 39.
+#[test]
+fn r12_8_the_strncpy_family_is_bounded_at_thirty_eight() {
+    let mut inp = StringInputs::new();
+    inp.str_vars[0] = "x".repeat(SCALC_STRING_MAX).into();
+    assert_eq!(len_of("LEN(AA)", &mut inp), 39.0);
+    assert_eq!(len_of(r#"LEN(AA+"")"#, &mut inp), 39.0);
+
+    assert_eq!(len_of(r#"LEN(PRINTF("%s",AA))"#, &mut inp), 38.0);
+    assert_eq!(len_of("LEN(TR_ESC(AA))", &mut inp), 38.0);
+    assert_eq!(len_of("LEN(ESC(AA))", &mut inp), 38.0);
+    assert_eq!(len_of(r#"LEN(SSCANF(AA,"%s"))"#, &mut inp), 38.0);
+
+    // ESC of 20 escaped newlines: the escape doubles them back to 40 bytes and
+    // the copy takes 38 (compiled C agrees).
+    inp.str_vars[0] = r"\n".repeat(20).into();
+    assert_eq!(len_of("LEN(ESC(TR_ESC(AA)))", &mut inp), 38.0);
 }

@@ -109,10 +109,15 @@ fn a_double_stored_into_a_string_var_is_converted_the_same_way() {
     );
 }
 
-/// The record's SVAL is `psresult` — filled by the same conversion, inside
-/// `sCalcPerform` (`sCalcPerform.c:2036-2043`), for every evaluation.
+/// The record's SVAL is `psresult`, filled inside `sCalcPerform` for every
+/// evaluation — and for a NUMERIC program that is the epilogue at
+/// `sCalcPerform.c:826-831`, which renders it at the record's **PREC**
+/// (`cvtDoubleToString(*pd, psresult, precision)`), not at a fixed 8.
+///
+/// PREC defaults to 0, so compiled sCalc answers "3" for VAL=2.5 — this is
+/// R11-C6, and the port used to answer "2.50000000" at every PREC.
 #[test]
-fn the_record_sval_is_the_c_conversion_of_val() {
+fn the_record_sval_is_rendered_at_prec() {
     let mut rec = ScalcoutRecord::new();
     rec.put_field("CALC", EpicsValue::String("A+0.5".into()))
         .unwrap();
@@ -120,8 +125,35 @@ fn the_record_sval_is_the_c_conversion_of_val() {
     rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.val, 2.5);
-    // Port before R11-1: "2.5".
-    assert_eq!(rec.sval, "2.50000000");
+    assert_eq!(rec.sval, "3", "the shipped default PREC=0");
+
+    for (prec, want) in [(2i16, "2.50"), (3, "2.500"), (8, "2.50000000")] {
+        rec.put_field("PREC", EpicsValue::Short(prec)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.sval, want, "PREC={prec}");
+    }
+}
+
+/// The STRING evaluator's epilogue (`sCalcPerform.c:2036-2043`) never sees
+/// `precision`: its `to_string` is `cvtDoubleToString(d, s, 8)`, hardcoded
+/// (`:90-96`). So the same VAL renders differently depending on which evaluator
+/// the program selected, and THAT is C. Compiled sCalc: `A+0.5` is "3" at
+/// PREC=0 while `AA+0.5` — string-marked by the `AA` fetch — is "3.14159265"...
+/// or here, "2.50000000", whatever the PREC.
+#[test]
+fn a_string_marked_program_ignores_prec() {
+    let mut rec = ScalcoutRecord::new();
+    // `AA` is FETCH_AA, which is what stamps the program USES_STRING.
+    rec.put_field("CALC", EpicsValue::String("AA+0.5".into()))
+        .unwrap();
+    rec.special("CALC", true).unwrap();
+    rec.put_field("AA", EpicsValue::String("2".into())).unwrap();
+    for prec in [0i16, 2, 8] {
+        rec.put_field("PREC", EpicsValue::Short(prec)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 2.5);
+        assert_eq!(rec.sval, "2.50000000", "PREC={prec} must not reach it");
+    }
 }
 
 /// OSV is the OCAL-side mirror (`sCalcoutRecord.c:768-769`), and DOPT=Use VAL
@@ -140,7 +172,11 @@ fn the_record_osv_is_the_c_conversion_of_oval() {
     rec.put_field("A", EpicsValue::Double(0.5)).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.oval, 1.0);
-    // Port before R11-1: "1".
+    // The OCAL side gets the SAME `pcalc->prec` (`sCalcoutRecord.c:770`), so it
+    // is rendered at PREC too — "1" at the default 0 (R11-C6).
+    assert_eq!(rec.osv, "1");
+    rec.put_field("PREC", EpicsValue::Short(8)).unwrap();
+    rec.process().unwrap();
     assert_eq!(rec.osv, "1.00000000");
 }
 

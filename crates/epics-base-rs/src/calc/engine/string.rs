@@ -2,7 +2,7 @@ use super::cast::{c_int, c_long, d2ui};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
-use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
+use super::value::{ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
@@ -17,7 +17,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
-    let mut loop_count: usize = 0;
+    // C's `until_scratch[]` (`sCalcPerform.c:329`) and `loopsDone` (`:330`) —
+    // one entry per UNTIL in the program, and ONE iteration budget for all of
+    // them together.
+    let mut until_marks: Vec<(usize, usize)> = Vec::new();
+    let mut loops_done: i32 = 0;
     // C compiles the USES_STRING marker into the postfix and `sCalcPerform`
     // switches on it ONCE (`sCalcPerform.c:399`) to pick a whole evaluator.
     let string_path = uses_string(code);
@@ -546,12 +550,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     }));
                 }
                 StringOp::Len => {
+                    // C `LEN` (sCalcPerform.c:1520-1526) opens with `toString(ps)`,
+                    // so a DOUBLE operand is measured in its string form:
+                    // `LEN(4)` is 10, the width of "4.00000000".
                     let v = pop1(&mut stack)?;
-                    let len = match &v {
-                        StackValue::Str(s) => s.len() as f64,
-                        StackValue::Double(_) => 0.0,
-                    };
-                    stack.push(StackValue::Double(len));
+                    stack.push(StackValue::Double(v.into_string_value().len() as f64));
                 }
                 StringOp::Byte => {
                     // C BYTE (sCalcPerform.c:1528-1533):
@@ -586,25 +589,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let v = pop1(&mut stack)?;
                     stack.push(match v {
                         StackValue::Double(d) => StackValue::Double(d),
-                        StackValue::Str(s) => StackValue::str(raw_from_escaped(s.as_bytes())),
+                        StackValue::Str(s) => StackValue::str_ncpy(raw_from_escaped(s.as_bytes())),
                     });
                 }
                 StringOp::Esc => {
                     // C ESC (sCalcPerform.c:1805-1815) — the same table run
-                    // backwards, and a double is again left alone. Its result is
-                    // bounded at THIRTY-EIGHT bytes, not 39: C passes
-                    // `SCALC_STRING_SIZE-1` as epicsStrSnPrintEscaped's dstlen,
-                    // and that function writes at most `dstlen-1` bytes before
-                    // its NUL (epicsString.c:133 `if (--rem > 0) *dst++ = chr`).
-                    // Compiled C: 20 newlines escape to 40 bytes and come back 38.
+                    // backwards, and a double is again left alone.
                     let v = pop1(&mut stack)?;
                     stack.push(match v {
                         StackValue::Double(d) => StackValue::Double(d),
-                        StackValue::Str(s) => {
-                            let mut esc = escaped_from_raw(s.as_bytes()).into_bytes();
-                            esc.truncate(SCALC_STRING_SIZE - 2);
-                            StackValue::str(esc)
-                        }
+                        StackValue::Str(s) => StackValue::str_ncpy(escaped_from_raw(s.as_bytes())),
                     });
                 }
                 StringOp::Printf => {
@@ -612,13 +606,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let val = pop1(&mut stack)?;
                     let fmt = pop1(&mut stack)?;
                     let result = simple_printf(fmt.as_bytes()?, &val)?;
-                    stack.push(StackValue::str(result));
+                    stack.push(StackValue::str_ncpy(result));
                 }
                 StringOp::Sscanf => {
                     // Pop format string, then input string
                     let fmt = pop1(&mut stack)?;
                     let input = pop1(&mut stack)?;
-                    let result = simple_sscanf(input.as_bytes()?, fmt.as_bytes()?);
+                    // C `if (i != 1) return(-1)` (sCalcPerform.c:1687): a failed
+                    // conversion is an ERROR, not a zero.
+                    let result = super::scanf::sscanf(input.as_bytes()?, fmt.as_bytes()?)?;
                     stack.push(result);
                 }
                 StringOp::BinRead => {
@@ -637,58 +633,31 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let val = pop1(&mut stack)?;
                     let fmt = pop1(&mut stack)?;
                     let result = bin_write(fmt.as_bytes()?, &val)?;
-                    stack.push(StackValue::str(result));
+                    stack.push(StackValue::str_ncpy(result));
                 }
                 StringOp::Crc16 => {
                     let v = pop1(&mut stack)?;
-                    let crc = super::checksum::crc16(v.as_bytes()?);
-                    stack.push(StackValue::Double(crc as f64));
+                    stack.push(checksum_op(v, crc16_escaped, Combine::Replace));
                 }
                 StringOp::Crc16Append => {
-                    // MODBUS: append CRC16 as two bytes (little-endian)
                     let v = pop1(&mut stack)?;
-                    let s = v.as_bytes()?;
-                    let crc = super::checksum::crc16(s);
-                    let mut result = s.to_vec();
-                    result.push((crc & 0xFF) as u8);
-                    result.push(((crc >> 8) & 0xFF) as u8);
-                    stack.push(StackValue::str(result));
+                    stack.push(checksum_op(v, crc16_escaped, Combine::Append));
                 }
                 StringOp::Lrc => {
                     let v = pop1(&mut stack)?;
-                    match super::checksum::lrc(v.as_bytes()?) {
-                        Some(lrc_str) => {
-                            stack.push(StackValue::str(lrc_str));
-                        }
-                        None => return Err(CalcError::InvalidFormat),
-                    }
+                    stack.push(checksum_op(v, super::checksum::lrc, Combine::Replace));
                 }
                 StringOp::LrcAppend => {
-                    // AMODBUS: append LRC hex string
                     let v = pop1(&mut stack)?;
-                    let s = v.as_bytes()?;
-                    match super::checksum::lrc(s) {
-                        Some(lrc_str) => {
-                            let mut result = s.to_vec();
-                            result.extend_from_slice(lrc_str.as_bytes());
-                            stack.push(StackValue::str(result));
-                        }
-                        None => return Err(CalcError::InvalidFormat),
-                    }
+                    stack.push(checksum_op(v, super::checksum::lrc, Combine::AsciiFrame));
                 }
                 StringOp::Xor8 => {
                     let v = pop1(&mut stack)?;
-                    let xor = super::checksum::xor8(v.as_bytes()?);
-                    stack.push(StackValue::Double(xor as f64));
+                    stack.push(checksum_op(v, xor8_escaped, Combine::Replace));
                 }
                 StringOp::Xor8Append => {
-                    // ADD_XOR8: append XOR8 as one byte
                     let v = pop1(&mut stack)?;
-                    let s = v.as_bytes()?;
-                    let xor = super::checksum::xor8(s);
-                    let mut result = s.to_vec();
-                    result.push(xor);
-                    stack.push(StackValue::str(result));
+                    stack.push(checksum_op(v, xor8_escaped, Combine::Append));
                 }
                 StringOp::Subrange => {
                     // C `sCalcPerform.c:1869-1901`. Pop: string, i, j. BOTH bounds
@@ -714,17 +683,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::str(out));
                 }
                 StringOp::Replace => {
-                    // Pop: string, find, replace
-                    let replace_val = pop1(&mut stack)?;
-                    let find_val = pop1(&mut stack)?;
-                    let s = pop1(&mut stack)?;
-                    let s = s.as_bytes()?;
-                    let find = find_val.as_bytes()?;
-                    let replace = replace_val.as_bytes()?;
-                    // Replace first occurrence only
+                    // C `REPLACE` (sCalcPerform.c:1903-1924) opens with
+                    // `toString` on ALL THREE operands, so `4{"4","x"}` is
+                    // "x.00000000" — the port raised TypeMismatch instead.
+                    // Only the first occurrence is replaced (C `strstr`).
+                    let replace = pop1(&mut stack)?.into_string_value();
+                    let find = pop1(&mut stack)?.into_string_value();
+                    let subject = pop1(&mut stack)?.into_string_value();
+                    let s = subject.as_bytes();
                     let mut result = s.to_vec();
-                    if let Some(pos) = find_sub(s, find) {
-                        result.splice(pos..pos + find.len(), replace.iter().copied());
+                    if let Some(pos) = find_sub(s, find.as_bytes()) {
+                        result.splice(pos..pos + find.len(), replace.as_bytes().iter().copied());
                     }
                     stack.push(StackValue::str(result));
                 }
@@ -743,34 +712,65 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
             },
 
             Opcode::Control(ctrl) => match ctrl {
+                // C `UNTIL` (`sCalcPerform.c:1978-1993`) does one thing: it
+                // remembers the stack pointer, so that a later `UNTIL_END` can
+                // wind the stack back to exactly this point before re-running the
+                // body (`ps = until_scratch[i].ps`, `:2003`). `until_loc` is the
+                // key C matches on, and `pc - 1` is that key here.
                 super::opcodes::ControlOp::Until(_end_pc) => {
-                    // UNTIL is just a loop start marker - no-op during execution.
-                    // The actual loop jump happens at UntilEnd.
+                    let until_pc = pc - 1;
+                    match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
+                        Some((_, depth)) => *depth = stack.len(),
+                        None => {
+                            // C's `until_scratch[10]` with `if (i>9) return(-1)`
+                            // (`:356-360`) — compiled C fails the perform on the
+                            // TENTH distinct UNTIL, so nine is the ceiling.
+                            if until_marks.len() >= MAX_UNTILS {
+                                return Err(CalcError::Overflow);
+                            }
+                            until_marks.push((until_pc, stack.len()));
+                        }
+                    }
                 }
                 super::opcodes::ControlOp::UntilEnd(start_pc) => {
-                    // C PEEKS the condition (`sCalcPerform.c:1999`: `if (ps->d == 0)`).
-                    // It pops nothing.
+                    // C `sCalcPerform.c:1995-2018`, in this order:
+                    //
+                    // ```c
+                    // if (++loopsDone > sCalcLoopMax) break;   /* give up, no error */
+                    // if (ps->d == 0) { ...wind back and re-run the body... }
+                    // ```
+                    //
+                    // `loopsDone` counts EVERY arrival at an UNTIL_END, is shared
+                    // by all the UNTILs in one program, and when it runs out C
+                    // simply STOPS LOOPING: the perform continues, returns 0, and
+                    // the value is whatever the last condition evaluated to. There
+                    // is no loop-limit error in sCalc, and the record does not
+                    // alarm. (`sCalcLoopMax` is an ioc-shell variable, so the
+                    // ceiling is settable — see `scalc_loop_max`.)
+                    loops_done += 1;
+                    if loops_done > scalc_loop_max() {
+                        continue;
+                    }
+                    // C PEEKS the condition (`:1999`: `if (ps->d == 0)`); it pops
+                    // nothing, which is why UNTIL_END has a runtime effect of 0.
                     let cond = match stack.last() {
                         Some(v) => v.to_double(),
                         None => return Err(CalcError::Underflow),
                     };
                     if cond == 0.0 {
-                        // Loop back. C restores `ps` to the stack pointer it saved
-                        // when it ran UNTIL (`:2004`) — i.e. to before the
-                        // condition — so the condition value is discarded on the
-                        // way round, and the next iteration pushes a fresh one.
-                        stack.pop();
-                        pc = *start_pc + 1; // jump to instruction after UNTIL marker
-                        loop_count += 1;
-                        if loop_count > MAX_LOOP_ITERATIONS {
-                            return Err(CalcError::LoopLimitExceeded);
-                        }
+                        // Wind the stack back to where the paired UNTIL saw it —
+                        // C restores the saved `ps` wholesale, so everything the
+                        // body pushed (the condition included) is discarded.
+                        let Some((_, depth)) = until_marks.iter().find(|(k, _)| k == start_pc)
+                        else {
+                            // C's `printf("sCalcPerform: UNTIL not found"); return(-1)`.
+                            return Err(CalcError::Internal);
+                        };
+                        stack.truncate(*depth);
+                        pc = *start_pc + 1;
                     }
                     // Condition true: fall out of the loop with the condition value
-                    // still on the stack. C leaves `ps` alone, which is why the
-                    // compile-time ledger gives UNTIL_END a runtime effect of 0
-                    // and why the body of an UNTIL has to be an assignment for the
-                    // program to end at depth 1.
+                    // still on the stack. It is the value of the `UNTIL(...)`.
                 }
             },
 
@@ -792,6 +792,107 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         return Err(CalcError::NonFiniteResult);
     }
     Ok(result)
+}
+
+/// What a checksum opcode does with the digest it computed.
+#[derive(Clone, Copy, PartialEq)]
+enum Combine {
+    /// `CRC16` / `LRC` / `XOR8` — the digest REPLACES the operand.
+    Replace,
+    /// `MODBUS` / `ADD_XOR8` — the digest is APPENDED to it.
+    Append,
+    /// `AMODBUS` — appended, and a `:` is PREPENDED (`sCalcPerform.c:1846-1850`):
+    ///
+    /// ```c
+    /// strcpy(tmpstr, ":");
+    /// strcat(tmpstr, ps->s);
+    /// strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE);
+    /// strncat(ps->s, tmpstr10, SCALC_STRING_SIZE-strlen(ps->s)-1);
+    /// ```
+    ///
+    /// The `:` is the ASCII-MODBUS start delimiter, and without it the frame is
+    /// not a frame. The port dropped it. (C bounds `":" + operand` to 39 before
+    /// appending the LRC, which is the same 39 bytes as bounding the whole
+    /// concatenation once — a long operand simply crowds the LRC out.)
+    AsciiFrame,
+}
+
+/// C's six checksum opcodes (`sCalcPerform.c:1819-1866`) are one shape written
+/// out three times:
+///
+/// ```c
+/// if (isString(ps)) {                  /* a DOUBLE operand is left ALONE, not rejected */
+///     if (chk(tmpstr, ps->s) == 0) {   /* a FAILED checksum leaves it alone too */
+///         if (op == CRC16)  strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1);
+///         else              strncat(ps->s, tmpstr, SCALC_STRING_SIZE-strlen(ps->s)-1);
+///     }
+/// }
+/// ```
+///
+/// so neither the type guard nor the failure is an error: compiled sCalc answers
+/// `CRC16(4)` = 4 and `CRC16(AA)` = "" for an empty AA, both with st=0. The port
+/// used `as_bytes()?`, which raised `TypeMismatch` on a double operand, and had no
+/// failure path at all.
+///
+/// `digest` returns the TEXT C's helper wrote into `tmpstr`, or `None` for its
+/// `return(-1)`.
+fn checksum_op(
+    v: StackValue,
+    digest: impl FnOnce(&[u8]) -> Option<String>,
+    combine: Combine,
+) -> StackValue {
+    let StackValue::Str(s) = v else {
+        return v; // `if (isString(ps))` — a double falls straight through.
+    };
+    let Some(text) = digest(s.as_bytes()) else {
+        return StackValue::Str(s); // the helper returned -1; C writes nothing.
+    };
+    match combine {
+        // C `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)` (:1823, :1845, :1861):
+        // a 38-byte result. The two appending forms use `strncat` instead, whose
+        // `SCALC_STRING_SIZE-strlen(ps->s)-1` bounds the TOTAL to 39.
+        Combine::Replace => StackValue::str_ncpy(text),
+        Combine::Append => StackValue::str([s.as_bytes(), text.as_bytes()].concat()),
+        Combine::AsciiFrame => StackValue::str([b":", s.as_bytes(), text.as_bytes()].concat()),
+    }
+}
+
+/// C `crc16` (`sCalcPerform.c:192-229`) — the digest CRC16 and MODBUS share.
+///
+/// Two things the port had wrong, and compiled sCalc confirms both:
+///
+///   * The operand is ESCAPED text, and the CRC is taken over what
+///     `dbTranslateEscape` makes of it (`:198`), not over the operand's own
+///     bytes. `MODBUS("\x01\x03")` checksums TWO bytes, not the eight characters
+///     that spell them.
+///   * The digest is handed back as ESCAPED text — a literal
+///     `sprintf(output, "\\x%02x\\x%02x", crc&0xff, (crc&0xff00)>>8)` (`:227`),
+///     low byte first. That is NOT the escape table: a printable digest byte is
+///     still written `\x41`, never `A` (compiled sCalc: `XOR8("A")` = `\x41`).
+///     The frame therefore stays escaped all the way to the octet layer, which is
+///     what translates it. The port emitted raw bytes, which the driver then
+///     escaped a second time.
+///
+/// `dbTranslateEscape` returning 0 is C's `return(-1)`, and the caller then leaves
+/// the operand untouched.
+fn crc16_escaped(operand: &[u8]) -> Option<String> {
+    let raw = raw_from_escaped(operand);
+    if raw.is_empty() {
+        return None;
+    }
+    let crc = super::checksum::crc16(&raw);
+    Some(format!("\\x{:02x}\\x{:02x}", crc & 0xff, (crc >> 8) & 0xff))
+}
+
+/// C `xor8` (`sCalcPerform.c:258-282`) — the digest XOR8 and ADD_XOR8 share. The
+/// same shape as [`crc16_escaped`], one byte wide:
+/// `sprintf(output, "\\x%02x", xor8&0xff)`.
+fn xor8_escaped(operand: &[u8]) -> Option<String> {
+    let raw = raw_from_escaped(operand);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(format!("\\x{:02x}", super::checksum::xor8(&raw)))
 }
 
 /// C `TO_DOUBLE` — the `DBL` OPERATOR (`sCalcPerform.c:1505-1514), which is not
@@ -826,7 +927,27 @@ fn hunt_double(s: &[u8]) -> f64 {
 /// are written around. It is sCalc's alone: base and aCalc compare exactly.
 const SMALL: f64 = 1e-11;
 
-const MAX_LOOP_ITERATIONS: usize = 1000;
+/// C `until_scratch[10]` guarded by `if (i>9) return(-1)` (`sCalcPerform.c:329`,
+/// `:356-360`). Compiled sCalc fails the perform on the tenth distinct UNTIL, so
+/// the usable ceiling is nine.
+const MAX_UNTILS: usize = 9;
+
+/// C `volatile int sCalcLoopMax = 1000` (`sCalcPerform.c:52`), exported to the
+/// ioc shell with `epicsExportAddress(int, sCalcLoopMax)` — a settable global,
+/// not a constant. It bounds the TOTAL number of `UNTIL_END` arrivals in one
+/// perform, across every UNTIL in the program, and running out is not an error:
+/// C stops looping and carries on (`:1997`).
+static SCALC_LOOP_MAX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
+
+/// Read `sCalcLoopMax`.
+pub fn scalc_loop_max() -> i32 {
+    SCALC_LOOP_MAX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Write `sCalcLoopMax` — the ioc-shell `var sCalcLoopMax, <n>`.
+pub fn set_scalc_loop_max(n: i32) {
+    SCALC_LOOP_MAX.store(n, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// C PRINTF (`sCalcPerform.c:1535-1567`).
 ///
@@ -1149,66 +1270,6 @@ fn pad(body: Vec<u8>, width: usize, minus: bool, zero: bool) -> Vec<u8> {
     out
 }
 
-fn simple_sscanf(input: &[u8], fmt: &[u8]) -> StackValue {
-    let bytes = fmt;
-    let mut i = 0;
-    // Find format specifier
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] != b'%' {
-            i += 1;
-            // Skip width
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                return StackValue::Double(0.0);
-            }
-            let spec = bytes[i];
-            let trimmed = trim_ascii(input);
-            return match spec {
-                b'd' | b'i' => {
-                    let digits = trimmed
-                        .iter()
-                        .take_while(|b| b.is_ascii_digit() || **b == b'-')
-                        .count();
-                    let text = std::str::from_utf8(&trimmed[..digits]).unwrap_or("");
-                    StackValue::Double(text.parse::<i64>().unwrap_or(0) as f64)
-                }
-                // C's `%e`/`%f`/`%g` conversion is strtod on the input, so it
-                // takes the longest numeric PREFIX and leaves the rest —
-                // `SSCANF("1.5V", "%f")` is 1.5, not a failed conversion.
-                b'f' | b'e' | b'g' => StackValue::Double(super::strtod::strtod(trimmed).value),
-                b's' => {
-                    // Read until whitespace
-                    let word: Vec<u8> = trimmed
-                        .iter()
-                        .copied()
-                        .take_while(|b| !b.is_ascii_whitespace())
-                        .collect();
-                    StackValue::str(word)
-                }
-                _ => StackValue::Double(0.0),
-            };
-        }
-        i += 1;
-    }
-    StackValue::Double(0.0)
-}
-
-/// C `isspace`-trimmed both ends, the way `sscanf`'s numeric conversions skip
-/// leading whitespace.
-fn trim_ascii(s: &[u8]) -> &[u8] {
-    let start = s
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(s.len());
-    let end = s
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map_or(start, |p| p + 1);
-    &s[start..end]
-}
-
 /// C `myNINT` (sCalcPerform.c:40) — round half away from zero.
 fn my_nint(d: f64) -> f64 {
     if d >= 0.0 { d + 0.5 } else { d - 0.5 }.trunc()
@@ -1290,7 +1351,7 @@ fn bin_write(f: &[u8], val: &StackValue) -> Result<String, CalcError> {
 /// assignment-suppressed conversions (`%*...`); the suppressed ones are then
 /// re-read as a byte count to skip over before the value is taken.
 fn bin_read(subject: &[u8], f: &[u8]) -> Result<f64, CalcError> {
-    let conv = find_conversion_indicator(f).ok_or(CalcError::InvalidFormat)?;
+    let conv = super::scanf::find_conversion_indicator(f).ok_or(CalcError::InvalidFormat)?;
     let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
         .ok_or(CalcError::InvalidFormat)?;
 
@@ -1342,30 +1403,6 @@ fn suppressed_skip_bytes(tail: &[u8]) -> usize {
         Some(b'e' | b'E' | b'f' | b'g' | b'G') => count * 4,
         _ => count,
     }
-}
-
-/// C `findConversionIndicator` (sCalcPerform.c:105): the byte offset of the
-/// first conversion character whose assignment is NOT suppressed, skipping
-/// `%%` pairs. Returns `None` when there is none.
-fn find_conversion_indicator(f: &[u8]) -> Option<usize> {
-    const CONV: &[u8] = b"pwn$c[deEfgGiousxX";
-    let mut i = 0;
-    while i < f.len() {
-        if let Some(p) = find_sub(&f[i..], b"%%") {
-            if find_byte(&f[i..], b'%') == Some(p) {
-                i += p + 2;
-                continue;
-            }
-        }
-        let pct = find_byte(&f[i..], b'%')? + i;
-        let cc = f[pct..].iter().position(|b| CONV.contains(b))? + pct;
-        match find_byte(&f[pct..], b'*') {
-            // Suppressed: skip past this conversion and keep looking.
-            Some(star) if star + pct < cc => i = cc + 1,
-            _ => return Some(cc),
-        }
-    }
-    None
 }
 
 fn find_byte(h: &[u8], n: u8) -> Option<usize> {
@@ -1493,6 +1530,65 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// C `sCalcPerform`'s output: the `(*presult, *psresult)` pair, which a record
+/// keeps as `(VAL, SVAL)` or `(OVAL, OSV)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalcResult {
+    pub val: f64,
+    pub sval: ScalcString,
+}
+
+/// C `sCalcPerform`'s epilogue — and there are TWO of them, one per evaluator,
+/// which is why this cannot be a function of the final stack value alone.
+///
+/// ```c
+/// /* NO_STRING (:826-831) */
+/// *presult = *pd;
+/// if (psresult && (lenSresult > 15)) {
+///     if (isnan(*pd)) strcpy(psresult, "NaN");
+///     else            cvtDoubleToString(*pd, psresult, precision);
+/// }
+///
+/// /* USES_STRING (:2034-2048) */
+/// if (isDouble(ps)) { *presult = ps->d;  to_string(ps); ...copy ps->s... }
+/// else              { ...copy ps->s...;  to_double(ps); *presult = ps->d; }
+/// ```
+///
+/// The numeric evaluator renders SVAL at the record's **PREC** — the `precision`
+/// argument sCalcoutRecord passes as `pcalc->prec` (`sCalcoutRecord.c:359`,
+/// `:770`). The string evaluator never sees `precision`: its `to_string` is
+/// `cvtDoubleToString(d, s, 8)` (`:90-96`), hardcoded. Compiled sCalc, `PI`:
+///
+///     program    PREC=0   PREC=2   PREC=8        PREC=12
+///     numeric    "3"      "3.14"   "3.14159265"  " 3.141592653590e+00"
+///     string     "3.14159265" whatever the PREC
+///
+/// so at the shipped default PREC=0 a numeric scalcout's SVAL is "3", and the
+/// port's uniform precision-8 rendering was wrong for every record that had not
+/// set PREC to 8.
+///
+/// (`lenSresult > 15` always holds: scalcout's buffer is `STRING_SIZE` = 40.)
+pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcResult {
+    let val = top.to_double();
+    if uses_string(&expr.code) {
+        ScalcResult {
+            val,
+            sval: top.clone().into_string_value(),
+        }
+    } else {
+        let sval = if val.is_nan() {
+            ScalcString::from_c("NaN")
+        } else {
+            // `cvtDoubleToString`'s parameter is `epicsUInt16` (`cvtFast.c:114`)
+            // while the record's PREC is a `short`, so C reinterprets a negative
+            // PREC as a huge unsigned one — which the function then clamps to 17
+            // and renders in %e. Not clamped to 0; this cast is that conversion.
+            ScalcString::from_c(super::cvt::cvt_double_to_string(val, precision as u16))
+        };
+        ScalcResult { val, sval }
+    }
+}
+
 /// Whether `sCalcPostfix` would have stamped this program `USES_STRING`
 /// (`sCalcPostfix.c:447-475`), which is what makes `sCalcPerform` run its
 /// string evaluator (`:2057`) instead of the plain double one (`:399`).
@@ -1507,7 +1603,12 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
 /// this list mirrors it case for case.
 fn uses_string(code: &[Opcode]) -> bool {
     code.iter().any(|op| match op {
-        // FETCH_SVAL — the only Core opcode in C's list.
+        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest
+        // trigger by far. The port's compiler emits them as `PushDoubleVar`
+        // (`postfix.rs:377`), not as the `StringOp::PushStringVar` this list
+        // used to name, so every `AA`-reading program was missing the marker.
+        Opcode::Core(CoreOp::PushDoubleVar(_)) => true,
+        // FETCH_SVAL.
         Opcode::Core(CoreOp::FetchSval) => true,
         Opcode::String(s) => match s {
             StringOp::PushStringVar(_)   // FETCH_AA..FETCH_LL

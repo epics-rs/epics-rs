@@ -503,9 +503,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // time.
                     stack.push(StackValue::str(s));
                 }
-                StringOp::PushStringVar(idx) => {
-                    stack.push(StackValue::Str(inputs.str_vars[*idx as usize].clone()));
-                }
                 StringOp::StoreStringVar(idx) => {
                     let v = pop1(&mut stack)?;
                     inputs.str_vars[*idx as usize] = v.into_string_value();
@@ -1656,16 +1653,17 @@ pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcR
 /// this list mirrors it case for case.
 fn uses_string(code: &[Opcode]) -> bool {
     code.iter().any(|op| match op {
-        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest
-        // trigger by far. The port's compiler emits them as `PushDoubleVar`
-        // (`postfix.rs:377`), not as the `StringOp::PushStringVar` this list
-        // used to name, so every `AA`-reading program was missing the marker.
+        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest trigger
+        // by far. `AA` compiles to `PushDoubleVar` in every engine (`postfix.rs`,
+        // `Token::DoubleVar`); which of the two things it means — a string in the
+        // string evaluator, a numeric AA elsewhere — is the EVALUATOR's business,
+        // not the compiler's, so there is one opcode and this is where it is
+        // recognised.
         Opcode::Core(CoreOp::PushDoubleVar(_)) => true,
         // FETCH_SVAL.
         Opcode::Core(CoreOp::FetchSval) => true,
         Opcode::String(s) => match s {
-            StringOp::PushStringVar(_)   // FETCH_AA..FETCH_LL
-            | StringOp::ToString         // TO_STRING
+            StringOp::ToString           // TO_STRING
             | StringOp::Printf           // PRINTF
             | StringOp::BinWrite         // BIN_WRITE
             | StringOp::Sscanf           // SSCANF

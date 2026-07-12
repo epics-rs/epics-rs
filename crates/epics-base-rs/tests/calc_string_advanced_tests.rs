@@ -717,9 +717,9 @@ fn test_replace_coerces_every_operand() {
 
 /// The USES_STRING marker (`sCalcPostfix.c:447-475`) picks the whole evaluator,
 /// and C's list opens with FETCH_AA..FETCH_LL — so merely reading `AA` marks the
-/// program. The port's marker named an opcode its own compiler never emits
-/// (`StringOp::PushStringVar`; `AA` compiles to `CoreOp::PushDoubleVar`), so no
-/// `AA`-reading program was marked.
+/// program. The port's marker used to name an opcode its own compiler never emits
+/// (a `StringOp::PushStringVar`, since deleted; `AA` compiles to
+/// `CoreOp::PushDoubleVar`), so no `AA`-reading program was marked.
 ///
 /// The two evaluators differ arithmetically in exactly one place, MODULO's cast
 /// width — `(int)` in the string evaluator, `(long)` in the numeric one — which

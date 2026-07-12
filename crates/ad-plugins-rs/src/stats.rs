@@ -2042,13 +2042,17 @@ mod tests {
         let (handle, stats, _params, _jh) =
             create_stats_runtime("STATS_RT", pool, 10, "", wiring, &ts_registry);
 
-        // Plugins default to disabled — enable for test
+        // Plugins default to disabled — enable for test, and fence until the
+        // data thread has applied the flip (the write only queues it).
         handle
             .port_runtime()
             .port_handle()
             .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            handle.wait_params_applied(std::time::Duration::from_secs(10)),
+            "data thread did not apply EnableCallbacks"
+        );
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -2065,7 +2069,17 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(handle.array_sender().publish(Arc::new(arr)));
-        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Wait on the observable itself — the stats land when the data thread
+        // processes the array; a fixed sleep is a race on a loaded machine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stats.lock().num_elements != 16 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for stats to be computed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
 
         let result = stats.lock().clone();
         assert_eq!(result.min, 1.0);

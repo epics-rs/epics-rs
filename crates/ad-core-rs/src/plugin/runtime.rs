@@ -36,6 +36,20 @@ use super::channel::{
 use super::params::PluginBaseParams;
 use super::wiring::{WiringRegistry, upstream_key};
 
+/// Message sent through the param channel from control plane to data plane.
+///
+/// The channel is FIFO, which is what gives [`PluginParamMsg::Barrier`] its
+/// meaning: when the data thread acknowledges a barrier, every `Change`
+/// enqueued before it has been fully applied (enable flips, wiring rewires,
+/// processor param updates).
+#[derive(Debug)]
+enum PluginParamMsg {
+    /// A param write to apply.
+    Change(usize, i32, ParamChangeValue),
+    /// Sync barrier — acknowledged (best-effort send of `()`) when consumed.
+    Barrier(std::sync::mpsc::SyncSender<()>),
+}
+
 /// Value sent through the param change channel from control plane to data plane.
 #[derive(Debug, Clone)]
 pub enum ParamChangeValue {
@@ -1161,7 +1175,7 @@ pub struct PluginPortDriver {
     base: PortDriverBase,
     ndarray_params: NDArrayDriverParams,
     plugin_params: PluginBaseParams,
-    param_change_tx: tokio::sync::mpsc::UnboundedSender<(usize, i32, ParamChangeValue)>,
+    param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
     /// Optional handle to the latest NDArray for array read methods (used by StdArrays).
     array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
     /// Param index for STD_ARRAY_DATA (triggers I/O Intr on ArrayData waveform).
@@ -1175,7 +1189,7 @@ impl PluginPortDriver {
         queue_size: usize,
         ndarray_port: &str,
         max_addr: usize,
-        param_change_tx: tokio::sync::mpsc::UnboundedSender<(usize, i32, ParamChangeValue)>,
+        param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
         processor: &mut P,
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
     ) -> AsynResult<Self> {
@@ -1462,9 +1476,11 @@ impl PortDriver for PluginPortDriver {
         self.base.set_int32_param(reason, addr, value)?;
         self.base.call_param_callbacks(addr)?;
         // B14: reliable send on an unbounded channel — never drop param changes.
-        let _ = self
-            .param_change_tx
-            .send((reason, addr, ParamChangeValue::Int32(value)));
+        let _ = self.param_change_tx.send(PluginParamMsg::Change(
+            reason,
+            addr,
+            ParamChangeValue::Int32(value),
+        ));
         Ok(())
     }
 
@@ -1473,9 +1489,11 @@ impl PortDriver for PluginPortDriver {
         let addr = user.addr;
         self.base.set_float64_param(reason, addr, value)?;
         self.base.call_param_callbacks(addr)?;
-        let _ = self
-            .param_change_tx
-            .send((reason, addr, ParamChangeValue::Float64(value)));
+        let _ = self.param_change_tx.send(PluginParamMsg::Change(
+            reason,
+            addr,
+            ParamChangeValue::Float64(value),
+        ));
         Ok(())
     }
 
@@ -1485,9 +1503,11 @@ impl PortDriver for PluginPortDriver {
         let s = String::from_utf8_lossy(data).into_owned();
         self.base.set_string_param(reason, addr, s.clone())?;
         self.base.call_param_callbacks(addr)?;
-        let _ = self
-            .param_change_tx
-            .send((reason, addr, ParamChangeValue::Octet(s)));
+        let _ = self.param_change_tx.send(PluginParamMsg::Change(
+            reason,
+            addr,
+            ParamChangeValue::Octet(s),
+        ));
         Ok(data.len())
     }
 
@@ -1549,6 +1569,7 @@ pub struct PluginRuntimeHandle {
     array_sender: NDArraySender,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     port_name: String,
+    param_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
     pub ndarray_params: NDArrayDriverParams,
     pub plugin_params: PluginBaseParams,
 }
@@ -1564,6 +1585,27 @@ impl PluginRuntimeHandle {
 
     pub fn array_output(&self) -> &Arc<parking_lot::Mutex<NDArrayOutput>> {
         &self.array_output
+    }
+
+    /// Block until the plugin's data thread has applied every control-plane
+    /// param change submitted before this call.
+    ///
+    /// `write_*_blocking` on the port handle returns once the port actor has
+    /// recorded the write and queued it for the data plane; the data thread
+    /// applies it (the EnableCallbacks flip, NDArrayPort/NDArrayAddr rewiring,
+    /// processor param updates) asynchronously. This is the fence between the
+    /// two planes: it enqueues a barrier behind every already-queued change
+    /// and waits for the data thread to consume it — the param channel is
+    /// FIFO, so consumption of the barrier implies every earlier change is
+    /// fully applied.
+    ///
+    /// Returns `false` if the data thread has exited or `timeout` elapsed.
+    pub fn wait_params_applied(&self, timeout: std::time::Duration) -> bool {
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        if self.param_tx.send(PluginParamMsg::Barrier(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
     }
 
     pub fn port_name(&self) -> &str {
@@ -1612,8 +1654,8 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
     // hundreds of PVs at IOC init) are never silently dropped before the
     // data plane sees them.
-    let (param_tx, param_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, i32, ParamChangeValue)>();
+    let (param_tx, param_rx) = tokio::sync::mpsc::unbounded_channel::<PluginParamMsg>();
+    let handle_param_tx = param_tx.clone();
 
     // Capture plugin type and array data handle before mutable borrow
     let plugin_type_name = processor.plugin_type().to_string();
@@ -1726,6 +1768,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         array_sender,
         array_output: array_output_for_handle,
         port_name: port_name.to_string(),
+        param_tx: handle_param_tx,
         ndarray_params,
         plugin_params,
     };
@@ -1780,7 +1823,7 @@ async fn clamp_writeback(port: &PortHandle, reason: usize, value: i32) {
 fn plugin_data_loop<P: NDPluginProcess>(
     shared: Arc<parking_lot::Mutex<SharedProcessorInner<P>>>,
     mut array_rx: NDArrayReceiver,
-    mut param_rx: tokio::sync::mpsc::UnboundedReceiver<(usize, i32, ParamChangeValue)>,
+    mut param_rx: tokio::sync::mpsc::UnboundedReceiver<PluginParamMsg>,
     plugin_params: PluginBaseParams,
     array_counter_reason: usize,
     enabled: Arc<AtomicBool>,
@@ -1887,7 +1930,13 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 }
                 param = param_rx.recv() => {
                     match param {
-                        Some((reason, addr, value)) => {
+                        // Barrier: every Change enqueued before it has been
+                        // applied by the arms below (FIFO channel). Ack and
+                        // move on; a gone waiter is not an error.
+                        Some(PluginParamMsg::Barrier(ack)) => {
+                            let _ = ack.try_send(());
+                        }
+                        Some(PluginParamMsg::Change(reason, addr, value)) => {
                             if reason == enable_callbacks_reason {
                                 let on = value.as_i32() != 0;
                                 enabled.store(on, Ordering::Release);
@@ -2150,8 +2199,8 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
     // hundreds of PVs at IOC init) are never silently dropped before the
     // data plane sees them.
-    let (param_tx, param_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, i32, ParamChangeValue)>();
+    let (param_tx, param_rx) = tokio::sync::mpsc::unbounded_channel::<PluginParamMsg>();
+    let handle_param_tx = param_tx.clone();
 
     let plugin_type_name = processor.plugin_type().to_string();
     let compression_aware = processor.compression_aware();
@@ -2252,6 +2301,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_sender,
         array_output: array_output_for_handle,
         port_name: port_name.to_string(),
+        param_tx: handle_param_tx,
         ndarray_params,
         plugin_params,
     };
@@ -2302,14 +2352,40 @@ mod tests {
         Arc::new(WiringRegistry::new())
     }
 
-    /// Enable callbacks on a plugin handle (plugins default to disabled).
+    /// Fence: wait until the data thread has applied every param change
+    /// submitted so far. `write_*_blocking` only guarantees the change is
+    /// queued for the data plane; asserting on data-plane behaviour without
+    /// this fence is a race.
+    fn params_applied(handle: &PluginRuntimeHandle) {
+        assert!(
+            handle.wait_params_applied(std::time::Duration::from_secs(10)),
+            "data thread did not apply queued param changes"
+        );
+    }
+
+    /// Poll `cond` until it holds; panic after 10 s. Waits on the observable
+    /// state itself instead of sleeping a guessed duration, so a loaded
+    /// machine cannot flake the test.
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Enable callbacks on a plugin handle (plugins default to disabled) and
+    /// fence until the data thread has actually flipped the enable flag.
     fn enable_callbacks(handle: &PluginRuntimeHandle) {
         handle
             .port_runtime()
             .port_handle()
             .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        params_applied(handle);
     }
 
     /// Send an array via the sender from a sync test context.
@@ -2373,10 +2449,12 @@ mod tests {
         send_array(handle.array_sender(), make_test_array(1));
         send_array(handle.array_sender(), make_test_array(2));
 
-        // Give processing thread time
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // No crash, no output needed
+        // ArrayCounter advances once per processed frame — both consumed.
+        let port = handle.port_runtime().port_handle().clone();
+        let counter = handle.ndarray_params.array_counter;
+        wait_until("sink to process both arrays", || {
+            port.read_int32_blocking(counter, 0).is_ok_and(|v| v == 2)
+        });
         assert_eq!(handle.port_name(), "SINK1");
     }
 
@@ -2516,7 +2594,7 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.blocking_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        params_applied(&handle);
 
         send_array(handle.array_sender(), make_test_array(1));
         let received = downstream_rx.blocking_recv().unwrap();
@@ -2528,7 +2606,7 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.blocking_callbacks, 0, 0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        params_applied(&handle);
 
         // Send in non-blocking mode — goes through channel to data thread
         send_array(handle.array_sender(), make_test_array(2));
@@ -2559,7 +2637,7 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        params_applied(&handle);
 
         // Send array — should be silently dropped by sender (callbacks disabled)
         send_array(handle.array_sender(), make_test_array(99));
@@ -2648,7 +2726,7 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        params_applied(&handle);
 
         // Still works after param update
         send_array(handle.array_sender(), make_test_array(2));
@@ -2764,7 +2842,7 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.sort_mode, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        params_applied(&handle);
 
         // B2: in-order arrays (1,2,3) must be emitted IMMEDIATELY via the
         // fast path — they are NOT delayed by the sort buffer.
@@ -2792,8 +2870,8 @@ mod tests {
         // unblocks it.
         send_array(handle.array_sender(), make_test_array(5));
         send_array(handle.array_sender(), make_test_array(4));
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // 4 emitted immediately (in order), then 5 released by contiguity.
+        // 4 emitted immediately (in order), then 5 released by contiguity;
+        // blocking_recv below is the wait.
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 4);
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 5);
     }
@@ -2825,12 +2903,20 @@ mod tests {
             .port_handle()
             .write_float64_blocking(handle.plugin_params.max_byte_rate, 0, 8.0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        params_applied(&handle);
 
         for id in 1..=5 {
             send_array(handle.array_sender(), make_test_array(id));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // ArrayCounter counts every processed frame (throttle drops happen on
+        // the output side, after counting), and its flush follows the array
+        // publish — so counter == 5 means everything that will ever reach the
+        // downstream queue is already there.
+        let port = handle.port_runtime().port_handle().clone();
+        let counter = handle.ndarray_params.array_counter;
+        wait_until("all 5 frames to be processed", || {
+            port.read_int32_blocking(counter, 0).is_ok_and(|v| v == 5)
+        });
 
         // Drain whatever made it through — strictly fewer than 5.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2922,11 +3008,10 @@ mod tests {
             .port_handle()
             .write_float64_blocking(handle.plugin_params.min_callback_time, 0, 10.0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        params_applied(&handle);
 
         send_array(handle.array_sender(), make_test_array(1));
         send_array(handle.array_sender(), make_test_array(2));
-        std::thread::sleep(std::time::Duration::from_millis(50));
 
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2974,10 +3059,15 @@ mod tests {
         // Disable downstream array callbacks.
         port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        params_applied(&handle);
 
         send_array(handle.array_sender(), make_test_array(1));
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Processing fence: the counter flush follows any downstream publish,
+        // so once it reads 1, a delivery that was going to happen already has.
+        wait_until("frame 1 to be processed", || {
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .is_ok_and(|v| v == 1)
+        });
 
         // No downstream delivery.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -3002,9 +3092,8 @@ mod tests {
         // Re-enable: the next array IS delivered downstream.
         port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        params_applied(&handle);
         send_array(handle.array_sender(), make_test_array(2));
-        std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 2);
     }
 
@@ -3052,12 +3141,14 @@ mod tests {
             enable_callbacks(&handle);
             let port = handle.port_runtime().port_handle().clone();
             send_array(handle.array_sender(), make_test_array(1));
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            assert_eq!(
-                port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
-                    .unwrap(),
-                4,
-                "uncompressed output must publish CompressedSize == raw byte count"
+            // The read errors with ParamUndefined until the first flush — treat
+            // that as "not yet".
+            wait_until(
+                "uncompressed output to publish CompressedSize == raw byte count",
+                || {
+                    port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
+                        .is_ok_and(|v| v == 4)
+                },
             );
         }
 
@@ -3079,12 +3170,12 @@ mod tests {
             enable_callbacks(&handle);
             let port = handle.port_runtime().port_handle().clone();
             send_array(handle.array_sender(), make_test_array(1));
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            assert_eq!(
-                port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
-                    .unwrap(),
-                7,
-                "compressed output must publish CompressedSize == codec.compressed_size"
+            wait_until(
+                "compressed output to publish CompressedSize == codec.compressed_size",
+                || {
+                    port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
+                        .is_ok_and(|v| v == 7)
+                },
             );
         }
     }
@@ -3117,11 +3208,10 @@ mod tests {
             .port_handle()
             .write_float64_blocking(handle.plugin_params.min_callback_time, 0, 10.0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        params_applied(&handle);
 
         send_array(handle.array_sender(), make_test_array(1));
         send_array(handle.array_sender(), make_test_array(2));
-        std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Array 1 was processed and emitted; array 2 was throttled out.
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
@@ -3135,7 +3225,9 @@ mod tests {
             .port_handle()
             .write_float64_blocking(handle.plugin_params.min_callback_time, 0, 0.0)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // No fence needed: the MinCallbackTime reset and the ProcessPlugin
+        // trigger below travel the same FIFO param channel, so the reset is
+        // applied before the trigger by construction.
         handle
             .port_runtime()
             .port_handle()

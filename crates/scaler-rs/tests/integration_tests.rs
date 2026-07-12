@@ -644,3 +644,126 @@ record(scaler, "TEST:SCNP") {
         "PROC must process and arm AutoCount (SS -> COUNTING)"
     );
 }
+
+// ============================================================
+// W10-E2 — the DLY watchdog is what starts the count
+// ============================================================
+//
+// C `special(CNT)` with DLY > 0 (scalerRecord.c:657-661) only arms a timer:
+//
+//     pscal->us = USER_STATE_WAITING;
+//     callbackRequestDelayed(pdelayCallback, pscal->dly);
+//
+// and `delayCallbackFunc` (:216-231) is what starts the count when it expires:
+//
+//     if (pscal->us == USER_STATE_WAITING && pscal->cnt) {
+//         pscal->us = USER_STATE_REQSTART;
+//         (void)scanOnce((void *)pscal);
+//     }
+//
+// That `scanOnce` has NO `if (pscal->scan)` guard — unlike the DLY == 0 arm at
+// :655 — so the count starts DLY seconds after the CNT write no matter how the
+// record is scanned. The port armed no timer: it back-filled the start from
+// whatever process cycle happened to arrive next — for a periodically scanned
+// scaler that is up to one scan period late, and for one with no scan source
+// at all (SCAN = "I/O Intr", "Event") it never comes.
+
+/// A periodically-scanned scaler whose next scan tick is 10 seconds out: the
+/// CNT put cannot process it (it is not Passive), so within the window of this
+/// test ONLY the DLY watchdog can start the count.
+#[tokio::test]
+async fn w10_e2_dly_start_does_not_depend_on_a_scan_source() {
+    let db_str = r#"
+record(scaler, "TEST:SC_E2") {
+    field(SCAN, "10 second")
+    field(FREQ, "1000000")
+    field(TP, "1.0")
+    field(DLY, "0.1")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("scaler", || Box::new(ScalerRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    server
+        .put("TEST:SC_E2.CNT", EpicsValue::Short(1))
+        .await
+        .unwrap();
+
+    // Mid-wait: WAITING, not counting.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        server.get("TEST:SC_E2.US").await.unwrap(),
+        EpicsValue::Short(1),
+        "US == USER_STATE_WAITING while the watchdog runs"
+    );
+    assert_eq!(
+        server.get("TEST:SC_E2.SS").await.unwrap(),
+        EpicsValue::Short(0),
+        "SS == SCALER_STATE_IDLE — the count has not started yet"
+    );
+
+    // Past expiry: delayCallbackFunc's scanOnce has started the count.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        server.get("TEST:SC_E2.SS").await.unwrap(),
+        EpicsValue::Short(2),
+        "SS == SCALER_STATE_COUNTING: the watchdog started the count with no scan source"
+    );
+    assert_eq!(
+        server.get("TEST:SC_E2.US").await.unwrap(),
+        EpicsValue::Short(3),
+        "US == USER_STATE_COUNTING"
+    );
+}
+
+/// The abort path: `caput CNT 0` during the wait cancels the watchdog
+/// (`epicsTimerCancel`, scalerRecord.c:645), so the count must never start —
+/// the armed re-entry finds `us != WAITING` and does nothing, C's own
+/// `us == WAITING && cnt` guard on a raced callback.
+#[tokio::test]
+async fn w10_e2_aborting_during_the_wait_never_starts_the_count() {
+    let db_str = r#"
+record(scaler, "TEST:SC_E2B") {
+    field(SCAN, "10 second")
+    field(FREQ, "1000000")
+    field(TP, "1.0")
+    field(DLY, "0.1")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("scaler", || Box::new(ScalerRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    server
+        .put("TEST:SC_E2B.CNT", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    server
+        .put("TEST:SC_E2B.CNT", EpicsValue::Short(0))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        server.get("TEST:SC_E2B.SS").await.unwrap(),
+        EpicsValue::Short(0),
+        "the cancelled watchdog must not arm the scaler"
+    );
+    assert_eq!(
+        server.get("TEST:SC_E2B.US").await.unwrap(),
+        EpicsValue::Short(0),
+        "US == USER_STATE_IDLE after the abort"
+    );
+}

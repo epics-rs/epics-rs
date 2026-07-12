@@ -108,9 +108,66 @@ pub fn is_constant(link: &crate::server::record::ParsedLink) -> bool {
     )
 }
 
+/// The record types whose C `.dbd` declares `field(SSCN)` + `field(OLDSIMM)`
+/// and whose `special()` routes `SPC_MOD` on SIMM to
+/// `recGblSaveSimm`/`recGblCheckSimm` — i.e. the records that own a
+/// simulation-mode SCAN swap.
+///
+/// Enumerated from the C, not from the port:
+/// `rg -l 'field\(SSCN' modules/database/src/std/rec/` lists exactly these 21.
+/// `busy` (`busyRecord.dbd`) and `swait` (`swaitRecord.dbd`) carry SIMM/SIML/
+/// SIOL but NO SSCN and NO OLDSIMM: their C reads SIML with a plain
+/// `dbGetLink` and never calls recGblSaveSimm/recGblCheckSimm, so a SIMM
+/// transition must NOT touch their SCAN. So do `mca` and `digitel`
+/// (unported). Every other record type has no SIMM at all.
+const RECORDS_WITH_SSCN: &[&str] = &[
+    "aai",
+    "aao",
+    "ai",
+    "ao",
+    "bi",
+    "bo",
+    "event",
+    "histogram",
+    "int64in",
+    "int64out",
+    "longin",
+    "longout",
+    "lsi",
+    "lso",
+    "mbbi",
+    "mbbiDirect",
+    "mbbo",
+    "mbboDirect",
+    "stringin",
+    "stringout",
+    "waveform",
+];
+
+/// Whether a record type participates in the SIMM↔SSCN scan swap
+/// (`recGblCheckSimm`). The single source of truth behind
+/// [`crate::server::record::Record::has_sim_mode_scan`]; see
+/// [`RECORDS_WITH_SSCN`].
+pub fn record_type_has_sscn(record_type: &str) -> bool {
+    RECORDS_WITH_SSCN.contains(&record_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_21_c_records_with_field_sscn_swap_scan() {
+        // The C population (`rg -l 'field\(SSCN' modules/database/src/std/rec/`).
+        assert!(record_type_has_sscn("longin"));
+        assert!(record_type_has_sscn("mbbiDirect"));
+        assert!(record_type_has_sscn("waveform"));
+        // SIMM/SIML/SIOL but no SSCN, no OLDSIMM, no recGblCheckSimm call.
+        assert!(!record_type_has_sscn("busy"));
+        assert!(!record_type_has_sscn("swait"));
+        // No simulation block at all.
+        assert!(!record_type_has_sscn("calc"));
+    }
 
     #[test]
     fn sim_mode_indices_match_menu_simm() {

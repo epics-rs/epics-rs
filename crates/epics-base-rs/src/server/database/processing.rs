@@ -4882,6 +4882,12 @@ impl PvDatabase {
         siml: &crate::server::record::ParsedLink,
     ) {
         use crate::server::recgbl::simm::SimLinkFetch;
+        // `recGblSaveSimm(*psscn, poldsimm, *psimm)` — latch the outgoing mode
+        // BEFORE the SIML read can move SIMM.
+        {
+            let mut instance = rec.write().await;
+            instance.rec_gbl_save_simm();
+        }
         // `dbTryGetLink`: a CONSTANT (or unset) SIML delivers NOTHING here —
         // its value was loaded into SIMM once, at init (`rec_gbl_init_simm`).
         // So a `caput REC.SIMM YES` on a record with a constant SIML STAYS
@@ -4894,6 +4900,33 @@ impl PvDatabase {
             let _ = instance
                 .record
                 .put_field_internal("SIMM", EpicsValue::Short(simm));
+        }
+        // `recGblCheckSimm(pcommon, psscn, *poldsimm, *psimm)` — a SIML-driven
+        // SIMM transition swaps SCAN with SSCN exactly like a `caput REC.SIMM`
+        // does.
+        self.apply_simm_scan_swap(rec).await;
+    }
+
+    /// Run C `recGblCheckSimm` on a record and hand the resulting scan move to
+    /// the scan-index owner (`update_scan_index`) — the `scanDelete`/`scanAdd`
+    /// pair inside it. The record lock is taken and released here: the
+    /// scan-index update re-enters the database.
+    pub(crate) async fn apply_simm_scan_swap(&self, rec: &Arc<RwLock<RecordInstance>>) {
+        use crate::server::record::CommonFieldPutResult;
+        let (name, result) = {
+            let mut instance = rec.write().await;
+            let name = instance.name.clone();
+            let result = instance.rec_gbl_check_simm();
+            (name, result)
+        };
+        if let CommonFieldPutResult::ScanChanged {
+            old_scan,
+            new_scan,
+            phas,
+        } = result
+        {
+            self.update_scan_index(&name, old_scan, new_scan, phas, phas)
+                .await;
         }
     }
 
@@ -4916,6 +4949,9 @@ impl PvDatabase {
         if instance.record.get_field("SIMM").is_none() {
             return;
         }
+        // `recGblSaveSimm(*psscn, poldsimm, *psimm)` — the latch, before the
+        // constant SIML can move SIMM.
+        instance.rec_gbl_save_simm();
         let link_of = |instance: &RecordInstance, field: &str| {
             instance.record.get_field(field).and_then(|v| {
                 if let EpicsValue::String(s) = v {
@@ -4943,6 +4979,11 @@ impl PvDatabase {
                 }
             }
         }
+        // `recGblCheckSimm(pcommon, psscn, *poldsimm, *psimm)`: a record loaded
+        // with `field(SIML,"1")` starts in simulation, so its SCAN and SSCN are
+        // already swapped by the time the IOC reaches runtime.
+        drop(instance);
+        self.apply_simm_scan_swap(rec).await;
     }
 
     /// Check simulation mode for a record. Returns

@@ -31,18 +31,20 @@ pub struct HistogramRecord {
     pub mdel: i32,     // Monitor count deadband
     pub mcnt: i32,     // Counts accumulated since last monitor post
     // Simulation block (histogramRecord.dbd.pod:245-282). SIMM is
-    // DBF_MENU menu(menuYesNo) (NO/YES), SIMS is DBF_MENU menu(menuAlarmSevr),
-    // OLDSIMM is DBF_MENU menu(menuSimm) special(SPC_NOMOD) (read-only saved
-    // copy); all served as DBR_ENUM shorts. SIOL/SIML are the simulation
-    // input/mode links, SVAL the DBF_DOUBLE simulation value. SSCN
-    // (menuScan) is served by the common-field path (common.sscn).
+    // DBF_MENU menu(menuYesNo) (NO/YES), SIMS is DBF_MENU menu(menuAlarmSevr);
+    // both served as DBR_ENUM shorts. SIOL/SIML are the simulation
+    // input/mode links, SVAL the DBF_DOUBLE simulation value. SSCN (menuScan)
+    // and OLDSIMM (menuSimm, SPC_NOMOD) are served by the common-field path
+    // (`CommonFields::sscn` / `CommonFields::oldsimm`) — they are framework
+    // state written only by the simulation-mode owner
+    // (`RecordInstance::rec_gbl_save_simm` / `rec_gbl_check_simm`), never by
+    // the record.
     pub simm: i16,
     pub siol: String,
     pub sval: f64,
     pub siml: String,
     pub sims: i16,
     pub sdly: f64,
-    pub oldsimm: i16,
 }
 
 impl Default for HistogramRecord {
@@ -78,7 +80,6 @@ impl Default for HistogramRecord {
             siml: String::new(),
             sims: 0,
             sdly: -1.0,
-            oldsimm: 0,
         }
     }
 }
@@ -242,13 +243,6 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
-    // OLDSIMM is special(SPC_NOMOD) — the saved previous simulation mode,
-    // not client-writable (histogramRecord.dbd.pod:270-274).
-    FieldDesc {
-        name: "OLDSIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
 ];
 
 /// Choice labels for the histogram command menu, in index order.
@@ -291,7 +285,6 @@ impl Record for HistogramRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
-            "OLDSIMM" => Some(EpicsValue::Short(self.oldsimm)),
             _ => None,
         }
     }
@@ -425,9 +418,10 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("NELM".into())),
             },
-            // WDTH/MCNT are computed runtime fields (no promptgroup) and OLDSIMM
-            // is the SPC_NOMOD saved copy — never client-writable, even at load.
-            "WDTH" | "MCNT" | "OLDSIMM" => Err(CaError::ReadOnlyField(name.to_string())),
+            // WDTH/MCNT are computed runtime fields (no promptgroup) — never
+            // client-writable, even at load. (OLDSIMM is the SPC_NOMOD saved
+            // copy, refused by the common-field path that owns it.)
+            "WDTH" | "MCNT" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -574,15 +568,16 @@ mod tests {
         rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
         assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
 
-        // OLDSIMM is special(SPC_NOMOD) — readable, not writable.
+        // OLDSIMM is special(SPC_NOMOD), and lives in the common fields (the
+        // simulation-mode owner's latch) — readable, not client-writable.
+        let mut inst = RecordInstance::new("HIST:SIM".into(), rec);
         assert!(matches!(
-            rec.put_field("OLDSIMM", EpicsValue::Short(1)),
+            inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
             Err(CaError::ReadOnlyField(_))
         ));
-        assert_eq!(rec.get_field("OLDSIMM"), Some(EpicsValue::Short(0)));
+        assert_eq!(inst.get_common_field("OLDSIMM"), Some(EpicsValue::Short(0)));
 
         // SIMS (menuAlarmSevr) and OLDSIMM (menuSimm) resolve centrally.
-        let inst = RecordInstance::new("HIST:SIM".into(), rec);
         let sims = inst.snapshot_for_field("SIMS").unwrap();
         assert_eq!(
             sims.enums.as_ref().unwrap().strings,

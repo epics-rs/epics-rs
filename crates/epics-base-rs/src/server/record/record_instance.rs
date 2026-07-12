@@ -1231,6 +1231,12 @@ impl RecordInstance {
             "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
             "SCAN" => Some(EpicsValue::Enum(self.common.scan as u16)),
             "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
+            // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
+            // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
+            // `promote_menu_value` (shared registry — the saved copy is ALWAYS
+            // menuSimm, unlike the live SIMM). Written only by the simulation
+            // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
+            "OLDSIMM" => Some(EpicsValue::Short(self.common.oldsimm)),
             "PINI" => Some(EpicsValue::Short(self.common.pini.to_u16() as i16)),
             "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
@@ -1332,6 +1338,119 @@ impl RecordInstance {
         self.put_common_field_bounded(name, value, MenuBound::DbPut)
     }
 
+    /// **The single owner of a record's SCAN transition** — C `dbPutField` on
+    /// SCAN, which is `scanDelete(precord)` … `scanAdd(precord)`
+    /// (`dbAccess.c::dbPutSpecial` SPC_SCAN, dbScan.c:236-248).
+    ///
+    /// Two callers reach it, and they are the two C sites that move a record
+    /// between scan lists: a `SCAN` put ([`Self::put_common_field`]) and the
+    /// simulation-mode scan swap (`recGblCheckSimm`, recGbl.c:427-437, which
+    /// calls exactly the same `scanDelete`/`scanAdd` pair). Returns the delta
+    /// for the scan-index owner (`PvDatabase::update_scan_index`) to apply once
+    /// the record lock is down; [`CommonFieldPutResult::NoChange`] when the scan
+    /// did not move.
+    pub fn set_scan(&mut self, new_scan: ScanType) -> CommonFieldPutResult {
+        let old_scan = self.common.scan;
+        self.common.scan = new_scan;
+        if old_scan == new_scan {
+            return CommonFieldPutResult::NoChange;
+        }
+        // C `scanDelete`/`scanAdd` call the record's device support
+        // `get_ioint_info(1)` / `get_ioint_info(0)`. Only a change of I/O Intr
+        // *membership* reaches those; a Passive→"1 second" move calls neither.
+        let was_io_intr = old_scan == ScanType::IoIntr;
+        let is_io_intr = new_scan == ScanType::IoIntr;
+        if was_io_intr != is_io_intr {
+            self.record.set_io_intr_scan(is_io_intr);
+        }
+        CommonFieldPutResult::ScanChanged {
+            old_scan,
+            new_scan,
+            phas: self.common.phas,
+        }
+    }
+
+    /// C `recGblSaveSimm` (`recGbl.c:421-425`) — latch the CURRENT simulation
+    /// mode into OLDSIMM:
+    ///
+    /// ```c
+    /// void recGblSaveSimm(const epicsEnum16 sscn,
+    ///     epicsEnum16 *poldsimm, const epicsEnum16 simm) {
+    ///     if (sscn == USHRT_MAX) return;
+    ///     *poldsimm = simm;
+    /// }
+    /// ```
+    ///
+    /// **The only writer of `CommonFields::oldsimm`.** Must run BEFORE the SIMM
+    /// value moves — C calls it from `special(SPC_MOD)` pass 0 (before the put)
+    /// and from `recGblGetSimm`/`recGblInitSimm` before the SIML read. The
+    /// `sscn == 65535` guard is C's: with SSCN unset there is no scan to swap
+    /// to, so the latch is not even taken (and [`Self::rec_gbl_check_simm`]
+    /// bails on the same test, so the stale OLDSIMM is never read).
+    ///
+    /// A record type with no SSCN/OLDSIMM in its C dbd (`busy`, `swait`) passes
+    /// neither pointer to any recGbl helper: no-op here.
+    pub fn rec_gbl_save_simm(&mut self) {
+        if !self.record.has_sim_mode_scan() {
+            return;
+        }
+        if self.common.sscn == SimModeScan::DoNotUse {
+            return;
+        }
+        if let Some(EpicsValue::Short(simm)) = self.record.get_field("SIMM") {
+            self.common.oldsimm = simm;
+        }
+    }
+
+    /// C `recGblCheckSimm` (`recGbl.c:427-437`) — on a SIMM transition, swap the
+    /// record's SCAN with SSCN:
+    ///
+    /// ```c
+    /// void recGblCheckSimm(struct dbCommon *pcommon, epicsEnum16 *psscn,
+    ///     const epicsEnum16 oldsimm, const epicsEnum16 simm) {
+    ///     if (*psscn == USHRT_MAX) return;
+    ///     if (simm != oldsimm) {
+    ///         epicsUInt16 scan = pcommon->scan;
+    ///         scanDelete(pcommon);
+    ///         pcommon->scan = *psscn;
+    ///         scanAdd(pcommon);
+    ///         *psscn = scan;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// This is what makes SSCN mean anything at all: a record configured
+    /// `field(SCAN,"1 second") field(SSCN,"Passive")` stops periodic scanning
+    /// the moment SIMM leaves NO, and resumes it when SIMM goes back — with the
+    /// two fields having traded places each time. Both are a genuine swap, not
+    /// an assignment: SSCN ends up holding the scan the record just left.
+    ///
+    /// **The only writer of the SIMM-driven SCAN/SSCN swap.** The scan-list
+    /// move itself goes through the single SCAN owner [`Self::set_scan`], whose
+    /// [`CommonFieldPutResult`] the caller hands to
+    /// `PvDatabase::update_scan_index` once the record lock is down. Runs AFTER
+    /// the SIMM value moved — C `special(SPC_MOD)` pass 1, and the tail of
+    /// `recGblGetSimm`/`recGblInitSimm`.
+    pub fn rec_gbl_check_simm(&mut self) -> CommonFieldPutResult {
+        if !self.record.has_sim_mode_scan() {
+            return CommonFieldPutResult::NoChange;
+        }
+        let SimModeScan::Scan(sim_scan) = self.common.sscn else {
+            // `*psscn == USHRT_MAX` — SSCN unset, no swap.
+            return CommonFieldPutResult::NoChange;
+        };
+        let Some(EpicsValue::Short(simm)) = self.record.get_field("SIMM") else {
+            return CommonFieldPutResult::NoChange;
+        };
+        if simm == self.common.oldsimm {
+            return CommonFieldPutResult::NoChange;
+        }
+        let previous_scan = self.common.scan;
+        let result = self.set_scan(sim_scan);
+        self.common.sscn = SimModeScan::Scan(previous_scan);
+        result
+    }
+
     /// Set a common field value from the `.db` loader, which in C is a
     /// different converter with a different out-of-menu bound
     /// (`dbStaticRun.c::dbPutStringNum`; see [`MenuBound::DbLoad`]). It is what
@@ -1363,6 +1482,10 @@ impl RecordInstance {
         // and already-typed values pass through unchanged.
         let value = coerce_common_field_string(&name, value, bound)?;
         match name.as_str() {
+            // `special(SPC_NOMOD)` — C `dbPutSpecial` refuses the put with
+            // `S_db_noMod` (dbAccess.c:123-127). OLDSIMM is written only by the
+            // simulation-mode owner (`rec_gbl_save_simm`).
+            "OLDSIMM" => return Err(CaError::ReadOnlyField(name)),
             "SEVR" => {
                 if let EpicsValue::Short(v) = value {
                     self.common.sevr = AlarmSeverity::from_u16(v as u16);
@@ -1443,32 +1566,16 @@ impl RecordInstance {
             // menu converter, which either produced an `Enum` index or failed
             // the put with `S_db_badChoice`.
             "SCAN" => {
-                let old_scan = self.common.scan;
                 let new_scan = match &value {
                     EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
                     EpicsValue::Enum(v) => ScanType::from_u16(*v),
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
-                self.common.scan = new_scan;
-                if old_scan != new_scan {
-                    let phas = self.common.phas;
-                    // C `dbPutField` on SCAN runs `scanDelete` then `scanAdd`
-                    // (dbScan.c:236-248), which call the record's device support
-                    // `get_ioint_info(1)` / `get_ioint_info(0)`. Only a change of
-                    // I/O Intr *membership* reaches those; a Passive→"1 second"
-                    // move calls neither.
-                    let was_io_intr = old_scan == ScanType::IoIntr;
-                    let is_io_intr = new_scan == ScanType::IoIntr;
-                    if was_io_intr != is_io_intr {
-                        self.record.set_io_intr_scan(is_io_intr);
-                    }
+                let result = self.set_scan(new_scan);
+                if !matches!(result, CommonFieldPutResult::NoChange) {
                     self.record.on_put(&name);
                     self.record.special(&name, true)?;
-                    return Ok(CommonFieldPutResult::ScanChanged {
-                        old_scan,
-                        new_scan,
-                        phas,
-                    });
+                    return Ok(result);
                 }
             }
             "SSCN" => {

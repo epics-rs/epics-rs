@@ -1287,6 +1287,21 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether this record type owns the simulation-mode SCAN swap — the C
+    /// `field(SSCN)` + `field(OLDSIMM)` pair, and the `special(SPC_MOD)` on SIMM
+    /// that routes to `recGblSaveSimm` / `recGblCheckSimm` (`recGbl.c:421-437`).
+    ///
+    /// The 21 base records that declare SSCN answer `true`; `busy` and `swait`
+    /// carry SIMM/SIML/SIOL but neither SSCN nor OLDSIMM, and their C never
+    /// calls either function — a SIMM transition must leave their SCAN alone.
+    /// Records with no simulation block answer `false` trivially.
+    ///
+    /// The default consults [`record_type_has_sscn`](crate::server::recgbl::simm::record_type_has_sscn),
+    /// which is enumerated from the C dbd files, so no record has to restate it.
+    fn has_sim_mode_scan(&self) -> bool {
+        crate::server::recgbl::simm::record_type_has_sscn(self.record_type())
+    }
+
     /// The record joined (`true`) or left (`false`) the `SCAN="I/O Intr"` list.
     ///
     /// C parity: `dbScan.c::scanAdd` calls the record's device support

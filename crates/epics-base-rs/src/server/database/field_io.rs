@@ -41,14 +41,41 @@ fn check_put_disabled(
 ///
 /// Every `dbPut` path in this module goes through here; nothing else may call
 /// `Record::special(field, true)`.
+///
+/// Returns the scan-index delta the after-put pass produced — non-`NoChange`
+/// only for the SIMM↔SSCN swap below, which the caller applies through
+/// `update_scan_index` once the record lock is down.
 fn special_after_put(
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
     out: &mut Vec<crate::server::record::ProcessAction>,
-) -> CaResult<()> {
+) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let status = instance.record.special(field, true);
     out.extend(instance.record.take_special_actions());
-    status
+    status?;
+    // C `special(SPC_MOD)` pass 1 on SIMM (`longinRecord.c:171-177` and the
+    // identical arm in all 21 SSCN-bearing records):
+    //   `recGblCheckSimm((dbCommon *)prec, &prec->sscn, prec->oldsimm, prec->simm);`
+    // Paired with `special_before_put`'s pass 0 (`recGblSaveSimm`), and gated
+    // per record type by `Record::has_sim_mode_scan`.
+    Ok(if field == "SIMM" {
+        instance.rec_gbl_check_simm()
+    } else {
+        crate::server::record::CommonFieldPutResult::NoChange
+    })
+}
+
+/// C `dbPutSpecial(paddr, 0)` — the before-put pass, run while the record lock
+/// is held and BEFORE the field's new value is stored.
+///
+/// The only `SPC_MOD` field in the record framework whose pass-0 does work is
+/// SIMM: `recGblSaveSimm` latches the outgoing simulation mode into OLDSIMM so
+/// the after-put pass can see the transition. Paired with
+/// [`special_after_put`]; every `dbPut` path in this module calls both.
+fn special_before_put(instance: &mut crate::server::record::RecordInstance, field: &str) {
+    if field == "SIMM" {
+        instance.rec_gbl_save_simm();
+    }
 }
 
 /// Coerce a write `value` to a record field's stored `target` type.
@@ -333,6 +360,7 @@ impl PvDatabase {
                     CommonFieldPutResult::NoChange
                 }
                 PutRequest::Write(value) => {
+                    special_before_put(&mut instance, &field);
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
@@ -343,8 +371,7 @@ impl PvDatabase {
                             // `pp(TRUE)` process. `calcRecord::special` uses
                             // that to refuse an uncompilable CALC with
                             // S_db_badField, so the status must not be dropped.
-                            special_after_put(&mut instance, &field, &mut special_actions)?;
-                            CommonFieldPutResult::NoChange
+                            special_after_put(&mut instance, &field, &mut special_actions)?
                         }
                         Err(CaError::FieldNotFound(_)) => {
                             instance.put_common_field(&field, value)?
@@ -561,12 +588,17 @@ impl PvDatabase {
             let mut special_actions = Vec::new();
 
             // Write value + special/on_put
-            match request {
+            use crate::server::record::CommonFieldPutResult;
+            let common_result = match request {
                 // C `dbAccess.c:1370-1372` — accept, write nothing, alarm. UDF
                 // is NOT cleared: C clears it at `:1409` only when the value
                 // field was actually written, and this branch wrote nothing.
-                PutRequest::EmptyIntoScalar => set_empty_request_alarm(&mut instance),
+                PutRequest::EmptyIntoScalar => {
+                    set_empty_request_alarm(&mut instance);
+                    CommonFieldPutResult::NoChange
+                }
                 PutRequest::Write(value) => {
+                    special_before_put(&mut instance, &field);
                     match instance.record.put_field(&field, value.clone()) {
                         Ok(()) => {
                             instance.record.on_put(&field);
@@ -574,7 +606,8 @@ impl PvDatabase {
                             // `dbPut` (dbAccess.c:1399-1405) — before the UDF
                             // clear and the monitor post below, both of which
                             // `goto done` skips on a non-zero status.
-                            special_after_put(&mut instance, &field, &mut special_actions)?;
+                            let result =
+                                special_after_put(&mut instance, &field, &mut special_actions)?;
                             // Clear UDF/UDF_ALARM on primary field write
                             if field == instance.record.primary_field() {
                                 instance.common.udf = false;
@@ -586,14 +619,15 @@ impl PvDatabase {
                                         crate::server::record::AlarmSeverity::NoAlarm;
                                 }
                             }
+                            result
                         }
                         Err(CaError::FieldNotFound(_)) => {
-                            instance.put_common_field(&field, value)?;
+                            instance.put_common_field(&field, value)?
                         }
                         Err(e) => return Err(e),
                     }
                 }
-            }
+            };
 
             // Invalidate metadata cache only if a metadata-class
             // field actually changed value (faac1df1 — DBE_PROPERTY
@@ -646,6 +680,30 @@ impl PvDatabase {
             // lock goes down first. C makes them inside `dbPut`, before it
             // returns to its caller.
             drop(instance);
+
+            // Same scan-index owner every other `dbPut` path routes through:
+            // a SCAN put and the SIMM↔SSCN swap (`recGblCheckSimm`) both move
+            // the record between scan lists and must reach `update_scan_index`.
+            match common_result {
+                CommonFieldPutResult::ScanChanged {
+                    old_scan,
+                    new_scan,
+                    phas,
+                } => {
+                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas)
+                        .await;
+                }
+                CommonFieldPutResult::PhasChanged {
+                    scan: s,
+                    old_phas,
+                    new_phas,
+                } => {
+                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas)
+                        .await;
+                }
+                CommonFieldPutResult::NoChange => {}
+            }
+
             self.run_special_actions(&canonical_base, &rec, special_actions)
                 .await;
 
@@ -1015,6 +1073,7 @@ impl PvDatabase {
 
             // Pre-write special hook (C EPICS dbPutSpecial pass=0)
             instance.record.special(&field, false)?;
+            special_before_put(&mut instance, &field);
 
             // Capture pre-put value for faac1df1 idempotent-write suppression.
             let prev_value = instance.record.get_field(&field);
@@ -1049,7 +1108,8 @@ impl PvDatabase {
                             // and the field's monitor post, and `dbPutField`
                             // skips the process. Propagating the error here
                             // reproduces all three.
-                            special_after_put(&mut instance, &field, &mut special_actions)?;
+                            let result =
+                                special_after_put(&mut instance, &field, &mut special_actions)?;
                             // C `dbAccess.c::dbPut:1410-1411` clears
                             // `precord->udf = FALSE` synchronously when the
                             // put target is the record-type's primary value
@@ -1077,7 +1137,7 @@ impl PvDatabase {
                                         crate::server::record::AlarmSeverity::NoAlarm;
                                 }
                             }
-                            CommonFieldPutResult::NoChange
+                            result
                         }
                         Err(CaError::FieldNotFound(_)) => {
                             instance.put_common_field(&field, value)?

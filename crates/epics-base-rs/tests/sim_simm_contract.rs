@@ -107,3 +107,153 @@ async fn simm_no_with_unset_links_does_not_simulate() {
         "SIMM=NO raises no SIMM_ALARM"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R12-64 — the SIMM↔SSCN scan swap (`recGblCheckSimm`, recGbl.c:427-437)
+// ---------------------------------------------------------------------------
+//
+// ```c
+// void recGblCheckSimm(struct dbCommon *pcommon, epicsEnum16 *psscn,
+//     const epicsEnum16 oldsimm, const epicsEnum16 simm) {
+//     if (*psscn == USHRT_MAX) return;
+//     if (simm != oldsimm) {
+//         epicsUInt16 scan = pcommon->scan;
+//         scanDelete(pcommon);
+//         pcommon->scan = *psscn;
+//         scanAdd(pcommon);
+//         *psscn = scan;
+//     }
+// }
+// ```
+//
+// Reached from `special(SPC_MOD)` pass 1 on a SIMM put (longinRecord.c:171-177)
+// and from the tail of `recGblGetSimm`/`recGblInitSimm`. Before the fix, SSCN
+// and OLDSIMM were inert storage: no site in the port swapped anything.
+
+use epics_base_rs::server::record::ScanType;
+use epics_base_rs::server::records::busy::BusyRecord;
+
+/// menuScan index of "1 second" (`menuScan.dbd`: 0 Passive … 6 "1 second").
+const SCAN_1_SECOND: u16 = 6;
+const SCAN_PASSIVE: u16 = 0;
+
+/// `field(SCAN,"1 second") field(SSCN,"Passive")`: entering simulation stops the
+/// periodic scan, and SSCN comes back holding the scan the record just left.
+/// Leaving simulation swaps them back. Both directions are a swap, not an
+/// assignment.
+#[tokio::test]
+async fn simm_transition_swaps_scan_with_sscn() {
+    let db = PvDatabase::new();
+    db.add_record("SWAP", Box::new(LonginRecord::new(1)))
+        .await
+        .unwrap();
+    db.put_pv("SWAP.SCAN", EpicsValue::Enum(SCAN_1_SECOND))
+        .await
+        .unwrap();
+    db.put_pv("SWAP.SSCN", EpicsValue::Enum(SCAN_PASSIVE))
+        .await
+        .unwrap();
+
+    // SIMM NO -> YES: scan and sscn trade places.
+    db.put_pv("SWAP.SIMM", EpicsValue::Short(1)).await.unwrap();
+    {
+        let rec = db.get_record("SWAP").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.common.scan,
+            ScanType::Passive,
+            "C `pcommon->scan = *psscn` — simulation adopts SSCN's scan"
+        );
+        assert_eq!(
+            inst.get_common_field("SSCN"),
+            Some(EpicsValue::Enum(SCAN_1_SECOND)),
+            "C `*psscn = scan` — SSCN takes the scan the record just left"
+        );
+        assert_eq!(
+            inst.get_common_field("OLDSIMM"),
+            Some(EpicsValue::Short(0)),
+            "C `recGblSaveSimm` latched the OUTGOING mode (NO) before the put"
+        );
+    }
+
+    // SIMM YES -> NO: swapped back.
+    db.put_pv("SWAP.SIMM", EpicsValue::Short(0)).await.unwrap();
+    {
+        let rec = db.get_record("SWAP").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(inst.common.scan, ScanType::Sec1);
+        assert_eq!(
+            inst.get_common_field("SSCN"),
+            Some(EpicsValue::Enum(SCAN_PASSIVE))
+        );
+        assert_eq!(
+            inst.get_common_field("OLDSIMM"),
+            Some(EpicsValue::Short(1)),
+            "the latch now holds the mode the record left (YES)"
+        );
+    }
+}
+
+/// `*psscn == USHRT_MAX` (the dbd default, `initial("65535")`) — C returns
+/// immediately from BOTH recGblSaveSimm and recGblCheckSimm, so SCAN is
+/// untouched and OLDSIMM is never even latched.
+#[tokio::test]
+async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
+    let db = PvDatabase::new();
+    db.add_record("NOSSCN", Box::new(LonginRecord::new(1)))
+        .await
+        .unwrap();
+    db.put_pv("NOSSCN.SCAN", EpicsValue::Enum(SCAN_1_SECOND))
+        .await
+        .unwrap();
+
+    db.put_pv("NOSSCN.SIMM", EpicsValue::Short(1))
+        .await
+        .unwrap();
+
+    let rec = db.get_record("NOSSCN").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.scan, ScanType::Sec1);
+    assert_eq!(
+        inst.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535)),
+        "the sentinel must survive the transition"
+    );
+    assert_eq!(
+        inst.get_common_field("OLDSIMM"),
+        Some(EpicsValue::Short(0)),
+        "recGblSaveSimm returns before the latch when sscn == USHRT_MAX"
+    );
+}
+
+/// `busy` (`busyRecord.dbd`) declares SIMM/SIML/SIOL but NO SSCN and NO
+/// OLDSIMM, and `busyRecord.c` calls neither recGblSaveSimm nor
+/// recGblCheckSimm — it has no `special()` at all. So a SIMM transition on a
+/// busy record must NOT move its SCAN, even with SSCN set. Same for `swait`.
+#[tokio::test]
+async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
+    let db = PvDatabase::new();
+    db.add_record("BUSY", Box::new(BusyRecord::new()))
+        .await
+        .unwrap();
+    db.put_pv("BUSY.SCAN", EpicsValue::Enum(SCAN_1_SECOND))
+        .await
+        .unwrap();
+    db.put_pv("BUSY.SSCN", EpicsValue::Enum(SCAN_PASSIVE))
+        .await
+        .unwrap();
+
+    db.put_pv("BUSY.SIMM", EpicsValue::Short(1)).await.unwrap();
+
+    let rec = db.get_record("BUSY").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.scan,
+        ScanType::Sec1,
+        "busy's C support never reaches recGblCheckSimm"
+    );
+    assert_eq!(
+        inst.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(SCAN_PASSIVE))
+    );
+}

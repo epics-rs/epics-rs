@@ -669,16 +669,26 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::str(result));
                 }
                 StringOp::SubLast => {
-                    // Remove last occurrence of substring
-                    let pattern = pop1(&mut stack)?;
-                    let s = pop1(&mut stack)?;
-                    let s = s.as_bytes()?;
-                    let pat = pattern.as_bytes()?;
-                    let mut result = s.to_vec();
-                    if let Some(pos) = rfind_sub(s, pat) {
-                        result.drain(pos..pos + pat.len());
-                    }
-                    stack.push(StackValue::str(result));
+                    // C gives SUBLAST no case of its own: it shares `case SUB`
+                    // (`sCalcPerform.c:979-1012`), so it is the SAME operator
+                    // with the same mixed-type rule, and only the both-strings
+                    // branch splits on `op == SUB` (first occurrence) vs
+                    // SUBLAST (last one). A double on either side therefore makes
+                    // `|-` plain subtraction: C's `4|-"."` is 4 and `"a.b"|-4` is
+                    // -4. The port took `as_bytes()?` on both operands and raised
+                    // TypeMismatch for either.
+                    let b = pop1(&mut stack)?;
+                    let a = pop1(&mut stack)?;
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(x, y) => StackValue::Double(x - y),
+                        Pair::Strings(x, y) => {
+                            let mut out = x.into_bytes();
+                            if let Some(pos) = rfind_sub(&out, y.as_bytes()) {
+                                out.drain(pos..pos + y.len());
+                            }
+                            StackValue::str(out)
+                        }
+                    });
                 }
             },
 

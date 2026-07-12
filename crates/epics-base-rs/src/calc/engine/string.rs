@@ -690,6 +690,40 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                         }
                     });
                 }
+                StringOp::DynFetch => {
+                    // C `A_FETCH` (`sCalcPerform.c:1446-1460`):
+                    //
+                    // ```c
+                    // if (isDouble(ps)) d = ps->d; else { d = atof(ps->s); ps->s = NULL; }
+                    // i = myNINT(d);
+                    // if (i >= numArgs || i < 0) { printf(...); ps->d = 0; }
+                    // else                        ps->d = parg[i];
+                    // ```
+                    //
+                    // so the operand is the INDEX: `@0` is A, `@1` is B, and a
+                    // string index goes through `atof` first (`@"1"` is B). Out of
+                    // range is 0, not an error. `numArgs` is the caller's argument
+                    // count, which here is the length of `num_vars`.
+                    let idx = my_nint(pop1(&mut stack)?.to_double());
+                    let v = f64_to_index(idx)
+                        .and_then(|i| inputs.num_vars.get(i))
+                        .copied()
+                        .unwrap_or(0.0);
+                    stack.push(StackValue::Double(v));
+                }
+                StringOp::DynSFetch => {
+                    // C `A_SFETCH` (`sCalcPerform.c:1462-1476`) — the same index
+                    // rule, applied to the STRING arguments: `@@0` is AA. C points
+                    // the cell at its local buffer and empties it BEFORE the range
+                    // test, so an out-of-range `@@` is the empty STRING (still a
+                    // string, still not an error).
+                    let idx = my_nint(pop1(&mut stack)?.to_double());
+                    let s = f64_to_index(idx)
+                        .and_then(|i| inputs.str_vars.get(i))
+                        .cloned()
+                        .unwrap_or_default();
+                    stack.push(StackValue::Str(s));
+                }
             },
 
             Opcode::Control(ctrl) => match ctrl {
@@ -1256,6 +1290,15 @@ fn my_nint(d: f64) -> f64 {
     if d >= 0.0 { d + 0.5 } else { d - 0.5 }.trunc()
 }
 
+/// C's `i = myNINT(d); if (i >= numArgs || i < 0)` — the rounded index as a
+/// subscript, or `None` when it is negative (the `>= numArgs` half is the
+/// caller's `get`). NaN and the non-representable magnitudes take the `None`
+/// branch, which is where C's `(int)` cast would land them anyway.
+fn f64_to_index(d: f64) -> Option<usize> {
+    let i = super::cast::c_int(d);
+    usize::try_from(i).ok()
+}
+
 /// The binary field a printf/scanf conversion character names, with `h`/`l`
 /// applied. This is the one place that reads C's `s[-1]` length modifier, so
 /// BIN_READ and BIN_WRITE cannot disagree about a width.
@@ -1611,9 +1654,13 @@ fn uses_string(code: &[Opcode]) -> bool {
             | StringOp::LrcAppend        // AMODBUS
             | StringOp::Xor8             // XOR8
             | StringOp::Xor8Append       // ADD_XOR8
-            | StringOp::Len => true,     // LEN
-            // Absent from C's list, deliberately:
+            | StringOp::Len              // LEN
+            | StringOp::DynSFetch => true, // A_SFETCH (`sCalcPostfix.c:461`)
+            // Absent from C's list, deliberately — `A_FETCH` (`@`) among them: it
+            // answers a double, so an expression whose only "string" element is a
+            // `@` keeps the no-string evaluator.
             StringOp::ToDouble | StringOp::Byte | StringOp::SubLast
+            | StringOp::DynFetch
             | StringOp::StoreStringVar(_) => false,
         },
         _ => false,

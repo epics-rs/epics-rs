@@ -265,6 +265,8 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::APos => return Opcode::Array(super::opcodes::ArrayOp::APos),
         FuncName::DynFetch => return Opcode::Array(super::opcodes::ArrayOp::DynFetch),
         FuncName::DynAFetch => return Opcode::Array(super::opcodes::ArrayOp::DynAFetch),
+        FuncName::SDynFetch => return Opcode::String(super::opcodes::StringOp::DynFetch),
+        FuncName::SDynSFetch => return Opcode::String(super::opcodes::StringOp::DynSFetch),
         FuncName::ALenNoop => return Opcode::Array(super::opcodes::ArrayOp::LenNoop),
         FuncName::Byte => return Opcode::String(super::opcodes::StringOp::Byte),
         FuncName::TrEsc => return Opcode::String(super::opcodes::StringOp::TrEsc),

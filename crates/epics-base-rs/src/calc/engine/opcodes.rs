@@ -133,6 +133,22 @@ pub enum StringOp {
     Subrange,   // [i:j]
     Replace,    // {find,replace}
     SubLast,    // |- last substring removal
+    /// sCalc `@` — C `A_FETCH` (`sCalcPerform.c:1446-1460`). The scalar argument
+    /// the operand INDEXES, so `@1` is B; the index is rounded with `myNINT` and
+    /// out of range answers 0. A sibling of aCalc's [`ArrayOp::DynFetch`], but it
+    /// lives here because the string evaluator is the only one whose C table can
+    /// emit it.
+    ///
+    /// It is NOT in C's `USES_STRING` list (`sCalcPostfix.c:450-471`) — it answers
+    /// a double — which is why `uses_string` classifies it `false`.
+    DynFetch,
+    /// sCalc `@@` — C `A_SFETCH` (`sCalcPerform.c:1462-1476`). The STRING argument
+    /// the operand indexes, so `@@1` is BB; out of range is the EMPTY string, not
+    /// an error. This is where sCalc and aCalc genuinely part: aCalc's `@@` is
+    /// `A_AFETCH`, the ARRAY argument ([`ArrayOp::DynAFetch`]).
+    ///
+    /// It IS in C's `USES_STRING` list (`sCalcPostfix.c:461`).
+    DynSFetch,
 }
 
 #[derive(Debug, Clone, PartialEq)]

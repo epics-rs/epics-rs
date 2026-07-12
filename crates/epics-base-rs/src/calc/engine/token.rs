@@ -47,6 +47,15 @@ pub enum FuncName {
     /// argument that the operand indexes.
     DynFetch,
     DynAFetch,
+    /// sCalc `@` / `@@` (`sCalcPostfix.c:99-100`) — `A_FETCH` and `A_SFETCH`.
+    /// `@` is the same idea as aCalc's, but it lands on the string engine's
+    /// stack, and `@@` is a different opcode entirely: aCalc's fetches the ARRAY
+    /// argument (`A_AFETCH`), sCalc's fetches the STRING argument (`A_SFETCH`).
+    /// Separate names because the opcode a token compiles to is a function of the
+    /// token alone — the same rule that gives aCalc's no-op `LEN` its own
+    /// [`FuncName::ALenNoop`].
+    SDynFetch,
+    SDynSFetch,
     /// aCalc `LEN` (`aCalcPostfix.c:199`) — a table entry with no implementation
     /// in `aCalcPerform`, so it compiles and does nothing. Distinct from the
     /// sCalc `LEN` string length ([`FuncName::Len`]), which IS implemented.
@@ -407,6 +416,11 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("SSCANF", Token::Func(FuncName::Sscanf)),
         ("STR", Token::Func(FuncName::Str)),
         ("SVAL", Token::FetchSval),
+        // sCalcPostfix.c:99-100 — sCalc has the dynamic-argument fetches too, at
+        // the same priorities as aCalc's (UNARY_OPERATOR, 9/10). `@x` is the
+        // scalar argument x indexes, `@@x` the STRING argument.
+        ("@", Token::Func(FuncName::SDynFetch)),
+        ("@@", Token::Func(FuncName::SDynSFetch)),
         ("TAN", Token::Func(FuncName::Tan)),
         ("TANH", Token::Func(FuncName::Tanh)),
         ("TR_ESC", Token::Func(FuncName::TrEsc)),

@@ -87,17 +87,6 @@
 //!   raised `nsev`). Mirrors the framework-wide `rec_gbl_set_sevr` (returns
 //!   void); a higher pre-existing severity can thus perturb next-cycle
 //!   hysteresis vs C.
-//! - `NEWM` — C sets it in `fetch_values` when an INAA..INLL link delivers an
-//!   array DIFFERENT from the one the field held (aCalcoutRecord.c:1105), and
-//!   `monitor()` posts those arrays and clears it (`:1031-1036`). The port's
-//!   input-link fetch does not compute it, so `NEWM` stays 0 and the changed
-//!   input arrays are posted by the framework's change detection instead.
-//!   (`AMASK` — the arrays the EXPRESSION stored into — is a different mask and
-//!   is computed; see [`AcalcoutRecord::apply_stores`].)
-//! - Array posting is change-gated, not write-gated. C `afterCalc` posts every
-//!   array field flagged in `AMASK` (`:293-297`), so a store that writes the value
-//!   the field already held still posts. The framework posts on change, so that
-//!   one case posts nothing here.
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
@@ -1655,6 +1644,41 @@ impl Record for AcalcoutRecord {
         }
     }
 
+    /// C `fetch_values` sets NEWM when an INAA..INLL link delivers an array
+    /// DIFFERENT from the one the field held (`aCalcoutRecord.c:1088-1106`):
+    ///
+    /// ```c
+    /// for (j=0; j<numElements; j++) pcalc->paa[j] = (*pavalue)[j];   /* save */
+    /// nRequest = acalcGetNumElements(pcalc);
+    /// status = dbGetLink(plink, DBR_DOUBLE, *pavalue, 0, &nRequest); /* fetch */
+    /// if (nRequest<numElements) for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
+    /// for (j=0; j<numElements; j++) {
+    ///     if (pcalc->paa[j] != (*pavalue)[j]) {pcalc->newm |= 1<<i; break;}
+    /// }
+    /// ```
+    ///
+    /// and `monitor()` posts exactly the NEWM-flagged arrays and clears the mask
+    /// (`:1031-1036`) — see [`Self::take_cycle_posted_fields`].
+    ///
+    /// The comparison window is `acalcGetNumElements` (NUSE, else NELM) with the
+    /// tail zero-filled: [`AcalcoutRecord::array_field_value`] is exactly that
+    /// view, so comparing it across the write is C's compare.
+    ///
+    /// This is the INTERNAL write path — the framework's input-link delivery
+    /// (`multi_input_links`: INAA..INLL -> AA..LL). A client caput lands in
+    /// `put_field` and does NOT set NEWM, which is C: only `fetch_values` sets it.
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        let Some(i) = Self::arr_index(name) else {
+            return crate::server::record::put_field_internal_default(self, name, value);
+        };
+        let before = self.array_field_value(&self.arr_vals[i]);
+        crate::server::record::put_field_internal_default(self, name, value)?;
+        if self.array_field_value(&self.arr_vals[i]) != before {
+            self.newm |= 1 << i;
+        }
+        Ok(())
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
@@ -2148,6 +2172,65 @@ impl Record for AcalcoutRecord {
             "PVAL", "POVL", "LALM", "ALST", "MLST", "CSTAT", "PA", "PB", "PC", "PD", "PE", "PF",
             "PG", "PH", "PI", "PJ", "PK", "PL",
         ]
+    }
+
+    /// C posts an aCalcout array field from a per-cycle BIT MASK, and neither
+    /// mask consults the value — a store that writes the value the field already
+    /// held still posts.
+    ///
+    /// `afterCalc` (`aCalcoutRecord.c:293-297`), the AMASK half:
+    ///
+    /// ```c
+    /// /* post array fields that aCalcPerform wrote to. */
+    /// for (j=0, panew=&pcalc->aa; j<ARRAY_MAX_FIELDS; j++, panew++) {
+    ///     if (*panew && (pcalc->amask & (1<<j))) {
+    ///         db_post_events(pcalc, *panew, DBE_VALUE|DBE_LOG);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// AMASK is the mask of arrays the EXPRESSION stored into: aCalcPerform
+    /// zeroes it at the top of every run (`aCalcPerform.c:326`) and sets bit i
+    /// in `STORE_AA..STORE_LL` (`:485-487`), so it is exactly this cycle's
+    /// stores. `AA := AA` sets the bit, changes nothing, and still posts AA —
+    /// the case the framework's change-detection loop drops.
+    ///
+    /// The other mask is NEWM — the arrays whose INAA..INLL LINK delivered a
+    /// changed value this cycle (`fetch_values`, see
+    /// [`AcalcoutRecord::put_field_internal`]). `monitor()` (`:1031-1036`) posts
+    /// those the same way and then clears the mask:
+    ///
+    /// ```c
+    /// for (i=0, panew=&pcalc->aa; i<ARRAY_MAX_FIELDS; i++, panew++) {
+    ///     if (*panew && (pcalc->newm & (1<<i))) {
+    ///         db_post_events(pcalc, *panew, monitor_mask|DBE_VALUE|DBE_LOG);
+    ///     }
+    /// }
+    /// pcalc->newm = 0;
+    /// ```
+    ///
+    /// A link-delivered change is usually also a value change, so the framework's
+    /// change detection covers most of it — but not when the field was moved
+    /// under the subscriber by a client caput, which posts the put's value and
+    /// does NOT advance `last_posted`. The link then re-delivering the ORIGINAL
+    /// value is a no-op to change detection and a NEWM post in C: without this
+    /// the caput value is the last thing the subscriber ever hears, and it is
+    /// wrong.
+    ///
+    /// AMASK needs no clearing here: [`AcalcoutRecord::process`] assigns
+    /// `self.amask` from the pass's mask on every cycle, which is C's
+    /// `*amask = 0` at the head of aCalcPerform. NEWM does — it accumulates
+    /// across `fetch_values` calls until `monitor()` zeroes it, which is why this
+    /// hook TAKES.
+    fn take_cycle_posted_fields(&mut self) -> Vec<&'static str> {
+        let mask = self.amask | self.newm;
+        self.newm = 0;
+        ARR_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1u32 << i) != 0)
+            .map(|(_, name)| *name)
+            .collect()
     }
 }
 

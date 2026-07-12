@@ -80,20 +80,48 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     push_src(&mut stack, Double(inputs.num_vars[i]), Some(i));
                 }
                 CoreOp::PushDoubleVar(idx) => {
-                    // In array evaluator, double vars are array vars. C's fresh
-                    // push clears the window (`INC`: `ps->numEl = -1`,
-                    // `aCalcPerform.c:88`), which is what `ArrayCell::new` gives.
-                    // Array fetches leave `sourceDouble` at -1 — only the SCALAR
-                    // fetches set it.
+                    // In the array evaluator, double vars are array vars. C's
+                    // `FETCH_AA..FETCH_LL` (`aCalcPerform.c:440-454`) opens with
+                    // `INC(ps); toArray(ps,0);` — so the cell is an `arraySize`
+                    // ARRAY *before* a single element is read, and it stays one
+                    // whatever the record holds:
+                    //
+                    // ```c
+                    // INC(ps); toArray(ps,0); ps->a[0] = 0.;
+                    // if (num_aArgs > i) {
+                    //     if (pp_aArg[i]) { for (i=0;i<arraySize;i++) ps->a[i] = pp_aArg[i][i]; }
+                    //     else            { for (i=0;i<arraySize;i++) ps->a[i] = 0.0; }
+                    // }
+                    // ```
+                    //
+                    // An array field the record never allocated — C's `pp_aArg[i] ==
+                    // NULL` — is an arraySize buffer of ZEROS, NOT the scalar 0. The
+                    // port keyed off an empty `Vec` and pushed `Double(0.0)`, which
+                    // gave the operators above it a scalar operand and so the wrong
+                    // BRANCH of every shape-sensitive one. Compiled C, arraySize 6,
+                    // with pp_aArg[0] = NULL:
+                    //
+                    //   IXZ(AA)  -> -1   (the array branch finds no zero CROSSING)
+                    //                    port: 0, from the scalar branch's `|d| < SMALL`
+                    //   FWHM(AA) -> 5    (the array branch's no-crossing fallback, lastEl)
+                    //                    port: 0, from the scalar branch's ZERO
+                    //
+                    // `ArrayCell::new` resizes to `array_size`, so it IS C's
+                    // `toArray(ps,0)` plus the zero fill. Going through it
+                    // unconditionally is what removes the dual meaning: an empty
+                    // `Vec` in `inputs.arrays` no longer means "a scalar", it means
+                    // exactly what C means by a NULL record array. `@@x`
+                    // (`ArrayOp::DynAFetch`) and `AVAL` (`ArrayOp::FetchAval`)
+                    // already fetch this way; this makes the named fetch agree.
+                    //
+                    // C's fresh push also clears the window (`INC`: `ps->numEl = -1`,
+                    // `:93`), which `ArrayCell::new` gives, and leaves `sourceDouble`
+                    // at -1 — only the SCALAR fetches set it.
                     let arr = inputs.arrays[*idx as usize].clone();
-                    if arr.is_empty() {
-                        push(&mut stack, Double(0.0));
-                    } else {
-                        push(
-                            &mut stack,
-                            ArrayStackValue::Array(ArrayCell::new(arr, inputs.array_size)),
-                        );
-                    }
+                    push(
+                        &mut stack,
+                        ArrayStackValue::Array(ArrayCell::new(arr, inputs.array_size)),
+                    );
                 }
 
                 CoreOp::Pi => push(&mut stack, Double(std::f64::consts::PI)),
@@ -155,7 +183,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 CoreOp::Neg => unary_op(&mut stack, |a| a.map(|x| -x))?,
-                CoreOp::Power => binary(&mut stack, |a, b| zip_map(a, b, |x, y| x.powf(y)))?,
+                // POWER is NOT one of C's two-arg array operators. It is its own
+                // case (`aCalcPerform.c:1306-1317`), and it is the only binary
+                // operator in aCalc that does not pair element-wise:
+                //
+                // ```c
+                // case POWER:
+                //     ps1 = ps; DEC(ps);
+                //     toDouble(ps1);                            /* <- the EXPONENT collapses */
+                //     if (isArray(ps)) { for (i=0; i<arraySize; i++) ps->a[i] = pow(ps->a[i], ps1->d); }
+                //     else             { ps->d = pow(ps->d, ps1->d); }
+                // ```
+                //
+                // So the exponent is always a SCALAR — an array exponent becomes its
+                // a[0] and the rest of it is never read — and the LEFT operand alone
+                // decides the result's shape. Compiled C, arraySize 6:
+                //
+                //   AA=[1,2,3,4,5,6]            `2**AA`  -> the SCALAR 2 (= pow(2, AA[0]))
+                //   AA=[1,2,3,4,5,6]            `AA**2`  -> [1,4,9,16,25,36]
+                //   AA=[1..6], CC=[3,1,1,1,1,1] `AA**CC` -> [1,8,27,64,125,216], i.e. AA**3
+                //
+                // `zip_map` promoted the left operand instead, so `2**AA` came out as
+                // the array [2,4,8,16,32,64]: both the VALUE and the SHAPE of the
+                // result diverged, and a record's VAL and AVAL diverged with them.
+                //
+                // `map` is C's in-place element-wise write, so the left operand's
+                // window survives — compiled C, AA=[1,5,2,8,3,9]: `(AA[1,3])**2` is
+                // [25,4,64,0,0,0] and `AVG((AA[1,3])**2)` is 31, the 3-element
+                // window's own average.
+                CoreOp::Power => {
+                    let exp = pop(&mut stack)?.v.as_f64()?;
+                    unary_op(&mut stack, |a| a.map(|x| x.powf(exp)))?
+                }
 
                 // Comparison (element-wise for arrays). aCalc compares EXACTLY —
                 // C's operators are the bare C ones in all three operand shapes
@@ -326,42 +385,28 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Atan2 => binary(&mut stack, |a, b| zip_map(a, b, |x, y| y.atan2(x)))?,
                 CoreOp::Fmod => binary(&mut stack, |a, b| zip_map(a, b, |x, y| x % y))?,
 
-                CoreOp::Max(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = pop_f64(&mut stack)?;
-                    for _ in 1..n {
-                        let v = pop_f64(&mut stack)?;
-                        if v > result || result.is_nan() {
-                            result = v;
-                        }
-                    }
-                    push(&mut stack, Double(result));
-                }
-                CoreOp::Min(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = pop_f64(&mut stack)?;
-                    for _ in 1..n {
-                        let v = pop_f64(&mut stack)?;
-                        if v < result || result.is_nan() {
-                            result = v;
-                        }
-                    }
-                    push(&mut stack, Double(result));
-                }
-                CoreOp::MaxVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    push(&mut stack, Double(if a > b { a } else { b }));
-                }
-                CoreOp::MinVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    push(&mut stack, Double(if a < b { a } else { b }));
-                }
+                // The vararg `MAX()`/`MIN()` — C `:1155-1191`. See [`vararg_extremum`].
+                CoreOp::Max(nargs) => vararg_extremum(
+                    &mut stack,
+                    *nargs as usize,
+                    inputs.array_size,
+                    Extremum::Max,
+                )?,
+                CoreOp::Min(nargs) => vararg_extremum(
+                    &mut stack,
+                    *nargs as usize,
+                    inputs.array_size,
+                    Extremum::Min,
+                )?,
+                // `>?` and `<?` are ordinary members of C's two-arg dispatch
+                // (`aCalcPerform.c:1326-1327` lists MAX_VAL/MIN_VAL alongside the
+                // comparisons), so an array operand on EITHER side yields an
+                // element-wise ARRAY. The port collapsed both operands to their
+                // a[0] and answered a scalar, which a record then broadcast into
+                // AVAL. [`max_val`]/[`min_val`] carry the one formula C uses in all
+                // three operand shapes; `zip_map` is C's promotion.
+                CoreOp::MaxVal => binary(&mut stack, |a, b| zip_map(a, b, max_val))?,
+                CoreOp::MinVal => binary(&mut stack, |a, b| zip_map(a, b, min_val))?,
 
                 CoreOp::StoreVar(idx) => {
                     // C `STORE_A..STORE_P` (`:456-464`) — `p_dArg[i] = ps->d`, a write
@@ -883,7 +928,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     // result write entirely.
     status.into_result()?;
 
-    Ok(stack.last().map_or(Double(0.0), |c| c.v.clone()))
+    // C `:1607-1618`, and it runs AFTER the deferred status above, in this order:
+    //
+    // ```c
+    // if (status) { freeStack(flp, stack); return(status); }
+    // /* if everything is peachy, the stack should end at its first position */
+    // if (ps != top) { freeStack(flp, stack); return(-1); }
+    // ```
+    //
+    // `ps` starts one BELOW `top` (`:418-419` — `top = ps = &stack[1]; ps--;`, with
+    // the comment "Expression handler assumes ps is pointing to a filled element"),
+    // and every push is an `INC` first. So `ps == top` means the stack holds
+    // EXACTLY ONE value, and C's check is a hard depth-1 assertion: an expression
+    // that leaked an operand AND one that consumed everything are both -1, with
+    // neither `p_dresult` nor `p_aresult` written.
+    //
+    // This is an INVARIANT GUARD, not a fix for a live bug. `aCalcPostfix`'s
+    // compile-time `runtime_depth` ledger (`aCalcPostfix.c:420-585`) rejects any
+    // program that would not end at depth 1, so a program it accepts always
+    // balances; no expression has been found where C returns -1 here while the port
+    // returns a value. (C's check DOES fire — compiled C, `FITMPOLY(AA,1)` is status
+    // -1 with AVAL never written, because a scalar mask takes the unary dispatch's
+    // scalar branch and never DECs the y operand below it — but the port already
+    // refuses that one earlier, in FITMPOLY's own arm.)
+    //
+    // It is here so that a future opcode which forgets to pop cannot silently
+    // publish the wrong stack cell as VAL/AVAL: `stack.last()` would have handed
+    // back the leaked operand, and an empty stack would have invented a 0 that C
+    // never produces.
+    match <[Cell; 1]>::try_from(stack) {
+        Ok([result]) => Ok(result.v),
+        Err(_) => Err(CalcError::StackLeak),
+    }
 }
 
 /// C's single `status` cell (`aCalcPerform.c:422`), read exactly ONCE, at the end of
@@ -1065,6 +1141,135 @@ fn domain_guarded(v: ArrayStackValue, f: fn(f64) -> f64, status: &mut Status) ->
             ArrayStackValue::Array(cell)
         }
     }
+}
+
+/// C's `MAX_VAL` — the `>?` operator. ONE formula, used verbatim in all THREE
+/// operand shapes of C's two-arg dispatch: array/array (`:1351`), array/scalar
+/// (`:1376`) and scalar/scalar (`:1403`) are each `if (x < y) x = y`.
+///
+/// It is deliberately not `f64::max`. The comparison is the bare C one, so a NaN
+/// is not "the missing value" it is for IEEE maxNum — it simply loses every
+/// comparison, and which operand holds it decides the answer. Compiled C:
+/// `5 >? NaN` is 5 (the `<` is false, so the left operand stands), while
+/// `NaN >? 5` is NaN (likewise false, and the left operand is the NaN).
+fn max_val(x: f64, y: f64) -> f64 {
+    if x < y { y } else { x }
+}
+
+/// C's `MIN_VAL` — `<?`, the mirror image (`:1352`, `:1377`, `:1404`).
+fn min_val(x: f64, y: f64) -> f64 {
+    if x > y { y } else { x }
+}
+
+/// Which of the two extremum operators is running. The point of the type is that
+/// C's `case MAX:` and `case MIN:` are ONE arm distinguished by a single `op ==
+/// MAX` test (`:1155-1191`), so the two must not drift apart into copied loops.
+#[derive(Clone, Copy)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+impl Extremum {
+    /// C's ARRAY-branch element rule (`:1166-1175`): `if (other > acc) acc = other`
+    /// for MAX. That is exactly the `>?` formula, which is why this delegates to it
+    /// rather than restating the comparison — one rule, two operators.
+    fn fold_element(self, acc: f64, other: f64) -> f64 {
+        match self {
+            Extremum::Max => max_val(acc, other),
+            Extremum::Min => min_val(acc, other),
+        }
+    }
+
+    /// C's SCALAR-branch keep test (`:1185`, `:1187`) — `ps->d < d` for MAX. Note
+    /// this is NOT the array rule: the scalar branch alone carries an `isnan` test,
+    /// which is why it cannot reuse [`Self::fold_element`]. See [`vararg_extremum`].
+    fn keeps(self, arg: f64, acc: f64) -> bool {
+        match self {
+            Extremum::Max => arg < acc,
+            Extremum::Min => arg > acc,
+        }
+    }
+}
+
+/// C's vararg `MAX()`/`MIN()` (`aCalcPerform.c:1155-1191`) — one opcode with two
+/// branches, chosen by whether ANY argument is an array (`:1159`, `j |=
+/// isArray(ps-i)`). The port answered a scalar built from each argument's a[0] in
+/// both, so a record's AVAL got a broadcast scalar instead of the element-wise
+/// extremum.
+///
+/// **Array branch** (`:1161-1178`). C coerces the BOTTOMMOST argument with
+/// `toArray(ps1,1)` and folds every other argument into it, so:
+///
+/// * the result cell is the FIRST argument's — it keeps that argument's window,
+///   and a scalar first argument brings `toArray`'s cleared window (and its NaN->0
+///   fill) with it. Compiled C, arraySize 6, AA=[1,5,2,8,3,9]:
+///   `AVG(MAX(AA[1,3],0))` is 5 (the 3-element window survives) while
+///   `AVG(MAX(0,AA[1,3]))` is 2.5 (the promoted scalar's window is the whole
+///   buffer, so the fold's zero tail counts).
+/// * the other arguments are read over the WHOLE `arraySize` buffer, not their
+///   windows (`for (i=0; i<arraySize; i++)`).
+/// * the fold is a bare comparison with no NaN test, so a NaN argument never wins.
+///   Compiled C: `MAX(AA,NaN)` is AA unchanged.
+///
+/// **Scalar branch** (`:1180-1189`). C starts the accumulator at the TOPMOST (last)
+/// argument and folds DOWN through the earlier ones, and this branch — unlike the
+/// array one — carries `|| isnan(d)`:
+///
+/// ```c
+/// while (--nargs) { d = ps->d; DEC(ps); if (ps->d < d || isnan(d)) ps->d = d; }
+/// ```
+///
+/// The running value therefore WINS whenever it is NaN, and a NaN argument that
+/// arrives later replaces a healthy running value (it is not `<` it). Either way a
+/// NaN anywhere in the list reaches the end: compiled C, `MAX(5,NaN)` and
+/// `MAX(NaN,5)` are both NaN (status -1). The port's test was inverted — it
+/// DISCARDED a NaN accumulator — so both answered 5.
+fn vararg_extremum(
+    stack: &mut Vec<Cell>,
+    nargs: usize,
+    array_size: usize,
+    op: Extremum,
+) -> Result<(), CalcError> {
+    let args = popn(stack, nargs)?;
+    if args.is_empty() {
+        return Err(CalcError::Underflow);
+    }
+
+    let result = if args.iter().any(ArrayStackValue::is_array) {
+        let mut it = args.into_iter();
+        let mut acc = it.next().ok_or(CalcError::Underflow)?.into_cell(array_size);
+        for arg in it {
+            match arg {
+                ArrayStackValue::Array(other) => {
+                    for (a, &o) in acc.buf_mut().iter_mut().zip(other.buf()) {
+                        *a = op.fold_element(*a, o);
+                    }
+                }
+                Double(d) => {
+                    for a in acc.buf_mut() {
+                        *a = op.fold_element(*a, d);
+                    }
+                }
+            }
+        }
+        ArrayStackValue::Array(acc)
+    } else {
+        let vals: Vec<f64> = args
+            .iter()
+            .map(ArrayStackValue::as_f64)
+            .collect::<Result<_, _>>()?;
+        let mut acc = *vals.last().ok_or(CalcError::Underflow)?;
+        for &arg in vals.iter().rev().skip(1) {
+            if !op.keeps(arg, acc) && !acc.is_nan() {
+                acc = arg;
+            }
+        }
+        Double(acc)
+    };
+
+    push(stack, result);
+    Ok(())
 }
 
 /// C's unary array-operator dispatch (`aCalcPerform.c:769-1101`) is ONE operator
@@ -1340,12 +1545,6 @@ fn pop_f64(stack: &mut Vec<Cell>) -> Result<f64, CalcError> {
     pop(stack)?.v.as_f64()
 }
 
-fn pop2_f64(stack: &mut Vec<Cell>) -> Result<(f64, f64), CalcError> {
-    let b = pop_f64(stack)?;
-    let a = pop_f64(stack)?;
-    Ok((a, b))
-}
-
 /// Forward-scan for a matching conditional opcode, mirroring C `cond_search`
 /// (calcPerform.c:520-557): `count` starts at 1, the target opcode decrements
 /// it (return when 0), `COND_IF` increments it.
@@ -1392,4 +1591,68 @@ fn simple_random() -> f64 {
     SEED.store(s, Ordering::Relaxed);
     // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range.
     (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
+}
+
+/// The end-of-expression depth invariant — C's `if (ps != top) return(-1)`
+/// (`aCalcPerform.c:1607-1618`).
+///
+/// These programs are hand-built because `aCalcPostfix` CANNOT emit them: its
+/// compile-time `runtime_depth` ledger (`aCalcPostfix.c:420-585`) rejects anything
+/// that would not end at depth 1, which is why C's runtime check has no reachable
+/// divergence today. Compiled C agrees, and so does the port's compiler — both
+/// answer "Incomplete expression, operand missing" for `A:=1`, `AA:=1`, `BB:=AA`
+/// and `AA:=AA+1`, and both compile and run `A:=1;2` to 2.
+///
+/// So the guard is tested where it actually applies: at the engine's own boundary,
+/// against a program that violates the invariant.
+#[cfg(test)]
+mod stack_depth_invariant {
+    use super::*;
+    use crate::calc::engine::ExprKind;
+
+    fn run(code: Vec<Opcode>) -> Result<ArrayStackValue, CalcError> {
+        let expr = CompiledExpr {
+            code,
+            kind: ExprKind::Array,
+            loop_pairs: Vec::new(),
+        };
+        eval(&expr, &mut ArrayInputs::new(4))
+    }
+
+    #[test]
+    fn a_leaked_operand_is_an_error_not_the_top_of_stack() {
+        // Two pushes, no operator to consume them: C ends with ps one ABOVE top and
+        // returns -1, writing neither p_dresult nor p_aresult. The port used to
+        // return `stack.last()` — the 2.0 — and publish it as VAL/AVAL.
+        let leaked = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn an_empty_stack_is_an_error_not_a_zero() {
+        // A store consumes the only value, so the program ends at depth 0: C's `ps`
+        // is left one BELOW `top` and the check fails just as hard. The port used to
+        // invent a 0.0 that C never produces.
+        let consumed = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::StoreVar(0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(consumed), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn exactly_one_value_is_the_result() {
+        let balanced = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::Add),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(balanced), Ok(Double(3.0)));
+    }
 }

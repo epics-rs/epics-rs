@@ -117,6 +117,53 @@ impl PartialOrd for ActorMessage {
     }
 }
 
+/// How C performs an operation: the one classification every gate in the actor
+/// derives from ([`PortActor::queue_gate`], [`PortActor::is_lifecycle_op`]).
+///
+/// The match that produces it ([`PortActor::c_dispatch`]) is **exhaustive by
+/// construction — no wildcard arm**. "Does C queue this?" has a different answer
+/// per operation and it must be *answered*, not defaulted: a wildcard silently
+/// put every unlisted op in the queued class, and C performs several of them as
+/// direct calls (R13-46). Adding a `RequestOp` now fails to compile until its C
+/// dispatch is stated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CDispatch {
+    /// C performs it as a direct call — no `queueRequest`, so no queue gate, and
+    /// no queue for the block holder to divert it into. These are `pasynManager`'s
+    /// own entry points, which take `asynManagerLock`, act and return: `enable`
+    /// (asynManager.c:2222-2249), `autoConnectAsyn` (:2310-2324),
+    /// `isConnected`/`isEnabled`/`isAutoConnect` (:2326-2354),
+    /// `blockProcessCallback` (:1692-1723), `shutdownPort`, `interposeInterface`.
+    ///
+    /// The gate must not run on them: a port disabled with `asynEnable(port,0)`
+    /// could never be re-enabled if the enable itself had to pass the enabled
+    /// check.
+    Direct,
+    /// C queues it at `asynQueuePriorityConnect`, and the port thread drains that
+    /// queue *before* it consults any connected flag (`portThread`,
+    /// asynManager.c:812-857) — so the *connected* refusal is waived. `enabled`
+    /// still binds: the same thread refuses to run anything at all on a disabled
+    /// port (:802-805), which is why a `CNCT=1` put cannot open the device
+    /// connection of a port disabled precisely to keep the IOC off the hardware
+    /// (R12-48).
+    ///
+    /// The block holder cannot divert these either: the Connect queue is drained
+    /// ahead of the lower-priority loop it gates, with no block check.
+    ConnectQueue,
+    /// C hands it to `queueRequest` (asynManager.c:1513-1552), so C's gate runs.
+    /// Its two refusals are **independent**: `!pport->dpc.enabled → asynDisabled`
+    /// (:1541-1546) is unconditional, and only `checkPortConnect` is conditioned
+    /// on the priority and reason (:1536-1538). The request's own user
+    /// ([`AsynUser::connect_check`]) selects the connected waiver;
+    /// [`PortDriverBase::check_queue`] enforces the split, so nothing can waive
+    /// the enabled half.
+    ///
+    /// This is also the only class the block holder can stall: C's
+    /// `pblockProcessHolder` gates exactly the `processUser` dispatch in the port
+    /// thread's lower-priority loop (:874-880).
+    Queued,
+}
+
 /// The actor that exclusively owns a port driver instance.
 pub(crate) struct PortActor {
     driver: Box<dyn PortDriver>,
@@ -259,67 +306,11 @@ impl PortActor {
         }
     }
 
-    /// The ops the block holder (`pblockProcessHolder`) cannot stall.
-    ///
-    /// C's block holder gates exactly one thing: the `processUser` dispatch in
-    /// the port thread's *lower-priority* loop (asynManager.c:874-880). The
-    /// manager calls that run directly under `asynManagerLock` — enable/disable,
-    /// auto-connect, the enable/auto-connect/connected queries, block/unblock,
-    /// port shutdown (`enable` 2222-2249, `autoConnectAsyn` 2310-2324,
-    /// `isConnected`/`isEnabled` 2326-2354, `blockProcessCallback` 1692-1723) —
-    /// never enter a queue at all, and the Connect queue is drained ahead of the
-    /// loop with no block check (:812-857). So none of them can be diverted.
-    ///
-    /// This predicate answers *that* question only. Whether the enabled/connected
-    /// refusals apply is a different question with a different answer — see
-    /// [`Self::queue_gate`], which is where C's `queueRequest` gate lives.
-    fn is_lifecycle_op(op: &RequestOp) -> bool {
-        matches!(
-            op,
-            RequestOp::Connect
-                | RequestOp::Disconnect
-                | RequestOp::ConnectAddr
-                | RequestOp::DisconnectAddr
-                | RequestOp::EnableAddr
-                | RequestOp::DisableAddr
-                | RequestOp::SetEnable { .. }
-                | RequestOp::SetAutoConnect { .. }
-                | RequestOp::GetEnable
-                | RequestOp::GetAutoConnect
-                | RequestOp::GetConnected
-                | RequestOp::PushEchoInterpose
-                | RequestOp::PushDelayInterpose { .. }
-                | RequestOp::BlockProcess
-                | RequestOp::UnblockProcess
-                | RequestOp::ShutdownPort
-        )
-    }
-
-    /// Which refusals C's `queueRequest` gate (asynManager.c:1539-1552) applies
-    /// to this request — the single owner of that classification.
-    ///
-    /// `None` — C never queues it. `enable`, `autoConnect`, `isEnabled` /
-    /// `isAutoConnect` / `isConnected`, `blockProcessCallback`, `shutdownPort`
-    /// and `interposeInterface` are direct `pasynManager` calls that take
-    /// `asynManagerLock`, act, and return; no gate runs. It must stay that way:
-    /// a port disabled with `asynEnable(port,0)` could never be re-enabled if the
-    /// enable itself had to pass the enabled check.
-    ///
-    /// `Some(_)` — C queues it, so C's gate runs, and its two refusals are
-    /// **independent**. `!pport->dpc.enabled → asynDisabled` (:1541-1546) is
-    /// unconditional; only `checkPortConnect` is conditioned on the priority
-    /// (:1536-1538). [`PortDriverBase::check_queue`] enforces that split, so
-    /// nothing here can waive the enabled half.
-    ///
-    /// The connect/disconnect ops are in the queued class — C reaches
-    /// `asynCommon->connect` only from a queued callback (asynRecord's CNCT put,
-    /// asynRecord.c:503-505,562-571) or from the port thread itself — and their
-    /// waiver covers *connected* alone. That is what R12-48 fixes: a `CNCT=1` put
-    /// used to skip the whole gate, so a port disabled precisely to keep the IOC
-    /// off the hardware would open the device connection anyway. C's port thread
-    /// will not even drain the Connect queue on a disabled port (:802-805).
-    fn queue_gate(op: &RequestOp, user: &AsynUser) -> Option<ConnectCheck> {
+    /// The single owner of "how does C perform this operation" — see [`CDispatch`].
+    /// Exhaustive on purpose; do not add a wildcard arm.
+    fn c_dispatch(op: &RequestOp) -> CDispatch {
         match op {
+            // Direct `pasynManager` calls under `asynManagerLock`.
             RequestOp::EnableAddr
             | RequestOp::DisableAddr
             | RequestOp::SetEnable { .. }
@@ -331,17 +322,80 @@ impl PortActor {
             | RequestOp::PushDelayInterpose { .. }
             | RequestOp::BlockProcess
             | RequestOp::UnblockProcess
-            | RequestOp::ShutdownPort => None,
-            // The connect owner runs on a down line by definition: C's port thread
-            // drains the Connect queue *before* it consults any connected flag
-            // (asynManager.c:812-857). `enabled` still binds.
+            | RequestOp::ShutdownPort => CDispatch::Direct,
+
+            // C reaches `asynCommon->connect`/`disconnect` only from a callback
+            // queued at Connect priority (asynRecord's CNCT/PCNCT put,
+            // asynRecord.c:503-505,562-571) or from the port thread itself.
             RequestOp::Connect
             | RequestOp::Disconnect
             | RequestOp::ConnectAddr
-            | RequestOp::DisconnectAddr => Some(ConnectCheck::Waived),
-            // Everything C queues: its gate, verbatim, keyed on the request's own
-            // user (`AsynUser::connect_check`).
-            _ => Some(user.connect_check()),
+            | RequestOp::DisconnectAddr => CDispatch::ConnectQueue,
+
+            // Everything device support reaches through `queueRequest`: the
+            // interface I/O (asynOctet / asynInt32 / asynInt64 / asynFloat64 /
+            // asynUInt32Digital / the array interfaces / asynEnum), the option and
+            // EOS accessors asynRecord queues (asynRecord.c:1787-1826, 1985-2026),
+            // the GPIB commands (:1638-1756), `flush`, and `getBounds`.
+            RequestOp::OctetWrite { .. }
+            | RequestOp::OctetRead { .. }
+            | RequestOp::OctetWriteRead { .. }
+            | RequestOp::OctetWriteBinary { .. }
+            | RequestOp::OctetReadBinary { .. }
+            | RequestOp::Int32Write { .. }
+            | RequestOp::Int32Read
+            | RequestOp::Int64Write { .. }
+            | RequestOp::Int64Read
+            | RequestOp::Float64Write { .. }
+            | RequestOp::Float64Read
+            | RequestOp::UInt32DigitalWrite { .. }
+            | RequestOp::UInt32DigitalRead { .. }
+            | RequestOp::Flush
+            | RequestOp::GetBoundsInt32
+            | RequestOp::GetBoundsInt64
+            | RequestOp::DrvUserCreate { .. }
+            | RequestOp::EnumRead
+            | RequestOp::EnumWrite { .. }
+            | RequestOp::Int32ArrayRead { .. }
+            | RequestOp::Int32ArrayWrite { .. }
+            | RequestOp::Float64ArrayRead { .. }
+            | RequestOp::Float64ArrayWrite { .. }
+            | RequestOp::Int8ArrayRead { .. }
+            | RequestOp::Int8ArrayWrite { .. }
+            | RequestOp::Int16ArrayRead { .. }
+            | RequestOp::Int16ArrayWrite { .. }
+            | RequestOp::Int64ArrayRead { .. }
+            | RequestOp::Int64ArrayWrite { .. }
+            | RequestOp::Float32ArrayRead { .. }
+            | RequestOp::Float32ArrayWrite { .. }
+            | RequestOp::CallParamCallbacks { .. }
+            | RequestOp::GetOption { .. }
+            | RequestOp::SetOption { .. }
+            | RequestOp::Report { .. }
+            | RequestOp::SetInputEos { .. }
+            | RequestOp::SetOutputEos { .. }
+            | RequestOp::GetInputEos
+            | RequestOp::GetOutputEos
+            | RequestOp::GpibUniversalCmd { .. }
+            | RequestOp::GpibAddressedCmd { .. }
+            | RequestOp::GpibIfc
+            | RequestOp::GpibRen { .. } => CDispatch::Queued,
+        }
+    }
+
+    /// The ops the block holder (`pblockProcessHolder`) cannot stall — everything
+    /// C does not put through `queueRequest`'s lower-priority loop.
+    fn is_lifecycle_op(op: &RequestOp) -> bool {
+        Self::c_dispatch(op) != CDispatch::Queued
+    }
+
+    /// Which refusals C's `queueRequest` gate (asynManager.c:1539-1552) applies
+    /// to this request. `None` — C never queues it, so no gate runs.
+    fn queue_gate(op: &RequestOp, user: &AsynUser) -> Option<ConnectCheck> {
+        match Self::c_dispatch(op) {
+            CDispatch::Direct => None,
+            CDispatch::ConnectQueue => Some(ConnectCheck::Waived),
+            CDispatch::Queued => Some(user.connect_check()),
         }
     }
 

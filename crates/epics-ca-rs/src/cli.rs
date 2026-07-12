@@ -348,9 +348,8 @@ impl Default for FloatFormat {
     }
 }
 
-/// Integer formatting requested via `-0x` / `-0o` / `-0b` (base for
-/// integer types) and `-lx` / `-lo` / `-lb` (round-float-to-long
-/// then print in base). C tool default is decimal.
+/// A `sprint_long` output base — C `tool_lib.c`'s `IntFormatT`
+/// (`dec` / `bin` / `oct` / `hex`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntStyle {
     Dec,
@@ -359,14 +358,50 @@ pub enum IntStyle {
     Bin,
 }
 
+/// Resolve one C base flag group (`-0x`/`-0o`/`-0b`, or `-lx`/`-lo`/`-lb`)
+/// into its [`IntStyle`], mirroring C's `switch ((char) *optarg)`
+/// (`caget.c:486-495`, `camonitor.c:327-336`). No flag of the group given →
+/// `Dec`, C's default for both `outTypeI` and `outTypeF`. The three flags of
+/// a group are mutually exclusive at the clap layer, so at most one is set.
+pub fn base_style(hex: bool, oct: bool, bin: bool) -> IntStyle {
+    match (hex, oct, bin) {
+        (true, _, _) => IntStyle::Hex,
+        (_, true, _) => IntStyle::Oct,
+        (_, _, true) => IntStyle::Bin,
+        _ => IntStyle::Dec,
+    }
+}
+
 /// Per-tool CLI formatting state.
+///
+/// C keeps the integer base and the float base in TWO independent globals
+/// (`tool_lib.c:51-52`, `outTypeI` / `outTypeF`), and every tool's getopt
+/// writes exactly one of them: `-0x`/`-0o`/`-0b` sets `outTypeI`,
+/// `-lx`/`-lo`/`-lb` sets `outTypeF` (`caget.c:485-497`,
+/// `camonitor.c:325-340`). Neither flag touches the other's global, so
+/// `int_style` and `float_style` are mirrored as two separate fields — a
+/// single shared base field made `-lx` hex an integer PV (C prints it
+/// decimal) and `-0x` reach the DBR_CHAR / DBR_ENUM arms of `val2str`,
+/// which C prints with a bare `%d`.
 #[derive(Debug, Clone)]
 pub struct ValueFormat {
     pub float: FloatFormat,
+    /// C `outTypeI` — the `-0x` / `-0o` / `-0b` base. Applies to EXACTLY
+    /// the two `val2str` arms that call `sprint_long(.., outTypeI)`:
+    /// `DBR_INT` (SHORT) and `DBR_LONG` (`tool_lib.c:163-167`). `DBR_CHAR`
+    /// and the `DBR_ENUM` index are plain `sprintf("%d")`
+    /// (`tool_lib.c:160-161,187`) and never see this base; `DBR_FLOAT` /
+    /// `DBR_DOUBLE` use [`ValueFormat::float_style`].
     pub int_style: IntStyle,
-    /// Round-float-to-long-and-render in `int_style` (the `-lx` / `-lo`
-    /// / `-lb` C-tool flags). Only applies to floating-point values.
-    pub float_as_int: bool,
+    /// C `outTypeF` — the `-lx` / `-lo` / `-lb` base, applying ONLY to
+    /// `DBR_FLOAT` / `DBR_DOUBLE`. `Dec` (the default) means the value
+    /// renders through the `-e`/`-f`/`-g` `dblFormatStr`; any other base
+    /// means C rounds it half-away-from-zero into a `dbr_long_t` and
+    /// prints that with `sprint_long(.., outTypeF)` (`tool_lib.c:138-158`).
+    /// Folding this into a separate field makes the old
+    /// `float_as_int: bool` + shared-base pair — whose inconsistent
+    /// combinations were the defect — unrepresentable.
+    pub float_style: IntStyle,
     /// `-n` flag: print enum value as its integer index instead of
     /// the menu string.
     pub enum_as_number: bool,
@@ -387,7 +422,7 @@ impl Default for ValueFormat {
         Self {
             float: FloatFormat::default(),
             int_style: IntStyle::Dec,
-            float_as_int: false,
+            float_style: IntStyle::Dec,
             enum_as_number: false,
             char_array_as_string: false,
             max_elements: None,
@@ -396,27 +431,57 @@ impl Default for ValueFormat {
     }
 }
 
-/// Render `EpicsValue` for CA tool output, matching C `tool_lib.c::
-/// print_value`. Scalars are bare (no count prefix); arrays are
-/// `count<sep>v0<sep>v1...` (the count is part of the value, not the
-/// PV-name column). Enum strings are NOT resolved here — caller passes
-/// `enum_strings = Some(&["off","on",...])` when it has them, else
-/// the integer index is used (matches `-n` flag default when no enum
-/// metadata is available). `format_value` does not emit a trailing
-/// newline.
+/// Whether a print loop's array rendering leads with the element count.
 ///
-/// `req_elems_present` mirrors C `caget.c:286` / the `PRN_TIME_VAL_STS`
-/// macro (`tool_lib.c:486`): the array element-count prefix is emitted
-/// only when `reqElems || pv->nElems > 1`. Pass `true` when the user
-/// supplied `-#` on the command line; a genuine 1-element waveform read
-/// without `-#` then prints just the value with no count prefix.
+/// C's value loops do NOT share one rule, and folding them onto a single
+/// `req_elems` bool was the defect: the bool then had to mean both "the user
+/// passed `-#`" and "emit the count", which are the same thing on three loops
+/// and unrelated on the fourth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountPrefix {
+    /// The `plain` / `terse` value loops (`caget.c:286`, `caput.c:223`) and
+    /// `print_time_val_sts` (`tool_lib.c:486`, shared by `caget -a`,
+    /// `caput -l` and `camonitor`): the count leads iff
+    /// `reqElems || nElems > 1`.
+    IfRequestedOrArray,
+    /// The `caget -d` specifiedDbr `Value:` line (`caget.c:328-334`): the
+    /// elements are joined BARE. That block already printed the count on its
+    /// own `Element count:` line (`caget.c:317-319`), so C's loop there
+    /// carries no `printf("%lu%c", ...)` gate at all — not even for an array.
+    Never,
+}
+
+impl CountPrefix {
+    fn leads(self, req_elems: bool, total: usize) -> bool {
+        match self {
+            CountPrefix::IfRequestedOrArray => req_elems || total > 1,
+            CountPrefix::Never => false,
+        }
+    }
+}
+
+/// Render `EpicsValue` for CA tool output, matching C `tool_lib.c::val2str`
+/// and the element loop of the calling print block. Enum strings are NOT
+/// resolved here — the caller passes `enum_strings = Some(&["off","on",...])`
+/// when it has them, else the integer index is used. `format_value` does not
+/// emit a trailing newline.
+///
+/// The two gates C's loops carry are separate arguments, because C reads
+/// `reqElems` for two INDEPENDENT decisions:
+///
+/// * `req_elems` — C's `reqElems`, non-zero iff the user passed `-#`. It gates
+///   the `-S` long-string branch on EVERY block that has one
+///   (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`:
+///   `caget.c:273` for plain/terse AND `caget.c:318` for specifiedDbr).
+/// * `count_prefix` — whether this block's element loop leads with the count
+///   at all. See [`CountPrefix`].
 pub fn format_value(
     v: &EpicsValue,
     fmt: &ValueFormat,
     enum_strings: Option<&[PvString]>,
-    req_elems_present: bool,
+    req_elems: bool,
+    count_prefix: CountPrefix,
 ) -> String {
-    let sep = fmt.field_separator;
     match v {
         EpicsValue::String(s) => escape_from_raw(s.as_bytes()),
         EpicsValue::Short(n) => format_int_i64(*n as i64, fmt.int_style),
@@ -427,156 +492,139 @@ pub fn format_value(
         // plain integer formatter is correct — no wide-unsigned path needed.
         EpicsValue::UShort(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::ULong(n) => format_int_i64(*n as i64, fmt.int_style),
-        EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
+        EpicsValue::Char(n) => format_char((*n as i8) as i64),
         // epicsUInt8 formats unsigned (0xFF -> 255), unlike the signed `Char`.
-        EpicsValue::UChar(n) => format_int_i64(*n as i64, fmt.int_style),
+        EpicsValue::UChar(n) => format_char(*n as i64),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         // Transient NTEnum carrier never reaches CA serialization (coerced in
         // base at the link-write boundary); format its index like a DBF_ENUM.
         EpicsValue::EnumWithChoices { index, .. } => format_enum(*index as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
         EpicsValue::Double(x) => format_float(*x, fmt),
-        EpicsValue::ShortArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::ShortArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
-        EpicsValue::LongArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::LongArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
         EpicsValue::Int64Array(arr) => render_array_iter(
             arr.iter()
                 .map(|&n| format_int_wide(n.to_string(), n as u64, fmt.int_style)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
         EpicsValue::UInt64Array(arr) => render_array_iter(
             arr.iter()
                 .map(|&n| format_int_wide(n.to_string(), n, fmt.int_style)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
-        EpicsValue::UShortArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::UShortArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
-        EpicsValue::ULongArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::ULongArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
         // DBF_UCHAR[] is numeric unsigned-byte image data: render each element
         // unsigned (0xFF -> 255), not the signed-i8 / long-string CharArray path.
-        EpicsValue::UCharArray(arr) => render_array_int(
-            arr.iter().map(|&b| b as i64),
+        EpicsValue::UCharArray(arr) => render_array_iter(
+            arr.iter().map(|&b| format_char(b as i64)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
-        EpicsValue::EnumArray(arr) => {
-            let mut parts = Vec::with_capacity(arr.len() + 1);
-            if req_elems_present || arr.len() > 1 {
-                parts.push(arr.len().to_string());
-            }
-            let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
-            for &idx in &arr[..take] {
-                parts.push(format_enum(idx as i64, fmt, enum_strings));
-            }
-            parts.join(&sep.to_string())
-        }
+        EpicsValue::EnumArray(arr) => render_array_iter(
+            arr.iter()
+                .map(|&idx| format_enum(idx as i64, fmt, enum_strings)),
+            arr.len(),
+            fmt,
+            req_elems,
+            count_prefix,
+        ),
         EpicsValue::FloatArray(arr) => render_array_iter(
             arr.iter().map(|&x| format_float(x as f64, fmt)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
         EpicsValue::DoubleArray(arr) => render_array_iter(
             arr.iter().map(|&x| format_float(x, fmt)),
             arr.len(),
             fmt,
-            sep,
-            req_elems_present,
+            req_elems,
+            count_prefix,
         ),
         EpicsValue::CharArray(arr) => {
-            // C `caget.c` renders a CHAR array as a long-string only when
-            // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element
-            // CHAR array with `-S` but no `-#` falls through to numeric.
-            if fmt.char_array_as_string && (req_elems_present || arr.len() > 1) {
+            // C renders a CHAR array as a long-string only when
+            // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element CHAR
+            // array with `-S` but no `-#` falls through to numeric. This gate
+            // reads `reqElems` DIRECTLY and is present on the specifiedDbr
+            // block too (`caget.c:318`), so it does NOT follow `count_prefix`.
+            if fmt.char_array_as_string && (req_elems || arr.len() > 1) {
                 // Long-string convention: bytes up to first NUL, then
                 // EPICS-escaped (caget.c:322-327 escapes the prefix).
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
                 escape_from_raw(&arr[..end])
             } else {
-                render_array_int(
-                    arr.iter().map(|&b| (b as i8) as i64),
+                render_array_iter(
+                    arr.iter().map(|&b| format_char((b as i8) as i64)),
                     arr.len(),
                     fmt,
-                    sep,
-                    req_elems_present,
+                    req_elems,
+                    count_prefix,
                 )
             }
         }
-        EpicsValue::StringArray(arr) => {
-            let mut parts = Vec::with_capacity(arr.len() + 1);
-            if req_elems_present || arr.len() > 1 {
-                parts.push(arr.len().to_string());
-            }
-            let take = fmt.max_elements.unwrap_or(arr.len()).min(arr.len());
-            parts.extend(arr[..take].iter().map(|s| escape_from_raw(s.as_bytes())));
-            parts.join(&sep.to_string())
-        }
+        EpicsValue::StringArray(arr) => render_array_iter(
+            arr.iter().map(|s| escape_from_raw(s.as_bytes())),
+            arr.len(),
+            fmt,
+            req_elems,
+            count_prefix,
+        ),
     }
 }
 
-fn render_array_int<I: Iterator<Item = i64>>(
-    iter: I,
-    total: usize,
-    fmt: &ValueFormat,
-    sep: char,
-    req_elems_present: bool,
-) -> String {
-    let take = fmt.max_elements.unwrap_or(total).min(total);
-    let mut parts = Vec::with_capacity(take + 1);
-    if req_elems_present || total > 1 {
-        parts.push(total.to_string());
-    }
-    for n in iter.take(take) {
-        parts.push(format_int_i64(n, fmt.int_style));
-    }
-    parts.join(&sep.to_string())
-}
-
+/// The single owner of C's array element loop: an optional leading count
+/// (see [`CountPrefix`]), then the elements joined by the `-F` separator.
+/// Every carrier renders its own elements and hands them here, so no array
+/// type can grow a private copy of the count rule.
 fn render_array_iter<I: Iterator<Item = String>>(
     iter: I,
     total: usize,
     fmt: &ValueFormat,
-    sep: char,
-    req_elems_present: bool,
+    req_elems: bool,
+    count_prefix: CountPrefix,
 ) -> String {
     let take = fmt.max_elements.unwrap_or(total).min(total);
     let mut parts = Vec::with_capacity(take + 1);
-    if req_elems_present || total > 1 {
+    if count_prefix.leads(req_elems, total) {
         parts.push(total.to_string());
     }
     parts.extend(iter.take(take));
-    parts.join(&sep.to_string())
+    parts.join(&fmt.field_separator.to_string())
 }
 
 fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -> String {
@@ -590,7 +638,25 @@ fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -
         // byte-wise escaper renders them faithfully on the CLI.
         return escape_from_raw(strs[idx as usize].as_bytes());
     }
-    format_int_i64(idx, fmt.int_style)
+    // C `val2str`'s DBR_ENUM arm prints a bare index with `sprintf("%d")`
+    // (`tool_lib.c:187`) — the `-0x`/`-0o`/`-0b` base (`outTypeI`) is
+    // reserved for the DBR_INT / DBR_LONG arms and never reaches here.
+    // `caget -n` / `camonitor -n` on a native ENUM field re-request the
+    // value as DBR_TIME_INT (`caget.c:179`, `camonitor.c:159`), so those
+    // DO carry the base — but they arrive as a SHORT carrier, not as this
+    // one. Only a request that keeps the ENUM type (`caget -d DBR_ENUM`,
+    // `-d DBR_GR_ENUM -n`) lands here, and C prints those in decimal.
+    format_int_i64(idx, IntStyle::Dec)
+}
+
+/// C `val2str`'s `DBR_CHAR` arm: `sprintf(str, "%d", ch)` — a bare decimal,
+/// unconditionally (`tool_lib.c:160-161`). Unlike `DBR_INT` / `DBR_LONG`,
+/// a CHAR value NEVER goes through `sprint_long`, so `-0x` / `-0o` / `-0b`
+/// leave it alone: `caget -0x` on a CHAR PV holding `0xFF` prints `-1`, not
+/// `0xFFFFFFFF`. Both CA-CHAR carriers (signed `Char`, unsigned `UChar`)
+/// share the arm; the caller supplies the already-widened value.
+fn format_char(n: i64) -> String {
+    format_int_i64(n, IntStyle::Dec)
 }
 
 /// Port of EPICS `epicsStrnEscapedFromRaw` (`epicsString.c:120-159`):
@@ -667,11 +733,75 @@ fn format_int_wide(decimal: String, bits: u64, style: IntStyle) -> String {
     }
 }
 
+/// C `sscanf(optarg, "%d", &n)` semantics, shared by every CA tool that
+/// scans a numeric option argument: skip leading whitespace, accept an
+/// optional sign, then take the leading run of decimal digits — trailing junk
+/// is ignored (`"16x"` → `16`, `"0x10"` → `0`). `None` is C's `sscanf`
+/// returning 0, i.e. no digit leads.
+///
+/// The tools branch on exactly that return: `caget -d` falls through to the
+/// textual `dbr_text_to_type` lookup (`caget.c:416-421`), while `-#` prints
+/// "not a valid array element count" and keeps going (`caget.c:445-450`,
+/// `caput.c:336-343`).
+pub fn scan_leading_i64(s: &str) -> Option<i64> {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut neg = false;
+    if let Some(&c) = bytes.first()
+        && (c == b'+' || c == b'-')
+    {
+        neg = c == b'-';
+        i = 1;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    s[start..i]
+        .parse::<i64>()
+        .ok()
+        .map(|n| if neg { -n } else { n })
+}
+
+/// `printf`'s default precision for `%e` / `%f` / `%g` when the conversion
+/// carries none — 6 (C99 7.19.6.1). C's `dblFormatStr` starts as `"%g"`
+/// (`tool_lib.c:53`) and the `FMT_GR` / `FMT_CTRL` limit macros hardcode a
+/// bare `%g`, so both land on this precision.
+const C_DEFAULT_PRECISION: usize = 6;
+
+/// The single owner of C's HARDCODED `%g` for a `dbr_gr_*` / `dbr_ctrl_*`
+/// FLOAT/DOUBLE limit.
+///
+/// `dbr2str` builds the graphic/control limit block from the `FMT_GR(%g)` /
+/// `FMT_CTRL(%g)` macros (`tool_lib.c:248-254,266-270`), which embed the
+/// literal `%g` — printf's default 6 significant digits. The `-e` / `-f` /
+/// `-g` flags rewrite `dblFormatStr`, which ONLY `val2str` reads
+/// (`tool_lib.c:138,150`), so they never reach a limit: `caget -d
+/// DBR_CTRL_DOUBLE -f 9` still prints every limit at 6 significant digits.
+///
+/// Non-finite limits fall through to C `printf`'s `inf` / `nan` spelling, the
+/// same escape [`format_float`] takes.
+pub fn format_c_g(x: f64) -> String {
+    if !x.is_finite() {
+        return format!("{x}");
+    }
+    format_g(x, C_DEFAULT_PRECISION)
+}
+
 fn format_float(x: f64, fmt: &ValueFormat) -> String {
-    if fmt.float_as_int {
-        // C tool: round-half-to-even via `lroundl`, then format as int.
+    if fmt.float_style != IntStyle::Dec {
+        // C `val2str` (`tool_lib.c:138-158`): a non-`dec` `outTypeF` rounds
+        // the value half-away-from-zero (`x > 0 ? x + 0.5 : x - 0.5`, then a
+        // truncating cast to `dbr_long_t`) and prints it with
+        // `sprint_long(.., outTypeF)`. `f64::round` is the same
+        // half-away-from-zero rule. The INTEGER base (`outTypeI`) plays no
+        // part here.
         let rounded = if x.is_nan() { 0i64 } else { x.round() as i64 };
-        return format_int_i64(rounded, fmt.int_style);
+        return format_int_i64(rounded, fmt.float_style);
     }
     if !x.is_finite() {
         // C printf prints "nan" / "inf" / "-inf"; Rust matches by
@@ -800,6 +930,24 @@ mod tests {
         ValueFormat::default()
     }
 
+    /// Every C print loop except `caget -d` uses `CountPrefix::IfRequestedOrArray`;
+    /// the `-d` Value line is covered explicitly by
+    /// `specified_dbr_value_line_never_leads_with_the_count`.
+    fn fv(
+        v: &EpicsValue,
+        fmt: &ValueFormat,
+        enum_strings: Option<&[PvString]>,
+        req_elems: bool,
+    ) -> String {
+        format_value(
+            v,
+            fmt,
+            enum_strings,
+            req_elems,
+            CountPrefix::IfRequestedOrArray,
+        )
+    }
+
     #[test]
     fn g_default_precision_matches_c() {
         // C `printf("%g", 475.123)` → "475.123"
@@ -880,28 +1028,25 @@ mod tests {
         let mut hex = fmt_default();
         hex.int_style = IntStyle::Hex;
         assert_eq!(
-            format_value(&EpicsValue::Int64(-1), &hex, None, false),
+            fv(&EpicsValue::Int64(-1), &hex, None, false),
             "0xFFFFFFFFFFFFFFFF",
             "Int64 -1 keeps the full 64-bit pattern, uppercase"
         );
         // UInt64 above i64::MAX prints its full unsigned decimal.
         assert_eq!(
-            format_value(&EpicsValue::UInt64(u64::MAX), &fmt_default(), None, false),
+            fv(&EpicsValue::UInt64(u64::MAX), &fmt_default(), None, false),
             u64::MAX.to_string()
         );
         // UInt64 binary is bare (no `0b`).
         let mut bin = fmt_default();
         bin.int_style = IntStyle::Bin;
-        assert_eq!(
-            format_value(&EpicsValue::UInt64(5), &bin, None, false),
-            "101"
-        );
+        assert_eq!(fv(&EpicsValue::UInt64(5), &bin, None, false), "101");
     }
 
     #[test]
     fn array_renders_count_then_values() {
         let v = EpicsValue::DoubleArray(vec![1.0, 2.5, 3.0]);
-        let s = format_value(&v, &fmt_default(), None, false);
+        let s = fv(&v, &fmt_default(), None, false);
         // C: `3 1 2.5 3` (count + space-separated %g values)
         assert_eq!(s, "3 1 2.5 3");
     }
@@ -913,19 +1058,95 @@ mod tests {
     fn single_element_array_omits_count_without_req_elems() {
         let v = EpicsValue::DoubleArray(vec![2.5]);
         // No `-#` on the command line → no count prefix.
-        assert_eq!(format_value(&v, &fmt_default(), None, false), "2.5");
+        assert_eq!(fv(&v, &fmt_default(), None, false), "2.5");
         // `-#` supplied → count prefix returns even for 1 element.
-        assert_eq!(format_value(&v, &fmt_default(), None, true), "1 2.5");
+        assert_eq!(fv(&v, &fmt_default(), None, true), "1 2.5");
         // Multi-element always carries the count prefix.
         let v2 = EpicsValue::DoubleArray(vec![1.0, 2.5]);
-        assert_eq!(format_value(&v2, &fmt_default(), None, false), "2 1 2.5");
+        assert_eq!(fv(&v2, &fmt_default(), None, false), "2 1 2.5");
+    }
+
+    /// C's `caget -d` specifiedDbr Value loop (`caget.c:328-334`) joins the
+    /// elements BARE — no `printf("%lu%c", nElems, ...)` gate at all, because
+    /// the block already printed `Element count:` on its own line. Only the
+    /// plain/terse loop (`:286`) leads with the count.
+    ///
+    /// Pre-fix the `-d` call passed `req_elems = false` and the shared
+    /// renderer STILL prefixed on `total > 1`, so `caget -d DBR_LONG` on a
+    /// 3-element array printed `Value: 3 v0 v1 v2` where C prints
+    /// `Value: v0 v1 v2`.
+    #[test]
+    fn specified_dbr_value_line_never_leads_with_the_count() {
+        let f = fmt_default();
+        let arr = EpicsValue::LongArray(vec![10, 20, 30]);
+        assert_eq!(
+            format_value(&arr, &f, None, false, CountPrefix::Never),
+            "10 20 30"
+        );
+        // `-#` cannot bring the prefix back on this block either — C's loop
+        // has no gate to enable.
+        assert_eq!(
+            format_value(&arr, &f, None, true, CountPrefix::Never),
+            "10 20 30"
+        );
+        // Every array carrier, not just the integer one.
+        assert_eq!(
+            format_value(
+                &EpicsValue::StringArray(vec!["a".into(), "b".into()]),
+                &f,
+                None,
+                false,
+                CountPrefix::Never
+            ),
+            "a b"
+        );
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
+        assert_eq!(
+            format_value(
+                &EpicsValue::EnumArray(vec![1, 0]),
+                &f,
+                Some(&strs),
+                false,
+                CountPrefix::Never
+            ),
+            "on off"
+        );
+        // Negative control: the SAME value on the plain/terse loop keeps C's
+        // `reqElems || nElems > 1` prefix.
+        assert_eq!(
+            format_value(&arr, &f, None, false, CountPrefix::IfRequestedOrArray),
+            "3 10 20 30"
+        );
+    }
+
+    /// `reqElems` still reaches the `-S` long-string gate on the specifiedDbr
+    /// block (`caget.c:318` repeats `charArrAsStr && dbr_type_is_CHAR &&
+    /// (reqElems || nElems > 1)` verbatim) — dropping the count prefix must
+    /// NOT drop that. Pre-fix the `-d` call hardcoded `false`, so
+    /// `caget -d DBR_CHAR -S -# 1` on a 1-element CHAR array fell through to
+    /// the numeric branch instead of printing the long string.
+    #[test]
+    fn specified_dbr_still_honours_req_elems_for_the_long_string_gate() {
+        let mut fmt = fmt_default();
+        fmt.char_array_as_string = true;
+        let one = EpicsValue::CharArray(b"A".to_vec());
+        assert_eq!(
+            format_value(&one, &fmt, None, true, CountPrefix::Never),
+            "A",
+            "`-S -# 1`: reqElems opens the long-string gate"
+        );
+        assert_eq!(
+            format_value(&one, &fmt, None, false, CountPrefix::Never),
+            "65",
+            "`-S` alone on a 1-element CHAR array stays numeric (C's gate)"
+        );
     }
 
     #[test]
     fn enum_with_strings_renders_string() {
         let strs: Vec<PvString> = vec!["off".into(), "on".into()];
         let v = EpicsValue::Enum(1);
-        let s = format_value(&v, &fmt_default(), Some(&strs), false);
+        let s = fv(&v, &fmt_default(), Some(&strs), false);
         assert_eq!(s, "on");
     }
 
@@ -935,7 +1156,7 @@ mod tests {
         let v = EpicsValue::Enum(1);
         let mut fmt = fmt_default();
         fmt.enum_as_number = true;
-        let s = format_value(&v, &fmt, Some(&strs), false);
+        let s = fv(&v, &fmt, Some(&strs), false);
         assert_eq!(s, "1");
     }
 
@@ -944,7 +1165,7 @@ mod tests {
         let v = EpicsValue::CharArray(b"hello\0xxxx".to_vec());
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
-        assert_eq!(format_value(&v, &fmt, None, false), "hello");
+        assert_eq!(fv(&v, &fmt, None, false), "hello");
     }
 
     #[test]
@@ -960,7 +1181,7 @@ mod tests {
         assert_eq!(escape_from_raw(&[0xc3, 0xa9]), "\\xc3\\xa9");
         // String scalar through format_value is escaped.
         assert_eq!(
-            format_value(
+            fv(
                 &EpicsValue::String("x\ty".into()),
                 &fmt_default(),
                 None,
@@ -970,22 +1191,126 @@ mod tests {
         );
         // StringArray elements escaped; count prefix preserved.
         let a = EpicsValue::StringArray(vec!["a\nb".into(), "c".into()]);
-        assert_eq!(format_value(&a, &fmt_default(), None, false), "2 a\\nb c");
+        assert_eq!(fv(&a, &fmt_default(), None, false), "2 a\\nb c");
         // `-S` long-string: escape the printable prefix up to NUL.
         let mut sfmt = fmt_default();
         sfmt.char_array_as_string = true;
         let cv = EpicsValue::CharArray(b"hi\tthere\0junk".to_vec());
-        assert_eq!(format_value(&cv, &sfmt, None, true), "hi\\tthere");
+        assert_eq!(fv(&cv, &sfmt, None, true), "hi\\tthere");
     }
 
     #[test]
     fn float_as_int_rounds_then_renders() {
         let v = EpicsValue::Double(1234.6);
         let mut fmt = fmt_default();
-        fmt.float_as_int = true;
-        fmt.int_style = IntStyle::Hex;
+        // C `-lx` sets outTypeF only (caget.c:493-496).
+        fmt.float_style = IntStyle::Hex;
         // 1235 = 0x4D3 (sprint_long uses uppercase %X)
-        assert_eq!(format_value(&v, &fmt, None, false), "0x4D3");
+        assert_eq!(fv(&v, &fmt, None, false), "0x4D3");
+    }
+
+    /// C `val2str` routes DBR_CHAR through `sprintf("%d", ch)`
+    /// (`tool_lib.c:160-161`), NOT through `sprint_long(.., outTypeI)` —
+    /// only DBR_INT / DBR_LONG take the `-0x`/`-0o`/`-0b` base. Every CHAR
+    /// carrier (scalar and array, signed `Char` and unsigned `UChar`) is
+    /// therefore plain decimal whatever the base flag says.
+    ///
+    /// Pre-fix: `caget -0x` on a CHAR PV holding 0xFF printed `0xFFFFFFFF`;
+    /// C prints `-1`.
+    #[test]
+    fn char_ignores_the_int_base_flag() {
+        for style in [IntStyle::Hex, IntStyle::Oct, IntStyle::Bin, IntStyle::Dec] {
+            let mut fmt = fmt_default();
+            fmt.int_style = style;
+            // Signed CHAR carrier: 0xFF is -1 as a C `char`.
+            assert_eq!(
+                fv(&EpicsValue::Char(0xFF), &fmt, None, false),
+                "-1",
+                "DBR_CHAR is %d, never sprint_long ({style:?})"
+            );
+            assert_eq!(
+                fv(&EpicsValue::UChar(255), &fmt, None, false),
+                "255",
+                "the unsigned CHAR carrier is %d too ({style:?})"
+            );
+            assert_eq!(
+                fv(&EpicsValue::CharArray(vec![255, 1]), &fmt, None, false),
+                "2 -1 1",
+                "a CHAR array renders every element via the same %d arm ({style:?})"
+            );
+            assert_eq!(
+                fv(&EpicsValue::UCharArray(vec![255, 1]), &fmt, None, false),
+                "2 255 1",
+                "an unsigned CHAR array likewise ({style:?})"
+            );
+        }
+        // Negative control: DBR_INT / DBR_LONG DO carry the base — the
+        // integer arms are the ones C hands to `sprint_long(.., outTypeI)`.
+        let mut hex = fmt_default();
+        hex.int_style = IntStyle::Hex;
+        assert_eq!(fv(&EpicsValue::Short(-1), &hex, None, false), "0xFFFFFFFF");
+        assert_eq!(fv(&EpicsValue::Long(-1), &hex, None, false), "0xFFFFFFFF");
+        assert_eq!(
+            fv(&EpicsValue::LongArray(vec![-1]), &hex, None, true),
+            "1 0xFFFFFFFF"
+        );
+    }
+
+    /// C `val2str`'s DBR_ENUM arm prints the index with a bare `sprintf("%d")`
+    /// (`tool_lib.c:187`), so an ENUM index never carries the `-0x` base
+    /// either. (`caget -n` on a native ENUM field re-requests DBR_TIME_INT,
+    /// which arrives as a SHORT carrier and DOES carry the base — that is the
+    /// negative control in [`char_ignores_the_int_base_flag`].)
+    #[test]
+    fn enum_index_ignores_the_int_base_flag() {
+        let mut fmt = fmt_default();
+        fmt.int_style = IntStyle::Hex;
+        // No labels available (`caget -d DBR_ENUM`): C prints the index.
+        assert_eq!(fv(&EpicsValue::Enum(255), &fmt, None, false), "255");
+        // `-n` with labels present (`-d DBR_GR_ENUM -n`): still the index.
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
+        fmt.enum_as_number = true;
+        assert_eq!(fv(&EpicsValue::Enum(1), &fmt, Some(&strs), false), "1");
+    }
+
+    /// The two C base globals are independent (`outTypeI` / `outTypeF`):
+    /// `-lx` must NOT hex an integer PV, and `-0x` must NOT hex a float PV.
+    /// Pre-fix both flags wrote one shared `int_style`, so `-lx` on a LONG PV
+    /// printed hex where C prints decimal.
+    #[test]
+    fn int_and_float_bases_do_not_cross() {
+        // `-lx`: outTypeF = hex, outTypeI stays dec.
+        let mut lx = fmt_default();
+        lx.float_style = IntStyle::Hex;
+        assert_eq!(
+            fv(&EpicsValue::Long(1235), &lx, None, false),
+            "1235",
+            "-lx leaves DBR_LONG on outTypeI = dec"
+        );
+        assert_eq!(
+            fv(&EpicsValue::Double(1234.6), &lx, None, false),
+            "0x4D3",
+            "-lx rounds the float and prints it in outTypeF"
+        );
+        // `-0x`: outTypeI = hex, outTypeF stays dec → the float keeps %g.
+        let mut ix = fmt_default();
+        ix.int_style = IntStyle::Hex;
+        assert_eq!(fv(&EpicsValue::Long(1235), &ix, None, false), "0x4D3");
+        assert_eq!(
+            fv(&EpicsValue::Double(1234.6), &ix, None, false),
+            "1234.6",
+            "-0x leaves DBR_DOUBLE on outTypeF = dec (the -e/-f/-g format)"
+        );
+    }
+
+    /// C's base resolution: the flag letter picks the base, no flag → `dec`
+    /// (`caget.c:486-495`).
+    #[test]
+    fn base_style_resolves_c_out_type() {
+        assert_eq!(base_style(true, false, false), IntStyle::Hex);
+        assert_eq!(base_style(false, true, false), IntStyle::Oct);
+        assert_eq!(base_style(false, false, true), IntStyle::Bin);
+        assert_eq!(base_style(false, false, false), IntStyle::Dec);
     }
 
     #[test]
@@ -1128,7 +1453,7 @@ mod tests {
         let mut fmt = fmt_default();
         fmt.max_elements = Some(3);
         // `-#` implies `req_elems_present` so the count prefix is present.
-        let s = format_value(&v, &fmt, None, true);
+        let s = fv(&v, &fmt, None, true);
         // Total count is full (10) per C `caget -# 3` behaviour:
         //   "10 0 1 2"
         assert_eq!(s, "10 0 1 2");

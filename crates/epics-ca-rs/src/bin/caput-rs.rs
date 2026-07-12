@@ -3,8 +3,8 @@ use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str, stat_to_str,
-    zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, scan_leading_i64,
+    sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
@@ -23,10 +23,18 @@ fn format_server_timestamp(ts: WallTime) -> String {
 /// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
 fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> String {
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-    // caput has no `-#` element-count flag, so req_elems is always false:
-    // an array count prefix is emitted only when the array length itself
-    // exceeds 1 (matches C `caget.c` / `tool_lib.c` PRN_TIME_VAL_STS gating).
-    let val = format_value(&snap.value, fmt, enum_strings, false);
+    // C `caput.c:535,583` calls its `caget()` with `reqElems = 0`, so the
+    // count prefix reduces to `nElems > 1` and the `-S` long-string gate to
+    // `reqElems(0) || reqElems_pv > 1` — `req_elems` is always false here even
+    // though `-#` is accepted on the command line (its value is overwritten
+    // before the put, `caput.c:418,441`).
+    let val = format_value(
+        &snap.value,
+        fmt,
+        enum_strings,
+        false,
+        CountPrefix::IfRequestedOrArray,
+    );
     let ts = format_server_timestamp(snap.timestamp);
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
@@ -48,8 +56,30 @@ fn format_client_timestamp() -> String {
     format_server_timestamp(SystemTime::now().into())
 }
 
-/// What C's `caget()` (`caput.c:130-240`) prints for one readback, WITHOUT
-/// the `Old : ` / `New : ` prefix its caller already emitted.
+/// The SINGLE owner of what a `caput` readback may write to STDERR.
+///
+/// C's `caget()` (`caput.c:130-240`) has exactly ONE `fprintf(stderr, ...)`:
+/// the `ca_pend_io` timeout warning (`caput.c:186-188`). Every other outcome
+/// is silent on stderr —
+///
+/// * a CA error or read denial renders its `*** ...` marker on STDOUT inside
+///   the print loop (`caput.c:200-206`) and `caget()` still returns 0;
+/// * `!nConn` returns 1 from `caput.c:181` BEFORE the print loop, so C emits
+///   nothing on EITHER stream for that PV.
+///
+/// Routing both readback sites through one exhaustive match is what keeps a
+/// caller from inventing a diagnostic C never prints: `caput-rs` used to
+/// `eprintln!("error: {e}")` on the `New :` disconnect path, which has no C
+/// counterpart (the exit code already matched).
+fn readback_stderr(rb: &Readback) -> Option<&'static str> {
+    match rb {
+        Readback::TimedOut(..) => Some("Read operation timed out: PV data was not read."),
+        Readback::Value(..) | Readback::Disconnected | Readback::Other(_) => None,
+    }
+}
+
+/// What C's `caget()` (`caput.c:130-240`) prints on STDOUT for one readback,
+/// WITHOUT the `Old : ` / `New : ` prefix its caller already emitted.
 ///
 /// `None` means C returned from `if (!nConn) return 1` (`caput.c:181`) BEFORE
 /// reaching its print loop — it printed nothing at all, not even a newline,
@@ -71,7 +101,7 @@ fn readback_line(
         // C treats a timed-out read exactly like a successful one here: the
         // zeroed buffer is still a buffer (see `zero_readback`).
         Readback::Value(v, snap) | Readback::TimedOut(v, snap) => {
-            let rendered = format_value(v, fmt, None, false);
+            let rendered = format_value(v, fmt, None, false, CountPrefix::IfRequestedOrArray);
             if terse {
                 return Some(rendered);
             }
@@ -81,7 +111,7 @@ fn readback_line(
                 (false, _) => format!("{name_col}{sep}{rendered}"),
             })
         }
-        Readback::Disconnected(_) => None,
+        Readback::Disconnected => None,
         Readback::Other(e) => {
             let marker = ca_error_marker(e.to_eca_status());
             Some(if terse {
@@ -172,6 +202,21 @@ struct Args {
     #[arg(short = 'a', long = "array", overrides_with = "long_string")]
     array_mode: bool,
 
+    /// Vestigial array element count. C's getopt string accepts `-# <n>`
+    /// (`caput.c:290`, `":cnlhatsVS#:w:p:F:"`) and scans it into `count`
+    /// (`:336-343`), but `count` is OVERWRITTEN unconditionally before the
+    /// put — with `argc - optind` in `-a` array mode (`:418`) and with `1` in
+    /// scalar mode (`:441`) — so the value never reaches the wire, the
+    /// readback element count, or the output. Accepted here for the same
+    /// reason C accepts it: `caput -# 3 PV 1` must not fail, and clap
+    /// otherwise exits 2 on the unknown flag.
+    ///
+    /// Held as a raw `String` so a non-numeric argument reproduces C's
+    /// `sscanf`-failure warning ([`Args::warn_bad_element_count`]) instead of
+    /// clap's own parse error.
+    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
+    max_elements: Option<String>,
+
     /// Alternate output field separator.
     #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
     field_separator: Option<char>,
@@ -187,9 +232,30 @@ struct Args {
     values: Vec<String>,
 }
 
+impl Args {
+    /// C `caput.c:336-343`: `-#` scans its argument with `sscanf("%d")` and,
+    /// on failure, warns and falls back to `count = 0`. The count is dead
+    /// either way (see [`Args::max_elements`]), so this warning is the flag's
+    /// ONLY observable effect — reproduce it rather than swallow the argument
+    /// silently. `None` when `-#` was absent or its argument scanned.
+    fn warn_bad_element_count_text(&self) -> Option<String> {
+        let raw = self.max_elements.as_deref()?;
+        if scan_leading_i64(raw).is_some() {
+            return None;
+        }
+        Some(format!(
+            "'{raw}' is not a valid array element count - ignored. ('caput -h' for help.)"
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    // C warns inside its getopt loop, before any of the work below.
+    if let Some(warning) = args.warn_bad_element_count_text() {
+        eprintln!("{warning}");
+    }
 
     if args.version {
         println!("{VERSION_INFO}");
@@ -344,10 +410,11 @@ async fn main() {
             read_elems,
             long_mode,
         );
-        if matches!(rb, Readback::TimedOut(..)) {
-            // C caput.c:186-188 warns and keeps going, printing the zeroed
-            // buffer on the `Old :` line.
-            eprintln!("Read operation timed out: PV data was not read.");
+        // C's `caget()` emits its stderr warning (if any) BEFORE the print
+        // loop (`caput.c:186-188` then `:191`). `readback_stderr` is the only
+        // source of it.
+        if let Some(warning) = readback_stderr(&rb) {
+            eprintln!("{warning}");
         }
         match readback_line(&rb, &name_col, sep, &fmt, false, long_mode) {
             Some(line) => println!("{line}"),
@@ -440,18 +507,19 @@ async fn main() {
         read_elems,
         long_mode,
     );
-    if matches!(rb, Readback::TimedOut(..)) {
-        eprintln!("Read operation timed out: PV data was not read.");
+    if let Some(warning) = readback_stderr(&rb) {
+        eprintln!("{warning}");
     }
     match readback_line(&rb, &name_col, sep, &fmt, args.terse, long_mode) {
         Some(line) => println!("{line}"),
-        // `!nConn`: C's caget() printed nothing and returned 1, which IS
-        // caput's exit status here (caput.c:589).
+        // `!nConn`: C's `caget()` returns 1 from `caput.c:181` BEFORE its
+        // print loop, so it emits NOTHING for this PV — no stdout line (not
+        // even a newline after the `New : ` prefix) and no stderr
+        // diagnostic. That return value IS caput's exit status
+        // (`caput.c:583,589`). Flush so the bare prefix reaches stdout
+        // before the process exits.
         None => {
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            if let Readback::Disconnected(e) = &rb {
-                eprintln!("error: {e}");
-            }
             std::process::exit(1);
         }
     }
@@ -494,9 +562,15 @@ enum Readback {
     /// falls through to the print loop with the ZEROED buffer. Exit stays 0.
     TimedOut(EpicsValue, Option<Snapshot>),
     /// No channel connected: C `caget()` returns 1 from `if (!nConn) return
-    /// 1` (`caput.c:181`) before printing anything, and caput propagates it
-    /// as the exit status (`caput.c:583,589`).
-    Disconnected(CaError),
+    /// 1` (`caput.c:181`) BEFORE its print loop, and caput propagates that as
+    /// the exit status (`caput.c:583,589`).
+    ///
+    /// The variant is deliberately payload-free. C prints nothing at all on
+    /// this path — not the PV's `*** not connected` marker (the print loop is
+    /// never reached) and not any stderr diagnostic — so there is no CA error
+    /// text to render, and carrying one only invited the port-invented
+    /// `error: channel disconnected` line this replaces.
+    Disconnected,
     /// Any other readback failure. C's `ca_array_get` failing *synchronously*
     /// — most notably read-access-denied, which libca rejects client-side with
     /// `ECA_NORDACCESS` before any I/O is outstanding — leaves `ca_pend_io` at
@@ -543,7 +617,7 @@ fn classify_readback(
             let (value, snap) = zero_readback(native, as_string, count, long_mode);
             Readback::TimedOut(value, snap)
         }
-        Err(e @ (CaError::Disconnected | CaError::Shutdown)) => Readback::Disconnected(e),
+        Err(CaError::Disconnected | CaError::Shutdown) => Readback::Disconnected,
         Err(e) => Readback::Other(e),
     }
 }
@@ -882,8 +956,8 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Readback, WriteValue, build_write_value, classify_readback, raw_from_escaped,
-        raw_from_escaped_string, zero_readback,
+        Args, Readback, ValueFormat, WriteValue, build_write_value, classify_readback,
+        raw_from_escaped, raw_from_escaped_string, readback_line, readback_stderr, zero_readback,
     };
     use clap::Parser;
     use epics_base_rs::types::WallTime;
@@ -896,6 +970,45 @@ mod tests {
 
     fn menu_vals(s: &[&str]) -> Vec<epics_ca_rs::PvString> {
         s.iter().map(|x| (*x).into()).collect()
+    }
+
+    /// C's getopt string accepts `-# <n>` (`caput.c:290`) and scans it into
+    /// `count` (`:336-343`), but `count` is then overwritten unconditionally —
+    /// `argc - optind` in `-a` mode (`:418`), `1` in scalar mode (`:441`) — so
+    /// the flag is vestigial: it must PARSE, and it must change nothing.
+    ///
+    /// Pre-fix caput-rs had no `-#` at all, so clap exited 2 on the unknown
+    /// flag where C runs the put.
+    #[test]
+    fn hash_flag_is_accepted_and_ignored() {
+        // Scalar: `-# 3` parses, and the value list is untouched.
+        let a = Args::try_parse_from(["caput", "-#", "3", "PV", "42"])
+            .expect("C's getopt accepts -# (caput.c:290); clap must too");
+        assert_eq!(a.max_elements.as_deref(), Some("3"));
+        assert_eq!(a.pv_name.as_deref(), Some("PV"));
+        assert_eq!(a.values, vals(&["42"]));
+        // The count that reaches the wire comes from the values, never from
+        // `-#` — C overwrites it at caput.c:441.
+        assert!(a.warn_bad_element_count_text().is_none());
+
+        // Array mode: `-# 1` must not truncate the 3-element write.
+        let a = Args::try_parse_from(["caput", "-a", "-#", "1", "WF", "3", "1", "2", "3"])
+            .expect("-# parses alongside -a");
+        assert!(a.array_mode);
+        assert_eq!(a.values, vals(&["3", "1", "2", "3"]));
+
+        // A non-numeric argument: C's `sscanf` fails, warns, and keeps going
+        // (caput.c:337-342). It must NOT be a hard error.
+        let a = Args::try_parse_from(["caput", "-#", "abc", "PV", "42"])
+            .expect("C warns on a bad -# argument, it does not exit");
+        assert_eq!(
+            a.warn_bad_element_count_text().as_deref(),
+            Some("'abc' is not a valid array element count - ignored. ('caput -h' for help.)")
+        );
+        // C's `sscanf("%d")` takes a LEADING integer and ignores the tail, so
+        // `3x` scans fine and warns nothing.
+        let a = Args::try_parse_from(["caput", "-#", "3x", "PV", "42"]).expect("leading digits");
+        assert!(a.warn_bad_element_count_text().is_none());
     }
 
     /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two
@@ -1015,6 +1128,52 @@ mod tests {
         );
     }
 
+    /// C's `caget()` inside caput has exactly ONE `fprintf(stderr, ...)` — the
+    /// `ca_pend_io` timeout warning (`caput.c:186-188`). Everything else is
+    /// silent on stderr: a CA error / read denial renders its `*** ...` marker
+    /// on STDOUT (`caput.c:200-206`), and the `!nConn` path returns from
+    /// `caput.c:181` BEFORE the print loop, emitting nothing on EITHER stream.
+    ///
+    /// Pre-fix, `caput-rs`'s `New :` disconnect path wrote a port-invented
+    /// `error: channel disconnected` to stderr (the exit code already matched
+    /// C's `return 1`). The `Readback::Disconnected` variant is now
+    /// payload-free, so there is no error text left to render, and both
+    /// readback sites take their stderr from this one function.
+    #[test]
+    fn readback_disconnect_prints_nothing_on_either_stream() {
+        let fmt = ValueFormat::default();
+
+        // `!nConn`: silent on stdout AND stderr, in every output mode.
+        assert_eq!(readback_stderr(&Readback::Disconnected), None);
+        for (terse, long_mode) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                readback_line(&Readback::Disconnected, "PV", ' ', &fmt, terse, long_mode),
+                None,
+                "C never reaches its print loop (terse={terse}, long={long_mode})"
+            );
+        }
+
+        // The ONE stderr line C does print.
+        assert_eq!(
+            readback_stderr(&Readback::TimedOut(EpicsValue::Double(0.0), None)),
+            Some("Read operation timed out: PV data was not read.")
+        );
+
+        // Negative control: a CA error is NOT silent — but it speaks on
+        // STDOUT, via the marker, and still says nothing on stderr.
+        let other = Readback::Other(CaError::ServerError(epics_ca_rs::protocol::ECA_NORDACCESS));
+        assert_eq!(readback_stderr(&other), None);
+        let line = readback_line(&other, "PV", ' ', &fmt, true, false)
+            .expect("a CA error still reaches C's print loop");
+        assert_eq!(line, "*** no read access");
+
+        // A good readback is silent on stderr too.
+        assert_eq!(
+            readback_stderr(&Readback::Value(EpicsValue::Double(1.0), None)),
+            None
+        );
+    }
+
     /// Only `!nConn` (`caput.c:181`) makes C's readback return non-zero.
     #[test]
     fn readback_disconnect_is_fatal() {
@@ -1027,11 +1186,11 @@ mod tests {
                 1,
                 false
             ),
-            Readback::Disconnected(_)
+            Readback::Disconnected
         ));
         assert!(matches!(
             classify_readback(Err(CaError::Shutdown), DbFieldType::Double, false, 1, false),
-            Readback::Disconnected(_)
+            Readback::Disconnected
         ));
     }
 

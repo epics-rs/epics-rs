@@ -3,9 +3,9 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, ca_error_marker,
-    dbr_value_field_type, format_value, sevr_to_str, stat_to_str, zero_dbr_snapshot,
-    zero_dbr_value,
+    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, base_style,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_value, scan_leading_i64, sevr_to_str,
+    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -195,14 +195,11 @@ impl Args {
                 precision: p,
             };
         }
-        if self.ix_flag || self.lx_flag {
-            fmt.int_style = IntStyle::Hex;
-        } else if self.io_flag || self.lo_flag {
-            fmt.int_style = IntStyle::Oct;
-        } else if self.ib_flag || self.lb_flag {
-            fmt.int_style = IntStyle::Bin;
-        }
-        fmt.float_as_int = self.lx_flag || self.lo_flag || self.lb_flag;
+        // C `caget.c:485-497` writes exactly ONE of the two base globals per
+        // flag: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
+        // `outTypeF` (floats, via round-to-long). They never cross.
+        fmt.int_style = base_style(self.ix_flag, self.io_flag, self.ib_flag);
+        fmt.float_style = base_style(self.lx_flag, self.lo_flag, self.lb_flag);
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
         fmt.max_elements = self.max_elements;
@@ -315,9 +312,9 @@ fn dbr_text(code: u16) -> &'static str {
 /// values. Each line is indented with four spaces and the block carries
 /// no trailing newline.
 ///
-/// Numeric limit formatting follows the C macros' spirit (`%8d` for
-/// integer classes, `%g` for float/double) but exact `sprint_long`/`%g`
-/// byte-parity is a separate concern.
+/// Numeric limits take the conversion the C macro embeds: `%8d` for the
+/// integer classes and a hardcoded `%g` for FLOAT/DOUBLE, rendered by
+/// [`epics_ca_rs::cli::format_c_g`] — NOT the `-e`/`-f`/`-g` value format.
 fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
     if req_type <= 6 {
         return String::new();
@@ -371,11 +368,17 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
             let is_float = matches!(req_type, 23 | 27 | 30 | 34); // GR/CTRL FLOAT/DOUBLE
             let is_int = matches!(req_type, 22 | 25 | 26 | 29 | 32 | 33); // SHORT/CHAR/LONG
             let d = snap.display.clone().unwrap_or_default();
+            // C renders each limit straight from the `FMT_GR` / `FMT_CTRL`
+            // macro's embedded conversion — `%8d` for the integer classes,
+            // a hardcoded `%g` for FLOAT/DOUBLE (`tool_lib.c:248-254`). The
+            // `-e`/`-f`/`-g` flags only rewrite `dblFormatStr`, which is
+            // read by `val2str` (the Value line) and never by `dbr2str`, so
+            // `fmt` deliberately does not participate here.
             let lim = |v: f64| -> String {
                 if is_int {
                     format!("{:8}", v as i64)
                 } else {
-                    format!("{v}")
+                    format_c_g(v)
                 }
             };
             let mut out = sts;
@@ -446,6 +449,7 @@ fn specified_dbr_report(
     req_type: u16,
     snap: &Snapshot,
     fmt: &ValueFormat,
+    req_elems: bool,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -468,10 +472,18 @@ fn specified_dbr_report(
         let _ = writeln!(out, "    Class Name:       {cn}");
     } else {
         let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-        // C's specifiedDbr Value line joins elements WITHOUT a leading
-        // count (unlike plain mode), so render with req_elems_present=false;
-        // a scalar therefore renders as the bare value.
-        let rendered = format_value(&snap.value, fmt, enum_strings, false);
+        // C `caget.c:328-334`: this block already printed `Element count:` on
+        // its own line, so its Value loop joins the elements BARE — there is
+        // no `printf("%lu%c", nElems, ...)` here, unlike the plain/terse loop
+        // at `:286`. `reqElems` still reaches the `-S` long-string gate
+        // (`caget.c:318`), so it is passed through unchanged.
+        let rendered = format_value(
+            &snap.value,
+            fmt,
+            enum_strings,
+            req_elems,
+            CountPrefix::Never,
+        );
         let _ = writeln!(out, "    Element count:    {}", snap.value.count());
         let _ = writeln!(out, "    Value:            {rendered}");
         let ext = dbr_extended_str(req_type, snap);
@@ -884,9 +896,10 @@ async fn main() {
 
     let fmt = args.value_format();
     let sep = fmt.field_separator;
-    // C `caget.c:286` gates the array count prefix on
-    // `reqElems || nElems > 1`. `reqElems` is non-zero iff the user
-    // passed `-#` on the command line.
+    // C's `reqElems` — non-zero iff the user passed `-#`. It feeds BOTH the
+    // plain/terse count-prefix gate (`caget.c:286`) and the `-S` long-string
+    // gate on every block (`caget.c:273,318`); the specifiedDbr Value loop
+    // takes the second but not the first (`CountPrefix::Never`).
     let req_elems_present = args.max_elements.is_some();
     // Mirror C `caget.c::main` (line 260): pad the PV name column to
     // 30 characters only when the value is a scalar AND the field
@@ -907,7 +920,13 @@ async fn main() {
     {
         match result {
             Ok(GetResult::Plain(value)) => {
-                let rendered = format_value(value, &fmt, None, req_elems_present);
+                let rendered = format_value(
+                    value,
+                    &fmt,
+                    None,
+                    req_elems_present,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = value.count() == 1;
                 if mode == OutputMode::Terse {
                     println!("{rendered}");
@@ -923,7 +942,13 @@ async fn main() {
                 // fields) on NO_ALARM. Mirror that exactly using the
                 // alarm pair the DBR_TIME response carried.
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
+                let rendered = format_value(
+                    &snap.value,
+                    &fmt,
+                    enum_strings,
+                    req_elems_present,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = snap.value.count() == 1;
                 let ts = format_server_timestamp(snap.timestamp);
                 let stat = snap.alarm.status;
@@ -953,7 +978,14 @@ async fn main() {
             }) => {
                 print!(
                     "{}",
-                    specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
+                    specified_dbr_report(
+                        pv_name,
+                        *native,
+                        *req_type,
+                        snap,
+                        &fmt,
+                        req_elems_present
+                    )
                 );
             }
             Err(e) => {
@@ -977,35 +1009,6 @@ async fn main() {
     if n_conn == 0 {
         std::process::exit(1);
     }
-}
-
-/// C `sscanf(optarg, "%d", &type)` semantics: skip leading whitespace,
-/// accept an optional sign, then take the leading run of decimal digits
-/// — trailing junk is ignored (`"16x"` → `16`, `"0x10"` → `0`). Returns
-/// `None` when no digit leads (C's `sscanf` returns 0, so `caget` falls
-/// through to the textual `dbr_text_to_type` lookup).
-fn scan_leading_i64(s: &str) -> Option<i64> {
-    let s = s.trim_start();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut neg = false;
-    if let Some(&c) = bytes.first()
-        && (c == b'+' || c == b'-')
-    {
-        neg = c == b'-';
-        i = 1;
-    }
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    s[start..i]
-        .parse::<i64>()
-        .ok()
-        .map(|n| if neg { -n } else { n })
 }
 
 /// resolve a `caget -d <type>` token to an EXACT DBR type code,
@@ -1051,10 +1054,13 @@ mod tests {
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
     use epics_base_rs::types::WallTime;
     use epics_base_rs::types::{
-        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_STRING,
-        DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_LONG,
+        DBR_STRING, DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
-    use epics_ca_rs::cli::{EPICS_EPOCH_UNIX_SECS, ValueFormat, zero_dbr_snapshot, zero_dbr_value};
+    use epics_ca_rs::cli::{
+        EPICS_EPOCH_UNIX_SECS, FloatFormat, FloatStyle, ValueFormat, zero_dbr_snapshot,
+        zero_dbr_value,
+    };
     use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
     use std::time::SystemTime;
@@ -1323,6 +1329,7 @@ mod tests {
             DBR_CTRL_DOUBLE,
             &snap,
             &ValueFormat::default(),
+            false,
         );
         assert!(out.starts_with("ai:temp\n"), "{out}");
         assert!(out.contains("    Native data type: DBF_DOUBLE\n"), "{out}");
@@ -1338,8 +1345,129 @@ mod tests {
         assert!(out.contains("    Hi ctrl limit:    9\n"), "{out}");
     }
 
-    // C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
-    // (no element count / value / extended block).
+    /// C's `FMT_GR` / `FMT_CTRL` macros embed a hardcoded `%g` for the
+    /// FLOAT/DOUBLE limit classes (`tool_lib.c:248-254,375-386`), so every
+    /// graphic/control limit prints at printf's default 6 significant digits.
+    /// The `-e`/`-f`/`-g` flags rewrite `dblFormatStr`, which only `val2str`
+    /// reads — they must NOT reach a limit line.
+    ///
+    /// Pre-fix the `lim` closure used Rust's `Display`, printing the full f64
+    /// (`3.14159265`, `1000000`) where C prints `3.14159` / `1e+06`.
+    #[test]
+    fn gr_ctrl_float_limits_use_c_hardcoded_g() {
+        let mut snap = ctrl_double_snap();
+        let d = snap
+            .display
+            .as_mut()
+            .expect("ctrl_double_snap sets display");
+        // Verified against `printf("%g", ...)`: 8.76543 / 1e+06 / -0.00123457.
+        d.lower_disp_limit = 8.765_432_19;
+        d.upper_disp_limit = 1e6;
+        d.lower_alarm_limit = -0.001234567;
+        let c = snap
+            .control
+            .as_mut()
+            .expect("ctrl_double_snap sets control");
+        c.upper_ctrl_limit = 123456789.0;
+
+        // The limit block must be identical under EVERY float style, because
+        // C's limits never consult `dblFormatStr`.
+        for float in [
+            FloatFormat::default(),
+            FloatFormat {
+                style: FloatStyle::F,
+                precision: 9,
+            },
+            FloatFormat {
+                style: FloatStyle::E,
+                precision: 2,
+            },
+            FloatFormat {
+                style: FloatStyle::G,
+                precision: 12,
+            },
+        ] {
+            let fmt = ValueFormat {
+                float,
+                ..ValueFormat::default()
+            };
+            let out = specified_dbr_report(
+                "ai:temp",
+                Some(DbFieldType::Double),
+                DBR_CTRL_DOUBLE,
+                &snap,
+                &fmt,
+                false,
+            );
+            assert!(
+                out.contains("    Lo disp limit:    8.76543\n"),
+                "%g truncates to 6 significant digits: {out}"
+            );
+            assert!(
+                out.contains("    Hi disp limit:    1e+06\n"),
+                "%g switches to scientific at exp >= precision: {out}"
+            );
+            assert!(out.contains("    Lo alarm limit:   -0.00123457\n"), "{out}");
+            assert!(out.contains("    Hi ctrl limit:    1.23457e+08\n"), "{out}");
+        }
+        // Negative control: the VALUE line DOES follow `-f 9` (C `val2str`
+        // reads `dblFormatStr`), so the two renderings are genuinely distinct.
+        let f9 = ValueFormat {
+            float: FloatFormat {
+                style: FloatStyle::F,
+                precision: 9,
+            },
+            ..ValueFormat::default()
+        };
+        let out = specified_dbr_report(
+            "ai:temp",
+            Some(DbFieldType::Double),
+            DBR_CTRL_DOUBLE,
+            &snap,
+            &f9,
+            false,
+        );
+        assert!(
+            out.contains("    Value:            1.500000000\n"),
+            "-f 9 must still reach the Value line: {out}"
+        );
+    }
+
+    /// C `caget.c:317-335`: the specifiedDbr block prints `Element count:` on
+    /// its own line and then a BARE value loop — unlike the plain loop at
+    /// `:286` it carries no `printf("%lu%c", nElems, sep)` count prefix.
+    ///
+    /// Pre-fix, `format_value`'s array renderers prefixed the count whenever
+    /// `total > 1` regardless of the `false` passed here, so `caget -d
+    /// DBR_LONG` on a 3-element array printed `Value:            3 10 20 30`
+    /// where C prints `Value:            10 20 30`.
+    #[test]
+    fn specified_report_value_line_has_no_count_prefix() {
+        let snap = Snapshot::new(
+            EpicsValue::LongArray(vec![10, 20, 30]),
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        );
+        for req_elems in [false, true] {
+            let out = specified_dbr_report(
+                "wf:x",
+                Some(DbFieldType::Long),
+                DBR_LONG,
+                &snap,
+                &ValueFormat::default(),
+                req_elems,
+            );
+            assert!(out.contains("    Element count:    3\n"), "{out}");
+            assert!(
+                out.contains("    Value:            10 20 30\n"),
+                "the -d Value loop is bare (req_elems={req_elems}): {out}"
+            );
+        }
+    }
+
+    /// C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
+    /// (no element count / value / extended block).
     #[test]
     fn specified_report_class_name_prints_class_line_only() {
         let mut snap = Snapshot::new(
@@ -1355,6 +1483,7 @@ mod tests {
             DBR_CLASS_NAME,
             &snap,
             &ValueFormat::default(),
+            false,
         );
         assert!(
             out.contains("    Request type:     DBR_CLASS_NAME\n"),

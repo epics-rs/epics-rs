@@ -6,8 +6,8 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str,
-    stat_to_str,
+    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, base_style, format_value,
+    sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 
@@ -116,14 +116,11 @@ impl Args {
                 precision: p,
             };
         }
-        if self.ix_flag || self.lx_flag {
-            fmt.int_style = IntStyle::Hex;
-        } else if self.io_flag || self.lo_flag {
-            fmt.int_style = IntStyle::Oct;
-        } else if self.ib_flag || self.lb_flag {
-            fmt.int_style = IntStyle::Bin;
-        }
-        fmt.float_as_int = self.lx_flag || self.lo_flag || self.lb_flag;
+        // C `camonitor.c:325-340` writes exactly ONE of the two base globals
+        // per flag: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
+        // `outTypeF` (floats, via round-to-long). They never cross.
+        fmt.int_style = base_style(self.ix_flag, self.io_flag, self.ib_flag);
+        fmt.float_style = base_style(self.lx_flag, self.lo_flag, self.lb_flag);
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
         fmt.max_elements = self.max_elements;
@@ -359,7 +356,13 @@ async fn monitor_pv(
                 .unwrap_or_default();
                 drop(fs);
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
+                let rendered = format_value(
+                    &snap.value,
+                    &fmt,
+                    enum_strings,
+                    req_elems_present,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = snap.value.count() == 1;
                 let name_col = if is_scalar && sep == ' ' {
                     format!("{pv_name:<width$}", width = PV_NAME_WIDTH)

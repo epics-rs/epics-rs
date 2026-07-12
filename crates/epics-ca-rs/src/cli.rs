@@ -141,6 +141,68 @@ pub async fn connect_pvs(
 /// `epics-base/modules/ca/src/tools/tool_lib.c::print_value`'s width.
 pub const PV_NAME_WIDTH: usize = 30;
 
+/// `epicsAlarmConditionStrings` (`libcom/src/misc/alarmString.c:27-50`) —
+/// the alarm-status mnemonics the CA tools print. Index is the wire `stat`
+/// byte; note index 11 is `HWLIMIT`, with no underscore.
+const ALARM_CONDITION_STRINGS: [&str; 22] = [
+    "NO_ALARM",
+    "READ",
+    "WRITE",
+    "HIHI",
+    "HIGH",
+    "LOLO",
+    "LOW",
+    "STATE",
+    "COS",
+    "COMM",
+    "TIMEOUT",
+    "HWLIMIT",
+    "CALC",
+    "SCAN",
+    "LINK",
+    "SOFT",
+    "BAD_SUB",
+    "UDF",
+    "DISABLE",
+    "SIMM",
+    "READ_ACCESS",
+    "WRITE_ACCESS",
+];
+
+/// `epicsAlarmSeverityStrings` (`libcom/src/misc/alarmString.c:17-22`).
+const ALARM_SEVERITY_STRINGS: [&str; 4] = ["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
+
+/// Out-of-range alarm index rendering. C `tool_lib.h:28-36` bounds every
+/// index against `lastEpicsAlarmCond` / `lastEpicsAlarmSev` and yields
+/// `"??"` past it — the tools never print a made-up token.
+const ALARM_STRING_UNKNOWN: &str = "??";
+
+/// C `tool_lib.h:28-30` `stat_to_str` — the single owner of the CA tools'
+/// alarm-status rendering (`caget -a`, `camonitor`, `caput -l` all print
+/// through it). An index past the table yields [`ALARM_STRING_UNKNOWN`].
+///
+/// The `stat_to_str` / `stat_to_str_unsigned` macro pair differs only in
+/// C's `(stat) >= 0` lower bound, which is vacuous for the port's unsigned
+/// wire `u16`, so one function covers both.
+///
+/// Deliberately NOT delegated to `epics_base_rs::server::recgbl::
+/// alarm_condition_string`: that owner serves pvxs `alarm.message`, whose
+/// out-of-range value is `""`, not `"??"`.
+pub fn stat_to_str(stat: u16) -> &'static str {
+    ALARM_CONDITION_STRINGS
+        .get(stat as usize)
+        .copied()
+        .unwrap_or(ALARM_STRING_UNKNOWN)
+}
+
+/// C `tool_lib.h:32-34` `sevr_to_str` — see [`stat_to_str`].
+pub fn sevr_to_str(sevr: u16) -> &'static str {
+    ALARM_SEVERITY_STRINGS
+        .get(sevr as usize)
+        .copied()
+        .unwrap_or(ALARM_STRING_UNKNOWN)
+}
+
 /// Float number representation requested via `-e` / `-f` / `-g`.
 #[derive(Debug, Clone, Copy)]
 pub enum FloatStyle {
@@ -892,6 +954,56 @@ mod tests {
         assert_eq!(env_default_timeout(), 0.0);
         assert_eq!(timeout_duration(env_default_timeout()), INDEFINITE_TIMEOUT);
         unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
+    }
+
+    /// Every index of C `epicsAlarmConditionStrings` / `epicsAlarmSeverityStrings`
+    /// (`alarmString.c:17-50`), transcribed from the C arrays in order, plus the
+    /// `"??"` out-of-range fallback of the `tool_lib.h:28-36` macros.
+    ///
+    /// Index 11 is `HWLIMIT` (no underscore) and an index past the table is
+    /// `"??"` — the two the three CA-tool copies got wrong (`HW_LIMIT` /
+    /// `"Illegal value"`).
+    #[test]
+    fn alarm_strings_match_the_c_tables() {
+        const C_CONDITIONS: [&str; 22] = [
+            "NO_ALARM",
+            "READ",
+            "WRITE",
+            "HIHI",
+            "HIGH",
+            "LOLO",
+            "LOW",
+            "STATE",
+            "COS",
+            "COMM",
+            "TIMEOUT",
+            "HWLIMIT",
+            "CALC",
+            "SCAN",
+            "LINK",
+            "SOFT",
+            "BAD_SUB",
+            "UDF",
+            "DISABLE",
+            "SIMM",
+            "READ_ACCESS",
+            "WRITE_ACCESS",
+        ];
+        for (i, want) in C_CONDITIONS.iter().enumerate() {
+            assert_eq!(stat_to_str(i as u16), *want, "stat_to_str({i})");
+        }
+        assert_eq!(stat_to_str(11), "HWLIMIT", "HW_LIMIT_ALARM prints HWLIMIT");
+
+        const C_SEVERITIES: [&str; 4] = ["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
+        for (i, want) in C_SEVERITIES.iter().enumerate() {
+            assert_eq!(sevr_to_str(i as u16), *want, "sevr_to_str({i})");
+        }
+
+        // Past `lastEpicsAlarmCond` / `lastEpicsAlarmSev`: C yields "??".
+        assert_eq!(stat_to_str(22), "??");
+        assert_eq!(stat_to_str(u16::MAX), "??");
+        assert_eq!(sevr_to_str(4), "??");
+        assert_eq!(sevr_to_str(u16::MAX), "??");
     }
 
     #[test]

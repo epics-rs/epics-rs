@@ -3,7 +3,8 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
+    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str,
+    stat_to_str,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -235,44 +236,6 @@ fn format_server_timestamp(ts: WallTime) -> String {
     // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
     let dt: DateTime<Local> = SystemTime::from(ts).into();
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
-
-fn sevr_to_str(sevr: u16) -> &'static str {
-    match sevr {
-        0 => "NO_ALARM",
-        1 => "MINOR",
-        2 => "MAJOR",
-        3 => "INVALID",
-        _ => "Illegal value",
-    }
-}
-
-fn stat_to_str(stat: u16) -> &'static str {
-    match stat {
-        0 => "NO_ALARM",
-        1 => "READ",
-        2 => "WRITE",
-        3 => "HIHI",
-        4 => "HIGH",
-        5 => "LOLO",
-        6 => "LOW",
-        7 => "STATE",
-        8 => "COS",
-        9 => "COMM",
-        10 => "TIMEOUT",
-        11 => "HW_LIMIT",
-        12 => "CALC",
-        13 => "SCAN",
-        14 => "LINK",
-        15 => "SOFT",
-        16 => "BAD_SUB",
-        17 => "UDF",
-        18 => "DISABLE",
-        19 => "SIMM",
-        20 => "READ_ACCESS",
-        21 => "WRITE_ACCESS",
-        _ => "Illegal value",
-    }
 }
 
 /// C `dbf_type_to_text`: native field type → `DBF_*` mnemonic.

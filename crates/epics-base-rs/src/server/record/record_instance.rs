@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::server::event_queue::{EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, Subscriber};
+use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -376,6 +377,29 @@ pub struct RecordInstance {
     /// the cache. (The `Q:form` -> `display.form` mapping is exempt: it
     /// reads an immutable load-time info tag, not a runtime field.)
     pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
+}
+
+/// The cycle status [`RecordInstance::run_registered_subroutine`] reports when
+/// `do_sub` was skipped — C's `fetch_values` failure / `S_db_BadSub` path, which
+/// leaves `process`'s `status` non-zero (aSubRecord.c:216-224).
+const SUBROUTINE_STATUS_SKIPPED: i64 = -1;
+/// No subroutine is bound: C `do_sub` returns `S_db_BadSub` (aSubRecord.c:255).
+const SUBROUTINE_STATUS_NO_SUB: i64 = -2;
+/// The bound subroutine returned `Err` — no C counterpart (a C subroutine
+/// returns a `long`), and a failed cycle either way.
+const SUBROUTINE_STATUS_ERROR: i64 = -3;
+
+/// C `monitor()`'s post of the deadband field, as assembled by the single owner
+/// [`RecordInstance::deadband_post`].
+pub(crate) struct DeadbandPost {
+    /// C's `monitor_mask` for this cycle. Also the mask the
+    /// [`Record::fields_posted_with_value_mask`] secondaries ride: C posts them
+    /// from INSIDE the `if (monitor_mask)` guard, with the same mask.
+    pub mask: EventMask,
+    /// The deadband field's own post — `(field, value)`. `None` when no class
+    /// fired (C's `if (monitor_mask)` skips the post) or the field does not
+    /// resolve.
+    pub field: Option<(String, EpicsValue)>,
 }
 
 impl RecordInstance {
@@ -2000,23 +2024,42 @@ impl RecordInstance {
     /// `sub`/`aSub` runs identically regardless of how it is processed.
     /// Previously only `process_local` invoked the subroutine, so on the
     /// main engine path `VAL`/`VALA..VALU`/`OUTA..OUTU` never updated.
+    /// The cycle's status is delivered to the record on EVERY exit path — see
+    /// [`Record::set_subroutine_status`], which aSub's OUT-link gate reads. The
+    /// delivery is factored out of the body below so a future early return
+    /// cannot skip it: the body returns the status, this wrapper publishes it.
     pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
+        let outcome = self.run_subroutine_body();
+        // A subroutine that errored out has no C counterpart (a C subroutine
+        // returns a `long`); it is a failed cycle, so it takes the non-zero
+        // arm — no outputs.
+        let status = *outcome.as_ref().unwrap_or(&SUBROUTINE_STATUS_ERROR);
+        self.record.set_subroutine_status(status);
+        outcome.map(|_| ())
+    }
+
+    /// Returns C `process`'s `status` for this cycle: 0 only when `do_sub` ran
+    /// and returned 0.
+    fn run_subroutine_body(&mut self) -> CaResult<i64> {
         use crate::server::recgbl::{self, alarm_status};
 
         // aSub `LFLG=READ`: a `SUBL` re-resolution that found a bad/unregistered
         // name (C `fetch_values` -> `S_db_BadSub`) or failed to read the link
         // signals "skip do_sub this cycle" — C `process` runs `do_sub` only on
-        // `!status`. One-shot: taken (cleared) whether or not a subroutine is
-        // set, so it never leaks into the next cycle. The single consumer of
-        // the flag, shared by every process path.
+        // `!status`. The framework's failed input-link fetch arms the same flag.
+        // One-shot: taken (cleared) whether or not a subroutine is set, so it
+        // never leaks into the next cycle. The single consumer of the flag,
+        // shared by every process path.
         if std::mem::take(&mut self.suppress_subroutine_run) {
-            return Ok(());
+            return Ok(SUBROUTINE_STATUS_SKIPPED);
         }
 
         // Clone the Arc so the borrow on `self.subroutine` is released
         // before we mutate `self.record` / `self.common` below.
         let Some(sub_fn) = self.subroutine.clone() else {
-            return Ok(());
+            // C `do_sub` with no bound routine returns `S_db_BadSub`
+            // (aSubRecord.c:255-258), so the cycle's status is non-zero.
+            return Ok(SUBROUTINE_STATUS_NO_SUB);
         };
         // C `do_sub` returns the subroutine's `long` status.
         let status = sub_fn(&mut *self.record)?;
@@ -2048,7 +2091,7 @@ impl RecordInstance {
                 .unwrap_or(AlarmSeverity::NoAlarm);
             recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::SOFT_ALARM, brsv);
         }
-        Ok(())
+        Ok(status)
     }
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
@@ -2355,31 +2398,15 @@ impl RecordInstance {
         let deadband_field = self.record.monitor_deadband_field();
         // Fields whose change post carries DBE_VALUE only (LOG stripped) —
         // C `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
-        // scalerRecord.c:478). Consulted in the deadband post here and the
-        // generic change loop below.
+        // scalerRecord.c:478). The deadband field's own post is assembled by
+        // `deadband_post`; this local serves the generic change loop below.
         let value_only = self.record.value_only_change_fields();
-        let deadband_mask = {
-            let mut m = alarm_bits;
-            if include_val {
-                m |= EventMask::VALUE;
-            }
-            // A value-only field's archive (ADEL) LOG bit is dropped — C
-            // posts it with a literal DBE_VALUE on a value change, never
-            // DBE_LOG (the LOG sweep is the idle `monitor()` path).
-            if include_archive && !value_only.contains(&deadband_field) {
-                m |= EventMask::LOG;
-            }
-            m
-        };
-        if !deadband_mask.is_empty() {
-            let dval = if deadband_field == "VAL" {
-                self.record.val()
-            } else {
-                self.resolve_field(deadband_field)
-            };
-            if let Some(val) = dval {
-                changed_fields.push((deadband_field.to_string(), val, deadband_mask));
-            }
+        // The deadband field's post — mask owned by `deadband_post`, the single
+        // assembler C's `db_post_events(&prec->val, monitor_mask)` maps to.
+        let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
+        let deadband_mask = deadband.mask;
+        if let Some((field, value)) = deadband.field {
+            changed_fields.push((field, value, deadband_mask));
         }
         // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
         // field with its OWN per-field mask, not one record-wide mask:
@@ -2609,6 +2636,63 @@ impl RecordInstance {
     /// circuit). It is NOT a deviation inherited from an earlier
     /// silent compromise — `record_tests.rs::deadband_*` pins both
     /// the NaN-sentinel behaviour and the C four-quadrant transitions.
+    /// The single owner of the deadband field's monitor post — C `monitor()`'s
+    /// `db_post_events(&prec->val, monitor_mask)`, the one post every record
+    /// makes for the value it deadbands.
+    ///
+    /// [`Self::check_deadband_ext`] decides WHETHER the MDEL/ADEL classes fired;
+    /// this decides what the resulting post looks like, and it is the only place
+    /// that assembles that mask. The three `processing.rs` snapshot builders and
+    /// the `notify_monitors` path all route through here, so a record's mask rule
+    /// cannot hold on one processing path and not another.
+    ///
+    /// Two record hooks strip C's `DBE_LOG` from the post:
+    ///
+    /// * [`Record::value_only_change_fields`] — C posts a literal `DBE_VALUE`
+    ///   (scaler VAL, scalerRecord.c:478).
+    /// * [`Record::fields_posted_with_monitor_mask`] — C posts
+    ///   `monitor_mask | DBE_VALUE` (event VAL, eventRecord.c:163). `monitor_mask`
+    ///   there is `recGblResetAlarms`'s return, i.e. the alarm bits alone, so the
+    ///   post carries `DBE_VALUE` (+ `DBE_ALARM` when the alarm moved) and never
+    ///   the archive `DBE_LOG` — an event's VAL reaches a `DBE_LOG` archiver on
+    ///   no cycle at all.
+    ///
+    /// [`DeadbandPost::field`] is `None` when no class fired, i.e. when C's
+    /// `if (monitor_mask)` guard would skip the post.
+    pub(crate) fn deadband_post(
+        &self,
+        alarm_bits: EventMask,
+        include_val: bool,
+        include_archive: bool,
+    ) -> DeadbandPost {
+        let field = self.record.monitor_deadband_field();
+        let log_suppressed = self.record.value_only_change_fields().contains(&field)
+            || self
+                .record
+                .fields_posted_with_monitor_mask()
+                .contains(&field);
+
+        let mut mask = alarm_bits;
+        if include_val {
+            mask |= EventMask::VALUE;
+        }
+        if include_archive && !log_suppressed {
+            mask |= EventMask::LOG;
+        }
+
+        let value = if mask.is_empty() {
+            None
+        } else if field == "VAL" {
+            self.record.val()
+        } else {
+            self.resolve_field(field)
+        };
+        DeadbandPost {
+            mask,
+            field: value.map(|v| (field.to_string(), v)),
+        }
+    }
+
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
         // C waveform/aai/aao `monitor()` (waveformRecord.c:291-326) replaces
         // the analog MDEL/ADEL deadband with the MPST/APST "Always vs On

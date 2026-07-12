@@ -1,7 +1,7 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -41,6 +41,17 @@ pub struct ScalcoutRecord {
     pub out: String, // output link
     pub wait: i16,   // wait for output completion
     pub prec: i16,
+    // MDEL / ADEL (C `sCalcoutRecord.dbd:541-550`, both DBF_DOUBLE). MDEL is
+    // read on two paths: the OOPT="On Change" test
+    // (`sCalcoutRecord.c:379`, `fabs(pval - val) > mdel`) and `monitor()`
+    // (:821-826), which is the framework's MDEL/ADEL deadband path here
+    // (`uses_monitor_deadband` defaults to true, and it reads the deadbands
+    // through `get_field("MDEL")`/`("ADEL")`). Neither field existed, so the
+    // deadbands read back as the framework's 0.0 default, a client put to
+    // either was rejected with `FieldNotFound`, and the On-Change test had no
+    // deadband to consult.
+    pub mdel: f64,
+    pub adel: f64,
     // Input link strings (INPA..INPL)
     pub inp_links: [String; 12],
     // Numeric input values A-L (mapped to vars A-P, but only 12 used)
@@ -56,6 +67,11 @@ pub struct ScalcoutRecord {
     /// already inspects a `CALC_ALARM` field for `scalcout`, so this
     /// flag is surfaced through `get_field("CALC_ALARM")`.
     calc_alarm: bool,
+    /// This cycle's `fetch_values()` outcome, pushed by the framework through
+    /// `set_fetch_gate_failed`. C `sCalcoutRecord.c::process` (356) runs
+    /// `sCalcPerform` only `if (fetch_values(pcalc)==0)`, and `fetch_values`
+    /// (885-887) returns at the first failing numeric `dbGetLink`.
+    fetch_gate_failed: bool,
     /// Output decision from the last `process()`. The framework's
     /// generic multi-output dispatch reads `multi_output_links()`
     /// unconditionally, so this caches the OOPT decision and gates
@@ -100,12 +116,15 @@ impl Default for ScalcoutRecord {
             out: String::new(),
             wait: 0,
             prec: 0,
+            mdel: 0.0,
+            adel: 0.0,
             inp_links: Default::default(),
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             prev_val: 0.0,
             prev_sval: PvString::new(),
             calc_alarm: false,
+            fetch_gate_failed: false,
             cached_should_output: false,
             odly: 0.0,
             dlya: 0,
@@ -153,10 +172,15 @@ impl ScalcoutRecord {
         }
     }
 
+    /// C `sCalcoutRecord.c:374-395` — the OOPT switch. "On Change" is the
+    /// numeric MDEL-deadband test `fabs(pcalc->pval - pcalc->val) > pcalc->mdel`
+    /// (:379) and nothing else: SVAL does not take part, so a cycle that changed
+    /// only the string result does NOT drive OUT on C, and a numeric change
+    /// inside MDEL does not either.
     fn should_output(&self) -> bool {
         match self.oopt {
             0 => true,
-            1 => (self.val - self.prev_val).abs() > f64::EPSILON || self.sval != self.prev_sval,
+            1 => (self.prev_val - self.val).abs() > self.mdel,
             2 => self.val == 0.0,
             3 => self.val != 0.0,
             4 => self.prev_val != 0.0 && self.val == 0.0,
@@ -274,6 +298,16 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
     FieldDesc {
@@ -591,12 +625,22 @@ impl Record for ScalcoutRecord {
         // indication.
         self.calc_alarm = false;
 
-        // C `sCalcoutRecord.c:357-360` — sCalcPerform runs unconditionally and a
-        // non-zero return is the failure. RPCL is always a program, so "empty
-        // CALC", "CALC that would not compile" and "CALC that failed at run time"
-        // are one case here, exactly as in C: the empty program fails
-        // (`sCalcPerform.c:396`) and the record alarms every process.
-        let calc_failed = {
+        // C `sCalcoutRecord.c::process` (356-367) runs the calc only
+        // `if (fetch_values(pcalc)==0)`, and its `fetch_values` (885-887)
+        // returns at the FIRST failing numeric `dbGetLink`. A failed input link
+        // therefore freezes VAL/SVAL/UDF and raises no CALC_ALARM; the OOPT
+        // switch, ODLY and the output below still run against the frozen VAL,
+        // exactly as in C where the gate wraps only the `sCalcPerform` block.
+        //
+        // C `sCalcoutRecord.c:357-360` — inside that gate, sCalcPerform runs
+        // unconditionally and a non-zero return is the failure. RPCL is always
+        // a program, so "empty CALC", "CALC that would not compile" and "CALC
+        // that failed at run time" are one case here, exactly as in C: the
+        // empty program fails (`sCalcPerform.c:396`) and the record alarms
+        // every process.
+        let calc_failed = if self.fetch_gate_failed {
+            false
+        } else {
             // C `sCalcoutRecord.c:357-359` — presult = &pcalc->val,
             // psresult = pcalc->sval: VAL/SVAL both read this cycle's
             // pre-evaluation values (captured in prev_val/prev_sval above).
@@ -739,6 +783,8 @@ impl Record for ScalcoutRecord {
             "OUT" => Some(EpicsValue::String(self.out.clone().into())),
             "WAIT" => Some(EpicsValue::Short(self.wait)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Double(self.adel)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::Short(self.dlya)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
@@ -864,6 +910,18 @@ impl Record for ScalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("PREC".into())),
             },
+            "MDEL" => {
+                self.mdel = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MDEL".into()))?;
+                Ok(())
+            }
+            "ADEL" => {
+                self.adel = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ADEL".into()))?;
+                Ok(())
+            }
             "ODLY" => {
                 self.odly = value
                     .to_f64()
@@ -925,6 +983,20 @@ impl Record for ScalcoutRecord {
         ]
     }
 
+    /// C `sCalcoutRecord.c::fetch_values` (885-887) `return`s at the first
+    /// failing numeric `dbGetLink`, and `process` (356) gates `sCalcPerform` on
+    /// the status. (C's string-input loop that follows cannot fail the gate — it
+    /// swallows its own errors into the input string and returns 0 — and the
+    /// port does not fetch INAA..INLL at all, so only the numeric links are
+    /// represented here.)
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
+    }
+
     /// scalcout writes its computed output to the `OUT` link. The
     /// framework's generic multi-output dispatch reads the `OUT` field
     /// for the link string and `OVAL` for the value. Gated on the last
@@ -975,6 +1047,62 @@ impl Record for ScalcoutRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R9-74 (family): OOPT="On Change" is the numeric MDEL deadband test
+    /// `fabs(pval - val) > mdel` (C `sCalcoutRecord.c:379`). A numeric change
+    /// that stays inside MDEL must NOT drive OUT.
+    #[test]
+    fn r9_74_scalcout_on_change_honours_mdel_deadband() {
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
+        rec.put_field("MDEL", EpicsValue::Double(2.0)).unwrap();
+
+        rec.put_field("A", EpicsValue::Double(1.0)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 1.0);
+        assert!(
+            !rec.should_output(),
+            "|pval - val| = 1.0 is inside MDEL=2.0 — C does not drive OUT"
+        );
+
+        rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
+        rec.process().unwrap();
+        assert!(
+            rec.should_output(),
+            "|1.0 - 5.0| = 4.0 exceeds MDEL=2.0 — C drives OUT"
+        );
+    }
+
+    /// R9-74 (family): SVAL takes no part in the OOPT="On Change" test — C's
+    /// switch (`sCalcoutRecord.c:378-380`) compares only PVAL against VAL. A
+    /// cycle whose only change is the string result leaves VAL at 0.0 and must
+    /// not drive OUT even with the default MDEL=0.
+    #[test]
+    fn r9_74_scalcout_on_change_ignores_string_result_change() {
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("AA".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
+
+        rec.put_field("AA", EpicsValue::String("first".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.sval, "first");
+        assert_eq!(rec.val, 0.0, "a non-numeric string result converts to 0.0");
+
+        rec.put_field("AA", EpicsValue::String("second".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.sval, "second");
+        assert!(
+            !rec.should_output(),
+            "SVAL changed but VAL did not — C's On-Change test is numeric only"
+        );
+    }
 
     #[test]
     fn test_scalcout_default() {

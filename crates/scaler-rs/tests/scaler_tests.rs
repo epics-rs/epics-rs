@@ -333,25 +333,36 @@ fn test_log_swept_fields_idle_active_channels_only() {
     assert_eq!(rec.log_swept_fields().len(), MAX_SCALER_CHANNELS);
 }
 
-// C `scalerRecord.c` posts CNT/T/VAL/PR1/TP/FREQ and each active channel
-// S1..Snch with a literal `DBE_VALUE` on a value change
-// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588); the
-// only `DBE_LOG` post is the idle `monitor()` sweep (line 771). The record
-// advertises that value-only set as the six scalar fields (always) plus
-// the active channels — state-independent, unlike the idle-only log sweep.
+// Every C `scalerRecord.c` post outside the idle `monitor()` sweep is a literal
+// `DBE_VALUE`: the process/updateCounts posts of CNT/T/VAL/PR1/TP/FREQ and the
+// active channels' Sn (:316/322/329/334/372/425/427/430/478/530/582/588), AND
+// the `special()` posts of PRn/Gn/Dn (:673-676, :682-687, :703-705, :716). The
+// only `DBE_LOG` post is the idle sweep of S1..Snch (line 771). The record
+// advertises all of them as value-only so the framework strips the LOG bit —
+// which for PRn/Gn/Dn means a DBE_LOG subscriber never sees them at all, as in C.
 #[test]
 fn test_value_only_change_fields_scalars_plus_active_channels() {
     let mut rec = ScalerRecord::default();
     rec.nch = 3;
 
-    // Counting, waiting, or idle: the value-only set is identical (the six
-    // scalar posts are always DBE_VALUE in C, not gated on the state).
+    // Counting, waiting, or idle: the value-only set is identical (C's posts are
+    // DBE_VALUE regardless of the record's state).
     for ss in [0i16, 1, 2] {
         rec.ss = ss;
-        assert_eq!(
-            rec.value_only_change_fields(),
-            &["CNT", "T", "VAL", "PR1", "TP", "FREQ", "S1", "S2", "S3"]
-        );
+        let set = rec.value_only_change_fields();
+        for f in [
+            "CNT", "T", "VAL", "PR1", "TP", "FREQ", // the six scalars
+            "S1", "S2", "S3", // active channels
+            "PR2", "PR3", // remaining presets (PR1 is a scalar above)
+            "G1", "G2", "G3", "D1", "D2", "D3", // gates + directions
+        ] {
+            assert!(set.contains(&f), "{f} must be value-only (ss={ss})");
+        }
+        // Inactive channels contribute nothing.
+        for f in ["S4", "PR4", "G4", "D4"] {
+            assert!(!set.contains(&f), "{f} is beyond nch=3");
+        }
+        assert_eq!(set.len(), 17, "6 scalars + 3 Sn + 2 PRn + 3 Gn + 3 Dn");
     }
 
     // Zero active channels → just the six fixed scalar fields.
@@ -365,7 +376,8 @@ fn test_value_only_change_fields_scalars_plus_active_channels() {
     rec.nch = (MAX_SCALER_CHANNELS as i16) + 5;
     assert_eq!(
         rec.value_only_change_fields().len(),
-        6 + MAX_SCALER_CHANNELS
+        6 + 4 * MAX_SCALER_CHANNELS - 1,
+        "6 scalars + (Sn + Gn + Dn) per channel + PRn for every channel but PR1"
     );
 }
 

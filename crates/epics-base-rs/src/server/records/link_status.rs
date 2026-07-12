@@ -126,3 +126,41 @@ pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
         LinkType::Ca | LinkType::Other => (LINK_EXT_NC, DBF_UNKNOWN),
     }
 }
+
+/// Choice labels for swait's PV-status menu, in index order. C
+/// `menu(swaitINAV)` (swaitRecord.dbd:18-22) — a DIFFERENT menu from
+/// [`LINK_STATUS_CHOICES`]: swait reaches all of its links through
+/// `recDynLink` (a CA-style dynamic link), so it reports connection state,
+/// never "Local PV"/"Constant". The label at index 1 reads "PV BAD" while the
+/// C code constant for the same index is `PV_NC` (swaitRecord.c:199-201).
+pub const SWAIT_PV_STATUS_CHOICES: &[&str] = &["PV OK", "PV BAD", "No PV"];
+
+/// swait PV-status menu indices (C `swaitRecord.c:199-201`).
+pub const SWAIT_PV_OK: i16 = 0;
+pub const SWAIT_PV_NC: i16 = 1;
+pub const SWAIT_NO_PV: i16 = 2;
+
+/// Classify one swait PV name (`INAN`..`INLN`, `DOLN`, `OUTN`) into its
+/// `menu(swaitINAV)` status.
+///
+/// C `swaitRecord.c::init_record` (338-373) and `::special` (507-553) drive
+/// this: a blank name is `NO_PV`, and any other name is set `PV_NC` and handed
+/// to `recDynLinkAddInput`/`AddOutput`, after which `pvSearchCallback`
+/// (900-928) flips it to `PV_OK` once the search connects and back to `PV_NC`
+/// when it does not. epics-base-rs has no CA client, so "connected" is
+/// "resolves to a field on this IOC": a DB-syntax name that addresses a local
+/// record is `PV_OK`, and every name that cannot be resolved here — an unknown
+/// record, a CA/PVA target, a bare constant that is not a PV name at all —
+/// stays at the `PV_NC` C leaves it in until a search succeeds.
+pub async fn classify_swait_pv(handle: &AsyncDbHandle, name: &str) -> i16 {
+    if name.trim().is_empty() {
+        return SWAIT_NO_PV;
+    }
+    match parse_link_v2(name).link_type() {
+        LinkType::Db => match handle.link_target_field_type(name).await {
+            Some(_) => SWAIT_PV_OK,
+            None => SWAIT_PV_NC,
+        },
+        _ => SWAIT_PV_NC,
+    }
+}

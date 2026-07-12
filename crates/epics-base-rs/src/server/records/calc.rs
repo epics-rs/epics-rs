@@ -1,6 +1,6 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, InputFetchPolicy, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Calc record — evaluates CALC expression with inputs A-U.
@@ -88,6 +88,12 @@ pub struct CalcRecord {
     pub lu: f64,
     // CALC_ALARM flag: set when calcPerform fails
     pub calc_alarm: bool,
+    // This cycle's `fetch_values()` outcome, pushed by the framework through
+    // `set_fetch_gate_failed`. C `calcRecord.c::process` (120) runs
+    // `calcPerform` only `if (fetch_values(prec) == 0)`, so a failed input link
+    // freezes VAL and UDF and raises no CALC_ALARM — while everything after the
+    // calc (LA..LU advance, alarms, monitors, forward link) still runs.
+    fetch_gate_failed: bool,
     // Alarm-range time-constant filter (epics-base calcRecord.c::checkAlarms).
     // AFTC > 0 enables an exponential smoothing of the integer alarmRange
     // (1=Lolo..5=Hihi) so transient excursions don't immediately alarm.
@@ -178,6 +184,7 @@ impl Default for CalcRecord {
             lt: 0.0,
             lu: 0.0,
             calc_alarm: false,
+            fetch_gate_failed: false,
             aftc: 0.0,
             afvl: 0.0,
             rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
@@ -206,6 +213,40 @@ impl CalcRecord {
         if new != *prev {
             *prev = new;
         }
+    }
+
+    /// Advance LA..LU to A..U. C `calcRecord.c::monitor` (lines 417-423) does
+    /// it inside the per-field change test
+    /// (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only for
+    /// inputs that actually changed — so LA..LU means "value of the input as of
+    /// the last time a monitor was posted for it".
+    ///
+    /// `monitor()` runs on EVERY cycle, including one where `fetch_values()`
+    /// failed and the calc was skipped (C gates only the `calcPerform` block,
+    /// calcRecord.c:119-126), so both paths through `process()` come through
+    /// here.
+    fn advance_prev_inputs(&mut self) {
+        Self::advance_prev(self.a, &mut self.la);
+        Self::advance_prev(self.b, &mut self.lb);
+        Self::advance_prev(self.c, &mut self.lc);
+        Self::advance_prev(self.d, &mut self.ld);
+        Self::advance_prev(self.e, &mut self.le);
+        Self::advance_prev(self.f, &mut self.lf);
+        Self::advance_prev(self.g, &mut self.lg);
+        Self::advance_prev(self.h, &mut self.lh);
+        Self::advance_prev(self.i, &mut self.li);
+        Self::advance_prev(self.j, &mut self.lj);
+        Self::advance_prev(self.k, &mut self.lk);
+        Self::advance_prev(self.l, &mut self.ll);
+        Self::advance_prev(self.m, &mut self.lm);
+        Self::advance_prev(self.n, &mut self.ln);
+        Self::advance_prev(self.o, &mut self.lo);
+        Self::advance_prev(self.p, &mut self.lp);
+        Self::advance_prev(self.q, &mut self.lq);
+        Self::advance_prev(self.r, &mut self.lr);
+        Self::advance_prev(self.s, &mut self.ls);
+        Self::advance_prev(self.t, &mut self.lt);
+        Self::advance_prev(self.u, &mut self.lu);
     }
 
     fn get_vars(&self) -> [f64; 21] {
@@ -708,6 +749,27 @@ impl Record for CalcRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // C `calcRecord.c::process` (119-126):
+        //
+        // ```c
+        // if (fetch_values(prec) == 0) {
+        //     if (calcPerform(&prec->a, &prec->val, prec->rpcl)) {
+        //         recGblSetSevr(prec, CALC_ALARM, INVALID_ALARM);
+        //     } else
+        //         prec->udf = isnan(prec->val);
+        // }
+        // ```
+        //
+        // A failed input link skips the whole calc: VAL and UDF freeze at the
+        // previous cycle's values and CALC_ALARM is neither raised nor cleared.
+        // The rest of the cycle is NOT skipped — the LA..LU advance below, the
+        // alarm check, the monitors and the forward link all still run, and the
+        // inputs that did read still refresh (C's fetch loop does not abort).
+        if self.fetch_gate_failed {
+            self.advance_prev_inputs();
+            return Ok(ProcessOutcome::complete());
+        }
+
         // C `calcRecord.c:121-123` — `calcPerform` runs unconditionally, and a
         // -1 is CALC_ALARM/INVALID with VAL left at its previous value. RPCL is
         // always a program, so there is no "no expression" case to improvise
@@ -730,34 +792,7 @@ impl Record for CalcRecord {
                 self.calc_alarm = true;
             }
         }
-        // Update LA-LU. C `calcRecord.c::monitor` (lines 417-423) advances
-        // `*pprev = *pnew` only inside the per-field change test
-        // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only
-        // for inputs that actually changed. So LA..LU means "value of the
-        // input as of the last time a monitor was posted for it" — copying
-        // unconditionally here would advance LA on a no-change cycle and
-        // diverge from C for CALC expressions that reference LA..LU.
-        Self::advance_prev(self.a, &mut self.la);
-        Self::advance_prev(self.b, &mut self.lb);
-        Self::advance_prev(self.c, &mut self.lc);
-        Self::advance_prev(self.d, &mut self.ld);
-        Self::advance_prev(self.e, &mut self.le);
-        Self::advance_prev(self.f, &mut self.lf);
-        Self::advance_prev(self.g, &mut self.lg);
-        Self::advance_prev(self.h, &mut self.lh);
-        Self::advance_prev(self.i, &mut self.li);
-        Self::advance_prev(self.j, &mut self.lj);
-        Self::advance_prev(self.k, &mut self.lk);
-        Self::advance_prev(self.l, &mut self.ll);
-        Self::advance_prev(self.m, &mut self.lm);
-        Self::advance_prev(self.n, &mut self.ln);
-        Self::advance_prev(self.o, &mut self.lo);
-        Self::advance_prev(self.p, &mut self.lp);
-        Self::advance_prev(self.q, &mut self.lq);
-        Self::advance_prev(self.r, &mut self.lr);
-        Self::advance_prev(self.s, &mut self.ls);
-        Self::advance_prev(self.t, &mut self.lt);
-        Self::advance_prev(self.u, &mut self.lu);
+        self.advance_prev_inputs();
 
         // AFVL housekeeping — C `calcRecord.c::checkAlarms` always drives
         // AFVL to 0 when the alarm-range filter is inactive: on UDF
@@ -1427,6 +1462,16 @@ impl Record for CalcRecord {
             ("INPT", "T"),
             ("INPU", "U"),
         ]
+    }
+
+    /// C `calcRecord.c::fetch_values` (427-443) reads every INP link and keeps
+    /// the FIRST failing status; `process` (120) gates `calcPerform` on it.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::ReadAllGateOnFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 }
 

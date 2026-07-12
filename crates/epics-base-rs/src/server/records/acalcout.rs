@@ -95,7 +95,7 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -218,6 +218,11 @@ pub struct AcalcoutRecord {
 
     // --- process flags ---
     calc_alarm: bool,
+    /// This cycle's `fetch_values()` outcome, pushed by the framework through
+    /// `set_fetch_gate_failed`. C `aCalcoutRecord.c::process` (399) runs
+    /// `doCalc` + `afterCalc` only `if (fetch_values(pcalc)==0)`, and
+    /// `fetch_values` (1068-1071) returns at the first failing `dbGetLink`.
+    fetch_gate_failed: bool,
     cached_should_output: bool,
     /// The output decision captured on an ODLY delaying cycle, restored into
     /// `cached_should_output` on the continuation so the deferred OUT write
@@ -291,6 +296,7 @@ impl Default for AcalcoutRecord {
             pmem: 0,
             newm: 0,
             calc_alarm: false,
+            fetch_gate_failed: false,
             cached_should_output: false,
             pending_output: false,
         }
@@ -1251,9 +1257,6 @@ impl Record for AcalcoutRecord {
 
         let n = self.num_elements();
 
-        self.calc_alarm = false;
-        self.cstat = 0;
-
         // C `process` line 374-377: clamp a stale NUSE > NELM.
         if self.nuse > self.nelm {
             self.nuse = self.nelm;
@@ -1261,8 +1264,27 @@ impl Record for AcalcoutRecord {
 
         // C `process` line 393-395: snapshot scalar inputs (so PA..PL track
         // the values used in this calc). The framework fetches inputs before
-        // `process()`, so these equal the current A..L.
+        // `process()`, so these equal the current A..L. Runs BEFORE the fetch
+        // gate below — C does it before calling `fetch_values`.
         self.pa = self.num_vals;
+
+        // C `aCalcoutRecord.c::process` (399-414) wraps BOTH `doCalc` and
+        // `afterCalc` in `if (fetch_values(pcalc)==0)`, and `fetch_values`
+        // (1068-1071) returns at the first failing `dbGetLink`. So a failed
+        // input link skips more here than in calc/calcout/sCalcout, whose gate
+        // covers only the calc: `afterCalc` (aCalcoutRecord.c:281-345) is where
+        // the CALC_ALARM/UDF update, `checkAlarms`, the OOPT decision, the
+        // `pval = val` advance and the output all live, so NONE of them happen.
+        // VAL/AVAL/OVAL/OAV and PVAL freeze, no OUT is written, and no limit
+        // alarm is re-evaluated. Only C's tail — timestamp, monitors, forward
+        // link — still runs, and the framework owns that.
+        if self.fetch_gate_failed {
+            self.cached_should_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
+        self.calc_alarm = false;
+        self.cstat = 0;
 
         // --- CALC (C call_aCalcPerform, first aCalcPerform → val, aval) ---
         //
@@ -1379,6 +1401,14 @@ impl Record for AcalcoutRecord {
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
+
+        // C reaches `checkAlarms` only through `afterCalc` (aCalcoutRecord.c:310),
+        // which the `fetch_values()` gate (:399) skips wholesale — so a cycle
+        // whose input fetch failed re-evaluates no alarm at all: neither
+        // CALC_ALARM nor the HIHI/LOLO limits, and LALM does not move.
+        if self.fetch_gate_failed {
+            return;
+        }
 
         // C afterCalc line 304-305: a failed aCalcPerform raises CALC_ALARM.
         if self.calc_alarm {
@@ -1941,6 +1971,18 @@ impl Record for AcalcoutRecord {
             ("INKK", "KK"),
             ("INLL", "LL"),
         ]
+    }
+
+    /// C `aCalcoutRecord.c::fetch_values` (1068-1071, 1097) `return`s at the
+    /// first failing `dbGetLink` — in the scalar INPA..INPL loop and then in the
+    /// array INAA..INLL loop, in exactly the order `multi_input_links` lists
+    /// them — and `process` (399) gates `doCalc` + `afterCalc` on the status.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 
     /// The OUT link receives the array result: AVAL when DOPT=Use CALC, OAV

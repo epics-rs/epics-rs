@@ -67,7 +67,7 @@ fn sval_of_a_fresh_evaluation_is_the_empty_string() {
     let mut inputs = StringInputs::new();
     assert_eq!(
         scalc("SVAL", &mut inputs).unwrap(),
-        StackValue::Str(String::new())
+        StackValue::Str(Default::default())
     );
     assert_eq!(
         scalc("SVAL+'a'", &mut inputs).unwrap(),

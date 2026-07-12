@@ -128,7 +128,7 @@ fn test_modbus_append() {
     match result {
         StackValue::Str(s) => {
             // First two chars are "AB"
-            assert!(s.starts_with("AB"));
+            assert!(s.as_bytes().starts_with(b"AB"));
             // Followed by two CRC chars (may be multi-byte in UTF-8)
             assert!(s.len() > 2);
         }
@@ -158,7 +158,7 @@ fn test_amodbus_append() {
 fn test_xor8() {
     // XOR of 0x01, 0x02, 0x03 = 0x00
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = String::from_utf8(vec![0x01, 0x02, 0x03]).unwrap();
+    inputs.str_vars[0] = vec![0x01u8, 0x02, 0x03].into();
     let result = scalc("XOR8(AA)", &mut inputs).unwrap();
     assert_eq!(result, StackValue::Double(0.0));
 }

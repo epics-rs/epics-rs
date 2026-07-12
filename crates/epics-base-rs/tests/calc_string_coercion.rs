@@ -19,8 +19,8 @@ use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc};
 /// `expr` with AA (and optionally BB) bound to strings.
 fn s(expr: &str, aa: &str, bb: &str) -> Result<StackValue, CalcError> {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = aa.to_string();
-    inputs.str_vars[1] = bb.to_string();
+    inputs.str_vars[0] = aa.into();
+    inputs.str_vars[1] = bb.into();
     scalc(expr, &mut inputs)
 }
 

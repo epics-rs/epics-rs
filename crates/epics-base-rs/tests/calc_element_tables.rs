@@ -125,7 +125,7 @@ fn invented_symbols_are_refused() {
 #[test]
 fn dbl_is_the_to_double_symbol_in_both_synapps_engines() {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "12.5".to_string();
+    inputs.str_vars[0] = "12.5".into();
     assert_eq!(
         scalc("DBL(AA)", &mut inputs).unwrap(),
         StackValue::Double(12.5)

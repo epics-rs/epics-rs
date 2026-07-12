@@ -15,6 +15,7 @@ pub mod array_value;
 
 use error::CalcError;
 use opcodes::Opcode;
+use value::ScalcString;
 
 pub type CalcResult<T> = Result<T, CalcError>;
 
@@ -160,24 +161,28 @@ impl Default for NumericInputs {
 
 #[derive(Debug, Clone)]
 pub struct StringInputs {
-    pub num_vars: [f64; CALC_NARGS],    // A..U
-    pub str_vars: [String; CALC_NARGS], // AA..UU
+    pub num_vars: [f64; CALC_NARGS], // A..U
+    /// AA..UU. C's are `char *psarg[]`, pointing at the record's `char[40]`
+    /// string fields (`sCalcoutRecord.c:357`), and `FETCH_AA` copies one into
+    /// the 40-byte stack element — so an input, like every other string in the
+    /// engine, is a [`ScalcString`].
+    pub str_vars: [ScalcString; CALC_NARGS],
     /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`).
     pub prev_val: f64,
     /// Previous *string* calculation result, read by the `SVAL` token
     /// (C `FETCH_SVAL`, sCalcPerform.c:927-932, which pushes `psresult`).
     /// Empty for a fresh evaluation, and for callers whose C counterpart
     /// passes no `psresult` (numeric `calcPerform`).
-    pub prev_sval: String,
+    pub prev_sval: ScalcString,
 }
 
 impl StringInputs {
     pub fn new() -> Self {
         StringInputs {
             num_vars: [0.0; CALC_NARGS],
-            str_vars: std::array::from_fn(|_| String::new()),
+            str_vars: std::array::from_fn(|_| ScalcString::new()),
             prev_val: 0.0,
-            prev_sval: String::new(),
+            prev_sval: ScalcString::new(),
         }
     }
 }

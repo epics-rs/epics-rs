@@ -7,7 +7,7 @@ pub use engine::{CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs};
 
 pub use engine::StringInputs;
 pub use engine::opcodes::StringOp;
-pub use engine::value::StackValue;
+pub use engine::value::{SCALC_STRING_MAX, SCALC_STRING_SIZE, ScalcString, StackValue};
 
 pub use engine::ArrayInputs;
 pub use engine::array_value::ArrayStackValue;

@@ -16,7 +16,7 @@ pub fn crc16(data: &[u8]) -> u16 {
 
 /// LRC: sum of hex-decoded bytes, then two's complement, masked to 8 bits.
 /// Input is a hex string (pairs of hex chars). Returns LRC as a hex string (2 chars uppercase).
-pub fn lrc(hex_data: &str) -> Option<String> {
+pub fn lrc(hex_data: &[u8]) -> Option<String> {
     let bytes = hex_decode(hex_data)?;
     let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     let lrc_val = (!sum).wrapping_add(1);
@@ -29,8 +29,7 @@ pub fn xor8(data: &[u8]) -> u8 {
 }
 
 /// Decode hex string into bytes. Returns None if invalid.
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    let hex = hex.as_bytes();
+fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
     if hex.len() % 2 != 0 {
         return None;
     }
@@ -77,13 +76,13 @@ mod tests {
     #[test]
     fn test_lrc() {
         // Example: bytes 0x01, 0x02, 0x03 -> sum=0x06, LRC=0xFA
-        let result = lrc("010203").unwrap();
+        let result = lrc(b"010203").unwrap();
         assert_eq!(result, "FA");
     }
 
     #[test]
     fn test_lrc_invalid() {
-        assert!(lrc("0G").is_none());
-        assert!(lrc("0").is_none());
+        assert!(lrc(b"0G").is_none());
+        assert!(lrc(b"0").is_none());
     }
 }

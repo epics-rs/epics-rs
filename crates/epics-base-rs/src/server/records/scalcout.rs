@@ -6,7 +6,7 @@ use crate::server::record::{
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
-use crate::calc::engine::value::StackValue;
+use crate::calc::engine::value::{ScalcString, StackValue};
 use crate::calc::{CompiledExpr, ExprKind, scalc_eval};
 
 /// Scalcout record — string calc with output.
@@ -149,13 +149,13 @@ impl ScalcoutRecord {
         let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
-            // The string-calc engine evaluates UTF-8 text (substr/concat/
-            // compare), so a byte-faithful `PvString` input is presented to
-            // it lossily; the stored value round-trips verbatim regardless.
-            inputs.str_vars[i] = self.str_vals[i].as_str_lossy().into_owned();
+            // C `FETCH_AA` copies the record's `char[40]` field into the 40-byte
+            // stack element (`sCalcPerform.c:872`), so the engine sees the same
+            // bytes, bounded the same way — no re-encoding on either side.
+            inputs.str_vars[i] = ScalcString::from_c(self.str_vals[i].as_bytes());
         }
         inputs.prev_val = prev_val;
-        inputs.prev_sval = prev_sval.as_str_lossy().into_owned();
+        inputs.prev_sval = ScalcString::from_c(prev_sval.as_bytes());
         inputs
     }
 
@@ -166,8 +166,8 @@ impl ScalcoutRecord {
                 self.sval = PvString::from(format!("{}", v));
             }
             StackValue::Str(s) => {
-                self.sval = PvString::from(s.clone());
-                self.val = s.parse::<f64>().unwrap_or(0.0);
+                self.sval = PvString::from_bytes(s.as_bytes());
+                self.val = s.as_str_lossy().parse::<f64>().unwrap_or(0.0);
             }
         }
     }
@@ -717,8 +717,8 @@ impl Record for ScalcoutRecord {
                             self.osv = PvString::from(format!("{}", v));
                         }
                         StackValue::Str(s) => {
-                            self.osv = PvString::from(s.clone());
-                            self.oval = s.parse::<f64>().unwrap_or(0.0);
+                            self.osv = PvString::from_bytes(s.as_bytes());
+                            self.oval = s.as_str_lossy().parse::<f64>().unwrap_or(0.0);
                         }
                     },
                     Err(_) => {

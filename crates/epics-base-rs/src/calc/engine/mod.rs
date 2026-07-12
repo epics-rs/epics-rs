@@ -3,6 +3,7 @@ pub mod error;
 pub mod numeric;
 pub mod opcodes;
 pub mod postfix;
+pub mod strtod;
 pub mod token;
 
 pub mod checksum;

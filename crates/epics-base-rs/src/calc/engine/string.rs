@@ -64,38 +64,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::Add => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            stack.push(StackValue::Double(x + y));
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(x, y) => StackValue::Double(x + y),
+                        Pair::Strings(mut x, y) => {
+                            x.push_str(&y);
+                            StackValue::Str(x)
                         }
-                        (StackValue::Str(x), StackValue::Str(y)) => {
-                            let mut result = x.clone();
-                            result.push_str(y);
-                            stack.push(StackValue::Str(result));
-                        }
-                        _ => return Err(CalcError::TypeMismatch),
-                    }
+                    });
                 }
                 CoreOp::Sub => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            stack.push(StackValue::Double(x - y));
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(x, y) => StackValue::Double(x - y),
+                        // C SUBLAST: remove the first occurrence of y from x.
+                        Pair::Strings(mut x, y) => {
+                            if let Some(pos) = x.find(y.as_str()) {
+                                x.replace_range(pos..pos + y.len(), "");
+                            }
+                            StackValue::Str(x)
                         }
-                        (StackValue::Str(x), StackValue::Str(y)) => {
-                            // Remove first occurrence of y from x
-                            let result = if let Some(pos) = x.find(y.as_str()) {
-                                let mut s = x.clone();
-                                s.replace_range(pos..pos + y.len(), "");
-                                s
-                            } else {
-                                x.clone()
-                            };
-                            stack.push(StackValue::Str(result));
-                        }
-                        _ => return Err(CalcError::TypeMismatch),
-                    }
+                    });
                 }
                 CoreOp::Mul => {
                     let (a, b) = pop2_f64(&mut stack)?;
@@ -156,70 +145,66 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: fabs(a-b) < SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() < SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x == y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() < SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x == y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Ne => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: fabs(a-b) > SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() > SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x != y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() > SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x != y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Lt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (b - a) > SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (y - x) > SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x < y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (y - x) > SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x < y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Le => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (fabs(a-b) < SMALL) || (a < b)
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < SMALL || x < y
-                        }
-                        (StackValue::Str(x), StackValue::Str(y)) => x <= y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() < SMALL || x < y,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x <= y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Gt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (a - b) > SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y) > SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x > y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y) > SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x > y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Ge => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (fabs(a-b) < SMALL) || (a > b)
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < SMALL || x > y
-                        }
-                        (StackValue::Str(x), StackValue::Str(y)) => x >= y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() < SMALL || x > y,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x >= y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
@@ -662,8 +647,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let start_val = pop1(&mut stack)?;
                     let s = pop1(&mut stack)?;
                     let s = s.as_str_ref()?;
-                    let start = start_val.as_f64()? as i64;
-                    let end = end_val.as_f64()? as i64;
+                    let start = subrange_index(&start_val)?;
+                    let end = subrange_index(&end_val)?;
                     let len = s.len() as i64;
                     let start = start.max(0).min(len) as usize;
                     let end = end.max(0).min(len) as usize;
@@ -869,15 +854,15 @@ fn simple_printf(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
             let fmt_str = std::str::from_utf8(&bytes[spec_start..i]).unwrap();
             match spec {
                 b'd' | b'i' => {
-                    let v = val.as_f64().unwrap_or(0.0) as i64;
+                    let v = val.to_double() as i64;
                     result.push_str(&c_format_int(fmt_str, v));
                 }
                 b'f' | b'e' | b'g' | b'E' | b'G' => {
-                    let v = val.as_f64().unwrap_or(0.0);
+                    let v = val.to_double();
                     result.push_str(&c_format_float(fmt_str, v));
                 }
                 b'x' | b'X' | b'o' => {
-                    let v = val.as_f64().unwrap_or(0.0) as i64;
+                    let v = val.to_double() as i64;
                     result.push_str(&c_format_int(fmt_str, v));
                 }
                 b's' => {
@@ -1093,7 +1078,7 @@ fn bin_write(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
     // C `toDouble(ps1)`: the value operand is coerced, never rejected. C's
     // `myNINT` casts to `int`, so the integer conversions see a 32-bit value
     // and `memcpy` then takes its low `width` bytes.
-    let d = val.clone().into_f64_lossy();
+    let d = val.to_double();
     let n = my_nint(d) as i32;
     let raw: Vec<u8> = match field {
         BinField::Char => vec![n as u8],
@@ -1329,9 +1314,55 @@ fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
 
+/// C's mixed-type rule for the binary operators that HAVE a string branch —
+/// ADD, SUB/SUBLAST, and the six comparisons (sCalcPerform.c:964-978 and the
+/// comparison cases). Each is written the same way:
+///
+/// ```c
+/// if (isDouble(ps))       { toDouble(ps1);  /* numeric */ }
+/// else if (isDouble(ps1)) { to_double(ps);  /* numeric */ }
+/// else                    { /* the string branch */ }
+/// ```
+///
+/// so the string branch runs ONLY when both operands are strings; if either
+/// side is already a double, the other is coerced and the operator is numeric.
+/// Classifying the pair once means these operators cannot grow a third,
+/// mixed-type outcome — there is no `_` arm left to reject.
+enum Pair {
+    Numeric(f64, f64),
+    Strings(String, String),
+}
+
+impl Pair {
+    fn of(a: StackValue, b: StackValue) -> Pair {
+        match (a, b) {
+            (StackValue::Str(x), StackValue::Str(y)) => Pair::Strings(x, y),
+            (a, b) => Pair::Numeric(a.to_double(), b.to_double()),
+        }
+    }
+}
+
+/// A `SUBRANGE` bound. This is NOT one of the numeric positions C coerces: C
+/// branches on the bound's TYPE (sCalcPerform.c:1876-1888) — a double is the
+/// index itself, while a STRING is searched for with `strstr` and positions the
+/// range at the match. The port implements only the numeric branch, so a string
+/// bound is still rejected here; running it through `to_double` instead would
+/// silently answer 0 for "abc" rather than looking for it. The missing branch is
+/// an open gap, reported, not papered over.
+fn subrange_index(v: &StackValue) -> Result<i64, CalcError> {
+    match v {
+        StackValue::Double(d) => Ok(*d as i64),
+        StackValue::Str(_) => Err(CalcError::TypeMismatch),
+    }
+}
+
+/// Pop a NUMERIC operand. C reaches every one of these through `toDouble`
+/// (sCalcPerform.c: MULT, DIV, POWER, MODULO, the trig/log/abs/sqrt functions,
+/// COND_IF, REL_AND/OR/NOT, the bit ops, ...), which coerces a string instead
+/// of rejecting it — so this cannot fail on type, only on underflow.
 fn pop1_f64(stack: &mut Vec<StackValue>) -> Result<f64, CalcError> {
     let v = stack.pop().ok_or(CalcError::Underflow)?;
-    v.as_f64()
+    Ok(v.to_double())
 }
 
 fn pop2_f64(stack: &mut Vec<StackValue>) -> Result<(f64, f64), CalcError> {

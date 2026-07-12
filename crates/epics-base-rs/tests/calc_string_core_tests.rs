@@ -1,6 +1,6 @@
 #![allow(clippy::approx_constant)]
 
-use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc, scalc_compile, scalc_eval};
+use epics_base_rs::calc::{StackValue, StringInputs, scalc, scalc_compile, scalc_eval};
 
 fn eval_str(expr: &str) -> StackValue {
     let mut inputs = StringInputs::new();
@@ -143,27 +143,41 @@ fn test_string_ge() {
     assert_eq!(eval_str(r#""abc" >= "abc""#), StackValue::Double(1.0));
 }
 
-// --- TypeMismatch tests ---
+// --- Mixed string/double operands ---
+//
+// These three cases asserted TypeMismatch. C raises no such error: a numeric
+// position COERCES a string with atof (`toDouble`, sCalcPerform.c:80-83), and a
+// binary operator with a string branch takes it only when BOTH sides are
+// strings. Compiled sCalcPerform answers each of them, so the assertions now
+// carry C's value instead of an error the C engine cannot produce.
+// tests/calc_string_coercion.rs covers the rule in full.
 
 #[test]
-fn test_type_mismatch_add() {
+fn a_string_plus_a_double_coerces_the_string() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#""abc" + 1"#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::TypeMismatch)));
+    // atof("abc") is 0, so this is 0 + 1.
+    assert_eq!(
+        scalc(r#""abc" + 1"#, &mut inputs).unwrap(),
+        StackValue::Double(1.0)
+    );
 }
 
 #[test]
-fn test_type_mismatch_add_reverse() {
+fn a_double_plus_a_string_coerces_the_string() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#"3 + "12""#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::TypeMismatch)));
+    assert_eq!(
+        scalc(r#"3 + "12""#, &mut inputs).unwrap(),
+        StackValue::Double(15.0)
+    );
 }
 
 #[test]
-fn test_type_mismatch_compare() {
+fn a_mixed_comparison_compares_numerically() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#""3" < 20"#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::TypeMismatch)));
+    assert_eq!(
+        scalc(r#""3" < 20"#, &mut inputs).unwrap(),
+        StackValue::Double(1.0)
+    );
 }
 
 // --- STR/DBL conversion ---

@@ -1,5 +1,6 @@
 use super::ExprKind;
 use super::error::CalcError;
+use super::strtod;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuncName {
@@ -666,182 +667,47 @@ impl<'a> Tokenizer<'a> {
     /// text strtod consumes, and strtod consuming NOTHING is
     /// `CALC_ERR_BAD_LITERAL` (C tests `pnext == psrc`) — which is why a lone `.`
     /// is a bad literal rather than a syntax error.
+    ///
+    /// The scan itself is `strtod::strtod`, shared with sCalc's `atof` coercion.
+    /// A sign or leading whitespace never reaches it here: `at_literal` only
+    /// fires on a digit, a `.`, or one of the table's literal words.
     fn read_literal(&mut self) -> Result<f64, CalcError> {
         let start = self.pos;
+        let rem = &self.input[start..];
 
-        // strtod's INF / INFINITY / NAN / NAN(n-char-sequence) forms (C99
-        // 7.22.1.3). Reachable only through a table that declares the word, so
-        // aCalc — which has no such element — never takes this path.
-        if self
-            .table
-            .literal_words
-            .iter()
-            .any(|w| starts_with_ci(&self.input[start..], w))
-        {
-            return Ok(self.read_inf_or_nan());
-        }
-
-        let is_hex = self.input[start] == b'0'
-            && matches!(self.input.get(start + 1), Some(b'x' | b'X'))
-            && self.input.get(start + 2).is_some_and(u8::is_ascii_hexdigit);
-
+        // base alone has a `{"0X", ..., LITERAL_INT}` element (postfix.c:79),
+        // and it is NOT strtod: postfix.c:283 parses it with `epicsParseUInt32`,
+        // so the value is 32-bit unsigned and anything wider is a bad literal.
+        // sCalc/aCalc have no such element — their `0x1F` matches `{"0"}` and
+        // goes to strtod, which reads hex at full double width.
+        let is_hex = rem.first() == Some(&b'0')
+            && matches!(rem.get(1), Some(b'x' | b'X'))
+            && rem.get(2).is_some_and(u8::is_ascii_hexdigit);
         if is_hex && self.table.hex == HexLiteral::Uint32Element {
-            // base postfix.c:79 has a `{"0X", ..., LITERAL_INT}` element, and
-            // postfix.c:283 parses it with `epicsParseUInt32` — a 32-bit
-            // unsigned value; anything wider is CALC_ERR_BAD_LITERAL.
-            self.pos = start + 2;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-                self.pos += 1;
-            }
-            let s = std::str::from_utf8(&self.input[start + 2..self.pos]).unwrap();
-            return u32::from_str_radix(s, 16)
-                .map(|v| v as f64)
+            let end = 2 + rem[2..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            self.pos = start + end;
+            let digits = std::str::from_utf8(&rem[2..end]).unwrap();
+            return u32::from_str_radix(digits, 16)
+                .map(f64::from)
                 .map_err(|_| CalcError::BadLiteral);
         }
-        if is_hex {
-            // sCalc/aCalc have no `0X` element: `0x1F` matches `{"0"}` and is
-            // then re-scanned by `epicsStrtod` from the `0`, i.e. C99 strtod,
-            // which parses hex at full double width (`0x1FFFFFFFFF` is
-            // 137438953471, not a bad literal).
-            return Ok(self.read_hex_strtod(start));
-        }
 
-        // strtod's decimal grammar: digits, AT MOST ONE `.`, optional exponent.
-        // The second `.` of `1.2.3` therefore starts a NEW literal (C lexes it as
-        // `1.2` then `.3`, two adjacent operands, and rejects it in the parser),
-        // and a `.` with no digit anywhere converts nothing.
-        let mut saw_digit = false;
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-            self.pos += 1;
-            saw_digit = true;
-        }
-        if self.pos < self.input.len() && self.input[self.pos] == b'.' {
-            self.pos += 1;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                self.pos += 1;
-                saw_digit = true;
-            }
-        }
-        if !saw_digit {
-            self.pos = start;
+        let (value, len) = strtod::strtod(rem);
+        if len == 0 {
             return Err(CalcError::BadLiteral);
         }
-
-        if self.pos < self.input.len()
-            && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
-        {
-            let exp_start = self.pos;
-            self.pos += 1;
-            if self.pos < self.input.len()
-                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
-            {
-                self.pos += 1;
-            }
-            let digits = self.pos;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
-            if self.pos == digits {
-                // `1E` with no exponent digits: strtod stops before the `E`.
-                self.pos = exp_start;
-            }
-        }
-
-        let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-        s.parse::<f64>().map_err(|_| CalcError::BadLiteral)
-    }
-
-    /// C99 `strtod`'s infinity and NaN forms, case-insensitive: `INF`, the
-    /// longer `INFINITY`, `NAN`, and `NAN(n-char-sequence)`.
-    ///
-    /// This is the whole of R9-9. C cannot stop after three characters — it
-    /// hands `INFINITY` to strtod, which takes all eight — so `INF` is not a
-    /// three-character token and `INFO` is not `INF` followed by `O`.
-    fn read_inf_or_nan(&mut self) -> f64 {
-        let rem = &self.input[self.pos..];
-        if starts_with_ci(rem, "INF") {
-            self.pos += if starts_with_ci(rem, "INFINITY") {
-                8
-            } else {
-                3
-            };
-            return f64::INFINITY;
-        }
-        self.pos += 3; // "NAN"
-        // glibc consumes the parenthesised n-char-sequence only when it closes;
-        // an unterminated `NAN(` leaves the `(` behind.
-        let tail = &self.input[self.pos..];
-        if tail.first() == Some(&b'(') {
-            if let Some(close) = tail.iter().position(|&b| b == b')').filter(|&i| {
-                tail[1..i]
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            }) {
-                self.pos += close + 1;
-            }
-        }
-        f64::NAN
-    }
-
-    /// C99 `strtod` on a `0x` prefix: hex mantissa, optional hex fraction,
-    /// optional binary (`p`) exponent.
-    fn read_hex_strtod(&mut self, start: usize) -> f64 {
-        self.pos = start + 2;
-        let mut value = 0.0f64;
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-            value = value * 16.0 + hex_digit(self.input[self.pos]) as f64;
-            self.pos += 1;
-        }
-        if self.pos < self.input.len() && self.input[self.pos] == b'.' {
-            self.pos += 1;
-            let mut scale = 1.0 / 16.0;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-                value += hex_digit(self.input[self.pos]) as f64 * scale;
-                scale /= 16.0;
-                self.pos += 1;
-            }
-        }
-        if self.pos < self.input.len() && matches!(self.input[self.pos], b'p' | b'P') {
-            let exp_start = self.pos;
-            self.pos += 1;
-            let mut negative = false;
-            if self.pos < self.input.len()
-                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
-            {
-                negative = self.input[self.pos] == b'-';
-                self.pos += 1;
-            }
-            let digits = self.pos;
-            let mut exp: i32 = 0;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                exp = exp
-                    .saturating_mul(10)
-                    .saturating_add((self.input[self.pos] - b'0') as i32);
-                self.pos += 1;
-            }
-            if self.pos == digits {
-                self.pos = exp_start; // no exponent digits: `p` is not consumed
-            } else {
-                value *= 2.0f64.powi(if negative { -exp } else { exp });
-            }
-        }
-        value
+        self.pos += len;
+        Ok(value)
     }
 }
 
 /// C `epicsStrnCaseCmp(text, name, strlen(name)) == 0`: does `name` prefix
 /// `text`, ignoring case? This is how `get_element` matches every element.
 fn starts_with_ci(text: &[u8], name: &str) -> bool {
-    let n = name.len();
-    text.len() >= n && text[..n].eq_ignore_ascii_case(name.as_bytes())
-}
-
-fn hex_digit(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        _ => b - b'A' + 10,
-    }
+    strtod::starts_with_ci(text, name.as_bytes())
 }
 
 /// Lex `input` with the `ELEMENT` table of the C compiler `kind` names.

@@ -1,10 +1,22 @@
+use super::link_status::{LinkStatusGen, SWAIT_NO_PV, SWAIT_PV_STATUS_CHOICES, classify_swait_pv};
 use crate::calc::NumericInputs;
 use crate::calc::{CompiledExpr, compile as calc_compile, eval as calc_eval};
 use crate::error::{CaError, CaResult};
+use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
     FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue};
+
+/// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
+/// (`INAV`..`INLV`), then `DOLV`, then `OUTV`. C keeps the statuses in one
+/// contiguous array starting at `pwait->inav` and walks it with the link names
+/// starting at `pwait->inan` (swaitRecord.c:334-338, 686-687), so the index of
+/// a status field IS the index of its link.
+const SWAIT_PV_STATUS_FIELDS: [&str; 14] = [
+    "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV", "INLV",
+    "DOLV", "OUTV",
+];
 
 // swait (string wait) record from synApps calc module.
 // Functionally equivalent to scalcout, but uses INxN/INxP naming for input links
@@ -69,6 +81,18 @@ pub struct SwaitRecord {
     // so the change history C publishes was unreadable and a put was rejected
     // with `FieldNotFound`.
     pub prev_vals: [f64; 12],
+    // INAV..INLV / DOLV / OUTV — the `menu(swaitINAV)` PV-connection status of
+    // each link, indexed as `SWAIT_PV_STATUS_FIELDS` (C keeps the same array,
+    // swaitRecord.c:334-338). Read-only to clients (`special(SPC_NOMOD)`,
+    // swaitRecord.dbd:166-250); written only by `refresh_link_status`, the
+    // single owner of the classification, through `put_field_internal`.
+    pv_status: [i16; 14],
+    // Async context + generation gate for `refresh_link_status`, the same
+    // shape calcout/sseq use (see `link_status::LinkStatusGen`): a refresh
+    // classifies a snapshot of the link names off-thread, and only the latest
+    // one issued may publish.
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    link_gen: LinkStatusGen,
     cached_should_output: bool,
     // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
     // no DLYA database field, unlike scalcout). `output_wait` marks that the
@@ -100,6 +124,11 @@ impl Default for SwaitRecord {
             inp_passive: [0; 12],
             num_vals: [0.0; 12],
             prev_vals: [0.0; 12],
+            // C `init_record` sets NO_PV for every blank name (swaitRecord.c:349),
+            // and every name starts blank.
+            pv_status: [SWAIT_NO_PV; 14],
+            async_ctx: None,
+            link_gen: LinkStatusGen::default(),
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
@@ -187,6 +216,55 @@ impl SwaitRecord {
         } else {
             None
         }
+    }
+
+    /// `INAV`..`INLV` / `DOLV` / `OUTV` → the index of the link they describe.
+    fn pv_status_index(name: &str) -> Option<usize> {
+        SWAIT_PV_STATUS_FIELDS.iter().position(|&f| f == name)
+    }
+
+    /// True for the link-NAME fields whose put re-classifies the PV status —
+    /// C `special()` (swaitRecord.c:507-553) re-runs the search for any name in
+    /// `INAN`..`INLN`, `DOLN`, `OUTN`. `OUTN` is a common field, so its put is
+    /// not visible in `special()`; it is caught by `check_alarms` instead, the
+    /// same split calcout uses.
+    fn is_pv_name_field(name: &str) -> bool {
+        Self::inp_name_index(name).is_some() || name == "DOLN"
+    }
+
+    /// Re-classify every PV name into its `menu(swaitINAV)` status and post the
+    /// result. The SINGLE writer of `pv_status`: C's statuses are set only by
+    /// `init_record`, `special()` and `pvSearchCallback` — all of them "the
+    /// name changed, re-run the search" — so the port funnels all three through
+    /// here. No-op without an async context.
+    fn refresh_link_status(&self) {
+        let Some((name, handle)) = &self.async_ctx else {
+            return;
+        };
+        let rec_name = name.clone();
+        let handle = handle.clone();
+        let mut links: Vec<String> = self.inp_names.to_vec();
+        links.push(self.doln.clone());
+        links.push(self.out.clone());
+        let link_gen = self.link_gen.clone();
+        // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
+        let token = link_gen.next();
+        tokio::spawn(async move {
+            // Let `add_record` finish registering this record before the init
+            // post (this task may be spawned from `set_async_context`).
+            tokio::task::yield_now().await;
+            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(links.len());
+            for (i, link) in links.iter().enumerate() {
+                let status = classify_swait_pv(&handle, link).await;
+                fields.push((
+                    SWAIT_PV_STATUS_FIELDS[i].to_string(),
+                    EpicsValue::Enum(status as u16),
+                ));
+            }
+            if link_gen.is_current(token) {
+                let _ = handle.post_fields(&rec_name, fields).await;
+            }
+        });
     }
 }
 
@@ -376,6 +454,78 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    // INAV..INLV / DOLV / OUTV — `menu(swaitINAV)` PV status, read-only to
+    // clients (`special(SPC_NOMOD)`, swaitRecord.dbd:166-250).
+    FieldDesc {
+        name: "INAV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INBV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INCV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INDV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INEV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INFV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INGV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INHV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INIV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INJV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INKV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INLV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "DOLV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OUTV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
     FieldDesc {
         name: "INAN",
         dbf_type: DbFieldType::String,
@@ -527,11 +677,13 @@ impl Record for SwaitRecord {
 
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
     /// menu's choice labels in `.dbd` index order (`swaitRecord.dbd`):
-    /// `OOPT` is `menu(swaitOOPT)`, `DOPT` is `menu(swaitDOPT)`.
+    /// `OOPT` is `menu(swaitOOPT)`, `DOPT` is `menu(swaitDOPT)`, and
+    /// `INAV`..`INLV`/`DOLV`/`OUTV` are `menu(swaitINAV)`.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "OOPT" => Some(SWAIT_OOPT_CHOICES),
             "DOPT" => Some(SWAIT_DOPT_CHOICES),
+            _ if Self::pv_status_index(field).is_some() => Some(SWAIT_PV_STATUS_CHOICES),
             _ => None,
         }
     }
@@ -545,6 +697,44 @@ impl Record for SwaitRecord {
             self.recompile();
         }
         Ok(())
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+        // C `init_record` (swaitRecord.c:334-373) searches every PV name and
+        // seeds INAV..INLV/DOLV/OUTV. The INxN/DOLN names are swait fields
+        // (applied before `add_record`), so classify them now; OUTN is a common
+        // field not yet applied, and `init_links` re-runs the refresh once it
+        // is. The generation gate lets that later, fuller refresh win.
+        self.refresh_link_status();
+    }
+
+    fn init_links(&mut self, common: &crate::server::record::CommonFields) {
+        self.out = common.out.clone();
+        self.refresh_link_status();
+    }
+
+    /// A put to a PV-name field re-runs the search — C `special()`
+    /// (swaitRecord.c:507-553) sets the status to `PV_NC` and re-issues
+    /// `recDynLinkAddInput`/`AddOutput`, or to `NO_PV` when the name was
+    /// cleared. `refresh_link_status` re-reads the name the put just stored.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        if Self::is_pv_name_field(field) {
+            self.refresh_link_status();
+        }
+        Ok(())
+    }
+
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        // OUTN lives in the common fields, so a runtime re-point is invisible to
+        // `special()`. Catch it here — the same split calcout uses for its OUT.
+        if self.out != common.out {
+            self.out = common.out.clone();
+            self.refresh_link_status();
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -649,9 +839,17 @@ impl Record for SwaitRecord {
     }
 
     /// DOL is read at OUTPUT time, and only under DOPT="Use DOL" — C
-    /// `execOutput` (763-772) guards the `recDynLinkGet` with
-    /// `if (pwait->dopt)`. With DOPT="Use VAL" the link is never read, so DOLD
-    /// keeps its client-put value.
+    /// `execOutput` (763-772) guards the `recDynLinkGet` with `if (pwait->dopt)`
+    /// and, inside it, `if (!pwait->dolv)` (DOLV == PV_OK).
+    ///
+    /// The DOLV half of that guard needs no arm here: the framework's
+    /// output-time fetch skips an empty name and writes the value field only
+    /// when the read SUCCEEDS (`processing.rs`), so a DOL name that is unset or
+    /// does not resolve leaves DOLD at its last value — exactly what C's
+    /// `if (!pwait->dolv)` produces, and C still writes that stale DOLD to OUT.
+    /// Gating on `pv_status` instead would ADD a divergence: that field is
+    /// filled by an async classification task, so a cycle running before the
+    /// task lands would skip a fetch C performs.
     fn output_time_input_links(&self) -> &'static [(&'static str, &'static str)] {
         if self.dopt == 1 {
             &[("DOLN", "DOLD")]
@@ -732,6 +930,9 @@ impl Record for SwaitRecord {
                 }
                 if let Some(idx) = Self::prev_val_index(name) {
                     return Some(EpicsValue::Double(self.prev_vals[idx]));
+                }
+                if let Some(idx) = Self::pv_status_index(name) {
+                    return Some(EpicsValue::Enum(self.pv_status[idx] as u16));
                 }
                 if let Some(idx) = Self::inp_name_index(name) {
                     return Some(EpicsValue::String(self.inp_names[idx].clone().into()));
@@ -818,6 +1019,14 @@ impl Record for SwaitRecord {
                     self.prev_vals[idx] = value
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                } else if let Some(idx) = Self::pv_status_index(name) {
+                    // SPC_NOMOD to clients; this is where `refresh_link_status`'s
+                    // `post_fields` -> `put_field_internal` stores the status it
+                    // just classified.
+                    self.pv_status[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
                 } else if let Some(idx) = Self::inp_name_index(name) {
                     if let EpicsValue::String(s) = value {
                         self.inp_names[idx] = s.as_str_lossy().into_owned();

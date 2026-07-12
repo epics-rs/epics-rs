@@ -890,7 +890,7 @@ impl DrvAsynIPPort {
                 // (no Connect-exception flap); the socket reopens lazily on
                 // the next write.
                 let eof = r.eom_reason.contains(EomReason::END);
-                if eof && self.base.connected {
+                if eof && self.base.is_connected() {
                     self.drop_connection();
                 }
                 Ok((r.nbytes_transferred, r.eom_reason))
@@ -914,7 +914,7 @@ impl DrvAsynIPPort {
                     user.timeout,
                     &self.host_info,
                 );
-                if failure.disconnect && self.base.connected {
+                if failure.disconnect && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -943,7 +943,7 @@ impl DrvAsynIPPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
 
         // C `drvAsynIPPortConfigure` (:1061): `if (tty->isCom) asynInterposeCOM(...)`
@@ -1011,7 +1011,7 @@ impl DrvAsynIPPort {
         };
         let out = f(&mut com.options, &mut link);
         let teardown = link.teardown;
-        if teardown && self.base.connected {
+        if teardown && self.base.is_connected() {
             self.drop_connection();
         }
         Some(out)
@@ -1380,7 +1380,7 @@ impl PortDriver for DrvAsynIPPort {
                 // fatal error; without the symmetric write-side teardown a
                 // wedged socket reports `connected` forever and never
                 // self-heals.
-                if e.is_fatal_transport() && self.base.connected {
+                if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -1612,7 +1612,7 @@ mod tests {
     #[test]
     fn test_driver_initial_state() {
         let drv = DrvAsynIPPort::new("iptest", "localhost:5025").unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         assert!(drv.base().auto_connect);
         assert!(drv.base().flags.can_block);
     }
@@ -1634,13 +1634,13 @@ mod tests {
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let user = AsynUser::default();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
 
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         drv.disconnect(&user).unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
     }
 
     #[test]
@@ -1695,7 +1695,7 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("httptest", &format!("127.0.0.1:{port} HTTP")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         // --- Transaction 1: write request, read the response in 4-B chunks.
         let mut wuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
@@ -1709,7 +1709,7 @@ mod tests {
         // The bug tore the socket down here; the fix keeps it up so the rest
         // of the response is still readable.
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "HTTP must stay connected mid-response (no truncation)"
         );
         assert!(
@@ -1730,7 +1730,7 @@ mod tests {
         assert_eq!(n3, 0);
         assert!(eom3.contains(EomReason::END));
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "HTTP logical connection must not flap on per-transaction EOF"
         );
         assert!(drv.io.inner.is_none(), "socket released after EOF");
@@ -1794,7 +1794,7 @@ mod tests {
         assert_eq!(n, 0);
         assert!(eom.contains(EomReason::END));
         // closeConnection ran, so the actor's reconnect can re-open it.
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
 
         handle.join().unwrap();
     }
@@ -1840,7 +1840,7 @@ mod tests {
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         drv.connect(&AsynUser::default()).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
         handle.join().unwrap();
         thread::sleep(Duration::from_millis(50));
 
@@ -1855,7 +1855,7 @@ mod tests {
         }
         assert!(last.is_err(), "expected a write to the dead peer to fail");
         assert!(
-            !drv.base().connected,
+            !drv.base().is_connected(),
             "DRV-5: fatal write error must set connected=false"
         );
     }
@@ -2179,7 +2179,7 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
             .unwrap();
         drv.connect(&AsynUser::default()).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
@@ -2200,7 +2200,7 @@ mod tests {
             err.message()
         );
         assert!(
-            !drv.base().connected,
+            !drv.base().is_connected(),
             "disconnectOnReadTimeout must drop the connection (C drvAsynIPPort.c:798-806)"
         );
 
@@ -2236,7 +2236,7 @@ mod tests {
         // failed read's.
         assert_eq!(err.status(), AsynStatus::Timeout);
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "a plain read timeout leaves the socket intact (C returns asynTimeout, no close)"
         );
 
@@ -2360,7 +2360,7 @@ mod tests {
             DrvAsynIPPort::new("udptest", &format!("127.0.0.1:{server_port} udp")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         drv.write_octet(&mut user, b"ping").unwrap();
@@ -2447,7 +2447,7 @@ mod tests {
         let n = drv.read_octet(&ruser, &mut buf).unwrap();
         assert_eq!(n, 0);
         // The port must remain open — a 0-byte datagram is not EOF.
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         // And it can still read a subsequent real datagram.
         server.send_to(b"world", src).unwrap();
@@ -2500,12 +2500,12 @@ mod tests {
             .unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
         let _ = drv.read_octet(&user, &mut buf);
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
     }
 
     #[test]
@@ -2547,7 +2547,7 @@ mod tests {
             .unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let user = AsynUser::new(0).with_timeout(Duration::ZERO);
         let mut buf = [0u8; 32];
@@ -2561,7 +2561,7 @@ mod tests {
         }
         // timeout == 0 → C `timeout > 0` guard is false → no teardown.
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "zero-timeout read must not disconnect even with disconnectOnReadTimeout=Y"
         );
     }
@@ -2655,7 +2655,7 @@ mod tests {
             "zero-length read must be rejected with asynError, got {res:?}"
         );
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "zero-length read must not tear down the connection"
         );
 
@@ -2702,12 +2702,12 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let err = drv.connect(&user).unwrap_err();
         assert!(matches!(err, AsynError::Status { .. }));
         // The original socket is left intact (still connected).
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
     }
 
     // --- hostInfo option tests ---
@@ -2732,11 +2732,11 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:9999")
             .unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         assert_eq!(drv.config.port, 9999);
     }
 
@@ -3158,7 +3158,7 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("unixtest", &format!("unix://{sock_path}")).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         drv.write_octet(&mut user, b"unix_hello").unwrap();

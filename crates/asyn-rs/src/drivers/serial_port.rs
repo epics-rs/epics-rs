@@ -553,7 +553,7 @@ impl DrvAsynSerialPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
 
         Ok(Self {
@@ -799,7 +799,7 @@ impl PortDriver for DrvAsynSerialPort {
         eprintln!(
             "Serial line {}: {}",
             self.device,
-            if self.base.connected {
+            if self.base.is_connected() {
                 "Connected"
             } else {
                 "Disconnected"
@@ -826,7 +826,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // read error / EOF so the actor's auto-reconnect re-opens the
                 // device. EINTR/EAGAIN are already retried inside
                 // SerialIoState::read, so an error reaching here is fatal.
-                if e.is_fatal_transport() && self.base.connected {
+                if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -867,7 +867,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // C parity: closeConnection on a fatal write error so the
                 // next request reconnects (symmetric with read; matches
                 // ip_port DRV-5).
-                if e.is_fatal_transport() && self.base.connected {
+                if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
@@ -1333,7 +1333,7 @@ impl DrvAsynSerialPort {
 impl Drop for DrvAsynSerialPort {
     fn drop(&mut self) {
         let user = AsynUser::default();
-        if self.base.connected {
+        if self.base.is_connected() {
             let _ = self.disconnect(&user);
         }
     }
@@ -1368,7 +1368,7 @@ mod tests {
     #[test]
     fn test_driver_initial_state() {
         let drv = DrvAsynSerialPort::new("serial1", "/dev/ttyUSB0").unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         assert!(drv.base().auto_connect);
         assert!(drv.base().flags.can_block);
         // `new` is parse-only: no EOS interpose (DRV-45).
@@ -1835,12 +1835,12 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         let user = AsynUser::default();
 
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         drv.disconnect(&user).unwrap();
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
     }
 
     /// DRV-57: a zero-length serial read request must be rejected with
@@ -1862,7 +1862,7 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("pty_maxchars", &slave_name).unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         let ruser = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut empty: [u8; 0] = [];
@@ -1878,7 +1878,7 @@ mod tests {
             "zero-length serial read must be rejected with asynError, got {res:?}"
         );
         assert!(
-            drv.base().connected,
+            drv.base().is_connected(),
             "zero-length serial read must not tear down the connection"
         );
     }
@@ -2028,7 +2028,7 @@ mod tests {
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         drv.connect(&AsynUser::default()).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         // Break the link: closing the master makes the driver's slave fd
         // return EOF (macOS) or EIO (Linux) on the next read — both fatal.
@@ -2042,7 +2042,7 @@ mod tests {
             "expected a fatal transport error, got {err:?}"
         );
         assert!(
-            !drv.base().connected,
+            !drv.base().is_connected(),
             "DRV-31: fatal read error must set connected=false"
         );
     }
@@ -2064,7 +2064,7 @@ mod tests {
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
         drv.connect(&AsynUser::default()).unwrap();
-        assert!(drv.base().connected);
+        assert!(drv.base().is_connected());
 
         // Break the link: closing the master makes the driver's slave fd return
         // a fatal error (EIO) on the next write.
@@ -2077,7 +2077,7 @@ mod tests {
             "expected a fatal transport error, got {err:?}"
         );
         assert!(
-            !drv.base().connected,
+            !drv.base().is_connected(),
             "DRV-31: fatal write error must set connected=false"
         );
     }
@@ -2520,7 +2520,7 @@ mod tests {
         drv.saved_termios = Some(saved);
         drv.disconnect(&user).unwrap();
         assert!(drv.saved_termios.is_none());
-        assert!(!drv.base().connected);
+        assert!(!drv.base().is_connected());
 
         // Now reopen and verify key flags were restored by reading termios
         // from the same PTY slave path. Re-open to read the restored state.

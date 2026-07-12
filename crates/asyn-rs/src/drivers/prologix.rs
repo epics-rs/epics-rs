@@ -179,7 +179,7 @@ impl DrvAsynPrologixPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = !no_auto_connect;
         Ok(Self {
             base,
@@ -235,7 +235,7 @@ impl DrvAsynPrologixPort {
         // state). Commit `State.eos` only after a successful bridge write, so a
         // failed write never leaves the cached mode out of sync with the
         // device (the DRV-35 commit-after-apply rule).
-        if self.base.connected {
+        if self.base.is_connected() {
             let cmd = format!("++eot_enable {}\n", Self::eot_enable_arg(eos));
             let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
             self.inner.write_octet(&mut bridge_user, cmd.as_bytes())?;
@@ -805,7 +805,7 @@ mod tests {
         let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
         let user = AsynUser::default().with_addr(-1);
         drv.connect(&user).unwrap();
-        assert!(drv.base.connected);
+        assert!(drv.base.is_connected());
         assert_eq!(drv.version(), "Prologix Test 1.0");
         // Tear down so the mock thread can drop and ship its capture.
         drv.disconnect(&user).unwrap();

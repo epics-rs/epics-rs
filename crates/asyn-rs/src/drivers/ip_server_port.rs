@@ -266,6 +266,17 @@ impl SlotFailure {
 pub struct ClientSlot {
     stream: Mutex<Option<TcpStream>>,
     peer: Mutex<Option<SocketAddr>>,
+    /// The slot's occupancy, and — because the child port shares this very cell
+    /// ([`PortDriverBase::share_connection`]) — the child port's `connected` flag.
+    /// They are one bit, so "the slot holds a live client while `parent:N` reports
+    /// `asynDisconnected`" cannot be constructed (R13-50).
+    ///
+    /// C reaches the same invariant by message: on slot reuse the listener sets
+    /// `pl->fd = clientFd` and calls `pasynCommonSyncIO->connectDevice(pl->pasynUser)`
+    /// on the child (drvAsynIPServerPort.c:357-367), and it is the child's own
+    /// `isConnected` that the listener's free-slot scan then reads (:342-350).
+    /// Assignment and connectivity are not allowed to disagree in C either.
+    occupied: Arc<AtomicBool>,
 }
 
 impl ClientSlot {
@@ -273,21 +284,32 @@ impl ClientSlot {
         Self {
             stream: Mutex::new(None),
             peer: Mutex::new(None),
+            occupied: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn is_occupied(&self) -> bool {
-        self.stream.lock().is_some()
+        self.occupied.load(Ordering::Acquire)
+    }
+
+    /// The cell the child port binds its `connected` flag to.
+    fn connection_cell(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.occupied)
     }
 
     fn assign(&self, stream: TcpStream, peer: SocketAddr) {
         *self.stream.lock() = Some(stream);
         *self.peer.lock() = Some(peer);
+        // Publish last: the socket and the peer are in place before any observer
+        // (the child port's actor, the parent's free-slot scan) can see the slot
+        // as occupied.
+        self.occupied.store(true, Ordering::Release);
     }
 
     fn clear(&self) {
         *self.stream.lock() = None;
         *self.peer.lock() = None;
+        self.occupied.store(false, Ordering::Release);
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
@@ -536,7 +558,7 @@ impl DrvAsynIPServerPort {
                 destructible: true,
             },
         );
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
         let mut slots = Vec::with_capacity(max);
         for _ in 0..max {
@@ -886,7 +908,7 @@ impl PortDriver for DrvAsynIPServerPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        let already_up = self.base.connected
+        let already_up = self.base.is_connected()
             && (self.listener.lock().is_some() || self.udp_socket.lock().is_some());
         if already_up {
             return Ok(());
@@ -1257,7 +1279,14 @@ impl DrvAsynIPSubport {
                 destructible: true,
             },
         );
-        base.connected = slot.is_occupied();
+        // The child does not own its link — the slot does, and the parent's accept
+        // loop assigns and clears it without this port's actor ever running. Bind
+        // `connected` to the slot's own cell rather than caching a copy of it, so
+        // a reused slot cannot leave the child stuck at `asynDisconnected`
+        // (R13-50). C keeps the same two facts in agreement by having the listener
+        // call `connectDevice` on the child the moment it hands it the socket
+        // (drvAsynIPServerPort.c:357-367).
+        base.share_connection(slot.connection_cell());
         base.auto_connect = false; // C uses noAutoConnect=1 for the child ports
         Self { base, slot }
     }
@@ -1302,10 +1331,13 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        // Passive sync — child port's connection is driven by the
-        // parent's accept loop, not by an outbound dial.
-        self.base.set_connected(self.slot.is_occupied());
-        if !self.base.connected {
+        // The child has no link of its own to dial: its socket is the slot's, and
+        // the parent's accept loop is what puts one there. C's child `connectIt`
+        // is likewise driven by the listener (`connectDevice`,
+        // drvAsynIPServerPort.c:357-367) and does no dialling either. So this
+        // publishes the slot's state — it cannot change it.
+        self.base.sync_connection_edge();
+        if !self.base.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
                 message: "no client assigned to this subport slot yet".into(),
@@ -1655,6 +1687,98 @@ mod tests {
             .accept_one()
             .expect("the freed slot must accept the next client");
         assert_eq!(idx2, 0);
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R13-50: a reused slot must revive the child subport.
+    ///
+    /// C's listener does it explicitly: when the free-slot scan hands slot `i` to
+    /// a new client it sets `pl->fd = clientFd` and calls
+    /// `pasynCommonSyncIO->connectDevice(pl->pasynUser)` on the child port
+    /// (drvAsynIPServerPort.c:357-367), which drives the child's `connectIt` and
+    /// its `exceptionConnect`. It has to: the child's own `isConnected` is what
+    /// the *next* free-slot scan reads (:342-350), so C cannot leave a child
+    /// disconnected while its slot holds a live socket.
+    ///
+    /// The port cached the child's `connected` in its own `PortDriverBase`, which
+    /// only the child's actor could write and which the parent's accept loop never
+    /// reached. Any teardown — EOF, and after R11-C9 any fatal errno — latched it
+    /// false, and since the child is `noAutoConnect` nothing ever set it back: the
+    /// next client accepted into that slot was served by a port that refused every
+    /// read and write with `asynDisconnected`, forever, over a live socket.
+    #[test]
+    fn a_reused_client_slot_revives_the_child_subport() {
+        use socket2::{Domain, Socket, Type};
+
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("slot_revive", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+
+        // First client, killed with an RST so the read tears the slot down through
+        // the fatal-errno path (C drvAsynIPPort.c:797-806).
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let victim = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        victim.connect(&addr.into()).unwrap();
+        assert_eq!(srv.accept_one().unwrap(), 0);
+        // An explicit connect on the child for the *first* client — C's
+        // `connectDevice`, and the only route by which a cached flag could ever
+        // have become true. Handing it to the first client isolates the defect to
+        // the *reuse*: the second client gets no extra call here, exactly as in C,
+        // where the listener's own `connectDevice` on assignment is all there is.
+        child.connect(&AsynUser::default()).unwrap();
+        assert!(
+            child.base().is_connected(),
+            "the child serves the new client"
+        );
+
+        victim.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(victim); // RST
+        std::thread::sleep(Duration::from_millis(50));
+
+        let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+        let err = child
+            .read_octet(&read_user, &mut buf)
+            .expect_err("a reset peer cannot deliver bytes");
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+        assert!(
+            !child.base().is_connected(),
+            "the child's own read tore the slot down (C closeConnection + exceptionDisconnect)"
+        );
+        assert!(!srv.slots[0].is_occupied());
+
+        // The next client takes the freed slot. C connects the child on assignment,
+        // so the child must serve it — the socket is live and the port must say so.
+        let mut client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert_eq!(srv.accept_one().unwrap(), 0);
+        assert!(
+            child.base().is_connected(),
+            "a reused slot revives the child: C calls connectDevice on it \
+             (drvAsynIPServerPort.c:357-367)"
+        );
+
+        // …and the revival is real I/O, not just a flag: the child must talk to the
+        // new client over the slot's socket.
+        let mut write_user = AsynUser::default();
+        child
+            .write_octet(&mut write_user, b"hello\n")
+            .expect("the revived child must write to the new client's socket");
+        let mut got = [0u8; 6];
+        client2
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client2.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello\n");
+
+        client2.write_all(b"world\n").unwrap();
+        let n = child
+            .read_octet(&read_user, &mut buf)
+            .expect("the revived child must read from the new client's socket");
+        assert_eq!(&buf[..n], b"world\n");
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

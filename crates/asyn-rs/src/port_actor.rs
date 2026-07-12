@@ -287,13 +287,13 @@ impl PortActor {
 
         // C :3257 — the port reconnected (or auto-connect was turned off)
         // while the timer was pending: nothing to do.
-        if self.driver.base().connected || !self.driver.base().auto_connect {
+        if self.driver.base().is_connected() || !self.driver.base().auto_connect {
             return;
         }
 
         let _ = self.driver.connect(&AsynUser::default());
 
-        if !self.driver.base().connected {
+        if !self.driver.base().is_connected() {
             // Still down — back off and try again (C :3281).
             let retry = self.driver.base().seconds_between_port_connect;
             self.driver.base_mut().connect_retry_at = Some(Instant::now() + retry);
@@ -517,6 +517,18 @@ impl PortActor {
         // Bare Connect *priority* is not enough: C keeps the EOS readback at Low
         // priority with no waiver (:1296), so IEOS/OEOS still stay blank on a
         // disconnected port, and keying the waiver on the reason preserves that.
+        // A port whose link is owned by another object — an IP-server child port,
+        // whose socket the parent's accept loop assigns and clears — can change
+        // connection state with no request of its own having run. Its `connected`
+        // is the owner's cell, so the gate below already reads the truth; what is
+        // still owed is the edge C's listener publishes explicitly when it hands
+        // the child a socket (`connectDevice`, drvAsynIPServerPort.c:357-367):
+        // the `exceptionConnect` fan-out and the interpose stack's reset, which
+        // drops the previous client's EOS read-ahead. Every other port is already
+        // in sync here (its own `set_connected` published the edge), so this is a
+        // no-op for them.
+        self.driver.base_mut().sync_connection_edge();
+
         if let Some(connect) = Self::queue_gate(&op, &user) {
             // C drains the Connect queue *before* `autoConnectDevice`
             // (asynManager.c:812-857): a waived request never triggers a connect
@@ -581,7 +593,7 @@ impl PortActor {
         // --- Port level (C :705-721). Runs for single- and multi-device
         // ports alike: in C the port `dpCommon` is reconnected before any
         // device `dpCommon` is even looked at.
-        if !self.driver.base().connected && self.driver.base().auto_connect {
+        if !self.driver.base().is_connected() && self.driver.base().auto_connect {
             if !self
                 .driver
                 .base()
@@ -594,7 +606,7 @@ impl PortActor {
                 .base_mut()
                 .stamp_auto_connect_attempt(-1, Instant::now());
         }
-        if !self.driver.base().connected {
+        if !self.driver.base().is_connected() {
             // C :721 — the port is still down, so the device cannot come up.
             return false;
         }
@@ -1752,7 +1764,7 @@ mod tests {
     #[test]
     fn actor_auto_connect() {
         let mut drv = TestDriver::new();
-        drv.base.connected = false;
+        drv.base.init_connected(false);
         drv.base.auto_connect = true;
         // Seed VAL so the read probe returns a value: the default read now
         // surfaces an unset param as ParamUndefined (C parity), so this
@@ -1796,7 +1808,7 @@ mod tests {
         let connect_calls = Arc::new(AtomicUsize::new(0));
         let mut base = PortDriverBase::new("throttle_test", 1, PortFlags::default());
         base.create_param("VAL", ParamType::Int32).unwrap();
-        base.connected = false;
+        base.init_connected(false);
         base.auto_connect = true;
         let drv = ThrottleDriver {
             base,
@@ -1877,7 +1889,7 @@ mod tests {
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.params.set_int32(0, 1, 7).unwrap();
             // The transport dropped: port down, and the device with it.
-            base.connected = false;
+            base.init_connected(false);
             base.auto_connect = true;
             base.device_state(1).connected = false;
             let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));

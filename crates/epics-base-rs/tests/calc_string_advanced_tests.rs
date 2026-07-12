@@ -210,12 +210,59 @@ fn test_lrc() {
     assert_eq!(result, StackValue::Str("FA".into()));
 }
 
+/// AMODBUS PREPENDS the ASCII-MODBUS start delimiter `:` as well as appending the
+/// LRC (`sCalcPerform.c:1846-1850`). The port dropped it, so every frame it built
+/// was missing its start character. Compiled sCalc:
+///
+///   AMODBUS("010203")        :010203FA        (9 chars)
+///   AMODBUS("F7031389000A")  :F7031389000A60  (15 chars — the example in C's own
+///                                              comment at `:1834`)
 #[test]
-fn test_amodbus_append() {
-    // AMODBUS appends LRC hex string (2 chars)
-    let result = eval_str(r#"LEN(AMODBUS("010203"))"#);
-    // "010203" is 6 chars, plus "FA" = 8
-    assert_eq!(result, StackValue::Double(8.0));
+fn test_amodbus_prepends_the_start_delimiter() {
+    assert_eq!(
+        eval_str(r#"AMODBUS("010203")"#),
+        StackValue::Str(":010203FA".into())
+    );
+    assert_eq!(
+        eval_str(r#"LEN(AMODBUS("010203"))"#),
+        StackValue::Double(9.0)
+    );
+    assert_eq!(
+        eval_str(r#"AMODBUS("F7031389000A")"#),
+        StackValue::Str(":F7031389000A60".into())
+    );
+}
+
+/// The 39-byte value bound bites the LRC, not the frame: C copies `":" + operand`
+/// in first (`strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE)`) and appends only what of
+/// the LRC still fits. Compiled sCalc, with a 38-character operand: 39 characters
+/// out, and the LRC entirely crowded out.
+///
+///   AMODBUS("0102030405060708090A0B0C0D0E0F10111213")
+///     = :0102030405060708090A0B0C0D0E0F10111213     (39 chars, no LRC)
+///   AMODBUS("0102030405060708090A0B0C0D0E0F1011")
+///     = :0102030405060708090A0B0C0D0E0F101167       (37 chars, LRC "67" fits)
+#[test]
+fn test_amodbus_long_operand_crowds_out_the_lrc() {
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = "0102030405060708090A0B0C0D0E0F10111213".into(); // 38
+    let r = scalc("AMODBUS(AA)", &mut inputs).unwrap();
+    assert_eq!(
+        r,
+        StackValue::Str(":0102030405060708090A0B0C0D0E0F10111213".into())
+    );
+    match r {
+        StackValue::Str(s) => assert_eq!(s.len(), 39),
+        _ => panic!("expected a string"),
+    }
+
+    // Four characters shorter, and the LRC fits.
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = "0102030405060708090A0B0C0D0E0F1011".into(); // 34
+    assert_eq!(
+        scalc("AMODBUS(AA)", &mut inputs).unwrap(),
+        StackValue::Str(":0102030405060708090A0B0C0D0E0F101167".into())
+    );
 }
 
 // --- Subrange [] ---

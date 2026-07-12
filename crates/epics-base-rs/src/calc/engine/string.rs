@@ -657,7 +657,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 StringOp::LrcAppend => {
                     let v = pop1(&mut stack)?;
-                    stack.push(checksum_op(v, super::checksum::lrc, Combine::Append));
+                    stack.push(checksum_op(v, super::checksum::lrc, Combine::AsciiFrame));
                 }
                 StringOp::Xor8 => {
                     let v = pop1(&mut stack)?;
@@ -802,12 +802,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     Ok(result)
 }
 
-/// What a checksum opcode does with the digest it computed: `CRC16`/`LRC`/`XOR8`
-/// REPLACE the operand with it, `MODBUS`/`AMODBUS`/`ADD_XOR8` APPEND it.
+/// What a checksum opcode does with the digest it computed.
 #[derive(Clone, Copy, PartialEq)]
 enum Combine {
+    /// `CRC16` / `LRC` / `XOR8` — the digest REPLACES the operand.
     Replace,
+    /// `MODBUS` / `ADD_XOR8` — the digest is APPENDED to it.
     Append,
+    /// `AMODBUS` — appended, and a `:` is PREPENDED (`sCalcPerform.c:1846-1850`):
+    ///
+    /// ```c
+    /// strcpy(tmpstr, ":");
+    /// strcat(tmpstr, ps->s);
+    /// strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE);
+    /// strncat(ps->s, tmpstr10, SCALC_STRING_SIZE-strlen(ps->s)-1);
+    /// ```
+    ///
+    /// The `:` is the ASCII-MODBUS start delimiter, and without it the frame is
+    /// not a frame. The port dropped it. (C bounds `":" + operand` to 39 before
+    /// appending the LRC, which is the same 39 bytes as bounding the whole
+    /// concatenation once — a long operand simply crowds the LRC out.)
+    AsciiFrame,
 }
 
 /// C's six checksum opcodes (`sCalcPerform.c:1819-1866`) are one shape written
@@ -843,6 +858,7 @@ fn checksum_op(
     match combine {
         Combine::Replace => StackValue::str(text),
         Combine::Append => StackValue::str([s.as_bytes(), text.as_bytes()].concat()),
+        Combine::AsciiFrame => StackValue::str([b":", s.as_bytes(), text.as_bytes()].concat()),
     }
 }
 

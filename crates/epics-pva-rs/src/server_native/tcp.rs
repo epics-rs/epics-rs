@@ -14317,6 +14317,125 @@ mod tests {
         }
     }
 
+    /// W10-C2: byte-level pin on the connect-time monitor **seed** frame.
+    ///
+    /// The seed is queued with `marked: None` and no previous snapshot
+    /// (`MonitorQueue::seed`), so the emitter dispatches it to
+    /// [`build_monitor_payload`] with the op's full pvRequest mask. Its
+    /// changed-bitset is therefore the leaf enumeration of that mask —
+    /// pvxs `to_wire_valid` (`dataencode.cpp:414-439`) sets a wire bit only
+    /// where `store[bit].valid`, and `Value::mark` (`data.cpp:256-270`)
+    /// never validates a parent structure, so neither the root bit (0) nor
+    /// the `alarm` (2) / `timeStamp` (6) bits can appear.
+    /// `test/testxcode.cpp:111-116` is the upstream regression for this.
+    ///
+    /// Asserted byte-for-byte so a future bitset change cannot silently
+    /// drift the seed frame.
+    #[test]
+    fn w10_c2_monitor_seed_frame_bytes_are_leaf_enumerated() {
+        let order = ByteOrder::Big; // pvxs testxcode serializes big-endian
+        let ioid = 1u32;
+        // NTScalar<UInt32> exactly as pvxs's nt::NTScalar{TypeCode::UInt32}:
+        // 0=root 1=value 2=alarm 3=.severity 4=.status 5=.message
+        // 6=timeStamp 7=.secondsPastEpoch 8=.nanoseconds 9=.userTag
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::UInt)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".into(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(1))));
+        alarm
+            .fields
+            .push(("status".into(), PvField::Scalar(ScalarValue::Int(2))));
+        alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("hi".into())),
+        ));
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(5)),
+        ));
+        ts.fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(6))));
+        ts.fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(7))));
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::UInt(0xdead_beef)),
+        ));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(ts)));
+        let seed = PvField::Structure(root);
+
+        // A wildcard pvRequest: `request_to_mask` selects every bit.
+        let mask = BitSet::all_set(intro.total_bits());
+        // The seed goes through the FIFO as `marked: None`, which the
+        // emitter dispatches to `build_monitor_payload`.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(seed.clone());
+        let ev = q.pop().expect("seed queued");
+        assert!(ev.marked.is_none(), "the seed carries no explicit mark set");
+
+        let frame = build_monitor_payload(ioid, &intro, &ev.value, &mask, order);
+        // 8-byte PVA header, then the payload.
+        let payload = &frame[8..];
+
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x01,             // ioid
+            0x00,                               // subcmd (monitor data)
+            // changed BitSet: 2 bytes, bits {1,3,4,5,7,8,9}.
+            // byte0 = 1<<1|1<<3|1<<4|1<<5|1<<7 = 0xBA; byte1 = 1<<0|1<<1 = 0x03.
+            0x02, 0xBA, 0x03,
+            0xde, 0xad, 0xbe, 0xef,             // value: UInt 0xdeadbeef
+            0x00, 0x00, 0x00, 0x01,             // alarm.severity = 1
+            0x00, 0x00, 0x00, 0x02,             // alarm.status   = 2
+            0x02, b'h', b'i',                   // alarm.message  = "hi"
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // timeStamp.secondsPastEpoch = 5
+            0x00, 0x00, 0x00, 0x06,             // timeStamp.nanoseconds = 6
+            0x00, 0x00, 0x00, 0x07,             // timeStamp.userTag = 7
+            0x00,                               // overrun BitSet: empty (servermon.cpp:174-176)
+        ];
+        assert_eq!(
+            payload, expected,
+            "connect-time monitor seed frame bytes (leaf-enumerated \
+             changed-bitset; pvxs testxcode.cpp:111-116)"
+        );
+    }
+
     /// pvxs `servermon.cpp:493` parity: when the client sets the
     /// pipeline bit (`subcmd & 0x80`) on MONITOR INIT, the body
     /// carries a trailing u32 `nack` (initial window). The handler

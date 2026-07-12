@@ -282,6 +282,24 @@ pub enum RequestOp {
     PushDelayInterpose {
         delay: std::time::Duration,
     },
+    /// Send a GPIB universal command byte — C `asynGpib::universalCmd`
+    /// (asynGpib.c:480-484). asynRecord's UCMD dispatch
+    /// (`gpibUniversalCmd`, asynRecord.c:1638-1679).
+    GpibUniversalCmd {
+        cmd: u8,
+    },
+    /// Send a GPIB addressed-command frame — C `asynGpib::addressedCmd`
+    /// (asynGpib.c:472-478). asynRecord's ACMD dispatch builds the frame
+    /// (`gpibAddressedCmd`, asynRecord.c:1681-1756).
+    GpibAddressedCmd {
+        data: Vec<u8>,
+    },
+    /// Assert Interface Clear — C `asynGpib::ifc` (asynGpib.c:486-490).
+    GpibIfc,
+    /// Set the Remote Enable line — C `asynGpib::ren` (asynGpib.c:492-496).
+    GpibRen {
+        enable: bool,
+    },
 }
 
 /// Result returned by the worker after executing a request.

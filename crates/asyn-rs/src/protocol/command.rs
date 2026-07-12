@@ -161,6 +161,21 @@ pub enum PortCommand {
     GetInputEos,
     /// Read back the driver's output EOS — C `pasynOctet->getOutputEos`.
     GetOutputEos,
+    /// Send a GPIB universal command byte — C `asynGpib::universalCmd`.
+    /// Appended last: the variant order is the wire encoding.
+    GpibUniversalCmd {
+        cmd: u8,
+    },
+    /// Send a GPIB addressed-command frame — C `asynGpib::addressedCmd`.
+    GpibAddressedCmd {
+        data: Vec<u8>,
+    },
+    /// Assert Interface Clear — C `asynGpib::ifc`.
+    GpibIfc,
+    /// Set the Remote Enable line — C `asynGpib::ren`.
+    GpibRen {
+        enable: bool,
+    },
 }
 
 #[cfg(test)]
@@ -230,6 +245,12 @@ mod tests {
             PortCommand::PushDelayInterpose { delay_secs: 0.001 },
             PortCommand::GetInputEos,
             PortCommand::GetOutputEos,
+            PortCommand::GpibUniversalCmd { cmd: 0x14 },
+            PortCommand::GpibAddressedCmd {
+                data: vec![0x5f, 0x3f, 0x25, 0x08, 0x5f, 0x3f],
+            },
+            PortCommand::GpibIfc,
+            PortCommand::GpibRen { enable: true },
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

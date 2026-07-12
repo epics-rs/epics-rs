@@ -1473,6 +1473,62 @@ pub trait PortDriver: Send + Sync + 'static {
         self.base().output_eos.clone()
     }
 
+    // --- asynGpib (IEEE-488 bus control) ---
+    //
+    // The four command methods of C's `asynGpib` interface (asynGpibDriver.h:47-51),
+    // which asynGpib.c passes straight through to the driver's `asynGpibPort`
+    // (asynGpib.c:472-496). A driver that implements them declares
+    // [`crate::interfaces::Capability::Gpib`], and that declaration is what a
+    // client's `findInterface(asynGpibType)` answers — asynRecord reads it into
+    // GPIBIV and refuses UCMD/ACMD when it is 0 (asynRecord.c:1231-1241,
+    // :1647-1651).
+    //
+    // The defaults refuse: a port that has not declared the capability can only
+    // be reached here by a caller that skipped the registry, and C has nothing
+    // to call in that case (the interface pointer is NULL).
+    //
+    // Not ported: the `asynGpibPort` methods that exist solely to drive
+    // asynGpib's SRQ poll thread — `srqStatus`, `srqEnable`, `serialPollBegin`,
+    // `serialPoll`, `serialPollEnd` (asynGpibDriver.h:88-92), plus `pollAddr` /
+    // `srqHappened` (asynGpib.c:498-559, 633-656). Nothing in this tree polls
+    // SRQ; asynRecord's own "Serial Poll" ACMD does not use them (it sends SPE,
+    // reads one octet, sends SPD — asynRecord.c:1717-1746).
+
+    /// C `asynGpib::universalCmd` — send one universal command byte with ATN
+    /// asserted (asynGpib.c:480-484, `vxiUniversalCmd` drvVxi11.c:1406-1424).
+    fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
+    /// C `asynGpib::addressedCmd` — send an addressed-command frame with ATN
+    /// asserted (asynGpib.c:472-478, `vxiAddressedCmd` drvVxi11.c:1360-1404).
+    /// The frame is built by [`crate::interfaces::gpib::addressed_request`].
+    fn gpib_addressed_cmd(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
+    /// C `asynGpib::ifc` — assert Interface Clear (asynGpib.c:486-490).
+    fn gpib_ifc(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
+    /// C `asynGpib::ren` — set the Remote Enable line (asynGpib.c:492-496).
+    fn gpib_ren(&mut self, _user: &mut AsynUser, _enable: bool) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "port has no asynGpib interface".into(),
+        })
+    }
+
     // --- Lifecycle ---
 
     /// Called when the port is being shut down. Drivers override this

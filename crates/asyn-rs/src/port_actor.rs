@@ -927,6 +927,27 @@ impl PortActor {
                 let n = eos.len();
                 Ok(RequestResult::octet_read(eos, n))
             }
+            // The asynGpib command interface. C reaches the driver's
+            // `asynGpibPort` methods through asynGpib's pass-through
+            // (asynGpib.c:472-496) on the port thread, under the same
+            // queue/auto-connect gating as any other transfer — which is where
+            // this dispatch sits.
+            RequestOp::GpibUniversalCmd { cmd } => {
+                self.driver.gpib_universal_cmd(user, *cmd)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::GpibAddressedCmd { data } => {
+                self.driver.gpib_addressed_cmd(user, data)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::GpibIfc => {
+                self.driver.gpib_ifc(user)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::GpibRen { enable } => {
+                self.driver.gpib_ren(user, *enable)?;
+                Ok(RequestResult::write_ok())
+            }
         };
 
         // Attach alarm/timestamp metadata on successful reads

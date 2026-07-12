@@ -559,11 +559,30 @@ struct IoInFlight {
     result: Arc<Mutex<Option<IoOutcome>>>,
 }
 
+/// The GPIB command a cycle carries, decoded from UCMD / ACMD at the top of the
+/// cycle — C `asynCallbackProcess` dispatches `gpibUniversalCmd` (UCMD) or
+/// `gpibAddressedCmd` (ACMD) *instead of* `performIO` (asynRecord.c:819-827), so
+/// a cycle is either a GPIB command or a transfer, never both.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum GpibCycle {
+    /// One `universalCmd(cmd)` — C `gpibUniversalCmd` (asynRecord.c:1638-1677).
+    Universal(u8),
+    /// One `addressedCmd(frame)` — C `gpibAddressedCmd`'s `acmd[]`
+    /// (asynRecord.c:1698-1750).
+    Addressed(Vec<u8>),
+    /// C's three-operation Serial Poll (asynRecord.c:1717-1746).
+    SerialPoll,
+}
+
 /// Immutable snapshot of the record fields `performIO` reads, built on the
 /// scan thread so the off-thread orchestration never touches the record.
 struct IoPlan {
     tmod: TransferMode,
     iface: InterfaceType,
+    /// `Some` when this cycle is a GPIB command rather than a transfer — the
+    /// UCMD / ACMD the operator put, decoded and consumed by
+    /// [`AsynRecord::take_gpib_cycle`].
+    gpib: Option<GpibCycle>,
     // Per-request `asynUser` inputs. Stored as primitives (not a built
     // `AsynUser`) because `AsynUser` owns a non-`Clone` `user_data` box, and
     // every phase consumes a fresh user by value (`io_user`/`flush_user`).
@@ -605,6 +624,9 @@ struct IoOutcome {
     i32inp: Option<i32>,
     ui32inp: Option<u32>,
     f64inp: Option<f64>,
+    /// The serial-poll response byte C reads straight into the SPR field
+    /// (`read(…, (char *) &pasynRec->spr, 1, …)`, asynRecord.c:1729-1731).
+    spr: Option<i32>,
     errs: Option<String>,
     /// Record alarm `(stat, sevr)` this I/O cycle raises — the C
     /// `recGblSetSevr(pasynRec, …)` calls scattered through `performIO`
@@ -693,12 +715,28 @@ fn flush_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason).with_addr(plan.addr)
 }
 
-/// One phase of a `performIO` cycle.
+/// One phase of a record I/O cycle — a `performIO` transfer phase, or one bus
+/// operation of a GPIB command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IoPhase {
     Flush,
     Write,
     Read,
+    /// C `gpibUniversalCmd`'s single `universalCmd(cmd_char)`
+    /// (asynRecord.c:1672).
+    GpibUniversal(u8),
+    /// C `gpibAddressedCmd`'s `addressedCmd(acmd, lenCmd)` (asynRecord.c:1750);
+    /// the frame is [`GpibCycle::Addressed`]'s.
+    GpibAddressed,
+    /// Serial Poll step 1 — `universalCmd(IBSPE)` (asynRecord.c:1719-1726).
+    GpibSerialPollEnable,
+    /// Serial Poll step 2 — a one-byte octet read into SPR
+    /// (asynRecord.c:1728-1735).
+    GpibSerialPollRead,
+    /// Serial Poll step 3 — `universalCmd(IBSPD)` (asynRecord.c:1737-1744).
+    /// C runs it even when the enable or the read failed, so it is a phase like
+    /// any other: a failing phase reports, it does not abort the cycle.
+    GpibSerialPollDisable,
 }
 
 /// The phases one `performIO` cycle runs, in C's execution order — the single
@@ -722,6 +760,20 @@ enum IoPhase {
 /// `performFloat64IO` :1442-1467) have no flush branch — a `TMOD=Flush` cycle on
 /// a register interface does nothing in C.
 fn io_phases(plan: &IoPlan) -> Vec<IoPhase> {
+    // A GPIB command replaces the transfer entirely — C dispatches
+    // gpibUniversalCmd / gpibAddressedCmd *instead of* performIO
+    // (asynRecord.c:819-827), so TMOD and IFACE do not apply to this cycle.
+    if let Some(cycle) = &plan.gpib {
+        return match cycle {
+            GpibCycle::Universal(cmd) => vec![IoPhase::GpibUniversal(*cmd)],
+            GpibCycle::Addressed(_) => vec![IoPhase::GpibAddressed],
+            GpibCycle::SerialPoll => vec![
+                IoPhase::GpibSerialPollEnable,
+                IoPhase::GpibSerialPollRead,
+                IoPhase::GpibSerialPollDisable,
+            ],
+        };
+    }
     let mut phases = Vec::with_capacity(3);
     if plan.iface == InterfaceType::Octet
         && matches!(plan.tmod, TransferMode::Flush | TransferMode::WriteRead)
@@ -783,6 +835,46 @@ fn io_read_op(plan: &IoPlan) -> RequestOp {
             mask: plan.ui32mask,
         },
         InterfaceType::Float64 => RequestOp::Float64Read,
+    }
+}
+
+/// The port operation one phase submits — the single owner of phase→`RequestOp`
+/// for both the synchronous [`AsynRecord::perform_io`] and the off-thread
+/// [`run_io_plan`].
+fn io_phase_op(plan: &IoPlan, phase: IoPhase) -> RequestOp {
+    match phase {
+        IoPhase::Flush => RequestOp::Flush,
+        IoPhase::Write => io_write_op(plan),
+        IoPhase::Read => io_read_op(plan),
+        IoPhase::GpibUniversal(cmd) => RequestOp::GpibUniversalCmd { cmd },
+        IoPhase::GpibAddressed => RequestOp::GpibAddressedCmd {
+            data: match &plan.gpib {
+                Some(GpibCycle::Addressed(frame)) => frame.clone(),
+                // Unreachable by construction: `io_phases` only emits
+                // `GpibAddressed` for `GpibCycle::Addressed`.
+                _ => Vec::new(),
+            },
+        },
+        IoPhase::GpibSerialPollEnable => RequestOp::GpibUniversalCmd {
+            cmd: crate::interfaces::gpib::IBSPE,
+        },
+        // C reads the response byte through asynOctet, not asynGpib
+        // (asynRecord.c:1729-1731) — one byte, into SPR.
+        IoPhase::GpibSerialPollRead => RequestOp::OctetRead { buf_size: 1 },
+        IoPhase::GpibSerialPollDisable => RequestOp::GpibUniversalCmd {
+            cmd: crate::interfaces::gpib::IBSPD,
+        },
+    }
+}
+
+/// The `asynUser` one phase submits with. C gives every transfer the record's
+/// TMOT (`pasynUser->timeout = pasynRec->tmot`, asynRecord.c:818) — including
+/// the GPIB commands, which run under the same queued user — and only the flush
+/// carries no transfer timeout.
+fn io_phase_user(plan: &IoPlan, phase: IoPhase) -> AsynUser {
+    match phase {
+        IoPhase::Flush => flush_user(plan),
+        _ => io_user(plan),
     }
 }
 
@@ -1065,6 +1157,64 @@ fn record_phase_result(
         }
         IoPhase::Write => record_write_result(plan, out, res),
         IoPhase::Read => record_read_result(plan, out, res),
+        IoPhase::GpibUniversal(_) => {
+            // C gpibUniversalCmd (asynRecord.c:1672-1677).
+            if let Err(e) = res {
+                out.report_error(format!("GPIB Universal command {}", e.message()));
+                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
+            }
+        }
+        IoPhase::GpibAddressed => {
+            // C gpibAddressedCmd (asynRecord.c:1750-1756).
+            if let Err(e) = res {
+                out.report_error(format!(
+                    "Error in GPIB Addressed Command write, {}",
+                    e.message()
+                ));
+                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
+            }
+        }
+        IoPhase::GpibSerialPollEnable => {
+            // C Serial Poll step 1 (asynRecord.c:1721-1726).
+            if let Err(e) = res {
+                out.report_error(format!("Error in GPIB Serial Poll write, {}", e.message()));
+                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
+            }
+        }
+        IoPhase::GpibSerialPollRead => {
+            // C Serial Poll step 2 (asynRecord.c:1728-1735): the response byte
+            // lands in SPR, and *either* a failing status *or* a transfer of
+            // other than one byte is the error — the record keeps the last SPR
+            // in that case, because C only ever wrote through the pointer if the
+            // driver moved a byte.
+            let (data, err) = match res {
+                Ok(result) => (result.data.unwrap_or_default(), None),
+                Err(e) => (
+                    e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
+                    Some(e),
+                ),
+            };
+            if let Some(byte) = data.first() {
+                out.spr = Some(i32::from(*byte));
+            }
+            if err.is_some() || data.len() != 1 {
+                // C's `%s` tail is `pasynUser->errorMessage`; a short read that
+                // reported success leaves it as `resetError` left it — empty.
+                let detail = err.map(|e| e.message()).unwrap_or_default();
+                out.report_error(format!("Error in GPIB Serial Poll read, {detail}"));
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
+            }
+        }
+        IoPhase::GpibSerialPollDisable => {
+            // C Serial Poll step 3 (asynRecord.c:1737-1744).
+            if let Err(e) = res {
+                out.report_error(format!(
+                    "Error in GPIB Serial Poll disable write, {}",
+                    e.message()
+                ));
+                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
+            }
+        }
     }
 }
 
@@ -1086,23 +1236,13 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
     }
 
     for phase in io_phases(&plan) {
-        let res = match phase {
-            IoPhase::Flush => {
-                handle
-                    .submit_cancellable(RequestOp::Flush, flush_user(&plan), cancel.clone())
-                    .await
-            }
-            IoPhase::Write => {
-                handle
-                    .submit_cancellable(io_write_op(&plan), io_user(&plan), cancel.clone())
-                    .await
-            }
-            IoPhase::Read => {
-                handle
-                    .submit_cancellable(io_read_op(&plan), io_user(&plan), cancel.clone())
-                    .await
-            }
-        };
+        let res = handle
+            .submit_cancellable(
+                io_phase_op(&plan, phase),
+                io_phase_user(&plan, phase),
+                cancel.clone(),
+            )
+            .await;
         if cancel.is_cancelled() {
             out.report_canceled();
             return out;
@@ -2729,6 +2869,15 @@ impl AsynRecord {
     /// I/O can run without touching the record (synchronously here, or off
     /// the scan thread in [`run_io_plan`]).
     fn build_io_plan(&mut self) -> IoPlan {
+        self.build_io_plan_for(None)
+    }
+
+    /// [`Self::build_io_plan`] for a cycle that may be a GPIB command instead of
+    /// a transfer. A GPIB cycle skips the octet output build and the NRRD/NOWT
+    /// clamps: C reaches those only inside `performOctetIO`
+    /// (asynRecord.c:1503-1546), which `gpibUniversalCmd` / `gpibAddressedCmd`
+    /// replace — a UCMD put must not rewrite the record's transfer sizes.
+    fn build_io_plan_for(&mut self, gpib: Option<GpibCycle>) -> IoPlan {
         let iface = InterfaceType::from_u16(self.iface as u16);
         // C `performOctetIO` (asynRecord.c:1503-1517): the input buffer is
         // chosen by IFMT — ASCII reads into the fixed 40-byte AINP string
@@ -2752,7 +2901,7 @@ impl AsynRecord {
         // (asynRecord.c:1326-1331). Gate both here for the same reason: a
         // register-interface cycle must leave NRRD/NOWT alone and has no octet
         // payload to send.
-        let (octet_out, octet_out_len) = if iface == InterfaceType::Octet {
+        let (octet_out, octet_out_len) = if gpib.is_none() && iface == InterfaceType::Octet {
             self.clamp_transfer_sizes(in_len);
             let out = self.octet_output_buffer();
             let len = out.len();
@@ -2771,6 +2920,7 @@ impl AsynRecord {
         IoPlan {
             tmod: TransferMode::from_u16(self.tmod as u16),
             iface,
+            gpib,
             reason: self.resolved_reason,
             addr: self.addr,
             timeout,
@@ -2785,6 +2935,35 @@ impl AsynRecord {
             in_len,
             ifmt: self.ifmt,
         }
+    }
+
+    /// Decode and consume this cycle's GPIB command — C `asynCallbackProcess`'s
+    /// `ucmd != gpibUCMD_None` / `acmd != gpibACMD_None` test, and the reset back
+    /// to `None` it performs right after the call returns
+    /// (asynRecord.c:819-827). UCMD wins over ACMD, as in C.
+    ///
+    /// The reset is unconditional in C — it happens whether the command reached
+    /// the bus, failed in the driver, or was refused because the port carries no
+    /// asynGpib interface — so an operator's UCMD/ACMD put runs exactly one
+    /// cycle. Consuming the field here, above the interface gate, keeps that.
+    fn take_gpib_cycle(&mut self) -> Option<GpibCycle> {
+        use crate::interfaces::gpib::{
+            GpibAddressedRequest, addressed_request, universal_cmd_byte,
+        };
+        if self.ucmd != 0 {
+            let cmd = universal_cmd_byte(self.ucmd);
+            self.ucmd = 0;
+            return Some(GpibCycle::Universal(cmd));
+        }
+        if self.acmd != 0 {
+            let request = addressed_request(self.acmd, self.addr);
+            self.acmd = 0;
+            return Some(match request {
+                GpibAddressedRequest::Frame(frame) => GpibCycle::Addressed(frame),
+                GpibAddressedRequest::SerialPoll => GpibCycle::SerialPoll,
+            });
+        }
+        None
     }
 
     /// Apply the results of a `performIO` cycle to the record's input/status
@@ -2820,6 +2999,9 @@ impl AsynRecord {
         if let Some(v) = out.f64inp {
             self.f64inp = v;
         }
+        if let Some(v) = out.spr {
+            self.spr = v;
+        }
         if let Some(v) = out.errs {
             self.errs = v;
         }
@@ -2832,12 +3014,14 @@ impl AsynRecord {
         }
     }
 
-    /// Synchronous `performIO` — the C `process()` `canBlock==0` branch
-    /// (asynRecord.c:351-352) that runs the I/O inline rather than queuing
-    /// it. Shares the op builders and result recorders with the off-thread
+    /// Run one cycle's phases inline — the C `process()` `canBlock==0` branch
+    /// (asynRecord.c:351-352), which runs the queued callback's work on the scan
+    /// thread rather than queuing it. The cycle is whatever `plan` says: a
+    /// `performIO` transfer, or the GPIB command a UCMD/ACMD put asked for.
+    /// Shares the op builders and result recorders with the off-thread
     /// [`run_io_plan`]; only the submit primitive differs (blocking here,
     /// awaited there).
-    fn perform_io(&mut self) -> CaResult<()> {
+    fn perform_io(&mut self, plan: IoPlan) -> CaResult<()> {
         let entry = match &self.port_entry {
             Some(e) => e.clone(),
             None => {
@@ -2845,21 +3029,12 @@ impl AsynRecord {
                 return Ok(());
             }
         };
-        let plan = self.build_io_plan();
         let mut out = IoOutcome::default();
 
         for phase in io_phases(&plan) {
-            let res = match phase {
-                IoPhase::Flush => entry
-                    .handle
-                    .submit_blocking(RequestOp::Flush, flush_user(&plan)),
-                IoPhase::Write => entry
-                    .handle
-                    .submit_blocking(io_write_op(&plan), io_user(&plan)),
-                IoPhase::Read => entry
-                    .handle
-                    .submit_blocking(io_read_op(&plan), io_user(&plan)),
-            };
+            let res = entry
+                .handle
+                .submit_blocking(io_phase_op(&plan, phase), io_phase_user(&plan, phase));
             record_phase_result(&plan, &mut out, phase, res);
         }
 
@@ -2879,8 +3054,8 @@ impl AsynRecord {
         handle: PortHandle,
         name: String,
         db: AsyncDbHandle,
+        plan: IoPlan,
     ) -> ProcessOutcome {
-        let plan = self.build_io_plan();
         let cancel = CancelToken::new();
         let slot: Arc<Mutex<Option<IoOutcome>>> = Arc::new(Mutex::new(None));
 
@@ -3735,62 +3910,54 @@ impl Record for AsynRecord {
         // here is both of C's.
         self.reset_error();
 
-        // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
-        // priority: a pending UCMD universal GPIB command first, else a
-        // pending ACMD addressed GPIB command, else octet/register I/O
-        // (performIO). The two GPIB commands take priority over performIO
-        // — they run even when TMOD is NoIO — and each resets its menu
-        // field back to None so the operator's request is consumed
-        // exactly once.
-        //
-        // gpibUniversalCmd / gpibAddressedCmd (asynRecord.c:1647-1651,
-        // 1693-1697) begin with `if (!pasynRec->gpibiv)`: with no asynGpib
-        // interface they report "No asynGpib interface", raise a
-        // COMM_ALARM/MAJOR_ALARM, and return without touching the bus.
-        // epics-rs ports carry no asynGpib interface (GPIBIV is always 0,
-        // set in connect_device), so that no-interface branch is the only
-        // reachable path here. The COMM/MAJOR severity is staged in `io_alarm`
-        // and committed by `check_alarms` on this same cycle.
-        if self.ucmd != 0 {
-            self.errs = "No asynGpib interface".to_string();
-            self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
-            self.ucmd = 0;
-            return Ok(ProcessOutcome::complete());
-        }
-        if self.acmd != 0 {
-            self.errs = "No asynGpib interface".to_string();
-            self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
-            self.acmd = 0;
-            return Ok(ProcessOutcome::complete());
-        }
-
-        let tmod = TransferMode::from_u16(self.tmod as u16);
-        if tmod == TransferMode::NoIo {
-            return Ok(ProcessOutcome::complete());
-        }
-
-        // C refuses in this order, and the order is load-bearing: `process()`
-        // rejects `state == stateNoDevice` before it queues anything
-        // (asynRecord.c:356-357), so a record with no port never reaches
-        // `performIO`'s interface dispatch and never reports a missing interface
-        // — it reports "Not connect to a port".
+        // C refuses on `state` before it queues anything, and the order is
+        // load-bearing: `process()` tests `state == stateNoDevice`
+        // (asynRecord.c:356-357) — the record has no working port (`:312`, `:513`)
+        // — above the queued callback that dispatches UCMD / ACMD / performIO.
+        // So a record with no port dispatches nothing at all: it reports "Not
+        // connect to a port" with STATE_ALARM/MINOR, and a pending UCMD/ACMD stays
+        // pending for a cycle that has a port to send it to.
         let Some(entry) = self.port_entry.clone() else {
             self.report_not_connected();
             return Ok(ProcessOutcome::complete());
         };
 
-        // Connected: `performIO` dispatches on IFACE and refuses the transfer
-        // when the port does not implement the selected interface — "No asynInt32
-        // interface" + COMM_ALARM/MAJOR_ALARM, no I/O (asynRecord.c:1328-1360).
-        // A pure-octet transport (an IP socket, a serial line) has exactly one
-        // valid interface, so this is the ordinary answer for a record pointed at
-        // one with IFACE=Int32, not an edge case. The gate sits here, above the
-        // blocking/non-blocking split, so both paths take the same refusal.
-        let iface = InterfaceType::from_u16(self.iface as u16);
-        if !self.has_interface(iface) {
-            self.report_no_interface(iface.c_asyn_name());
-            return Ok(ProcessOutcome::complete());
-        }
+        // C asynCallbackProcess (asynRecord.c:819-827) dispatches by priority: a
+        // pending UCMD universal GPIB command first, else a pending ACMD addressed
+        // GPIB command, else the TMOD/IFACE transfer (performIO). A GPIB command
+        // therefore runs even when TMOD is NoIO, and it is not a transfer — the
+        // IFACE gate below does not apply to it.
+        let plan = if let Some(cycle) = self.take_gpib_cycle() {
+            // gpibUniversalCmd / gpibAddressedCmd open with
+            // `if (!pasynRec->gpibiv)` (asynRecord.c:1647-1651, :1693-1697): a port
+            // with no asynGpib interface gets "No asynGpib interface" +
+            // COMM_ALARM/MAJOR_ALARM and no bus traffic. The gate asks the port's
+            // registry, like every other interface gate here; GPIBIV is the
+            // operator's readback of the same answer.
+            if !self.port_has(crate::interfaces::InterfaceType::Gpib) {
+                self.report_no_interface(crate::interfaces::InterfaceType::Gpib.asyn_name());
+                return Ok(ProcessOutcome::complete());
+            }
+            self.build_io_plan_for(Some(cycle))
+        } else {
+            if TransferMode::from_u16(self.tmod as u16) == TransferMode::NoIo {
+                return Ok(ProcessOutcome::complete());
+            }
+
+            // `performIO` dispatches on IFACE and refuses the transfer when the
+            // port does not implement the selected interface — "No asynInt32
+            // interface" + COMM_ALARM/MAJOR_ALARM, no I/O (asynRecord.c:1328-1360).
+            // A pure-octet transport (an IP socket, a serial line) has exactly one
+            // valid interface, so this is the ordinary answer for a record pointed
+            // at one with IFACE=Int32, not an edge case. The gate sits here, above
+            // the blocking/non-blocking split, so both paths take the same refusal.
+            let iface = InterfaceType::from_u16(self.iface as u16);
+            if !self.has_interface(iface) {
+                self.report_no_interface(iface.c_asyn_name());
+                return Ok(ProcessOutcome::complete());
+            }
+            self.build_io_plan()
+        };
 
         // C `process()` (asynRecord.c:342-353) queues `performIO`, then
         // `canBlock(&yesNo)`: a blocking port runs the I/O on the port
@@ -3802,10 +3969,10 @@ impl Record for AsynRecord {
         // not built into a database) keeps the synchronous inline path.
         let blocking_handle = entry.handle.can_block().then(|| entry.handle.clone());
         if let (Some(handle), Some((name, db))) = (blocking_handle, self.async_ctx.clone()) {
-            return Ok(self.spawn_async_io(handle, name, db));
+            return Ok(self.spawn_async_io(handle, name, db, plan));
         }
 
-        self.perform_io()?;
+        self.perform_io(plan)?;
         Ok(ProcessOutcome::complete())
     }
 
@@ -4140,9 +4307,18 @@ mod tests {
     /// *above* the TMOD dispatch. So a record that failed a transfer and is then
     /// scanned with TMOD=NoIO comes back with an empty ERRS: the message does not
     /// outlive the cycle that raised it.
+    ///
+    /// The record needs a port for that: C's idle branch — the one that resets
+    /// and then dispatches nothing for TMOD=NoIO — is reached only in
+    /// `stateIdle`. A record with no port is `stateNoDevice` and reports "Not
+    /// connect to a port" on every scan, whatever TMOD says (:356-357).
     #[test]
     fn a_noio_process_clears_a_stale_errs() {
-        let mut rec = AsynRecord::default();
+        let calls = Arc::new(Mutex::new(GpibCalls::default()));
+        let (mut rec, _rt) = gpib_record(
+            "r10_47_noio",
+            GpibSpyPort::new("r10_47_noio", calls.clone()),
+        );
         rec.tmod = TransferMode::NoIo as i32;
         rec.errs = "Read error, timeout".to_string();
 
@@ -4402,35 +4578,271 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_ucmd_with_no_gpib_interface_errors_and_resets() {
-        // C asynCallbackProcess (asynRecord.c:819-822): a pending UCMD is
-        // dispatched to gpibUniversalCmd then reset to None. With no
-        // asynGpib interface (the only epics-rs case) gpibUniversalCmd
-        // reports "No asynGpib interface" (asynRecord.c:1648). The command
-        // takes priority over performIO, so even with TMOD=Read on an
-        // unconnected record the I/O path ("not connected") is never
-        // reached.
-        let mut rec = AsynRecord::default();
-        rec.tmod = TransferMode::Read as i32;
-        rec.ucmd = 1; // Device Clear (DCL)
-        rec.process().unwrap();
-        assert_eq!(rec.errs, "No asynGpib interface");
-        assert_eq!(rec.ucmd, 0, "UCMD must reset to None after dispatch");
+    use crate::port::{PortDriver, PortDriverBase, PortFlags};
+
+    /// R10-55. The bus traffic a GPIB spy port saw — C's asynGpibPort, reduced
+    /// to the three methods asynRecord's UCMD / ACMD paths can reach.
+    #[derive(Default)]
+    struct GpibCalls {
+        universal: Vec<u8>,
+        addressed: Vec<Vec<u8>>,
+        reads: usize,
     }
 
-    #[test]
-    fn process_acmd_with_no_gpib_interface_errors_and_resets() {
-        // C asynCallbackProcess (asynRecord.c:823-826): a pending ACMD is
-        // dispatched to gpibAddressedCmd then reset to None. With no
-        // asynGpib interface gpibAddressedCmd reports "No asynGpib
-        // interface" (asynRecord.c:1694).
+    /// A port that registers asynGpib (as `pasynGpib->registerPort` does,
+    /// asynGpib.c:562-631) and records what the record sends it.
+    struct GpibSpyPort {
+        base: PortDriverBase,
+        calls: Arc<Mutex<GpibCalls>>,
+        /// The serial-poll response byte the device returns, if any.
+        poll_byte: Option<u8>,
+        /// When set, every GPIB command fails with this driver text — C's
+        /// driver-error branch (`pasynUser->errorMessage` in the ERRS tail).
+        fail: Option<String>,
+    }
+
+    impl GpibSpyPort {
+        fn new(name: &str, calls: Arc<Mutex<GpibCalls>>) -> Self {
+            Self {
+                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                calls,
+                poll_byte: None,
+                fail: None,
+            }
+        }
+
+        fn check(&self) -> AsynResult<()> {
+            match &self.fail {
+                Some(msg) => Err(crate::error::AsynError::Status {
+                    status: crate::error::AsynStatus::Error,
+                    message: msg.clone(),
+                }),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl PortDriver for GpibSpyPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+            crate::interfaces::gpib::gpib_port_capabilities()
+        }
+        fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
+            self.calls.lock().unwrap().universal.push(cmd);
+            self.check()
+        }
+        fn gpib_addressed_cmd(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+            self.calls.lock().unwrap().addressed.push(data.to_vec());
+            self.check()
+        }
+        fn read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            self.calls.lock().unwrap().reads += 1;
+            match self.poll_byte {
+                Some(b) if !buf.is_empty() => {
+                    buf[0] = b;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    /// Register a GPIB spy port and attach a record to it. The runtime handle
+    /// comes back with the record: dropping it shuts the port actor down, and
+    /// the record's next request would fail on a dead reply channel.
+    fn gpib_record(
+        port_name: &str,
+        port: GpibSpyPort,
+    ) -> (AsynRecord, crate::runtime::PortRuntimeHandle) {
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        let (rt, _jh) = create_port_runtime(port, RuntimeConfig::default());
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
         let mut rec = AsynRecord::default();
-        rec.tmod = TransferMode::Read as i32;
+        rec.port = port_name.to_string();
+        rec.connect_device().unwrap();
+        (rec, rt)
+    }
+
+    /// R10-55. C asynCallbackProcess (asynRecord.c:819-822) dispatches a pending
+    /// UCMD to `gpibUniversalCmd`, which sends the menu's command byte through
+    /// `pasynGpib->universalCmd` (:1672) and then resets UCMD to None. The
+    /// command takes priority over performIO, so it runs even under TMOD=NoIO.
+    #[test]
+    fn process_ucmd_sends_the_universal_command_to_the_port() {
+        let calls = Arc::new(Mutex::new(GpibCalls::default()));
+        let (mut rec, _rt) = gpib_record(
+            "r10_55_ucmd",
+            GpibSpyPort::new("r10_55_ucmd", calls.clone()),
+        );
+
+        rec.tmod = TransferMode::NoIo as i32;
+        rec.ucmd = 1; // Device Clear (DCL)
+        rec.process().unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().universal,
+            vec![crate::interfaces::gpib::IBDCL]
+        );
+        assert_eq!(rec.errs, "");
+        assert_eq!(rec.ucmd, 0, "UCMD resets to None after dispatch");
+    }
+
+    /// R10-55. A pending ACMD reaches `pasynGpib->addressedCmd` with the frame C
+    /// builds in `acmd[]` — `[UNT, UNL, addr + LADBASE, cmd, UNT, UNL]`
+    /// (asynRecord.c:1698-1716, :1750).
+    #[test]
+    fn process_acmd_sends_the_addressed_frame_to_the_port() {
+        use crate::interfaces::gpib::{IBGET, IBUNL, IBUNT, LADBASE};
+
+        let calls = Arc::new(Mutex::new(GpibCalls::default()));
+        let (mut rec, _rt) = gpib_record(
+            "r10_55_acmd",
+            GpibSpyPort::new("r10_55_acmd", calls.clone()),
+        );
+
+        rec.addr = 7;
         rec.acmd = 1; // Group Execute Trigger (GET)
         rec.process().unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().addressed,
+            vec![vec![IBUNT, IBUNL, 7 + LADBASE, IBGET, IBUNT, IBUNL]]
+        );
+        assert_eq!(rec.errs, "");
+        assert_eq!(rec.acmd, 0, "ACMD resets to None after dispatch");
+    }
+
+    /// R10-55. ACMD = Serial Poll is three operations, not one frame: universal
+    /// SPE, a one-byte octet read into SPR, universal SPD
+    /// (asynRecord.c:1717-1746).
+    #[test]
+    fn process_acmd_serial_poll_runs_spe_read_spd() {
+        use crate::interfaces::gpib::{IBSPD, IBSPE};
+
+        let calls = Arc::new(Mutex::new(GpibCalls::default()));
+        let mut port = GpibSpyPort::new("r10_55_poll", calls.clone());
+        port.poll_byte = Some(0x41);
+        let (mut rec, _rt) = gpib_record("r10_55_poll", port);
+
+        rec.acmd = 5; // Serial Poll
+        rec.process().unwrap();
+
+        let seen = calls.lock().unwrap();
+        assert_eq!(seen.universal, vec![IBSPE, IBSPD]);
+        assert_eq!(seen.reads, 1, "one status-byte read between SPE and SPD");
+        assert!(seen.addressed.is_empty(), "serial poll sends no ACMD frame");
+        drop(seen);
+        assert_eq!(rec.spr, 0x41, "the status byte lands in SPR");
+        assert_eq!(rec.errs, "");
+    }
+
+    /// R10-55. A driver that refuses the command puts its own text in ERRS
+    /// behind C's format — "GPIB Universal command %s" — and raises
+    /// WRITE_ALARM/MAJOR (asynRecord.c:1673-1677).
+    #[test]
+    fn a_failing_universal_command_reports_the_driver_text() {
+        let calls = Arc::new(Mutex::new(GpibCalls::default()));
+        let mut port = GpibSpyPort::new("r10_55_ucmd_fail", calls.clone());
+        port.fail = Some("prologixUniversalCmd unimplemented".to_string());
+        let (mut rec, _rt) = gpib_record("r10_55_ucmd_fail", port);
+
+        rec.ucmd = 1;
+        rec.process().unwrap();
+
+        assert_eq!(
+            rec.errs,
+            "GPIB Universal command prologixUniversalCmd unimplemented"
+        );
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::WRITE_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Major);
+    }
+
+    /// R10-55. The negative control: a port that never registered asynGpib —
+    /// every octet transport (IP socket, serial line) — refuses the command with
+    /// "No asynGpib interface" + COMM_ALARM/MAJOR and sends nothing, C's
+    /// `if (!pasynRec->gpibiv)` branch (asynRecord.c:1647-1651, :1693-1697). The
+    /// menu field is still consumed: C resets it in the caller either way
+    /// (:822, :826).
+    #[test]
+    fn a_port_without_asyngpib_refuses_ucmd_and_acmd() {
+        use crate::interfaces::octet_transport_capabilities;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct OctetTransport(PortDriverBase);
+        impl PortDriver for OctetTransport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                octet_transport_capabilities()
+            }
+        }
+
+        let port_name = "r10_55_no_gpib";
+        let (rt, _jh) = create_port_runtime(
+            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.gpibiv, 0, "an octet transport has no asynGpib");
+
+        rec.tmod = TransferMode::NoIo as i32;
+        rec.ucmd = 1;
+        rec.process().unwrap();
         assert_eq!(rec.errs, "No asynGpib interface");
-        assert_eq!(rec.acmd, 0, "ACMD must reset to None after dispatch");
+        assert_eq!(rec.ucmd, 0, "UCMD is consumed even when refused");
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::COMM_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Major);
+
+        rec.acmd = 1;
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynGpib interface");
+        assert_eq!(rec.acmd, 0, "ACMD is consumed even when refused");
+    }
+
+    /// R10-55. C tests `state == stateNoDevice` (asynRecord.c:356-357) *above*
+    /// the queued callback that dispatches UCMD/ACMD, so a record with no port
+    /// dispatches nothing and its pending command survives for a cycle that has
+    /// a port.
+    #[test]
+    fn a_record_with_no_port_leaves_ucmd_pending() {
+        let mut rec = AsynRecord::default();
+        rec.ucmd = 1;
+        rec.process().unwrap();
+
+        assert_eq!(rec.errs, "Not connect to a port");
+        assert_eq!(
+            rec.ucmd, 1,
+            "nothing was dispatched, so nothing is consumed"
+        );
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::STATE_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Minor);
     }
 
     #[test]
@@ -4438,12 +4850,23 @@ mod tests {
         // C dispatches UCMD first (`if`), ACMD only in the `else if`. With
         // both pending only UCMD is consumed this cycle; ACMD is left for
         // the next process.
-        let mut rec = AsynRecord::default();
+        let calls = Arc::new(Mutex::new(GpibCalls::default()));
+        let (mut rec, _rt) = gpib_record(
+            "r10_55_priority",
+            GpibSpyPort::new("r10_55_priority", calls.clone()),
+        );
+
         rec.ucmd = 1;
         rec.acmd = 1;
         rec.process().unwrap();
         assert_eq!(rec.ucmd, 0, "UCMD consumed first");
         assert_eq!(rec.acmd, 1, "ACMD left pending while UCMD was set");
+        assert_eq!(
+            calls.lock().unwrap().universal,
+            vec![crate::interfaces::gpib::IBDCL],
+            "only the universal command went to the bus"
+        );
+        assert!(calls.lock().unwrap().addressed.is_empty());
     }
 
     #[test]
@@ -6364,24 +6787,6 @@ mod tests {
         );
     }
 
-    /// C `gpibUniversalCmd`/`gpibAddressedCmd` raise COMM/MAJOR when the port
-    /// has no asynGpib interface (asynRecord.c:1649/1695); epics-rs ports never
-    /// do, so UCMD/ACMD always hits that branch.
-    #[test]
-    fn gpib_command_raises_comm_alarm() {
-        use epics_base_rs::server::recgbl::alarm_status;
-        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
-
-        let mut rec = AsynRecord::default();
-        rec.ucmd = 5; // any non-zero GPIB universal command
-        rec.process().unwrap();
-        assert_eq!(rec.errs, "No asynGpib interface");
-        let mut c = CommonFields::default();
-        rec.check_alarms(&mut c);
-        assert_eq!(c.nsta, alarm_status::COMM_ALARM, "no GPIB iface -> COMM");
-        assert_eq!(c.nsev, AlarmSeverity::Major, "no GPIB iface -> MAJOR");
-    }
-
     #[test]
     fn test_register_asyn_record_type() {
         register_asyn_record_type();
@@ -7190,6 +7595,60 @@ mod tests {
         );
         assert_eq!(rec.enbl, 1, "ENBL is re-read and unchanged");
         assert_eq!(rec.auct, 1, "AUCT is re-read and unchanged");
+    }
+
+    /// R10-55. A GPIB driver takes its interfaces from
+    /// `pasynGpib->registerPort` (asynGpib.c:562-631) — asynCommon, asynOctet,
+    /// asynGpib and asynInt32 — so on a vxi11 (drvVxi11.c:1761) or Prologix
+    /// (drvPrologixGPIB.c:592) port C's `connectDevice` reads back GPIBIV = 1
+    /// and I32IV = 1. vxi11 registers asynOption on top (drvVxi11.c:1777);
+    /// Prologix does not.
+    #[test]
+    fn a_gpib_port_reads_back_gpibiv_and_i32iv() {
+        use crate::drivers::prologix::DrvAsynPrologixPort;
+        use crate::drivers::vxi11::DrvVxi11Port;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        let vxi_name = "r10_55_vxi11";
+        let (vxi_rt, _vxi_jh) = create_port_runtime(
+            DrvVxi11Port::configure(vxi_name, "192.0.2.1", 0, "", "gpib0", 0, true).unwrap(),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            vxi_name,
+            vxi_rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = vxi_name.to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1228-1234)");
+        assert_eq!(rec.i32iv, 1, "asynInt32, registered by asynGpib (C :140)");
+        assert_eq!(rec.octetiv, 1, "asynOctet");
+        assert_eq!(rec.optioniv, 1, "vxi11 registers asynOption (:1777)");
+
+        let prologix_name = "r10_55_prologix";
+        let (p_rt, _p_jh) = create_port_runtime(
+            DrvAsynPrologixPort::new(prologix_name, "192.0.2.1:1234", true).unwrap(),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            prologix_name,
+            p_rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = prologix_name.to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1228-1234)");
+        assert_eq!(rec.i32iv, 1, "asynInt32, registered by asynGpib (C :140)");
+        assert_eq!(rec.octetiv, 1, "asynOctet");
+        assert_eq!(
+            rec.optioniv, 0,
+            "drvPrologixGPIB registers no asynOption (:592)"
+        );
     }
 
     /// R9-53. C `connectDevice` asks the manager for each interface in turn

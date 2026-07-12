@@ -33,6 +33,35 @@ pub struct CompiledExpr {
 }
 
 impl CompiledExpr {
+    /// C's `*pout = END_EXPRESSION` buffer — the program a compiler leaves
+    /// behind when it has nothing to say.
+    ///
+    /// Every failure path in all three C compilers writes it before returning
+    /// -1 (`postfix.c:238,506`; `sCalcPostfix.c:429,880`;
+    /// `aCalcPostfix.c:434,808`), and the empty expression IS it
+    /// (`sCalcPostfix.c:432-434`, `aCalcPostfix.c:439-441`). It is a real,
+    /// runnable program, not the absence of one — which is why a record never
+    /// has to ask whether it has a program. Running it is an error
+    /// ([`is_empty`](Self::is_empty)).
+    pub fn empty(kind: ExprKind) -> Self {
+        Self {
+            code: Vec::new(),
+            kind,
+            loop_pairs: Vec::new(),
+        }
+    }
+
+    /// C `*post == END_EXPRESSION` — the program has no instruction to run.
+    ///
+    /// The single definition of that test: all three evaluators refuse such a
+    /// program, so a failed or empty compile fails every evaluation instead of
+    /// quietly yielding a value.
+    pub fn is_empty(&self) -> bool {
+        self.code
+            .iter()
+            .all(|op| matches!(op, Opcode::Core(opcodes::CoreOp::End)))
+    }
+
     /// Compute which input arguments this expression reads and which it
     /// stores into, equivalent to C `calcArgUsage` (`calcPerform.c:429-507`).
     ///

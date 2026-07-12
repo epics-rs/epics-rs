@@ -26,6 +26,7 @@ pub enum CalcError {
     BraceNotOpen,
     DomainError,
     NonFiniteResult,
+    EmptyProgram,
 }
 
 impl fmt::Display for CalcError {
@@ -55,6 +56,7 @@ impl fmt::Display for CalcError {
             CalcError::BraceNotOpen => write!(f, "Close brace found without open"),
             CalcError::DomainError => write!(f, "Operand outside the operator's domain"),
             CalcError::NonFiniteResult => write!(f, "Result is not a finite number"),
+            CalcError::EmptyProgram => write!(f, "Empty postfix program"),
         }
     }
 }
@@ -98,8 +100,13 @@ impl CalcError {
             | CalcError::InvalidSubrange
             | CalcError::DomainError
             | CalcError::NonFiniteResult => 11,
-            // CALC_ERR_NULL_ARG       = 12
-            CalcError::NullArg => 12,
+            // CALC_ERR_NULL_ARG       = 12. `EmptyProgram` is an *evaluation*
+            // failure — C's `perform()` returns a bare -1 with no error code
+            // (`calcPerform.c:419-420`, `sCalcPerform.c:396`,
+            // `aCalcPerform.c:312-314`) — so it has no C code of its own; 12 is
+            // the nearest, and is what base `postfix()` calls the empty
+            // expression that produces such a program.
+            CalcError::NullArg | CalcError::EmptyProgram => 12,
             // CALC_ERR_INTERNAL       = 13
             CalcError::Internal => 13,
         }

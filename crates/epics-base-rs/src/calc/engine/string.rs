@@ -5,6 +5,14 @@ use super::value::StackValue;
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
+    // C `sCalcPerform.c:396` — `if (*post == END_EXPRESSION) return(-1);`,
+    // checked before anything else, so an empty CALC (which sCalcPostfix
+    // ACCEPTS, CLCV 0) and a failed one behave identically at run time: the
+    // record alarms every process and VAL/SVAL keep their previous values.
+    if expr.is_empty() {
+        return Err(CalcError::EmptyProgram);
+    }
+
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;

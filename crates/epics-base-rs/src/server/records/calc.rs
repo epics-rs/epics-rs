@@ -94,8 +94,10 @@ pub struct CalcRecord {
     // AFVL is the filter accumulator state (sign encodes rounding hysteresis).
     pub aftc: f64,
     pub afvl: f64,
-    // Cached compiled expression (RPCL equivalent)
-    rpcl: Option<crate::calc::CompiledExpr>,
+    // C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
+    // empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run — the
+    // record then alarms on every process. See [`calc_compile`].
+    rpcl: crate::calc::CompiledExpr,
 }
 
 impl Default for CalcRecord {
@@ -178,17 +180,24 @@ impl Default for CalcRecord {
             calc_alarm: false,
             aftc: 0.0,
             afvl: 0.0,
-            rpcl: None,
+            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
         }
     }
 }
 
 impl CalcRecord {
+    /// Construct with a CALC expression, compiled. RPCL is a function of CALC,
+    /// so a constructor that sets one must set the other — otherwise the record
+    /// carries a CALC it has no program for, and `process` has to guess. (C has
+    /// no such window: `init_record` compiles before the record can be
+    /// processed.)
     pub fn new(calc: &str) -> Self {
-        Self {
+        let mut rec = Self {
             calc: calc.to_string(),
             ..Default::default()
-        }
+        };
+        rec.rpcl = calc_compile::postfix("calc", "CALC", &rec.calc).program;
+        rec
     }
 
     /// C `calcRecord.c::monitor`: advance the `LX` previous-value field
@@ -659,14 +668,21 @@ impl Record for CalcRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 && !self.calc.is_empty() {
+        if pass == 0 {
             // C `calcRecord.c::init_record:105-110` — postfix() into RPCL; a
             // failure is logged (errlog + recGblRecordError) but does NOT abort
             // the record's init (`return 0`). Only `special()` refuses.
+            //
+            // Unconditional, exactly as in C: an empty CALC is `CALC_ERR_NULL_ARG`
+            // there, and the empty program it leaves in RPCL is what makes the
+            // record alarm on every process. Skipping the compile for an empty
+            // CALC left the port with no program and no alarm.
             self.rpcl = calc_compile::postfix(self.record_type(), "CALC", &self.calc).program;
-            self.mlst = self.val;
-            self.alst = self.val;
-            self.lalm = self.val;
+            if !self.calc.is_empty() {
+                self.mlst = self.val;
+                self.alst = self.val;
+                self.lalm = self.val;
+            }
         }
         Ok(())
     }
@@ -692,41 +708,26 @@ impl Record for CalcRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if let Some(ref compiled) = self.rpcl {
-            let vars = self.get_vars();
-            let mut inputs = crate::calc::NumericInputs::with_vars(vars);
-            // C `calcPerform(&prec->a, &prec->val, rpcl)` passes `presult =
-            // &val`, so the `VAL` token (`FETCH_VAL`, calcPerform.c:73-74)
-            // pushes the *previous* VAL. Seed `prev_val` from the current
-            // `self.val` before it is overwritten below; otherwise
-            // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
-            inputs.prev_val = self.val;
-            // C sets CALC_ALARM on failure but continues processing
-            match crate::calc::eval(compiled, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
+        // C `calcRecord.c:121-123` — `calcPerform` runs unconditionally, and a
+        // -1 is CALC_ALARM/INVALID with VAL left at its previous value. RPCL is
+        // always a program, so there is no "no expression" case to improvise
+        // around: an empty or uncompilable CALC IS the empty program, and the
+        // engine fails it every cycle.
+        let vars = self.get_vars();
+        let mut inputs = crate::calc::NumericInputs::with_vars(vars);
+        // C `calcPerform(&prec->a, &prec->val, rpcl)` passes `presult =
+        // &val`, so the `VAL` token (`FETCH_VAL`, calcPerform.c:73-74)
+        // pushes the *previous* VAL. Seed `prev_val` from the current
+        // `self.val` before it is overwritten below; otherwise
+        // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
+        inputs.prev_val = self.val;
+        match crate::calc::eval(&self.rpcl, &mut inputs) {
+            Ok(v) => {
+                self.val = v;
+                self.calc_alarm = false;
             }
-        } else if !self.calc.is_empty() {
-            // Fallback: try to compile and eval (e.g., if CALC was set after init)
-            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
-            // Same `VAL`-token previous-value seed as the cached-RPCL path
-            // above (C `presult = &val`).
-            inputs.prev_val = self.val;
-            match crate::calc::calc(&self.calc, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                    // Cache for next time
-                    self.rpcl = crate::calc::compile(&self.calc).ok();
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
+            Err(_) => {
+                self.calc_alarm = true;
             }
         }
         // Update LA-LU. C `calcRecord.c::monitor` (lines 417-423) advances

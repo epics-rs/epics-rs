@@ -7,7 +7,7 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
-use crate::calc::{CompiledExpr, scalc_eval};
+use crate::calc::{CompiledExpr, ExprKind, scalc_eval};
 
 /// Scalcout record — string calc with output.
 ///
@@ -19,7 +19,10 @@ pub struct ScalcoutRecord {
     pub val: f64,
     pub sval: PvString,
     pub calc: String,
-    compiled_calc: Option<CompiledExpr>,
+    /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
+    /// empty `END_EXPRESSION` postfix, which `sCalcPerform` refuses to run
+    /// (`sCalcPerform.c:396`), so the record alarms on every process.
+    compiled_calc: CompiledExpr,
     /// CLCV/OCLV — `DBF_LONG` expression-validity fields
     /// (sCalcoutRecord.dbd:75,438). C stores `sCalcPostfix()`'s RETURN VALUE
     /// (`pcalc->clcv = sCalcPostfix(...)`, sCalcoutRecord.c:464,475): 0 when the
@@ -29,7 +32,8 @@ pub struct ScalcoutRecord {
     pub oopt: i16, // 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
     pub dopt: i16, // 0=Use CALC, 1=Use OCAL
     pub ocal: String,
-    compiled_ocal: Option<CompiledExpr>,
+    /// C `ORPC`. Same contract as [`Self::compiled_calc`].
+    compiled_ocal: CompiledExpr,
     pub oval: f64,
     pub osv: PvString,
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
@@ -82,13 +86,13 @@ impl Default for ScalcoutRecord {
             val: 0.0,
             sval: PvString::new(),
             calc: String::new(),
-            compiled_calc: None,
+            compiled_calc: CompiledExpr::empty(ExprKind::String),
             clcv: 0,
             oclv: 0,
             oopt: 0,
             dopt: 0,
             ocal: String::new(),
-            compiled_ocal: None,
+            compiled_ocal: CompiledExpr::empty(ExprKind::String),
             oval: 0.0,
             osv: PvString::new(),
             ivoa: 0,
@@ -587,25 +591,23 @@ impl Record for ScalcoutRecord {
         // indication.
         self.calc_alarm = false;
 
-        // A non-empty CALC that did not compile is itself a broken
-        // expression — flag it (scalc_eval is never reached for None).
-        let calc_failed = if self.calc.is_empty() {
-            false
-        } else if let Some(ref compiled) = self.compiled_calc {
+        // C `sCalcoutRecord.c:357-360` — sCalcPerform runs unconditionally and a
+        // non-zero return is the failure. RPCL is always a program, so "empty
+        // CALC", "CALC that would not compile" and "CALC that failed at run time"
+        // are one case here, exactly as in C: the empty program fails
+        // (`sCalcPerform.c:396`) and the record alarms every process.
+        let calc_failed = {
             // C `sCalcoutRecord.c:357-359` — presult = &pcalc->val,
             // psresult = pcalc->sval: VAL/SVAL both read this cycle's
             // pre-evaluation values (captured in prev_val/prev_sval above).
             let mut inputs = self.build_inputs(self.val, &self.sval);
-            match scalc_eval(compiled, &mut inputs) {
+            match scalc_eval(&self.compiled_calc, &mut inputs) {
                 Ok(result) => {
                     self.apply_result(&result);
                     false
                 }
                 Err(_) => true,
             }
-        } else {
-            // calc non-empty but compile failed
-            true
         };
 
         // IVOA=Don't_drive on a failed calc vetoes the OUT WRITE only. C
@@ -654,45 +656,32 @@ impl Record for ScalcoutRecord {
         // there.)
         if oopt_fires {
             if self.dopt == 1 {
-                // Use OCAL. A broken OCAL (compile OR eval failure)
-                // raises CALC_ALARM — sibling calcout.rs does the same,
-                // and synApps `sCalcoutRecord` raises CALC_ALARM on an
-                // OCAL sCalcPerform failure. Previously an OCAL error
-                // was discarded and OVAL/OSV kept stale values with no
-                // alarm.
-                if !self.ocal.is_empty() {
-                    if let Some(ref compiled) = self.compiled_ocal {
-                        // C `sCalcoutRecord.c:768-770` — presult = &pcalc->oval,
-                        // psresult = pcalc->osv, so the VAL/SVAL tokens in OCAL
-                        // read the previous OVAL/OSV, not the VAL/SVAL this
-                        // cycle just computed.
-                        let mut inputs = self.build_inputs(self.oval, &self.osv);
-                        match scalc_eval(compiled, &mut inputs) {
-                            Ok(result) => match &result {
-                                StackValue::Double(v) => {
-                                    self.oval = *v;
-                                    self.osv = PvString::from(format!("{}", v));
-                                }
-                                StackValue::Str(s) => {
-                                    self.osv = PvString::from(s.clone());
-                                    self.oval = s.parse::<f64>().unwrap_or(0.0);
-                                }
-                            },
-                            Err(_) => {
-                                // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
-                                // a failed OCAL sCalcPerform forces OVAL=-1 and
-                                // OSV="***ERROR***" — the OCAL-side mirror of the
-                                // CALC-fail VAL=-1 sentinel. Previously OVAL/OSV
-                                // were left stale.
-                                self.oval = -1.0;
-                                self.osv = PvString::from("***ERROR***");
-                                self.calc_alarm = true;
-                            }
+                // Use OCAL. C `execOutput` (sCalcoutRecord.c:768) calls
+                // sCalcPerform on ORPC unconditionally on this branch, so an
+                // empty, uncompilable or failing OCAL are one case — the empty
+                // program fails like any other broken one.
+                //
+                // C `sCalcoutRecord.c:768-770` — presult = &pcalc->oval,
+                // psresult = pcalc->osv, so the VAL/SVAL tokens in OCAL
+                // read the previous OVAL/OSV, not the VAL/SVAL this
+                // cycle just computed.
+                let mut inputs = self.build_inputs(self.oval, &self.osv);
+                match scalc_eval(&self.compiled_ocal, &mut inputs) {
+                    Ok(result) => match &result {
+                        StackValue::Double(v) => {
+                            self.oval = *v;
+                            self.osv = PvString::from(format!("{}", v));
                         }
-                    } else {
-                        // OCAL non-empty but compile failed — C's sCalcPerform
-                        // fails identically on an unparsable expression, so the
-                        // same OVAL=-1/OSV="***ERROR***" sentinel applies.
+                        StackValue::Str(s) => {
+                            self.osv = PvString::from(s.clone());
+                            self.oval = s.parse::<f64>().unwrap_or(0.0);
+                        }
+                    },
+                    Err(_) => {
+                        // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
+                        // a failed OCAL sCalcPerform forces OVAL=-1 and
+                        // OSV="***ERROR***" — the OCAL-side mirror of the
+                        // CALC-fail VAL=-1 sentinel.
                         self.oval = -1.0;
                         self.osv = PvString::from("***ERROR***");
                         self.calc_alarm = true;
@@ -1148,7 +1137,7 @@ mod tests {
         let mut rec = ScalcoutRecord::new();
         // Use an expression that will fail to compile
         rec.calc = "???invalid".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::String);
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap();
         rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
             .unwrap();
@@ -1178,7 +1167,7 @@ mod tests {
         // must NOT complete immediately as the old IVOA==1 early-return did.
         let mut rec = ScalcoutRecord::new();
         rec.calc = "???invalid".into();
-        rec.compiled_calc = None; // calc fails
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::String); // calc fails
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
         rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
             .unwrap();

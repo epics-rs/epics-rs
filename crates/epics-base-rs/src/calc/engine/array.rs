@@ -13,6 +13,13 @@ use crate::calc::math::{derivative, fitting, stats};
 const MY_MAXFLOAT: f64 = 1e35f32 as f64;
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
+    // C `aCalcPerform.c:312-314` — `if (*postfix == END_EXPRESSION) return(-1);`,
+    // ahead of even the value-stack allocation. Same contract as the other two
+    // engines: an empty or failed compile is a program that fails every run.
+    if expr.is_empty() {
+        return Err(CalcError::EmptyProgram);
+    }
+
     let mut stack: Vec<ArrayStackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;

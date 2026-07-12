@@ -100,7 +100,7 @@ use crate::server::record::{
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::calc_compile;
-use crate::calc::{ArrayInputs, CompiledExpr, acalc_eval};
+use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::LINK_CON;
@@ -145,12 +145,16 @@ pub struct AcalcoutRecord {
 
     // --- CALC ---
     pub calc: String,
-    compiled_calc: Option<CompiledExpr>,
+    /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
+    /// empty `END_EXPRESSION` postfix, which `aCalcPerform` refuses to run
+    /// (`aCalcPerform.c:312-314`), so the record alarms on every process.
+    compiled_calc: CompiledExpr,
     clcv: i32,
 
     // --- OCAL / output-data option ---
     pub ocal: String,
-    compiled_ocal: Option<CompiledExpr>,
+    /// C `ORPC`. Same contract as [`Self::compiled_calc`].
+    compiled_ocal: CompiledExpr,
     oclv: i32,
     dopt: i16, // 0=Use CALC, 1=Use OCAL
     oval: f64,
@@ -230,10 +234,10 @@ impl Default for AcalcoutRecord {
             nelm: 1, // dbd initial("1")
             nuse: 0, // dbd initial("0")
             calc: String::new(),
-            compiled_calc: None,
+            compiled_calc: CompiledExpr::empty(ExprKind::Array),
             clcv: 0,
             ocal: String::new(),
-            compiled_ocal: None,
+            compiled_ocal: CompiledExpr::empty(ExprKind::Array),
             oclv: 0,
             dopt: 0,
             oval: 0.0,
@@ -1255,47 +1259,40 @@ impl Record for AcalcoutRecord {
         self.pa = self.num_vals;
 
         // --- CALC (C call_aCalcPerform, first aCalcPerform → val, aval) ---
+        //
+        // C calls aCalcPerform unconditionally (`aCalcoutRecord.c:263`): RPCL is
+        // always a program, and an empty or uncompilable CALC is the empty one,
+        // which aCalcPerform fails (`aCalcPerform.c:312-314`) → cstat=-1 →
+        // CALC_ALARM every process. So there is no "no expression" case here.
         let mut calc_failed = false;
-        if !self.calc.is_empty() {
-            if let Some(ref compiled) = self.compiled_calc {
-                // NLL: `compiled`'s last use is `eval`, so the immutable
-                // borrow ends before the `self.val`/`self.aval` writes.
-                // CALC pass: the `VAL` token reads `prec->val` (this pass's
-                // result field) before it is overwritten.
-                match self.eval(compiled, n, self.val) {
-                    Some((v, arr, finite)) => {
-                        self.val = v;
-                        self.aval = arr;
-                        if !finite {
-                            calc_failed = true; // NaN/Inf result: C returns -1
-                        }
-                    }
-                    None => calc_failed = true,
+        // CALC pass: the `VAL` token reads `prec->val` (this pass's result
+        // field) before it is overwritten.
+        match self.eval(&self.compiled_calc, n, self.val) {
+            Some((v, arr, finite)) => {
+                self.val = v;
+                self.aval = arr;
+                if !finite {
+                    calc_failed = true; // NaN/Inf result: C returns -1
                 }
-            } else {
-                calc_failed = true; // non-empty CALC failed to compile
             }
+            None => calc_failed = true,
         }
 
         // --- OCAL (C call_aCalcPerform: evaluated EVERY cycle when DOPT=Use
         //     OCAL, before afterCalc → oval, oav) ---
-        if self.dopt == 1 && !self.ocal.is_empty() {
-            if let Some(ref compiled) = self.compiled_ocal {
-                // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
-                // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
-                // OCAL accumulator like "VAL+1" runs on OVAL.
-                match self.eval(compiled, n, self.oval) {
-                    Some((v, arr, finite)) => {
-                        self.oval = v;
-                        self.oav = arr;
-                        if !finite {
-                            calc_failed = true; // NaN/Inf result: C returns -1
-                        }
+        if self.dopt == 1 {
+            // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
+            // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
+            // OCAL accumulator like "VAL+1" runs on OVAL.
+            match self.eval(&self.compiled_ocal, n, self.oval) {
+                Some((v, arr, finite)) => {
+                    self.oval = v;
+                    self.oav = arr;
+                    if !finite {
+                        calc_failed = true; // NaN/Inf result: C returns -1
                     }
-                    None => calc_failed = true,
                 }
-            } else {
-                calc_failed = true;
+                None => calc_failed = true,
             }
         }
 
@@ -2182,7 +2179,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         // Non-empty CALC that fails to compile.
         rec.calc = "???bad".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
         rec.process().unwrap();
         assert!(rec.calc_alarm);
         assert_eq!(rec.cstat, -1);
@@ -2239,7 +2236,7 @@ mod tests {
     fn test_acalcout_ivoa_dont_drive_on_failure() {
         let mut rec = AcalcoutRecord::new();
         rec.calc = "???bad".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
         rec.process().unwrap();
         assert!(!rec.cached_should_output);
@@ -2251,7 +2248,7 @@ mod tests {
         let mut rec = AcalcoutRecord::new();
         rec.put_field("NELM", EpicsValue::ULong(2)).unwrap();
         rec.calc = "???bad".into();
-        rec.compiled_calc = None;
+        rec.compiled_calc = CompiledExpr::empty(ExprKind::Array);
         rec.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set to IVOV
         rec.put_field("IVOV", EpicsValue::Double(9.0)).unwrap();
         rec.process().unwrap();

@@ -322,15 +322,14 @@ fn opcode_supported_by_engine(kind: &ExprKind, op: &Opcode) -> bool {
 /// compiler's `ELEMENT` table is applied, so every symbol here is one this
 /// engine has. The resulting `CompiledExpr` carries only opcodes its evaluator
 /// can execute.
+/// Compile a token stream. A source with no tokens is NOT special-cased: C only
+/// short-circuits the literal empty string (`*psrc == '\0'`), and an expression
+/// that merely *lexes* to nothing — `"   "` — walks the normal path and comes
+/// out `CALC_ERR_INCOMPLETE`, because `operand_needed` is still set at the end.
+/// Compiled C, all three engines: `postfix("   ")` = -1, error 8. The empty
+/// SOURCE is handled by each engine's entry point in `calc::mod`, where C puts
+/// it.
 pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcError> {
-    if tokens.is_empty() {
-        return Ok(CompiledExpr {
-            code: vec![Opcode::Core(CoreOp::End)],
-            kind,
-            loop_pairs: Vec::new(),
-        });
-    }
-
     let mut output: Vec<Opcode> = Vec::new();
     let mut stack: Vec<StackEntry> = Vec::new();
     let mut operand_needed = true;
@@ -744,14 +743,17 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     //   - depth > 1                     -> residual values (`1 2`, `A;B`)
     //                                      -> Incomplete (TooMany already
     //                                      fired at any `;`).
-    // The empty-program case (`output` is empty before the End sentinel) is
-    // a deliberate Rust special case and is exempt.
+    //
+    // A source that produced no opcodes at all is NOT exempt: `operand_needed`
+    // is still set, so it lands on Incomplete — which is what C answers for a
+    // whitespace-only expression, the only way to get here (the empty string
+    // never reaches the compiler; see `calc::compile`).
     let ends_with_store = matches!(
         output.last(),
         Some(Opcode::Core(CoreOp::StoreVar(_))) | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
     );
     let depth_ok = runtime_depth == 1 || (runtime_depth == 0 && ends_with_store);
-    if !output.is_empty() && (operand_needed || !depth_ok) {
+    if operand_needed || !depth_ok {
         return Err(CalcError::Incomplete);
     }
 

@@ -133,8 +133,11 @@ pub struct CalcoutRecord {
     // CALC_ALARM flag
     pub calc_alarm: bool,
     // Cached compiled expressions (RPCL/ORPC equivalents)
-    rpcl: Option<crate::calc::CompiledExpr>,
-    orpc: Option<crate::calc::CompiledExpr>,
+    // C `RPCL` / `ORPC`. Always a program: an empty or uncompilable CALC/OCAL
+    // carries C's empty `END_EXPRESSION` postfix, which `calcPerform` refuses to
+    // run, so the record alarms on every process. See [`calc_compile`].
+    rpcl: crate::calc::CompiledExpr,
+    orpc: crate::calc::CompiledExpr,
     // CLCV/OCLV — `DBF_LONG` expression-validity fields
     // (calcoutRecord.dbd.pod:729,1049). C stores `postfix()`'s RETURN VALUE
     // here (`prec->clcv = postfix(...)`, calcoutRecord.c:327,338), i.e. 0 when
@@ -256,8 +259,8 @@ impl Default for CalcoutRecord {
             oevt: String::new(),
             pending_output: false,
             calc_alarm: false,
-            rpcl: None,
-            orpc: None,
+            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            orpc: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
             clcv: 0,
             oclv: 0,
             // C `init_record` leaves an empty/unconfigured link CON
@@ -1054,21 +1057,22 @@ impl Record for CalcoutRecord {
         // not before. It holds the previous cycle's value for
         // transition detection in should_output().
 
-        // Evaluate CALC using cached RPCL
-        if let Some(ref compiled) = self.rpcl {
-            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
-            // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
-            // passes `presult = &val`, so the CALC `VAL` token reads the
-            // *previous* VAL. Seed before `self.val` is overwritten below.
-            inputs.prev_val = self.val;
-            match crate::calc::eval(compiled, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
+        // C `calcoutRecord.c:238-241` — `calcPerform` runs unconditionally and a
+        // -1 is CALC_ALARM/INVALID with VAL unchanged. RPCL is always a program:
+        // an empty or uncompilable CALC is the empty one, and it fails here every
+        // cycle rather than being silently skipped.
+        let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+        // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
+        // passes `presult = &val`, so the CALC `VAL` token reads the
+        // *previous* VAL. Seed before `self.val` is overwritten below.
+        inputs.prev_val = self.val;
+        match crate::calc::eval(&self.rpcl, &mut inputs) {
+            Ok(v) => {
+                self.val = v;
+                self.calc_alarm = false;
+            }
+            Err(_) => {
+                self.calc_alarm = true;
             }
         }
 
@@ -1079,27 +1083,28 @@ impl Record for CalcoutRecord {
         self.ocal_udf_override = None;
         if self.should_output() {
             if self.dopt == 1 {
-                // Use OCAL
-                if let Some(ref compiled) = self.orpc {
-                    let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
-                    // C `calcPerform(&prec->a, &prec->oval, orpc)`
-                    // (calcoutRecord.c:621) passes `presult = &oval`, so the
-                    // OCAL `VAL` token reads the *previous* OVAL, not VAL.
-                    inputs.prev_val = self.oval;
-                    match crate::calc::eval(compiled, &mut inputs) {
-                        Ok(v) => {
-                            self.oval = v;
-                            // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
-                            // on the successful-OCAL branch. A NaN OVAL then
-                            // raises UDF_ALARM (execOutput:628) so IVOA gates the
-                            // OUT write — without this a finite VAL but NaN OVAL
-                            // drives NaN to OUT with NO_ALARM (silent-wrong-value).
-                            self.ocal_udf_override = Some(self.oval.is_nan());
-                        }
-                        // C `execOutput:622`: OCAL calcPerform failure raises
-                        // CALC_ALARM and leaves udf VAL-based (no override).
-                        Err(_) => self.calc_alarm = true,
+                // Use OCAL. C `execOutput:621` calls calcPerform on ORPC
+                // unconditionally on this branch — an empty OCAL with DOPT=Use_OCAL
+                // is the empty program, so it fails and raises CALC_ALARM instead
+                // of leaving OVAL stale and silent.
+                let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+                // C `calcPerform(&prec->a, &prec->oval, orpc)`
+                // (calcoutRecord.c:621) passes `presult = &oval`, so the
+                // OCAL `VAL` token reads the *previous* OVAL, not VAL.
+                inputs.prev_val = self.oval;
+                match crate::calc::eval(&self.orpc, &mut inputs) {
+                    Ok(v) => {
+                        self.oval = v;
+                        // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
+                        // on the successful-OCAL branch. A NaN OVAL then
+                        // raises UDF_ALARM (execOutput:628) so IVOA gates the
+                        // OUT write — without this a finite VAL but NaN OVAL
+                        // drives NaN to OUT with NO_ALARM (silent-wrong-value).
+                        self.ocal_udf_override = Some(self.oval.is_nan());
                     }
+                    // C `execOutput:622`: OCAL calcPerform failure raises
+                    // CALC_ALARM and leaves udf VAL-based (no override).
+                    Err(_) => self.calc_alarm = true,
                 }
             } else {
                 self.oval = self.val;

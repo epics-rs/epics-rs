@@ -28,8 +28,19 @@
 //! wire-visible: base `postfix("")` is `CALC_ERR_NULL_ARG` → -1
 //! (`postfix.c:235-240`), while `sCalcPostfix("")` / `aCalcPostfix("")` return
 //! 0 with an empty program (`sCalcPostfix.c:432-434`, `aCalcPostfix.c:439-441`).
+//! They do NOT differ on what that program then does: it fails every evaluation
+//! (see [`CompiledExpr::empty`]).
+//!
+//! # Invariant
+//!
+//! **A CALC-class field always owns a program.** Success, empty and failure all
+//! produce one — C never leaves the `RPCL` buffer absent, it writes
+//! `END_EXPRESSION` into it on every failure path. So no caller may ask whether
+//! a program is present; a broken CALC is not "nothing to run", it is
+//! "something that always fails", and that is precisely how C makes it alarm on
+//! every process instead of only at compile time.
 
-use crate::calc::{CalcError, CompiledExpr, calc_error_str};
+use crate::calc::{CalcError, CompiledExpr, ExprKind, calc_error_str};
 
 /// C `postfix()` success status.
 pub(crate) const POSTFIX_OK: i32 = 0;
@@ -39,22 +50,23 @@ pub(crate) const POSTFIX_ERR: i32 = -1;
 /// What a CALC-class compile produced: C's `RPCL`/`ORPC` program plus the
 /// `postfix()` return status.
 pub(crate) struct CalcCompile {
-    /// The compiled program, or `None` for C's empty `END_EXPRESSION` postfix
-    /// (both the empty-expression and the failed-compile cases).
-    pub program: Option<CompiledExpr>,
+    /// The compiled program. Never absent — a failed compile carries C's empty
+    /// `END_EXPRESSION` program, which every engine refuses to run.
+    pub program: CompiledExpr,
     /// C `postfix()`'s return value: [`POSTFIX_OK`] or [`POSTFIX_ERR`].
     pub status: i32,
 }
 
 impl CalcCompile {
-    fn ok(program: Option<CompiledExpr>) -> Self {
+    fn ok(program: CompiledExpr) -> Self {
         Self {
             program,
             status: POSTFIX_OK,
         }
     }
 
-    fn failed(record: &str, field: &str, expr: &str, err: &CalcError) -> Self {
+    /// C's `bad:` label — `*pdest = END_EXPRESSION; return -1;`.
+    fn failed(kind: ExprKind, record: &str, field: &str, expr: &str, err: &CalcError) -> Self {
         // C `errlogPrintf("%s.CALC: %s in expression \"%s\"\n", prec->name,
         // calcErrorStr(error_number), prec->calc)` — calcRecord.c:150-151,
         // calcoutRecord.c:331-333.
@@ -64,7 +76,7 @@ impl CalcCompile {
             calc_error_str(err.code()).unwrap_or("Unknown error")
         );
         Self {
-            program: None,
+            program: CompiledExpr::empty(kind),
             status: POSTFIX_ERR,
         }
     }
@@ -76,39 +88,30 @@ impl CalcCompile {
 }
 
 /// C base `postfix()` (`postfix.c`) — the numeric engine behind calc, calcout
-/// and swait. An empty expression is `CALC_ERR_NULL_ARG`, status -1.
+/// and swait. An empty expression is `CALC_ERR_NULL_ARG`, status -1
+/// (`crate::calc::compile` owns that rule).
 pub(crate) fn postfix(record: &str, field: &str, expr: &str) -> CalcCompile {
-    if expr.is_empty() {
-        return CalcCompile::failed(record, field, expr, &CalcError::NullArg);
-    }
     match crate::calc::compile(expr) {
-        Ok(program) => CalcCompile::ok(Some(program)),
-        Err(e) => CalcCompile::failed(record, field, expr, &e),
+        Ok(program) => CalcCompile::ok(program),
+        Err(e) => CalcCompile::failed(ExprKind::Numeric, record, field, expr, &e),
     }
 }
 
 /// C `sCalcPostfix()` (`sCalcPostfix.c:410-434`) — the string engine behind
-/// scalcout. An empty expression is a valid empty program, status 0
-/// (`sCalcPostfix.c:432-434`), unlike base `postfix()`.
+/// scalcout. An empty expression is a valid empty program, status 0, unlike
+/// base `postfix()`.
 pub(crate) fn scalc_postfix(record: &str, field: &str, expr: &str) -> CalcCompile {
-    if expr.is_empty() {
-        return CalcCompile::ok(None);
-    }
     match crate::calc::scalc_compile(expr) {
-        Ok(program) => CalcCompile::ok(Some(program)),
-        Err(e) => CalcCompile::failed(record, field, expr, &e),
+        Ok(program) => CalcCompile::ok(program),
+        Err(e) => CalcCompile::failed(ExprKind::String, record, field, expr, &e),
     }
 }
 
 /// C `aCalcPostfix()` (`aCalcPostfix.c:410-441`) — the array engine behind
-/// acalcout. An empty expression is a valid empty program, status 0
-/// (`aCalcPostfix.c:439-441`).
+/// acalcout. An empty expression is a valid empty program, status 0.
 pub(crate) fn acalc_postfix(record: &str, field: &str, expr: &str) -> CalcCompile {
-    if expr.is_empty() {
-        return CalcCompile::ok(None);
-    }
     match crate::calc::acalc_compile(expr) {
-        Ok(program) => CalcCompile::ok(Some(program)),
-        Err(e) => CalcCompile::failed(record, field, expr, &e),
+        Ok(program) => CalcCompile::ok(program),
+        Err(e) => CalcCompile::failed(ExprKind::Array, record, field, expr, &e),
     }
 }

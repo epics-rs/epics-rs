@@ -54,6 +54,64 @@ pub(crate) fn value_gate(
         .map(|(_, gate)| *gate)
 }
 
+/// The event mask a change-detected AUXILIARY field posts with — the single
+/// owner of that decision, built once per cycle from the record's declarations
+/// and shared by every monitor loop (both `process_record_*` paths, the
+/// deferred-completion path, and `RecordInstance::process_local`), so they
+/// cannot drift apart on what mask a field carries.
+///
+/// C's usual shape for the "post every input/aux field that changed" loop is
+/// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400,
+/// motor `DBE_VAL_LOG`) — that is the default. Three record-declared exceptions
+/// narrow it, and no two are the same narrowing:
+///
+/// * [`Record::value_only_change_fields`] — a literal `DBE_VALUE`
+///   (tableRecord.c:659, scaler `Sn`): alarm bits + `DBE_VALUE`, never `LOG`.
+/// * [`Record::fields_posted_with_monitor_mask`] — `monitor_mask | DBE_VALUE`
+///   (swaitRecord.c:650): VAL's own monitor mask, so `DBE_LOG` rides along
+///   exactly when VAL's ADEL deadband crossed.
+/// * [`Record::fields_posted_without_alarm_bits`] — a literal
+///   `DBE_VALUE | DBE_LOG` (epidRecord.c:376): both value classes, alarm bits
+///   discarded.
+#[derive(Clone, Copy)]
+pub(crate) struct AuxPostMask {
+    value_only: &'static [&'static str],
+    monitor_masked: &'static [&'static str],
+    no_alarm_bits: &'static [&'static str],
+}
+
+impl AuxPostMask {
+    /// Read the record's three declarations once, outside the per-field loop.
+    pub(crate) fn of(record: &dyn Record) -> Self {
+        Self {
+            value_only: record.value_only_change_fields(),
+            monitor_masked: record.fields_posted_with_monitor_mask(),
+            no_alarm_bits: record.fields_posted_without_alarm_bits(),
+        }
+    }
+
+    /// `alarm_bits` is this cycle's `recGblResetAlarms` result; `deadband_mask`
+    /// is VAL's own monitor mask (those alarm bits, plus `DBE_VALUE` when MDEL
+    /// crossed and `DBE_LOG` when ADEL crossed).
+    pub(crate) fn mask_for(
+        &self,
+        field: &str,
+        alarm_bits: crate::server::recgbl::EventMask,
+        deadband_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::recgbl::EventMask {
+        use crate::server::recgbl::EventMask;
+        if self.value_only.contains(&field) {
+            alarm_bits | EventMask::VALUE
+        } else if self.monitor_masked.contains(&field) {
+            deadband_mask | EventMask::VALUE
+        } else if self.no_alarm_bits.contains(&field) {
+            EventMask::VALUE | EventMask::LOG
+        } else {
+            alarm_bits | EventMask::VALUE | EventMask::LOG
+        }
+    }
+}
+
 /// Outcome of a record's array-style monitor decision, returned by
 /// [`Record::array_monitor_post`] (C waveform/aai/aao `monitor()`,
 /// waveformRecord.c:291-326).
@@ -1009,6 +1067,39 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: empty.
     fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Fields whose change post carries a LITERAL `DBE_VALUE | DBE_LOG` — this
+    /// cycle's alarm bits DISCARDED.
+    ///
+    /// C's fourth mask shape, and the only one that *drops* information the
+    /// record already computed. `epidRecord.c::monitor` builds VAL's mask from
+    /// `recGblResetAlarms` (`:350`) and posts VAL with it, then REASSIGNS
+    /// (not `|=`) before the secondaries:
+    ///
+    /// ```c
+    /// monitor_mask = DBE_LOG|DBE_VALUE;          /* :376 */
+    /// if (pepid->ovlp != pepid->oval) db_post_events(pepid, &pepid->oval, monitor_mask);
+    /// ...                                        /* P, I, D, CT, DT, ERR, CVAL */
+    /// ```
+    ///
+    /// so on an alarm-transition cycle a `DBE_ALARM`-only subscriber to one of
+    /// those fields is sent NOTHING, while the generic aux mask
+    /// (`alarm_bits | DBE_VALUE | DBE_LOG`) would send it an event.
+    ///
+    /// Distinct from the three narrower shapes: [`Self::value_only_change_fields`]
+    /// (literal `DBE_VALUE`), [`Self::fields_posted_with_monitor_mask`]
+    /// (`monitor_mask | DBE_VALUE` — keeps the alarm bits AND VAL's ADEL LOG bit)
+    /// and [`Self::fields_posted_with_value_mask`] (VAL's mask, posted from inside
+    /// C's `if (monitor_mask)` guard). A field named here posts on every change,
+    /// with both value classes and no alarm class, whatever the cycle's alarms did.
+    ///
+    /// Resolved for every change-detected field by [`aux_change_mask`], the single
+    /// owner of the aux-post mask.
+    ///
+    /// Default: empty.
+    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
         &[]
     }
 

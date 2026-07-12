@@ -18,7 +18,7 @@ use super::link::{
 use super::menu_choices::MenuBound;
 use super::pini::PiniMode;
 use super::record_trait::{
-    CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -2392,11 +2392,10 @@ impl RecordInstance {
         // RBV — C motor `monitor()`, motorRecord.cc:3468-3507) leaves
         // VAL to the generic change-detection loop below.
         let deadband_field = self.record.monitor_deadband_field();
-        // Fields whose change post carries DBE_VALUE only (LOG stripped) —
-        // C `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
-        // scalerRecord.c:478). The deadband field's own post is assembled by
-        // `deadband_post`; this local serves the generic change loop below.
-        let value_only = self.record.value_only_change_fields();
+        // The mask every change-detected aux field posts with — owned by
+        // `AuxPostMask`, the same resolver the `processing.rs` paths use, so
+        // this builder cannot drift from them on what mask a field carries.
+        let aux_post = AuxPostMask::of(self.record.as_ref());
         // The deadband field's post — mask owned by `deadband_post`, the single
         // assembler C's `db_post_events(&prec->val, monitor_mask)` maps to.
         let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
@@ -2526,15 +2525,7 @@ impl RecordInstance {
                             sub_updates.push((field.clone(), val, deadband_mask));
                         }
                     } else if changed {
-                        // A value-only field posts DBE_VALUE (+ this
-                        // cycle's alarm bits) without the LOG bit —
-                        // `aux_mask` minus LOG is exactly
-                        // `alarm_bits | DBE_VALUE`.
-                        let mask = if value_only.contains(&field.as_str()) {
-                            alarm_bits | EventMask::VALUE
-                        } else {
-                            aux_mask
-                        };
+                        let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                         sub_updates.push((field.clone(), val, mask));
                     } else if force_fields.contains(&field.as_str()) {
                         // C `monitor()` posts a re-marked field with

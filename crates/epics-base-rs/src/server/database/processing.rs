@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
 use crate::server::record::{
-    InputFetchPolicy, NotifyWaitSet, RecordInstance, ValuePostGate, value_gate,
+    AuxPostMask, InputFetchPolicy, NotifyWaitSet, RecordInstance, ValuePostGate, value_gate,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -341,40 +341,6 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
         }
     }
     instance.suppress_subroutine_run = ds.skip_run;
-}
-
-/// The event mask a change-detected AUXILIARY field posts with — the single
-/// owner of that decision, shared by the three snapshot builders (the main
-/// process path, the async-write completion, and `process_local`).
-///
-/// C's usual shape for the "post every input/aux field that changed" loop is
-/// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400,
-/// motor `DBE_VAL_LOG`) — that is the default. Two record-declared exceptions
-/// narrow it, and they are NOT the same narrowing:
-///
-/// * [`Record::value_only_change_fields`] — C posts a literal `DBE_VALUE`
-///   (tableRecord.c:659, scaler `Sn`): alarm bits + `DBE_VALUE`, never `LOG`.
-/// * [`Record::fields_posted_with_monitor_mask`] — C posts
-///   `monitor_mask | DBE_VALUE` (swaitRecord.c:650): VAL's own monitor mask,
-///   so `DBE_LOG` rides along exactly when VAL's ADEL deadband crossed.
-///
-/// `deadband_mask` is that VAL monitor mask for this cycle (alarm bits, plus
-/// `DBE_VALUE` when MDEL crossed and `DBE_LOG` when ADEL crossed).
-fn aux_change_mask(
-    field: &str,
-    value_only: &[&'static str],
-    monitor_masked: &[&'static str],
-    alarm_bits: crate::server::recgbl::EventMask,
-    deadband_mask: crate::server::recgbl::EventMask,
-) -> crate::server::recgbl::EventMask {
-    use crate::server::recgbl::EventMask;
-    if value_only.contains(&field) {
-        alarm_bits | EventMask::VALUE
-    } else if monitor_masked.contains(&field) {
-        deadband_mask | EventMask::VALUE
-    } else {
-        alarm_bits | EventMask::VALUE | EventMask::LOG
-    }
 }
 
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
@@ -2993,15 +2959,10 @@ impl PvDatabase {
             // change-detection loop below — an unchanged setpoint is
             // not re-posted on every readback poll.
             let deadband_field = instance.record.monitor_deadband_field();
-            // Fields whose change post carries DBE_VALUE only (LOG
-            // stripped) — C `db_post_events(field, DBE_VALUE)` literal
-            // (e.g. scaler VAL, scalerRecord.c:478). The deadband field's own
-            // post is assembled by `deadband_post`; this serves the generic
-            // change loop below.
-            let value_only = instance.record.value_only_change_fields();
-            // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
-            // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
-            let monitor_masked = instance.record.fields_posted_with_monitor_mask();
+            // The mask every change-detected aux field posts with — owned by
+            // `AuxPostMask`, the single resolver of the record's declared
+            // narrowings of C's default `monitor_mask | DBE_VALUE | DBE_LOG`.
+            let aux_post = AuxPostMask::of(instance.record.as_ref());
             // The deadband field's post — mask owned by `deadband_post`, the
             // single assembler for C's `db_post_events(&prec->val, monitor_mask)`.
             let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
@@ -3084,13 +3045,7 @@ impl PvDatabase {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
-                            let mask = aux_change_mask(
-                                field,
-                                value_only,
-                                monitor_masked,
-                                alarm_bits,
-                                deadband_mask,
-                            );
+                            let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                             sub_updates.push((field.clone(), val, mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
@@ -4122,15 +4077,10 @@ impl PvDatabase {
             // (motor RBV) leaves VAL to the generic change-detection
             // loop below.
             let deadband_field = instance.record.monitor_deadband_field();
-            // Fields whose change post carries DBE_VALUE only (LOG
-            // stripped) — C `db_post_events(field, DBE_VALUE)` literal
-            // (e.g. scaler VAL, scalerRecord.c:478). The deadband field's own
-            // post is assembled by `deadband_post`; this serves the generic
-            // change loop below.
-            let value_only = instance.record.value_only_change_fields();
-            // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
-            // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
-            let monitor_masked = instance.record.fields_posted_with_monitor_mask();
+            // The mask every change-detected aux field posts with — owned by
+            // `AuxPostMask`, the single resolver of the record's declared
+            // narrowings of C's default `monitor_mask | DBE_VALUE | DBE_LOG`.
+            let aux_post = AuxPostMask::of(instance.record.as_ref());
             // The deadband field's post — mask owned by `deadband_post`, the
             // single assembler for C's `db_post_events(&prec->val, monitor_mask)`.
             let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
@@ -4249,13 +4199,7 @@ impl PvDatabase {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
-                            let mask = aux_change_mask(
-                                field,
-                                value_only,
-                                monitor_masked,
-                                alarm_bits,
-                                deadband_mask,
-                            );
+                            let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                             sub_updates.push((field.clone(), val, mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
@@ -5307,14 +5251,10 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
         }
     };
     let deadband_field = instance.record.monitor_deadband_field();
-    // Fields whose change post carries DBE_VALUE only (LOG stripped) — C
-    // `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
-    // scalerRecord.c:478). The deadband field's own post is assembled by
-    // `deadband_post`; this serves the generic change loop below.
-    let value_only = instance.record.value_only_change_fields();
-    // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
-    // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
-    let monitor_masked = instance.record.fields_posted_with_monitor_mask();
+    // The mask every change-detected aux field posts with — owned by
+    // `AuxPostMask`, the single resolver of the record's declared narrowings of
+    // C's default `monitor_mask | DBE_VALUE | DBE_LOG`.
+    let aux_post = AuxPostMask::of(instance.record.as_ref());
     // The deadband field's post — mask owned by `deadband_post`, the single
     // assembler for C's `db_post_events(&prec->val, monitor_mask)`.
     let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
@@ -5385,13 +5325,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                         sub_updates.push((field.clone(), val, deadband_mask));
                     }
                 } else if changed {
-                    let mask = aux_change_mask(
-                        field,
-                        value_only,
-                        monitor_masked,
-                        alarm_bits,
-                        deadband_mask,
-                    );
+                    let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                     sub_updates.push((field.clone(), val, mask));
                 } else if force_fields.contains(&field.as_str()) {
                     // C `monitor()` posts a re-marked field with

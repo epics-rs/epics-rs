@@ -182,14 +182,18 @@ fn a_mixed_comparison_compares_numerically() {
 
 // --- STR/DBL conversion ---
 
+// C `to_string` is `cvtDoubleToString(d, s, 8)` — a FIXED-POINT rendering with 8
+// fractional digits, not a shortest-round-trip one (R11-1). See
+// `tests/scalc_double_to_string.rs` for the compiled-C table.
+
 #[test]
 fn test_str_function() {
-    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14".into()));
+    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14000000".into()));
 }
 
 #[test]
 fn test_str_integer() {
-    assert_eq!(eval_str("STR(42)"), StackValue::Str("42".into()));
+    assert_eq!(eval_str("STR(42)"), StackValue::Str("42.00000000".into()));
 }
 
 #[test]

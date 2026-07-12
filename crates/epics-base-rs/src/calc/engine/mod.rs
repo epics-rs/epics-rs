@@ -1,4 +1,5 @@
 pub mod cast;
+pub mod cvt;
 pub mod error;
 pub mod numeric;
 pub mod opcodes;

@@ -1,4 +1,5 @@
 use super::cast::{c_int, c_long, d2ui};
+use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
 use super::value::{ScalcString, StackValue};
@@ -500,15 +501,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     inputs.num_vars[*idx as usize] = v;
                 }
                 CoreOp::StoreDoubleVar(idx) => {
+                    // C STORE_AA..STORE_LL (`sCalcPerform.c:888-895`):
+                    //
+                    //     toString(ps);
+                    //     strncpy(psarg[op - STORE_AA], ps->s, SCALC_STRING_SIZE);
+                    //
+                    // `AA:=` names a STRING field, so the value is coerced, not
+                    // dispatched on: a double is converted and stored as text,
+                    // and no store of `AA` ever reaches the numeric args.
                     let v = pop1(&mut stack)?;
-                    match v {
-                        StackValue::Str(s) => {
-                            inputs.str_vars[*idx as usize] = s;
-                        }
-                        StackValue::Double(d) => {
-                            inputs.num_vars[*idx as usize] = d;
-                        }
-                    }
+                    inputs.str_vars[*idx as usize] = v.into_string_value();
                 }
             },
 
@@ -529,11 +531,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     inputs.str_vars[*idx as usize] = v.into_string_value();
                 }
                 StringOp::ToString => {
+                    // C TO_STRING (sCalcPerform.c:1516-1519) is `toString(ps)`,
+                    // no more — the one conversion, not a formatter of its own.
                     let v = pop1(&mut stack)?;
-                    match v {
-                        StackValue::Double(d) => stack.push(StackValue::str(format_double(d))),
-                        StackValue::Str(s) => stack.push(StackValue::Str(s)),
-                    }
+                    stack.push(StackValue::Str(v.into_string_value()));
                 }
                 StringOp::ToDouble => {
                     let v = pop1(&mut stack)?;
@@ -889,8 +890,11 @@ fn simple_printf(bytes: &[u8], val: &StackValue) -> Result<Vec<u8>, CalcError> {
                 }
                 b's' => match val {
                     StackValue::Str(s) => result.extend_from_slice(s.as_bytes()),
+                    // C PRINTF (sCalcPerform.c:1553) `toString(ps1)` before the
+                    // snprintf, so `%s` of a double is cvtDoubleToString, not a
+                    // shortest-round-trip rendering.
                     StackValue::Double(d) => {
-                        result.extend_from_slice(format!("{d}").as_bytes());
+                        result.extend_from_slice(cvt::to_string(*d).as_bytes());
                     }
                 },
                 _ => return Err(CalcError::InvalidFormat),
@@ -1303,14 +1307,6 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
         }
     }
     out
-}
-
-fn format_double(d: f64) -> String {
-    if d == d.trunc() && d.is_finite() {
-        format!("{}", d as i64)
-    } else {
-        format!("{}", d)
-    }
 }
 
 /// Whether `sCalcPostfix` would have stamped this program `USES_STRING`

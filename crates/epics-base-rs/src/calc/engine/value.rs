@@ -175,10 +175,18 @@ impl StackValue {
     }
 
     /// C `toString` (sCalcPerform.c:86-96) — the stack element's STRING form.
+    ///
+    /// ```c
+    /// #define toString(ps) {if (isDouble(ps)) to_string(ps);}
+    /// ```
+    ///
+    /// so a double becomes text by [`cvt::to_string`](super::cvt::to_string) —
+    /// `cvtDoubleToString(d, s, 8)` — and by nothing else. This is the ONLY way
+    /// to read a string operand that C coerces rather than rejects.
     pub fn into_string_value(self) -> ScalcString {
         match self {
             StackValue::Str(s) => s,
-            StackValue::Double(v) => ScalcString::from_c(format!("{v}")),
+            StackValue::Double(v) => ScalcString::from_c(super::cvt::to_string(v)),
         }
     }
 }

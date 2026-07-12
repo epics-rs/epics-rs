@@ -121,10 +121,17 @@ impl SwaitRecord {
     /// C `swaitRecord.c:425-450` — the OOPT switch, whose "old value" operand
     /// is `pwait->oval` (the previous cycle's VAL), passed in as `old` because
     /// C reads it BEFORE `:471` overwrites it with the new VAL.
+    ///
+    /// "On Change" is a MDEL-deadband test, not an inequality: C
+    /// `swaitRecord.c:432` is `if (fabs(pwait->oval - pwait->val) > pwait->mdel)`,
+    /// the same rule as calcout (`calcoutRecord.c:257`), sCalcout
+    /// (`sCalcoutRecord.c:379`) and aCalcout (`aCalcoutRecord.c:318`). With the
+    /// default MDEL=0 the two rules agree; a configured MDEL makes a sub-deadband
+    /// change fire the OUT link on the port and not on C.
     fn eval_should_output(&self, old: f64) -> bool {
         match self.oopt {
             0 => true,
-            1 => self.val != old,
+            1 => (old - self.val).abs() > self.mdel,
             2 => self.val == 0.0,
             3 => self.val != 0.0,
             4 => old != 0.0 && self.val == 0.0,
@@ -748,6 +755,33 @@ impl Record for SwaitRecord {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+
+    /// R9-74: OOPT="On Change" is `fabs(oval - val) > mdel`
+    /// (C `swaitRecord.c:432`), not `val != oval`. A change that stays inside
+    /// MDEL must not drive OUT; one that crosses it must.
+    #[test]
+    fn r9_74_swait_on_change_honours_mdel_deadband() {
+        let mut rec = SwaitRecord::default();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
+        rec.put_field("MDEL", EpicsValue::Double(2.0)).unwrap();
+
+        rec.put_field("A", EpicsValue::Double(1.0)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 1.0);
+        assert!(
+            !rec.should_output(),
+            "|oval - val| = 1.0 is inside MDEL=2.0 — C does not schedule output"
+        );
+
+        rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
+        rec.process().unwrap();
+        assert!(
+            rec.should_output(),
+            "|1.0 - 5.0| = 4.0 exceeds MDEL=2.0 — C schedules output"
+        );
+    }
 
     /// The CALC `VAL` token reads the *previous* VAL: C `swaitRecord.c:409`
     /// calls `sCalcPerform(&pwait->a, ..., &pwait->val, ...)`, so `FETCH_VAL`

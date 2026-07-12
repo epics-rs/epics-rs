@@ -37,6 +37,17 @@ pub struct ScalcoutRecord {
     pub out: String, // output link
     pub wait: i16,   // wait for output completion
     pub prec: i16,
+    // MDEL / ADEL (C `sCalcoutRecord.dbd:541-550`, both DBF_DOUBLE). MDEL is
+    // read on two paths: the OOPT="On Change" test
+    // (`sCalcoutRecord.c:379`, `fabs(pval - val) > mdel`) and `monitor()`
+    // (:821-826), which is the framework's MDEL/ADEL deadband path here
+    // (`uses_monitor_deadband` defaults to true, and it reads the deadbands
+    // through `get_field("MDEL")`/`("ADEL")`). Neither field existed, so the
+    // deadbands read back as the framework's 0.0 default, a client put to
+    // either was rejected with `FieldNotFound`, and the On-Change test had no
+    // deadband to consult.
+    pub mdel: f64,
+    pub adel: f64,
     // Input link strings (INPA..INPL)
     pub inp_links: [String; 12],
     // Numeric input values A-L (mapped to vars A-P, but only 12 used)
@@ -96,6 +107,8 @@ impl Default for ScalcoutRecord {
             out: String::new(),
             wait: 0,
             prec: 0,
+            mdel: 0.0,
+            adel: 0.0,
             inp_links: Default::default(),
             num_vals: [0.0; 12],
             str_vals: Default::default(),
@@ -149,10 +162,15 @@ impl ScalcoutRecord {
         }
     }
 
+    /// C `sCalcoutRecord.c:374-395` — the OOPT switch. "On Change" is the
+    /// numeric MDEL-deadband test `fabs(pcalc->pval - pcalc->val) > pcalc->mdel`
+    /// (:379) and nothing else: SVAL does not take part, so a cycle that changed
+    /// only the string result does NOT drive OUT on C, and a numeric change
+    /// inside MDEL does not either.
     fn should_output(&self) -> bool {
         match self.oopt {
             0 => true,
-            1 => (self.val - self.prev_val).abs() > f64::EPSILON || self.sval != self.prev_sval,
+            1 => (self.prev_val - self.val).abs() > self.mdel,
             2 => self.val == 0.0,
             3 => self.val != 0.0,
             4 => self.prev_val != 0.0 && self.val == 0.0,
@@ -270,6 +288,16 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
     FieldDesc {
@@ -750,6 +778,8 @@ impl Record for ScalcoutRecord {
             "OUT" => Some(EpicsValue::String(self.out.clone().into())),
             "WAIT" => Some(EpicsValue::Short(self.wait)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Double(self.adel)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::Short(self.dlya)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
@@ -875,6 +905,18 @@ impl Record for ScalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("PREC".into())),
             },
+            "MDEL" => {
+                self.mdel = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MDEL".into()))?;
+                Ok(())
+            }
+            "ADEL" => {
+                self.adel = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ADEL".into()))?;
+                Ok(())
+            }
             "ODLY" => {
                 self.odly = value
                     .to_f64()
@@ -986,6 +1028,62 @@ impl Record for ScalcoutRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R9-74 (family): OOPT="On Change" is the numeric MDEL deadband test
+    /// `fabs(pval - val) > mdel` (C `sCalcoutRecord.c:379`). A numeric change
+    /// that stays inside MDEL must NOT drive OUT.
+    #[test]
+    fn r9_74_scalcout_on_change_honours_mdel_deadband() {
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
+        rec.put_field("MDEL", EpicsValue::Double(2.0)).unwrap();
+
+        rec.put_field("A", EpicsValue::Double(1.0)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 1.0);
+        assert!(
+            !rec.should_output(),
+            "|pval - val| = 1.0 is inside MDEL=2.0 — C does not drive OUT"
+        );
+
+        rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
+        rec.process().unwrap();
+        assert!(
+            rec.should_output(),
+            "|1.0 - 5.0| = 4.0 exceeds MDEL=2.0 — C drives OUT"
+        );
+    }
+
+    /// R9-74 (family): SVAL takes no part in the OOPT="On Change" test — C's
+    /// switch (`sCalcoutRecord.c:378-380`) compares only PVAL against VAL. A
+    /// cycle whose only change is the string result leaves VAL at 0.0 and must
+    /// not drive OUT even with the default MDEL=0.
+    #[test]
+    fn r9_74_scalcout_on_change_ignores_string_result_change() {
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("AA".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
+
+        rec.put_field("AA", EpicsValue::String("first".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.sval, "first");
+        assert_eq!(rec.val, 0.0, "a non-numeric string result converts to 0.0");
+
+        rec.put_field("AA", EpicsValue::String("second".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.sval, "second");
+        assert!(
+            !rec.should_output(),
+            "SVAL changed but VAL did not — C's On-Change test is numeric only"
+        );
+    }
 
     #[test]
     fn test_scalcout_default() {

@@ -294,42 +294,15 @@ fn process_mode_from_field(field: &PvField, log: &RemoteLog) -> ProcessMode {
 }
 
 /// Render a pvRequest option value the way pvxs's `SB()<<value` does —
-/// `Value`'s default (tree) formatter, `datafmt.cpp:187-211`:
-/// `<type name> = <value>` with strings quoted, terminated by the `"\n"`
-/// the formatter always writes. That trailing newline is part of the
-/// message pvxs puts on the wire, so it is part of the contract.
+/// [`epics_pva_rs::pvdata::render_value`], the single owner of that
+/// rendering, shared with the native PVA server's monitor-option
+/// diagnostics.
 ///
-/// Only values that fail `as<bool>` ever reach here — every numeric and
-/// boolean scalar converts — so in practice this renders strings. A
-/// non-scalar field (structure / union / array) also fails `as<bool>` and
-/// `as<string>` in pvxs; its full tree rendering is approximated by the
-/// type name alone, which is all a client needs to identify the offending
-/// option.
-fn render_option_value(field: &PvField) -> String {
-    let scalar = match field {
-        PvField::Scalar(sv) => sv,
-        _ => return "<non-scalar>\n".to_string(),
-    };
-    match scalar {
-        ScalarValue::String(s) => {
-            // pvxs `escape()` — backslash and quote are the escapes a
-            // pvRequest option value can realistically carry.
-            let escaped = s.as_str_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-            format!("string = \"{escaped}\"\n")
-        }
-        ScalarValue::Boolean(b) => format!("bool = {b}\n"),
-        ScalarValue::Byte(v) => format!("int8 = {v}\n"),
-        ScalarValue::Short(v) => format!("int16 = {v}\n"),
-        ScalarValue::Int(v) => format!("int32 = {v}\n"),
-        ScalarValue::Long(v) => format!("int64 = {v}\n"),
-        ScalarValue::UByte(v) => format!("uint8 = {v}\n"),
-        ScalarValue::UShort(v) => format!("uint16 = {v}\n"),
-        ScalarValue::UInt(v) => format!("uint32 = {v}\n"),
-        ScalarValue::ULong(v) => format!("uint64 = {v}\n"),
-        ScalarValue::Float(v) => format!("float32 = {v}\n"),
-        ScalarValue::Double(v) => format!("float64 = {v}\n"),
-    }
-}
+/// This used to be a second, divergent copy: it invented the pvData type
+/// spellings (`int32`, `float64`) where pvxs's `TypeCode::name()` prints the
+/// C-ish `int32_t` / `double` (`src/type.cpp:126-166`), and it collapsed every
+/// non-scalar to `<non-scalar>` (R10-36).
+use epics_pva_rs::pvdata::render_value as render_option_value;
 
 impl PutOptions {
     /// Extract process/block options from a PvStructure.

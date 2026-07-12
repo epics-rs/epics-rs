@@ -67,16 +67,16 @@ struct MonitorOptionDiag {
     message: String,
 }
 
-/// Render a monitor `_options` scalar value for a pvxs-shaped
-/// `logRemote` message. pvxs streams the option `Value` through
-/// `operator<<` (`SB()<<…<<pipeline`); the scalar text form is the
-/// faithful approximation. Non-scalar fields render as `<non-scalar>`.
-fn render_option_value(f: &PvField) -> String {
-    match f {
-        PvField::Scalar(sv) => sv.to_string(),
-        _ => "<non-scalar>".to_string(),
-    }
-}
+/// Render a monitor `_options` value for a pvxs-shaped `logRemote` message.
+///
+/// pvxs streams the option `Value` through `operator<<` (`SB()<<…<<pipeline`,
+/// `servermon.cpp:529`), i.e. the default TREE formatter — `<typecode> =
+/// <value>` with the trailing newline the formatter always writes. That is
+/// [`crate::pvdata::render_value`], the one owner shared with the QSRV
+/// bridge's `record._options.process` diagnostic. This used to render a bare
+/// scalar (`maybe` where pvxs sends `string = "maybe"\n`) while the bridge
+/// rendered a third, differently-typed form (R10-36).
+use crate::pvdata::render_value as render_option_value;
 
 #[derive(Debug)]
 struct PipelineOptions {
@@ -8909,6 +8909,61 @@ mod tests {
             "pvxs error text: {msg}"
         );
         assert!(msg.contains("not-a-number"), "the value is named: {msg}");
+    }
+
+    /// R10-36: `SB()<<queueSize` streams the option `Value` through pvxs's
+    /// DEFAULT (tree) formatter — `<typecode> = <value>` plus the newline the
+    /// formatter always writes — not the bare scalar text this used to append.
+    /// Every diagnostic that names an option value shares that one renderer
+    /// ([`crate::pvdata::render_value`]) with the QSRV bridge.
+    #[test]
+    fn pva_r10_36_option_diagnostics_render_the_value_like_pvxs() {
+        // Reject text (`servermon.cpp:538`).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::String("not-a-number".into())),
+        );
+        let Ok(Some(MonitorPipelineRequest::Reject(msg))) = monitor_pipeline_options(&req) else {
+            panic!("pipeline + unconvertible queueSize must reject the INIT");
+        };
+        assert_eq!(
+            msg, "can not pipeline invalid queueSize : string = \"not-a-number\"\n",
+            "pre-R10-36 this rendered the bare scalar (`not-a-number`)"
+        );
+
+        // Warn text on a NON-pipeline monitor (`servermon.cpp:542`).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to use record._options.queueSize : string = \"garbage\"\n"
+        );
+
+        // `pipeline` Warn (`servermon.cpp:529`) — a string `as<bool>` refuses.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("maybe".into())),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to parse record._options.pipeline : string = \"maybe\"\n"
+        );
+
+        // Negative control: a NON-scalar option is no longer flattened to
+        // `<non-scalar>`; it renders as pvxs's tree form for that value.
+        let req = make_pipeline_request(
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![1, 2].into())),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to parse record._options.pipeline : int32_t[] = {2}[1, 2]\n"
+        );
     }
 
     /// R10-32: pvxs `queueSize.as(qSize)` converts a REAL

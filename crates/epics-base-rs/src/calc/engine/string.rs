@@ -794,7 +794,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         }
     }
 
-    let result = stack.last().cloned().unwrap_or(StackValue::Double(0.0));
+    // C checks the depth on BOTH evaluator paths, in the same place and to the
+    // same rule — `sCalcPerform.c:817-823` (no-string path) and `:2023-2032`
+    // (string path):
+    //
+    // ```c
+    // /* if everything is peachy, the stack should end at its first position */
+    // if (pd != topd) return(-1);        /* no-string path */
+    // if (ps != top)  return(-1);        /* string path    */
+    // ```
+    //
+    // The stack pointer starts one BELOW the first slot and every push increments
+    // first, so "ends at its first position" means the stack holds EXACTLY ONE
+    // value. A leaked operand and a fully-consumed stack are both -1, and C writes
+    // neither `*presult` nor `psresult`.
+    //
+    // The port returned `stack.last()`: a leaked operand was published as VAL/SVAL,
+    // and an empty stack invented a 0.0 that C never produces. `aCalcPerform.c:1607`
+    // has the identical check, closed for aCalc by b87dcbd7; this is the sCalc half
+    // of that family, and it takes the same shape — the one-value invariant PRODUCES
+    // the result rather than being checked beside it.
+    //
+    // Like the aCalc half, it is an invariant guard: `sCalcPostfix`'s compile-time
+    // `runtime_depth` ledger rejects any program that would not end at depth 1, so
+    // no source expression the port's compiler accepts can reach it. (Compiled C
+    // DOES reach it — `4|-2` is -1 there — but for a reason the port does not yet
+    // model: C's double-only evaluator has no `case SUBLAST`, silently skips it, and
+    // the operand it should have consumed is what trips this check. That gap is
+    // reported separately; it is not this guard.)
+    let result = match <[StackValue; 1]>::try_from(stack) {
+        Ok([result]) => result,
+        Err(_) => return Err(CalcError::StackLeak),
+    };
     // Both of C's evaluator paths end with the same line — `sCalcPerform.c:833`
     // (no-string) and `:2056` (string):
     //     return(((isnan(*presult)||isinf(*presult)) ? -1 : 0));
@@ -1982,5 +2013,84 @@ mod parity_tests {
         assert!(scalc("1/0", &mut inp).is_err()); // C: PERFORM st=-1
         assert!(scalc("-1/0", &mut inp).is_err()); // C: PERFORM st=-1
         assert!(scalc("0/0", &mut inp).is_err()); // C: PERFORM st=-1
+    }
+}
+
+/// The end-of-expression depth invariant — C's `if (pd != topd) return(-1)` on the
+/// no-string path (`sCalcPerform.c:817-823`) and `if (ps != top) return(-1)` on the
+/// string path (`:2023-2032`).
+///
+/// These programs are hand-built because `sCalcPostfix` CANNOT emit them: its
+/// compile-time `runtime_depth` ledger rejects anything that would not end at depth
+/// 1, which is why no source expression reaches the guard. Compiled C agrees with
+/// the port's compiler on every probe — `A:=1`, `AA:=4` and `1;2` are all
+/// "Incomplete expression, operand missing" in both, and `A:=1;A+1` compiles and
+/// runs to 2 in both.
+///
+/// So the guard is tested where it applies: at the engine's own boundary, against a
+/// program that violates the invariant. Same reasoning, and same shape, as the aCalc
+/// half in `array.rs` (b87dcbd7).
+#[cfg(test)]
+mod stack_depth_invariant {
+    use super::*;
+    use crate::calc::engine::ExprKind;
+
+    fn run(code: Vec<Opcode>) -> Result<StackValue, CalcError> {
+        let expr = CompiledExpr {
+            code,
+            kind: ExprKind::String,
+            loop_pairs: Vec::new(),
+        };
+        eval(&expr, &mut StringInputs::new())
+    }
+
+    #[test]
+    fn a_leaked_operand_is_an_error_not_the_top_of_stack() {
+        // Two pushes and no operator to consume them: C ends with the stack pointer
+        // one ABOVE its first position and returns -1, writing neither *presult nor
+        // psresult. The port used to return `stack.last()` — the 2.0 — and publish
+        // it as VAL/SVAL.
+        let leaked = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn an_empty_stack_is_an_error_not_a_zero() {
+        // A store consumes the only value, so the program ends at depth 0 — C's
+        // pointer is left one BELOW the first position and the check fails just as
+        // hard. The port used to invent a 0.0 that C never produces.
+        let consumed = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::StoreVar(0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(consumed), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn a_leaked_string_operand_is_an_error_too() {
+        // The string path has its own copy of the check (`:2023-2032`), and it is the
+        // same rule: depth 1, whatever the type of the value.
+        let leaked = vec![
+            Opcode::String(StringOp::PushString(b"a".to_vec())),
+            Opcode::String(StringOp::PushString(b"b".to_vec())),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn exactly_one_value_is_the_result() {
+        let balanced = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::Add),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(balanced), Ok(StackValue::Double(3.0)));
     }
 }

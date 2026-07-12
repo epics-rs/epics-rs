@@ -559,23 +559,36 @@ mod parity_tests {
         // Other 2-arg array ops.
         assert!(acalc_compile("NSMOO(AA,2)").is_ok());
         assert!(acalc_compile("NDERIV(AA,5)").is_ok());
-        assert!(acalc_compile("FITPOLY(AA,BB)").is_ok());
-        assert!(acalc_compile("FITQ(AA,BB)").is_ok());
+        assert!(acalc_compile("FITMPOLY(AA,BB)").is_ok());
+        // FITPOLY is a UNARY_OPERATOR (`aCalcPostfix.c:142`) — one operand, and a
+        // second is a COMPILE error, not an extra argument. Compiled C:
+        // `FITPOLY(AA,BB)` is "Incomplete expression, operand missing", the same
+        // rejection `SUM(AA,BB)` gets.
+        assert!(acalc_compile("FITPOLY(AA)").is_ok());
+        assert!(acalc_compile("FITPOLY(AA,BB)").is_err());
+        // FITQ/FITMQ are VARARG_OPERATORs (`:140-141`): their trailing arguments
+        // name the scalar arguments the coefficients are stored into.
+        assert!(acalc_compile("FITQ(AA)").is_ok());
+        assert!(acalc_compile("FITQ(AA,C,D,E)").is_ok());
+        assert!(acalc_compile("FITMQ(AA,BB,C,D,E)").is_ok());
 
-        // And acalc end-to-end still produces an array result.
+        // And acalc end-to-end still produces an array result. CAT cannot grow the
+        // `arraySize` buffer: with AA carrying no window its `lastEl` is already
+        // arraySize-1, so C copies nothing (`aCalcPerform.c:1359-1364`) and the
+        // result is AA. See `tests/calc_array_window.rs` for the windowed cases.
         let mut inputs = ArrayInputs::new(3);
         inputs.arrays[0] = vec![1.0, 2.0, 3.0];
         inputs.arrays[1] = vec![4.0, 5.0, 6.0];
         let cat = acalc("CAT(AA,BB)", &mut inputs).unwrap();
         assert_eq!(
             cat,
-            crate::calc::ArrayStackValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            crate::calc::ArrayStackValue::array(vec![1.0, 2.0, 3.0])
         );
 
         let mut inputs2 = ArrayInputs::new(5);
         let arndm = acalc("ARNDM", &mut inputs2).unwrap();
         match arndm {
-            crate::calc::ArrayStackValue::Array(arr) => assert_eq!(arr.len(), 5),
+            crate::calc::ArrayStackValue::Array(cell) => assert_eq!(cell.buf().len(), 5),
             other => panic!("expected Array, got {other:?}"),
         }
     }

@@ -1969,8 +1969,33 @@ impl PvDatabase {
             // value. `put_field_internal` defaults to `put_field`, so
             // records with writable targets (calc/sub `A..L`) are
             // unaffected.
+            // An ARRAY-valued link value is offered to the target field whole:
+            // C's `fetch_values` hands `dbGetLink` a pointer to the target FIELD,
+            // so the field decides how much of the source it takes. An array
+            // field takes `nRequest` = its own element count with the tail
+            // zero-filled (aCalcoutRecord.c:1096-1099 for INAA..INLL -> AA..LL);
+            // a scalar field is a one-element destination, so it takes element 0
+            // (`dbGetLink(..., DBR_DOUBLE, pvalue, 0, 0)`, calcRecord.c:434).
+            // `to_f64()` answers None for every array variant, so routing every
+            // value through it dropped array-valued links outright — AA..LL never
+            // populated and the record calculated on an empty array.
             for (val_field, value) in &multi_input_values {
-                if let Some(f) = value.to_f64() {
+                if value.is_array() {
+                    if instance
+                        .record
+                        .put_field_internal(val_field, value.clone())
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    // The target is a scalar field: element 0, as C's
+                    // one-element destination takes.
+                    if let Some(f) = value.first_element().and_then(|v| v.to_f64()) {
+                        let _ = instance
+                            .record
+                            .put_field_internal(val_field, EpicsValue::Double(f));
+                    }
+                } else if let Some(f) = value.to_f64() {
                     let _ = instance
                         .record
                         .put_field_internal(val_field, EpicsValue::Double(f));
@@ -1988,7 +2013,16 @@ impl PvDatabase {
             // link value in 32768..65535 is not lost to f64->i16 saturation
             // before it reaches the field's put.
             if let Some(nvl_val) = sel_nvl_value {
-                if let Some(f) = nvl_val.to_f64() {
+                // Same one-element-destination rule as the multi-input loop
+                // above: C reads NVL with `dbGetLink(..., DBR_USHORT, &pse->seln,
+                // 0, 0)` (selRecord.c), so an array-valued source contributes its
+                // element 0 rather than being dropped by `to_f64`.
+                let scalar = if nvl_val.is_array() {
+                    nvl_val.first_element()
+                } else {
+                    Some(nvl_val)
+                };
+                if let Some(f) = scalar.and_then(|v| v.to_f64()) {
                     let _ = instance
                         .record
                         .put_field("SELN", EpicsValue::UShort(f as u16));

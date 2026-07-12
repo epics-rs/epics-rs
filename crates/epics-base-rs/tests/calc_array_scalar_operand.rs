@@ -72,6 +72,45 @@ fn no_unary_array_operator_errors_on_a_scalar() {
     }
 }
 
+/// R10-10 — NDERIV is NOT in that unary switch (`aCalcPerform.c:594-617`), so it has
+/// no `ps->d = 0` arm: its own case PROMOTES the operand with `toArray(ps,1)` (`:599`)
+/// and differentiates the broadcast buffer. A constant's derivative is zero, so the
+/// answer is an ARRAY of (floating-point) zeros, not a scalar and not an error.
+/// Compiled C, arraySize 5, A=3, `NDERIV(A,2)`: status 0,
+/// [3.55e-15, 1.78e-15, 0, -1.78e-15, -3.55e-15].
+#[test]
+fn r10_10_nderiv_promotes_a_scalar_operand() {
+    let mut inputs = ArrayInputs::new(5);
+    inputs.num_vars[0] = 3.0;
+    match acalc("NDERIV(A,2)", &mut inputs).expect("NDERIV of a scalar is legal in C") {
+        ArrayStackValue::Array(cell) => {
+            for (i, &v) in cell.buf().iter().enumerate() {
+                assert!(
+                    v.abs() < 1e-9,
+                    "element {i} of the derivative of a constant is {v}, not ~0"
+                );
+            }
+            assert_eq!(cell.buf().len(), 5, "the promotion fills the whole buffer");
+        }
+        other => panic!("`toArray` makes the result an array, got {other:?}"),
+    }
+}
+
+/// The negative control for that promotion: NSMOOTH is the other operator outside the
+/// unary switch, and it does NOT promote — it indexes `ps->a[]` straight after
+/// `DEC(ps)` (`:583`), so a scalar operand dereferences a NULL array. Compiled C,
+/// `NSMOO(A,2)` with A=3: SIGSEGV. There is no C answer to match, so refusing it is
+/// the deliberate deviation, and NDERIV's promotion must not be generalised to it.
+#[test]
+fn r10_10_nsmooth_does_not_promote_a_scalar() {
+    let mut inputs = ArrayInputs::new(5);
+    inputs.num_vars[0] = 3.0;
+    assert!(
+        acalc("NSMOO(A,2)", &mut inputs).is_err(),
+        "C segfaults here; the port must refuse rather than invent an answer"
+    );
+}
+
 /// The array branch must be untouched by the scalar branch's arrival.
 #[test]
 fn the_array_branch_still_answers() {

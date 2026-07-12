@@ -27,7 +27,7 @@ fn run(expr: &str) -> ArrayStackValue {
 
 fn arr(expr: &str) -> Vec<f64> {
     match run(expr) {
-        ArrayStackValue::Array(v) => v,
+        ArrayStackValue::Array(v) => v.into_buf(),
         ArrayStackValue::Double(d) => panic!("{expr}: expected an array result, got {d}"),
     }
 }

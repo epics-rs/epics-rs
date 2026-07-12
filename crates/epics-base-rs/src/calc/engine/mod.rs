@@ -199,6 +199,18 @@ pub struct ArrayInputs {
     /// (`FETCH_AVAL`, aCalcPerform.c:534-539). The array counterpart of
     /// [`Self::prev_val`].
     pub prev_aval: Vec<f64>,
+    /// C's `*amask` (`aCalcPerform.c:300`) — bit `i` marks that the expression
+    /// STORED into array variable `i` (AA..LL) during this run.
+    ///
+    /// C hands aCalcPerform a pointer to the record's own arrays, so a store lands
+    /// in the record directly and this mask is how the caller learns WHICH ones
+    /// changed: `afterCalc` posts exactly the flagged fields (`aCalcoutRecord.c:293-297`).
+    ///
+    /// The engine OWNS it. It is reset at the top of every run (`:326`, `*amask = 0`)
+    /// and set only by the array-store opcodes (`:487`, `:524`), so a caller cannot
+    /// see a stale bit and a store cannot land without its bit. Read it AFTER the
+    /// run, never set it before.
+    pub amask: u32,
 }
 
 impl ArrayInputs {
@@ -209,6 +221,7 @@ impl ArrayInputs {
             array_size,
             prev_val: 0.0,
             prev_aval: vec![0.0; array_size],
+            amask: 0,
         }
     }
 }

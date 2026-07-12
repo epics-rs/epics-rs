@@ -104,7 +104,16 @@ fn token_to_binary_opcode(token: &Token) -> Opcode {
 fn is_vararg(func: &FuncName) -> bool {
     matches!(
         func,
-        FuncName::Min | FuncName::Max | FuncName::Finite | FuncName::IsNan
+        FuncName::Min
+            | FuncName::Max
+            | FuncName::Finite
+            | FuncName::IsNan
+            // aCalc's two VARARG_OPERATORs (`aCalcPostfix.c:140-141`). Their trailing
+            // arguments NAME the scalar arguments the fitted coefficients are stored
+            // into, so their count is genuinely variable: `FITQ(AA)` fits and stores
+            // nothing, `FITQ(AA,C,D,E)` fits and stores all three coefficients.
+            | FuncName::FitQ
+            | FuncName::FitMQ
     )
 }
 
@@ -140,19 +149,21 @@ fn func_arity(func: &FuncName) -> u8 {
         FuncName::Printf | FuncName::Sscanf | FuncName::BinRead | FuncName::BinWrite => 2,
 
         // 2-arg array ops.
-        //   NSmoo  -> ArrayOp::NSmooth   (array.rs:527 — pop n, pop array)
-        //   NDeriv -> ArrayOp::NDeriv    (array.rs:538 — pop n, pop array)
-        //   Cat    -> ArrayOp::Cat       (array.rs:553 — pop b, pop a)
-        //   FitPoly-> ArrayOp::FitPoly   (array.rs:592 — pop y, pop x)
-        //   FitQ   -> ArrayOp::FitQ      (array.rs:611 — pop y, pop x)
-        FuncName::NSmoo | FuncName::NDeriv | FuncName::Cat | FuncName::FitPoly | FuncName::FitQ => {
-            2
-        }
+        //   NSmoo  -> ArrayOp::NSmooth   (pop n, pop array)
+        //   NDeriv -> ArrayOp::NDeriv    (pop n, pop array)
+        //   Cat    -> ArrayOp::Cat       (pop b, pop a)
+        //   FitMPoly -> ArrayOp::FitMPoly (pop mask, pop y)
+        //
+        // FITMPOLY is C's only UNARY_OPERATOR with `runtime_effect = -1`
+        // (`aCalcPostfix.c:143`) — two operands in, one out. It takes NO x: like
+        // FITPOLY it fits against the ELEMENT INDEX (`aCalcPerform.c:1017-1018`,
+        // `ps2->a[i] = i`), and its second operand is the MASK.
+        FuncName::NSmoo | FuncName::NDeriv | FuncName::Cat | FuncName::FitMPoly => 2,
 
-        // 3-arg array ops.
-        //   FitMPoly -> ArrayOp::FitMPoly (array.rs:601 — pop mask, y, x)
-        //   FitMQ    -> ArrayOp::FitMQ    (array.rs:629 — pop mask, y, x)
-        FuncName::FitMPoly | FuncName::FitMQ => 3,
+        // FITPOLY is a plain UNARY_OPERATOR, `runtime_effect = 0`
+        // (`aCalcPostfix.c:142`): `FITPOLY(y)`, one operand in, one out. The port
+        // used to demand an x array as well, which no aCalc expression supplies.
+        FuncName::FitPoly => 1,
 
         // Everything else is a 1-arg function: one operand in, one out.
         //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Sin,
@@ -240,8 +251,8 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::NDeriv => return Opcode::Array(super::opcodes::ArrayOp::NDeriv),
         FuncName::FitPoly => return Opcode::Array(super::opcodes::ArrayOp::FitPoly),
         FuncName::FitMPoly => return Opcode::Array(super::opcodes::ArrayOp::FitMPoly),
-        FuncName::FitQ => return Opcode::Array(super::opcodes::ArrayOp::FitQ),
-        FuncName::FitMQ => return Opcode::Array(super::opcodes::ArrayOp::FitMQ),
+        FuncName::FitQ => return Opcode::Array(super::opcodes::ArrayOp::FitQ(nargs)),
+        FuncName::FitMQ => return Opcode::Array(super::opcodes::ArrayOp::FitMQ(nargs)),
         FuncName::Cum => return Opcode::Array(super::opcodes::ArrayOp::Cum),
         FuncName::Cat => return Opcode::Array(super::opcodes::ArrayOp::Cat),
         FuncName::ARndm => return Opcode::Array(super::opcodes::ArrayOp::ArrayRandom),

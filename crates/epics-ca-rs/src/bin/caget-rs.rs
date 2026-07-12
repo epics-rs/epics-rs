@@ -3,13 +3,14 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, dbr_value_field_type,
-    format_value, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    FloatFormat, FloatStyle, IntStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, ca_error_marker,
+    dbr_value_field_type, format_value, sevr_to_str, stat_to_str, zero_dbr_snapshot,
+    zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
 };
-use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
+use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
@@ -547,10 +548,9 @@ impl ReadError {
     /// and that `print_time_val_sts` repeats for `-a`).
     fn marker(&self) -> String {
         match self {
-            ReadError::Disconnected => "*** not connected".to_string(),
-            ReadError::CallbackTimeout => "*** no data available (timeout)".to_string(),
-            ReadError::Ca(s) if *s == ECA_NORDACCESS => "*** no read access".to_string(),
-            ReadError::Ca(s) => format!("*** CA error {}", eca_message(*s)),
+            ReadError::Disconnected => ca_error_marker(ECA_DISCONN),
+            ReadError::CallbackTimeout => NO_DATA_MARKER.to_string(),
+            ReadError::Ca(s) => ca_error_marker(*s),
         }
     }
 }

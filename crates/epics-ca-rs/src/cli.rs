@@ -204,6 +204,31 @@ pub fn sevr_to_str(sevr: u16) -> &'static str {
         .unwrap_or(ALARM_STRING_UNKNOWN)
 }
 
+/// C's `*** ...` marker for a PV whose read failed, keyed on the PV's ECA
+/// status — the single owner of those strings for `caget` and `caput`.
+///
+/// `caput` carries its own copy of `caget()` (`caput.c:130-240`), and the two
+/// print loops are identical here (`caget.c:262-267`, `caput.c:201-206`):
+/// `ECA_DISCONN` → `*** not connected`, `ECA_NORDACCESS` → `*** no read
+/// access`, anything else → `*** CA error` plus `ca_message` text.
+///
+/// The fourth marker, `*** no data available (timeout)`
+/// ([`NO_DATA_MARKER`]), is NOT keyed on a status: C reaches it on
+/// `value == 0`, which only a callback get can leave — see
+/// [`zero_dbr_value`].
+pub fn ca_error_marker(status: u32) -> String {
+    match status {
+        crate::protocol::ECA_DISCONN => "*** not connected".to_string(),
+        crate::protocol::ECA_NORDACCESS => "*** no read access".to_string(),
+        s => format!("*** CA error {}", crate::protocol::eca_message(s)),
+    }
+}
+
+/// C's marker for a readback that produced NO buffer at all (`value == 0`,
+/// `caget.c:268`). Only the callback get (`caget -c`) can leave one — the
+/// synchronous get callocs up front (see [`zero_dbr_value`]).
+pub const NO_DATA_MARKER: &str = "*** no data available (timeout)";
+
 /// Unix seconds at the EPICS epoch (1990-01-01T00:00:00Z) — the instant a
 /// zeroed `epicsTimeStamp` denotes, and therefore the timestamp C's `-a` /
 /// `-l` modes print for a timed-out synchronous readback (see

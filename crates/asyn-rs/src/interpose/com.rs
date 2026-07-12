@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
+use crate::trace::TraceMask;
 use crate::user::AsynUser;
 
 // TELNET special characters — C asynInterposeCom.c:32-38.
@@ -227,26 +228,23 @@ impl Default for ComInterpose {
     }
 }
 
-/// C `nextChar` (:94-107) — one byte from the layer below, or `EOF` when the
-/// read fails. C discards the failing `asynStatus` and keeps only the message
+/// C `nextChar` (:94-107) — one byte from the layer below, or `Err(message)` when
+/// the read fails. C discards the failing `asynStatus` and keeps only the message
 /// the lower layer left in `pasynUser->errorMessage`, which is what the caller's
-/// `return asynError` then carries out; `err_msg` is that message slot.
+/// `return asynError` then carries out. The message comes back to the caller here
+/// because the two callers put it in different places: the negotiation lands it in
+/// the user's message slot (C's buffer), while `readIt` discards it and reports
+/// "Missing IAC" instead (:226-230).
 ///
 /// Deviation: C does not check `nbytes`, so a lower read that reports success
 /// having transferred nothing leaves `char c` uninitialized and C reads garbage.
-/// That is treated as `EOF` here.
-fn next_char(next: &mut dyn OctetNext, user: &AsynUser, err_msg: &mut String) -> i32 {
+/// That is treated as EOF here.
+fn next_char(next: &mut dyn OctetNext, user: &AsynUser) -> Result<u8, String> {
     let mut c = [0u8; 1];
     match next.read(user, &mut c) {
-        Ok(r) if r.nbytes_transferred >= 1 => i32::from(c[0]),
-        Ok(_) => {
-            *err_msg = "no data".into();
-            EOF
-        }
-        Err(e) => {
-            *err_msg = e.message();
-            EOF
-        }
+        Ok(r) if r.nbytes_transferred >= 1 => Ok(c[0]),
+        Ok(_) => Err("no data".into()),
+        Err(e) => Err(e.message()),
     }
 }
 
@@ -283,7 +281,7 @@ impl OctetInterpose for ComInterpose {
         // be the start of the buffer.
         let mut d: isize = 0;
         let mut n_check: isize = n_read as isize;
-        let mut err_msg = String::new();
+        let mut unstuffed = false;
 
         while n_check > 0 {
             let span = &buf[d as usize..(d + n_check) as usize];
@@ -292,13 +290,18 @@ impl OctetInterpose for ComInterpose {
             };
             let mut iac = d + rel as isize;
 
+            unstuffed = true;
             // C :217 — any unstuffing clears CNT: the count the base layer
             // reported is no longer the count being returned.
             eom.remove(EomReason::CNT);
 
             let c = if iac == d + n_check - 1 {
-                // :218-221 — partner not yet read; pull it from the device.
-                let c = next_char(next, user, &mut err_msg);
+                // :218-221 — partner not yet read; pull it from the device. C
+                // keeps the lower layer's message in `pasynUser->errorMessage`
+                // here, but the only exit from this arm overwrites it with
+                // "Missing IAC" (:226-230), so the message is dropped on the
+                // floor exactly as C drops it.
+                let c = next_char(next, user).map_or(EOF, i32::from);
                 iac -= 1;
                 c
             } else {
@@ -324,6 +327,18 @@ impl OctetInterpose for ComInterpose {
             // under this update minus one, and started at `n_read <= buf.len()`.
             let dst = d as usize;
             buf.copy_within(dst + 1..dst + 1 + n_check as usize, dst);
+        }
+
+        // :237-239 — a read that unstuffed anything is traced at
+        // ASYN_TRACEIO_FILTER, with the buffer as it now stands. The layer has no
+        // handle on the port; the trace config comes through the asynUser, as it
+        // does in C (`asynPrintIO(pasynUser, …)`).
+        if unstuffed {
+            user.print_io(
+                TraceMask::IO_FILTER,
+                &buf[..n_read],
+                &format!("nRead {n_read} after IAC unstuffing"),
+            );
         }
 
         // :240-241 — restore CNT if, after unstuffing, the buffer is still full.
@@ -378,15 +393,18 @@ impl OctetInterpose for ComInterpose {
 // asynOption interface: the telnet negotiation
 // ---------------------------------------------------------------------------
 
-/// The negotiation's view of the link below the interpose, plus the one message
-/// slot every C layer writes into.
+/// The negotiation's view of the link below the interpose, and the `asynUser`
+/// whose message slot every C layer writes into.
 ///
-/// `err_msg` models `pasynUser->errorMessage` literally: `nextChar` leaves the
-/// lower read's message there on EOF (:103-106), `expectChar` overwrites it on a
-/// mismatch (:120-122), and each `return asynError` carries out whatever it
-/// currently holds. Modelling it as a slot rather than threading `Result`s is
-/// what lets a failing read surface the *lower driver's* message with C's
-/// `asynError` status, exactly as C does.
+/// The slot is [`AsynUser::error_message`] — C's `pasynUser->errorMessage`
+/// itself, not a copy: `nextChar` leaves the lower read's message there on EOF
+/// (:103-106), `expectChar` overwrites it on a mismatch (:120-122), `setOption`
+/// leaves a *non-failing* advisory there (:571-573, :587-589), and each `return
+/// asynError` carries out whatever it currently holds. Keeping the negotiation's
+/// messages in the caller's user is what lets a failing read surface the *lower
+/// driver's* message with C's `asynError` status, and what gives the advisories
+/// somewhere to live at all — a `Result` cannot carry a message that does not
+/// fail the call.
 struct TelnetLink<'a> {
     next: &'a mut dyn OctetNext,
     /// The `asynUser` C threads through the whole negotiation — the *caller's*
@@ -396,20 +414,28 @@ struct TelnetLink<'a> {
     /// bounds every wire read the handshake performs, so the negotiation has no
     /// timeout of its own to disagree with the caller's.
     user: &'a mut AsynUser,
-    err_msg: String,
 }
 
 impl<'a> TelnetLink<'a> {
     fn new(next: &'a mut dyn OctetNext, user: &'a mut AsynUser) -> Self {
-        Self {
-            next,
-            user,
-            err_msg: String::new(),
-        }
+        Self { next, user }
     }
 
     fn next_char(&mut self) -> i32 {
-        next_char(self.next, self.user, &mut self.err_msg)
+        match next_char(self.next, self.user) {
+            Ok(b) => i32::from(b),
+            Err(msg) => {
+                self.user.error_message = msg;
+                EOF
+            }
+        }
+    }
+
+    /// C's `epicsSnprintf(pasynUser->errorMessage, …)` on a path that does *not*
+    /// return an error (:571-573, :587-589): the message is left for the caller
+    /// to find and the call carries on.
+    fn advise(&mut self, msg: &str) {
+        self.user.error_message = msg.to_string();
     }
 
     /// C `expectChar` (:112-125) — fetch and compare. Returns false on EOF
@@ -421,7 +447,7 @@ impl<'a> TelnetLink<'a> {
             return false;
         }
         if c != i32::from(expect) {
-            self.err_msg = format!(
+            self.user.error_message = format!(
                 "Expected {}, got {}",
                 hash_hex_upper(i32::from(expect)),
                 hash_hex_upper(c)
@@ -434,7 +460,7 @@ impl<'a> TelnetLink<'a> {
     /// C's `return asynError` — the status is always `asynError`, the message is
     /// whatever is in the slot.
     fn error(&self) -> AsynError {
-        asyn_error(self.err_msg.clone())
+        asyn_error(self.user.error_message.clone())
     }
 
     fn write(&mut self, bytes: &[u8]) -> AsynResult<usize> {
@@ -487,14 +513,15 @@ impl<'a> TelnetLink<'a> {
                         continue;
                     }
                     if command == DO {
-                        self.err_msg = format!(
+                        self.user.error_message = format!(
                             "Received response {} in response to DO.",
                             hash_hex_lower(opt)
                         );
                         return Err(self.error());
                     }
                     if wd == DONT {
-                        self.err_msg = format!("Device says DON'T {}.", hash_hex_lower(opt));
+                        self.user.error_message =
+                            format!("Device says DON'T {}.", hash_hex_lower(opt));
                         return Err(self.error());
                     }
                     return Ok(());
@@ -510,14 +537,15 @@ impl<'a> TelnetLink<'a> {
                         continue;
                     }
                     if command == WILL {
-                        self.err_msg = format!(
+                        self.user.error_message = format!(
                             "Received response {} in response to WILL.",
                             hash_hex_lower(opt)
                         );
                         return Err(self.error());
                     }
                     if wd == WONT {
-                        self.err_msg = format!("Device says WON'T {}.", hash_hex_lower(opt));
+                        self.user.error_message =
+                            format!("Device says WON'T {}.", hash_hex_lower(opt));
                         return Err(self.error());
                     }
                     return Ok(());
@@ -549,7 +577,7 @@ impl<'a> TelnetLink<'a> {
                 }
                 _ => {
                     // :405-408
-                    self.err_msg =
+                    self.user.error_message =
                         format!("Unexpected character {} in TELNET reply", hash_hex_lower(c));
                     return Err(self.error());
                 }
@@ -617,7 +645,8 @@ impl<'a> TelnetLink<'a> {
                 return Ok(());
             } else {
                 // :461-465 — C prints `c` with %d, so an EOF here reports -1.
-                self.err_msg = format!("Sent COM-PORT-OPTION {} but got reply {}", x[0], c);
+                self.user.error_message =
+                    format!("Sent COM-PORT-OPTION {} but got reply {}", x[0], c);
                 return Err(self.error());
             }
         }
@@ -868,6 +897,12 @@ impl ComPortOptions {
             // :569-584 — "y" turns hardware flow control on; "n" re-sends the
             // *current* flow mode rather than NOFLOW, so switching RTS/CTS off
             // while XON/XOFF is on leaves XON/XOFF running.
+            //
+            // :571-573 — switching to RTS/CTS over a live XON/XOFF setting is
+            // announced in the message slot and does *not* fail the call.
+            if self.flow == CPO_CONTROL_IXON {
+                link.advise("XON/XOFF already set. Now using RTS/CTS.");
+            }
             let mode = if val.eq_ignore_ascii_case("n") {
                 self.flow
             } else if val.eq_ignore_ascii_case("y") {
@@ -880,7 +915,10 @@ impl ComPortOptions {
             self.flow = r[0];
             Ok(())
         } else if key.eq_ignore_ascii_case("ixon") {
-            // :585-604 — mirror of crtscts.
+            // :585-604 — mirror of crtscts, advisory (:587-589) included.
+            if self.flow == CPO_CONTROL_HWFLOW {
+                link.advise("RTS/CTS already set. Now using XON/XOFF.");
+            }
             let mode = if val.eq_ignore_ascii_case("n") {
                 self.flow
             } else if val.eq_ignore_ascii_case("y") {
@@ -895,9 +933,18 @@ impl ComPortOptions {
                 return Err(asyn_error("Bad option value"));
             };
             let mut r = [0u8; 1];
-            link.sb_com_port_option(&[CPO_SET_CONTROL, mode], &mut r)?;
-            self.flow = r[0];
-            Ok(())
+            match link.sb_com_port_option(&[CPO_SET_CONTROL, mode], &mut r) {
+                Ok(()) => {
+                    self.flow = r[0];
+                    Ok(())
+                }
+                Err(e) => {
+                    // :601-603 — and only on this key does C print the failure to
+                    // stdout as well as returning it.
+                    println!("XON/XOFF not set.");
+                    Err(e)
+                }
+            }
         } else if key.eq_ignore_ascii_case("break") {
             self.set_break(link, val)
         } else {
@@ -1739,6 +1786,109 @@ mod tests {
             "restoreSettings runs on the interpose's own 2 s asynUser, got {:?}",
             spy.seen
         );
+    }
+
+    /// R9-57, first half. C `readIt` traces every read it unstuffed at
+    /// `ASYN_TRACEIO_FILTER` (asynInterposeCom.c:237-239). The interpose has no
+    /// handle on the port to trace through — in C it prints through the
+    /// `asynUser` (`asynPrintIO(pasynUser, …)` → `findTracePvt`), and the port's
+    /// `AsynUser` now carries the same port/trace linkage, stamped by the actor.
+    #[test]
+    fn an_unstuffed_read_is_traced_at_traceio_filter() {
+        use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager};
+        use crate::user::UserTrace;
+        use std::sync::{Arc, Mutex};
+
+        let mgr = Arc::new(TraceManager::new());
+        mgr.set_trace_mask(Some("comtrace"), TraceMask::IO_FILTER);
+        mgr.set_trace_info_mask(Some("comtrace"), TraceInfoMask::PORT);
+        mgr.set_trace_io_mask(Some("comtrace"), TraceIoMask::ESCAPE);
+        let temp = std::env::temp_dir().join("asyn_com_filter_trace.txt");
+        let file = std::fs::File::create(&temp).unwrap();
+        mgr.set_trace_file(
+            Some("comtrace"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
+
+        let user = AsynUser {
+            trace: Some(UserTrace {
+                manager: mgr.clone(),
+                port: "comtrace".into(),
+            }),
+            ..AsynUser::default()
+        };
+
+        // "A<IAC><IAC>B" on the wire is "A<IAC>B" to the caller — one unstuffing.
+        let mut server = FakeServer::new(&[b'A', IAC, IAC, b'B']);
+        let mut com = ComInterpose::new();
+        let mut buf = [0u8; 8];
+        let r = com.read(&user, &mut buf, &mut server).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], &[b'A', IAC, b'B']);
+
+        let contents = std::fs::read_to_string(&temp).unwrap();
+        assert!(
+            contents.contains("nRead 3 after IAC unstuffing"),
+            "C :238 label, got {contents:?}"
+        );
+        assert!(contents.contains("IO_FILTER"), "at ASYN_TRACEIO_FILTER");
+        let _ = std::fs::remove_file(&temp);
+
+        // A read with nothing to unstuff prints nothing (C tests `unstuffed`).
+        let temp2 = std::env::temp_dir().join("asyn_com_filter_trace_quiet.txt");
+        let file = std::fs::File::create(&temp2).unwrap();
+        mgr.set_trace_file(
+            Some("comtrace"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
+        let mut server = FakeServer::new(b"AB");
+        com.read(&user, &mut buf, &mut server).unwrap();
+        assert_eq!(std::fs::read_to_string(&temp2).unwrap(), "");
+        let _ = std::fs::remove_file(&temp2);
+    }
+
+    /// R9-57, second half. C's `setOption` leaves an advisory in
+    /// `pasynUser->errorMessage` when the operator switches flow control over a
+    /// live setting of the other kind, and does *not* fail the call (:571-573,
+    /// :587-589). A `Result` cannot carry a message that does not fail, so the
+    /// port dropped both; they now land in the user's message slot, which is
+    /// where C's caller finds them.
+    #[test]
+    fn switching_flow_control_leaves_c_s_advisory_in_the_users_message() {
+        let mut user = AsynUser::default();
+
+        // XON/XOFF is live; the operator turns RTS/CTS on.
+        let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_HWFLOW]));
+        let mut com = ComPortOptions::new();
+        com.flow = CPO_CONTROL_IXON;
+        com.set_option(&mut user, &mut server, "crtscts", "y")
+            .expect("the advisory does not fail the call");
+        assert_eq!(
+            user.error_message,
+            "XON/XOFF already set. Now using RTS/CTS."
+        );
+        assert_eq!(com.flow, CPO_CONTROL_HWFLOW);
+
+        // Mirror image: RTS/CTS is live; the operator turns XON/XOFF on.
+        let mut user = AsynUser::default();
+        let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_IXON]));
+        let mut com = ComPortOptions::new();
+        com.flow = CPO_CONTROL_HWFLOW;
+        com.set_option(&mut user, &mut server, "ixon", "y")
+            .expect("the advisory does not fail the call");
+        assert_eq!(
+            user.error_message,
+            "RTS/CTS already set. Now using XON/XOFF."
+        );
+        assert_eq!(com.flow, CPO_CONTROL_IXON);
+
+        // No live setting of the other kind: no advisory (C only writes it under
+        // the flow test).
+        let mut user = AsynUser::default();
+        let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_HWFLOW]));
+        let mut com = ComPortOptions::new();
+        com.set_option(&mut user, &mut server, "crtscts", "y")
+            .unwrap();
+        assert_eq!(user.error_message, "");
     }
 
     #[test]

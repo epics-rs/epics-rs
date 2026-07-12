@@ -59,6 +59,35 @@ pub struct AsynUser {
     /// Token for BlockProcess ownership. When a port is blocked, only requests
     /// with a matching block_token (or UnblockProcess) are dequeued.
     pub block_token: Option<u64>,
+    /// The port this user is connected to, and that port's trace config.
+    ///
+    /// C's `pasynUser` reaches the trace through its `userPvt → pport/pdevice`
+    /// linkage, which is what lets any layer holding the user call
+    /// `asynPrint`/`asynPrintIO` (`findTracePvt`, asynManager.c:3040-3060) —
+    /// including an *interpose*, which has no other handle on the port
+    /// (`asynInterposeCom.c:237-239` prints the unstuffed read at
+    /// `ASYN_TRACEIO_FILTER`). [`crate::port_actor::PortActor`] is the single
+    /// owner of this linkage: it stamps every request's user with the port it is
+    /// about to run on. A user built outside a port (a unit test, a driver's own
+    /// internal user) carries `None` and its prints are silent.
+    pub trace: Option<UserTrace>,
+    /// C's `pasynUser->errorMessage`: the message slot every asyn layer writes
+    /// its diagnostic into.
+    ///
+    /// Most of them accompany a failing `asynStatus` and are the `Err` arm here.
+    /// This slot exists for the ones that do *not* fail the call —
+    /// `asynInterposeCom.c:571-573` and `:587-589` leave "XON/XOFF already set.
+    /// Now using RTS/CTS." (and its mirror) in the buffer and carry on — which a
+    /// `Result` has no way to carry.
+    pub error_message: String,
+}
+
+/// The port context an [`AsynUser`] carries so the layers it passes through can
+/// trace — C's `pasynUser → pport/pdevice`. Cheap to clone: two `Arc`s.
+#[derive(Clone)]
+pub struct UserTrace {
+    pub manager: std::sync::Arc<crate::trace::TraceManager>,
+    pub port: std::sync::Arc<str>,
 }
 
 impl Default for AsynUser {
@@ -73,6 +102,8 @@ impl Default for AsynUser {
             alarm_severity: 0,
             user_data: None,
             block_token: None,
+            trace: None,
+            error_message: String::new(),
         }
     }
 }
@@ -93,6 +124,18 @@ impl AsynUser {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// C `asynPrintIO(pasynUser, mask, data, len, format, …)`
+    /// (asynManager.c:3080-3099): print the buffer through the trace config of
+    /// the port/device this user is connected to, if that mask is enabled there.
+    /// Silent for a user with no port.
+    pub fn print_io(&self, mask: crate::trace::TraceMask, data: &[u8], label: &str) {
+        let Some(t) = &self.trace else { return };
+        if t.manager.is_enabled(&t.port, mask) {
+            t.manager
+                .output_device_io(&t.port, Some(self.addr), mask, data, label);
+        }
     }
 }
 

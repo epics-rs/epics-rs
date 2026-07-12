@@ -1314,6 +1314,35 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether this record type's support reads SIML through the `recGbl`
+    /// simulation helpers (`recGblGetSimm`/`recGblInitSimm`, and therefore
+    /// `recGblSaveSimm`/`recGblCheckSimm`) rather than a bare `dbGetLink`.
+    ///
+    /// ONE C fact, two consequences — which is why it is one predicate:
+    ///
+    /// - **The SCAN swap.** The helpers take `&prec->sscn` and `&prec->oldsimm`,
+    ///   so only a record that declares those fields can call them, and only
+    ///   such a record swaps SCAN with SSCN on a SIMM transition
+    ///   (`recGblCheckSimm`, `recGbl.c:427-437`).
+    /// - **The alarm on a failed SIML read.** `recGblGetSimm` reads SIML with
+    ///   `dbTryGetLink` — which does NOT call `setLinkAlarm` — and then raises
+    ///   the alarm itself, by writing `nsta` DIRECTLY:
+    ///   `if (status && !pcommon->nsev) pcommon->nsta = LINK_ALARM;`
+    ///   (`recGbl.c:454`). SEVR is left alone. A record reading SIML with a
+    ///   plain `dbGetLink` (`busyRecord.c:399`, `swaitRecord.c:402`) instead
+    ///   gets `setLinkAlarm` (`dbLink.c:319-323`) →
+    ///   `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`, a full severity raise.
+    ///
+    /// The 21 base records that declare SSCN answer `true`; `busy` and `swait`
+    /// carry SIMM/SIML/SIOL but neither SSCN nor OLDSIMM. Records with no
+    /// simulation block answer `false` trivially.
+    ///
+    /// The default consults [`record_type_has_sscn`](crate::server::recgbl::simm::record_type_has_sscn),
+    /// which is enumerated from the C dbd files, so no record has to restate it.
+    fn uses_recgbl_simm_helpers(&self) -> bool {
+        crate::server::recgbl::simm::record_type_has_sscn(self.record_type())
+    }
+
     /// The record joined (`true`) or left (`false`) the `SCAN="I/O Intr"` list.
     ///
     /// C parity: `dbScan.c::scanAdd` calls the record's device support
@@ -1501,6 +1530,31 @@ pub trait Record: Send + Sync + 'static {
     /// [`Self::set_simulation_active`] pushed before `process()`.
     fn simulation_substitutes_input_stage(&self) -> bool {
         false
+    }
+
+    /// Whether the record's C `switch (prec->simm)` carries a `default:` arm
+    /// that REFUSES a SIMM value outside its own menu:
+    ///
+    /// ```c
+    /// default:
+    ///     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
+    ///     status = -1;
+    /// ```
+    ///
+    /// Every record in the framework has it — all 21 base records
+    /// (`longinRecord.c:436-438` and its twins; `aaiRecord.c:381-384` writes the
+    /// same arm as an `else if (prec->simm != menuYesNoNO)`) and `busy`
+    /// (`busyRecord.c:409-413`, the `else` of its YES test).
+    ///
+    /// `swait` is the sole exception: `swaitRecord.c:407-421` is a plain
+    /// `if (pwait->simm == menuYesNoNO) { … } else { /* SIMULATION MODE */ … }`,
+    /// so every non-NO value — legal or not — simulates. It overrides to
+    /// `false`.
+    ///
+    /// Consumed by [`resolve_sim_mode`](crate::server::recgbl::simm::resolve_sim_mode),
+    /// the single owner of the SIMM dispatch.
+    fn rejects_illegal_sim_mode(&self) -> bool {
+        true
     }
 
     /// This cycle's simulation state, pushed by the framework before

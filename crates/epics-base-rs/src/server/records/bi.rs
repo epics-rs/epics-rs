@@ -26,6 +26,10 @@ pub struct BiRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    // SVAL is `DBF_ULONG` (biRecord.dbd.pod:263-265) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
+    // &prec->sval)`, biRecord.c:289) before publishing `val = sval`.
+    pub sval: u32,
     pub sims: i16,
     pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
@@ -54,6 +58,7 @@ impl Default for BiRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,

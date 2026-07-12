@@ -32,6 +32,17 @@ pub struct CommonFields {
     // SSCN's dbd default is the out-of-range sentinel 65535 ("use SCAN"),
     // unrepresentable in `ScanType`; see [`SimModeScan`].
     pub sscn: SimModeScan,
+    /// `OLDSIMM` (`DBF_MENU menu(menuSimm)`, `special(SPC_NOMOD)`) — the
+    /// PREVIOUS simulation mode, the latch C's `recGblSaveSimm`
+    /// (`recGbl.c:421-425`) writes and `recGblCheckSimm` (`recGbl.c:427-437`)
+    /// compares against to detect a SIMM transition and swap SCAN with SSCN.
+    ///
+    /// C declares it per record (in each of the 21 dbd files that carry SSCN);
+    /// this port keeps it next to `sscn` in the common fields, for the same
+    /// reason `sscn` lives here — it is framework state, written by exactly one
+    /// owner (`PvDatabase::rec_gbl_save_simm`) and read by exactly one
+    /// (`rec_gbl_check_simm`). Read-only to clients (SPC_NOMOD).
+    pub oldsimm: i16,
     /// `PINI` is `DBF_MENU`/`menu(menuPini)` — a six-choice lifecycle
     /// selector, not a flag. See [`PiniMode`].
     pub pini: PiniMode,
@@ -133,6 +144,9 @@ impl Default for CommonFields {
             // C dbd `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`:
             // the default is the out-of-range "use SCAN" sentinel, not Passive.
             sscn: SimModeScan::DoNotUse,
+            // C dbd `field(OLDSIMM,DBF_MENU){ menu(menuSimm) }` — no
+            // `initial()`, so it starts at index 0 (`menuSimmNO`).
+            oldsimm: 0,
             pini: PiniMode::No,
             tpro: false,
             bkpt: 0,

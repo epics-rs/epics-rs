@@ -72,16 +72,17 @@ pub struct WaveformRecord {
     /// altogether.
     pub malm: i32,
     /// Simulation block (waveform/aai/aao only; subArray has no sim block).
-    /// SIMM is DBF_MENU menu(menuYesNo), SIMS is menu(menuAlarmSevr),
-    /// OLDSIMM is menu(menuSimm) special(SPC_NOMOD); SIML/SIOL the sim
-    /// in/out links. waveformRecord.dbd.pod:475-507, aaiRecord.dbd.pod:374-402,
-    /// aaoRecord.dbd.pod:407-435. SSCN (menuScan) is served by the common
-    /// path (common.sscn).
+    /// SIMM is DBF_MENU menu(menuYesNo), SIMS is menu(menuAlarmSevr);
+    /// SIML/SIOL the sim in/out links. waveformRecord.dbd.pod:475-507,
+    /// aaiRecord.dbd.pod:374-402, aaoRecord.dbd.pod:407-435. SSCN (menuScan)
+    /// and OLDSIMM (menuSimm, SPC_NOMOD) are served by the common path
+    /// (`CommonFields::sscn` / `CommonFields::oldsimm`) — framework state
+    /// written only by the simulation-mode owner
+    /// (`RecordInstance::rec_gbl_save_simm` / `rec_gbl_check_simm`).
     pub simm: i16,
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    pub oldsimm: i16,
     /// aao-only: output mode select, `menu(menuOmsl)` (0=supervisory,
     /// 1=closed_loop). When `closed_loop`, aao sources VAL from `DOL`
     /// before each write (C `aaoRecord.c::fetchValue`, 357). waveform/aai/
@@ -179,7 +180,6 @@ impl Default for WaveformRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
-            oldsimm: 0,
             // C `aaoRecord.dbd.pod` declares OMSL `menu(menuOmsl)` and DOL
             // `DBF_INLINK` with no `initial(...)`, so both default to the
             // zero value: OMSL=supervisory (no DOL fetch), DOL=constant/empty.
@@ -1177,7 +1177,6 @@ impl Record for WaveformRecord {
             "SIML" if self.has_sim_block() => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" if self.has_sim_block() => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" if self.has_sim_block() => Some(EpicsValue::Short(self.sims)),
-            "OLDSIMM" if self.has_sim_block() => Some(EpicsValue::Short(self.oldsimm)),
             // aao-only output-mode / desired-output link (aaoRecord.dbd.pod).
             "OMSL" if matches!(self.kind, ArrayKind::Aao) => Some(EpicsValue::Short(self.omsl)),
             "DOL" if matches!(self.kind, ArrayKind::Aao) => {
@@ -1407,8 +1406,6 @@ impl Record for WaveformRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
             },
-            // OLDSIMM is special(SPC_NOMOD) — saved copy, not client-writable.
-            "OLDSIMM" if self.has_sim_block() => Err(CaError::ReadOnlyField(name.to_string())),
             // aao-only OMSL (menu, resolved to a Short index by the central
             // shared_menu_choices("OMSL") path) and DOL link string. The
             // field_list AAO set carries these so apply_fields routes
@@ -2127,12 +2124,14 @@ mod array_kind_tests {
             );
             rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
             assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
-            // OLDSIMM is special(SPC_NOMOD) — readable, not writable.
+            // OLDSIMM is special(SPC_NOMOD) and lives in the common fields
+            // (the simulation owner's latch) — readable, not client-writable.
+            let mut inst = RecordInstance::new("WF:OLDSIMM".into(), rec);
             assert!(matches!(
-                rec.put_field("OLDSIMM", EpicsValue::Short(1)),
+                inst.put_common_field("OLDSIMM", EpicsValue::Short(1)),
                 Err(crate::error::CaError::ReadOnlyField(_))
             ));
-            assert_eq!(rec.get_field("OLDSIMM"), Some(EpicsValue::Short(0)));
+            assert_eq!(inst.get_common_field("OLDSIMM"), Some(EpicsValue::Short(0)));
         }
 
         // SIMM snapshot carries the NO/YES menuYesNo labels on these records.
@@ -2152,7 +2151,6 @@ mod array_kind_tests {
         // subArray has no sim block — those names must not resolve.
         let sub = WaveformRecord::with_kind(ArrayKind::SubArray);
         assert_eq!(sub.get_field("SIMM"), None);
-        assert_eq!(sub.get_field("OLDSIMM"), None);
         let mut sub_mut = WaveformRecord::with_kind(ArrayKind::SubArray);
         assert!(matches!(
             sub_mut.put_field("SIMM", EpicsValue::Short(1)),

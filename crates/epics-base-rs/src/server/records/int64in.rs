@@ -48,6 +48,11 @@ pub struct Int64inRecord {
     pub siml: String,
     #[field(type = "String")]
     pub siol: String,
+    // SVAL is `DBF_INT64` (int64inRecord.dbd.pod:270-272) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_INT64,
+    // &prec->sval)`, int64inRecord.c:409) before publishing `val = sval`.
+    #[field(type = "Int64")]
+    pub sval: i64,
     #[field(type = "Short")]
     pub sims: i16,
 }
@@ -70,6 +75,7 @@ impl Default for Int64inRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
         }
     }

@@ -1168,33 +1168,31 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
 /// `recGblRecordError` and **demoted to `menuScanPassive`** — it never joins the
 /// I/O Intr scan list, and `caget REC.SCAN` reads back `Passive`.
 ///
-/// The demotion goes through `update_scan_index` so the record also leaves the
-/// `IoIntr` scan bucket that `scanpiol` and `dbla` report from.
+/// The demotion is a SCAN transition like any other, so it goes through
+/// `RecordInstance::set_scan` — the single owner, which drives the C
+/// `scanDelete` → `get_ioint_info(1)` hook and hands back the delta for
+/// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
+/// `scanpiol` and `dbla` report from.
 async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
     let Some(rec_arc) = db.get_record(name).await else {
         return;
     };
-    let phas = {
+    let result = {
         let mut inst = rec_arc.write().await;
         if inst.common.scan != record::ScanType::IoIntr {
             return;
         }
-        inst.common.scan = record::ScanType::Passive;
-        // This assignment bypasses `put_common_field`, so the C
-        // `scanDelete` → `get_ioint_info(1)` hook has to be driven here too —
-        // otherwise a record demoted at `iocInit` would keep whatever interrupt
-        // registration it made while it believed it was on the I/O Intr list.
-        inst.record.set_io_intr_scan(false);
-        inst.common.phas
+        inst.set_scan(record::ScanType::Passive)
     };
-    db.update_scan_index(
-        name,
-        record::ScanType::IoIntr,
-        record::ScanType::Passive,
+    if let record::CommonFieldPutResult::ScanChanged {
+        old_scan,
+        new_scan,
         phas,
-        phas,
-    )
-    .await;
+    } = result
+    {
+        db.update_scan_index(name, old_scan, new_scan, phas, phas)
+            .await;
+    }
     eprintln!("scanAdd: I/O Intr not valid ({reason}), {name} set to Passive");
 }
 

@@ -76,6 +76,10 @@ pub struct MbbiRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    // SVAL is `DBF_ULONG` (mbbiRecord.dbd.pod:299-301) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
+    // &prec->sval)`, mbbiRecord.c:390) before publishing `val = sval`.
+    pub sval: u32,
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
@@ -153,6 +157,7 @@ impl Default for MbbiRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,

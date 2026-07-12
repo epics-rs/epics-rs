@@ -559,8 +559,18 @@ mod parity_tests {
         // Other 2-arg array ops.
         assert!(acalc_compile("NSMOO(AA,2)").is_ok());
         assert!(acalc_compile("NDERIV(AA,5)").is_ok());
-        assert!(acalc_compile("FITPOLY(AA,BB)").is_ok());
-        assert!(acalc_compile("FITQ(AA,BB)").is_ok());
+        assert!(acalc_compile("FITMPOLY(AA,BB)").is_ok());
+        // FITPOLY is a UNARY_OPERATOR (`aCalcPostfix.c:142`) — one operand, and a
+        // second is a COMPILE error, not an extra argument. Compiled C:
+        // `FITPOLY(AA,BB)` is "Incomplete expression, operand missing", the same
+        // rejection `SUM(AA,BB)` gets.
+        assert!(acalc_compile("FITPOLY(AA)").is_ok());
+        assert!(acalc_compile("FITPOLY(AA,BB)").is_err());
+        // FITQ/FITMQ are VARARG_OPERATORs (`:140-141`): their trailing arguments
+        // name the scalar arguments the coefficients are stored into.
+        assert!(acalc_compile("FITQ(AA)").is_ok());
+        assert!(acalc_compile("FITQ(AA,C,D,E)").is_ok());
+        assert!(acalc_compile("FITMQ(AA,BB,C,D,E)").is_ok());
 
         // And acalc end-to-end still produces an array result. CAT cannot grow the
         // `arraySize` buffer: with AA carrying no window its `lastEl` is already

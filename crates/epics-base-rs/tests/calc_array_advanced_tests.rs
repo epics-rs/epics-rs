@@ -146,48 +146,9 @@ fn test_arndm() {
     }
 }
 
-// --- FitPoly ---
-
-#[test]
-fn test_fitpoly_quadratic() {
-    let x: Vec<f64> = (0..11).map(|i| i as f64).collect();
-    let y: Vec<f64> = x.iter().map(|&xi| 1.0 + 2.0 * xi + 3.0 * xi * xi).collect();
-    let mut inputs = ArrayInputs::new(11);
-    inputs.arrays[0] = x; // AA = x
-    inputs.arrays[1] = y; // BB = y
-    let result = eval_arr_with("FITPOLY(AA, BB)", &mut inputs);
-    match result {
-        ArrayStackValue::Array(cell) => {
-            let coeffs = cell.buf();
-            assert_eq!(coeffs.len(), 3);
-            assert!((coeffs[0] - 1.0).abs() < 1e-4, "a0={}", coeffs[0]);
-            assert!((coeffs[1] - 2.0).abs() < 1e-4, "a1={}", coeffs[1]);
-            assert!((coeffs[2] - 3.0).abs() < 1e-4, "a2={}", coeffs[2]);
-        }
-        _ => panic!("expected Array"),
-    }
-}
-
-// --- FitQ ---
-
-#[test]
-fn test_fitq() {
-    let x: Vec<f64> = (0..11).map(|i| i as f64).collect();
-    let y: Vec<f64> = x.iter().map(|&xi| 1.0 + 2.0 * xi + 3.0 * xi * xi).collect();
-    let mut inputs = ArrayInputs::new(11);
-    inputs.arrays[0] = x;
-    inputs.arrays[1] = y;
-    let result = eval_arr_with("FITQ(AA, BB)", &mut inputs);
-    match result {
-        ArrayStackValue::Array(cell) => {
-            let coeffs = cell.buf();
-            assert_eq!(coeffs.len(), 4);
-            assert!((coeffs[0] - 1.0).abs() < 1e-4, "a0={}", coeffs[0]);
-            assert!((coeffs[3]).abs() < 1e-10, "rss={}", coeffs[3]); // perfect fit -> rss ~ 0
-        }
-        _ => panic!("expected Array"),
-    }
-}
+// The FIT family lives in `calc_array_fit.rs` (R10-8) — the two tests that were
+// here asserted an x/y pair of operands and a coefficient ARRAY as the result,
+// neither of which aCalc has.
 
 // --- Subrange ---
 

@@ -1297,10 +1297,16 @@ impl Record for ScalerRecord {
     /// change — so an archiver `camonitor SCALER:Sn` receives an event on
     /// every idle scan, even when the count is unchanged. A counting or
     /// WAITING cycle does not call `monitor()`, so the sweep is empty
-    /// there. The framework's snapshot builder posts each returned field
-    /// with `DBE_LOG` only (a field that also changed this cycle is
-    /// already delivered with `DBE_VALUE|DBE_LOG`, so it is not
-    /// double-posted). Slicing the static `SN_FIELD_NAMES` to `nch`
+    /// there.
+    ///
+    /// The sweep is INDEPENDENT of the change post, and the
+    /// count-completion cycle is where that matters: the done-interrupt
+    /// sets `ss = IDLE` (`:367`), `updateCounts()` posts each changed `Sn`
+    /// with `DBE_VALUE` (`:582`), and `monitor()` then posts the SAME `Sn`
+    /// with `DBE_LOG` (`:771`). Both events fire on that one cycle, so the
+    /// framework emits the sweep post in addition to the change post — the
+    /// final counts are the only `Sn` value a `DBE_LOG`-only archiver ever
+    /// cares about. Slicing the static `SN_FIELD_NAMES` to `nch`
     /// avoids a per-call allocation; the unsafe `'static` re-view matches
     /// `field_list` above (the `LazyLock` lives for the program and
     /// `active_channels() <= SN_FIELD_NAMES.len()`).

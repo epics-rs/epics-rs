@@ -965,23 +965,27 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Distinct from [`Self::force_posted_fields`], which posts with
     /// `DBE_VALUE | DBE_LOG`: these post with `DBE_LOG` alone, so only a
-    /// `DBE_LOG` (archiver) subscriber receives the unchanged-value
-    /// event. The LOG sweep lands only for fields that did not change
-    /// this cycle (the change/no-change branches are disjoint), so a
-    /// field that also changed is not double-posted. For a field that is
-    /// ALSO a [`Self::value_only_change_fields`] member the change post
-    /// carries `DBE_VALUE` only, so this idle sweep is the sole source of
-    /// its `DBE_LOG` events — which is exactly C's split (counting cycle
-    /// → `DBE_VALUE`, idle `monitor()` → `DBE_LOG`); the scaler never
-    /// changes `Sn` on an idle cycle, so the two never collide.
+    /// `DBE_LOG` (archiver) subscriber receives the event.
     ///
-    /// C `scalerRecord.c` `monitor()` (scalerRecord.c:770-787) runs on
-    /// every IDLE process and posts each active channel `S1..Snch` with a
-    /// literal `DBE_LOG`. The scaler returns those channel field names
-    /// here ONLY while idle (it reads its own `ss` state), so an archiver
-    /// `camonitor SCALER:Sn` gets an event every idle scan even when the
-    /// count is unchanged — while a counting cycle (which does not run C
-    /// `monitor()`) returns empty.
+    /// The sweep is an INDEPENDENT post, NOT an alternative to the
+    /// change-detected post. C's `db_post_events` calls compose: on the
+    /// scaler's count-completion cycle `updateCounts()` posts each changed
+    /// `Sn` with `DBE_VALUE` (scalerRecord.c:582) and then `monitor()` —
+    /// reached because the done-interrupt set `ss = IDLE` (`:367`,
+    /// `:510`) — posts the SAME `Sn` again with a literal `DBE_LOG`
+    /// (`:757-773`). Two events, one field, one cycle. So the framework
+    /// emits the sweep post in addition to whatever the change detection
+    /// produced; gating it on "did not change" would silently drop the
+    /// `DBE_LOG` half on exactly the cycle that carries the final counts.
+    ///
+    /// For a field that is ALSO a [`Self::value_only_change_fields`]
+    /// member (scaler `Sn`) the change post carries `DBE_VALUE` only, so
+    /// this sweep is the sole source of its `DBE_LOG` events, matching C.
+    ///
+    /// The record returns the names ONLY on the cycles whose C `monitor()`
+    /// runs — the scaler reads its own `ss` state and returns `S1..Snch`
+    /// while idle, empty while counting (a counting cycle never reaches C
+    /// `monitor()`).
     ///
     /// Default: empty — most record types have no LOG-only sweep.
     fn log_swept_fields(&self) -> &'static [&'static str] {

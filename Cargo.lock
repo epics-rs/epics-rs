@@ -1011,6 +1011,7 @@ name = "epics-bridge-rs"
 version = "0.23.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",

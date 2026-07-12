@@ -22,8 +22,18 @@ pub struct PortManager {
 
 impl PortManager {
     pub fn new() -> Self {
+        Self::with_trace_manager(Arc::new(TraceManager::new()))
+    }
+
+    /// Build a manager that shares an existing [`TraceManager`].
+    ///
+    /// The `asynSetTrace*` iocsh commands mutate the trace manager reached
+    /// through [`Self::trace_manager`]. An IOC whose ports and drivers were
+    /// registered against a trace manager it built itself (e.g. `AdIoc`) must
+    /// hand that same instance here, or those commands would mutate a trace
+    /// manager nothing reads and silently do nothing.
+    pub fn with_trace_manager(trace: Arc<TraceManager>) -> Self {
         let exceptions = Arc::new(ExceptionManager::new());
-        let trace = Arc::new(TraceManager::new());
         // Wire the exception sink so `setTrace*` setters announce
         // `asynExceptionTrace*` to subscribers, matching C
         // asynManager.c:2790/2832/2874/2923/2956.
@@ -89,19 +99,33 @@ impl PortManager {
             return Err(AsynError::PortAlreadyRegistered(name));
         }
         ph.insert(name.clone(), handle.port_handle().clone());
-        rh.insert(name, handle.clone());
+        rh.insert(name.clone(), handle.clone());
         drop(rh);
         drop(ph);
+
+        // Publish into the process port registry, the single place every
+        // consumer resolves a name through: the asyn iocsh commands, asynRecord
+        // device support, and the asyn device-support adapter. A port that only
+        // this manager knows about would be invisible to all three.
+        crate::asyn_record::register_port(&name, handle.port_handle().clone(), self.trace.clone());
 
         Ok(handle)
     }
 
     /// Find a port handle by name.
+    ///
+    /// Ports this manager registered itself resolve from its own map; any other
+    /// name falls through to the process port registry, which is where the
+    /// `drvAsyn*PortConfigure` iocsh commands, areaDetector plugins and
+    /// hand-registered driver ports publish. Without that fall-through the asyn
+    /// iocsh commands could not act on a port created from st.cmd — they would
+    /// report "port not found" for a port the IOC had just built.
     pub fn find_port_handle(&self, name: &str) -> AsynResult<PortHandle> {
-        self.port_handles
-            .lock()
-            .get(name)
-            .cloned()
+        if let Some(handle) = self.port_handles.lock().get(name).cloned() {
+            return Ok(handle);
+        }
+        crate::asyn_record::get_port(name)
+            .map(|entry| entry.handle)
             .ok_or_else(|| AsynError::PortNotFound(name.to_string()))
     }
 
@@ -147,10 +171,15 @@ impl PortManager {
     pub fn unregister_port(&self, name: &str) {
         let mut ph = self.port_handles.lock();
         let mut rh = self.runtime_handles.lock();
-        ph.remove(name);
+        let was_ours = ph.remove(name).is_some();
         let runtime = rh.remove(name);
         drop(rh);
         drop(ph);
+        // A port this manager published must not outlive it in the registry,
+        // or the name would keep resolving to a handle whose runtime is gone.
+        if was_ours {
+            crate::asyn_record::unregister_port(name);
+        }
         if let Some(runtime_handle) = runtime {
             runtime_handle.shutdown();
         }
@@ -166,15 +195,23 @@ impl PortManager {
         &self.trace
     }
 
-    /// Names of every currently-registered port, in arbitrary order.
+    /// Names of every port this IOC can act on, in sorted order.
     ///
     /// C parity: `asynManager::report` walks the global port list to
     /// emit one entry per port — iocsh `asynReport` exposes the same
     /// view (no port argument = all ports). Used by
     /// [`crate::iocsh::register_asyn_commands`] for the no-port-arg
     /// case; also useful for diagnostic tooling.
+    ///
+    /// This is the union of the ports this manager registered and the ports
+    /// published to the process registry (`drvAsyn*PortConfigure`, plugin and
+    /// driver ports), so `asynReport` sees the whole IOC rather than only the
+    /// ports that happened to be created through this manager.
     pub fn list_port_names(&self) -> Vec<String> {
-        self.port_handles.lock().keys().cloned().collect()
+        let mut names: std::collections::BTreeSet<String> =
+            self.port_handles.lock().keys().cloned().collect();
+        names.extend(crate::asyn_record::port_names());
+        names.into_iter().collect()
     }
 }
 

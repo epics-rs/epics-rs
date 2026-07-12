@@ -1,7 +1,7 @@
 pub mod registry;
 pub use registry::{
-    PortEntry, PortRegistry, asyn_record_factory, get_port, register_asyn_record_type,
-    register_port,
+    PortEntry, PortRegistry, asyn_record_factory, get_port, port_names, register_asyn_record_type,
+    register_port, unregister_port,
 };
 
 use std::collections::HashMap;

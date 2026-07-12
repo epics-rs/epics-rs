@@ -1243,8 +1243,9 @@ fn test_autocount_start_no_periodic_update_when_rat1_too_low() {
 }
 
 /// BUG 4 regression — C scalerRecord.c:623-624 fires the COUTP link on every
-/// CNT write inside `special()`. The CNT-triggered `process()` must emit a
-/// `WriteDbLink` to COUTP.
+/// CNT write, from inside `special()` itself. `special()` hands the put to the
+/// framework through `take_special_actions()` (R10-64), which executes it inside
+/// the put; `process()` must NOT carry it.
 #[test]
 fn test_special_cnt_fires_coutp() {
     use epics_base_rs::server::record::ProcessAction;
@@ -1254,35 +1255,38 @@ fn test_special_cnt_fires_coutp() {
     rec.tp = 1.0;
     rec.init_record(1).unwrap();
 
-    // CNT write — special() must request the COUTP fire.
+    // CNT write — special() must queue the COUTP put.
     rec.cnt = 1;
     rec.special("CNT", true).unwrap();
-
-    // The CNT-triggered process() must emit a WriteDbLink to COUTP.
-    let outcome = rec.process().unwrap();
+    let special = rec.take_special_actions();
     assert!(
-        outcome.actions.iter().any(|a| matches!(
+        special.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "COUTP",
                 ..
             }
         )),
-        "special(CNT) must cause process() to fire the COUTP link (C:623-624)"
+        "special(CNT) must make the COUTP put itself (C:623-624)"
     );
 
-    // The pending flag is consumed — a subsequent process() with no new CNT
-    // write must not re-fire COUTP.
-    let outcome2 = rec.process().unwrap();
+    // The queue is consumed by the drain — the CNT-triggered process() does not
+    // repeat it, and neither does any later cycle.
+    let outcome = rec.process().unwrap();
     assert!(
-        !outcome2.actions.iter().any(|a| matches!(
+        !outcome.actions.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "COUTP",
                 ..
             }
         )),
-        "COUTP fire must not repeat without a new CNT write"
+        "C's process() makes no COUTP put on a start (:463 is guarded by \
+         justFinishedUserCount)"
+    );
+    assert!(
+        rec.take_special_actions().is_empty(),
+        "COUTP must not re-fire without a new CNT write"
     );
 }
 
@@ -1301,9 +1305,8 @@ fn test_special_cnt_stop_fires_coutp() {
     // still fires COUTP.
     rec.cnt = 0;
     rec.special("CNT", true).unwrap();
-    let outcome = rec.process().unwrap();
     assert!(
-        outcome.actions.iter().any(|a| matches!(
+        rec.take_special_actions().iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "COUTP",

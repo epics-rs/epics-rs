@@ -29,6 +29,28 @@ fn check_put_disabled(
     Ok(())
 }
 
+/// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
+/// of the link writes it queued ([`Record::take_special_actions`]).
+///
+/// The pairing is the point: `special()` and its drain are ONE step, so a queued
+/// action cannot survive the put that queued it — not even when `special()`
+/// returns an error (C's `dbPut` `goto done`), because the drain happens before
+/// the status is propagated. The caller executes `out` once the record lock is
+/// released, ahead of the put-driven process cycle, which is where C runs it
+/// (inside `dbPut`, before `dbPutField`'s `dbProcess`).
+///
+/// Every `dbPut` path in this module goes through here; nothing else may call
+/// `Record::special(field, true)`.
+fn special_after_put(
+    instance: &mut crate::server::record::RecordInstance,
+    field: &str,
+    out: &mut Vec<crate::server::record::ProcessAction>,
+) -> CaResult<()> {
+    let status = instance.record.special(field, true);
+    out.extend(instance.record.take_special_actions());
+    status
+}
+
 /// Coerce a write `value` to a record field's stored `target` type.
 ///
 /// A `DBR_STRING` write to a `DBF_MENU` field belongs to ONE converter — C
@@ -296,6 +318,10 @@ impl PvDatabase {
             // epics-base faac1df1.
             let prev_value = instance.record.get_field(&field);
 
+            // Link writes the record's `special()` makes itself (C runs them
+            // inside `dbPut`); executed below, once the record lock is released.
+            let mut special_actions = Vec::new();
+
             // put_pv is C EPICS dbPut: write value + special/on_put.
             // Does NOT post monitor events (use put_pv_and_post for that).
             // Does NOT clear UDF or trigger processing.
@@ -317,7 +343,7 @@ impl PvDatabase {
                             // `pp(TRUE)` process. `calcRecord::special` uses
                             // that to refuse an uncompilable CALC with
                             // S_db_badField, so the status must not be dropped.
-                            instance.record.special(&field, true)?;
+                            special_after_put(&mut instance, &field, &mut special_actions)?;
                             CommonFieldPutResult::NoChange
                         }
                         Err(CaError::FieldNotFound(_)) => {
@@ -332,6 +358,11 @@ impl PvDatabase {
             // field's value actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
+            // The record lock must be down before the scan-index update and
+            // before the `special()` link writes below, which re-enter the
+            // database (they can process their target).
+            drop(instance);
+
             // Update scan index if SCAN or PHAS changed
             match common_result {
                 CommonFieldPutResult::ScanChanged {
@@ -339,7 +370,6 @@ impl PvDatabase {
                     new_scan,
                     phas,
                 } => {
-                    drop(instance);
                     self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas)
                         .await;
                 }
@@ -348,12 +378,18 @@ impl PvDatabase {
                     old_phas,
                     new_phas,
                 } => {
-                    drop(instance);
                     self.update_scan_index(&canonical_base, s, s, old_phas, new_phas)
                         .await;
                 }
                 CommonFieldPutResult::NoChange => {}
             }
+
+            // C `dbPut` runs `dbPutSpecial(paddr, 1)` to completion — the
+            // `dbPutLink` calls a `special()` makes included — before it returns
+            // to `dbPutField`. This is the last statement of the `dbPut`
+            // analogue, so it is that point.
+            self.run_special_actions(&canonical_base, &rec, special_actions)
+                .await;
 
             // mirror the CA-write path's ASG-field notifier so
             // restore scripts / autosave / admin tools that go via
@@ -520,6 +556,10 @@ impl PvDatabase {
                 None
             };
 
+            // Link writes the record's `special()` makes itself (C runs them
+            // inside `dbPut`); executed below, once the record lock is released.
+            let mut special_actions = Vec::new();
+
             // Write value + special/on_put
             match request {
                 // C `dbAccess.c:1370-1372` — accept, write nothing, alarm. UDF
@@ -534,7 +574,7 @@ impl PvDatabase {
                             // `dbPut` (dbAccess.c:1399-1405) — before the UDF
                             // clear and the monitor post below, both of which
                             // `goto done` skips on a non-zero status.
-                            instance.record.special(&field, true)?;
+                            special_after_put(&mut instance, &field, &mut special_actions)?;
                             // Clear UDF/UDF_ALARM on primary field write
                             if field == instance.record.primary_field() {
                                 instance.common.udf = false;
@@ -602,6 +642,13 @@ impl PvDatabase {
                 }
             }
 
+            // The `special()` link writes re-enter the database, so the record
+            // lock goes down first. C makes them inside `dbPut`, before it
+            // returns to its caller.
+            drop(instance);
+            self.run_special_actions(&canonical_base, &rec, special_actions)
+                .await;
+
             // same SPC_AS parity as `put_pv` / `put_pv_no_process`
             // / the CA-write path — a gateway mirroring `.ASG` via
             // `put_pv_and_post` must still trigger per-client
@@ -614,6 +661,33 @@ impl PvDatabase {
         }
 
         Err(CaError::ChannelNotFound(name.to_string()))
+    }
+
+    /// Execute the link writes a record's `special()` queued
+    /// ([`Record::take_special_actions`](crate::server::record::Record::take_special_actions)).
+    ///
+    /// The single consumer: every `dbPut` path in this module calls it once, at
+    /// the end of the put and before any `pp(TRUE)` process cycle, which is
+    /// where C runs them (`dbPut` → `dbPutSpecial(paddr, 1)` → `dbPutLink`,
+    /// with `dbProcess` still ahead in `dbPutField`). The put is the root of the
+    /// chain these writes start, so they get a fresh visited set, exactly like a
+    /// client put entering `process_record_with_links`.
+    ///
+    /// Must be called with no record lock held: a `WriteDbLink` can process its
+    /// target, which re-enters the database.
+    async fn run_special_actions(
+        &self,
+        record_name: &str,
+        rec: &std::sync::Arc<crate::runtime::sync::RwLock<crate::server::record::RecordInstance>>,
+        actions: Vec<crate::server::record::ProcessAction>,
+    ) {
+        if actions.is_empty() {
+            return;
+        }
+        let mut visited = HashSet::new();
+        // A `WriteDbLink` here can land back in a `dbPut` (its target's), which
+        // is the function that called us: the async cycle needs one boxed edge.
+        Box::pin(self.execute_process_actions(record_name, rec, actions, &mut visited, 0)).await;
     }
 
     /// CA client's unified entry point for record field put.
@@ -914,6 +988,12 @@ impl PvDatabase {
         // Normal field put (write lock) — C `dbPut`, which does NOT touch
         // `putf`: the marker is raised only where C raises it, at the
         // put-driven process decision (`put_driven_process`).
+        //
+        // Link writes the record's `special()` makes itself. C runs them inside
+        // `dbPut`, so they land BEFORE the `pp(TRUE)` process below — a record
+        // wired to scaler `.COUTP` is processed with the scaler not yet armed
+        // (scalerRecord.c:623-624, before the `:637` REQSTART).
+        let mut special_actions = Vec::new();
         let common_result = {
             let mut instance = rec.write().await;
 
@@ -969,7 +1049,7 @@ impl PvDatabase {
                             // and the field's monitor post, and `dbPutField`
                             // skips the process. Propagating the error here
                             // reproduces all three.
-                            instance.record.special(&field, true)?;
+                            special_after_put(&mut instance, &field, &mut special_actions)?;
                             // C `dbAccess.c::dbPut:1410-1411` clears
                             // `precord->udf = FALSE` synchronously when the
                             // put target is the record-type's primary value
@@ -1119,6 +1199,12 @@ impl PvDatabase {
             crate::server::access_security::notify_asg_field_changed();
         }
         // record lock released
+
+        // C `dbPutField` reaches `dbProcess` only after `dbPut` — and therefore
+        // after `dbPutSpecial(paddr, 1)` and every `dbPutLink` it made — has run
+        // to completion. Execute them here, ahead of the `pp(TRUE)` process.
+        self.run_special_actions(record_name, &rec, std::mem::take(&mut special_actions))
+            .await;
 
         // Update scan index if SCAN or PHAS changed
         match common_result {

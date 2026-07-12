@@ -139,15 +139,16 @@ pub struct ScalerRecord {
     /// Carries C's `special()` COUTP put — and only that one.
     ///
     /// C `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)` inside
-    /// `special()` itself, before the CNT-triggered `scanOnce()`. `special()`
-    /// here cannot emit `ProcessAction`s, so it raises this flag and the
-    /// CNT-triggered `process()` emits that put at the head of the cycle and
-    /// clears it.
+    /// `special()` itself, so the link is written — and its target processed —
+    /// while the scaler is still IDLE, before `:637` sets REQSTART and before
+    /// the CNT-triggered process cycle arms the count. The framework drains this
+    /// through [`Record::take_special_actions`] at the end of the put and
+    /// executes it there, which is that point.
     ///
     /// It is NOT the record's "should COUTP fire" state: C's other COUTP put
-    /// (`:463`, on the finish edge) is independent and is emitted on its own, so
-    /// a user stop writes the link twice. Never merge the two.
-    coutp_pending: bool,
+    /// (`:463`, on the finish edge) is independent, is emitted by `process()` on
+    /// its own, and both fire on a user stop. Never merge the two.
+    special_actions: Vec<ProcessAction>,
 
     /// The `db_post_events` calls C's `special()` made on the put now in flight,
     /// handed to the framework by
@@ -235,7 +236,7 @@ impl Default for ScalerRecord {
             autocount_delay: 0.0,
             done_flag: false,
             reqstart_old_pr1: 0,
-            coutp_pending: false,
+            special_actions: Vec::new(),
             side_effect_posts: &[],
             fire_fwd_link: false,
         }
@@ -754,21 +755,6 @@ impl Record for ScalerRecord {
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
 
-        // C scalerRecord.c:623-624 — `special("CNT")` puts to COUTP itself, and
-        // it runs to completion on the CA put BEFORE the CNT-triggered process()
-        // starts. `special()` has no action channel here, so the put is deferred
-        // to the front of this cycle — the earliest point it can land, and ahead
-        // of every put process() makes below. It is C's FIRST COUTP put; the one
-        // at :463 (below, on the finish edge) is a second, independent put, not
-        // this one arriving late.
-        if self.coutp_pending {
-            self.coutp_pending = false;
-            actions.push(ProcessAction::WriteDbLink {
-                link_field: "COUTP",
-                value: EpicsValue::Short(self.cnt),
-            });
-        }
-
         // C scalerRecord.c:346 — dbPutNotify completions also force the
         // long autocount hold time. The port has no putNotify plumbing
         // yet, so this stays false; kept named for C-structure parity.
@@ -954,6 +940,15 @@ impl Record for ScalerRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
+    /// C's `special()` COUTP put (`scalerRecord.c:623-624`), handed to the
+    /// framework to execute where C executes it: inside the put, before the
+    /// CNT-triggered process cycle. The queue is filled by `special()` and
+    /// emptied here — the framework drains it on every put, so a put that queues
+    /// nothing hands back nothing.
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        std::mem::take(&mut self.special_actions)
+    }
+
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {
             // The framework runs this pre-pass on every put (field_io.rs:937),
@@ -973,10 +968,15 @@ impl Record for ScalerRecord {
                     return Ok(());
                 }
                 // C:623-624 — fire the COUTP link on every CNT write that
-                // passes the redundant-command guard. `special()` cannot
-                // emit actions; raise a flag the CNT-triggered `process()`
-                // turns into a `WriteDbLink`.
-                self.coutp_pending = true;
+                // passes the redundant-command guard. C makes this put from
+                // `special()` itself, i.e. inside `dbPut`: the target is written
+                // and processed with `us` still IDLE and the count not yet
+                // armed. The framework drains `take_special_actions()` at the
+                // end of the put and executes it there.
+                self.special_actions.push(ProcessAction::WriteDbLink {
+                    link_field: "COUTP",
+                    value: EpicsValue::Short(self.cnt),
+                });
                 // C:633-634 — `dly = pscal->dly; if (dly<0.0) dly = 0.0;`
                 let dly = self.dly.max(0.0);
                 // C:635 — `if (dly == 0.0 || pscal->cnt == 0)`: handle now.

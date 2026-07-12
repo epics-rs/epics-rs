@@ -3734,7 +3734,7 @@ impl PvDatabase {
     ///   (bypasses read-only checks via put_field_internal)
     /// - WriteDbLink: writes a value to a linked PV
     /// - ReprocessAfter: schedules a delayed re-process via tokio::spawn
-    async fn execute_process_actions(
+    pub(super) async fn execute_process_actions(
         &self,
         record_name: &str,
         rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,

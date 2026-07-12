@@ -1196,6 +1196,36 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The link writes a C `special()` performs *itself*, inside `dbPut`.
+    ///
+    /// `special()` takes the record alone — it has no database handle — so a
+    /// record whose C `special()` calls `dbPutLink` cannot make that write from
+    /// `special()`. It queues the write here instead, and the put owner
+    /// (`field_io`'s `dbPut` paths) drains the queue immediately after
+    /// `special(field, true)` returns and executes the actions BEFORE the put's
+    /// `pp(TRUE)` process cycle. That is C's order: `dbPutField` → `dbPut` →
+    /// `dbPutSpecial(paddr, 1)` — which runs the `dbPutLink` to completion,
+    /// target processing included — → `dbProcess`.
+    ///
+    /// The scaler is the case this exists for: `scalerRecord.c:623-624` puts
+    /// `CNT` to `COUTP` inside `special()`, so a record wired to `.COUTP` is
+    /// processed while the scaler is still IDLE, before the count is armed. The
+    /// port deferred that write to the head of the CNT-triggered process cycle,
+    /// where the target saw an already-COUNTING scaler.
+    ///
+    /// This is neither the record's "should the link fire" state nor part of the
+    /// process cycle's action list: a `special()` put and a `process()` put to
+    /// the same link (scaler `COUTP` again, `:463`) are independent writes.
+    ///
+    /// The drain is unconditional — it runs even when `special()` returned an
+    /// error — so a queued action can never survive the put that queued it and
+    /// fire against a later, unrelated put.
+    ///
+    /// Default: none (a `special()` that writes no link).
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        Vec::new()
+    }
+
     /// Other fields whose monitors must be posted because a put to
     /// `put_field` changed them as a side effect, without driving a full
     /// process cycle.

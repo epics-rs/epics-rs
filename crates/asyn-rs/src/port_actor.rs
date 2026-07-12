@@ -623,9 +623,9 @@ impl PortActor {
                 // layer onto the port's octet interface at any time after
                 // configure. The actor owns the driver, so the install lands
                 // between transfers instead of racing one.
-                self.driver
-                    .base_mut()
-                    .push_octet_interpose(Box::new(crate::interpose::echo::EchoInterpose::new()));
+                self.driver.base_mut().install_octet_interpose(Box::new(
+                    crate::interpose::echo::EchoInterpose::new(),
+                ));
                 Ok(RequestResult::write_ok())
             }
             RequestOp::PushDelayInterpose { delay } => {
@@ -633,7 +633,7 @@ impl PortActor {
                 // the per-character write delay onto the port's octet interface
                 // from the iocsh command (:221-234), after configure. Same
                 // actor-owned install point as the echo layer above.
-                self.driver.base_mut().push_octet_interpose(Box::new(
+                self.driver.base_mut().install_octet_interpose(Box::new(
                     crate::interpose::delay::DelayInterpose::new(*delay),
                 ));
                 Ok(RequestResult::write_ok())

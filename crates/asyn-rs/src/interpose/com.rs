@@ -1034,7 +1034,7 @@ mod tests {
     #[test]
     fn write_doubles_iac_and_reports_the_unstuffed_count() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[]);
         let mut user = AsynUser::default();
 
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn write_without_iac_is_verbatim_passthrough() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[]);
         let mut user = AsynUser::default();
 
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn write_stuffs_every_iac_in_a_run() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[]);
         let mut user = AsynUser::default();
 
@@ -1095,7 +1095,7 @@ mod tests {
             }
         }
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = ShortWrite;
         let mut user = AsynUser::default();
 
@@ -1112,7 +1112,7 @@ mod tests {
     #[test]
     fn read_unstuffs_a_doubled_iac_inside_the_buffer() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[b'A', IAC, IAC, b'B']);
         let user = AsynUser::default();
         let mut buf = [0u8; 8];
@@ -1128,7 +1128,7 @@ mod tests {
     #[test]
     fn read_pulls_the_partner_from_the_device_when_iac_lands_last() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         // A 2-byte buffer takes [A, IAC]; the partner IAC is still on the wire.
         let mut base = FakeServer::new(&[b'A', IAC, IAC]);
         let user = AsynUser::default();
@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn read_handles_a_lone_iac_as_the_only_byte() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[IAC, IAC]);
         let user = AsynUser::default();
         let mut buf = [0u8; 1];
@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn read_unstuffs_consecutive_escapes() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[IAC, IAC, IAC, IAC, b'Z']);
         let user = AsynUser::default();
         let mut buf = [0u8; 8];
@@ -1175,7 +1175,7 @@ mod tests {
     #[test]
     fn read_rejects_an_unescaped_iac() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[b'A', IAC, WILL, 0]);
         let user = AsynUser::default();
         let mut buf = [0u8; 8];
@@ -1191,7 +1191,7 @@ mod tests {
     #[test]
     fn unstuffing_clears_the_count_eom_reason() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(&[b'A', IAC, IAC, b'B']);
         let user = AsynUser::default();
         let mut buf = [0u8; 4];
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn read_without_iac_keeps_the_base_eom_reason() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(ComInterpose::new()));
+        stack.install(Box::new(ComInterpose::new()));
         let mut base = FakeServer::new(b"ABCD");
         let user = AsynUser::default();
         let mut buf = [0u8; 4];

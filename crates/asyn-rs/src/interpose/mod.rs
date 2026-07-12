@@ -134,9 +134,22 @@ impl OctetInterposeStack {
         Self { layers: Vec::new() }
     }
 
-    /// Push a layer onto the top of the stack (outermost = called first).
-    pub fn push(&mut self, layer: Box<dyn OctetInterpose>) {
-        self.layers.push(layer);
+    /// Install an interpose layer — C `interposeInterface`
+    /// (asynManager.c:2190-2220).
+    ///
+    /// The new layer *becomes* the port's octet interface (C overwrites the
+    /// interpose node's `pasynInterface` with it, :2217) and the interface it
+    /// displaced — the previously installed interpose, or the driver's own
+    /// interface when there was none — becomes the one it delegates down to
+    /// (C hands it back as `pPrev`, :2209-2215).
+    ///
+    /// So the **last layer installed is the outermost**: a caller enters it first,
+    /// and it calls down through the earlier layers to the driver. An
+    /// `asynInterposeEcho` installed from iocsh after the driver's configure-time
+    /// EOS layer therefore sits *above* EOS, exactly as in C. Dispatch walks index
+    /// 0 first, so the new layer goes to the front.
+    pub fn install(&mut self, layer: Box<dyn OctetInterpose>) {
+        self.layers.insert(0, layer);
     }
 
     /// Number of interpose layers.
@@ -386,7 +399,7 @@ mod tests {
     #[test]
     fn test_single_passthrough_layer() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(PassthroughInterpose));
+        stack.install(Box::new(PassthroughInterpose));
 
         let mut base = MockBase::new(b"world");
         let user = AsynUser::default();
@@ -400,7 +413,7 @@ mod tests {
     #[test]
     fn test_uppercase_interpose_write() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(UppercaseInterpose));
+        stack.install(Box::new(UppercaseInterpose));
 
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
@@ -415,14 +428,14 @@ mod tests {
     #[test]
     fn test_multi_layer_chain() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(PassthroughInterpose));
-        stack.push(Box::new(UppercaseInterpose));
+        stack.install(Box::new(PassthroughInterpose));
+        stack.install(Box::new(UppercaseInterpose));
         assert_eq!(stack.len(), 2);
 
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
 
-        // PassthroughInterpose -> UppercaseInterpose -> base
+        // UppercaseInterpose (installed last, so outermost) -> Passthrough -> base
         stack.dispatch_write(&mut user, b"test", &mut base).unwrap();
         assert_eq!(&base.written, b"TEST");
     }
@@ -430,12 +443,64 @@ mod tests {
     #[test]
     fn test_flush_dispatch() {
         let mut stack = OctetInterposeStack::new();
-        stack.push(Box::new(PassthroughInterpose));
+        stack.install(Box::new(PassthroughInterpose));
 
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
 
         stack.dispatch_flush(&mut user, &mut base).unwrap();
         assert!(base.flushed);
+    }
+
+    /// R9-56. C `interposeInterface` (asynManager.c:2209-2217) makes each newly
+    /// installed layer the port's octet interface and hands it the one it
+    /// displaced to call down into, so the *last* install is the *outermost*.
+    /// This stack appended and dispatched from index 0, so a later install landed
+    /// *innermost* — the exact inverse. Under the inverted rule an
+    /// `asynInterposeEcho`/`asynInterposeDelay` installed from iocsh sank *below*
+    /// the EOS layer the driver installs at configure time, when C puts it above.
+    #[test]
+    fn the_last_layer_installed_is_the_outermost() {
+        /// Marks the payload with its own tag on the way down, so the base's
+        /// buffer records the order the layers ran in.
+        struct Tag(u8);
+        impl OctetInterpose for Tag {
+            fn read(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<OctetReadResult> {
+                next.read(user, buf)
+            }
+            fn write(
+                &mut self,
+                user: &mut AsynUser,
+                data: &[u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<usize> {
+                let mut tagged = vec![self.0];
+                tagged.extend_from_slice(data);
+                next.write(user, &tagged)
+            }
+            fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
+                next.flush(user)
+            }
+        }
+
+        let mut stack = OctetInterposeStack::new();
+        stack.install(Box::new(Tag(b'A')));
+        stack.install(Box::new(Tag(b'B')));
+        stack.install(Box::new(Tag(b'C')));
+
+        let mut base = MockBase::new(b"");
+        let mut user = AsynUser::default();
+        stack.dispatch_write(&mut user, b"x", &mut base).unwrap();
+
+        // C's chain is C -> B -> A -> driver: the caller enters the last-installed
+        // layer first, and each calls down into the one it displaced, so the
+        // driver sees the tags in install order. The inverted stack ran A first
+        // and delivered b"CBAx".
+        assert_eq!(&base.written, b"ABCx");
     }
 }

@@ -563,21 +563,19 @@ pub struct DrvAsynIPPort {
 struct ComState {
     /// The `asynOctet` half — IAC stuffing.
     ///
-    /// Deliberately **not** pushed onto [`PortDriverBase::interpose_octet`]. C
+    /// Deliberately **not** installed onto [`PortDriverBase::interpose_octet`]. C
     /// installs COM at :1061 and the EOS interpose at :1065, and its
     /// `interposeInterface` makes each *later* install the *outer* one — so C's
     /// chain is `EOS → COM → driver`, with COM directly above the IP driver's
-    /// octet interface and below every other interpose. This stack's `push`
-    /// appends, and dispatch runs index 0 first, so a later push lands *inner*:
-    /// pushing COM at construction would have put it *outside* the EOS layer that
-    /// `build_configured_ip_port` pushes afterwards, leaving EOS to scan
-    /// still-stuffed bytes and hunt terminators in a stream COM had not yet
-    /// unescaped.
+    /// octet interface and below every other interpose.
     ///
-    /// Making it the base link instead (see [`DrvAsynIPPort::with_base_link`])
-    /// puts it beneath every stack layer *by construction*, so no push order can
-    /// get it wrong — rather than pinning the ordering with a convention that the
-    /// next person to push a layer has to know about.
+    /// Making it the base link (see [`DrvAsynIPPort::with_base_link`]) puts it
+    /// beneath every stack layer *by construction*, so no install order can get it
+    /// wrong — rather than pinning the ordering with a convention the next person
+    /// to install a layer has to know about. (The stack now follows C's rule too —
+    /// [`crate::interpose::OctetInterposeStack::install`] — so COM installed first
+    /// would land innermost anyway; the base link keeps the invariant whatever
+    /// else is installed later.)
     octet: ComInterpose,
     /// The `asynOption` half — the negotiation and the serial settings it
     /// carries. Driven against the raw link, since C's `setOption`/`getOption`
@@ -986,8 +984,8 @@ impl DrvAsynIPPort {
     }
 
     /// Push an interpose layer onto the octet I/O stack.
-    pub fn push_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
-        self.base.push_octet_interpose(layer);
+    pub fn install_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
+        self.base.install_octet_interpose(layer);
     }
 
     fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
@@ -2095,7 +2093,7 @@ mod tests {
             input_eos: vec![b'\r', b'\n'],
             output_eos: vec![],
         });
-        drv.push_interpose(Box::new(eos));
+        drv.install_interpose(Box::new(eos));
 
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
@@ -2131,7 +2129,7 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));
@@ -2173,7 +2171,7 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));
@@ -3111,7 +3109,7 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));

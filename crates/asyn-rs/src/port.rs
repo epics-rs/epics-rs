@@ -780,8 +780,8 @@ impl PortDriverBase {
     /// **Concurrency**: requires `&mut self`, which means the caller must hold
     /// the port lock (`Arc<Mutex<dyn PortDriver>>`). This ensures
     /// interpose modifications are serialized with I/O dispatch.
-    pub fn push_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
-        self.interpose_octet.push(layer);
+    pub fn install_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
+        self.interpose_octet.install(layer);
     }
 
     /// Flush changed parameters as interrupt notifications.
@@ -1988,7 +1988,7 @@ mod tests {
             let mut guard = port.lock();
             guard
                 .base_mut()
-                .push_octet_interpose(Box::new(NoopInterpose));
+                .install_octet_interpose(Box::new(NoopInterpose));
             assert_eq!(guard.base().interpose_octet.len(), 1);
         }
     }
@@ -2026,7 +2026,7 @@ mod tests {
 
         let mut drv = TestDriver::new();
         drv.base_mut()
-            .push_octet_interpose(Box::new(EosInterpose::default()));
+            .install_octet_interpose(Box::new(EosInterpose::default()));
 
         // Set IEOS through the driver trait: caches in base AND must reach
         // the interpose.
@@ -2109,7 +2109,7 @@ mod tests {
 
         let resets = Arc::new(AtomicUsize::new(0));
         let mut base = PortDriverBase::new("reset_test", 1, PortFlags::default());
-        base.push_octet_interpose(Box::new(CountingInterpose(resets.clone())));
+        base.install_octet_interpose(Box::new(CountingInterpose(resets.clone())));
 
         // Port starts connected. Disconnect edge → reset (C exceptionDisconnect).
         assert!(base.set_connected(false));

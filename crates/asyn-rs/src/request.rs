@@ -269,7 +269,7 @@ pub enum RequestOp {
     /// (`asynInterposeEcho.c:165-190`), the iocsh command a startup script
     /// runs *after* the port is configured.
     ///
-    /// It is a request rather than a direct `push_interpose` because the actor
+    /// It is a request rather than a direct `install_interpose` because the actor
     /// owns the driver once the port is registered — the same reason
     /// `SetOption` / `SetInputEos` are requests. Installing from the shell
     /// thread would race every in-flight transfer.

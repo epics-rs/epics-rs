@@ -152,7 +152,7 @@ impl DrvAsynFtdiPort {
         // (empty terminator until setInputEos/OEOS), suppressed by
         // noProcessEos.
         if !no_process_eos {
-            base.push_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         }
         Ok(Self {
             base,

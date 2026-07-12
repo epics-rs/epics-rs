@@ -588,14 +588,14 @@ impl DrvAsynSerialPort {
             driver.base.auto_connect = false;
         }
         if !no_process_eos {
-            driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+            driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         }
         Ok(driver)
     }
 
     /// Push an interpose layer onto the octet I/O stack.
-    pub fn push_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
-        self.base.push_octet_interpose(layer);
+    pub fn install_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
+        self.base.install_octet_interpose(layer);
     }
 
     /// Send a serial line BREAK condition (RS-232 BREAK), mirroring
@@ -2119,7 +2119,7 @@ mod tests {
             input_eos: vec![b'\r', b'\n'],
             output_eos: vec![],
         });
-        drv.push_interpose(Box::new(eos));
+        drv.install_interpose(Box::new(eos));
 
         let user = AsynUser::default();
         drv.connect(&user).unwrap();

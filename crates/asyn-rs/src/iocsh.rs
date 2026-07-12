@@ -759,7 +759,7 @@ pub(crate) fn build_configured_ip_port(
         driver.base_mut().auto_connect = false;
     }
     if !no_process_eos {
-        driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
     }
     Ok(driver)
 }

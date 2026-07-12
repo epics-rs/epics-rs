@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue, convert};
 use epics_pva_rs::server_native::source::RemoteLog;
 
 use super::monitor::BridgeMonitor;
@@ -243,12 +243,14 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
 ///
 /// pvxs resolves group atomicity with `pvRequest["record._options.atomic"]
 /// .as(atomic)` on both PUT and GET (`groupsource.cpp:203,480`), i.e.
-/// `Value::as<bool>`. Route through the shared [`scalar_as_bool`] owner so
-/// the coercion is identical to `record._options.block`: a bool, any
-/// signed/unsigned integer or real scalar maps by nonzero truthiness, and
-/// a string is accepted only as the exact tokens `"true"` / `"false"`.
-/// Numeric `0` / `1` / `UInt(1)` / `Double(1.0)` therefore override the
-/// group default instead of being silently ignored.
+/// `Value::as(bool&)`. Route through the shared
+/// [`epics_pva_rs::pvdata::convert::as_bool`] owner so the coercion is
+/// identical to `record._options.block` / `process` — and to the native
+/// server's `record._options.pipeline`: a bool, any signed/unsigned integer
+/// or real scalar maps by nonzero truthiness, and a string is accepted only
+/// as the exact tokens `"true"` / `"false"`. Numeric `0` / `1` / `UInt(1)` /
+/// `Double(1.0)` therefore override the group default instead of being
+/// silently ignored.
 pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
     let options = request
         .get_field("record")
@@ -261,10 +263,7 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
             _ => None,
         })?;
 
-    match options.get_field("atomic")? {
-        PvField::Scalar(sv) => scalar_as_bool(sv),
-        _ => None,
-    }
+    convert::as_bool(options.get_field("atomic")?).ok()
 }
 
 /// Map a present `record._options.process` field to a [`ProcessMode`],
@@ -279,11 +278,11 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 ///
 /// `True`/`False`/`Unset` map to Force/Inhibit/Passive here. The `as<bool>`
 /// coercion is the *same* one `record._options.atomic`/`block` use, so it
-/// routes through the shared [`scalar_as_bool`] owner rather than being
-/// re-derived: a bool, any signed/unsigned integer or real scalar maps by
-/// nonzero truthiness (`copyOutScalar` `bool(src)`, src/data.cpp:402-408),
-/// and a string is accepted only as the exact tokens `"true"`/`"false"` —
-/// no trim, case sensitive (src/data.cpp:459-461).
+/// routes through the shared [`epics_pva_rs::pvdata::convert::as_bool`] owner
+/// rather than being re-derived: a bool, any signed/unsigned integer or real
+/// scalar maps by nonzero truthiness (`copyOutScalar` `bool(src)`,
+/// src/data.cpp:402-408), and a string is accepted only as the exact tokens
+/// `"true"`/`"false"` — no trim, case sensitive (src/data.cpp:459-461).
 ///
 /// The third arm is what this function exists for: `"passive"` is a
 /// SUPPORTED spelling of the default and is silent, while a
@@ -293,15 +292,14 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 /// distinction, which is the only thing the client can act on: the PUT it
 /// asked to force will silently not process.
 fn process_mode_from_field(field: &PvField, log: &RemoteLog) -> ProcessMode {
-    if let PvField::Scalar(sv) = field {
-        match scalar_as_bool(sv) {
-            Some(true) => return ProcessMode::Force,
-            Some(false) => return ProcessMode::Inhibit,
-            // NoConvert — pvxs falls through to its `proc.as(s)` check.
-            None => {
-                if matches!(sv, ScalarValue::String(s) if s.as_str_lossy() == "passive") {
-                    return ProcessMode::Passive;
-                }
+    match convert::as_bool(field) {
+        Ok(true) => return ProcessMode::Force,
+        Ok(false) => return ProcessMode::Inhibit,
+        // NoConvert — pvxs falls through to its `proc.as(s)` check.
+        Err(_) => {
+            if matches!(field, PvField::Scalar(ScalarValue::String(s)) if s.as_str_lossy() == "passive")
+            {
+                return ProcessMode::Passive;
             }
         }
     }
@@ -353,41 +351,6 @@ fn render_option_value(field: &PvField) -> String {
     }
 }
 
-/// Coerce a pvRequest scalar to a bool exactly as pvxs `Value::as<bool>`
-/// does. `copyOutScalar` (`src/data.cpp:399-409`) converts a bool, any
-/// signed/unsigned integer (nonzero ⇒ true), or a real to bool; the
-/// string store (`src/data.cpp:459-462`) accepts only the exact tokens
-/// `"true"` / `"false"` (no trim, case-sensitive) and otherwise raises
-/// `NoConvert`. `None` mirrors that `NoConvert` outcome — the caller
-/// keeps its default, matching pvxs `as<bool>(fallback)` returning the
-/// fallback for an absent or unconvertible field.
-///
-/// [`process_mode_from_scalar`] shares this exact `as<bool>` coercion:
-/// pvxs `setForceProcessingFlag` (iocsource.cpp:436) calls the same
-/// `proc.as<bool>`, so the only difference is that it is a tri-state — a
-/// NoConvert outcome (this returning `None`) becomes the passive default
-/// there instead of the caller's bool fallback here.
-fn scalar_as_bool(sv: &ScalarValue) -> Option<bool> {
-    match sv {
-        ScalarValue::Boolean(b) => Some(*b),
-        ScalarValue::Byte(n) => Some(*n != 0),
-        ScalarValue::Short(n) => Some(*n != 0),
-        ScalarValue::Int(n) => Some(*n != 0),
-        ScalarValue::Long(n) => Some(*n != 0),
-        ScalarValue::UByte(n) => Some(*n != 0),
-        ScalarValue::UShort(n) => Some(*n != 0),
-        ScalarValue::UInt(n) => Some(*n != 0),
-        ScalarValue::ULong(n) => Some(*n != 0),
-        ScalarValue::Float(v) => Some(*v != 0.0),
-        ScalarValue::Double(v) => Some(*v != 0.0),
-        ScalarValue::String(s) => match s.as_str_lossy().as_ref() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
-    }
-}
-
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
@@ -435,10 +398,10 @@ impl PutOptions {
             // only `Boolean`, silently dropping the integer and string
             // forms a PVA client can legally send — so a `block=1` or
             // `block="true"` lost the put-notify completion barrier.
-            if let Some(PvField::Scalar(sv)) = opt_struct.get_field("block") {
-                if let Some(b) = scalar_as_bool(sv) {
-                    opts.block = b;
-                }
+            if let Some(field) = opt_struct.get_field("block")
+                && let Ok(b) = convert::as_bool(field)
+            {
+                opts.block = b;
             }
             // No point blocking if processing is inhibited
             // (singlesource.cpp:350-352: `doWait` is cleared whenever the

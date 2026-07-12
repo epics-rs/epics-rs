@@ -650,72 +650,42 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
     // options, accumulated alongside the effective options without
     // altering any negotiated value.
     let mut diagnostics: Vec<MonitorOptionDiag> = Vec::new();
-    // pvxs `servermon.cpp:523-540` parses `pipeline` via
-    // `Value::as(bool)` and `queueSize` via the analogous scalar
-    // conversion. A pvxs client using the typed builder form
-    // (`.record("pipeline", true).record("queueSize", N)`) sends a
-    // BOOL/INT, not the parsed-from-`record[pipeline=true]` STRING.
-    // Pre-fix Rust matched only the string form; the typed builder
-    // produced a pvRequest Rust decoded as non-pipelined, dropping
-    // flow control. Accept both shapes.
+    // pvxs `servermon.cpp:523-531` — `pipeline.as(v)` with `bool v`, i.e.
+    // `Value::as(bool&)`: ONE conversion ([`crate::pvdata::convert::as_bool`],
+    // the port's `copyOut`/`copyOutScalar` owner), not a type test. Bool,
+    // every signed/unsigned integer, AND both reals convert by C's
+    // `bool(src)` non-zero rule (`data.cpp:405`); a string converts only as
+    // the exact tokens `"true"`/`"false"` (`data.cpp:466-469`). Anything the
+    // conversion refuses — an unrecognized string, an array, a struct — is
+    // `NoConvert` → `as(v)` answers false → pvxs leaves `op->pipeline` at its
+    // `false` default and emits a `Level::Warn` logRemote (`:529`).
     //
-    // The effective `enabled` mapping below is unchanged from before this
-    // finding (every input maps to the same true/false it did): the only
-    // addition is a pvxs `Level::Warn` diagnostic for a PRESENT pipeline
-    // value pvxs's `pipeline.as(bool)` cannot parse (an unrecognized
-    // string or a non-scalar). pvxs leaves pipeline disabled in that case
-    // (`servermon.cpp:528-530`), which the unrecognized→`false` mapping
-    // already does, so the diagnostic is purely additive.
+    // The hand-rolled per-variant match this replaces diverged twice: it
+    // hardcoded Float/Double to `false` (a pvxs client sending
+    // `pipeline = Double(1.0)` ran the credit-windowed pipeline sub-protocol
+    // against pvxs and a plain monitor here — R10-31), and it accepted
+    // `"1"`/`"yes"`/`"0"`/`"no"` strings that pvxs's `as<bool>` refuses. The
+    // QSRV side already had this conversion right for
+    // `record._options.atomic`/`block`/`process`; both now share the one owner.
     let pipeline_field = opt_s
         .fields
         .iter()
         .find_map(|(k, v)| (k == "pipeline").then_some(v));
     let enabled = match pipeline_field {
         None => false,
-        Some(PvField::Scalar(ScalarValue::Boolean(b))) => *b,
-        Some(PvField::Scalar(ScalarValue::Byte(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::UByte(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::Short(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::UShort(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::Int(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::UInt(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::Long(i))) => *i != 0,
-        Some(PvField::Scalar(ScalarValue::ULong(i))) => *i != 0,
-        // Float/Double pipeline fell to the pre-fix `_ => None` →
-        // `false`; keep that exact effective value with no diagnostic
-        // (this is an effective-value choice, out of scope for the
-        // diagnostics finding — do not start warning here).
-        Some(PvField::Scalar(ScalarValue::Float(_)))
-        | Some(PvField::Scalar(ScalarValue::Double(_))) => false,
-        Some(PvField::Scalar(ScalarValue::String(s))) => {
-            match s.as_str_lossy().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
-                _ => {
-                    // PRESENT but unrecognized string: pvxs `as(bool)`
-                    // fails → Warn logRemote, pipeline left disabled.
-                    diagnostics.push(MonitorOptionDiag {
-                        level: MessageType::Warning,
-                        message: format!(
-                            "Unable to parse record._options.pipeline : {}",
-                            s.as_str_lossy()
-                        ),
-                    });
-                    false
-                }
+        Some(f) => match crate::pvdata::convert::as_bool(f) {
+            Ok(v) => v,
+            Err(_) => {
+                diagnostics.push(MonitorOptionDiag {
+                    level: MessageType::Warning,
+                    message: format!(
+                        "Unable to parse record._options.pipeline : {}",
+                        render_option_value(f)
+                    ),
+                });
+                false
             }
-        }
-        Some(other) => {
-            // PRESENT non-scalar: pvxs `as(bool)` fails → Warn, disabled.
-            diagnostics.push(MonitorOptionDiag {
-                level: MessageType::Warning,
-                message: format!(
-                    "Unable to parse record._options.pipeline : {}",
-                    render_option_value(other)
-                ),
-            });
-            false
-        }
+        },
     };
     // pvxs `servermon.cpp:533-540` distinguishes a PRESENT-but-invalid
     // `queueSize` from an ABSENT one: `if(auto queueSize = ...)` gates
@@ -8985,6 +8955,61 @@ mod tests {
         );
     }
 
+    /// R10-31: pvxs `pipeline.as(v)` routes a REAL through `copyOutScalar`
+    /// → `bool(src)` (`servermon.cpp:525`, `data.cpp:405`), so
+    /// `pipeline = Double(1.0)` enables the credit-windowed pipeline
+    /// sub-protocol. The port hardcoded Float/Double to `false`, serving a
+    /// plain monitor where pvxs serves a pipelined one — a different wire
+    /// flow-control shape, with any accompanying `ackAny` silently dropped.
+    #[test]
+    fn pva_r10_31_real_pipeline_converts_by_nonzero() {
+        for (v, want) in [
+            (ScalarValue::Double(1.0), true),
+            (ScalarValue::Double(0.5), true),
+            (ScalarValue::Double(0.0), false),
+            (ScalarValue::Float(1.0), true),
+            (ScalarValue::Float(0.0), false),
+        ] {
+            let req = make_pipeline_request(
+                PvField::Scalar(v.clone()),
+                PvField::Scalar(ScalarValue::Int(8)),
+            );
+            let opts = parsed_opts(&req);
+            assert_eq!(opts.enabled, want, "pipeline = {v:?} must convert as bool");
+            // A converted option draws NO diagnostic — pvxs `as(v)` succeeded.
+            assert!(
+                opts.diagnostics.is_empty(),
+                "a converted pipeline value must not warn: {:?}",
+                opts.diagnostics
+            );
+        }
+    }
+
+    /// R10-31 (same owner): pvxs `Value::as<bool>` accepts ONLY the exact
+    /// string tokens `"true"`/`"false"` (`data.cpp:466-469`). The port's
+    /// hand-rolled match also took `"1"`/`"yes"`/`"0"`/`"no"` and case-folded,
+    /// so `pipeline="1"` enabled a pipeline pvxs leaves DISABLED (with a Warn).
+    #[test]
+    fn pva_r10_31_unconvertible_pipeline_string_warns_and_disables() {
+        for s in ["1", "yes", "0", "no", "TRUE", "True"] {
+            let req = make_pipeline_request(
+                PvField::Scalar(ScalarValue::String(s.into())),
+                PvField::Scalar(ScalarValue::Int(8)),
+            );
+            let opts = parsed_opts(&req);
+            assert!(
+                !opts.enabled,
+                "pvxs as<bool> refuses {s:?}: pipeline stays disabled"
+            );
+            assert_eq!(
+                opts.diagnostics.len(),
+                1,
+                "an unconvertible pipeline value draws the servermon.cpp:529 Warn"
+            );
+            assert_eq!(opts.diagnostics[0].level, MessageType::Warning);
+        }
+    }
+
     #[test]
     fn pva_r20_pipeline_absent_queue_size_keeps_default_window() {
         // pvxs keeps the default `limit` (4) when queueSize is ABSENT;
@@ -9754,19 +9779,26 @@ mod tests {
     }
 
     #[test]
-    fn monitor_diag_recognized_false_tokens_do_not_warn() {
-        // Recognized false-ish tokens are intentional disables, NOT parse
-        // errors — no diagnostic (only genuinely unrecognized values warn).
-        for tok in ["false", "0", "no", "FALSE", "No"] {
-            let req = make_pipeline_request(
-                PvField::Scalar(ScalarValue::String(tok.into())),
-                PvField::Scalar(ScalarValue::Int(16)),
-            );
+    fn monitor_diag_converted_false_does_not_warn() {
+        // A CONVERTED false is an intentional disable, not a parse error —
+        // `as(bool)` succeeded, so pvxs emits no diagnostic. The convertible
+        // false-ish values are exactly the ones `Value::as<bool>` accepts:
+        // the string token `"false"` (and only that spelling — `"0"`/`"no"`/
+        // `"FALSE"` are NoConvert, covered by
+        // `pva_r10_31_unconvertible_pipeline_string_warns_and_disables`), plus
+        // any zero numeric or `Boolean(false)`.
+        for tok in [
+            PvField::Scalar(ScalarValue::String("false".into())),
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(0)),
+            PvField::Scalar(ScalarValue::Double(0.0)),
+        ] {
+            let req = make_pipeline_request(tok.clone(), PvField::Scalar(ScalarValue::Int(16)));
             let opts = parsed_opts(&req);
-            assert!(!opts.enabled, "{tok} → disabled");
+            assert!(!opts.enabled, "{tok:?} → disabled");
             assert!(
                 opts.diagnostics.is_empty(),
-                "{tok} is a recognized false token, no Warn"
+                "{tok:?} converts to false, no Warn"
             );
         }
     }

@@ -174,14 +174,10 @@ pub fn rec_gbl_set_sevr_msg(
 /// Matches EPICS recGblResetAlarms. Call at end of process cycle.
 ///
 /// Mirrors epics-base PR #566 — the alarm-message string (`amsg`) is
-/// transferred from `namsg` alongside the severity / status, and
-/// `namsg` is cleared for the next cycle. Records that did not call
-/// `rec_gbl_set_sevr_msg` this cycle end up with an empty `amsg`.
+/// transferred from `namsg` alongside the severity / status.
 pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let prev_sevr = common.sevr;
     let prev_stat = common.stat;
-    let prev_amsg = std::mem::take(&mut common.amsg);
-    let prev_acks = common.acks;
 
     // C parity (recGbl.c:188-189): clamp pending severity at INVALID_ALARM.
     // Records that erroneously call `recGblSetSevr` with a severity > 3
@@ -193,18 +189,40 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
         common.nsev = AlarmSeverity::Invalid;
     }
 
+    // C parity (recGbl.c:191-195): the amsg copy AND the namsg clear are BOTH
+    // inside `if (strcmp(namsg, amsg) != 0)`:
+    //
+    // ```c
+    // if (strcmp(pdbc->namsg, pdbc->amsg) != 0) {
+    //     strcpy(pdbc->amsg, pdbc->namsg);
+    //     pdbc->namsg[0] = '\0';
+    //     stat_mask = DBE_ALARM;
+    // }
+    // ```
+    //
+    // So an UNCHANGED message survives in `namsg` — C does not clear it — and
+    // the next cycle that raises no alarm at all finds `namsg == amsg` again
+    // and leaves `amsg` alone. AMSG therefore keeps the last alarm text after
+    // the alarm clears. An unconditional take (the pre-fix shape) empties
+    // `namsg` on the repeat cycle, so the clearing cycle transfers `""` and
+    // publishes an empty AMSG — divergent for any message alarm that persists
+    // for two or more cycles, which is every broken-then-recovered link
+    // (`dbLink.c:320` raises `recGblSetSevrMsg(LINK_ALARM, INVALID, "field %s")`
+    // on every failing read).
+    let amsg_changed = common.namsg != common.amsg;
+    if amsg_changed {
+        common.amsg = std::mem::take(&mut common.namsg);
+    }
+
     // Transfer new alarm state
     common.sevr = common.nsev;
     common.stat = common.nsta;
-    common.amsg = std::mem::take(&mut common.namsg);
 
     // Reset for next cycle
     common.nsev = AlarmSeverity::NoAlarm;
     common.nsta = alarm_status::NO_ALARM;
-    // common.namsg already cleared by `mem::take` above.
 
     let alarm_changed = common.sevr != prev_sevr || common.stat != prev_stat;
-    let amsg_changed = common.amsg != prev_amsg;
 
     // C parity (recGbl.c:209-217): when an alarm-class field changed
     // this cycle, update the alarm-acknowledge severity `acks`. If
@@ -225,8 +243,6 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
             }
         }
     }
-
-    let _ = prev_acks; // reserved for future post-event integration
 
     AlarmResetResult {
         alarm_changed,
@@ -464,6 +480,72 @@ mod tests {
         let result = rec_gbl_reset_alarms(&mut common);
         assert!(result.amsg_changed);
         assert_eq!(common.amsg, "");
+    }
+
+    /// R13-61. C `recGbl.c:191-195` gates the `amsg = namsg` copy AND the
+    /// `namsg[0] = '\0'` clear on `strcmp(namsg, amsg) != 0`, so a message that
+    /// repeats across cycles is never cleared out of `namsg` — and AMSG then
+    /// keeps the last alarm text after the alarm itself clears.
+    ///
+    /// Compiled C (`recGblResetAlarms` + `recGblSetSevrVMsg`, verbatim bodies
+    /// over a minimal `dbCommon`), the calcout fail/fail/succeed scenario:
+    ///
+    /// ```text
+    /// cycle1 (calc fails):      sevr=3 stat=12 amsg='calcPerform' namsg=''
+    /// cycle2 (fails, same msg): sevr=3 stat=12 amsg='calcPerform' namsg='calcPerform'
+    /// cycle3 (succeeds):        sevr=0 stat=0  amsg='calcPerform' namsg='calcPerform'
+    /// ```
+    ///
+    /// Cycle 3 still POSTS amsg (sevr moved, so `stat_mask` carries DBE_ALARM)
+    /// — it just carries the stale text, not `""`.
+    #[test]
+    fn reset_alarms_keeps_amsg_when_the_same_message_repeats() {
+        let mut common = CommonFields::default();
+
+        // cycle 1: calcPerform fails.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::CALC_ALARM,
+            AlarmSeverity::Invalid,
+            "calcPerform",
+        );
+        let c1 = rec_gbl_reset_alarms(&mut common);
+        assert!(c1.amsg_changed);
+        assert_eq!(common.sevr, AlarmSeverity::Invalid);
+        assert_eq!(common.amsg, "calcPerform");
+        assert_eq!(common.namsg, "");
+
+        // cycle 2: still fails, SAME message. C leaves `namsg` alone.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::CALC_ALARM,
+            AlarmSeverity::Invalid,
+            "calcPerform",
+        );
+        let c2 = rec_gbl_reset_alarms(&mut common);
+        assert!(!c2.alarm_changed);
+        assert!(
+            !c2.amsg_changed,
+            "an unchanged message is not an AMSG event"
+        );
+        assert_eq!(common.amsg, "calcPerform");
+        assert_eq!(
+            common.namsg, "calcPerform",
+            "C does NOT clear namsg when it equals amsg (recGbl.c:191-195)"
+        );
+
+        // cycle 3: the calc succeeds — no `recGblSetSevr*` call at all.
+        let c3 = rec_gbl_reset_alarms(&mut common);
+        assert!(c3.alarm_changed, "severity dropped INVALID -> NO_ALARM");
+        assert!(
+            !c3.amsg_changed,
+            "namsg still equals amsg, so recGblResetAlarms does not touch it"
+        );
+        assert_eq!(common.sevr, AlarmSeverity::NoAlarm);
+        assert_eq!(
+            common.amsg, "calcPerform",
+            "AMSG keeps the last alarm text after the alarm clears"
+        );
     }
 
     #[test]

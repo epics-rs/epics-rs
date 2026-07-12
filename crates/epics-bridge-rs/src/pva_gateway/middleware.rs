@@ -2918,9 +2918,8 @@ mod tests {
             let layered = AuditLayer::new(NoopAudit).layer(read_only);
 
             let opts = MonitorOptions {
-                pipeline: false,
-                queue_size: None,
                 server_filter: true,
+                ..MonitorOptions::default()
             };
             if raw {
                 let _ = layered

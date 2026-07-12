@@ -79,8 +79,22 @@ pub struct PvaServerConfig {
     /// Idle timeout — server closes connections that haven't received
     /// anything in this window. Applied even if `op_timeout` is longer.
     pub idle_timeout: Duration,
-    /// Per-monitor outbound queue depth. When exceeded, the back-pressure
-    /// policy kicks in (squash to last value).
+    /// The queue limit each MONITOR operation STARTS with, before the
+    /// client's `record._options.queueSize` gets a say. When the queue is
+    /// full the back-pressure policy kicks in (squash into the last
+    /// value).
+    ///
+    /// This is pvxs `MonitorOp::limit` (`servermon.cpp:66`, `limit=4u`)
+    /// made configurable — a per-operation initializer, NOT a server-wide
+    /// capacity. pvxs has no server knob here, so
+    /// [`crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT`] (4)
+    /// is the default; a deployment may raise it, which is the same
+    /// deviation as building pvxs with a different `limit` initializer.
+    /// A valid client `queueSize >= 2` always wins over it
+    /// (`servermon.cpp:533-543`), pipelined or not, and the resolved
+    /// value is the single per-op depth: the squash threshold, the base
+    /// of the `ackAny` arithmetic, and the reported queue limit
+    /// (`MonitorOptions::queue_size`).
     pub monitor_queue_depth: usize,
     /// Require TLS — refuse plaintext sessions (anti-downgrade). Parsed
     /// from `disable_plaintext=true` in `EPICS_PVAS_TLS_OPTIONS` /
@@ -251,7 +265,8 @@ pub struct PvaServerConfig {
     pub enable_ipv6_udp: bool,
     /// Per-monitor "high" watermark — emit a `tracing::warn!` when an
     /// outbound monitor queue grows past this many items. Default:
-    /// `monitor_queue_depth * 3 / 4`. Mirrors pvxs
+    /// `monitor_queue_depth * 3 / 4` (3, for the pvxs per-op default
+    /// depth of 4). Mirrors pvxs
     /// `MonitorControlOp::setWatermarks` `high` argument; high-mark
     /// callbacks (`onHighMark`) aren't surfaced yet — the watermark
     /// drives diagnostics only.
@@ -279,6 +294,18 @@ pub struct PvaServerConfig {
 }
 
 impl PvaServerConfig {
+    /// [`Self::monitor_queue_depth`] as the `u32` the MONITOR INIT
+    /// negotiation works in — the value a fresh `MonitorOp::limit` starts
+    /// at. Saturating (a `usize` above `u32::MAX` is not a wire-legal
+    /// queueSize) and floored at 1, so the negotiated limit a monitor ends
+    /// up with is never 0 and the squash comparison always admits a first
+    /// event.
+    pub fn monitor_queue_limit(&self) -> u32 {
+        u32::try_from(self.monitor_queue_depth)
+            .unwrap_or(u32::MAX)
+            .max(1)
+    }
+
     /// True when `peer` matches an entry in `ignore_addrs`. Port 0 in
     /// the entry is a wildcard. O(n) over the list; n is expected to
     /// be small (single-digit) in practice.
@@ -311,7 +338,7 @@ impl Default for PvaServerConfig {
             max_channels_per_connection: 1024,
             max_ops_per_channel: 64,
             idle_timeout: Duration::from_secs(45),
-            monitor_queue_depth: 64,
+            monitor_queue_depth: super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize,
             disable_plaintext: false,
             tls: None,
             access_gate_override: None,
@@ -328,7 +355,7 @@ impl Default for PvaServerConfig {
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
             enable_ipv6_udp: false,
-            monitor_high_watermark: 48, // 64 * 3 / 4 default
+            monitor_high_watermark: (super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize) * 3 / 4,
             monitor_low_watermark: 0,
             auth_complete: None,
             send_timeout: Duration::from_secs(5),

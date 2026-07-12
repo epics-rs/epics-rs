@@ -1459,12 +1459,13 @@ impl super::source::ChannelSource for SharedSource {
         Output = Option<super::source::SubscriptionSeed<super::source::MonitorUpdate>>,
     > + Send {
         let _ = ctx;
-        // pvxs `op->limit = qSize` (servermon.cpp:533-543): the client's
-        // `record._options.queueSize` sizes the source-side accrual buffer, so
-        // a STOP->START or INIT->START window holds up to `queueSize` distinct
-        // posts, not just the latest. Falls back to the pvxs default
-        // of 4 (servermon.cpp:66) when the client requests no queueSize.
-        let queue_limit = opts.queue_size.map(|n| (n as usize).max(1)).unwrap_or(4);
+        // pvxs `op->limit` (servermon.cpp:66,533-543): the negotiated per-op
+        // limit — the server's default unless the client's
+        // `record._options.queueSize` replaced it — sizes the source-side
+        // accrual buffer, so a STOP->START or INIT->START window holds up to
+        // `limit` distinct posts, not just the latest. The limit arrives
+        // already resolved (never 0), so there is no second default here.
+        let queue_limit = (opts.queue_size as usize).max(1);
         let pv = if checked.allows_read() {
             self.pvs.lock().get(checked.pv_name()).cloned()
         } else {

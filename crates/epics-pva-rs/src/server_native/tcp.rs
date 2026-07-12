@@ -484,48 +484,6 @@ fn monitor_filter_chain_json(req: &PvField) -> Option<String> {
     }
 }
 
-/// epics-base PR `70735383350b` parity: extract
-/// `record._options.autoExec` from a decoded pvRequest. Returns
-/// `Some(false)` only when the field is explicitly set to "false"
-/// (case-insensitive); `Some(true)` for "true"; `None` when the
-/// option is absent (caller defaults to true / immediate execute).
-fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
-    use crate::pvdata::ScalarValue;
-    let root = match req? {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let record = root
-        .fields
-        .iter()
-        .find_map(|(k, v)| (k == "record").then_some(v))?;
-    let record_s = match record {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let options = record_s
-        .fields
-        .iter()
-        .find_map(|(k, v)| (k == "_options").then_some(v))?;
-    let opt_s = match options {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let raw = opt_s.fields.iter().find_map(|(k, v)| {
-        (k == "autoExec").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => {
-                Some(s.as_str_lossy().trim().to_ascii_lowercase())
-            }
-            _ => None,
-        })
-    })?;
-    match raw.as_str() {
-        "true" | "yes" | "1" => Some(true),
-        "false" | "no" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 /// Consume the optional u32 `nack` (initial pipeline window) that a
 /// pvxs client appends to a MONITOR INIT body when it sets the
 /// pipeline bit (pvxs `servermon.cpp:494-495` / `clientmon.cpp:341-342`).
@@ -1253,15 +1211,6 @@ struct OpState {
     /// the event cause the iteration to continue without sending.
     /// Empty chain (the default) is a no-op.
     monitor_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
-    /// `record._options.autoExec` from the INIT pvRequest. pvxs
-    /// uses this purely client-side to decide whether to send the
-    /// PUT EXEC immediately after INIT or wait for an explicit
-    /// `reExec()` call (clientget.cpp:123). The server has no
-    /// queueing role — pvxs `serverget.cpp:488-492` calls `onPut`
-    /// the moment a CMD_PUT with !init arrives, regardless of the
-    /// client's autoExec setting. We keep the field for diagnostic
-    /// echoing but DO NOT gate write commits on it.
-    put_auto_exec: bool,
     /// full INIT pvRequest value (decoded). PVA PUT INIT
     /// carries per-operation options (`record._options.process` /
     /// `block`, etc.) that the data-phase payload does NOT carry.
@@ -4089,7 +4038,6 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         monitor_op_id: next_op_id(),
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
-        put_auto_exec: true,
         pv_request: None,
         monitor_options: crate::server_native::source::MonitorOptions::default(),
         data_task_abort: None,
@@ -6397,17 +6345,6 @@ async fn handle_op(
             Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
         };
 
-        // pvxs autoExec is purely client-side timing control
-        // (clientget.cpp:123 — controls when the client sends the
-        // PUT EXEC frame). The server-side handler runs onPut
-        // unconditionally on every CMD_PUT !init regardless of
-        // autoExec. We parse the option for diagnostic echo only.
-        let put_auto_exec = if kind == OpKind::Put {
-            put_autoexec_from_request(req_value.as_ref()).unwrap_or(true)
-        } else {
-            true
-        };
-
         // Stash the INIT pvRequest so the data-phase
         // dispatch can forward it through `ChannelContext.pv_request`.
         // PUT needs `record._options.process|block`; MONITOR needs
@@ -6517,7 +6454,6 @@ async fn handle_op(
                 monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 monitor_op_id: next_op_id(),
                 monitor_filters,
-                put_auto_exec,
                 pv_request: stashed_pv_request,
                 monitor_options,
                 data_task_abort: None,
@@ -12441,7 +12377,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -13399,7 +13334,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -17466,7 +17400,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -19481,14 +19414,146 @@ mod tests {
 
 #[cfg(test)]
 mod autoexec_tests {
-    //! epics-base PR `70735383350b` regression: the
-    //! `record._options.autoExec` pvRequest option must parse
-    //! correctly into the per-op `put_auto_exec` flag.
+    //! R10-34: `autoExec` is a pvxs CLIENT-side builder flag
+    //! (`SubBuilder::autoExec`, `src/pvxs/client.h:698` → `op->autoExec`,
+    //! `clientget.cpp:633`), never a pvRequest member. pvxs has NO
+    //! server-side reader for it: `serverget.cpp:488-492` runs `onPut` on
+    //! every `CMD_PUT` with `!init`, whatever the client's `autoExec`.
+    //!
+    //! The port used to parse `record._options.autoExec` server-side into a
+    //! per-op flag. These tests pin the contract that replaces it: the
+    //! option is INERT on the server. They fail if a server-side gate is
+    //! reintroduced.
 
     use super::*;
-    use crate::pvdata::{PvField, PvStructure, ScalarValue};
+    use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::SharedSource;
+    use crate::server_native::runtime::PvaServerConfig;
+    use crate::server_native::shared_pv::SharedPV;
+    use crate::server_native::tcp::ClientCredentials;
+    use std::sync::Arc;
 
-    fn build_request(autoexec: Option<&str>) -> PvField {
+    // Local test scaffolding, per this file's convention for `#[cfg(test)]`
+    // sub-modules (`mod tests` keeps its copies private).
+    fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
+        let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    fn discard_mon_fin() -> mpsc::UnboundedSender<MonitorFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    fn discard_exec_fin() -> mpsc::UnboundedSender<ExecFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    /// Drive a PUT INIT (carrying `pv_request`) + PUT EXEC (writing 2.5)
+    /// through `handle_op`, and return the PV's value afterwards.
+    async fn put_through(pv_request: PvField) -> Option<PvField> {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 77;
+
+        let pv = SharedPV::build_mailbox();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv.clone());
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let req_desc = pv_request.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&pv_request, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.recv().await.expect("INIT resp");
+
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+        handle_op(
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("PUT EXEC ok");
+        let _ = rx.recv().await.expect("PUT EXEC response emitted");
+        pv.current()
+    }
+
+    fn request_with_autoexec(autoexec: Option<&str>) -> PvField {
         let mut options = PvStructure::new("");
         if let Some(s) = autoexec {
             options.fields.push((
@@ -19506,60 +19571,51 @@ mod autoexec_tests {
         PvField::Structure(root)
     }
 
-    #[test]
-    fn parses_explicit_false() {
-        let req = build_request(Some("false"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), Some(false));
-    }
-
-    #[test]
-    fn parses_explicit_true() {
-        let req = build_request(Some("true"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), Some(true));
-    }
-
-    #[test]
-    fn parses_alternate_truthy_strings() {
-        for v in ["yes", "1", "TRUE"] {
-            let req = build_request(Some(v));
-            assert_eq!(
-                put_autoexec_from_request(Some(&req)),
-                Some(true),
-                "{v} must parse as true"
-            );
-        }
-        for v in ["no", "0", "FALSE"] {
-            let req = build_request(Some(v));
-            assert_eq!(
-                put_autoexec_from_request(Some(&req)),
-                Some(false),
-                "{v} must parse as false"
-            );
+    fn value_of(pv: Option<PvField>) -> f64 {
+        match pv {
+            Some(PvField::Structure(s)) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::Double(v))) => *v,
+                other => panic!("unexpected value member: {other:?}"),
+            },
+            other => panic!("unexpected PV shape: {other:?}"),
         }
     }
 
-    #[test]
-    fn missing_field_returns_none() {
-        let req = build_request(None);
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    /// `record._options.autoExec=false` must NOT suppress the write: pvxs
+    /// never reads the option server-side, so the EXEC commits.
+    #[tokio::test]
+    async fn autoexec_false_still_commits_the_put() {
+        let after = put_through(request_with_autoexec(Some("false"))).await;
+        assert_eq!(
+            value_of(after),
+            2.5,
+            "autoExec=false is a client-side flag; the server must still commit the EXEC"
+        );
     }
 
-    #[test]
-    fn no_request_returns_none() {
-        assert_eq!(put_autoexec_from_request(None), None);
+    /// Negative control: with the option absent the EXEC commits too — so
+    /// the assertion above is pinning "the option is inert", not merely
+    /// "PUT works".
+    #[tokio::test]
+    async fn put_without_autoexec_commits_identically() {
+        let after = put_through(request_with_autoexec(None)).await;
+        assert_eq!(value_of(after), 2.5);
     }
 
-    #[test]
-    fn malformed_request_returns_none() {
-        // Plain scalar — not a Structure. Must not panic.
-        let req = PvField::Scalar(ScalarValue::Double(42.0));
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
-    }
-
-    #[test]
-    fn unknown_string_returns_none() {
-        let req = build_request(Some("maybe"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    /// The option is inert for EVERY spelling — including the ones the
+    /// deleted parser treated as false (`"no"`, `"0"`) and the ones it
+    /// rejected outright (`"maybe"`). No server-side branch may depend on
+    /// this text.
+    #[tokio::test]
+    async fn every_autoexec_spelling_is_inert() {
+        for v in ["false", "FALSE", "no", "0", "true", "maybe"] {
+            let after = put_through(request_with_autoexec(Some(v))).await;
+            assert_eq!(
+                value_of(after),
+                2.5,
+                "autoExec={v:?} must not gate the server-side write"
+            );
+        }
     }
 }
 

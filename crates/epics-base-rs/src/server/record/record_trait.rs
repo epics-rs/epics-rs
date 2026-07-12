@@ -1392,6 +1392,24 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Whether this record type raises UDF_ALARM at all.
+    ///
+    /// C has no framework-level UDF alarm: every record that reports one does
+    /// it itself, with the guard at the top of its own `checkAlarms` —
+    /// `if (prec->udf) { recGblSetSevr(prec, UDF_ALARM, prec->udfs); return; }`
+    /// (`aiRecord.c:319-323`, `calcRecord.c:300-304`, …). A record whose
+    /// support has no such guard NEVER reports UDF_ALARM, no matter what its
+    /// `UDF` field says — `swaitRecord.c` is the case in point: its two only
+    /// `udf` statements are `udf = FALSE` (`:411`, `:419`); it has no
+    /// `checkAlarms` and never names UDF_ALARM.
+    ///
+    /// The framework raises UDF_ALARM centrally (`rec_gbl_check_udf`), so this
+    /// hook is where a record type says C does not. Default `true` — the base
+    /// analog/binary/string records all carry the guard.
+    fn raises_udf_alarm(&self) -> bool {
+        true
+    }
+
     /// Whether the record's current `VAL` is undefined (UDF must
     /// stay set).
     ///

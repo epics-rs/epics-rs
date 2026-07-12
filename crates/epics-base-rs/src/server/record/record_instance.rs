@@ -1910,8 +1910,12 @@ impl RecordInstance {
     pub fn evaluate_alarms(&mut self) {
         use crate::server::recgbl;
 
-        // Check UDF first
-        recgbl::rec_gbl_check_udf(&mut self.common);
+        // Check UDF first — but only for record types whose C support carries
+        // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
+        // no central UDF alarm; see `Record::raises_udf_alarm`.
+        if self.record.raises_udf_alarm() {
+            recgbl::rec_gbl_check_udf(&mut self.common);
+        }
 
         let rtype = self.record.record_type();
         match rtype {

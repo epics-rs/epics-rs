@@ -40,6 +40,17 @@ pub enum FuncName {
     // String functions (Phase 2B)
     TrEsc,
     Esc,
+    /// aCalc `ANEG` / `APOS` (`aCalcPostfix.c:153-154`).
+    ANeg,
+    APos,
+    /// aCalc `@` / `@@` (`aCalcPostfix.c:93-94`) — fetch the scalar/array
+    /// argument that the operand indexes.
+    DynFetch,
+    DynAFetch,
+    /// aCalc `LEN` (`aCalcPostfix.c:199`) — a table entry with no implementation
+    /// in `aCalcPerform`, so it compiles and does nothing. Distinct from the
+    /// sCalc `LEN` string length ([`FuncName::Len`]), which IS implemented.
+    ALenNoop,
     Printf,
     Sscanf,
     BinRead,
@@ -83,6 +94,11 @@ pub enum ConstName {
     Pi,
     D2R,
     R2D,
+    /// `S2R` / `R2S` — arc-seconds <-> radians. In the sCalc AND aCalc element
+    /// tables (`sCalcPostfix.c:136,173`, `aCalcPostfix.c:186,195`); base has
+    /// neither, so they stay out of BASE_TABLE.
+    S2R,
+    R2S,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +118,8 @@ pub enum Token {
 
     Plus,
     Minus,
+    /// aCalc `AVAL` — the array-valued `VAL` (`aCalcPostfix.c:118`, OPERAND).
+    FetchAval,
     Star,
     Slash,
     Percent,
@@ -326,6 +344,14 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("DBL", Token::Func(FuncName::Dbl)),
         ("D2R", Token::Const(ConstName::D2R)),
         ("ESC", Token::Func(FuncName::Esc)),
+        // The `$`-spellings are the SAME elements, not new ones — C lists each
+        // twice with an identical opcode row (sCalcPostfix.c:136,173-194).
+        ("$E", Token::Func(FuncName::Esc)),
+        ("$P", Token::Func(FuncName::Printf)),
+        ("$R", Token::Func(FuncName::BinRead)),
+        ("$S", Token::Func(FuncName::Sscanf)),
+        ("$T", Token::Func(FuncName::TrEsc)),
+        ("$W", Token::Func(FuncName::BinWrite)),
         ("EXP", Token::Func(FuncName::Exp)),
         ("FINITE", Token::Func(FuncName::Finite)),
         ("FLOOR", Token::Func(FuncName::Floor)),
@@ -347,6 +373,8 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("PI", Token::Const(ConstName::Pi)),
         ("PRINTF", Token::Func(FuncName::Printf)),
         ("R2D", Token::Const(ConstName::R2D)),
+        ("R2S", Token::Const(ConstName::R2S)),
+        ("S2R", Token::Const(ConstName::S2R)),
         // sCalcPostfix.c:180 `{"READ", ..., BIN_READ}` — the C symbol is
         // `READ`, not `BIN_READ`.
         ("READ", Token::Func(FuncName::BinRead)),
@@ -402,6 +430,12 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("|", Token::BitOr),
         ("||", Token::OrOr),
         ("|-", Token::PipeMinus),
+        // `-|` is NOT a new operator: C gives it the SUB opcode, the same one
+        // plain `-` has (sCalcPostfix.c:243 vs :237). It is a second spelling
+        // that says "subtract the FIRST occurrence" out loud, the behaviour `-`
+        // already has. Compiled sCalc, AA="abcabc" BB="bc": AA-|BB and AA-BB are
+        // both "aabc"; only AA|-BB ("abca") differs.
+        ("-|", Token::Minus),
         (">?", Token::MaxOp),
         ("<?", Token::MinOp),
         ("!", Token::Bang),
@@ -427,6 +461,14 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("ATAN", Token::Func(FuncName::Atan)),
         ("ATAN2", Token::Func(FuncName::Atan2)),
         ("AVG", Token::Func(FuncName::Avg)),
+        // aCalc-only elements the port had never lexed (aCalcPostfix.c:93-94,
+        // 118, 153-154, 199).
+        ("@", Token::Func(FuncName::DynFetch)),
+        ("@@", Token::Func(FuncName::DynAFetch)),
+        ("AVAL", Token::FetchAval),
+        ("ANEG", Token::Func(FuncName::ANeg)),
+        ("APOS", Token::Func(FuncName::APos)),
+        ("LEN", Token::Func(FuncName::ALenNoop)),
         ("CAT", Token::Func(FuncName::Cat)),
         ("CEIL", Token::Func(FuncName::Ceil)),
         ("COS", Token::Func(FuncName::Cos)),
@@ -466,6 +508,8 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("NSMOO", Token::Func(FuncName::NSmoo)),
         ("PI", Token::Const(ConstName::Pi)),
         ("R2D", Token::Const(ConstName::R2D)),
+        ("R2S", Token::Const(ConstName::R2S)),
+        ("S2R", Token::Const(ConstName::S2R)),
         ("RNDM", Token::Rndm),
         ("SIN", Token::Func(FuncName::Sin)),
         ("SINH", Token::Func(FuncName::Sinh)),

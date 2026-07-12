@@ -103,6 +103,25 @@ impl CompiledExpr {
     }
 }
 
+/// C's subrange bound rule, spelled once. Both synApps engines normalise `[i,j]`
+/// the same way over a container of length `k` — sCalc over `strlen(ps->s)`
+/// (`sCalcPerform.c:1875-1895`), aCalc over `arraySize`
+/// (`aCalcPerform.c:1527-1534`):
+///
+/// ```c
+/// i = (int)ps1->d;  if (i < 0) i += k;
+/// j = (int)ps2->d;  if (j < 0) j += k;
+/// i = myMAX(myMIN(i,k),0);  j = myMIN(j,k);
+/// ```
+///
+/// So: a negative bound counts back from the end, `j` is INCLUSIVE, and only `i`
+/// is clamped from below — C leaves a `j` that is still negative alone, which is
+/// what makes an inverted range select nothing.
+pub(crate) fn subrange_bounds(i: i64, j: i64, k: i64) -> (i64, i64) {
+    let wrap = |v: i64| if v < 0 { v + k } else { v };
+    (wrap(i).clamp(0, k), wrap(j).min(k))
+}
+
 /// Number of named scalar inputs accepted by the calc engine.
 /// Mirrors `CALCPERFORM_NARGS` in epics-base after PR #655 (12 → 21,
 /// fields A..U). Doubled-letter previous-value slots (LA..LU) and any
@@ -176,6 +195,10 @@ pub struct ArrayInputs {
     pub array_size: usize,
     /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`).
     pub prev_val: f64,
+    /// Previous ARRAY result — C's `p_aresult`, read by the `AVAL` token
+    /// (`FETCH_AVAL`, aCalcPerform.c:534-539). The array counterpart of
+    /// [`Self::prev_val`].
+    pub prev_aval: Vec<f64>,
 }
 
 impl ArrayInputs {
@@ -185,6 +208,7 @@ impl ArrayInputs {
             arrays: vec![Vec::new(); CALC_NARGS],
             array_size,
             prev_val: 0.0,
+            prev_aval: vec![0.0; array_size],
         }
     }
 }

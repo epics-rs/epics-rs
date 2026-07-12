@@ -45,6 +45,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::R2D => {
                     stack.push(StackValue::Double(180.0 / std::f64::consts::PI));
                 }
+                // C `CONST_S2R` / `CONST_R2S` (`sCalcPerform.c:952-962`):
+                // arcseconds <-> radians, `PI/(180*3600)` and its reciprocal.
+                CoreOp::S2R => {
+                    stack.push(StackValue::Double(std::f64::consts::PI / (180.0 * 3600.0)));
+                }
+                CoreOp::R2S => {
+                    stack.push(StackValue::Double((180.0 * 3600.0) / std::f64::consts::PI));
+                }
 
                 CoreOp::Random => {
                     stack.push(StackValue::Double(simple_random()));
@@ -650,18 +658,32 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Str(result));
                 }
                 StringOp::Subrange => {
-                    // Pop: string, start, end
+                    // C `sCalcPerform.c:1869-1901`. Pop: string, i, j — and BOTH
+                    // bounds are inclusive:
+                    //
+                    // ```c
+                    // for (s1=s+i, s2=s+j ; *s1 && s1 <= s2; ) *s++ = *s1++;
+                    // ```
+                    //
+                    // so `"hello"[1,4]` is "ello" and `"hello"[2,2]` is "l". The
+                    // bound arithmetic itself is `subrange_bounds`, shared with
+                    // aCalc's `[`.
                     let end_val = pop1(&mut stack)?;
                     let start_val = pop1(&mut stack)?;
                     let s = pop1(&mut stack)?;
                     let s = s.as_str_ref()?;
-                    let start = subrange_index(&start_val)?;
-                    let end = subrange_index(&end_val)?;
-                    let len = s.len() as i64;
-                    let start = start.max(0).min(len) as usize;
-                    let end = end.max(0).min(len) as usize;
-                    let end = end.max(start);
-                    stack.push(StackValue::Str(s[start..end].to_string()));
+                    let k = s.len() as i64;
+                    let (i, j) = super::subrange_bounds(
+                        subrange_index(&start_val)?,
+                        subrange_index(&end_val)?,
+                        k,
+                    );
+                    let out = if j < i {
+                        String::new()
+                    } else {
+                        s[i as usize..(j + 1).min(k) as usize].to_string()
+                    };
+                    stack.push(StackValue::Str(out));
                 }
                 StringOp::Replace => {
                     // Pop: string, find, replace

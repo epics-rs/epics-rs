@@ -60,6 +60,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Pi => stack.push(ArrayStackValue::Double(std::f64::consts::PI)),
                 CoreOp::D2R => stack.push(ArrayStackValue::Double(std::f64::consts::PI / 180.0)),
                 CoreOp::R2D => stack.push(ArrayStackValue::Double(180.0 / std::f64::consts::PI)),
+                // C `CONST_S2R` / `CONST_R2S` (`aCalcPerform.c:559-569`):
+                // arcseconds <-> radians, `PI/(180*3600)` and its reciprocal.
+                CoreOp::S2R => stack.push(ArrayStackValue::Double(
+                    std::f64::consts::PI / (180.0 * 3600.0),
+                )),
+                CoreOp::R2S => stack.push(ArrayStackValue::Double(
+                    (180.0 * 3600.0) / std::f64::consts::PI,
+                )),
 
                 CoreOp::Random => stack.push(ArrayStackValue::Double(simple_random())),
                 CoreOp::NormalRandom => {
@@ -612,27 +620,104 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let arr: Vec<f64> = (0..inputs.array_size).map(|_| simple_random()).collect();
                     stack.push(ArrayStackValue::Array(arr));
                 }
-                ArrayOp::ArraySubrange => {
-                    let end_val = pop1_f64(&mut stack)? as i64;
-                    let start_val = pop1_f64(&mut stack)? as i64;
-                    let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let len = arr.len() as i64;
-                    let start = start_val.max(0).min(len) as usize;
-                    let end = end_val.max(0).min(len) as usize;
-                    let end = end.max(start);
-                    stack.push(ArrayStackValue::Array(arr[start..end].to_vec()));
+                ArrayOp::ArraySubrange | ArrayOp::ArraySubrangeInPlace => {
+                    // C `aCalcPerform.c:1520-1549`. Both bounds are INCLUSIVE, a
+                    // negative bound counts back from the end, and the result is
+                    // still a full `arraySize` buffer: `[` shifts the selected
+                    // elements down to index 0 and zero-fills the tail, `{` leaves
+                    // them where they are and zeroes everything outside.
+                    let n = inputs.array_size as i64;
+                    let (i, j) = pop_subrange_bounds(&mut stack, n)?;
+                    let mut a = pop1(&mut stack)?.to_array(inputs.array_size);
+                    a.resize(inputs.array_size, 0.0);
+                    let out = if matches!(aop, ArrayOp::ArraySubrange) {
+                        let mut out = vec![0.0; inputs.array_size];
+                        // C: `for (k=0; i<=j; k++, i++) ps->a[k] = ps->a[i];`
+                        // then `for ( ; k<arraySize; k++) ps->a[k] = 0.;`
+                        for (k, src) in (i..=j).enumerate() {
+                            match (out.get_mut(k), a.get(src as usize)) {
+                                (Some(dst), Some(&v)) => *dst = v,
+                                _ => break,
+                            }
+                        }
+                        out
+                    } else {
+                        // C: zero `[0,i)` and `(j,arraySize)`, keep the rest in place.
+                        for (k, cell) in a.iter_mut().enumerate() {
+                            let k = k as i64;
+                            if k < i || k > j {
+                                *cell = 0.0;
+                            }
+                        }
+                        a
+                    };
+                    stack.push(ArrayStackValue::Array(out));
                 }
-                ArrayOp::ArraySubrangeInPlace => {
-                    let end_val = pop1_f64(&mut stack)? as i64;
-                    let start_val = pop1_f64(&mut stack)? as i64;
+                ArrayOp::ANeg => {
+                    // C `:772` (array) / `:1046` (scalar) — ANEG zeroes the
+                    // NEGATIVE elements and keeps the rest.
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let len = arr.len() as i64;
-                    let start = start_val.max(0).min(len) as usize;
-                    let end = end_val.max(0).min(len) as usize;
-                    let end = end.max(start);
-                    stack.push(ArrayStackValue::Array(arr[start..end].to_vec()));
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            ArrayStackValue::Array(
+                                a.iter().map(|&x| if x < 0.0 { 0.0 } else { x }).collect(),
+                            )
+                        },
+                        |d| if d < 0.0 { 0.0 } else { d },
+                    ));
+                }
+                ArrayOp::APos => {
+                    // C `:773` (array) / `:1047` (scalar) — APOS zeroes the
+                    // POSITIVE elements.
+                    let v = pop1(&mut stack)?;
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            ArrayStackValue::Array(
+                                a.iter().map(|&x| if x > 0.0 { 0.0 } else { x }).collect(),
+                            )
+                        },
+                        |d| if d > 0.0 { 0.0 } else { d },
+                    ));
+                }
+                ArrayOp::FetchAval => {
+                    // C `FETCH_AVAL` (`:534-539`) — push `p_aresult`, the record's
+                    // previous array result. The array counterpart of `VAL`.
+                    let mut prev = inputs.prev_aval.clone();
+                    prev.resize(inputs.array_size, 0.0);
+                    stack.push(ArrayStackValue::Array(prev));
+                }
+                ArrayOp::DynFetch => {
+                    // C `A_FETCH` (`:1461-1477`) — `@x` is the scalar argument x
+                    // INDEXES (`@1` is B). C rounds the index with myNINT and
+                    // answers 0 (with a console message) when it is out of range.
+                    let idx = my_nint(pop1_f64(&mut stack)?);
+                    let v = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| inputs.num_vars.get(i).copied())
+                        .unwrap_or(0.0);
+                    stack.push(ArrayStackValue::Double(v));
+                }
+                ArrayOp::DynAFetch => {
+                    // C `A_AFETCH` (`:1479-1494`) — `@@x` is the ARRAY argument x
+                    // indexes (`@@1` is BB). Out of range, and an argument the
+                    // record never allocated, are both an all-zero array — and the
+                    // result is an array either way (C `toArray(ps,0)`).
+                    let idx = my_nint(pop1_f64(&mut stack)?);
+                    let mut arr = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| inputs.arrays.get(i))
+                        .cloned()
+                        .unwrap_or_default();
+                    arr.resize(inputs.array_size, 0.0);
+                    stack.push(ArrayStackValue::Array(arr));
+                }
+                ArrayOp::LenNoop => {
+                    // C has no `case LEN` and no `default:` in aCalcPerform's
+                    // switch (`aCalcPostfix.c:199`: "Array length not
+                    // implemented"), so the opcode falls through and the operand
+                    // stays on the stack untouched. Compiled C: `LEN(AA)` is AA.
                 }
                 ArrayOp::FitPoly => {
                     let y = pop1(&mut stack)?;
@@ -930,6 +1015,19 @@ fn shift_elements(a: &mut [f64], e: f64) {
         // C `:1455`, mirror image: a[1] here has already been updated.
         a[0] += d * (a[0] - a[1]);
     }
+}
+
+/// Pop the two bounds of an aCalc subrange. C `toDouble`s both
+/// (`aCalcPerform.c:1526,1530`) — so an ARRAY bound collapses to its first
+/// element — and casts each with a truncating `(int)`, not `myNINT`. The rest of
+/// the rule is [`super::subrange_bounds`], shared with sCalc.
+fn pop_subrange_bounds(
+    stack: &mut Vec<ArrayStackValue>,
+    array_size: i64,
+) -> Result<(i64, i64), CalcError> {
+    let j = pop1_f64(stack)? as i64;
+    let i = pop1_f64(stack)? as i64;
+    Ok(super::subrange_bounds(i, j, array_size))
 }
 
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {

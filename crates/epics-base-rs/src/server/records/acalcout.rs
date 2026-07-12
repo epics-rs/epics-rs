@@ -324,7 +324,7 @@ impl AcalcoutRecord {
         EpicsValue::DoubleArray(out)
     }
 
-    fn build_inputs(&self, n: usize, prev_val: f64) -> ArrayInputs {
+    fn build_inputs(&self, n: usize, prev_val: f64, prev_aval: &[f64]) -> ArrayInputs {
         let mut inputs = ArrayInputs::new(n);
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
@@ -340,6 +340,11 @@ impl AcalcoutRecord {
         // `aCalcPerform` calls; `aCalcPerform.c:528-532`). The caller supplies
         // that field's pre-write value as `prev_val`.
         inputs.prev_val = prev_val;
+        // The `AVAL` token is the same story one dimension up: it reads
+        // `p_aresult` (`aCalcPerform.c:534-539`), which is `prec->aval` for the
+        // CALC pass and `prec->oav` for the OCAL pass (`aCalcoutRecord.c:1283-1290`).
+        inputs.prev_aval = prev_aval.to_vec();
+        inputs.prev_aval.resize(n, 0.0);
         inputs
     }
 
@@ -359,8 +364,9 @@ impl AcalcoutRecord {
         compiled: &CompiledExpr,
         n: usize,
         prev_val: f64,
+        prev_aval: &[f64],
     ) -> Option<(f64, Vec<f64>, bool)> {
-        let mut inputs = self.build_inputs(n, prev_val);
+        let mut inputs = self.build_inputs(n, prev_val, prev_aval);
         match acalc_eval(compiled, &mut inputs) {
             Ok(result) => {
                 let v = result.as_f64().unwrap_or(0.0);
@@ -1267,7 +1273,7 @@ impl Record for AcalcoutRecord {
         let mut calc_failed = false;
         // CALC pass: the `VAL` token reads `prec->val` (this pass's result
         // field) before it is overwritten.
-        match self.eval(&self.compiled_calc, n, self.val) {
+        match self.eval(&self.compiled_calc, n, self.val, &self.aval) {
             Some((v, arr, finite)) => {
                 self.val = v;
                 self.aval = arr;
@@ -1284,7 +1290,7 @@ impl Record for AcalcoutRecord {
             // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
             // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
             // OCAL accumulator like "VAL+1" runs on OVAL.
-            match self.eval(&self.compiled_ocal, n, self.oval) {
+            match self.eval(&self.compiled_ocal, n, self.oval, &self.oav) {
                 Some((v, arr, finite)) => {
                     self.oval = v;
                     self.oav = arr;

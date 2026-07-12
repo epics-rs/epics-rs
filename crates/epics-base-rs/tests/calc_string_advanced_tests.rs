@@ -183,10 +183,13 @@ fn test_add_xor8_append() {
 
 // --- Subrange [] ---
 
+/// C `sCalcPerform.c:1897` (`s1 <= s2`) — the upper bound is INCLUSIVE.
+/// Compiled sCalc: `"hello"[1,4]` = "ello". This test previously pinned the
+/// port's exclusive-end reading ("ell").
 #[test]
 fn test_subrange_basic() {
     let result = eval_str(r#""hello"[1,4]"#);
-    assert_eq!(result, StackValue::Str("ell".into()));
+    assert_eq!(result, StackValue::Str("ello".into()));
 }
 
 #[test]
@@ -201,10 +204,27 @@ fn test_subrange_clamp() {
     assert_eq!(result, StackValue::Str("hello".into()));
 }
 
+/// `i == j` selects ONE character, not none — the bounds are inclusive.
+/// Compiled sCalc: `"hello"[2,2]` = "l". An empty selection takes `i > j`.
 #[test]
-fn test_subrange_empty() {
+fn test_subrange_single_char() {
     let result = eval_str(r#""hello"[2,2]"#);
+    assert_eq!(result, StackValue::Str("l".into()));
+}
+
+/// Compiled sCalc: `"hello"[3,1]` = "".
+#[test]
+fn test_subrange_inverted_is_empty() {
+    let result = eval_str(r#""hello"[3,1]"#);
     assert_eq!(result, StackValue::Str("".into()));
+}
+
+/// A negative bound counts back from the end (C `:1878,1885`: `if (i < 0) i += k`).
+/// Compiled sCalc: `"hello"[-2,-1]` = "lo", `"hello"[-3,10]` = "llo".
+#[test]
+fn test_subrange_negative_bounds_wrap() {
+    assert_eq!(eval_str(r#""hello"[-2,-1]"#), StackValue::Str("lo".into()));
+    assert_eq!(eval_str(r#""hello"[-3,10]"#), StackValue::Str("llo".into()));
 }
 
 // --- Replace {} ---

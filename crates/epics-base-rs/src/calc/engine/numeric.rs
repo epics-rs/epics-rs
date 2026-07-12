@@ -37,6 +37,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 CoreOp::Pi => stack.push(std::f64::consts::PI),
                 CoreOp::D2R => stack.push(std::f64::consts::PI / 180.0),
                 CoreOp::R2D => stack.push(180.0 / std::f64::consts::PI),
+                CoreOp::S2R | CoreOp::R2S => {
+                    // The arcsecond constants are synApps-only (`sCalcPostfix.c:136,173`,
+                    // `aCalcPostfix.c:186,195`); base's element table has no S2R/R2S,
+                    // so `calcPerform` can never see them. Same shared-tokenizer
+                    // reachability as `FetchSval` below.
+                    return Err(CalcError::Internal);
+                }
 
                 // Random
                 CoreOp::Random => {

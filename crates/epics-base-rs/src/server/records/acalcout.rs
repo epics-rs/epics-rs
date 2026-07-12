@@ -360,7 +360,11 @@ impl AcalcoutRecord {
         match acalc_eval(compiled, &mut inputs) {
             Ok(result) => {
                 let v = result.as_f64().unwrap_or(0.0);
-                let mut arr = result.broadcast(n);
+                // C fills AVAL from a scalar result with `toArray(ps,1)`
+                // (`aCalcPerform.c:1624`) — the same promotion as anywhere else,
+                // so a NaN scalar fills AVAL with ZEROS while VAL keeps the NaN
+                // (compiled aCalcPerform: `ACOS(2)` -> st=-1 d=nan a=[0 x8]).
+                let mut arr = result.to_array(n);
                 arr.resize(n, 0.0);
                 Some((v, arr, v.is_finite()))
             }
@@ -2185,13 +2189,20 @@ mod tests {
     }
 
     /// A NaN/Inf calc result is written into VAL/AVAL (not left stale): C
-    /// `aCalcPerform` stores `*p_dresult` before returning -1, so VAL holds the
-    /// non-finite value and CALC_ALARM is raised. (`1/0` → NaN in the array
-    /// engine.)
+    /// `aCalcPerform` stores `*p_dresult` before its non-finite tail returns -1
+    /// (`aCalcPerform.c:1644`), so VAL holds the non-finite value and
+    /// CALC_ALARM is raised.
+    ///
+    /// R8-7: the expression here used to be `1/0`, on the belief that the array
+    /// engine divides in IEEE and yields NaN. It does not — C answers
+    /// `myMAXFLOAT` (1e35) and `st=0` for `1/0` (`aCalcPerform.c:690-696`), so
+    /// that expression pinned invented behaviour and could never reach this
+    /// path. `1e300*1e300` is the C-verified non-finite case: the compiled
+    /// `aCalcPerform` prints `st=-1 d=inf`.
     #[test]
     fn test_acalcout_nonfinite_result_written_to_val() {
         let mut rec = AcalcoutRecord::new();
-        rec.put_field("CALC", EpicsValue::String("1/0".into()))
+        rec.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
             .unwrap();
         rec.special("CALC", true).unwrap();
         rec.process().unwrap();
@@ -2201,6 +2212,26 @@ mod tests {
             }
             other => panic!("expected Double VAL, got {other:?}"),
         }
+        assert!(rec.calc_alarm);
+    }
+
+    /// R9-2 — a NaN SCALAR result reaches AVAL through C's `toArray(ps,1)`
+    /// (`aCalcPerform.c:1624`), whose promotion fills 0 for a NaN
+    /// (`to_array`, :135-138). So VAL keeps the NaN and AVAL is all ZEROS, not
+    /// all NaN. Compiled aCalcPerform: `ACOS(2)` -> st=-1 d=nan a=[0 x8].
+    #[test]
+    fn test_acalcout_nan_scalar_fills_aval_with_zeros() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+        rec.put_field("CALC", EpicsValue::String("ACOS(2)".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.process().unwrap();
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => assert!(v.is_nan(), "VAL = {v}, expected NaN"),
+            other => panic!("expected Double VAL, got {other:?}"),
+        }
+        assert_eq!(rec.aval, vec![0.0; 4], "C fills AVAL with zeros for a NaN");
         assert!(rec.calc_alarm);
     }
 

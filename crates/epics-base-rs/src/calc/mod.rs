@@ -16,13 +16,12 @@ pub use engine::opcodes::ArrayOp;
 /// Compile an infix expression for the **numeric** engine — C `postfix()`
 /// (`postfix.c`), used by calc, calcout and swait.
 ///
-/// Tokens outside `postfix.c`'s element table (`SVAL`, string literals and
-/// sCalc string functions, aCalc array functions, `UNTIL`, `AA`..`UU`, `>?`,
-/// `<?`, `NRNDM`, `INT`) are rejected here with `CalcError::Syntax` — C's
-/// `CALC_ERR_SYNTAX`, raised at compile time (`CLCV != 0`), not at first
-/// evaluation.
+/// Symbols outside `postfix.c`'s element table (`SVAL`, string literals and
+/// sCalc string functions, aCalc array functions, `UNTIL`, `AA`..`LL`, `>?`,
+/// `<?`, `NRNDM`, `INT`) are `CalcError::Syntax` — C's `CALC_ERR_SYNTAX`,
+/// raised at compile time (`CLCV != 0`), not at first evaluation.
 pub fn compile(expr: &str) -> CalcResult<CompiledExpr> {
-    let tokens = engine::token::tokenize(expr)?;
+    let tokens = engine::token::tokenize(expr, ExprKind::Numeric)?;
     engine::postfix::compile(&tokens, ExprKind::Numeric)
 }
 
@@ -38,10 +37,11 @@ pub fn calc(expr: &str, inputs: &mut NumericInputs) -> CalcResult<f64> {
 }
 
 /// Compile an infix expression for the **string** engine — synApps
-/// `sCalcPostfix()`, used by scalcout. Array-only tokens are rejected at
-/// compile time, as aCalc's element table is a separate one.
+/// `sCalcPostfix()`, used by scalcout. Its element table is its own: no `FMOD`,
+/// no `>>>`, operands `A`..`P` / `AA`..`LL`, plus the string symbols base has
+/// never had.
 pub fn scalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
-    let tokens = engine::token::tokenize(expr)?;
+    let tokens = engine::token::tokenize(expr, ExprKind::String)?;
     engine::postfix::compile(&tokens, ExprKind::String)
 }
 
@@ -55,10 +55,11 @@ pub fn scalc(expr: &str, inputs: &mut StringInputs) -> CalcResult<StackValue> {
 }
 
 /// Compile an infix expression for the **array** engine — synApps
-/// `aCalcPostfix()`, used by acalcout. String-only tokens are rejected at
-/// compile time, as sCalc's element table is a separate one.
+/// `aCalcPostfix()`, used by acalcout. Its element table is its own: no `FMOD`,
+/// no `>>>`, no `INF`/`NAN` literal and no `SVAL`, operands `A`..`P` /
+/// `AA`..`LL`, plus the array symbols.
 pub fn acalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
-    let tokens = engine::token::tokenize(expr)?;
+    let tokens = engine::token::tokenize(expr, ExprKind::Array)?;
     engine::postfix::compile(&tokens, ExprKind::Array)
 }
 

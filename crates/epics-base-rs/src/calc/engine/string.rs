@@ -103,7 +103,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Div => {
                     let (a, b) = pop2_f64(&mut stack)?;
-                    // C calcPerform.c:157-160: bare IEEE divide (1/0 = +Inf, 0/0 = NaN).
+                    // sCalc, not base: a zero divisor is an ERROR, on both
+                    // evaluator paths (`sCalcPerform.c:495-500` no-string,
+                    // :1022-1030 string) — `return(-1)`, with `*presult`
+                    // never written. Base's DIV (`calcPerform.c:156-159`) is
+                    // a bare IEEE divide and the old comment here cited it;
+                    // the port must not inherit base's rule in sCalc.
+                    if b == 0.0 {
+                        return Err(CalcError::DivisionByZero);
+                    }
                     stack.push(StackValue::Double(a / b));
                 }
                 CoreOp::Mod => {
@@ -138,15 +146,19 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(a.powf(b)));
                 }
 
-                // Type-aware comparison.
-                // C calcPerform.c:373-393 compares doubles with exact IEEE
-                // operators; the numeric evaluator does the same, so the string
-                // evaluator must not apply an epsilon.
+                // Type-aware comparison. sCalc does NOT compare doubles exactly:
+                // every numeric comparison goes through `SMALL` (= 1e-11,
+                // `sCalcPerform.c:46`) on both evaluator paths — :595-620
+                // (no-string) and :1161-1255 (string), which are the same six
+                // formulas. Two strings are compared with `strcmp` (:1167-1169).
+                // The exact IEEE operators these arms used to apply are base's
+                // (`calcPerform.c:369-393`) and aCalc's, not sCalc's.
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x == y,
+                        // C: fabs(a-b) < SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() < SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x == y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -156,7 +168,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x != y,
+                        // C: fabs(a-b) > SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() > SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x != y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -166,7 +179,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x < y,
+                        // C: (b - a) > SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (y - x) > SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x < y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -176,7 +190,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x <= y,
+                        // C: (fabs(a-b) < SMALL) || (a < b)
+                        (StackValue::Double(x), StackValue::Double(y)) => {
+                            (x - y).abs() < SMALL || x < y
+                        }
                         (StackValue::Str(x), StackValue::Str(y)) => x <= y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -186,7 +203,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x > y,
+                        // C: (a - b) > SMALL
+                        (StackValue::Double(x), StackValue::Double(y)) => (x - y) > SMALL,
                         (StackValue::Str(x), StackValue::Str(y)) => x > y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -196,7 +214,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
                     let result = match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => x >= y,
+                        // C: (fabs(a-b) < SMALL) || (a > b)
+                        (StackValue::Double(x), StackValue::Double(y)) => {
+                            (x - y).abs() < SMALL || x > y
+                        }
                         (StackValue::Str(x), StackValue::Str(y)) => x >= y,
                         _ => return Err(CalcError::TypeMismatch),
                     };
@@ -282,6 +303,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Sqrt => {
                     let a = pop1_f64(&mut stack)?;
+                    // sCalc, not base: a negative operand is an ERROR, not
+                    // NaN (`sCalcPerform.c:521-524` no-string, :1056-1061
+                    // string — both `if (< 0) return(-1)` BEFORE the sqrt).
+                    if a < 0.0 {
+                        return Err(CalcError::DomainError);
+                    }
                     stack.push(StackValue::Double(a.sqrt()));
                 }
                 CoreOp::Exp => {
@@ -290,10 +317,21 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::Log10 => {
                     let a = pop1_f64(&mut stack)?;
+                    // sCalc, not base (`sCalcPerform.c:531-535`, :1068-1073).
+                    // Note the test is `< 0`, so LOG(0) is NOT caught here —
+                    // it produces -inf and is caught by the non-finite tail
+                    // below, exactly as in C.
+                    if a < 0.0 {
+                        return Err(CalcError::DomainError);
+                    }
                     stack.push(StackValue::Double(a.log10()));
                 }
                 CoreOp::LogE => {
                     let a = pop1_f64(&mut stack)?;
+                    // sCalc, not base (`sCalcPerform.c:537-541`, :1075-1080).
+                    if a < 0.0 {
+                        return Err(CalcError::DomainError);
+                    }
                     stack.push(StackValue::Double(a.ln()));
                 }
                 CoreOp::Sin => {
@@ -495,15 +533,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 StringOp::ToDouble => {
                     let v = pop1(&mut stack)?;
-                    match v {
-                        StackValue::Str(s) => {
-                            let d = s.trim().parse::<f64>().unwrap_or(0.0);
-                            stack.push(StackValue::Double(d));
-                        }
-                        StackValue::Double(d) => {
-                            stack.push(StackValue::Double(d));
-                        }
-                    }
+                    stack.push(StackValue::Double(to_double(&v)));
                 }
                 StringOp::Len => {
                     let v = pop1(&mut stack)?;
@@ -693,8 +723,33 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         }
     }
 
-    Ok(stack.last().cloned().unwrap_or(StackValue::Double(0.0)))
+    let result = stack.last().cloned().unwrap_or(StackValue::Double(0.0));
+    // Both of C's evaluator paths end with the same line — `sCalcPerform.c:833`
+    // (no-string) and `:2056` (string):
+    //     return(((isnan(*presult)||isinf(*presult)) ? -1 : 0));
+    // `*presult` is the DOUBLE form of the result: a string result is first
+    // run through `to_double` (:2046-2050). So an expression whose operators
+    // all succeeded still fails the perform when its value is not finite
+    // (`LOG(0)` = -inf, `1e300*1e300` = +inf, `ACOS(2)` = NaN) — the record
+    // then forces VAL=-1 / SVAL="***ERROR***" / CALC_ALARM.
+    if !to_double(&result).is_finite() {
+        return Err(CalcError::NonFiniteResult);
+    }
+    Ok(result)
 }
+
+/// C `to_double` (`sCalcPerform.c:83`) — `atof` of the stack element's string
+/// form; a double element is already its own double form.
+fn to_double(v: &StackValue) -> f64 {
+    match v {
+        StackValue::Double(d) => *d,
+        StackValue::Str(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+    }
+}
+
+/// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
+/// are written around. It is sCalc's alone: base and aCalc compare exactly.
+const SMALL: f64 = 1e-11;
 
 const MAX_LOOP_ITERATIONS: usize = 1000;
 
@@ -1097,28 +1152,40 @@ mod parity_tests {
         }
     }
 
-    // `==` compares doubles exactly, not within an epsilon.
+    // R9-1: these two cases pinned EXACT comparison on the string engine, on
+    // the belief (taken from base's `calcPerform.c`) that no calc engine has an
+    // epsilon. sCalc has one — `SMALL` = 1e-11 (`sCalcPerform.c:46`), used by
+    // all six numeric comparisons (:595-620, :1161-1255) — so the compiled C
+    // evaluator answers the opposite of what was pinned here. The values below
+    // are its output.
     #[test]
-    fn h6_eq_is_exact() {
-        // 1e-12 is not equal to 0 under exact IEEE comparison.
-        assert_eq!(run_num("1e-12 == 0"), 0.0);
-        assert_eq!(run_num("1e-12 # 0"), 1.0); // `#` is the NE operator
-        assert_eq!(run_num("0 == 0"), 1.0);
+    fn h6_eq_is_within_small() {
+        assert_eq!(run_num("1e-12 == 0"), 1.0); // C: d=1 (|1e-12| < SMALL)
+        assert_eq!(run_num("1e-12 # 0"), 0.0); // C: d=0. `#` is the NE operator
+        assert_eq!(run_num("0 == 0"), 1.0); // C: d=1
+        assert_eq!(run_num("0.1+0.2 == 0.3"), 1.0); // C: d=1 — SMALL absorbs the ULP
     }
 
     #[test]
-    fn h6_inequalities_exact() {
-        // 1e-12 < 1e-11 must be true (epsilon would have hidden it).
-        assert_eq!(run_num("1e-12 < 1e-11"), 1.0);
-        assert_eq!(run_num("1 >= 1"), 1.0);
-        assert_eq!(run_num("2 > 1"), 1.0);
+    fn h6_inequalities_are_within_small() {
+        // C: d=0 — the difference (9e-12) does not exceed SMALL, so `<` is false
+        // even though 1e-12 is genuinely below 1e-11.
+        assert_eq!(run_num("1e-12 < 1e-11"), 0.0);
+        assert_eq!(run_num("1 >= 1"), 1.0); // C: d=1
+        assert_eq!(run_num("2 > 1"), 1.0); // C: d=1
     }
 
-    // division by zero yields IEEE Inf/NaN, not forced NaN.
+    // R8-7: this case used to pin base's IEEE divide (`1/0` = +Inf) onto the
+    // STRING engine, which was never sCalc's rule — it was read off
+    // `calcPerform.c` and never checked against `sCalcPerform.c`. The compiled
+    // C evaluator answers `st=-1` for all three (`sCalcPerform.c:495-500`,
+    // :1022-1030), i.e. a failed perform, so the expectations below are the
+    // C-verified ones.
     #[test]
-    fn h7_div_by_zero_is_ieee() {
-        assert_eq!(run_num("1/0"), f64::INFINITY);
-        assert_eq!(run_num("-1/0"), f64::NEG_INFINITY);
-        assert!(run_num("0/0").is_nan());
+    fn h7_div_by_zero_fails_the_perform() {
+        let mut inp = StringInputs::new();
+        assert!(scalc("1/0", &mut inp).is_err()); // C: PERFORM st=-1
+        assert!(scalc("-1/0", &mut inp).is_err()); // C: PERFORM st=-1
+        assert!(scalc("0/0", &mut inp).is_err()); // C: PERFORM st=-1
     }
 }

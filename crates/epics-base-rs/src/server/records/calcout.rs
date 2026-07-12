@@ -1011,23 +1011,23 @@ impl Record for CalcoutRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // C `calcoutRecord.c::init_record:190-205` — `clcv = postfix(...)`
-            // and `oclv = postfix(...)`, both at init, both logged but never
-            // fatal. An empty CALC/OCAL is CALC_ERR_NULL_ARG in base postfix,
-            // so C's own default `field(OCAL,"")` record already inits with
-            // OCLV = -1; the port only compiles a non-empty expression, so its
-            // CLCV/OCLV stay 0 there. Preserving that: only a *put* to
-            // CALC/OCAL (special) can land a non-zero validity code, which is
-            // the field's observable contract.
-            if !self.calc.is_empty() {
-                let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-                self.clcv = compiled.status;
-                self.rpcl = compiled.program;
-            }
-            if !self.ocal.is_empty() {
-                let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
-                self.oclv = compiled.status;
-                self.orpc = compiled.program;
-            }
+            // and `oclv = postfix(...)`, UNCONDITIONALLY, both logged but never
+            // fatal. Base `postfix()` refuses an empty expression
+            // (`postfix.c:235-240`: CALC_ERR_NULL_ARG, return -1), so C's own
+            // default `field(OCAL,"")` record inits with OCLV = -1 and a
+            // `field(CALC,"")` one with CLCV = -1. The port skipped the compile
+            // when the field was empty and left the validity code at 0, so a
+            // record that C reports as invalid looked healthy — and CLCV then
+            // depended on whether the value arrived from the db file or from a
+            // later put, which is not a distinction C makes. The compile is the
+            // single owner of CLCV/RPCL on both paths.
+            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+            self.clcv = compiled.status;
+            self.rpcl = compiled.program;
+
+            let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
+            self.oclv = compiled.status;
+            self.orpc = compiled.program;
             self.pval = self.val;
             self.mlst = self.val;
             self.alst = self.val;

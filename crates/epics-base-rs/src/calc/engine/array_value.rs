@@ -29,9 +29,17 @@ impl ArrayStackValue {
         }
     }
 
-    pub fn broadcast(self, target_len: usize) -> Vec<f64> {
+    /// C `to_array(..., setValues=1)` (`aCalcPerform.c:124-143`) — the ONLY way
+    /// a scalar becomes an array in aCalc, and it does not simply repeat the
+    /// scalar: **a NaN scalar fills the array with 0**, not with NaN
+    /// (`:135-138`). Every promotion must go through here so that rule cannot be
+    /// bypassed.
+    pub fn to_array(self, array_size: usize) -> Vec<f64> {
         match self {
-            ArrayStackValue::Double(v) => vec![v; target_len],
+            ArrayStackValue::Double(v) => {
+                let fill = if v.is_nan() { 0.0 } else { v };
+                vec![fill; array_size]
+            }
             ArrayStackValue::Array(arr) => arr,
         }
     }
@@ -64,11 +72,22 @@ pub fn zip_map<F: Fn(f64, f64) -> f64>(
                     .collect(),
             ))
         }
+        // C's binary arms promote the LEFT operand only — `toArray(ps,1)`
+        // (`aCalcPerform.c:630`, :1338) — and then read the right one as the
+        // plain double `ps1->d` (:659-684). The two mixed shapes are therefore
+        // NOT mirror images when the scalar is NaN:
+        //
+        //   array OP NaN -> the NaN goes into every element (no promotion)
         (ArrayStackValue::Array(arr), ArrayStackValue::Double(scalar)) => Ok(
             ArrayStackValue::Array(arr.into_iter().map(|x| f(x, scalar)).collect()),
         ),
-        (ArrayStackValue::Double(scalar), ArrayStackValue::Array(arr)) => Ok(
-            ArrayStackValue::Array(arr.into_iter().map(|y| f(scalar, y)).collect()),
-        ),
+        //   NaN OP array -> the NaN is promoted, and `to_array` turns it into 0
+        (ArrayStackValue::Double(scalar), ArrayStackValue::Array(arr)) => {
+            let len = arr.len();
+            let left = ArrayStackValue::Double(scalar).to_array(len);
+            Ok(ArrayStackValue::Array(
+                left.into_iter().zip(arr).map(|(x, y)| f(x, y)).collect(),
+            ))
+        }
     }
 }

@@ -174,10 +174,14 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
     .await
     .unwrap();
 
-    // acalcout: CALC="1/0" → non-finite → calc_failed → INVALID; IVOA=2
+    // acalcout: CALC="1e300*1e300" → non-finite → calc_failed → INVALID; IVOA=2
     // (Set_output_to_IVOV), IVOV=99; OOPT=Every → output due; ODLY=100; OUT→PROBE.
+    // R8-7: this used to be "1/0" on the belief that the array engine divides in
+    // IEEE. C answers myMAXFLOAT/st=0 for aCalc `1/0` (aCalcPerform.c:690-696),
+    // so it cannot drive the INVALID cycle this case needs; `1e300*1e300` is the
+    // C-verified non-finite one (compiled aCalcPerform: st=-1 d=inf).
     let mut a = AcalcoutRecord::default();
-    a.put_field("CALC", EpicsValue::String("1/0".into()))
+    a.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
         .unwrap();
     a.special("CALC", true).unwrap();
     a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
@@ -250,10 +254,12 @@ async fn acalcout_odly_dont_drive_still_defers() {
     .await
     .unwrap();
 
-    // acalcout: CALC="1/0" → non-finite → calc_failed → INVALID; IVOA=1
+    // acalcout: CALC="1e300*1e300" → non-finite → calc_failed → INVALID; IVOA=1
     // (Don't_drive); OOPT=Every → output due; ODLY=100; OUT→PROBE.
+    // R8-7: was "1/0", which C evaluates to myMAXFLOAT with st=0 — see the
+    // sibling case above.
     let mut a = AcalcoutRecord::default();
-    a.put_field("CALC", EpicsValue::String("1/0".into()))
+    a.put_field("CALC", EpicsValue::String("1e300*1e300".into()))
         .unwrap();
     a.special("CALC", true).unwrap();
     a.put_field("IVOA", EpicsValue::Short(1)).unwrap();

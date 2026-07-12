@@ -318,11 +318,13 @@ fn test_arr() {
     assert_eq!(result, ArrayStackValue::Array(vec![42.0, 42.0, 42.0]));
 }
 
+/// aCalc's array->double op is spelled `DBL` (aCalcPostfix.c:133 `{"DBL", …,
+/// TO_DOUBLE}`); `ATOD`, which these two cases used to name, is in no C table.
 #[test]
 fn test_atod() {
     let mut inputs = ArrayInputs::new(3);
     inputs.arrays[0] = vec![7.0, 8.0, 9.0];
-    let result = eval_arr_with("ATOD(AA)", &mut inputs);
+    let result = eval_arr_with("DBL(AA)", &mut inputs);
     assert_eq!(result, ArrayStackValue::Double(7.0));
 }
 
@@ -330,7 +332,7 @@ fn test_atod() {
 fn test_atod_empty() {
     let mut inputs = ArrayInputs::new(3);
     // AA is empty
-    let result = eval_arr_with("ATOD(AA)", &mut inputs);
+    let result = eval_arr_with("DBL(AA)", &mut inputs);
     assert_eq!(result, ArrayStackValue::Double(0.0));
 }
 

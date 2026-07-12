@@ -413,13 +413,32 @@ pub struct ProcessSnapshot {
 /// they do not share a failure shape, so the framework cannot pick one rule
 /// for all of them — each record declares its own via
 /// [`Record::input_fetch_policy`].
+///
+/// The two dimensions C varies are "does the loop stop at the first failure"
+/// and "does a failure gate the record body", and it uses three of the four
+/// combinations. Whichever variant a record picks, the framework reduces the
+/// cycle to ONE outcome — C's `fetch_values()` return status, zero or not —
+/// and delivers it through a single owner: [`Record::set_fetch_gate_failed`]
+/// for records that compute in their own `process()`, and
+/// `RecordInstance::suppress_subroutine_run` for the two whose body is a
+/// framework-dispatched subroutine (sub/aSub).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFetchPolicy {
-    /// Read every configured link; a failed read does not stop the loop.
-    /// C `calcRecord.c::fetch_values` (427-443) and
-    /// `transformRecord.c::process` (531-545) keep going after a failed
-    /// `dbGetLink`, so the inputs behind the failure still refresh.
+    /// Read every configured link; a failed read neither stops the loop nor
+    /// gates the record body. C `transformRecord.c::process` (531-545) reads
+    /// on through a failed `dbGetLink` and computes anyway.
     ReadAll,
+    /// Read every configured link — a failure does NOT stop the loop, so the
+    /// inputs behind it still refresh — but the body is skipped this cycle.
+    ///
+    /// C `calcRecord.c::fetch_values` (427-443) keeps the FIRST failing status
+    /// while looping to the end (`if (status == 0) status = newStatus;`), and
+    /// `calcRecord.c::process` (120) runs `calcPerform` only
+    /// `if (fetch_values(prec) == 0)` — so VAL and UDF freeze, no CALC_ALARM is
+    /// raised, and everything after the calc (timestamp, alarms, monitors,
+    /// forward link) still runs. `calcoutRecord.c` (694-709 fetch, 237 gate) is
+    /// the same shape, and its OOPT decision then runs against the frozen VAL.
+    ReadAllGateOnFailure,
     /// Stop at the FIRST failed link and skip the record body this cycle.
     ///
     /// C `subRecord.c::fetch_values` (407-418) `return -1`s on the first
@@ -427,11 +446,9 @@ pub enum InputFetchPolicy {
     /// their previous values; `subRecord.c::process` (145-146) then runs
     /// `do_sub` only `if (status == 0)`, freezing VAL/UDF and raising none of
     /// the subroutine's alarms. `aSubRecord.c` (277-289 fetch, 216-218
-    /// process) is the same shape.
-    ///
-    /// The framework consumes the gate through the single subroutine-skip
-    /// owner (`RecordInstance::suppress_subroutine_run`), which is what runs
-    /// the body for these two record types.
+    /// process), `sCalcoutRecord.c` (885-887 fetch, 356 gate),
+    /// `aCalcoutRecord.c` (1068-1071 fetch, 399 gate) and
+    /// `swaitRecord.c` (686-705 fetch, 408 gate) are the same shape.
     AbortOnFirstFailure,
 }
 
@@ -1093,14 +1110,23 @@ pub trait Record: Send + Sync + 'static {
     /// [`Record::set_process_context`]). Default: ignore.
     fn set_resolved_input_links(&mut self, _resolved: &[&'static str]) {}
 
-    /// Report that a record which gates its value update on a *selected*
-    /// input read (currently sel in `Specified` mode) had that gating
-    /// fetch fail this cycle. C `selRecord.c::process` (line 114) runs
-    /// `do_sel` only when `fetch_values` succeeds; on failure VAL/UDF
-    /// freeze. `failed == true` ⇒ the configured selected input or NVL
-    /// link did not resolve, so `process()` must hold the previous output.
-    /// Default: ignore (records with no fetch gate). Same framework-set
-    /// hook pattern as [`Record::set_resolved_input_links`].
+    /// Report this cycle's `fetch_values()` outcome: `failed == true` means C's
+    /// helper would have returned a non-zero status, so the record body — the
+    /// `calcPerform` / `do_sel` the C `process()` wraps in
+    /// `if (fetch_values(prec) == 0)` — must NOT run, and VAL/UDF freeze.
+    ///
+    /// This is the single delivery point for that outcome, whichever
+    /// [`InputFetchPolicy`] produced it (a failed link read) and whichever
+    /// record-specific rule did (sel's `Specified`-mode selected-input read).
+    /// Records that gate: calc (calcRecord.c:120), calcout (:237), sCalcout
+    /// (sCalcoutRecord.c:356), aCalcout (aCalcoutRecord.c:399), swait
+    /// (swaitRecord.c:408 — which additionally raises READ_ALARM/INVALID on the
+    /// failure) and sel (selRecord.c:114). sub/aSub gate the same outcome, but
+    /// their body is the framework-dispatched subroutine, so they consume it
+    /// through `RecordInstance::suppress_subroutine_run` instead.
+    ///
+    /// Default: ignore (records with no fetch gate). Same framework-set hook
+    /// pattern as [`Record::set_resolved_input_links`].
     fn set_fetch_gate_failed(&mut self, _failed: bool) {}
 
     /// Called before/after a field put for side-effect processing.

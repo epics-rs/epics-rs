@@ -3,7 +3,7 @@ use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, classify_
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -132,6 +132,12 @@ pub struct CalcoutRecord {
     pending_output: bool,
     // CALC_ALARM flag
     pub calc_alarm: bool,
+    // This cycle's `fetch_values()` outcome, pushed by the framework through
+    // `set_fetch_gate_failed`. C `calcoutRecord.c::process` (237) runs
+    // `calcPerform` only `if (fetch_values(prec) == 0)`: a failed input link
+    // freezes VAL/UDF and raises no CALC_ALARM, while the OOPT switch, the
+    // output and the monitors still run against the frozen VAL.
+    fetch_gate_failed: bool,
     // Cached compiled expressions (RPCL/ORPC equivalents)
     rpcl: Option<crate::calc::CompiledExpr>,
     orpc: Option<crate::calc::CompiledExpr>,
@@ -256,6 +262,7 @@ impl Default for CalcoutRecord {
             oevt: String::new(),
             pending_output: false,
             calc_alarm: false,
+            fetch_gate_failed: false,
             rpcl: None,
             orpc: None,
             clcv: 0,
@@ -1054,20 +1061,28 @@ impl Record for CalcoutRecord {
         // not before. It holds the previous cycle's value for
         // transition detection in should_output().
 
+        // C `calcoutRecord.c::process` (237-243) runs the calc only
+        // `if (fetch_values(prec) == 0)`. A failed input link freezes VAL and
+        // UDF and raises no CALC_ALARM; the OOPT decision below then runs
+        // against that frozen VAL (C leaves the switch OUTSIDE the gate), so an
+        // OOPT of Every_Time still drives OUT with the previous value.
+        //
         // Evaluate CALC using cached RPCL
-        if let Some(ref compiled) = self.rpcl {
-            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
-            // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
-            // passes `presult = &val`, so the CALC `VAL` token reads the
-            // *previous* VAL. Seed before `self.val` is overwritten below.
-            inputs.prev_val = self.val;
-            match crate::calc::eval(compiled, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
+        if !self.fetch_gate_failed {
+            if let Some(ref compiled) = self.rpcl {
+                let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+                // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
+                // passes `presult = &val`, so the CALC `VAL` token reads the
+                // *previous* VAL. Seed before `self.val` is overwritten below.
+                inputs.prev_val = self.val;
+                match crate::calc::eval(compiled, &mut inputs) {
+                    Ok(v) => {
+                        self.val = v;
+                        self.calc_alarm = false;
+                    }
+                    Err(_) => {
+                        self.calc_alarm = true;
+                    }
                 }
             }
         }
@@ -1674,6 +1689,16 @@ impl Record for CalcoutRecord {
             ("INPT", "T"),
             ("INPU", "U"),
         ]
+    }
+
+    /// C `calcoutRecord.c::fetch_values` (694-709) reads every INP link and
+    /// keeps the FIRST failing status; `process` (237) gates `calcPerform` on it.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::ReadAllGateOnFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 
     fn should_output(&self) -> bool {

@@ -4,7 +4,7 @@ use crate::calc::{CompiledExpr, compile as calc_compile, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue};
 
@@ -87,6 +87,22 @@ pub struct SwaitRecord {
     // swaitRecord.dbd:166-250); written only by `refresh_link_status`, the
     // single owner of the classification, through `put_field_internal`.
     pv_status: [i16; 14],
+    // This cycle's `fetch_values()` outcome, pushed by the framework through
+    // `set_fetch_gate_failed`. C `swaitRecord.c::process` (407-414):
+    //
+    // ```c
+    // if (fetch_values(pwait)==0) {
+    //     if (calcPerform(...)) recGblSetSevr(pwait,CALC_ALARM,INVALID_ALARM);
+    //     else pwait->udf = FALSE;
+    // } else {
+    //     recGblSetSevr(pwait,READ_ALARM,INVALID_ALARM);
+    // }
+    // ```
+    //
+    // — so unlike the calc family, a failed input ALSO raises READ_ALARM at
+    // INVALID severity. The OOPT switch that follows (:424) is outside the
+    // gate and runs against the frozen VAL.
+    fetch_gate_failed: bool,
     // Async context + generation gate for `refresh_link_status`, the same
     // shape calcout/sseq use (see `link_status::LinkStatusGen`): a refresh
     // classifies a snapshot of the link names off-thread, and only the latest
@@ -127,6 +143,7 @@ impl Default for SwaitRecord {
             // C `init_record` sets NO_PV for every blank name (swaitRecord.c:349),
             // and every name starts blank.
             pv_status: [SWAIT_NO_PV; 14],
+            fetch_gate_failed: false,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             cached_should_output: true,
@@ -729,12 +746,34 @@ impl Record for SwaitRecord {
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        use crate::server::recgbl::{self, alarm_status};
+        use crate::server::record::AlarmSeverity;
+
         // OUTN lives in the common fields, so a runtime re-point is invisible to
         // `special()`. Catch it here — the same split calcout uses for its OUT.
         if self.out != common.out {
             self.out = common.out.clone();
             self.refresh_link_status();
         }
+
+        // C `swaitRecord.c:412-414`: the `else` arm of the fetch gate —
+        // `recGblSetSevr(pwait, READ_ALARM, INVALID_ALARM)`. This is what makes
+        // swait's gate visible to a client even though VAL simply freezes; the
+        // calc family raises nothing at all on the same failure.
+        if self.fetch_gate_failed {
+            recgbl::rec_gbl_set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
+        }
+    }
+
+    /// C `swaitRecord.c::fetch_values` (686-705) returns at the FIRST input that
+    /// is `PV_NC` or whose `recDynLinkGet` fails, and `process` (408) gates
+    /// `calcPerform` on the status.
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -758,12 +797,20 @@ impl Record for SwaitRecord {
         // the OOPT decision.
         let old_val = self.oval;
 
-        if let Some(ref compiled) = self.compiled_calc {
-            let mut inputs = self.build_inputs(self.val);
-            // C `swaitRecord.c:409` — `calcPerform(&pwait->a, &pwait->val,
-            // pwait->rpcl)`: the numeric engine, whose result is a double.
-            if let Ok(v) = calc_eval(compiled, &mut inputs) {
-                self.val = v;
+        // C `swaitRecord.c:407-414` runs the calc only `if (fetch_values(pwait)
+        // ==0)`; its `fetch_values` (686-705) returns at the first input that is
+        // PV_NC or whose get fails. A failed input freezes VAL and UDF and
+        // raises READ_ALARM/INVALID instead (see `check_alarms`). The OOPT
+        // decision below stays outside the gate, as in C — it runs against the
+        // frozen VAL.
+        if !self.fetch_gate_failed {
+            if let Some(ref compiled) = self.compiled_calc {
+                let mut inputs = self.build_inputs(self.val);
+                // C `swaitRecord.c:409` — `calcPerform(&pwait->a, &pwait->val,
+                // pwait->rpcl)`: the numeric engine, whose result is a double.
+                if let Ok(v) = calc_eval(compiled, &mut inputs) {
+                    self.val = v;
+                }
             }
         }
 

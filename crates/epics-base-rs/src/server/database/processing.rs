@@ -1717,12 +1717,15 @@ impl PvDatabase {
         // `select_input_links`), so the gate fails when the NVL link or the
         // selected input was configured but did not resolve this cycle.
         let sel_fetch_failed: bool;
-        // sub/aSub abort-on-first-failure gate: C `subRecord.c::fetch_values`
-        // (407-418) / `aSubRecord.c::fetch_values` (277-289) `return` on the
-        // first failed `dbGetLink`, and `process` (subRecord.c:146,
-        // aSubRecord.c:216) then skips `do_sub`. Armed here, consumed via
-        // `RecordInstance::suppress_subroutine_run` below.
-        let mut input_fetch_aborted = false;
+        // This cycle's `fetch_values()` outcome — non-zero status in C, i.e.
+        // "the record body must not run". Derived from the record's declared
+        // `InputFetchPolicy` (see the loop below) and folded with the sel gate
+        // into ONE boolean, which is then delivered to its single consumer:
+        // `Record::set_fetch_gate_failed` for records that compute in their own
+        // `process()` (calc/calcout/scalcout/acalcout/swait/sel), and
+        // `RecordInstance::suppress_subroutine_run` for the two whose body is
+        // the framework-dispatched subroutine (sub/aSub).
+        let mut fetch_values_failed = false;
         {
             let input_fetch_policy;
             let link_info: Vec<(String, &'static str, String)> = {
@@ -1796,18 +1799,35 @@ impl PvDatabase {
                             _ => {}
                         }
                     }
-                    // C `subRecord.c::fetch_values` (407-418):
-                    // `if (dbGetLink(plink, ...)) return -1;` — the loop stops
-                    // dead at the first failing link. Every input behind it is
-                    // never read, so its value field keeps the previous cycle's
-                    // value (no monitor, no PP of that source, no link-alarm
-                    // inheritance), and the record body is skipped below. The
-                    // failed link's own alarm is already folded above: C's
-                    // `dbGetLink` raises the MS severity for the link it failed
-                    // on before returning.
-                    if read_failed && input_fetch_policy == InputFetchPolicy::AbortOnFirstFailure {
-                        input_fetch_aborted = true;
-                        break;
+                    // The record's declared fetch shape decides what a failed
+                    // read means. The failed link's own alarm is already folded
+                    // above in every shape: C's `dbGetLink` raises the MS
+                    // severity for the link it failed on before returning.
+                    if read_failed {
+                        match input_fetch_policy {
+                            // C `transformRecord.c::process` (531-545): read on,
+                            // and compute anyway.
+                            InputFetchPolicy::ReadAll => {}
+                            // C `calcRecord.c::fetch_values` (427-443):
+                            // `if (status == 0) status = newStatus;` — the loop
+                            // runs to the end, so the inputs behind the failure
+                            // still refresh (and post), but the first failing
+                            // status is what `process` (:120) gates the calc on.
+                            InputFetchPolicy::ReadAllGateOnFailure => {
+                                fetch_values_failed = true;
+                            }
+                            // C `subRecord.c::fetch_values` (407-418):
+                            // `if (dbGetLink(plink, ...)) return -1;` — the loop
+                            // stops dead at the first failing link. Every input
+                            // behind it is never read, so its value field keeps
+                            // the previous cycle's value (no monitor, no PP of
+                            // that source, no link-alarm inheritance), and the
+                            // record body is skipped below.
+                            InputFetchPolicy::AbortOnFirstFailure => {
+                                fetch_values_failed = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -2055,11 +2075,14 @@ impl PvDatabase {
                 .record
                 .set_resolved_input_links(&resolved_link_fields);
 
-            // Report the sel Specified-mode fetch-gate outcome. C
-            // `selRecord.c::process` (114) skips `do_sel` — freezing
-            // VAL/UDF — when `fetch_values` fails. Non-sel records ignore
-            // this (default no-op). Reported per cycle; sel consumes it.
-            instance.record.set_fetch_gate_failed(sel_fetch_failed);
+            // The cycle's single `fetch_values()` outcome: a link read that
+            // failed under a gating `InputFetchPolicy`, or sel's Specified-mode
+            // selected-input read that did not resolve (C `selRecord.c::process`
+            // (114) skips `do_sel` on it). Every C record that gates its body on
+            // `if (fetch_values(prec) == 0)` reads it from here — one boolean,
+            // one hook — and a record with no gate ignores it (default no-op).
+            let fetch_gate_failed = fetch_values_failed || sel_fetch_failed;
+            instance.record.set_fetch_gate_failed(fetch_gate_failed);
 
             // Note: C EPICS LCNT prevents reentrant processing of the same
             // record within a single processing chain. In Rust, this is handled
@@ -2140,8 +2163,10 @@ impl PvDatabase {
             // alarms (BAD_SUB / SOFT at BRSV) or its `udf = isnan(val)` update
             // happen. Same one-shot flag the aSub bad-SNAM skip arms, consumed
             // by the single owner `run_registered_subroutine`; OR-ed in so
-            // whichever reason fired first still suppresses the run.
-            if input_fetch_aborted {
+            // whichever reason fired first still suppresses the run. Same
+            // `fetch_values()` outcome the `set_fetch_gate_failed` hook above
+            // carries — sub/aSub differ only in WHERE their body runs.
+            if fetch_gate_failed {
                 instance.suppress_subroutine_run = true;
             }
 

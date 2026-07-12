@@ -1,7 +1,7 @@
 use super::calc_compile;
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -63,6 +63,11 @@ pub struct ScalcoutRecord {
     /// already inspects a `CALC_ALARM` field for `scalcout`, so this
     /// flag is surfaced through `get_field("CALC_ALARM")`.
     calc_alarm: bool,
+    /// This cycle's `fetch_values()` outcome, pushed by the framework through
+    /// `set_fetch_gate_failed`. C `sCalcoutRecord.c::process` (356) runs
+    /// `sCalcPerform` only `if (fetch_values(pcalc)==0)`, and `fetch_values`
+    /// (885-887) returns at the first failing numeric `dbGetLink`.
+    fetch_gate_failed: bool,
     /// Output decision from the last `process()`. The framework's
     /// generic multi-output dispatch reads `multi_output_links()`
     /// unconditionally, so this caches the OOPT decision and gates
@@ -115,6 +120,7 @@ impl Default for ScalcoutRecord {
             prev_val: 0.0,
             prev_sval: PvString::new(),
             calc_alarm: false,
+            fetch_gate_failed: false,
             cached_should_output: false,
             odly: 0.0,
             dlya: 0,
@@ -615,9 +621,16 @@ impl Record for ScalcoutRecord {
         // indication.
         self.calc_alarm = false;
 
+        // C `sCalcoutRecord.c::process` (356-367) runs the calc only
+        // `if (fetch_values(pcalc)==0)`, and its `fetch_values` (885-887)
+        // returns at the FIRST failing numeric `dbGetLink`. A failed input link
+        // therefore freezes VAL/SVAL/UDF and raises no CALC_ALARM; the OOPT
+        // switch, ODLY and the output below still run against the frozen VAL,
+        // exactly as in C where the gate wraps only the `sCalcPerform` block.
+        //
         // A non-empty CALC that did not compile is itself a broken
         // expression — flag it (scalc_eval is never reached for None).
-        let calc_failed = if self.calc.is_empty() {
+        let calc_failed = if self.fetch_gate_failed || self.calc.is_empty() {
             false
         } else if let Some(ref compiled) = self.compiled_calc {
             // C `sCalcoutRecord.c:357-359` — presult = &pcalc->val,
@@ -976,6 +989,20 @@ impl Record for ScalcoutRecord {
             ("INPK", "K"),
             ("INPL", "L"),
         ]
+    }
+
+    /// C `sCalcoutRecord.c::fetch_values` (885-887) `return`s at the first
+    /// failing numeric `dbGetLink`, and `process` (356) gates `sCalcPerform` on
+    /// the status. (C's string-input loop that follows cannot fail the gate — it
+    /// swallows its own errors into the input string and returns 0 — and the
+    /// port does not fetch INAA..INLL at all, so only the numeric links are
+    /// represented here.)
+    fn input_fetch_policy(&self) -> InputFetchPolicy {
+        InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 
     /// scalcout writes its computed output to the `OUT` link. The

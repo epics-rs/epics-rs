@@ -3,10 +3,11 @@ use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, scan_leading_i64,
-    sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str,
+    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
+use epics_ca_rs::copt::CTool;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
@@ -25,14 +26,15 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
     // C `caput.c:535,583` calls its `caget()` with `reqElems = 0`, so the
     // count prefix reduces to `nElems > 1` and the `-S` long-string gate to
-    // `reqElems(0) || reqElems_pv > 1` — `req_elems` is always false here even
-    // though `-#` is accepted on the command line (its value is overwritten
-    // before the put, `caput.c:418,441`).
+    // `reqElems(0) || reqElems_pv > 1`. C's readback call is literally
+    // `caget(pvs, nPvs, format, 0, 0)` (`caput.c:537`) — `reqElems` is a
+    // hardcoded 0 — which is why `caput` never sets `ValueFormat::req_elems`
+    // even though `-#` is accepted on the command line (its value is
+    // overwritten before the put, `caput.c:418,441`).
     let val = format_value(
         &snap.value,
         fmt,
         enum_strings,
-        false,
         CountPrefix::IfRequestedOrArray,
     );
     let ts = format_server_timestamp(snap.timestamp);
@@ -101,7 +103,7 @@ fn readback_line(
         // C treats a timed-out read exactly like a successful one here: the
         // zeroed buffer is still a buffer (see `zero_readback`).
         Readback::Value(v, snap) | Readback::TimedOut(v, snap) => {
-            let rendered = format_value(v, fmt, None, false, CountPrefix::IfRequestedOrArray);
+            let rendered = format_value(v, fmt, None, CountPrefix::IfRequestedOrArray);
             if terse {
                 return Some(rendered);
             }
@@ -128,6 +130,10 @@ fn readback_line(
     }
 }
 
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]).
+const TOOL: CTool = CTool::new("caput");
+
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
     env!("CARGO_PKG_VERSION"),
@@ -153,18 +159,20 @@ struct Args {
     #[arg(short = 'V', long, hide = true)]
     version: bool,
 
-    /// CA timeout in seconds. Mirrors C `tool_lib.c:use_ca_timeout_env`.
-    #[arg(short = 'w', long = "timeout")]
-    timeout: Option<f64>,
+    /// CA timeout in seconds (`epicsScanDouble`; a bad value warns and keeps
+    /// the default — `caput.c:323-332`). Raw `String`: every C-scanned option
+    /// argument is resolved by [`epics_ca_rs::copt`], never by clap.
+    #[arg(short = 'w', long = "timeout", allow_hyphen_values = true)]
+    timeout: Option<String>,
 
     /// Wait for completion callback (`ca_put_callback`).
     #[arg(short = 'c', long = "callback")]
     callback: bool,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
+    /// and `-p 500` both clamp to 99 in C, `caput.c:344-351`).
+    #[arg(short = 'p', long, allow_hyphen_values = true)]
+    priority: Option<String>,
 
     /// Terse output: print only the new value (no `Old :`/`New :`
     /// prefix, no PV name).
@@ -214,12 +222,23 @@ struct Args {
     /// Held as a raw `String` so a non-numeric argument reproduces C's
     /// `sscanf`-failure warning ([`Args::warn_bad_element_count`]) instead of
     /// clap's own parse error.
-    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
+    #[arg(
+        short = '#',
+        long = "max-elements",
+        value_name = "COUNT",
+        allow_hyphen_values = true
+    )]
     max_elements: Option<String>,
 
-    /// Alternate output field separator.
-    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
-    field_separator: Option<char>,
+    /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
+    /// character, discarding the rest (`caput.c:353`).
+    #[arg(
+        short = 'F',
+        long = "field-separator",
+        value_name = "OFS",
+        allow_hyphen_values = true
+    )]
+    field_separator: Option<String>,
 
     /// Positional PV name.
     #[arg(required_unless_present_any = ["version"])]
@@ -235,17 +254,13 @@ struct Args {
 impl Args {
     /// C `caput.c:336-343`: `-#` scans its argument with `sscanf("%d")` and,
     /// on failure, warns and falls back to `count = 0`. The count is dead
-    /// either way (see [`Args::max_elements`]), so this warning is the flag's
-    /// ONLY observable effect — reproduce it rather than swallow the argument
-    /// silently. `None` when `-#` was absent or its argument scanned.
-    fn warn_bad_element_count_text(&self) -> Option<String> {
-        let raw = self.max_elements.as_deref()?;
-        if scan_leading_i64(raw).is_some() {
-            return None;
-        }
-        Some(format!(
-            "'{raw}' is not a valid array element count - ignored. ('caput -h' for help.)"
-        ))
+    /// either way (see [`Args::max_elements`]), so the warning is the flag's
+    /// ONLY observable effect — but it is emitted by the SAME owner every
+    /// other C-scanned option uses ([`CTool::req_elems_int`]), so `caput`
+    /// cannot drift from `caget` on what "not a valid array element count"
+    /// means. The returned count is deliberately discarded.
+    fn scan_dead_element_count(&self) {
+        let _ = TOOL.req_elems_int(self.max_elements.as_deref());
     }
 }
 
@@ -253,9 +268,7 @@ impl Args {
 async fn main() {
     let args = Args::parse();
     // C warns inside its getopt loop, before any of the work below.
-    if let Some(warning) = args.warn_bad_element_count_text() {
-        eprintln!("{warning}");
-    }
+    args.scan_dead_element_count();
 
     if args.version {
         println!("{VERSION_INFO}");
@@ -276,26 +289,26 @@ async fn main() {
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    let timeout = epics_ca_rs::cli::timeout_duration(
-        args.timeout
-            .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
-    );
+    // C `-w`: `epicsScanDouble` overwrites the env-loaded `caTimeout` only on
+    // a successful scan; a bad value warns and the put still runs.
+    let timeout = epics_ca_rs::cli::timeout_duration(TOOL.timeout(
+        args.timeout.as_deref(),
+        epics_ca_rs::cli::env_default_timeout(),
+    ));
 
+    let priority = TOOL.priority(args.priority.as_deref());
     // -p selects the priority virtual circuit. C `caput.c:406-410` runs the
     // same `connect_pvs` barrier as caget/cainfo ("If the connection fails,
     // we're done"): its ECA_TIMEOUT diagnostic names the single PV, and the
     // put phase never starts.
     let names = [pv_name.clone()];
-    let ch =
-        match epics_ca_rs::cli::connect_pvs(&client, &names, args.priority.unwrap_or(0), timeout)
-            .await
-        {
-            Ok(mut channels) => channels.remove(0),
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        };
+    let ch = match epics_ca_rs::cli::connect_pvs(&client, &names, priority, timeout).await {
+        Ok(mut channels) => channels.remove(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     // The channel's native field type drives how the value to WRITE is
     // encoded (C `ca_field_type`, caput.c:143) — it must stay the real
@@ -374,7 +387,7 @@ async fn main() {
         char_array_as_string: args.long_string,
         ..ValueFormat::default()
     };
-    if let Some(c) = args.field_separator {
+    if let Some(c) = TOOL.field_separator(args.field_separator.as_deref()) {
         fmt.field_separator = c;
     }
     let sep = fmt.field_separator;
@@ -962,6 +975,7 @@ mod tests {
     use clap::Parser;
     use epics_base_rs::types::WallTime;
     use epics_ca_rs::cli::EPICS_EPOCH_UNIX_SECS;
+    use epics_ca_rs::copt::scan_i32;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
@@ -988,8 +1002,9 @@ mod tests {
         assert_eq!(a.pv_name.as_deref(), Some("PV"));
         assert_eq!(a.values, vals(&["42"]));
         // The count that reaches the wire comes from the values, never from
-        // `-#` — C overwrites it at caput.c:441.
-        assert!(a.warn_bad_element_count_text().is_none());
+        // `-#` — C overwrites it at caput.c:441. The scan is still performed
+        // (through the shared owner), purely for its warning.
+        assert_eq!(scan_i32("3"), Some(3));
 
         // Array mode: `-# 1` must not truncate the 3-element write.
         let a = Args::try_parse_from(["caput", "-a", "-#", "1", "WF", "3", "1", "2", "3"])
@@ -1001,14 +1016,12 @@ mod tests {
         // (caput.c:337-342). It must NOT be a hard error.
         let a = Args::try_parse_from(["caput", "-#", "abc", "PV", "42"])
             .expect("C warns on a bad -# argument, it does not exit");
-        assert_eq!(
-            a.warn_bad_element_count_text().as_deref(),
-            Some("'abc' is not a valid array element count - ignored. ('caput -h' for help.)")
-        );
+        assert_eq!(a.max_elements.as_deref(), Some("abc"));
+        assert_eq!(scan_i32("abc"), None, "the owner warns and falls back to 0");
         // C's `sscanf("%d")` takes a LEADING integer and ignores the tail, so
         // `3x` scans fine and warns nothing.
-        let a = Args::try_parse_from(["caput", "-#", "3x", "PV", "42"]).expect("leading digits");
-        assert!(a.warn_bad_element_count_text().is_none());
+        Args::try_parse_from(["caput", "-#", "3x", "PV", "42"]).expect("leading digits");
+        assert_eq!(scan_i32("3x"), Some(3));
     }
 
     /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two

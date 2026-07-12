@@ -1,6 +1,11 @@
 use clap::Parser;
 use epics_ca_rs::DbFieldType;
 use epics_ca_rs::client::CaClient;
+use epics_ca_rs::copt::CTool;
+
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]).
+const TOOL: CTool = CTool::new("cainfo");
 
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
@@ -19,8 +24,8 @@ struct Args {
     version: bool,
 
     /// CA timeout in seconds. Mirrors C `tool_lib.c:use_ca_timeout_env`.
-    #[arg(short = 'w', long = "wait")]
-    timeout: Option<f64>,
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true)]
+    timeout: Option<String>,
 
     /// `ca_client_status` interest level. A non-zero level prints the
     /// client status dump *instead of* per-PV info (C `cainfo.c:77-79`,
@@ -30,10 +35,10 @@ struct Args {
     #[arg(short = 's', long = "stat-level", value_name = "LEVEL")]
     stat_level: Option<String>,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
+    /// and `-p 500` both clamp to 99 in C, `cainfo.c:175-182`).
+    #[arg(short = 'p', long, allow_hyphen_values = true)]
+    priority: Option<String>,
 
     /// Show client diagnostic counters and event history (Rust-only,
     /// no C analogue). Unlike `-s`, this is *additive*: per-PV info still
@@ -43,45 +48,6 @@ struct Args {
 
     /// PV names to query.
     pv_names: Vec<String>,
-}
-
-/// `cainfo.c:167-173` `sscanf(optarg, "%u", &statLevel)` parity.
-///
-/// C `%u` skips leading whitespace, accepts an OPTIONAL sign (`+`/`-`),
-/// then reads a decimal-digit run, stopping at the first non-digit. With
-/// at least one digit the conversion succeeds and applies unsigned
-/// wrapping: a leading `-` negates modulo 2^32 (a local probe gives
-/// `sscanf("-1","%u") == 4294967295` and `sscanf("+3abc","%u") == 3`).
-/// With no digit after the optional sign the conversion fails and C resets
-/// `statLevel` to 0 with the warning. Any non-zero result selects
-/// `ca_client_status` mode, so the earlier digit-only parser wrongly
-/// dropped signed inputs like `-1`/`+3abc` into normal per-PV mode.
-fn parse_stat_level(s: &str) -> u32 {
-    let mut chars = s.trim_start().chars().peekable();
-    let neg = match chars.peek() {
-        Some('+') => {
-            chars.next();
-            false
-        }
-        Some('-') => {
-            chars.next();
-            true
-        }
-        _ => false,
-    };
-    let digits: String = chars.take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        eprintln!("'{s}' is not a valid interest level - ignored. ('cainfo -h' for help.)");
-        return 0;
-    }
-    // C `%u` accumulates the magnitude into a 64-bit `unsigned long`
-    // (strtoul, clamping to ULONG_MAX only past 2^64) and then assigns it
-    // to the 32-bit `unsigned int statLevel` by truncation mod 2^32 — a
-    // local probe gives `sscanf("99999999999","%u") == 1215752191`
-    // (== 99999999999 mod 2^32), NOT a saturated `u32::MAX`. Mirror with a
-    // u64 parse, `as u32` truncation, then the sign via wrapping negation.
-    let mag = (digits.parse::<u64>().unwrap_or(u64::MAX)) as u32;
-    if neg { mag.wrapping_neg() } else { mag }
 }
 
 #[tokio::main]
@@ -97,11 +63,7 @@ async fn main() {
     // mode, which prints the client status dump *instead of* per-PV
     // info and does not require PV names. Zero (or an unparseable `-s`)
     // is normal per-PV mode. `--diag` is the Rust-only additive flag.
-    let stat_level = args
-        .stat_level
-        .as_deref()
-        .map(parse_stat_level)
-        .unwrap_or(0);
+    let stat_level = TOOL.stat_level(args.stat_level.as_deref());
     let stat_mode = stat_level != 0;
 
     // C `cainfo.c:202-205`: a missing PV list is an error unless a
@@ -123,13 +85,15 @@ async fn main() {
         return;
     }
 
-    let timeout = epics_ca_rs::cli::timeout_duration(
-        args.timeout
-            .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
-    );
+    // C `-w`: `epicsScanDouble` overwrites the env-loaded `caTimeout` only on
+    // a successful scan; a bad value warns and the query still runs.
+    let timeout = epics_ca_rs::cli::timeout_duration(TOOL.timeout(
+        args.timeout.as_deref(),
+        epics_ca_rs::cli::env_default_timeout(),
+    ));
 
     // -p selects the priority virtual circuit.
-    let priority = args.priority.unwrap_or(0);
+    let priority = TOOL.priority(args.priority.as_deref());
     // C `cainfo.c:228-232`: `connect_pvs` gates the ENTIRE per-PV print
     // phase (`if (!result) result = cainfo(pvs, nPvs)`). One PV that fails
     // to connect inside the single `ca_pend_io` window aborts before
@@ -238,19 +202,23 @@ fn dbr_name(t: DbFieldType) -> &'static str {
 mod tests {
     use super::*;
 
-    // C `cainfo.c:167-173` `sscanf("%u")` semantics by boundary:
-    // valid → that level; `0` → 0 (normal mode, NOT diagnostics);
-    // unparseable → reset to 0 (ignored).
+    /// The `-s` scan now lives in the shared owner ([`CTool::stat_level`]),
+    /// which every C-scanned option argument in every tool goes through.
+    /// These boundaries are cainfo's stake in it.
+    ///
+    /// C `cainfo.c:167-173` `sscanf("%u")` semantics by boundary:
+    /// valid → that level; `0` → 0 (normal mode, NOT diagnostics);
+    /// unparseable → reset to 0 (ignored).
     #[test]
     fn stat_level_parses_like_sscanf_u() {
-        assert_eq!(parse_stat_level("0"), 0);
-        assert_eq!(parse_stat_level("1"), 1);
-        assert_eq!(parse_stat_level("10"), 10);
+        assert_eq!(TOOL.stat_level(Some("0")), 0);
+        assert_eq!(TOOL.stat_level(Some("1")), 1);
+        assert_eq!(TOOL.stat_level(Some("10")), 10);
         // Leading digits with trailing junk: sscanf("%u") stops at junk.
-        assert_eq!(parse_stat_level("3abc"), 3);
+        assert_eq!(TOOL.stat_level(Some("3abc")), 3);
         // No leading digits → ignored (reset to 0).
-        assert_eq!(parse_stat_level("abc"), 0);
-        assert_eq!(parse_stat_level(""), 0);
+        assert_eq!(TOOL.stat_level(Some("abc")), 0);
+        assert_eq!(TOOL.stat_level(Some("")), 0);
     }
 
     // C `%u` accepts an
@@ -260,20 +228,20 @@ mod tests {
     #[test]
     fn stat_level_accepts_signed_unsigned_prefix() {
         // `sscanf("-1","%u")` -> 4294967295 (probe-confirmed).
-        assert_eq!(parse_stat_level("-1"), 4_294_967_295);
+        assert_eq!(TOOL.stat_level(Some("-1")), 4_294_967_295);
         // `sscanf("+3abc","%u")` -> 3.
-        assert_eq!(parse_stat_level("+3abc"), 3);
+        assert_eq!(TOOL.stat_level(Some("+3abc")), 3);
         // Leading whitespace is skipped before the sign.
-        assert_eq!(parse_stat_level("  -5"), 5u32.wrapping_neg());
-        assert_eq!(parse_stat_level("+7"), 7);
+        assert_eq!(TOOL.stat_level(Some("  -5")), 5u32.wrapping_neg());
+        assert_eq!(TOOL.stat_level(Some("+7")), 7);
         // A sign with no following digit is not a match → reset to 0.
-        assert_eq!(parse_stat_level("-"), 0);
-        assert_eq!(parse_stat_level("+"), 0);
+        assert_eq!(TOOL.stat_level(Some("-")), 0);
+        assert_eq!(TOOL.stat_level(Some("+")), 0);
         // `-0` converts to 0 → normal per-PV mode (not diagnostics).
-        assert_eq!(parse_stat_level("-0"), 0);
+        assert_eq!(TOOL.stat_level(Some("-0")), 0);
         // Overflow truncates mod 2^32 (NOT saturate): probe-confirmed
         // `sscanf("99999999999","%u") == 1215752191`.
-        assert_eq!(parse_stat_level("99999999999"), 1_215_752_191);
+        assert_eq!(TOOL.stat_level(Some("99999999999")), 1_215_752_191);
     }
 
     // The decisive mode-selector property: any non-zero `parse_stat_level`
@@ -282,9 +250,13 @@ mod tests {
     // error — matching C `cainfo.c:202` `if (!statLevel && nPvs < 1)`.
     #[test]
     fn signed_stat_level_selects_status_mode() {
-        assert_ne!(parse_stat_level("-1"), 0, "-s -1 must enter status mode");
         assert_ne!(
-            parse_stat_level("+3abc"),
+            TOOL.stat_level(Some("-1")),
+            0,
+            "-s -1 must enter status mode"
+        );
+        assert_ne!(
+            TOOL.stat_level(Some("+3abc")),
             0,
             "-s +3abc must enter status mode"
         );

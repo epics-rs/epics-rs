@@ -4,13 +4,13 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG, WallTime};
 use epics_ca_rs::cli::{
     CountPrefix, FloatFormat, FloatStyle, IntStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
-    ca_error_marker, dbr_value_field_type, format_c_g, format_value, scan_leading_i64, sevr_to_str,
-    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_value, sevr_to_str, stat_to_str,
+    zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
 };
-use epics_ca_rs::copt::CTool;
+use epics_ca_rs::copt::{CTool, scan_i32};
 use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
@@ -133,10 +133,12 @@ struct Args {
     #[arg(short = 'V', long, hide = true)]
     version: bool,
 
-    /// CA timeout in seconds.
-    /// C ref: `tool_lib.c:use_ca_timeout_env` (commit 1d056c6).
-    #[arg(short = 'w', long = "wait")]
-    timeout: Option<f64>,
+    /// CA timeout in seconds (`epicsScanDouble`; a bad value warns and keeps
+    /// the `EPICS_CA_TIMEOUT` default). Raw `String`: every C-scanned option
+    /// argument is resolved by [`epics_ca_rs::copt`], never by clap.
+    /// C ref: `caget.c:437-443`, `tool_lib.c:use_ca_timeout_env`.
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true)]
+    timeout: Option<String>,
 
     /// Asynchronous get (`ca_get_callback`); waits for completion.
     /// Today the Rust client always waits via the GET response, so
@@ -144,10 +146,10 @@ struct Args {
     #[arg(short = 'c', long)]
     callback: bool,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`). `-p -1`
+    /// and `-p 500` are NOT errors in C — both clamp to 99 (`caget.c:455-462`).
+    #[arg(short = 'p', long, allow_hyphen_values = true)]
+    priority: Option<String>,
 
     /// Terse: print only the value (no PV name column).
     #[arg(short = 't', long)]
@@ -168,26 +170,49 @@ struct Args {
     #[arg(short = 'n', long = "num-enum")]
     enum_as_number: bool,
 
-    /// Print at most this many array elements (count prefix in the
-    /// output stays the actual array length).
-    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
-    max_elements: Option<usize>,
+    /// C's `reqElems` (`sscanf("%d")`, `caget.c:447-453`). `0` — including
+    /// `-# 0` and an unscannable `-#` — is C's "not specified", i.e. ALL
+    /// elements. Resolved by [`CTool::req_elems_int`].
+    #[arg(
+        short = '#',
+        long = "max-elements",
+        value_name = "COUNT",
+        allow_hyphen_values = true
+    )]
+    max_elements: Option<String>,
 
     /// Render `DBR_CHAR` arrays as a NUL-terminated string.
     #[arg(short = 'S', long = "char-as-string")]
     char_array_as_string: bool,
 
-    /// `%e` float format with the given precision.
-    #[arg(short = 'e', long = "format-e", value_name = "PRECISION")]
-    fmt_e: Option<u32>,
+    /// `%e` float format with the given precision (`sscanf("%d")` + the
+    /// `0..=VALID_DOUBLE_DIGITS` gate; both failures warn and keep the
+    /// default format — `caget.c:470-484`).
+    #[arg(
+        short = 'e',
+        long = "format-e",
+        value_name = "PRECISION",
+        allow_hyphen_values = true
+    )]
+    fmt_e: Option<String>,
 
     /// `%f` float format with the given precision.
-    #[arg(short = 'f', long = "format-f", value_name = "PRECISION")]
-    fmt_f: Option<u32>,
+    #[arg(
+        short = 'f',
+        long = "format-f",
+        value_name = "PRECISION",
+        allow_hyphen_values = true
+    )]
+    fmt_f: Option<String>,
 
     /// `%g` float format with the given precision (the default style).
-    #[arg(short = 'g', long = "format-g", value_name = "PRECISION")]
-    fmt_g: Option<u32>,
+    #[arg(
+        short = 'g',
+        long = "format-g",
+        value_name = "PRECISION",
+        allow_hyphen_values = true
+    )]
+    fmt_g: Option<String>,
 
     /// Get value as string (honors server-side precision).
     /// Accepted for parity; today returns the same as default since
@@ -209,9 +234,15 @@ struct Args {
     #[arg(short = 'l', value_name = "BASE", action = clap::ArgAction::Append)]
     float_base: Vec<String>,
 
-    /// Alternate output field separator. Defaults to a single space.
-    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
-    field_separator: Option<char>,
+    /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
+    /// character, and discards the rest (`caget.c:505`).
+    #[arg(
+        short = 'F',
+        long = "field-separator",
+        value_name = "OFS",
+        allow_hyphen_values = true
+    )]
+    field_separator: Option<String>,
 
     /// PV names to read.
     #[arg(required_unless_present_any = ["version"])]
@@ -219,23 +250,30 @@ struct Args {
 }
 
 impl Args {
-    /// Build a [`ValueFormat`] from the CLI flags.
+    /// Build a [`ValueFormat`] from the CLI flags. Every C-scanned argument
+    /// goes through [`TOOL`], which warns and falls back exactly like C's
+    /// getopt loop — nothing here can fail the program.
     fn value_format(&self) -> ValueFormat {
         let mut fmt = ValueFormat::default();
-        if let Some(p) = self.fmt_e {
+        // All three are scanned (not short-circuited) so that EACH malformed
+        // precision emits its own warning, as C's getopt loop does.
+        let e = self.fmt_e.as_deref().and_then(|a| TOOL.digits('e', a));
+        let f = self.fmt_f.as_deref().and_then(|a| TOOL.digits('f', a));
+        let g = self.fmt_g.as_deref().and_then(|a| TOOL.digits('g', a));
+        if let Some(precision) = e {
             fmt.float = FloatFormat {
                 style: FloatStyle::E,
-                precision: p,
+                precision,
             };
-        } else if let Some(p) = self.fmt_f {
+        } else if let Some(precision) = f {
             fmt.float = FloatFormat {
                 style: FloatStyle::F,
-                precision: p,
+                precision,
             };
-        } else if let Some(p) = self.fmt_g {
+        } else if let Some(precision) = g {
             fmt.float = FloatFormat {
                 style: FloatStyle::G,
-                precision: p,
+                precision,
             };
         }
         // C `caget.c:485-499` writes exactly ONE of the two base globals per
@@ -245,8 +283,8 @@ impl Args {
         fmt.float_style = TOOL.base('l', &self.float_base);
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
-        fmt.max_elements = self.max_elements;
-        if let Some(c) = self.field_separator {
+        fmt.req_elems = TOOL.req_elems_int(self.max_elements.as_deref());
+        if let Some(c) = TOOL.field_separator(self.field_separator.as_deref()) {
             fmt.field_separator = c;
         }
         fmt
@@ -492,7 +530,6 @@ fn specified_dbr_report(
     req_type: u16,
     snap: &Snapshot,
     fmt: &ValueFormat,
-    req_elems: bool,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -520,13 +557,7 @@ fn specified_dbr_report(
         // no `printf("%lu%c", nElems, ...)` here, unlike the plain/terse loop
         // at `:286`. `reqElems` still reaches the `-S` long-string gate
         // (`caget.c:318`), so it is passed through unchanged.
-        let rendered = format_value(
-            &snap.value,
-            fmt,
-            enum_strings,
-            req_elems,
-            CountPrefix::Never,
-        );
+        let rendered = format_value(&snap.value, fmt, enum_strings, CountPrefix::Never);
         let _ = writeln!(out, "    Element count:    {}", snap.value.count());
         let _ = writeln!(out, "    Value:            {rendered}");
         let ext = dbr_extended_str(req_type, snap);
@@ -551,11 +582,14 @@ fn specified_dbr_report(
 ///   (`reqElems && reqElems < nElems ? reqElems : nElems`) →
 ///   [`ReqCount::Fixed`] (which resolves `0` to `native`).
 ///
-/// `max_elements` is the user's `-#` argument (`None` = not given);
-/// `native` is the connected channel's element count (libca
-/// `ca_element_count`).
-fn caget_req_count(callback: bool, max_elements: Option<usize>, native: u32) -> ReqCount {
-    let count = max_elements.map_or(0, |n| (n as u32).min(native));
+/// `req_elems` is C's `reqElems` — the resolved `-#` count, where `0` is
+/// "not specified" (see [`ValueFormat::req_elems`]); `native` is the
+/// connected channel's element count (libca `ca_element_count`). Both C
+/// branches clamp with `reqElems > nElems ? nElems : reqElems`, and `0`
+/// survives the clamp as `0`, so the two modes differ only in what they do
+/// with a `0` afterwards.
+fn caget_req_count(callback: bool, req_elems: u64, native: u32) -> ReqCount {
+    let count = req_elems.min(u64::from(native)) as u32;
     if callback {
         ReqCount::Autosize(count)
     } else {
@@ -708,14 +742,16 @@ async fn main() {
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    let timeout = epics_ca_rs::cli::timeout_duration(
-        args.timeout
-            .unwrap_or_else(epics_ca_rs::cli::env_default_timeout),
-    );
+    // C `-w`: `epicsScanDouble` overwrites the env-loaded `caTimeout` only on
+    // a successful scan; a bad value warns and the get still runs.
+    let timeout = epics_ca_rs::cli::timeout_duration(TOOL.timeout(
+        args.timeout.as_deref(),
+        epics_ca_rs::cli::env_default_timeout(),
+    ));
 
     // Route -p into the priority circuit (libca
     // `tool_lib.c` passes `caPriority` to `ca_create_channel`).
-    let priority = args.priority.unwrap_or(0);
+    let priority = TOOL.priority(args.priority.as_deref());
     // C `caget.c:553-556`: `connect_pvs` gates the ENTIRE get+print phase.
     // Any PV that fails to connect inside the one `ca_pend_io` window
     // aborts before `caget()` runs, so stdout carries zero value lines and
@@ -782,9 +818,9 @@ async fn main() {
     let want_time = mode == OutputMode::All;
     // C `caget.c:200` clamps the user's `-#` count to the native element
     // count before the wire request (`reqElems > nElems ? nElems :
-    // reqElems`); `None` (no `-#`) requests the full count. Captured as a
-    // Copy so each spawned task owns it without moving `args`.
-    let max_elements = args.max_elements;
+    // reqElems`); `0` (no `-#`, `-# 0`, or an unscannable `-#`) requests the
+    // full count. Taken from `fmt`, the single carrier of C's `reqElems`.
+    let req_elems = fmt.req_elems;
     // C `caget.c:197-218` resolves that count differently per request mode:
     // callback (`-c`) preserves a count-0 autosize request, the synchronous
     // path rewrites 0 → native. Captured as a Copy for the same reason.
@@ -807,7 +843,7 @@ async fn main() {
             // dynamic waveform returns its current NORD, while the
             // synchronous path requests the full native count.
             let native = ch.element_count().unwrap_or(0);
-            let req_count = caget_req_count(callback, max_elements, native);
+            let req_count = caget_req_count(callback, req_elems, native);
             // C sizes the readback buffer `dbr_size_n(dbrType, nElems)` with
             // the SAME clamped count it puts on the wire (`caget.c:207-215`).
             let elems = req_count.resolve(native);
@@ -947,11 +983,11 @@ async fn main() {
     }
 
     let sep = fmt.field_separator;
-    // C's `reqElems` — non-zero iff the user passed `-#`. It feeds BOTH the
-    // plain/terse count-prefix gate (`caget.c:286`) and the `-S` long-string
-    // gate on every block (`caget.c:273,318`); the specifiedDbr Value loop
-    // takes the second but not the first (`CountPrefix::Never`).
-    let req_elems_present = args.max_elements.is_some();
+    // C's `reqElems` feeds BOTH the plain/terse count-prefix gate
+    // (`caget.c:286`) and the `-S` long-string gate on every block
+    // (`caget.c:273,318`); the specifiedDbr Value loop takes the second but
+    // not the first (`CountPrefix::Never`). Both read it off `fmt`, which is
+    // now its only carrier.
     // Mirror C `caget.c::main` (line 260): pad the PV name column to
     // 30 characters only when the value is a scalar AND the field
     // separator is the default space. Custom `-F` separator and
@@ -971,13 +1007,7 @@ async fn main() {
     {
         match result {
             Ok(GetResult::Plain(value)) => {
-                let rendered = format_value(
-                    value,
-                    &fmt,
-                    None,
-                    req_elems_present,
-                    CountPrefix::IfRequestedOrArray,
-                );
+                let rendered = format_value(value, &fmt, None, CountPrefix::IfRequestedOrArray);
                 let is_scalar = value.count() == 1;
                 if mode == OutputMode::Terse {
                     println!("{rendered}");
@@ -997,7 +1027,6 @@ async fn main() {
                     &snap.value,
                     &fmt,
                     enum_strings,
-                    req_elems_present,
                     CountPrefix::IfRequestedOrArray,
                 );
                 let is_scalar = snap.value.count() == 1;
@@ -1029,14 +1058,7 @@ async fn main() {
             }) => {
                 print!(
                     "{}",
-                    specified_dbr_report(
-                        pv_name,
-                        *native,
-                        *req_type,
-                        snap,
-                        &fmt,
-                        req_elems_present
-                    )
+                    specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
                 );
             }
             Err(e) => {
@@ -1081,8 +1103,8 @@ async fn main() {
 /// `-d 37`/`-d 38` reach `DBR_STSACK_STRING`/`DBR_CLASS_NAME`.
 fn parse_dbr_type(s: &str) -> Option<u16> {
     let s = s.trim();
-    let resolved: Option<i64> = if let Some(n) = scan_leading_i64(s) {
-        Some(n)
+    let resolved: Option<i64> = if let Some(n) = scan_i32(s) {
+        Some(i64::from(n))
     } else {
         epics_base_rs::types::dbr_text_to_type(s)
             .or_else(|| epics_base_rs::types::dbr_text_to_type(&format!("DBR_{s}")))
@@ -1099,7 +1121,7 @@ mod tests {
     use super::{
         Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, caget_req_count,
         dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,
-        resolve_output_mode, scan_leading_i64, specified_dbr_report,
+        resolve_output_mode, specified_dbr_report,
     };
     use clap::{CommandFactory, FromArgMatches, Parser};
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
@@ -1113,6 +1135,7 @@ mod tests {
         EPICS_EPOCH_UNIX_SECS, FloatFormat, FloatStyle, ValueFormat, zero_dbr_snapshot,
         zero_dbr_value,
     };
+    use epics_ca_rs::copt::scan_i32;
     use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
     use std::time::SystemTime;
@@ -1375,25 +1398,26 @@ mod tests {
     fn caget_req_count_callback_preserves_autosize() {
         let native = 5u32;
         let wire =
-            |callback, max: Option<usize>| caget_req_count(callback, max, native).resolve(native);
+            |callback, req_elems: u64| caget_req_count(callback, req_elems, native).resolve(native);
 
         // Synchronous (no -c): a count-0 request becomes the native count.
-        assert_eq!(wire(false, None), native, "sync, no -#");
-        assert_eq!(wire(false, Some(0)), native, "sync, -# 0");
-        assert_eq!(wire(false, Some(3)), 3, "sync, -# 3");
-        assert_eq!(wire(false, Some(9)), native, "sync, -# > native clamps");
+        // `-# 0` and no `-#` are the SAME value in C (`reqElems == 0` is the
+        // single "not specified" encoding, caget.c:386), so there is no
+        // Some(0)/None distinction left to test.
+        assert_eq!(wire(false, 0), native, "sync, no -# / -# 0");
+        assert_eq!(wire(false, 3), 3, "sync, -# 3");
+        assert_eq!(wire(false, 9), native, "sync, -# > native clamps");
 
         // Callback (-c): no positive -# preserves the count-0 autosize wire
         // request; a positive -# clamps to native exactly like the sync path.
-        assert_eq!(wire(true, None), 0, "callback, no -# => autosize 0");
-        assert_eq!(wire(true, Some(0)), 0, "callback, -# 0 => autosize 0");
-        assert_eq!(wire(true, Some(3)), 3, "callback, -# 3");
-        assert_eq!(wire(true, Some(9)), native, "callback, -# > native clamps");
+        assert_eq!(wire(true, 0), 0, "callback, no -# / -# 0 => autosize 0");
+        assert_eq!(wire(true, 3), 3, "callback, -# 3");
+        assert_eq!(wire(true, 9), native, "callback, -# > native clamps");
 
         // The request-mode variant itself: no-positive-`-#` callback is the
         // only case that constructs an Autosize request.
-        assert_eq!(caget_req_count(true, None, native), ReqCount::Autosize(0));
-        assert_eq!(caget_req_count(false, None, native), ReqCount::Fixed(0));
+        assert_eq!(caget_req_count(true, 0, native), ReqCount::Autosize(0));
+        assert_eq!(caget_req_count(false, 0, native), ReqCount::Fixed(0));
     }
 
     // C `complainIfNotPlainAndSet` (caget.c:369): -t/-a/-d are mutually
@@ -1453,7 +1477,6 @@ mod tests {
             DBR_CTRL_DOUBLE,
             &snap,
             &ValueFormat::default(),
-            false,
         );
         assert!(out.starts_with("ai:temp\n"), "{out}");
         assert!(out.contains("    Native data type: DBF_DOUBLE\n"), "{out}");
@@ -1521,7 +1544,6 @@ mod tests {
                 DBR_CTRL_DOUBLE,
                 &snap,
                 &fmt,
-                false,
             );
             assert!(
                 out.contains("    Lo disp limit:    8.76543\n"),
@@ -1549,7 +1571,6 @@ mod tests {
             DBR_CTRL_DOUBLE,
             &snap,
             &f9,
-            false,
         );
         assert!(
             out.contains("    Value:            1.500000000\n"),
@@ -1562,9 +1583,10 @@ mod tests {
     /// `:286` it carries no `printf("%lu%c", nElems, sep)` count prefix.
     ///
     /// Pre-fix, `format_value`'s array renderers prefixed the count whenever
-    /// `total > 1` regardless of the `false` passed here, so `caget -d
-    /// DBR_LONG` on a 3-element array printed `Value:            3 10 20 30`
-    /// where C prints `Value:            10 20 30`.
+    /// `total > 1`, so `caget -d DBR_LONG` on a 3-element array printed
+    /// `Value:            3 10 20 30` where C prints `Value:            10 20
+    /// 30`. The bare-ness holds for EVERY `-#` value, so the report passes
+    /// `CountPrefix::Never` rather than inspecting `fmt.req_elems`.
     #[test]
     fn specified_report_value_line_has_no_count_prefix() {
         let snap = Snapshot::new(
@@ -1573,15 +1595,12 @@ mod tests {
             0,
             SystemTime::UNIX_EPOCH,
         );
-        for req_elems in [false, true] {
-            let out = specified_dbr_report(
-                "wf:x",
-                Some(DbFieldType::Long),
-                DBR_LONG,
-                &snap,
-                &ValueFormat::default(),
+        for req_elems in [0u64, 3] {
+            let fmt = ValueFormat {
                 req_elems,
-            );
+                ..ValueFormat::default()
+            };
+            let out = specified_dbr_report("wf:x", Some(DbFieldType::Long), DBR_LONG, &snap, &fmt);
             assert!(out.contains("    Element count:    3\n"), "{out}");
             assert!(
                 out.contains("    Value:            10 20 30\n"),
@@ -1607,7 +1626,6 @@ mod tests {
             DBR_CLASS_NAME,
             &snap,
             &ValueFormat::default(),
-            false,
         );
         assert!(
             out.contains("    Request type:     DBR_CLASS_NAME\n"),
@@ -1694,15 +1712,18 @@ mod tests {
         assert_eq!(dbr_text(99), "DBR_invalid");
     }
 
+    // `-d` takes a numeric DBR code or a mnemonic; the numeric branch is
+    // C `sscanf(optarg, "%d", &type)` (caget.c:454), which is now the shared
+    // owner `copt::scan_i32`.
     #[test]
-    fn scan_leading_i64_matches_sscanf_d() {
-        assert_eq!(scan_leading_i64("16"), Some(16));
-        assert_eq!(scan_leading_i64("  20  "), Some(20));
-        assert_eq!(scan_leading_i64("-5"), Some(-5));
-        assert_eq!(scan_leading_i64("16x"), Some(16));
-        assert_eq!(scan_leading_i64("0x10"), Some(0));
-        assert_eq!(scan_leading_i64("DBR_TIME_FLOAT"), None);
-        assert_eq!(scan_leading_i64(""), None);
+    fn dbr_type_number_scan_matches_sscanf_d() {
+        assert_eq!(scan_i32("16"), Some(16));
+        assert_eq!(scan_i32("  20  "), Some(20));
+        assert_eq!(scan_i32("-5"), Some(-5));
+        assert_eq!(scan_i32("16x"), Some(16));
+        assert_eq!(scan_i32("0x10"), Some(0));
+        assert_eq!(scan_i32("DBR_TIME_FLOAT"), None);
+        assert_eq!(scan_i32(""), None);
     }
 
     #[test]

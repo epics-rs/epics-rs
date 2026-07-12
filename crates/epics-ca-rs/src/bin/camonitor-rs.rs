@@ -36,10 +36,12 @@ struct Args {
     #[arg(short = 'V', long, hide = true)]
     version: bool,
 
-    /// CA timeout in seconds (initial connection wait). Mirrors C
-    /// `tool_lib.c:use_ca_timeout_env` (commit 1d056c6).
-    #[arg(short = 'w', long = "wait")]
-    timeout: Option<f64>,
+    /// CA timeout in seconds (initial connection wait). `epicsScanDouble`;
+    /// a bad value warns and keeps the default (`camonitor.c:263-272`). Raw
+    /// `String`: every C-scanned option argument is resolved by
+    /// [`epics_ca_rs::copt`], never by clap.
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true)]
+    timeout: Option<String>,
 
     /// CA event mask `<msk>`: any combination of `v` (value), `a`
     /// (alarm), `l` (log/archive), `p` (property). The subscription is
@@ -47,10 +49,10 @@ struct Args {
     #[arg(short = 'm', long, value_name = "MASK")]
     event_mask: Option<String>,
 
-    /// CA priority (0-99). Opens the channel on the matching priority
-    /// virtual circuit (libca `ca_create_channel` priority parameter).
-    #[arg(short = 'p', long)]
-    priority: Option<u8>,
+    /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
+    /// and `-p 500` both clamp to 99 in C, `camonitor.c:281-288`).
+    #[arg(short = 'p', long, allow_hyphen_values = true)]
+    priority: Option<String>,
 
     /// Timestamp source(s) and kind. Sources: `s`=CA server/remote
     /// (default), `c`=CA client/local receive time (shown in `()`).
@@ -63,18 +65,44 @@ struct Args {
     #[arg(short = 'n', long = "num-enum")]
     enum_as_number: bool,
 
-    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
-    max_elements: Option<usize>,
+    /// C's `reqElems`, scanned with `sscanf("%lu")` — 64-bit, unlike
+    /// `caget`'s `%d` (`camonitor.c:273-280`). `0` (no `-#`, `-# 0`, or an
+    /// unscannable `-#`) is "not specified": the CA autosize request.
+    #[arg(
+        short = '#',
+        long = "max-elements",
+        value_name = "COUNT",
+        allow_hyphen_values = true
+    )]
+    max_elements: Option<String>,
 
     #[arg(short = 'S', long = "char-as-string")]
     char_array_as_string: bool,
 
-    #[arg(short = 'e', long = "format-e", value_name = "PRECISION")]
-    fmt_e: Option<u32>,
-    #[arg(short = 'f', long = "format-f", value_name = "PRECISION")]
-    fmt_f: Option<u32>,
-    #[arg(short = 'g', long = "format-g", value_name = "PRECISION")]
-    fmt_g: Option<u32>,
+    /// `%e`/`%f`/`%g` float format with the given precision (`sscanf("%d")`
+    /// plus the `0..=VALID_DOUBLE_DIGITS` gate; both failures warn and keep
+    /// the default format — `camonitor.c:310-324`).
+    #[arg(
+        short = 'e',
+        long = "format-e",
+        value_name = "PRECISION",
+        allow_hyphen_values = true
+    )]
+    fmt_e: Option<String>,
+    #[arg(
+        short = 'f',
+        long = "format-f",
+        value_name = "PRECISION",
+        allow_hyphen_values = true
+    )]
+    fmt_f: Option<String>,
+    #[arg(
+        short = 'g',
+        long = "format-g",
+        value_name = "PRECISION",
+        allow_hyphen_values = true
+    )]
+    fmt_g: Option<String>,
 
     #[arg(short = 's', long = "string-format")]
     string_format: bool,
@@ -93,10 +121,15 @@ struct Args {
     #[arg(short = 'l', value_name = "BASE", action = clap::ArgAction::Append)]
     float_base: Vec<String>,
 
-    /// Alternate output field separator. Defaults to a single space.
-    /// Mirrors C `camonitor.c:342` (`case 'F'`).
-    #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
-    field_separator: Option<char>,
+    /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
+    /// character, discarding the rest (`camonitor.c:342`).
+    #[arg(
+        short = 'F',
+        long = "field-separator",
+        value_name = "OFS",
+        allow_hyphen_values = true
+    )]
+    field_separator: Option<String>,
 
     /// PV names to monitor.
     #[arg(required_unless_present_any = ["version"])]
@@ -106,20 +139,25 @@ struct Args {
 impl Args {
     fn value_format(&self) -> ValueFormat {
         let mut fmt = ValueFormat::default();
-        if let Some(p) = self.fmt_e {
+        // All three are scanned (not short-circuited) so that EACH malformed
+        // precision emits its own warning, as C's getopt loop does.
+        let e = self.fmt_e.as_deref().and_then(|a| TOOL.digits('e', a));
+        let f = self.fmt_f.as_deref().and_then(|a| TOOL.digits('f', a));
+        let g = self.fmt_g.as_deref().and_then(|a| TOOL.digits('g', a));
+        if let Some(precision) = e {
             fmt.float = FloatFormat {
                 style: FloatStyle::E,
-                precision: p,
+                precision,
             };
-        } else if let Some(p) = self.fmt_f {
+        } else if let Some(precision) = f {
             fmt.float = FloatFormat {
                 style: FloatStyle::F,
-                precision: p,
+                precision,
             };
-        } else if let Some(p) = self.fmt_g {
+        } else if let Some(precision) = g {
             fmt.float = FloatFormat {
                 style: FloatStyle::G,
-                precision: p,
+                precision,
             };
         }
         // C `camonitor.c:325-340` writes exactly ONE of the two base globals
@@ -129,8 +167,8 @@ impl Args {
         fmt.float_style = TOOL.base('l', &self.float_base);
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
-        fmt.max_elements = self.max_elements;
-        if let Some(c) = self.field_separator {
+        fmt.req_elems = TOOL.req_elems_ulong(self.max_elements.as_deref());
+        if let Some(c) = TOOL.field_separator(self.field_separator.as_deref()) {
             fmt.field_separator = c;
         }
         fmt
@@ -148,7 +186,7 @@ async fn main() {
 
     let client = CaClient::new().await.expect("failed to create CA client");
     // -p selects the priority virtual circuit.
-    let priority = args.priority.unwrap_or(0);
+    let priority = TOOL.priority(args.priority.as_deref());
 
     let connected_flags: Vec<Arc<AtomicBool>> = args
         .pv_names
@@ -157,10 +195,6 @@ async fn main() {
         .collect();
 
     let fmt = Arc::new(args.value_format());
-    // C `tool_lib.c:486` (`PRN_TIME_VAL_STS`) gates the array count
-    // prefix on `reqElems || nElems > 1`; `reqElems` is non-zero iff
-    // the user passed `-#`.
-    let req_elems_present = args.max_elements.is_some();
     // resolve the `-m <msk>` DBE_* mask + `-t` timestamp mode
     // once for all PVs. `prev_all`/`start` back the relative and
     // incremental timestamp renderings.
@@ -172,12 +206,16 @@ async fn main() {
     let float_as_string = args.string_format;
     // C `camonitor.c:168-169` applies the user's `-#` count to the
     // `ca_create_subscription` request count (clamped to the native element
-    // count at connect); `None` (no `-#`) leaves `reqElems == 0`, the CA
-    // autosize request, so the server reports each event at the record's
-    // current element count. Carried into the subscription so each monitor
-    // event transfers only the requested slice (or the autosized current
-    // count) instead of the native capacity.
-    let req_count = args.max_elements.map(|n| n as u32);
+    // count at connect); `reqElems == 0` — no `-#`, `-# 0`, or an unscannable
+    // `-#` — is the CA autosize request, so the server reports each event at
+    // the record's current element count. `fmt` is the single carrier of C's
+    // `reqElems`; a count that overflows `u32` clamps at the wire boundary,
+    // which is where C's `ca_create_subscription(..., unsigned long)` narrows
+    // it too.
+    let req_count = match fmt.req_elems {
+        0 => None,
+        n => Some(u32::try_from(n).unwrap_or(u32::MAX)),
+    };
     let start = SystemTime::now();
     // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all
     // channels, captured once — the server-relative (`-t sr`) baseline.
@@ -203,7 +241,6 @@ async fn main() {
                 flag,
                 fmt,
                 float_as_string,
-                req_elems_present,
                 req_count,
                 mask,
                 spec,
@@ -217,9 +254,10 @@ async fn main() {
     }
 
     // Initial connection wait (C: ca_pend_event(caTimeout))
-    let timeout_secs = args
-        .timeout
-        .unwrap_or_else(epics_ca_rs::cli::env_default_timeout);
+    let timeout_secs = TOOL.timeout(
+        args.timeout.as_deref(),
+        epics_ca_rs::cli::env_default_timeout(),
+    );
     tokio::time::sleep(epics_ca_rs::cli::timeout_duration(timeout_secs)).await;
 
     // Print "*** Not connected" for PVs that didn't connect within
@@ -231,7 +269,10 @@ async fn main() {
     // not-connected PV carries no element count here, so we gate on
     // the separator alone — identical to C for the common scalar /
     // no-`-#` case.
-    let sep = args.field_separator.unwrap_or(' ');
+    // Taken off `fmt`, which is where `-F` was already resolved through the
+    // owner — re-reading the raw argument here would be a second source for
+    // one C global (`fieldSeparator`).
+    let sep = fmt.field_separator;
     for (i, pv_name) in args.pv_names.iter().enumerate() {
         if !connected_flags[i].load(Ordering::Acquire) {
             let name_col = if sep == ' ' {
@@ -260,7 +301,6 @@ async fn monitor_pv(
     connected_flag: Arc<AtomicBool>,
     fmt: Arc<ValueFormat>,
     float_as_string: bool,
-    req_elems_present: bool,
     req_count: Option<u32>,
     mask: u16,
     spec: TimestampSpec,
@@ -366,7 +406,6 @@ async fn monitor_pv(
                     &snap.value,
                     &fmt,
                     enum_strings,
-                    req_elems_present,
                     CountPrefix::IfRequestedOrArray,
                 );
                 let is_scalar = snap.value.count() == 1;

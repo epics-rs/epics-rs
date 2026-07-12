@@ -175,7 +175,14 @@ fn asyn_set_eos(
             // The shell's own user — no queue-wait deadline: `QUEUE_TIMEOUT` is
             // asynRecord's, and every other C caller passes
             // `queueRequest(..., 0.0)`. (`_addr` stays unused here, as before.)
-            let user = crate::user::AsynUser::default();
+            //
+            // C `asynSetEos` queues at `asynQueuePriorityConnect` carrying
+            // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynShellCommands.c:240,
+            // :245) so an `st.cmd` can set a line's EOS before the device is
+            // powered on. This is the *shell* command; the record's IEOS/OEOS put
+            // is queued at Low priority with no waiver (asynRecord.c:1296) and
+            // stays refused on a disconnected port.
+            let user = crate::user::AsynUser::default().queue_even_if_not_connected();
             let res = if set_input {
                 handle.set_input_eos_blocking(user, &eos)
             } else {
@@ -310,9 +317,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // `timeout = 2` (asynShellCommands.c:119) before queueing the
                 // setOption callback; `addr` rides on the same user, as C's
                 // `findInterface(portName, addr, ...)` connects it to the device.
+                // It queues at `asynQueuePriorityConnect` carrying
+                // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:121,:126) — that is
+                // what lets an `st.cmd` configure a serial line whose device is
+                // not powered on yet.
                 let user = AsynUser::default()
                     .with_addr(addr)
-                    .with_timeout(Duration::from_secs(2));
+                    .with_timeout(Duration::from_secs(2))
+                    .queue_even_if_not_connected();
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => match handle.set_option_blocking(user, &key, &value) {
                         Ok(()) => Ok(CommandOutcome::Continue),

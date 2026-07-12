@@ -221,6 +221,41 @@ impl IpServerConfig {
     }
 }
 
+/// A socket failure on a client slot, and what it did to the slot.
+///
+/// The `closed` half is not advice: [`ClientSlot::read_or_close`] /
+/// [`ClientSlot::write_or_close`] have *already* dropped the socket when it is
+/// set — C decides the teardown and the reported status in one statement
+/// (drvAsynIPPort.c:797-806), so no caller can take the error and forget the
+/// `closeConnection`. What is left to the owner is the disconnect exception
+/// fan-out, which differs by port shape: the parent announces on the client's
+/// `addr`, the child port announces on its own single device and drops its
+/// port-level connected flag.
+struct SlotFailure {
+    closed: bool,
+    error: AsynError,
+}
+
+impl SlotFailure {
+    /// The socket survives — C's `asynTimeout` branch, and the pre-socket
+    /// refusals (`maxchars == 0`, no client in the slot).
+    fn kept(error: AsynError) -> Self {
+        Self {
+            closed: false,
+            error,
+        }
+    }
+
+    /// C ran `closeConnection`: the slot is free and the port owes the
+    /// disconnect exception.
+    fn closed(error: AsynError) -> Self {
+        Self {
+            closed: true,
+            error,
+        }
+    }
+}
+
 /// Per-accepted-connection state.
 ///
 /// Each slot is pre-allocated and shared between the parent server
@@ -257,6 +292,118 @@ impl ClientSlot {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         *self.peer.lock()
+    }
+
+    /// Read from this slot, applying C's failed-read rule and performing the
+    /// `closeConnection` half of it — the single owner of "a client slot dies on
+    /// a read", shared by the parent's addressed read
+    /// ([`DrvAsynIPServerPort::base_read_octet`]) and the child port's
+    /// ([`DrvAsynIPSubport::read_octet`]).
+    ///
+    /// C serves each accepted connection with a full `drvAsynIPPort` child
+    /// (drvAsynIPServerPort.c:681-708), so the read that runs is
+    /// `drvAsynIPPort`'s `readIt`: it calls `closeConnection` on a TCP EOF
+    /// (:815-820) **and** on every errno that is not `EWOULDBLOCK`/`EINTR`
+    /// (:797-806), and `closeConnection` destroys the socket and issues
+    /// `exceptionDisconnect` (:206-217).
+    ///
+    /// That teardown is what frees the slot: the listener reuses a slot exactly
+    /// when its child port reports `isConnected() == false`
+    /// (drvAsynIPServerPort.c:344-350). The port tore down on EOF only, so a
+    /// client whose socket died mid-read — `ECONNRESET`, `EPIPE`, a NAT drop —
+    /// kept its slot forever, and once the table filled no client could
+    /// reconnect.
+    fn read_or_close(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+        device: &str,
+    ) -> Result<usize, SlotFailure> {
+        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
+        // touching the socket; an empty buffer would otherwise read Ok(0) and be
+        // misclassified as a peer EOF, tearing down a healthy connection.
+        if buf.is_empty() {
+            return Err(SlotFailure::kept(maxchars_zero_error()));
+        }
+        let mut guard = self.stream.lock();
+        let Some(stream) = guard.as_mut() else {
+            return Err(SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("{device} has no client"),
+            }));
+        };
+        // C parity: the child `drvAsynIPPort`'s `readRaw` floors a zero request
+        // timeout to a 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on
+        // every read. `socket_poll_timeout` is the shared owner of that mapping;
+        // setting it unconditionally (rather than skipping on `timeout == 0`)
+        // keeps a poll request a 1 ms poll instead of blocking on the accept-time
+        // timeout.
+        if let Err(e) = stream.set_read_timeout(Some(socket_poll_timeout(timeout))) {
+            return Err(SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_read_timeout failed: {e}"),
+            }));
+        }
+        let res = stream.read(buf);
+        // `clear()` re-locks the stream, so the read guard must go first.
+        drop(guard);
+        match res {
+            Ok(0) => {
+                self.clear();
+                Err(SlotFailure::closed(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: format!("{device} peer closed"),
+                }))
+            }
+            Ok(n) => Ok(n),
+            Err(e) => Err(self.classify_io_error(e, device, "read")),
+        }
+    }
+
+    /// Write to this slot, applying the same rule to C's `writeIt`, which calls
+    /// `closeConnection(pasynUser, tty, "Write error")` on a fatal errno
+    /// (drvAsynIPPort.c:694-698) and reports `asynTimeout` — socket intact — for
+    /// the `EWOULDBLOCK`/`EINTR` class it retries (:661-672). Single owner of "a
+    /// client slot dies on a write", shared by the parent's addressed and
+    /// broadcast writes and the child port's.
+    fn write_or_close(&self, data: &[u8], device: &str) -> Result<(), SlotFailure> {
+        let mut guard = self.stream.lock();
+        let Some(stream) = guard.as_mut() else {
+            return Err(SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: format!("{device} has no client"),
+            }));
+        };
+        let res = stream.write_all(data).and_then(|()| stream.flush());
+        drop(guard);
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.classify_io_error(e, device, "write")),
+        }
+    }
+
+    /// C's `should_disconnect` for a slot's socket error, and the teardown it
+    /// implies, as one value — the branch that closes the socket is the branch
+    /// that reports `asynError` (drvAsynIPPort.c:797-806, :694-698). The
+    /// non-fatal set is [`is_nonfatal_read_timeout`], shared with the IP client
+    /// port; C excludes exactly `SOCK_EWOULDBLOCK` and `SOCK_EINTR` on both the
+    /// read (:798-800) and the write (:661) side.
+    ///
+    /// (C's other `should_disconnect` disjunct — `disconnectOnReadTimeout` — is
+    /// an option of the child `drvAsynIPPort` that this port does not model, so
+    /// a timeout never tears a slot down here.)
+    fn classify_io_error(&self, e: std::io::Error, device: &str, what: &str) -> SlotFailure {
+        if is_nonfatal_read_timeout(e.kind()) {
+            return SlotFailure::kept(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: format!("{what} timeout"),
+            });
+        }
+        self.clear();
+        SlotFailure::closed(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{device} {what} error: {e}"),
+        })
     }
 
     /// Toss all pending input on this slot's TCP stream — the single
@@ -844,35 +991,29 @@ impl PortDriver for DrvAsynIPServerPort {
                 if !slot.is_occupied() {
                     continue;
                 }
-                if let Err(e) = self.write_to_slot(slot, data) {
+                if let Err(f) = self.write_to_slot(slot, i as i32, data) {
                     tracing::debug!(
                         target: "asyn_rs::ip_server_port",
                         addr = i,
-                        error = %e,
+                        error = %f.error,
                         "broadcast write to slot failed"
                     );
-                    // Drop the slot if the write looks fatal (peer
-                    // closed). Match the connection-refused / broken-
-                    // pipe pattern from drvAsynIPPort.
-                    slot.clear();
-                    self.base
-                        .announce_exception(AsynException::Connect, i as i32);
+                    // The slot is torn down by `write_or_close` on exactly C's
+                    // fatal-errno branch (drvAsynIPPort.c:694-698) — and *only*
+                    // there: a send timeout is C's `asynTimeout` with the socket
+                    // intact (:661-672), so a slow peer no longer loses its slot.
+                    if f.closed {
+                        self.base
+                            .announce_exception(AsynException::Connect, i as i32);
+                    }
                 }
             }
             return Ok(data.len());
         }
         let arc = self.slot_arc(user.addr)?;
-        match self.write_to_slot(&arc, data) {
+        match self.write_to_slot(&arc, user.addr, data) {
             Ok(()) => Ok(data.len()),
-            Err(e) => {
-                // Mark slot disconnected so the next read/write fails fast.
-                if let Ok(idx) = self.slot_index(user.addr) {
-                    self.slots[idx].clear();
-                    self.base
-                        .announce_exception(AsynException::Connect, user.addr);
-                }
-                Err(e)
-            }
+            Err(f) => Err(self.finish_slot_failure(user.addr, f)),
         }
     }
 
@@ -909,44 +1050,8 @@ impl PortDriver for DrvAsynIPServerPort {
 impl DrvAsynIPServerPort {
     fn base_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let arc = self.slot_arc(user.addr)?;
-        let mut stream_guard = arc.stream.lock();
-        let stream = stream_guard.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("slot {} stream gone", user.addr),
-        })?;
-        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
-        // touching the socket; an empty buffer would otherwise read Ok(0)
-        // and be misclassified as a peer EOF (tearing down the slot).
-        if buf.is_empty() {
-            return Err(maxchars_zero_error());
-        }
-        // C parity: the server-mode data read flows through a child
-        // `drvAsynIPPort` whose `readRaw` floors a zero request timeout to a
-        // 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on every
-        // read. `socket_poll_timeout` is the shared owner of that mapping;
-        // setting it unconditionally (rather than skipping on `timeout == 0`)
-        // keeps a poll request a 1 ms poll instead of blocking on the
-        // accept-time timeout.
-        stream
-            .set_read_timeout(Some(socket_poll_timeout(user.timeout)))
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("set_read_timeout failed: {e}"),
-            })?;
-        match stream.read(buf) {
-            Ok(0) => {
-                // Peer closed — drop the slot, surface as Disconnect.
-                drop(stream_guard);
-                if let Ok(idx) = self.slot_index(user.addr) {
-                    self.slots[idx].clear();
-                    self.base
-                        .announce_exception(AsynException::Connect, user.addr);
-                }
-                Err(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: format!("peer closed slot {}", user.addr),
-                })
-            }
+        let device = self.slot_device_name(user.addr);
+        match arc.read_or_close(buf, user.timeout, &device) {
             Ok(n) => Ok(OctetReadResult {
                 nbytes_transferred: n,
                 // C parity: CNT only when the requested count was
@@ -958,37 +1063,31 @@ impl DrvAsynIPServerPort {
                     EomReason::empty()
                 },
             }),
-            // C parity: the server data read flows through a child
-            // `drvAsynIPPort` whose `readRaw` (798-800) treats EINTR as a
-            // non-fatal timeout, identically to EWOULDBLOCK — `Interrupted`
-            // must not surface as a hard read error. Shared owner of the
-            // non-fatal-read-error set: `is_nonfatal_read_timeout`.
-            Err(e) if is_nonfatal_read_timeout(e.kind()) => Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
-            }),
-            Err(e) => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("read failed: {e}"),
-            }),
+            Err(f) => Err(self.finish_slot_failure(user.addr, f)),
         }
     }
 
-    fn write_to_slot(&self, slot: &ClientSlot, data: &[u8]) -> AsynResult<()> {
-        let mut g = slot.stream.lock();
-        let stream = g.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "slot stream gone".into(),
-        })?;
-        stream.write_all(data).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("write failed: {e}"),
-        })?;
-        stream.flush().map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("flush failed: {e}"),
-        })?;
-        Ok(())
+    /// The disconnect fan-out the parent owes when [`ClientSlot`] closed a slot —
+    /// C's `exceptionDisconnect` on the child port (drvAsynIPPort.c:216), which
+    /// is what makes the listener's `isConnected` scan see the slot as free
+    /// (drvAsynIPServerPort.c:344-350). The socket is already gone; this is the
+    /// announcement half only.
+    fn finish_slot_failure(&mut self, addr: i32, failure: SlotFailure) -> AsynError {
+        if failure.closed {
+            self.base.announce_exception(AsynException::Connect, addr);
+        }
+        failure.error
+    }
+
+    /// C `tty->IPDeviceName` for a client slot — the name that goes into
+    /// `"%s read error: %s"` (drvAsynIPPort.c:801-803). C's child ports are named
+    /// `parent:N` (drvAsynIPServerPort.c:686).
+    fn slot_device_name(&self, addr: i32) -> String {
+        format!("{}:{}", self.base.port_name, addr)
+    }
+
+    fn write_to_slot(&self, slot: &ClientSlot, addr: i32, data: &[u8]) -> Result<(), SlotFailure> {
+        slot.write_or_close(data, &self.slot_device_name(addr))
     }
 
     /// UDP-mode read: copy at most `buf.len()` bytes from the cache,
@@ -1167,6 +1266,23 @@ impl DrvAsynIPSubport {
     pub fn peer(&self) -> Option<SocketAddr> {
         self.slot.peer_addr()
     }
+
+    /// The disconnect fan-out this child port owes when [`ClientSlot`] closed its
+    /// slot — C `closeConnection`'s `exceptionDisconnect` (drvAsynIPPort.c:216),
+    /// which is exactly what makes the listener see the slot as reusable
+    /// (drvAsynIPServerPort.c:344-350). The socket is already gone.
+    ///
+    /// Per-addr Connect carries addr=0 (this is the subport's single device
+    /// slot); the port-level `set_connected(false)` fires the port-level
+    /// transition once thanks to its edge guard. Both fan-outs are needed because
+    /// observers can listen at either granularity.
+    fn finish_slot_failure(&mut self, failure: SlotFailure) -> AsynError {
+        if failure.closed {
+            self.base.announce_exception(AsynException::Connect, 0);
+            self.base.set_connected(false);
+        }
+        failure.error
+    }
 }
 
 impl PortDriver for DrvAsynIPSubport {
@@ -1212,79 +1328,19 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let mut stream_guard = self.slot.stream.lock();
-        let stream = stream_guard.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "subport slot has no client".into(),
-        })?;
-        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
-        // touching the socket; an empty buffer would otherwise read Ok(0)
-        // and be misclassified as a peer EOF (tearing down the slot).
-        if buf.is_empty() {
-            return Err(maxchars_zero_error());
-        }
-        // C parity: the server-mode data read flows through a child
-        // `drvAsynIPPort` whose `readRaw` floors a zero request timeout to a
-        // 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on every
-        // read. `socket_poll_timeout` is the shared owner of that mapping;
-        // setting it unconditionally (rather than skipping on `timeout == 0`)
-        // keeps a poll request a 1 ms poll instead of blocking on the
-        // accept-time timeout.
-        stream
-            .set_read_timeout(Some(socket_poll_timeout(user.timeout)))
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("set_read_timeout failed: {e}"),
-            })?;
-        match stream.read(buf) {
-            Ok(0) => {
-                drop(stream_guard);
-                self.slot.clear();
-                // Per-addr Connect carries addr=0 (this is the
-                // subport's single device slot). The port-level
-                // set_connected(false) handles the port-level
-                // transition exactly once thanks to its edge
-                // guard. Both fan-outs are necessary because
-                // observers can listen at either the port or
-                // the device granularity.
-                self.base.announce_exception(AsynException::Connect, 0);
-                self.base.set_connected(false);
-                Err(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: "peer closed".into(),
-                })
-            }
+        let device = self.base.port_name.clone();
+        match self.slot.read_or_close(buf, user.timeout, &device) {
             Ok(n) => Ok(n),
-            // C parity: a child `drvAsynIPPort` `readRaw` (798-800) treats
-            // EINTR as a non-fatal timeout, identically to EWOULDBLOCK —
-            // `Interrupted` must not surface as a hard read error. Shared
-            // owner of the non-fatal-read-error set: `is_nonfatal_read_timeout`.
-            Err(e) if is_nonfatal_read_timeout(e.kind()) => Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
-            }),
-            Err(e) => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("read failed: {e}"),
-            }),
+            Err(f) => Err(self.finish_slot_failure(f)),
         }
     }
 
     fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let mut g = self.slot.stream.lock();
-        let stream = g.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Disconnected,
-            message: "subport slot has no client".into(),
-        })?;
-        stream.write_all(data).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("write failed: {e}"),
-        })?;
-        stream.flush().map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("flush failed: {e}"),
-        })?;
-        Ok(data.len())
+        let device = self.base.port_name.clone();
+        match self.slot.write_or_close(data, &device) {
+            Ok(()) => Ok(data.len()),
+            Err(f) => Err(self.finish_slot_failure(f)),
+        }
     }
 
     fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
@@ -1535,6 +1591,70 @@ mod tests {
             Ok(0) => {}
             other => panic!("expected drained (timeout / 0 bytes), got {other:?}"),
         }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R11-C9: a client whose socket dies mid-read must lose its slot.
+    ///
+    /// C serves each accepted connection with a full `drvAsynIPPort` child
+    /// (drvAsynIPServerPort.c:681-708), whose `readIt` calls `closeConnection` on
+    /// *any* errno outside `EWOULDBLOCK`/`EINTR` (drvAsynIPPort.c:797-806), not
+    /// just on EOF — and `closeConnection`'s `exceptionDisconnect` (:216) is
+    /// exactly what makes the listener's `isConnected` scan hand the slot to the
+    /// next client (drvAsynIPServerPort.c:344-350).
+    ///
+    /// The port tore down on EOF only, so a peer that vanished with an RST
+    /// (`ECONNRESET` — a crashed client, a NAT drop) kept its slot forever, and
+    /// once the table filled no client could reconnect.
+    #[test]
+    fn a_fatal_read_error_frees_the_client_slot() {
+        use socket2::{Domain, Socket, Type};
+
+        // max_clients = 1: the slot is the whole table, so "the slot was freed"
+        // and "the next client can connect" are the same assertion.
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("rst_frees_slot", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+
+        // A client that dies with an RST rather than a FIN: SO_LINGER(0) makes
+        // close() send RST, so the server's next read gets ECONNRESET — a fatal
+        // errno, not the EOF the port already handled.
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        client.connect(&addr.into()).unwrap();
+        let idx = srv.accept_one().unwrap();
+        assert_eq!(idx, 0);
+        assert!(srv.slots[0].is_occupied(), "the client owns the only slot");
+
+        client.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client); // RST
+        std::thread::sleep(Duration::from_millis(50));
+
+        let read_user = AsynUser::default()
+            .with_addr(0)
+            .with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+        let err = srv
+            .read_octet(&read_user, &mut buf)
+            .expect_err("a reset peer cannot deliver bytes");
+        // C reports the teardown branch as asynError with "%s read error: %s"
+        // (drvAsynIPPort.c:801-805) — never as a retryable asynTimeout.
+        assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
+
+        assert!(
+            !srv.slots[0].is_occupied(),
+            "C's readIt closeConnection frees the slot on a fatal errno, not just on EOF"
+        );
+
+        // …and the slot really is reusable: a second client takes it.
+        let _client2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let idx2 = srv
+            .accept_one()
+            .expect("the freed slot must accept the next client");
+        assert_eq!(idx2, 0);
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

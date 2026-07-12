@@ -69,7 +69,7 @@ use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
 use crate::interrupt::{InterruptManager, InterruptValue};
 use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
-use crate::user::AsynUser;
+use crate::user::{AsynUser, ConnectCheck};
 
 /// C asyn `queueRequest` priority. In asyn-rs this exists as compatibility
 /// metadata only — there is no actual request queue or priority-based scheduling.
@@ -439,10 +439,35 @@ impl PortDriverBase {
         self.defunct
     }
 
-    /// Check that the port is enabled, connected, and not defunct.
-    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
-    /// (defunct => permanently disabled) otherwise.
-    pub fn check_ready(&self) -> AsynResult<()> {
+    /// C `queueRequest`'s gate (asynManager.c:1539-1552), and the single owner
+    /// of the two refusals it is built from.
+    ///
+    /// They are independent, and the [`ConnectCheck`] the caller hands in
+    /// selects between them — it can waive the *connected* refusal and nothing
+    /// else. There is no argument, op class or priority that waives
+    /// [`Self::check_enabled`]: C's `if(!pport->dpc.enabled) return asynDisabled`
+    /// (:1541-1546) sits *above* `checkPortConnect` and is reached by every
+    /// request, and its port thread refuses to run anything at all on a disabled
+    /// port (`portThread`, :802-805).
+    ///
+    /// The `ConnectCheck` can only come from [`AsynUser::connect_check`], so the
+    /// waiver is available exactly to the requests C gives it to.
+    pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
+        self.check_enabled()?;
+        match connect {
+            // C `checkPortConnect == FALSE`: neither the port's nor the device's
+            // connected flag is read — the port thread drains the Connect queue
+            // before it ever calls `autoConnectDevice` (asynManager.c:812-856),
+            // and the device-level checks live in the lower-priority loop it has
+            // not reached yet (:864-874).
+            ConnectCheck::Waived => Ok(()),
+            ConnectCheck::Required => self.check_ready_addr(addr),
+        }
+    }
+
+    /// The unconditional half of the queue gate: a defunct or disabled port
+    /// refuses every request (asynManager.c:1541-1546).
+    pub fn check_enabled(&self) -> AsynResult<()> {
         // C asyn parity: a defunct port short-circuits queueRequest
         // (asynManager.c:2283 comment). Reject *before* the enabled
         // check so the error message names the lifecycle phase, not
@@ -459,6 +484,14 @@ impl PortDriverBase {
                 message: format!("port {} is disabled", self.port_name),
             });
         }
+        Ok(())
+    }
+
+    /// Check that the port is enabled, connected, and not defunct.
+    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
+    /// (defunct => permanently disabled) otherwise.
+    pub fn check_ready(&self) -> AsynResult<()> {
+        self.check_enabled()?;
         if !self.connected {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,

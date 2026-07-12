@@ -29,6 +29,45 @@ pub fn timeout_from_secs(secs: f64) -> Duration {
     Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_TIMEOUT)
 }
 
+/// C `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynDriver.h:105, aliasing
+/// `ASYN_REASON_RESERVED_LOW`): the reason value a caller stamps on its
+/// [`AsynUser`] to tell the queue gate that this request must be queued on a
+/// port that is **not connected**.
+///
+/// It is not a driver parameter: the reserved band `0x70000000..=0x7FFFFFFF` is
+/// carved out of the reason space precisely so no `drvUser` index can collide
+/// with it. The requests that carry it (`asynSetOption` / `asynSetEos` from
+/// iocsh, the record's HOSTINFO put and its connect-time option readback) are
+/// the ones whose whole point is to reconfigure a dead line — a serial port
+/// before the crate is powered on, an IP port aimed at the wrong host — and the
+/// ops they run (`setOption`/`getOption`/`setEos`/`getEos`) never look at
+/// `reason`.
+pub const ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED: usize = 0x7000_0000;
+
+/// Which of the two independent refusals C's `queueRequest` applies to a
+/// request (asynManager.c:1536-1552).
+///
+/// The two are *not* interchangeable and only one of them is ever waived:
+///
+/// * `!pport->dpc.enabled → asynDisabled` (:1541-1546) is **unconditional** —
+///   no priority, no reason, no op class escapes it. A port disabled with
+///   `asynEnable(port,0)` was disabled precisely to keep the IOC off the
+///   hardware, so nothing it queues may touch the wire.
+/// * `!pport->dpc.connected → asynDisconnected` (:1547-1552) is conditional on
+///   `checkPortConnect`, which :1536-1538 clears for a request that is queued at
+///   `asynQueuePriorityConnect` **and** either carries no device (`addr == -1`)
+///   or carries [`ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`].
+///
+/// Producing this value is [`AsynUser::connect_check`]'s job and nobody else's:
+/// there is deliberately no way to ask the gate to skip the *enabled* half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectCheck {
+    /// The port (and device) must be connected — C `checkPortConnect == TRUE`.
+    Required,
+    /// C `checkPortConnect = FALSE`: queue it on a disconnected port.
+    Waived,
+}
+
 /// Per-request context, equivalent to C asyn's asynUser.
 ///
 /// `timeout` is meaningful only when a driver performs actual I/O synchronously.
@@ -137,6 +176,40 @@ impl AsynUser {
     pub fn with_addr(mut self, addr: i32) -> Self {
         self.addr = addr;
         self
+    }
+
+    pub fn with_priority(mut self, priority: QueuePriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Queue this request even on a port that is not connected — C's
+    /// `pasynUser->reason = ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` paired with
+    /// `queueRequest(..., asynQueuePriorityConnect, ...)`.
+    ///
+    /// Both halves are set here because C's gate reads both (:1536-1538) and
+    /// every C caller sets both together: `asynSetOption`
+    /// (asynShellCommands.c:121,126), `asynSetEos`/`asynShowEos` (:240,:291),
+    /// the record's HOSTINFO put (asynRecord.c:566-569) and its connect-time
+    /// option readback (:1277-1280). Setting only the reason would leave the
+    /// request at Low priority, where C still refuses it.
+    pub fn queue_even_if_not_connected(mut self) -> Self {
+        self.reason = ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED;
+        self.priority = QueuePriority::Connect;
+        self
+    }
+
+    /// C `queueRequest`'s `checkPortConnect` (asynManager.c:1536-1538) — the
+    /// *only* producer of a [`ConnectCheck`], so the connected refusal is waived
+    /// exactly where C waives it and the enabled refusal is waived nowhere.
+    pub fn connect_check(&self) -> ConnectCheck {
+        if self.priority == QueuePriority::Connect
+            && (self.addr < 0 || self.reason == ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED)
+        {
+            ConnectCheck::Waived
+        } else {
+            ConnectCheck::Required
+        }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {

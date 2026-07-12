@@ -1379,6 +1379,49 @@ const OPTION_READBACK_KEYS: &[&str] = &[
     "disconnectOnReadTimeout",
 ];
 
+/// The fields C `monitorStatus` POST_IF_NEWs (asynRecord.c:1102-1141) — the
+/// readbacks it re-imports from the trace manager and the port, plus the two it
+/// posts because `special()` changed them behind the operator's back (REASON and
+/// the DRVINFO its put blanks, :488-489).
+///
+/// TFIL is in the list: C posts it from the same function, substituting
+/// "Unknown" when another thread re-pointed the trace file (:1119-1124).
+const MONITOR_STATUS_FIELDS: &[&str] = &[
+    "TMSK", "TB0", "TB1", "TB2", "TB3", "TB4", "TB5", "TIOM", "TIB0", "TIB1", "TIB2", "TINM",
+    "TINB0", "TINB1", "TINB2", "TINB3", "TSIZ", "TFIL", "AUCT", "CNCT", "PCNCT", "REASON",
+    "DRVINFO", "ENBL", "OCTETIV", "OPTIONIV", "GPIBIV", "I32IV", "UI32IV", "F64IV",
+];
+
+/// The driver option key C's HOSTINFO field writes (asynRecord.c:1802-1806) —
+/// the one option put C queues on a port that is not connected.
+const HOSTINFO_OPTION_KEY: &str = "hostinfo";
+
+/// Which queue class an option request belongs to — C's choice between
+/// `queueRequest(..., asynQueuePriorityLow, ...)` and
+/// `queueRequest(..., asynQueuePriorityConnect, ...)` with
+/// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` on the user.
+///
+/// C makes that choice per *field* (asynRecord.c:565-569), so it is made here
+/// per option *key* and nowhere else: [`Self::for_key`] is the single owner of
+/// "may this option request run on a disconnected port".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionQueue {
+    /// Low priority — refused while the port is disconnected.
+    Normal,
+    /// Connect priority carrying `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`.
+    EvenIfNotConnected,
+}
+
+impl OptionQueue {
+    fn for_key(key: &str) -> Self {
+        if key == HOSTINFO_OPTION_KEY {
+            Self::EvenIfNotConnected
+        } else {
+            Self::Normal
+        }
+    }
+}
+
 /// The fields C `getEos` re-reads and posts (asynRecord.c:2016-2024) — both
 /// EOS strings, whichever one was written.
 const EOS_READBACK_FIELDS: &[&str] = &["IEOS", "OEOS"];
@@ -2361,7 +2404,7 @@ impl AsynRecord {
     /// option put (see [`Self::write_option`]) as well as on connect, so those
     /// fields always show the driver's actual value rather than the requested
     /// one.
-    fn read_options_from_driver(&mut self, handle: &PortHandle) {
+    fn read_options_from_driver(&mut self, handle: &PortHandle, queue: OptionQueue) {
         // C returns immediately when the port carries no asynOption interface
         // (asynRecord.c:1843-1844) — the record keeps the values it had.
         if !handle.has_interface(crate::interfaces::InterfaceType::Option) {
@@ -2369,8 +2412,10 @@ impl AsynRecord {
         }
         // Every `getOption` C's `getOptions` runs happens *inside* one queued
         // request (`callbackGetOption`), so they stand or fall together: if that
-        // request never ran, no option was read.
-        let Some(opts) = self.get_options(handle, OPTION_READBACK_KEYS) else {
+        // request never ran, no option was read. That also fixes their queue
+        // class: the readback inherits the gate of the request that carries it,
+        // which is why `queue` is the caller's and not this function's to pick.
+        let Some(opts) = self.get_options(handle, OPTION_READBACK_KEYS, queue) else {
             return;
         };
         // C hands `getOption` a buffer the driver clears at entry
@@ -2473,10 +2518,11 @@ impl AsynRecord {
         &mut self,
         handle: &PortHandle,
         keys: &[&str],
+        queue: OptionQueue,
     ) -> Option<HashMap<String, String>> {
         let mut opts = HashMap::new();
         for key in keys {
-            match handle.get_option_blocking(self.option_user(), key) {
+            match handle.get_option_blocking(self.option_user_for(queue), key) {
                 Ok(val) => {
                     opts.insert((*key).to_string(), val);
                 }
@@ -2607,9 +2653,18 @@ impl AsynRecord {
             self.report_no_interface("asynOption");
             return;
         }
+        // C `special()` queues every option put at `asynQueuePriorityLow` — with
+        // one exception it calls out by name: HOSTINFO goes at
+        // `asynQueuePriorityConnect` carrying
+        // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, "Enable changing host:port
+        // when not connected" (asynRecord.c:565-569). It is the operator's only
+        // route to repoint an IP port that is aimed at a wrong or moved host,
+        // and such a port is disconnected by definition — refusing the put is
+        // refusing the repair.
+        let queue = OptionQueue::for_key(key);
         if let Err(e) = entry
             .handle
-            .set_option_blocking(self.option_user(), key, value)
+            .set_option_blocking(self.option_user_for(queue), key, value)
         {
             // The queued special request never ran (C `queueTimeoutCallbackSpecial`,
             // asynRecord.c:929-938): no option was written, and the
@@ -2624,7 +2679,11 @@ impl AsynRecord {
             self.errs = format!("Error setting option, {}", e.message());
         }
         let before = self.field_snapshot(OPTION_READBACK_FIELDS);
-        self.read_options_from_driver(&entry.handle);
+        // The re-read runs *inside* the request the put queued (C's `setOption`
+        // callback falls through to `getOptions`, asynRecord.c:845-849), so it
+        // is queued under the same class: a HOSTINFO put that reached a
+        // disconnected driver reads the new host:port back off it.
+        self.read_options_from_driver(&entry.handle, queue);
         self.post_if_new(&before);
     }
 
@@ -2969,8 +3028,15 @@ impl AsynRecord {
 
                 self.port_entry = Some(entry.clone());
 
-                // Read serial/IP options from driver
-                self.read_options_from_driver(&entry.handle);
+                // Read serial/IP options from driver. C queues this readback at
+                // `asynQueuePriorityConnect` carrying
+                // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynRecord.c:1277-1280),
+                // so a record attaching to a *down* serial or IP port still shows
+                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown". C's asymmetry is
+                // deliberate and preserved: the EOS readback right below it is
+                // queued at Low priority with no waiver (:1296), so IEOS/OEOS do
+                // stay blank until the port connects.
+                self.read_options_from_driver(&entry.handle, OptionQueue::EvenIfNotConnected);
 
                 // Attached to the port (C `connectDevice` sets PCNCT=1,
                 // asynRecord.c:1305).
@@ -3090,6 +3156,16 @@ impl AsynRecord {
             // getOption/getEos readbacks with the same (:1281,:1297) — every
             // request built from this user is one of those.
             .with_queue_timeout(QUEUE_TIMEOUT)
+    }
+
+    /// The `asynUser` an option request runs under, for the [`OptionQueue`] class
+    /// it belongs to — the single place the record decides whether an option
+    /// request may be queued on a disconnected port.
+    fn option_user_for(&self, queue: OptionQueue) -> AsynUser {
+        match queue {
+            OptionQueue::Normal => self.option_user(),
+            OptionQueue::EvenIfNotConnected => self.option_user().queue_even_if_not_connected(),
+        }
     }
 
     /// Clamp the operator's requested transfer sizes into the record fields —
@@ -4030,13 +4106,30 @@ impl Record for AsynRecord {
             }
 
             // REASON change. C `special()` case asynRecordREASON
-            // (asynRecord.c:487-492) assigns `pasynUser->reason` and then calls
-            // `cancelIOInterruptScan` — the registration was made for the old
-            // reason.
+            // (asynRecord.c:487-492) runs four statements, and the port ran two.
+            //
+            // `strcpy(pasynRec->drvinfo, "")` (:489) is not cosmetic — it is what
+            // makes the operator's put *stick*. DRVINFO is the other way to set
+            // REASON: `connectDevice` re-resolves it through
+            // `asynDrvUser->create` and assigns the result over REASON whenever
+            // DRVINFO is non-empty (:1248-1254). Leaving the old DRVINFO in place
+            // meant the next reconnect — a PORT/ADDR put, a PCNCT=1, an IOC
+            // restart with a saved DRVINFO — silently re-resolved REASON from a
+            // string the operator had just overridden by hand.
+            //
+            // `monitorStatus` (:491) is the only place C posts DRVINFO
+            // (:1129-1132), so without it the blank never reaches the operator's
+            // screen; it also re-imports the trace / enable / auto-connect /
+            // connect readbacks, which is why the whole [`MONITOR_STATUS_FIELDS`]
+            // set is what gets POST_IF_NEW'd here and not just DRVINFO.
             "REASON" => {
                 self.resolved_reason = self.reason as usize;
+                let before = self.field_snapshot(MONITOR_STATUS_FIELDS);
+                self.drvinfo.clear();
                 self.cancel_io_interrupt_scan();
                 self.publish_io_intr_binding();
+                self.monitor_status();
+                self.post_if_new(&before);
             }
 
             // --- Serial options ---
@@ -4803,6 +4896,150 @@ mod tests {
         assert_eq!(
             rec.errs, "",
             "a successful connect leaves no diagnostic behind, whatever the reason resolves to"
+        );
+    }
+
+    /// R12-47: the record's HOSTINFO put and its connect-time option readback are
+    /// the two requests C queues at `asynQueuePriorityConnect` carrying
+    /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynRecord.c:566-569,
+    /// :1277-1280), so both run on a port that is *down* — the HOSTINFO put is
+    /// the operator's only route to repoint an IP port aimed at a wrong or moved
+    /// host, and such a port is disconnected by definition.
+    ///
+    /// C's asymmetry is the other half of the test: an ordinary option put (BAUD)
+    /// and the EOS put are queued at Low priority with no waiver, so they still
+    /// take `asynDisconnected` from the queue gate.
+    #[test]
+    fn hostinfo_put_and_option_readback_run_on_a_disconnected_port() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        #[derive(Default)]
+        struct Log {
+            option_sets: Vec<(String, String)>,
+            eos_sets: Vec<Vec<u8>>,
+        }
+
+        struct DeadLineDriver {
+            base: PortDriverBase,
+            log: Arc<Mutex<Log>>,
+            host: Arc<Mutex<String>>,
+        }
+        impl PortDriver for DeadLineDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                key: &str,
+                value: &str,
+            ) -> crate::error::AsynResult<()> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .option_sets
+                    .push((key.to_string(), value.to_string()));
+                if key == "hostinfo" {
+                    *self.host.lock().unwrap() = value.to_string();
+                }
+                Ok(())
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                match key {
+                    // A serial/IP driver answers its configured line settings from
+                    // its own state; none of it needs the wire to be up.
+                    "baud" => Ok("9600".to_string()),
+                    "parity" => Ok("even".to_string()),
+                    "hostinfo" => Ok(self.host.lock().unwrap().clone()),
+                    _ => Err(crate::error::AsynError::Status {
+                        status: crate::error::AsynStatus::Error,
+                        message: format!("unsupported option {key}"),
+                    }),
+                }
+            }
+            fn set_input_eos(&mut self, eos: &[u8]) -> crate::error::AsynResult<()> {
+                self.log.lock().unwrap().eos_sets.push(eos.to_vec());
+                Ok(())
+            }
+        }
+
+        let port_name = "r12_47_dead_line";
+        let log = Arc::new(Mutex::new(Log::default()));
+        let host = Arc::new(Mutex::new("oldhost:5000".to_string()));
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        // The port is down and nothing will bring it back: C's `autoConnectDevice`
+        // is not consulted for a waived request, and must not be needed for one.
+        base.auto_connect = false;
+        base.set_connected(false);
+        let (tx, rx) = mpsc::channel(64);
+        let actor = PortActor::new(
+            Box::new(DeadLineDriver {
+                base,
+                log: log.clone(),
+                host: host.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(16)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+
+        // The connect-time option readback ran on the down port (C :1277-1280).
+        assert_eq!(
+            rec.baud,
+            baud_choice_index("9600"),
+            "C queues getOptions with QUEUE_EVEN_IF_NOT_CONNECTED, so BAUD is the \
+             port's real rate, not Unknown"
+        );
+        assert_eq!(rec.prty, 2, "…and PRTY likewise");
+        assert_eq!(rec.hostinfo, "oldhost:5000", "…and HOSTINFO likewise");
+
+        // The HOSTINFO put reaches the driver, and the fall-through readback comes
+        // back off the same down port.
+        log.lock().unwrap().option_sets.clear();
+        rec.hostinfo = "newhost:5000".to_string();
+        rec.special("HOSTINFO", true).unwrap();
+        assert_eq!(
+            log.lock().unwrap().option_sets,
+            vec![("hostinfo".to_string(), "newhost:5000".to_string())],
+            "the only route to repoint a dead IP port must not be refused"
+        );
+        assert_eq!(rec.errs, "", "a waived put reports no error");
+        assert_eq!(rec.hostinfo, "newhost:5000");
+
+        // An ordinary option put carries no waiver: C queues it at Low priority
+        // (asynRecord.c:560-564) and the gate refuses it.
+        log.lock().unwrap().option_sets.clear();
+        rec.baud = baud_choice_index("19200");
+        rec.special("BAUD", true).unwrap();
+        assert!(
+            log.lock().unwrap().option_sets.is_empty(),
+            "a BAUD put on a disconnected port is asynDisconnected in C, not a driver call"
+        );
+        assert!(
+            rec.errs.starts_with("Error setting option"),
+            "and the refusal is reported: {}",
+            rec.errs
+        );
+
+        // Nor does the EOS put — C keeps it at Low priority with no waiver
+        // (asynRecord.c:1296 for the readback half), so IEOS/OEOS stay refused on
+        // a down port. Preserving that asymmetry is part of the parity.
+        rec.ieos = "\\r\\n".to_string();
+        rec.special("IEOS", true).unwrap();
+        assert!(
+            log.lock().unwrap().eos_sets.is_empty(),
+            "the EOS put must not inherit the HOSTINFO waiver"
         );
     }
 
@@ -8562,6 +8799,51 @@ mod tests {
             rec.errs, "asynDrvUser not supported but drvInfo not blank",
             "C reportError text (asynRecord.c:1264-1265)"
         );
+    }
+
+    /// R11-C8: a REASON put blanks DRVINFO — and that is what makes the put
+    /// stick.
+    ///
+    /// C's `special()` REASON arm runs four statements (asynRecord.c:487-492):
+    /// assign `pasynUser->reason`, `strcpy(pasynRec->drvinfo, "")`,
+    /// `cancelIOInterruptScan`, `monitorStatus`. The blank is load-bearing:
+    /// DRVINFO is the *other* way to set REASON, and `connectDevice` re-resolves
+    /// it through `asynDrvUser->create` and assigns the result over REASON
+    /// whenever it is non-empty (:1248-1254). Keeping the stale string meant the
+    /// next reconnect silently undid the operator's put.
+    #[test]
+    fn a_reason_put_blanks_drvinfo_so_a_reconnect_cannot_undo_it() {
+        let port_name = "r11_c8_reason_put";
+        register_param_port(port_name, "GAIN");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "GAIN".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.reason, 1, "DRVINFO resolved GAIN to parameter 1");
+        assert_eq!(rec.resolved_reason, 1);
+
+        // The operator overrides REASON by hand.
+        rec.reason = 3;
+        rec.special("REASON", true).unwrap();
+        assert_eq!(
+            rec.resolved_reason, 3,
+            "C assigns pasynUser->reason from the field (asynRecord.c:488)"
+        );
+        assert_eq!(
+            rec.drvinfo, "",
+            "C blanks DRVINFO in the same arm (asynRecord.c:489)"
+        );
+
+        // The reconnect any PORT/ADDR put, PCNCT=1 or IOC restart performs must
+        // now leave the operator's REASON alone: there is no DRVINFO left to
+        // re-resolve it from.
+        rec.connect_device().unwrap();
+        assert_eq!(
+            rec.reason, 3,
+            "a stale DRVINFO would have re-resolved REASON back to 1"
+        );
+        assert_eq!(rec.resolved_reason, 3, "and the I/O user with it");
     }
 
     /// R11-48: the zeroing is unconditional — C runs `pasynRec->reason = 0` above

@@ -358,20 +358,6 @@ pub enum IntStyle {
     Bin,
 }
 
-/// Resolve one C base flag group (`-0x`/`-0o`/`-0b`, or `-lx`/`-lo`/`-lb`)
-/// into its [`IntStyle`], mirroring C's `switch ((char) *optarg)`
-/// (`caget.c:486-495`, `camonitor.c:327-336`). No flag of the group given →
-/// `Dec`, C's default for both `outTypeI` and `outTypeF`. The three flags of
-/// a group are mutually exclusive at the clap layer, so at most one is set.
-pub fn base_style(hex: bool, oct: bool, bin: bool) -> IntStyle {
-    match (hex, oct, bin) {
-        (true, _, _) => IntStyle::Hex,
-        (_, true, _) => IntStyle::Oct,
-        (_, _, true) => IntStyle::Bin,
-        _ => IntStyle::Dec,
-    }
-}
-
 /// Per-tool CLI formatting state.
 ///
 /// C keeps the integer base and the float base in TWO independent globals
@@ -408,10 +394,20 @@ pub struct ValueFormat {
     /// `-S` flag: render `DBR_CHAR` arrays as a NUL-terminated string
     /// (long-string CA convention).
     pub char_array_as_string: bool,
-    /// `-# <count>` flag: cap displayed array elements; `None` means
-    /// "all". Acts on display only — the request still asks for the
-    /// requested count from the IOC.
-    pub max_elements: Option<usize>,
+    /// C's `reqElems` — the `-#` count, where `0` means "not specified"
+    /// (`caget.c:386`, `int count = 0; /* 0 = not specified by -# option */`).
+    ///
+    /// `0` is the ONLY encoding of "no `-#`", and that is the point: the
+    /// previous `Option<usize>` had TWO — `None` and `Some(0)` — and they
+    /// drifted apart, so `caget -# 0 WF` displayed ZERO elements where C
+    /// displays all of them. A bare `u64` makes the second encoding
+    /// unrepresentable.
+    ///
+    /// The value is C's `unsigned long`, so a negative `-#` arrives here
+    /// sign-extended (huge) and clamps to the native count — "all elements",
+    /// but still "requested" for [`CountPrefix`]. Built only by
+    /// [`crate::copt::CTool::req_elems_int`] / `req_elems_ulong`.
+    pub req_elems: u64,
     /// `-F <ofs>` flag: replacement field separator. Defaults to a
     /// single space.
     pub field_separator: char,
@@ -425,7 +421,7 @@ impl Default for ValueFormat {
             float_style: IntStyle::Dec,
             enum_as_number: false,
             char_array_as_string: false,
-            max_elements: None,
+            req_elems: 0,
             field_separator: ' ',
         }
     }
@@ -466,22 +462,61 @@ impl CountPrefix {
 /// when it has them, else the integer index is used. `format_value` does not
 /// emit a trailing newline.
 ///
-/// The two gates C's loops carry are separate arguments, because C reads
-/// `reqElems` for two INDEPENDENT decisions:
+/// C's `reqElems` (carried by [`ValueFormat::req_elems`]) drives two
+/// INDEPENDENT decisions here, and `count_prefix` selects which print block's
+/// rule applies to the second:
 ///
-/// * `req_elems` — C's `reqElems`, non-zero iff the user passed `-#`. It gates
-///   the `-S` long-string branch on EVERY block that has one
+/// * the `-S` long-string branch, gated on every block that has one
 ///   (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`:
-///   `caget.c:273` for plain/terse AND `caget.c:318` for specifiedDbr).
-/// * `count_prefix` — whether this block's element loop leads with the count
-///   at all. See [`CountPrefix`].
+///   `caget.c:273` for plain/terse AND `caget.c:318` for specifiedDbr). That
+///   branch prints the escaped string and NOTHING else — no count prefix.
+/// * the leading element count. In C this `printf("%lu%c", nElems, ...)` sits
+///   in the print block BEFORE the element loop (`caget.c:286`), so it fires
+///   for a SCALAR too whenever `reqElems` is set — `caget -# 1 TST:LO` prints
+///   `1 200`, not `200`. Keeping it inside the array rendering (as this
+///   function once did) made it an array-only rule, which is the C behaviour
+///   only by coincidence of `reqElems` usually being unset. See [`CountPrefix`].
 pub fn format_value(
     v: &EpicsValue,
     fmt: &ValueFormat,
     enum_strings: Option<&[PvString]>,
-    req_elems: bool,
     count_prefix: CountPrefix,
 ) -> String {
+    // C's `reqElems` is ONE value, carried by `fmt`. It used to arrive a
+    // second time as a `bool` parameter, and two sources for one C variable is
+    // exactly the drift this closes.
+    let req_elems = fmt.req_elems != 0;
+
+    // C renders a CHAR array as a long-string only when
+    // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element CHAR array with
+    // `-S` but no `-#` falls through to numeric. This gate reads `reqElems`
+    // DIRECTLY and is present on the specifiedDbr block too (`caget.c:318`),
+    // so it does NOT follow `count_prefix`, and it returns before C's count
+    // printf — a long-string never carries the count.
+    if let EpicsValue::CharArray(arr) = v
+        && fmt.char_array_as_string
+        && (req_elems || arr.len() > 1)
+    {
+        // Long-string convention: bytes up to first NUL, then EPICS-escaped
+        // (`caget.c:322-327` escapes the prefix).
+        let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
+        return escape_from_raw(&arr[..end]);
+    }
+
+    let total = v.count() as usize;
+    let body = render_elements(v, fmt, enum_strings);
+    if count_prefix.leads(req_elems, total) {
+        format!("{total}{sep}{body}", sep = fmt.field_separator)
+    } else {
+        body
+    }
+}
+
+/// C's element loop alone: every element of the value, capped at `reqElems`
+/// and joined by the `-F` separator. The leading count is NOT emitted here —
+/// [`format_value`] owns it, so scalar and array carriers cannot disagree
+/// about when it appears.
+fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -> String {
     match v {
         EpicsValue::String(s) => escape_from_raw(s.as_bytes()),
         EpicsValue::Short(n) => format_int_i64(*n as i64, fmt.int_style),
@@ -501,130 +536,89 @@ pub fn format_value(
         EpicsValue::EnumWithChoices { index, .. } => format_enum(*index as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
         EpicsValue::Double(x) => format_float(*x, fmt),
-        EpicsValue::ShortArray(arr) => render_array_iter(
+        EpicsValue::ShortArray(arr) => join_elements(
             arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::LongArray(arr) => render_array_iter(
+        EpicsValue::LongArray(arr) => join_elements(
             arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::Int64Array(arr) => render_array_iter(
+        EpicsValue::Int64Array(arr) => join_elements(
             arr.iter()
                 .map(|&n| format_int_wide(n.to_string(), n as u64, fmt.int_style)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::UInt64Array(arr) => render_array_iter(
+        EpicsValue::UInt64Array(arr) => join_elements(
             arr.iter()
                 .map(|&n| format_int_wide(n.to_string(), n, fmt.int_style)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::UShortArray(arr) => render_array_iter(
+        EpicsValue::UShortArray(arr) => join_elements(
             arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::ULongArray(arr) => render_array_iter(
+        EpicsValue::ULongArray(arr) => join_elements(
             arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
         // DBF_UCHAR[] is numeric unsigned-byte image data: render each element
         // unsigned (0xFF -> 255), not the signed-i8 / long-string CharArray path.
-        EpicsValue::UCharArray(arr) => render_array_iter(
-            arr.iter().map(|&b| format_char(b as i64)),
-            arr.len(),
-            fmt,
-            req_elems,
-            count_prefix,
-        ),
-        EpicsValue::EnumArray(arr) => render_array_iter(
+        EpicsValue::UCharArray(arr) => {
+            join_elements(arr.iter().map(|&b| format_char(b as i64)), arr.len(), fmt)
+        }
+        EpicsValue::EnumArray(arr) => join_elements(
             arr.iter()
                 .map(|&idx| format_enum(idx as i64, fmt, enum_strings)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::FloatArray(arr) => render_array_iter(
+        EpicsValue::FloatArray(arr) => join_elements(
             arr.iter().map(|&x| format_float(x as f64, fmt)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::DoubleArray(arr) => render_array_iter(
-            arr.iter().map(|&x| format_float(x, fmt)),
+        EpicsValue::DoubleArray(arr) => {
+            join_elements(arr.iter().map(|&x| format_float(x, fmt)), arr.len(), fmt)
+        }
+        // The `-S` long-string form is handled by `format_value` before this
+        // is reached; here a CHAR array is always numeric (signed i8).
+        EpicsValue::CharArray(arr) => join_elements(
+            arr.iter().map(|&b| format_char((b as i8) as i64)),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
-        EpicsValue::CharArray(arr) => {
-            // C renders a CHAR array as a long-string only when
-            // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element CHAR
-            // array with `-S` but no `-#` falls through to numeric. This gate
-            // reads `reqElems` DIRECTLY and is present on the specifiedDbr
-            // block too (`caget.c:318`), so it does NOT follow `count_prefix`.
-            if fmt.char_array_as_string && (req_elems || arr.len() > 1) {
-                // Long-string convention: bytes up to first NUL, then
-                // EPICS-escaped (caget.c:322-327 escapes the prefix).
-                let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
-                escape_from_raw(&arr[..end])
-            } else {
-                render_array_iter(
-                    arr.iter().map(|&b| format_char((b as i8) as i64)),
-                    arr.len(),
-                    fmt,
-                    req_elems,
-                    count_prefix,
-                )
-            }
-        }
-        EpicsValue::StringArray(arr) => render_array_iter(
+        EpicsValue::StringArray(arr) => join_elements(
             arr.iter().map(|s| escape_from_raw(s.as_bytes())),
             arr.len(),
             fmt,
-            req_elems,
-            count_prefix,
         ),
     }
 }
 
-/// The single owner of C's array element loop: an optional leading count
-/// (see [`CountPrefix`]), then the elements joined by the `-F` separator.
-/// Every carrier renders its own elements and hands them here, so no array
-/// type can grow a private copy of the count rule.
-fn render_array_iter<I: Iterator<Item = String>>(
-    iter: I,
-    total: usize,
-    fmt: &ValueFormat,
-    req_elems: bool,
-    count_prefix: CountPrefix,
-) -> String {
-    let take = fmt.max_elements.unwrap_or(total).min(total);
-    let mut parts = Vec::with_capacity(take + 1);
-    if count_prefix.leads(req_elems, total) {
-        parts.push(total.to_string());
-    }
-    parts.extend(iter.take(take));
-    parts.join(&fmt.field_separator.to_string())
+/// The single owner of C's array element loop: the elements, capped at
+/// `reqElems` and joined by the `-F` separator. Every carrier renders its own
+/// elements and hands them here, so no array type can grow a private copy of
+/// the cap rule.
+fn join_elements<I: Iterator<Item = String>>(iter: I, total: usize, fmt: &ValueFormat) -> String {
+    // C fetches only `reqElems` elements and then prints every element it
+    // fetched, so the display cap IS `reqElems` — with `0` meaning "all",
+    // never "none" (`caget.c:208`, `nElems = reqElems && reqElems < nElems
+    // ? reqElems : nElems`).
+    let take = if fmt.req_elems == 0 {
+        total
+    } else {
+        (fmt.req_elems as usize).min(total)
+    };
+    iter.take(take)
+        .collect::<Vec<_>>()
+        .join(&fmt.field_separator.to_string())
 }
 
 fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -> String {
@@ -731,40 +725,6 @@ fn format_int_wide(decimal: String, bits: u64, style: IntStyle) -> String {
         IntStyle::Oct => format!("0o{bits:o}"),
         IntStyle::Bin => format!("{bits:b}"),
     }
-}
-
-/// C `sscanf(optarg, "%d", &n)` semantics, shared by every CA tool that
-/// scans a numeric option argument: skip leading whitespace, accept an
-/// optional sign, then take the leading run of decimal digits — trailing junk
-/// is ignored (`"16x"` → `16`, `"0x10"` → `0`). `None` is C's `sscanf`
-/// returning 0, i.e. no digit leads.
-///
-/// The tools branch on exactly that return: `caget -d` falls through to the
-/// textual `dbr_text_to_type` lookup (`caget.c:416-421`), while `-#` prints
-/// "not a valid array element count" and keeps going (`caget.c:445-450`,
-/// `caput.c:336-343`).
-pub fn scan_leading_i64(s: &str) -> Option<i64> {
-    let s = s.trim_start();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut neg = false;
-    if let Some(&c) = bytes.first()
-        && (c == b'+' || c == b'-')
-    {
-        neg = c == b'-';
-        i = 1;
-    }
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    s[start..i]
-        .parse::<i64>()
-        .ok()
-        .map(|n| if neg { -n } else { n })
 }
 
 /// `printf`'s default precision for `%e` / `%f` / `%g` when the conversion
@@ -933,19 +893,19 @@ mod tests {
     /// Every C print loop except `caget -d` uses `CountPrefix::IfRequestedOrArray`;
     /// the `-d` Value line is covered explicitly by
     /// `specified_dbr_value_line_never_leads_with_the_count`.
+    /// `req_elems` is now carried by `fmt` (C has ONE `reqElems`), so the
+    /// helper stamps it onto a copy rather than passing a second source.
     fn fv(
         v: &EpicsValue,
         fmt: &ValueFormat,
         enum_strings: Option<&[PvString]>,
         req_elems: bool,
     ) -> String {
-        format_value(
-            v,
-            fmt,
-            enum_strings,
-            req_elems,
-            CountPrefix::IfRequestedOrArray,
-        )
+        let mut fmt = fmt.clone();
+        if req_elems && fmt.req_elems == 0 {
+            fmt.req_elems = 1;
+        }
+        format_value(v, &fmt, enum_strings, CountPrefix::IfRequestedOrArray)
     }
 
     #[test]
@@ -1079,14 +1039,13 @@ mod tests {
     fn specified_dbr_value_line_never_leads_with_the_count() {
         let f = fmt_default();
         let arr = EpicsValue::LongArray(vec![10, 20, 30]);
-        assert_eq!(
-            format_value(&arr, &f, None, false, CountPrefix::Never),
-            "10 20 30"
-        );
+        assert_eq!(format_value(&arr, &f, None, CountPrefix::Never), "10 20 30");
         // `-#` cannot bring the prefix back on this block either — C's loop
         // has no gate to enable.
+        let mut req = f.clone();
+        req.req_elems = 3;
         assert_eq!(
-            format_value(&arr, &f, None, true, CountPrefix::Never),
+            format_value(&arr, &req, None, CountPrefix::Never),
             "10 20 30"
         );
         // Every array carrier, not just the integer one.
@@ -1095,7 +1054,6 @@ mod tests {
                 &EpicsValue::StringArray(vec!["a".into(), "b".into()]),
                 &f,
                 None,
-                false,
                 CountPrefix::Never
             ),
             "a b"
@@ -1106,7 +1064,6 @@ mod tests {
                 &EpicsValue::EnumArray(vec![1, 0]),
                 &f,
                 Some(&strs),
-                false,
                 CountPrefix::Never
             ),
             "on off"
@@ -1114,7 +1071,7 @@ mod tests {
         // Negative control: the SAME value on the plain/terse loop keeps C's
         // `reqElems || nElems > 1` prefix.
         assert_eq!(
-            format_value(&arr, &f, None, false, CountPrefix::IfRequestedOrArray),
+            format_value(&arr, &f, None, CountPrefix::IfRequestedOrArray),
             "3 10 20 30"
         );
     }
@@ -1130,13 +1087,15 @@ mod tests {
         let mut fmt = fmt_default();
         fmt.char_array_as_string = true;
         let one = EpicsValue::CharArray(b"A".to_vec());
+        let mut req = fmt.clone();
+        req.req_elems = 1;
         assert_eq!(
-            format_value(&one, &fmt, None, true, CountPrefix::Never),
+            format_value(&one, &req, None, CountPrefix::Never),
             "A",
             "`-S -# 1`: reqElems opens the long-string gate"
         );
         assert_eq!(
-            format_value(&one, &fmt, None, false, CountPrefix::Never),
+            format_value(&one, &fmt, None, CountPrefix::Never),
             "65",
             "`-S` alone on a 1-element CHAR array stays numeric (C's gate)"
         );
@@ -1303,16 +1262,6 @@ mod tests {
         );
     }
 
-    /// C's base resolution: the flag letter picks the base, no flag → `dec`
-    /// (`caget.c:486-495`).
-    #[test]
-    fn base_style_resolves_c_out_type() {
-        assert_eq!(base_style(true, false, false), IntStyle::Hex);
-        assert_eq!(base_style(false, true, false), IntStyle::Oct);
-        assert_eq!(base_style(false, false, true), IntStyle::Bin);
-        assert_eq!(base_style(false, false, false), IntStyle::Dec);
-    }
-
     #[test]
     fn pv_name_width_constant_is_30() {
         // Lock the pad width so a future tweak gets caught.
@@ -1448,14 +1397,58 @@ mod tests {
     }
 
     #[test]
-    fn max_elements_caps_array() {
+    fn req_elems_caps_array() {
         let v = EpicsValue::LongArray((0..10).collect());
         let mut fmt = fmt_default();
-        fmt.max_elements = Some(3);
-        // `-#` implies `req_elems_present` so the count prefix is present.
-        let s = fv(&v, &fmt, None, true);
-        // Total count is full (10) per C `caget -# 3` behaviour:
-        //   "10 0 1 2"
-        assert_eq!(s, "10 0 1 2");
+        fmt.req_elems = 3;
+        // Total count is full (10) per C `caget -# 3` behaviour: "10 0 1 2".
+        assert_eq!(
+            format_value(&v, &fmt, None, CountPrefix::IfRequestedOrArray),
+            "10 0 1 2"
+        );
+    }
+
+    /// R12-17. C has ONE encoding of "no `-#`": `reqElems == 0`
+    /// (`caget.c:386`). The pre-fix `Option<usize>` had two, and they drifted:
+    /// `-# 0` became `Some(0)`, which capped the DISPLAY to zero elements.
+    /// Observed on the compiled C against a live softIoc:
+    ///   `caget -# 0 TST:WF` → `TST:WF 8 0 0 0 0 0 0 0 0`   (all 8)
+    /// while caget-rs printed `TST:WF 8` — the count and nothing else.
+    ///
+    /// A negative `-#` sign-extends into a huge `unsigned long`, which clamps
+    /// to the native count but still reads as "requested":
+    ///   `caget -# -3 TST:LO` → `TST:LO   1 200`   (count prefix, all elems)
+    #[test]
+    fn req_elems_zero_means_all_elements_not_none() {
+        let v = EpicsValue::LongArray(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let mut fmt = fmt_default();
+
+        fmt.req_elems = 0; // `-# 0`, `-# abc`, and no `-#` at all
+        assert_eq!(
+            format_value(&v, &fmt, None, CountPrefix::IfRequestedOrArray),
+            "8 0 1 2 3 4 5 6 7",
+            "reqElems == 0 is C's 'not specified' — every element prints"
+        );
+
+        fmt.req_elems = u64::MAX - 2; // `-# -3`, sign-extended
+        assert_eq!(
+            format_value(&v, &fmt, None, CountPrefix::IfRequestedOrArray),
+            "8 0 1 2 3 4 5 6 7",
+            "a negative count clamps to the native count, still 'requested'"
+        );
+
+        // The one-element case is where the count prefix distinguishes them.
+        let one = EpicsValue::LongArray(vec![200]);
+        fmt.req_elems = 0;
+        assert_eq!(
+            format_value(&one, &fmt, None, CountPrefix::IfRequestedOrArray),
+            "200"
+        );
+        fmt.req_elems = u64::MAX - 2;
+        assert_eq!(
+            format_value(&one, &fmt, None, CountPrefix::IfRequestedOrArray),
+            "1 200",
+            "C: `caget -# -3 TST:LO` → `1 200`"
+        );
     }
 }

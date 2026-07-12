@@ -25,6 +25,7 @@ pub(crate) mod channel;
 pub mod chaos;
 pub mod cli;
 pub mod client;
+pub mod copt;
 pub mod discovery;
 pub mod observability;
 pub mod protocol;

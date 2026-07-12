@@ -3950,7 +3950,8 @@ mod tests {
             "ts_factory",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynInt32TimeSeries",
@@ -6732,7 +6733,8 @@ mod tests {
             "binwrite_wb",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWriteBinary",
@@ -6768,7 +6770,8 @@ mod tests {
             "binwrite_text",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             dtyp: "asynOctetWrite",
@@ -7063,7 +7066,8 @@ mod tests {
             "cmdresp_factory",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
@@ -7119,7 +7123,8 @@ mod tests {
             "cmdresp_nul",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
@@ -7157,7 +7162,8 @@ mod tests {
             "cmdresp_lnul",
             handle,
             Arc::new(crate::trace::TraceManager::new()),
-        );
+        )
+        .unwrap();
 
         // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty

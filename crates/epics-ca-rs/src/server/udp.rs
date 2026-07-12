@@ -292,7 +292,25 @@ async fn recv_loop(
     let mut peek_buf = vec![0u8; 64 * 1024];
 
     loop {
-        let (len, src, drops) = recv_from_with_drop_count_socket(&socket, &mut buf).await?;
+        // C `cast_server.c:171-179`: a UDP recv error never exits the cast
+        // server thread — it logs and sleeps 1 s, then keeps receiving. On
+        // Windows, `WSAECONNRESET` (os error 10054) surfaces here whenever an
+        // earlier send from this socket drew an ICMP port-unreachable
+        // (KB263823); on Linux a connected-socket ICMP shows as
+        // `ECONNREFUSED`. Propagating the error instead killed the SEARCH
+        // responder for the rest of the server's life.
+        let (len, src, drops) = match recv_from_with_drop_count_socket(&socket, &mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "epics_ca_rs::server::udp",
+                    %bind_ip,
+                    "CAS: UDP recv error: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         if drops != 0 && drops != prev_drops {
             tracing::debug!(
                 target: "epics_ca_rs::server::udp",

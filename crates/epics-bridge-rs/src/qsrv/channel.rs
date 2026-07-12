@@ -632,7 +632,7 @@ impl BridgeChannel {
         // the matched rule's TRAPWRITE flag (`WriteGrant`). The grant is
         // the single source of "is this a trapped write" — the PUT below
         // routes through it and never re-derives the trap flag.
-        let grant = self.access.write_grant(&self.pv_name);
+        let grant = self.access.write_grant(&self.pv_name).await;
         if !grant.allowed {
             return Err(BridgeError::PutRejected(format!(
                 "write denied for {} (user='{}' host='{}')",
@@ -809,7 +809,7 @@ impl Channel for BridgeChannel {
     }
 
     async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.pv_name) {
+        if !self.access.can_read(&self.pv_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for {} (user='{}' host='{}')",
                 self.pv_name, self.access.user, self.access.host
@@ -889,7 +889,7 @@ impl BridgeChannel {
         // Check read permission up front so a denied client cannot
         // even obtain a monitor handle. start() also re-checks (defense
         // in depth: handles created via with_access elsewhere).
-        if !self.access.can_read(&self.pv_name) {
+        if !self.access.can_read(&self.pv_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for {} (user='{}' host='{}')",
                 self.pv_name, self.access.user, self.access.host

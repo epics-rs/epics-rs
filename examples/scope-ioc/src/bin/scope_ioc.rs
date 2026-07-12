@@ -61,7 +61,8 @@ impl CommandHandler for ConfigHandler {
 
         // Register port in global registry so universal asyn device support can find it
         let port_handle = runtime_handle.port_handle().clone();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone());
+        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
+            .map_err(|e| e.to_string())?;
 
         // Start background simulation task using the PortHandle API
         let sim_notify = notify.clone();

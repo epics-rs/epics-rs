@@ -162,8 +162,12 @@ mod tests {
     }
 
     impl TestPort {
-        fn new() -> Self {
-            let mut base = PortDriverBase::new("ipc_test", 1, PortFlags::default());
+        // Per-test unique port names: registration goes through the
+        // process-global registry, which now errors on duplicates
+        // (C registerPort parity), so tests sharing one name would
+        // collide when run in a single process (`cargo test`).
+        fn new(name: &str) -> Self {
+            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -180,9 +184,9 @@ mod tests {
         }
     }
 
-    fn make_client() -> (PortManager, InProcessClient) {
+    fn make_client(name: &str) -> (PortManager, InProcessClient) {
         let mgr = PortManager::new();
-        let rt_handle = mgr.register_port(TestPort::new()).unwrap();
+        let rt_handle = mgr.register_port(TestPort::new(name)).unwrap();
         let client = InProcessClient::new(rt_handle.port_handle().clone());
         (mgr, client)
     }
@@ -204,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn int32_write_read_cycle() {
-        let (_mgr, client) = make_client();
+        let (_mgr, client) = make_client("ipc_int32");
 
         // Write
         let req = make_request(PortCommand::Int32Write { value: 42 }, 0);
@@ -222,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn float64_write_read_cycle() {
-        let (_mgr, client) = make_client();
+        let (_mgr, client) = make_client("ipc_f64");
 
         let req = make_request(PortCommand::Float64Write { value: 3.14 }, 1);
         let reply = client.request(req).await.unwrap();
@@ -243,7 +247,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (_mgr, client) = rt.block_on(async { make_client() });
+        let (_mgr, client) = rt.block_on(async { make_client("ipc_blocking") });
 
         let req = make_request(PortCommand::Int32Write { value: 99 }, 0);
         let reply = client.request_blocking(req).unwrap();
@@ -264,13 +268,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (_mgr, client) = rt.block_on(async { make_client() });
+        let (_mgr, client) = rt.block_on(async { make_client("ipc_conn") });
         assert_eq!(client.connection_state(), ConnectionState::Connected);
     }
 
     #[tokio::test]
     async fn event_subscription() {
-        let (_mgr, client) = make_client();
+        let (_mgr, client) = make_client("ipc_event");
 
         let mut rx = client.subscribe(EventFilter::default()).await.unwrap();
 
@@ -290,7 +294,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(event.port_name, "ipc_test");
+        assert_eq!(event.port_name, "ipc_event");
         match event.payload {
             EventPayload::ValueChanged {
                 reason,
@@ -307,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_subscription_filtered() {
-        let (_mgr, client) = make_client();
+        let (_mgr, client) = make_client("ipc_event_filt");
 
         let mut rx = client
             .subscribe(EventFilter {

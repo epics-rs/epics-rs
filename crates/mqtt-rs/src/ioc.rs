@@ -161,7 +161,10 @@ impl CommandHandler for MqttConfigHandler {
         let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime_handle.port_handle().clone();
 
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone());
+        // On a duplicate port name the runtime handle drops here, shutting
+        // the just-spawned actor down.
+        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
+            .map_err(|e| e.to_string())?;
 
         // Keep the runtime handle alive — dropping it shuts down the actor
         keep_runtime(runtime_handle);

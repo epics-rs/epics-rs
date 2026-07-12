@@ -1660,7 +1660,10 @@ impl CommandHandler for ModbusConfigHandler {
 
         let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime.port_handle().clone();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone());
+        // On a duplicate port name the runtime handle drops here, shutting
+        // the just-spawned actor down.
+        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
+            .map_err(|e| e.to_string())?;
         keep_runtime(runtime);
 
         println!("drvModbusAsynConfigure: port='{port_name}' octet='{octet_port}' link={link:?}");

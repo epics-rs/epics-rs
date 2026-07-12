@@ -403,7 +403,7 @@ mod tests {
         // mismatch); the PROPERTY subscription must.
         {
             let rec = db.get_record("MON_PROPERTY").await.expect("rec exists");
-            let instance = rec.read().await;
+            let mut instance = rec.write().await;
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
 
@@ -474,7 +474,7 @@ mod tests {
         // A PROPERTY-only post (metadata change) carries the current VAL.
         {
             let rec = db.get_record("WF_ARR").await.expect("rec exists");
-            let instance = rec.read().await;
+            let mut instance = rec.write().await;
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
 

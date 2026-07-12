@@ -2462,7 +2462,7 @@ impl PvDatabase {
                 // DBE_ALARM bit.
                 let mut changed_fields = Vec::new();
                 for (name, val) in fields {
-                    let changed = match instance.last_posted.get(&name) {
+                    let changed = match instance.posted_value(&name) {
                         Some(prev) => prev != &val,
                         None => true,
                     };
@@ -2473,7 +2473,7 @@ impl PvDatabase {
                                 instance.common.mlst = Some(f);
                             }
                         }
-                        instance.last_posted.insert(name.clone(), val.clone());
+                        instance.record_value_post(&name, val.clone());
                         changed_fields.push((
                             name,
                             val,
@@ -3075,7 +3075,7 @@ impl PvDatabase {
                     && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
                 {
                     if let Some(val) = instance.resolve_field(field) {
-                        let changed = match instance.last_posted.get(field) {
+                        let changed = match instance.posted_value(field) {
                             Some(prev) => prev != &val,
                             None => true,
                         };
@@ -3121,7 +3121,7 @@ impl PvDatabase {
             }
             if !sub_updates.is_empty() {
                 for (field, val, _) in &sub_updates {
-                    instance.last_posted.insert(field.clone(), val.clone());
+                    instance.record_value_post(field, val.clone());
                 }
                 changed_fields.extend(sub_updates);
             }
@@ -3187,7 +3187,10 @@ impl PvDatabase {
 
         // 3. Notify subscribers (outside lock)
         {
-            let instance = rec.read().await;
+            // Write guard: a value-class post advances the record's
+            // already-published state (`RecordInstance::record_value_post`),
+            // so posting is a `&mut` operation.
+            let mut instance = rec.write().await;
             instance.notify_from_snapshot(&snapshot);
             // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
             // individual C masks — see recGblResetAlarms above.
@@ -4229,7 +4232,7 @@ impl PvDatabase {
                     && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
                 {
                     if let Some(val) = instance.resolve_field(field) {
-                        let changed = match instance.last_posted.get(field) {
+                        let changed = match instance.posted_value(field) {
                             Some(prev) => prev != &val,
                             None => true,
                         };
@@ -4275,7 +4278,7 @@ impl PvDatabase {
             }
             if !sub_updates.is_empty() {
                 for (field, val, _) in &sub_updates {
-                    instance.last_posted.insert(field.clone(), val.clone());
+                    instance.record_value_post(field, val.clone());
                 }
                 changed_fields.extend(sub_updates);
             }
@@ -4394,7 +4397,10 @@ impl PvDatabase {
 
         // Notify subscribers
         {
-            let instance = rec.read().await;
+            // Write guard: a value-class post advances the record's
+            // already-published state (`RecordInstance::record_value_post`),
+            // so posting is a `&mut` operation.
+            let mut instance = rec.write().await;
             instance.notify_from_snapshot(&snapshot);
             // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
             // individual C masks — see recGblResetAlarms above.
@@ -5360,7 +5366,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
             && !event_posted.contains(&field.as_str())
         {
             if let Some(val) = instance.resolve_field(field) {
-                let changed = match instance.last_posted.get(field) {
+                let changed = match instance.posted_value(field) {
                     Some(prev) => prev != &val,
                     None => true,
                 };
@@ -5399,7 +5405,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     }
     if !sub_updates.is_empty() {
         for (field, val, _) in &sub_updates {
-            instance.last_posted.insert(field.clone(), val.clone());
+            instance.record_value_post(field, val.clone());
         }
         changed_fields.extend(sub_updates);
     }

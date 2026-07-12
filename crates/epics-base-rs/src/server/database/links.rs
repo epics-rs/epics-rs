@@ -1086,7 +1086,10 @@ impl PvDatabase {
             }
         };
         if posted {
-            let inst = rec.read().await;
+            // Write guard: a value-class post advances the record's
+            // already-published state (`RecordInstance::record_value_post`),
+            // so posting is a `&mut` operation.
+            let mut inst = rec.write().await;
             inst.notify_field("SEVR", crate::server::recgbl::EventMask::ALARM);
             inst.notify_field("STAT", crate::server::recgbl::EventMask::VALUE);
         }

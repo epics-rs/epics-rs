@@ -1326,17 +1326,19 @@ impl Record for ScalerRecord {
 
     /// C's scaler posts a FIXED list from a process cycle (see
     /// [`PROCESS_POSTED_BY_NCH`]) and leaves every other field it wrote silent.
-    /// Declaring that list closes two spurious-event families the framework's
+    /// Declaring that list closes the spurious-event family the framework's
     /// generic "post whatever changed" rule opened:
     ///
     /// * `D1..Dnch` — `process()` copies the gates into them on every count
     ///   start (`scalerRecord.c:413-414`, `:525-526`) and posts NOTHING; C's
     ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:704`). The port
     ///   change-detected the copy and fired a `Dn` monitor C never sends.
-    /// * `G1..Gnch`, `PR2..PRnch` — a put posts them (C `dbPut`), but the put
-    ///   path does not advance `last_posted`, so the next process cycle
-    ///   change-detected them a SECOND time. C's `process()` posts no `Gn` at
-    ///   all, and `PRn` only for n = 1.
+    ///
+    /// `G1..Gnch` and `PR2..PRnch` stay outside the set for the same C reason —
+    /// `process()` posts no `Gn` at all, and `PRn` only for n = 1 — NOT to
+    /// compensate for a framework defect: the put-time double post (R11-C10,
+    /// `last_posted` not advanced by the put's own post) is fixed at the
+    /// framework, in `RecordInstance::notify_field_with_origin`.
     ///
     /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
     /// count-start preset recompute moved it.

@@ -307,8 +307,37 @@ pub struct RecordInstance {
     // taken + `leave`d when the record's processing completes. `None`
     // outside any put-notify. See [`NotifyWaitSet`].
     pub notify: Option<Arc<NotifyWaitSet>>,
-    // Last posted values for subscribed fields (generic change detection)
-    pub last_posted: HashMap<String, EpicsValue>,
+    /// The value of each subscribed field as ALREADY PUBLISHED to that
+    /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
+    /// change-detection loop in every snapshot builder posts a field only
+    /// when its current value differs from this — so this map is what
+    /// C's per-record `*_lst` / MARK state is to `monitor()`.
+    ///
+    /// # Invariant (CONTRACT)
+    ///
+    /// A field's value MUST NOT be published twice by the framework.
+    /// Concretely: every value-class post (a `db_post_events` carrying
+    /// `DBE_VALUE` and/or `DBE_LOG`) MUST advance this map for the field it
+    /// posts; an alarm-only / property-only post MUST NOT (those classes do
+    /// not deliver the value to a `DBE_VALUE`/`DBE_LOG` subscriber, so the
+    /// change is still owed to them).
+    ///
+    /// In C, `dbPut` (dbAccess.c:1407-1414) is the record's ONLY post for a
+    /// put: `db_post_events(precord, pfieldsave, DBE_VALUE|DBE_LOG)`. No
+    /// record's `monitor()` re-posts that field — it posts a closed set and
+    /// compares against its own `*_lst` fields. A framework that posts on the
+    /// put and then change-detects the same field on the next process cycle
+    /// sends an event C never sends.
+    ///
+    /// # Owner
+    ///
+    /// [`RecordInstance::record_value_post`] is the SINGLE writer. The field
+    /// is private so no path outside this module can advance (or fail to
+    /// advance) it: the snapshot builders read it through
+    /// [`RecordInstance::posted_value`] and every poster —
+    /// [`RecordInstance::notify_field_with_origin`] included — advances it
+    /// through the owner.
+    last_posted: HashMap<String, EpicsValue>,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -463,6 +492,31 @@ impl RecordInstance {
         self.info.get(key).map(|s| s.as_str())
     }
 
+    /// The value of `field` already published to its `DBE_VALUE`/`DBE_LOG`
+    /// subscribers, or `None` when the framework has never published one.
+    /// The read side of the `last_posted` contract — see the field's docs.
+    pub(crate) fn posted_value(&self, field: &str) -> Option<&EpicsValue> {
+        self.last_posted.get(field)
+    }
+
+    /// SINGLE OWNER of `last_posted`: record that `value` has been published
+    /// to `field`'s `DBE_VALUE`/`DBE_LOG` subscribers, so no later cycle
+    /// change-detects and re-publishes it.
+    ///
+    /// Every value-class post — the snapshot builders' change-detected posts,
+    /// the intermediate async-notify posts, and the put-time
+    /// [`Self::notify_field_with_origin`] post that C makes from `dbPut`
+    /// (dbAccess.c:1414) — routes through here. Alarm-only / property-only
+    /// posts MUST NOT call it: they deliver nothing to a value-class
+    /// subscriber, so the value is still owed.
+    pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
+        if let Some(slot) = self.last_posted.get_mut(field) {
+            *slot = value;
+        } else {
+            self.last_posted.insert(field.to_string(), value);
+        }
+    }
+
     /// Invalidate the metadata cache. Called after writing any
     /// metadata-class field (EGU, PREC, HOPR/LOPR, alarm limits,
     /// DRVH/DRVL, enum strings). The next snapshot will rebuild the
@@ -497,7 +551,7 @@ impl RecordInstance {
     /// know the field is non-metadata) can keep using
     /// [`notify_field_written`].
     // must post EventMask::PROPERTY to all field subscribers when metadata changes
-    pub fn notify_field_written_if_changed(&self, field: &str, prev: Option<&EpicsValue>) {
+    pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
         if !is_metadata_field(&upper) {
             return;
@@ -2309,7 +2363,7 @@ impl RecordInstance {
             // no alarm transition ran on this pending pass.
             let mut changed_fields = Vec::new();
             for (name, val) in fields {
-                let changed = match self.last_posted.get(&name) {
+                let changed = match self.posted_value(&name) {
                     Some(prev) => prev != &val,
                     None => true,
                 };
@@ -2320,7 +2374,7 @@ impl RecordInstance {
                             self.common.mlst = Some(f);
                         }
                     }
-                    self.last_posted.insert(name.clone(), val.clone());
+                    self.record_value_post(&name, val.clone());
                     changed_fields.push((name, val, EventMask::VALUE | EventMask::LOG));
                 }
             }
@@ -2515,7 +2569,7 @@ impl RecordInstance {
                 && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
             {
                 if let Some(val) = self.resolve_field(field) {
-                    let changed = match self.last_posted.get(field) {
+                    let changed = match self.posted_value(field) {
                         Some(prev) => prev != &val,
                         None => true,
                     };
@@ -2559,7 +2613,7 @@ impl RecordInstance {
         }
         if !sub_updates.is_empty() {
             for (field, val, _) in &sub_updates {
-                self.last_posted.insert(field.clone(), val.clone());
+                self.record_value_post(field, val.clone());
             }
             changed_fields.extend(sub_updates);
         }
@@ -2899,7 +2953,7 @@ impl RecordInstance {
     }
 
     /// Notify subscribers of a specific field, filtering by event mask.
-    pub fn notify_field(&self, field: &str, mask: crate::server::recgbl::EventMask) {
+    pub fn notify_field(&mut self, field: &str, mask: crate::server::recgbl::EventMask) {
         self.notify_field_with_origin(field, mask, 0);
     }
 
@@ -2909,7 +2963,7 @@ impl RecordInstance {
     /// value (the per-field `notify_field` already filters by mask
     /// intersection). Used by the alarm-acknowledge (ACKT/ACKS) put path so
     /// an alarm-mask monitor on any field observes the acknowledgement.
-    pub fn notify_record_alarm(&self) {
+    pub fn notify_record_alarm(&mut self) {
         let fields: Vec<String> = self.subscribers.keys().cloned().collect();
         for field in fields {
             self.notify_field(&field, crate::server::recgbl::EventMask::ALARM);
@@ -2917,15 +2971,35 @@ impl RecordInstance {
     }
 
     /// Notify subscribers with an origin tag for self-write filtering.
+    ///
+    /// This is C `db_post_events(precord, pfield, mask)` for one field, and —
+    /// per the `last_posted` contract — the poster that advances the
+    /// already-published value when `mask` carries a value class. Taking
+    /// `&mut self` is what makes that unbypassable: there is no way to publish
+    /// a field's value through the framework without the change detector
+    /// learning that it was published.
     pub fn notify_field_with_origin(
-        &self,
+        &mut self,
         field: &str,
         mask: crate::server::recgbl::EventMask,
         origin: u64,
     ) {
         use crate::server::database::filters::FilteredMonitorEvent;
+        // A value-class post publishes the field to its DBE_VALUE/DBE_LOG
+        // subscribers, exactly as C's `dbPut` does for the put field
+        // (dbAccess.c:1414) — record it so the next process cycle's
+        // change-detection loop does not publish the same value a second
+        // time. An alarm-only / property-only post publishes no value, so it
+        // leaves the map alone.
+        let publishes_value = mask.intersects(
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+        );
+        let mut posted: Option<EpicsValue> = None;
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
+                if publishes_value {
+                    posted = Some(value.clone());
+                }
                 let mon_snap = self.make_monitor_snapshot(field, value);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
@@ -2962,6 +3036,15 @@ impl RecordInstance {
                     }
                 }
             }
+        }
+        // The value is now published to this field's value-class subscribers:
+        // hand it to the `last_posted` owner so the change detector does not
+        // publish it again. Delivery to any individual subscriber may have
+        // been filtered out, exactly as C's `db_post_events` may find an empty
+        // `mlis` — C still leaves `monitor()`'s `*_lst` state advanced by the
+        // cycle that ran, so the post, not the delivery, is what counts.
+        if let Some(value) = posted {
+            self.record_value_post(field, value);
         }
     }
 
@@ -3479,7 +3562,7 @@ mod metadata_cache_tests {
     /// the existing `notify_field_written` short-circuit.
     #[test]
     fn notify_field_written_if_changed_skips_non_metadata_field() {
-        let inst = ai_instance();
+        let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
         assert!(inst.metadata_cache.lock().unwrap().is_some());
         // VAL is not in is_metadata_field set — must be skipped even

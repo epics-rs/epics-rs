@@ -1138,12 +1138,14 @@ pub trait Record: Send + Sync + 'static {
     /// * a field the record WRITES during `process()` but C never posts
     ///   (scaler's gate→direction copy, `scalerRecord.c:413-414`: `pdir[i] =
     ///   pgate[i]` with no `db_post_events` — C posts `Dn` only from
-    ///   `special()`), and
-    /// * a field a PUT already posted, whose `last_posted` the put path does
-    ///   not advance, so the next process cycle change-detects it a second
-    ///   time (`Gn`, `PRn`).
+    ///   `special()`).
     ///
-    /// `Some(list)` closes both by construction: a field outside the list is
+    /// (A field a PUT already posted is NOT in that category: the put's own
+    /// post advances `last_posted` — see the `RecordInstance::last_posted`
+    /// contract — so the next process cycle does not change-detect it. This
+    /// hook must not be used to paper over a framework double post.)
+    ///
+    /// `Some(list)` closes it by construction: a field outside the list is
     /// never posted by a process cycle — its only monitors come from its own
     /// put and from [`Self::monitor_side_effect_fields`]. The list is a
     /// whitelist, not a blacklist, so a field added to the record later stays

@@ -254,23 +254,39 @@ impl PortDriver for ErrorDriver {
 // Helpers
 // ============================================================
 
+/// Per-call unique port name. Registration goes through the
+/// process-global registry, which errors on duplicates (C registerPort
+/// parity) — tests sharing one fixed name would collide when several
+/// run in the same process (`cargo test` thread mode).
+fn unique_name(prefix: &str) -> String {
+    static PORT_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = PORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}_{n}")
+}
+
 fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
-    let rt = mgr.register_port(TestScopeDriver::new("SCOPE")).unwrap();
+    let rt = mgr
+        .register_port(TestScopeDriver::new(&unique_name("SCOPE")))
+        .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
 }
 
 fn setup_echo() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
-    let rt = mgr.register_port(EchoDriver::new("ECHO")).unwrap();
+    let rt = mgr
+        .register_port(EchoDriver::new(&unique_name("ECHO")))
+        .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
 }
 
 fn setup_error() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
-    let rt = mgr.register_port(ErrorDriver::new("ERRTEST")).unwrap();
+    let rt = mgr
+        .register_port(ErrorDriver::new(&unique_name("ERRTEST")))
+        .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
 }

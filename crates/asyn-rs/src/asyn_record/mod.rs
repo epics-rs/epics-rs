@@ -3201,7 +3201,7 @@ mod tests {
         let handle = PortHandle::new(tx, "test_asyn_rec".into(), interrupts);
         let trace = Arc::new(TraceManager::new());
 
-        register_port("test_asyn_rec", handle, trace);
+        register_port("test_asyn_rec", handle, trace).unwrap();
 
         let entry = registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
@@ -3246,7 +3246,7 @@ mod tests {
         let mut handle = PortHandle::new(tx, port_name.into(), interrupts);
         handle.set_capabilities(true, 4);
         let trace = Arc::new(TraceManager::new());
-        register_port(port_name, handle, trace.clone());
+        register_port(port_name, handle, trace.clone()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -3312,7 +3312,7 @@ mod tests {
             Some(port_name),
             TraceInfoMask::SOURCE | TraceInfoMask::THREAD,
         );
-        register_port(port_name, handle, trace);
+        register_port(port_name, handle, trace).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -3366,7 +3366,7 @@ mod tests {
         // it); without it the record's subscription is a no-op.
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         trace.set_trace_info_mask(Some(port_name), TraceInfoMask::TIME);
-        register_port(port_name, handle, trace.clone());
+        register_port(port_name, handle, trace.clone()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -3447,7 +3447,7 @@ mod tests {
         );
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         // ASCII read: AINP gets the (lossy) text; BINP must stay untouched.
         let mut ascii = AsynRecord::default();
@@ -3545,7 +3545,7 @@ mod tests {
         );
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         // ASCII read failure: NORD/EOMR cleared to 0, AINP/TINP cleared to "",
         // and BINP (not the IFMT-selected field) left as it was — matching C,
@@ -3684,7 +3684,7 @@ mod tests {
         );
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         let mk = |iface: i32, tmod: TransferMode| {
             let mut rec = AsynRecord::default();
@@ -3792,7 +3792,7 @@ mod tests {
         );
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -4248,7 +4248,7 @@ mod tests {
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         // Known baseline mask, then register the port for the record to find.
         trace.set_trace_mask(Some(port_name), TraceMask::empty());
-        super::registry::register_port(port_name, handle, trace.clone());
+        super::registry::register_port(port_name, handle, trace.clone()).unwrap();
 
         // Build the record, hand it the database handle, and connect it —
         // connecting registers the trace exception callback with the same
@@ -4361,7 +4361,7 @@ mod tests {
         // `monitorStatus`): TMSK = ERROR, all IO bits clear.
         trace.set_trace_mask(Some(port_name), TraceMask::ERROR);
         trace.set_trace_io_mask(Some(port_name), TraceIoMask::empty());
-        super::registry::register_port(port_name, handle, trace.clone());
+        super::registry::register_port(port_name, handle, trace.clone()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "TRACE_POSTIFNEW_REC";

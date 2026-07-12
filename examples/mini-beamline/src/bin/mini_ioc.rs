@@ -199,7 +199,8 @@ async fn main() -> CaResult<()> {
                     let rt = point_detector::create_point_detector(port, *mode)
                         .map_err(|e| format!("failed to create PointDetector {port}: {e}"))?;
                     let port_handle = rt.port_handle().clone();
-                    asyn_rs::asyn_record::register_port(port, port_handle, h.trace.clone());
+                    asyn_rs::asyn_record::register_port(port, port_handle, h.trace.clone())
+                        .map_err(|e| e.to_string())?;
                     h.pd_runtimes.lock().unwrap().insert(port.to_string(), rt);
                     println!("  PointDetector '{port}' created");
                 }
@@ -235,7 +236,8 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("DOT", dot_handle, h.trace.clone());
+                asyn_rs::asyn_record::register_port("DOT", dot_handle, h.trace.clone())
+                    .map_err(|e| e.to_string())?;
 
                 // Connect MovingDot as the data source for the plugin chain
                 // (NDStdArraysConfigure etc. will call connect_downstream on this)

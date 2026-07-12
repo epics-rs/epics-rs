@@ -645,54 +645,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 StringOp::Crc16 => {
                     let v = pop1(&mut stack)?;
-                    let crc = super::checksum::crc16(v.as_bytes()?);
-                    stack.push(StackValue::Double(crc as f64));
+                    stack.push(checksum_op(v, crc16_escaped, Combine::Replace));
                 }
                 StringOp::Crc16Append => {
-                    // MODBUS: append CRC16 as two bytes (little-endian)
                     let v = pop1(&mut stack)?;
-                    let s = v.as_bytes()?;
-                    let crc = super::checksum::crc16(s);
-                    let mut result = s.to_vec();
-                    result.push((crc & 0xFF) as u8);
-                    result.push(((crc >> 8) & 0xFF) as u8);
-                    stack.push(StackValue::str(result));
+                    stack.push(checksum_op(v, crc16_escaped, Combine::Append));
                 }
                 StringOp::Lrc => {
                     let v = pop1(&mut stack)?;
-                    match super::checksum::lrc(v.as_bytes()?) {
-                        Some(lrc_str) => {
-                            stack.push(StackValue::str(lrc_str));
-                        }
-                        None => return Err(CalcError::InvalidFormat),
-                    }
+                    stack.push(checksum_op(v, super::checksum::lrc, Combine::Replace));
                 }
                 StringOp::LrcAppend => {
-                    // AMODBUS: append LRC hex string
                     let v = pop1(&mut stack)?;
-                    let s = v.as_bytes()?;
-                    match super::checksum::lrc(s) {
-                        Some(lrc_str) => {
-                            let mut result = s.to_vec();
-                            result.extend_from_slice(lrc_str.as_bytes());
-                            stack.push(StackValue::str(result));
-                        }
-                        None => return Err(CalcError::InvalidFormat),
-                    }
+                    stack.push(checksum_op(v, super::checksum::lrc, Combine::Append));
                 }
                 StringOp::Xor8 => {
                     let v = pop1(&mut stack)?;
-                    let xor = super::checksum::xor8(v.as_bytes()?);
-                    stack.push(StackValue::Double(xor as f64));
+                    stack.push(checksum_op(v, xor8_escaped, Combine::Replace));
                 }
                 StringOp::Xor8Append => {
-                    // ADD_XOR8: append XOR8 as one byte
                     let v = pop1(&mut stack)?;
-                    let s = v.as_bytes()?;
-                    let xor = super::checksum::xor8(s);
-                    let mut result = s.to_vec();
-                    result.push(xor);
-                    stack.push(StackValue::str(result));
+                    stack.push(checksum_op(v, xor8_escaped, Combine::Append));
                 }
                 StringOp::Subrange => {
                     // C `sCalcPerform.c:1869-1901`. Pop: string, i, j. BOTH bounds
@@ -827,6 +800,88 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         return Err(CalcError::NonFiniteResult);
     }
     Ok(result)
+}
+
+/// What a checksum opcode does with the digest it computed: `CRC16`/`LRC`/`XOR8`
+/// REPLACE the operand with it, `MODBUS`/`AMODBUS`/`ADD_XOR8` APPEND it.
+#[derive(Clone, Copy, PartialEq)]
+enum Combine {
+    Replace,
+    Append,
+}
+
+/// C's six checksum opcodes (`sCalcPerform.c:1819-1866`) are one shape written
+/// out three times:
+///
+/// ```c
+/// if (isString(ps)) {                  /* a DOUBLE operand is left ALONE, not rejected */
+///     if (chk(tmpstr, ps->s) == 0) {   /* a FAILED checksum leaves it alone too */
+///         if (op == CRC16)  strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1);
+///         else              strncat(ps->s, tmpstr, SCALC_STRING_SIZE-strlen(ps->s)-1);
+///     }
+/// }
+/// ```
+///
+/// so neither the type guard nor the failure is an error: compiled sCalc answers
+/// `CRC16(4)` = 4 and `CRC16(AA)` = "" for an empty AA, both with st=0. The port
+/// used `as_bytes()?`, which raised `TypeMismatch` on a double operand, and had no
+/// failure path at all.
+///
+/// `digest` returns the TEXT C's helper wrote into `tmpstr`, or `None` for its
+/// `return(-1)`.
+fn checksum_op(
+    v: StackValue,
+    digest: impl FnOnce(&[u8]) -> Option<String>,
+    combine: Combine,
+) -> StackValue {
+    let StackValue::Str(s) = v else {
+        return v; // `if (isString(ps))` — a double falls straight through.
+    };
+    let Some(text) = digest(s.as_bytes()) else {
+        return StackValue::Str(s); // the helper returned -1; C writes nothing.
+    };
+    match combine {
+        Combine::Replace => StackValue::str(text),
+        Combine::Append => StackValue::str([s.as_bytes(), text.as_bytes()].concat()),
+    }
+}
+
+/// C `crc16` (`sCalcPerform.c:192-229`) — the digest CRC16 and MODBUS share.
+///
+/// Two things the port had wrong, and compiled sCalc confirms both:
+///
+///   * The operand is ESCAPED text, and the CRC is taken over what
+///     `dbTranslateEscape` makes of it (`:198`), not over the operand's own
+///     bytes. `MODBUS("\x01\x03")` checksums TWO bytes, not the eight characters
+///     that spell them.
+///   * The digest is handed back as ESCAPED text — a literal
+///     `sprintf(output, "\\x%02x\\x%02x", crc&0xff, (crc&0xff00)>>8)` (`:227`),
+///     low byte first. That is NOT the escape table: a printable digest byte is
+///     still written `\x41`, never `A` (compiled sCalc: `XOR8("A")` = `\x41`).
+///     The frame therefore stays escaped all the way to the octet layer, which is
+///     what translates it. The port emitted raw bytes, which the driver then
+///     escaped a second time.
+///
+/// `dbTranslateEscape` returning 0 is C's `return(-1)`, and the caller then leaves
+/// the operand untouched.
+fn crc16_escaped(operand: &[u8]) -> Option<String> {
+    let raw = raw_from_escaped(operand);
+    if raw.is_empty() {
+        return None;
+    }
+    let crc = super::checksum::crc16(&raw);
+    Some(format!("\\x{:02x}\\x{:02x}", crc & 0xff, (crc >> 8) & 0xff))
+}
+
+/// C `xor8` (`sCalcPerform.c:258-282`) — the digest XOR8 and ADD_XOR8 share. The
+/// same shape as [`crc16_escaped`], one byte wide:
+/// `sprintf(output, "\\x%02x", xor8&0xff)`.
+fn xor8_escaped(operand: &[u8]) -> Option<String> {
+    let raw = raw_from_escaped(operand);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(format!("\\x{:02x}", super::checksum::xor8(&raw)))
 }
 
 /// C `TO_DOUBLE` — the `DBL` OPERATOR (`sCalcPerform.c:1505-1514), which is not

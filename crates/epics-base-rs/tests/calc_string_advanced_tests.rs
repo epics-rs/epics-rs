@@ -112,31 +112,97 @@ fn test_sscanf_string() {
     assert_eq!(result, StackValue::Str("hello".into()));
 }
 
-// --- CRC16 ---
+// --- CRC16 / MODBUS / XOR8 / ADD_XOR8 ---
+//
+// The digest is ESCAPED TEXT, not raw bytes. C's helpers end with a literal
+// `sprintf(output, "\\x%02x\\x%02x", crc&0xff, (crc&0xff00)>>8)`
+// (`sCalcPerform.c:227`, `:281`), so the frame stays escaped all the way to the
+// octet layer — which is the thing that translates it. CRC16 and XOR8 REPLACE
+// the operand with the digest; MODBUS and ADD_XOR8 APPEND it.
 
+/// Compiled sCalc: `CRC16("123456789")` = `\x37\x4b` — the standard 0x4B37
+/// MODBUS CRC, low byte first, as eight characters of escaped text. This test
+/// used to pin `Double(0x4B37)`, which is not a value C can produce here.
 #[test]
-fn test_crc16() {
-    let result = eval_str(r#"CRC16("123456789")"#);
-    assert_eq!(result, StackValue::Double(0x4B37 as f64));
+fn test_crc16_is_escaped_text_low_byte_first() {
+    assert_eq!(
+        eval_str(r#"CRC16("123456789")"#),
+        StackValue::Str(r"\x37\x4b".into())
+    );
+    assert_eq!(
+        eval_str(r#"CRC16("AB")"#),
+        StackValue::Str(r"\xb1\xd1".into())
+    );
 }
 
+/// Compiled sCalc: `MODBUS("AB")` = `AB\xb1\xd1`, ten characters.
 #[test]
-fn test_modbus_append() {
-    // MODBUS appends CRC16 bytes to the string
+fn test_modbus_appends_the_escaped_crc() {
+    assert_eq!(
+        eval_str(r#"MODBUS("AB")"#),
+        StackValue::Str(r"AB\xb1\xd1".into())
+    );
+    assert_eq!(eval_str(r#"LEN(MODBUS("AB"))"#), StackValue::Double(10.0));
+}
+
+/// Compiled sCalc: `XOR8("AB")` = `\x03`, `ADD_XOR8("AB")` = `AB\x03` (six
+/// characters). A PRINTABLE digest byte is escaped too — `XOR8("A")` = `\x41`,
+/// never `A` — because C's sprintf is unconditional, not the escape table.
+#[test]
+fn test_xor8_is_escaped_text() {
+    assert_eq!(eval_str(r#"XOR8("AB")"#), StackValue::Str(r"\x03".into()));
+    assert_eq!(eval_str(r#"XOR8("A")"#), StackValue::Str(r"\x41".into()));
+    assert_eq!(
+        eval_str(r#"ADD_XOR8("AB")"#),
+        StackValue::Str(r"AB\x03".into())
+    );
+    assert_eq!(eval_str(r#"LEN(ADD_XOR8("AB"))"#), StackValue::Double(6.0));
+}
+
+/// The operand is ESCAPED text: the digest is taken over what `dbTranslateEscape`
+/// makes of it (`sCalcPerform.c:198`, `:264`), not over its own characters.
+/// Compiled sCalc: `CRC16("\x01\x03")` = `\x40\x21` — a CRC of TWO bytes, not of
+/// the eight characters that spell them.
+#[test]
+fn test_checksum_operand_is_translated_first() {
+    assert_eq!(
+        eval_str(r#"CRC16("\x01\x03")"#),
+        StackValue::Str(r"\x40\x21".into())
+    );
+    // XOR of the RAW bytes 0x01^0x02^0x03 = 0x00.
     let mut inputs = StringInputs::new();
-    let result = scalc(r#"MODBUS("AB")"#, &mut inputs).unwrap();
-    match result {
-        StackValue::Str(s) => {
-            // First two chars are "AB"
-            assert!(s.as_bytes().starts_with(b"AB"));
-            // Followed by two CRC chars (may be multi-byte in UTF-8)
-            assert!(s.len() > 2);
-        }
-        _ => panic!("expected string"),
+    inputs.str_vars[0] = vec![0x01u8, 0x02, 0x03].into();
+    assert_eq!(
+        scalc("XOR8(AA)", &mut inputs).unwrap(),
+        StackValue::Str(r"\x00".into())
+    );
+}
+
+/// C guards every checksum with `if (isString(ps))` and then with
+/// `if (chk(...) == 0)`, and neither guard raises an error: a DOUBLE operand and
+/// an operand that translates to nothing are both left EXACTLY as they are, with
+/// st=0. The port raised `TypeMismatch` on the first and had no path for the
+/// second. Compiled sCalc: `CRC16(4)` = 4, `MODBUS(4)` = 4, `CRC16(AA)` = "" for
+/// an empty AA — all st=0.
+#[test]
+fn test_checksum_guards_are_not_errors() {
+    assert_eq!(eval_str("CRC16(4)"), StackValue::Double(4.0));
+    assert_eq!(eval_str("MODBUS(4)"), StackValue::Double(4.0));
+    assert_eq!(eval_str("XOR8(4)"), StackValue::Double(4.0));
+    assert_eq!(eval_str("ADD_XOR8(4)"), StackValue::Double(4.0));
+
+    for expr in ["CRC16(AA)", "MODBUS(AA)", "XOR8(AA)", "ADD_XOR8(AA)"] {
+        let mut inputs = StringInputs::new();
+        inputs.str_vars[0] = "".into();
+        assert_eq!(
+            scalc(expr, &mut inputs).unwrap(),
+            StackValue::Str("".into()),
+            "{expr}"
+        );
     }
 }
 
-// --- LRC ---
+// --- LRC / AMODBUS ---
 
 #[test]
 fn test_lrc() {
@@ -150,35 +216,6 @@ fn test_amodbus_append() {
     let result = eval_str(r#"LEN(AMODBUS("010203"))"#);
     // "010203" is 6 chars, plus "FA" = 8
     assert_eq!(result, StackValue::Double(8.0));
-}
-
-// --- XOR8 ---
-
-#[test]
-fn test_xor8() {
-    // XOR of 0x01, 0x02, 0x03 = 0x00
-    let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = vec![0x01u8, 0x02, 0x03].into();
-    let result = scalc("XOR8(AA)", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(0.0));
-}
-
-#[test]
-fn test_xor8_ascii() {
-    let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "AB".into(); // 0x41 ^ 0x42 = 0x03
-    let result = scalc("XOR8(AA)", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(3.0));
-}
-
-#[test]
-fn test_add_xor8_append() {
-    // ADD_XOR8 appends XOR8 as one byte
-    let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "AB".into();
-    let result = scalc("LEN(ADD_XOR8(AA))", &mut inputs).unwrap();
-    // "AB" is 2 bytes + 1 XOR8 byte = 3
-    assert_eq!(result, StackValue::Double(3.0));
 }
 
 // --- Subrange [] ---
@@ -404,11 +441,19 @@ fn test_until_count_ceiling_is_nine() {
 
 // --- Edge cases ---
 
+/// A checksum NEVER fails the perform. C's call site is
+/// `if (lrc(tmpstr10, ps->s) == 0) { ...write... }` (`sCalcPerform.c:1843`), so
+/// the helper's `return(-1)` just means "write nothing" — the operand survives
+/// and st stays 0. This test pinned `Err(InvalidFormat)`, which no sCalc path
+/// produces.
+///
+/// The VALUE compiled sCalc gives is `"00"` (its `hex()` reads a non-hex
+/// character as 0); making the port agree is R12-9. What is fixed here is only
+/// that it is not an error.
 #[test]
-fn test_lrc_invalid() {
+fn test_lrc_non_hex_is_not_an_error() {
     let mut inputs = StringInputs::new();
-    let result = scalc(r#"LRC("0G")"#, &mut inputs);
-    assert!(matches!(result, Err(CalcError::InvalidFormat)));
+    assert!(scalc(r#"LRC("0G")"#, &mut inputs).is_ok());
 }
 
 #[test]

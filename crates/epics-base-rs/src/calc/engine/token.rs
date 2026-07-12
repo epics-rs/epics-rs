@@ -194,9 +194,26 @@ struct ElementTable {
     /// True when the table has `LITERAL_STRING` elements (`"` and `'`) —
     /// sCalcPostfix.c:97-98 only.
     string_literals: bool,
+    /// The table's word-shaped `LITERAL_OPERAND` elements: `INF` and `NAN` in
+    /// base (`postfix.c:111,125`) and sCalc (`sCalcPostfix.c:149,167`), and
+    /// NOTHING in aCalc, whose table has neither — `INF` lexes there as the
+    /// operands `I`, `N`, `F`.
+    ///
+    /// These are elements, not constants. A `LITERAL_OPERAND` name only says
+    /// WHERE a literal starts: C rewinds past the name it just matched
+    /// (`psrc -= strlen(pel->name)`, postfix.c:258 / sCalcPostfix.c:491) and
+    /// re-scans from the first character with strtod, so strtod alone decides
+    /// how far the literal runs. `INFINITY` is a literal `inf` because strtod
+    /// eats all eight characters; `INFO` is CALC_ERR_SYNTAX because strtod eats
+    /// `INF` and the `O` left behind matches no element.
+    literal_words: &'static [&'static str],
     /// How a numeric literal is parsed once its first character has matched.
     hex: HexLiteral,
 }
+
+/// The `LITERAL_OPERAND` words shared by base and sCalc. aCalc's table has no
+/// such element, so it gets `&[]`.
+static INF_NAN: &[&str] = &["INF", "NAN"];
 
 /// C's two literal-parsing paths, one per table shape.
 #[derive(Clone, Copy, PartialEq)]
@@ -228,7 +245,6 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("FINITE", Token::Func(FuncName::Finite)),
         ("FLOOR", Token::Func(FuncName::Floor)),
         ("FMOD", Token::Func(FuncName::Fmod)),
-        ("INF", Token::Number(f64::INFINITY)),
         ("ISINF", Token::Func(FuncName::IsInf)),
         ("ISNAN", Token::Func(FuncName::IsNan)),
         ("LN", Token::Func(FuncName::Ln)),
@@ -237,7 +253,6 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("MAX", Token::Func(FuncName::Max)),
         ("MIN", Token::Func(FuncName::Min)),
         ("NINT", Token::Func(FuncName::Nint)),
-        ("NAN", Token::Number(f64::NAN)),
         ("NOT", Token::Func(FuncName::Not)),
         ("PI", Token::Const(ConstName::Pi)),
         ("R2D", Token::Const(ConstName::R2D)),
@@ -288,6 +303,7 @@ static BASE_TABLE: ElementTable = ElementTable {
     last_var: b'U' - b'A',
     last_double_var: None,
     string_literals: false,
+    literal_words: INF_NAN,
     hex: HexLiteral::Uint32Element,
 };
 
@@ -312,7 +328,6 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("EXP", Token::Func(FuncName::Exp)),
         ("FINITE", Token::Func(FuncName::Finite)),
         ("FLOOR", Token::Func(FuncName::Floor)),
-        ("INF", Token::Number(f64::INFINITY)),
         // sCalcPostfix.c:150 — `INT` is an ALIAS of `NINT`: it rounds.
         ("INT", Token::Func(FuncName::Int)),
         ("ISINF", Token::Func(FuncName::IsInf)),
@@ -325,7 +340,6 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("MAX", Token::Func(FuncName::Max)),
         ("MIN", Token::Func(FuncName::Min)),
         ("MODBUS", Token::Func(FuncName::ModBus)),
-        ("NAN", Token::Number(f64::NAN)),
         ("NINT", Token::Func(FuncName::Nint)),
         ("NOT", Token::Func(FuncName::Not)),
         ("NRNDM", Token::Nrndm),
@@ -395,6 +409,7 @@ static SCALC_TABLE: ElementTable = ElementTable {
     last_var: b'P' - b'A',
     last_double_var: Some(b'L' - b'A'),
     string_literals: true,
+    literal_words: INF_NAN,
     hex: HexLiteral::Strtod,
 };
 
@@ -507,6 +522,9 @@ static ACALC_TABLE: ElementTable = ElementTable {
     last_var: b'P' - b'A',
     last_double_var: Some(b'L' - b'A'),
     string_literals: false,
+    // aCalcPostfix.c:98-108 — the table's only LITERAL_OPERANDs are `.` and the
+    // digits. It has no `INF` and no `NAN` element.
+    literal_words: &[],
     hex: HexLiteral::Strtod,
 };
 
@@ -585,14 +603,11 @@ impl<'a> Tokenizer<'a> {
         let rem = &self.input[self.pos..];
         let mut best: Option<(usize, &Token)> = None;
         for (name, tok) in self.table.symbols {
+            if !starts_with_ci(rem, name) {
+                continue;
+            }
             let n = name.len();
-            if rem.len() < n {
-                continue;
-            }
-            if !rem[..n].eq_ignore_ascii_case(name.as_bytes()) {
-                continue;
-            }
-            if best.map_or(true, |(blen, _)| n > blen) {
+            if best.is_none_or(|(blen, _)| n > blen) {
                 best = Some((n, tok));
             }
         }
@@ -626,9 +641,46 @@ impl<'a> Tokenizer<'a> {
         None
     }
 
-    /// A `LITERAL_OPERAND` element (`.`, `0`..`9`, and base's own `0X`).
-    fn read_number(&mut self) -> Result<f64, CalcError> {
+    /// Does a `LITERAL_OPERAND` element of this table start here?
+    ///
+    /// Every table has `.` and `0`..`9` (postfix.c:77-88, sCalcPostfix.c:104-114,
+    /// aCalcPostfix.c:98-108); base and sCalc add the words `INF` and `NAN`. This
+    /// decides only WHERE the literal starts — `read_literal` decides how far it
+    /// runs, exactly as C's rewind-then-strtod does.
+    fn at_literal(&self) -> bool {
+        let rem = &self.input[self.pos..];
+        match rem.first() {
+            None => false,
+            Some(b) if b.is_ascii_digit() || *b == b'.' => true,
+            _ => self
+                .table
+                .literal_words
+                .iter()
+                .any(|w| starts_with_ci(rem, w)),
+        }
+    }
+
+    /// C's `LITERAL_OPERAND` case: rewind to the element's first character and
+    /// hand the text to strtod (`epicsParseDouble`, postfix.c:261; `epicsStrtod`,
+    /// sCalcPostfix.c:492 and aCalcPostfix.c:462). The literal covers exactly the
+    /// text strtod consumes, and strtod consuming NOTHING is
+    /// `CALC_ERR_BAD_LITERAL` (C tests `pnext == psrc`) — which is why a lone `.`
+    /// is a bad literal rather than a syntax error.
+    fn read_literal(&mut self) -> Result<f64, CalcError> {
         let start = self.pos;
+
+        // strtod's INF / INFINITY / NAN / NAN(n-char-sequence) forms (C99
+        // 7.22.1.3). Reachable only through a table that declares the word, so
+        // aCalc — which has no such element — never takes this path.
+        if self
+            .table
+            .literal_words
+            .iter()
+            .any(|w| starts_with_ci(&self.input[start..], w))
+        {
+            return Ok(self.read_inf_or_nan());
+        }
+
         let is_hex = self.input[start] == b'0'
             && matches!(self.input.get(start + 1), Some(b'x' | b'X'))
             && self.input.get(start + 2).is_some_and(u8::is_ascii_hexdigit);
@@ -654,11 +706,27 @@ impl<'a> Tokenizer<'a> {
             return Ok(self.read_hex_strtod(start));
         }
 
-        while self.pos < self.input.len()
-            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.')
-        {
+        // strtod's decimal grammar: digits, AT MOST ONE `.`, optional exponent.
+        // The second `.` of `1.2.3` therefore starts a NEW literal (C lexes it as
+        // `1.2` then `.3`, two adjacent operands, and rejects it in the parser),
+        // and a `.` with no digit anywhere converts nothing.
+        let mut saw_digit = false;
+        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
             self.pos += 1;
+            saw_digit = true;
         }
+        if self.pos < self.input.len() && self.input[self.pos] == b'.' {
+            self.pos += 1;
+            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                self.pos += 1;
+                saw_digit = true;
+            }
+        }
+        if !saw_digit {
+            self.pos = start;
+            return Err(CalcError::BadLiteral);
+        }
+
         if self.pos < self.input.len()
             && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
         {
@@ -681,6 +749,38 @@ impl<'a> Tokenizer<'a> {
 
         let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
         s.parse::<f64>().map_err(|_| CalcError::BadLiteral)
+    }
+
+    /// C99 `strtod`'s infinity and NaN forms, case-insensitive: `INF`, the
+    /// longer `INFINITY`, `NAN`, and `NAN(n-char-sequence)`.
+    ///
+    /// This is the whole of R9-9. C cannot stop after three characters — it
+    /// hands `INFINITY` to strtod, which takes all eight — so `INF` is not a
+    /// three-character token and `INFO` is not `INF` followed by `O`.
+    fn read_inf_or_nan(&mut self) -> f64 {
+        let rem = &self.input[self.pos..];
+        if starts_with_ci(rem, "INF") {
+            self.pos += if starts_with_ci(rem, "INFINITY") {
+                8
+            } else {
+                3
+            };
+            return f64::INFINITY;
+        }
+        self.pos += 3; // "NAN"
+        // glibc consumes the parenthesised n-char-sequence only when it closes;
+        // an unterminated `NAN(` leaves the `(` behind.
+        let tail = &self.input[self.pos..];
+        if tail.first() == Some(&b'(') {
+            if let Some(close) = tail.iter().position(|&b| b == b')').filter(|&i| {
+                tail[1..i]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            }) {
+                self.pos += close + 1;
+            }
+        }
+        f64::NAN
     }
 
     /// C99 `strtod` on a `0x` prefix: hex mantissa, optional hex fraction,
@@ -729,6 +829,13 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// C `epicsStrnCaseCmp(text, name, strlen(name)) == 0`: does `name` prefix
+/// `text`, ignoring case? This is how `get_element` matches every element.
+fn starts_with_ci(text: &[u8], name: &str) -> bool {
+    let n = name.len();
+    text.len() >= n && text[..n].eq_ignore_ascii_case(name.as_bytes())
+}
+
 fn hex_digit(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
@@ -750,15 +857,11 @@ pub fn tokenize(input: &str, kind: ExprKind) -> Result<Vec<Token>, CalcError> {
         tokenizer.skip_whitespace();
         let Some(b) = tokenizer.peek() else { break };
 
-        // LITERAL_OPERAND: `.` and `0`..`9` (and base's `0X`).
-        if b.is_ascii_digit()
-            || (b == b'.'
-                && tokenizer
-                    .input
-                    .get(tokenizer.pos + 1)
-                    .is_some_and(u8::is_ascii_digit))
-        {
-            let n = tokenizer.read_number()?;
+        // LITERAL_OPERAND. Checked before the other elements because C's
+        // longest-match `get_element` cannot prefer one: no table has a
+        // non-literal element that starts with a digit, a `.`, `INF` or `NAN`.
+        if tokenizer.at_literal() {
+            let n = tokenizer.read_literal()?;
             tokens.push(Token::Number(n));
             continue;
         }

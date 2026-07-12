@@ -56,7 +56,9 @@ fn test_string_var_push() {
 #[test]
 fn test_string_var_store() {
     let mut inputs = StringInputs::new();
-    let compiled = scalc_compile(r#"AA:="test""#).unwrap();
+    // R10-9: bare `AA:="test"` is CALC_ERR_INCOMPLETE in sCalcPostfix — a store
+    // leaves nothing on the stack, and the program must end with exactly one value.
+    let compiled = scalc_compile(r#"AA:="test";AA"#).unwrap();
     scalc_eval(&compiled, &mut inputs).unwrap();
     assert_eq!(inputs.str_vars[0], "test");
 }

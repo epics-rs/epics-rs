@@ -517,21 +517,15 @@ mod parity_tests {
     }
 
     #[test]
-    fn h1_store_terminated_expression_compiles() {
-        // This engine is a synApps superset: sCalc `:=` store-assignment is
-        // a valid construct that epics-base `postfix.c` does not have.
-        // `A:=5` is store-terminated — it ends at runtime depth 0 with a
-        // store as its final opcode — and must compile successfully.
-        use crate::calc::engine::opcodes::{CoreOp, Opcode};
-        let compiled = compile("A:=5").expect("A:=5 is a valid sCalc store");
-        assert_eq!(
-            compiled.code,
-            vec![
-                Opcode::Core(CoreOp::PushConst(5.0)),
-                Opcode::Core(CoreOp::StoreVar(0)),
-                Opcode::Core(CoreOp::End),
-            ]
-        );
+    fn h1_store_terminated_expression_is_incomplete() {
+        // `:=` is in base's element table too (`postfix.c:162`), with the same
+        // runtime_effect -1 as sCalc's — so a store-terminated source ends at
+        // depth 0 and fails the `runtime_depth != 1` check. Compiled base
+        // postfix: `A:=5` is CALC_ERR_INCOMPLETE, `A:=5;A` is 0.
+        //
+        // The port used to compile `A:=5` on the theory that base has no `:=`
+        // and synApps allows a value-less program. Neither is true.
+        assert!(matches!(compile("A:=5"), Err(CalcError::Incomplete)));
     }
 
     #[test]

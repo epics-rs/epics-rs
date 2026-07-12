@@ -263,45 +263,45 @@ fn test_sublast_no_match() {
 
 // --- UNTIL loop ---
 
+/// R10-9: C's UNTIL_END has runtime_effect 0 (`sCalcPostfix.c:782`) — it PEEKS
+/// the condition (`sCalcPerform.c:1999`) and leaves it on the stack on the way
+/// out. So the condition value is still there when the loop exits, and a source
+/// that then pushes another value ends at depth 2 and does not compile.
+///
+/// Compiled sCalcPostfix: `UNTIL 1; 42`, `UNTIL A; A` and `UNTIL 0; 0` are all
+/// CALC_ERR_INCOMPLETE. These three cases used to pin the port's -1 accounting,
+/// which accepted them.
 #[test]
-fn test_until_immediate_exit() {
-    // UNTIL with true condition should exit immediately
-    let mut inputs = StringInputs::new();
-    let compiled = epics_base_rs::calc::scalc_compile("UNTIL 1; 42").unwrap();
-    // Debug: print opcodes
-    for (i, op) in compiled.code.iter().enumerate() {
-        eprintln!("  [{}] {:?}", i, op);
+fn test_until_with_a_value_body_is_incomplete() {
+    for expr in ["UNTIL 1; 42", "UNTIL A; A", "UNTIL B; B", "UNTIL 0; 0"] {
+        assert!(
+            matches!(
+                epics_base_rs::calc::scalc_compile(expr),
+                Err(CalcError::Incomplete)
+            ),
+            "{expr}"
+        );
     }
-    let result = epics_base_rs::calc::scalc_eval(&compiled, &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(42.0));
 }
 
+/// The form C accepts: the body is an ASSIGNMENT, whose -1 brings the program
+/// back to depth 1 — the condition value, which is what it evaluates to.
+/// Compiled sCalcPerform: `A:=0; UNTIL A>3; A:=A+1` gives VAL=0 (the condition)
+/// with A=1.
 #[test]
-fn test_until_counter() {
-    // Test UNTIL with a simple counter using external state mutation.
-    // Increment A each iteration via num_vars externally isn't possible in expression.
-    // Test that UNTIL exits when condition is true and loops when false:
-    // A starts at 3. UNTIL A; tests A. A=3 (non-zero) -> exit immediately.
+fn test_until_with_an_assignment_body() {
     let mut inputs = StringInputs::new();
-    inputs.num_vars[0] = 3.0;
-    let result = scalc("UNTIL A; A", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(3.0));
-
-    // A starts at 0. UNTIL A; loops forever -> but we already test that via loop_limit.
-    // Test multi-iteration: A starts at 0, B starts at 1.
-    // Loop body: B (pushes B). Condition = B (non-zero -> exit).
-    // First iteration: B=1 -> exit. Works.
-    let mut inputs2 = StringInputs::new();
-    inputs2.num_vars[1] = 1.0; // B
-    let result2 = scalc("UNTIL B; B", &mut inputs2).unwrap();
-    assert_eq!(result2, StackValue::Double(1.0));
+    inputs.num_vars[0] = 3.0; // A: the condition is true at once
+    let result = scalc("UNTIL A; A:=A+1", &mut inputs).unwrap();
+    assert_eq!(result, StackValue::Double(3.0), "the condition value");
+    assert_eq!(inputs.num_vars[0], 4.0, "the body ran");
 }
 
 #[test]
 fn test_until_loop_limit() {
-    // Condition always false (0), never exits -> LoopLimitExceeded
+    // Condition always false, body is a legal store -> the loop never exits.
     let mut inputs = StringInputs::new();
-    let result = scalc("UNTIL 0; 0", &mut inputs);
+    let result = scalc("UNTIL 0; A:=1", &mut inputs);
     assert!(matches!(result, Err(CalcError::LoopLimitExceeded)));
 }
 

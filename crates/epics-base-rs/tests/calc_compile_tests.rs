@@ -240,10 +240,17 @@ fn test_vararg_max() {
 
 #[test]
 fn test_assign() {
-    let ops = opcodes_without_end("A:=5");
+    // R10-9: the store cannot be the last word — C requires the program to leave
+    // exactly one value (`postfix.c:499-502`), and `:=` pushes nothing. This case
+    // used to compile bare `A:=5`, which compiled C rejects (CALC_ERR_INCOMPLETE).
+    let ops = opcodes_without_end("A:=5;A");
     assert_eq!(
         ops,
-        vec![c(CoreOp::PushConst(5.0)), c(CoreOp::StoreVar(0)),]
+        vec![
+            c(CoreOp::PushConst(5.0)),
+            c(CoreOp::StoreVar(0)),
+            c(CoreOp::PushVar(0)),
+        ]
     );
 }
 

@@ -748,16 +748,29 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // The actual loop jump happens at UntilEnd.
                 }
                 super::opcodes::ControlOp::UntilEnd(start_pc) => {
-                    // Pop condition from stack: if false (0), jump back to loop start
-                    let cond = pop1_f64(&mut stack)?;
+                    // C PEEKS the condition (`sCalcPerform.c:1999`: `if (ps->d == 0)`).
+                    // It pops nothing.
+                    let cond = match stack.last() {
+                        Some(v) => v.to_double(),
+                        None => return Err(CalcError::Underflow),
+                    };
                     if cond == 0.0 {
+                        // Loop back. C restores `ps` to the stack pointer it saved
+                        // when it ran UNTIL (`:2004`) — i.e. to before the
+                        // condition — so the condition value is discarded on the
+                        // way round, and the next iteration pushes a fresh one.
+                        stack.pop();
                         pc = *start_pc + 1; // jump to instruction after UNTIL marker
                         loop_count += 1;
                         if loop_count > MAX_LOOP_ITERATIONS {
                             return Err(CalcError::LoopLimitExceeded);
                         }
                     }
-                    // else: condition true, continue past loop
+                    // Condition true: fall out of the loop with the condition value
+                    // still on the stack. C leaves `ps` alone, which is why the
+                    // compile-time ledger gives UNTIL_END a runtime effect of 0
+                    // and why the body of an UNTIL has to be an assignment for the
+                    // program to end at depth 1.
                 }
             },
 

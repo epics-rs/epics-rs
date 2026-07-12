@@ -151,9 +151,11 @@ fn engines_reject_each_others_tokens_at_compile_time() {
         );
     }
 
-    // `UNTIL` is in the sCalc and aCalc tables, not in postfix.c's.
-    assert_eq!(compile("UNTIL 1; 42").unwrap_err(), CalcError::Syntax);
-    assert!(scalc_compile("UNTIL 1; 42").is_ok());
+    // `UNTIL` is in the sCalc and aCalc tables, not in postfix.c's. (R10-9: the
+    // body has to be an assignment — UNTIL_END leaves the condition on the stack,
+    // so `UNTIL 1; 42` ends at depth 2 and is Incomplete even in sCalc.)
+    assert_eq!(compile("UNTIL 1; A:=1").unwrap_err(), CalcError::Syntax);
+    assert!(scalc_compile("UNTIL 1; A:=1").is_ok());
 }
 
 /// R6-77, swait half — swait's CALC is compiled by the **numeric** `postfix()`

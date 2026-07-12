@@ -110,10 +110,7 @@ async fn main() -> CaResult<()> {
 
     // Set macro paths so st.cmd can resolve $(MINI_BEAMLINE)/db/..., $(ADCORE)/ioc/..., $(OPTICS)/db/...
     epics_base_rs::runtime::env::set_default("MINI_BEAMLINE", env!("CARGO_MANIFEST_DIR"));
-    epics_base_rs::runtime::env::set_default(
-        "ADCORE",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/ad-core-rs"),
-    );
+    epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
     epics_base_rs::runtime::env::set_default(
         "OPTICS",
         optics_rs::OPTICS_DB_DIR.trim_end_matches("/db"),

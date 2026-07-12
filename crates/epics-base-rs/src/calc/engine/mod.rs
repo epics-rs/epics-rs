@@ -105,10 +105,10 @@ impl CompiledExpr {
     }
 }
 
-/// C's subrange bound rule, spelled once. Both synApps engines normalise `[i,j]`
-/// the same way over a container of length `k` — sCalc over `strlen(ps->s)`
-/// (`sCalcPerform.c:1875-1895`), aCalc over `arraySize`
-/// (`aCalcPerform.c:1527-1534`):
+/// C's subrange bound rule for a pair of NUMERIC bounds over a container of
+/// length `k` — aCalc's `[` over `arraySize` (`aCalcPerform.c:1527-1534`), and
+/// sCalc's `isDouble` branch over `strlen(ps->s)` (`sCalcPerform.c:1876-1886`),
+/// which is the same arithmetic:
 ///
 /// ```c
 /// i = (int)ps1->d;  if (i < 0) i += k;
@@ -119,6 +119,10 @@ impl CompiledExpr {
 /// So: a negative bound counts back from the end, `j` is INCLUSIVE, and only `i`
 /// is clamped from below — C leaves a `j` that is still negative alone, which is
 /// what makes an inverted range select nothing.
+///
+/// sCalc alone can also take a STRING bound, which is searched for rather than
+/// counted; that branch (and the wrap it must NOT do) lives with the operator, in
+/// [`string::subrange_bounds`].
 pub(crate) fn subrange_bounds(i: i64, j: i64, k: i64) -> (i64, i64) {
     let wrap = |v: i64| if v < 0 { v + k } else { v };
     (wrap(i).clamp(0, k), wrap(j).min(k))

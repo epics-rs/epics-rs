@@ -691,26 +691,21 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::str(result));
                 }
                 StringOp::Subrange => {
-                    // C `sCalcPerform.c:1869-1901`. Pop: string, i, j — and BOTH
-                    // bounds are inclusive:
+                    // C `sCalcPerform.c:1869-1901`. Pop: string, i, j. BOTH bounds
+                    // are inclusive:
                     //
                     // ```c
                     // for (s1=s+i, s2=s+j ; *s1 && s1 <= s2; ) *s++ = *s1++;
                     // ```
                     //
                     // so `"hello"[1,4]` is "ello" and `"hello"[2,2]` is "l". The
-                    // bound arithmetic itself is `subrange_bounds`, shared with
-                    // aCalc's `[`.
+                    // subject is `toString(ps)`, not a string-only operand.
                     let end_val = pop1(&mut stack)?;
                     let start_val = pop1(&mut stack)?;
-                    let s = pop1(&mut stack)?;
-                    let s = s.as_bytes()?;
+                    let subject = pop1(&mut stack)?.into_string_value();
+                    let s = subject.as_bytes();
                     let k = s.len() as i64;
-                    let (i, j) = super::subrange_bounds(
-                        subrange_index(&start_val)?,
-                        subrange_index(&end_val)?,
-                        k,
-                    );
+                    let (i, j) = subrange_bounds(s, &start_val, &end_val);
                     let out = if j < i {
                         &[][..]
                     } else {
@@ -1560,18 +1555,50 @@ impl Pair {
     }
 }
 
-/// A `SUBRANGE` bound. This is NOT one of the numeric positions C coerces: C
-/// branches on the bound's TYPE (sCalcPerform.c:1876-1888) — a double is the
-/// index itself, while a STRING is searched for with `strstr` and positions the
-/// range at the match. The port implements only the numeric branch, so a string
-/// bound is still rejected here; running it through `to_double` instead would
-/// silently answer 0 for "abc" rather than looking for it. The missing branch is
-/// an open gap, reported, not papered over.
-fn subrange_index(v: &StackValue) -> Result<i64, CalcError> {
-    match v {
-        StackValue::Double(d) => Ok(*d as i64),
-        StackValue::Str(_) => Err(CalcError::TypeMismatch),
-    }
+/// `SUBRANGE`'s bounds (`sCalcPerform.c:1875-1895`). A bound is NOT one of the
+/// numeric positions C coerces — C branches on its TYPE:
+///
+/// ```c
+/// if (isDouble(ps1)) { i = (int)ps1->d;  if (i < 0) i += k; }
+/// else { s = strstr(ps->s, ps1->s);  i = s ? (s - ps->s) + strlen(ps1->s) : 0; }
+///
+/// if (isDouble(ps2)) { j = (int)ps2->d;  if (j < 0) j += k; }
+/// else if (*(ps2->s)) { s = strstr(ps->s, ps2->s);  j = s ? (s - ps->s) - 1 : k; }
+/// else { j = k; }
+///
+/// i = myMAX(myMIN(i,k),0);   /* i is clamped BOTH ways */
+/// j = myMIN(j,k);            /* j only from above — a negative j selects nothing */
+/// ```
+///
+/// So a string START bound puts the range just AFTER its match and a string END
+/// bound just BEFORE its match, each falling back to the whole string when the
+/// search fails (`i = 0`, `j = k`), and an empty END bound means "to the end"
+/// — without that special case `strstr` would match at 0 and give `j = -1`.
+///
+/// Only the DOUBLE branch wraps a negative bound around the end; a search never
+/// produces one except the `j = -1` of a match at position 0, which C leaves
+/// negative on purpose (`"hello world"["h","h"]` is empty). That is why the wrap
+/// lives in the branch and not in the clamp.
+fn subrange_bounds(subject: &[u8], start: &StackValue, end: &StackValue) -> (i64, i64) {
+    let k = subject.len() as i64;
+    let i = match start {
+        StackValue::Double(d) => {
+            let i = *d as i64;
+            if i < 0 { i + k } else { i }
+        }
+        StackValue::Str(needle) => {
+            find_sub(subject, needle.as_bytes()).map_or(0, |p| (p + needle.len()) as i64)
+        }
+    };
+    let j = match end {
+        StackValue::Double(d) => {
+            let j = *d as i64;
+            if j < 0 { j + k } else { j }
+        }
+        StackValue::Str(needle) if needle.is_empty() => k,
+        StackValue::Str(needle) => find_sub(subject, needle.as_bytes()).map_or(k, |p| p as i64 - 1),
+    };
+    (i.clamp(0, k), j.min(k))
 }
 
 /// Pop a NUMERIC operand. C reaches every one of these through `toDouble`

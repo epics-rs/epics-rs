@@ -1595,6 +1595,107 @@ fn push_squash_monitor<T>(
     }
 }
 
+/// The decoded monitor's bounded FIFO and the SINGLE owner of the enqueue
+/// transition — pvxs `ServerMonitorControl::doPost` (`servermon.cpp:239-289`).
+///
+/// Invariant: **an update reaches the queue only if it would produce a
+/// non-empty wire changed-bitset** (or it is the first post, or a terminal).
+/// pvxs decides that BEFORE touching the queue:
+///
+/// ```text
+/// bool real = mon->first;                       // always post the first update
+/// if(real) mon->first = false;
+/// else     real = testmask(val, mon->pvMask);   // else consider the mask
+/// if(real || !val) { ...queue or squash...; maybeReply(); }
+/// ```
+///
+/// A masked-out update is DROPPED, never queued: it neither occupies a slot
+/// in the negotiated FIFO nor coalesces a real update out of the tail. The
+/// port used to push every arrival straight into the FIFO, so an update whose
+/// marked leaves lay entirely outside the client's pvRequest mask both framed
+/// an empty-bitset frame and evicted a real update under back-pressure — the
+/// squash CONTENTS differed, not just the frame count.
+///
+/// [`Self::seed`] carries pvxs's `first`: the connect-time seed IS the first
+/// post, so it is exempt from the mask test (and clears `first`). A source
+/// with no seed leaves `first` set, so ITS first stream event is the exempt
+/// one — exactly `MonitorOp::first` ("set until first update queued").
+struct MonitorQueue<'a> {
+    pending: std::collections::VecDeque<crate::server_native::MonitorUpdate>,
+    /// The ONE negotiated squash limit (`MonitorOp::limit`).
+    limit: usize,
+    /// pvxs `MonitorOp::first` — set until the first update is queued.
+    first: bool,
+    intro: &'a FieldDesc,
+    /// The op's pvRequest selection mask (`MonitorOp::pvMask`).
+    mask: &'a BitSet,
+}
+
+impl<'a> MonitorQueue<'a> {
+    fn new(limit: usize, intro: &'a FieldDesc, mask: &'a BitSet) -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            limit: limit.max(1),
+            first: true,
+            intro,
+            mask,
+        }
+    }
+
+    /// Queue the connect-time seed as pvxs's first post: exempt from the mask
+    /// test, and it clears `first` so every later arrival is tested.
+    fn seed(&mut self, initial: PvField) {
+        self.first = false;
+        self.pending.push_back(crate::server_native::MonitorUpdate {
+            value: initial,
+            marked: None,
+            type_changed: false,
+            overrun: Vec::new(),
+        });
+    }
+
+    /// pvxs `doPost`. Returns whether the update was queued (`false` = dropped
+    /// by the mask test, i.e. `real == false`).
+    fn push(&mut self, ev: crate::server_native::MonitorUpdate) -> bool {
+        if !self.real(&ev) {
+            return false;
+        }
+        self.first = false;
+        push_squash_monitor(&mut self.pending, ev, self.limit, coalesce_monitor_update);
+        true
+    }
+
+    /// pvxs's `real || !val`: the first post and a terminal (pvxs's null Value
+    /// — here the `type_changed` boundary, which MUST survive to become the
+    /// MONITOR FINISH) always queue; anything else must pass `testmask`
+    /// (`pvrequest.cpp:73-92`) — at least one marked bit inside `pvMask`.
+    ///
+    /// A source that marks nothing explicitly (`marked: None`) posts a value
+    /// the port treats as wholly changed, which is what pvxs's fully-marked
+    /// `Value` is: `testmask` finds a marked bit in any non-empty `pvMask`, so
+    /// it always passes. `request2mask` cannot produce an empty mask (it
+    /// throws instead), so there is no case where such a post is dropped.
+    fn real(&self, ev: &crate::server_native::MonitorUpdate) -> bool {
+        if self.first || ev.type_changed {
+            return true;
+        }
+        let Some(paths) = ev.marked.as_ref() else {
+            return true;
+        };
+        crate::pvdata::encode::marked_changed_bitset(self.intro, paths)
+            .iter()
+            .any(|bit| self.mask.get(bit))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn pop(&mut self) -> Option<crate::server_native::MonitorUpdate> {
+        self.pending.pop_front()
+    }
+}
+
 /// Inputs to [`spawn_monitor_subscriber`]. A cohesive bundle of the per-op
 /// monitor state captured at INIT (read out of the just-inserted `OpState`)
 /// plus the connection-scope handles the subscriber task needs — one struct
@@ -1986,24 +2087,19 @@ fn spawn_monitor_subscriber(
         let emits_partial = src.monitor_emits_partial(&pv_name).await;
         let mut prev_value: Option<PvField> = None;
 
-        // Bounded FIFO: the connect-time seed is `pending[0]` (the
-        // consumer emits it first at START, ahead of the accrued backlog) rather
-        // than an unconditional pre-loop send. The seed is pushed RAW — the
-        // consumer runs the `_filter` chain on every pending item (so the seed
-        // is filtered exactly once, like epics-base `dbChannelRunPreChain`; a
-        // gating filter that drops it suppresses the initial frame, a transform
-        // mismatch tears the monitor down with an error). `prev_value` is NOT
-        // set here — the seed must emit FULL (the consumer sets `prev_value`
-        // after emitting, so event #2 onward is partial).
-        let mut pending: std::collections::VecDeque<crate::server_native::MonitorUpdate> =
-            std::collections::VecDeque::new();
+        // Bounded FIFO, owned by [`MonitorQueue`] (pvxs `doPost`): the
+        // connect-time seed is `pending[0]` (the consumer emits it first at
+        // START, ahead of the accrued backlog) rather than an unconditional
+        // pre-loop send. The seed is pushed RAW — the consumer runs the
+        // `_filter` chain on every pending item (so the seed is filtered
+        // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
+        // that drops it suppresses the initial frame, a transform mismatch
+        // tears the monitor down with an error). `prev_value` is NOT set here —
+        // the seed must emit FULL (the consumer sets `prev_value` after
+        // emitting, so event #2 onward is partial).
+        let mut pending = MonitorQueue::new(queue_limit, &intro_clone, &mask_clone);
         if let Some(initial) = seed_initial {
-            pending.push_back(crate::server_native::MonitorUpdate {
-                value: initial,
-                marked: None,
-                type_changed: false,
-                overrun: Vec::new(),
-            });
+            pending.seed(initial);
         }
 
         let mut source_open = true;
@@ -2026,9 +2122,9 @@ fn spawn_monitor_subscriber(
                 r = rx.recv(), if source_open => {
                     match r {
                         Some(ev) => {
-                            push_squash_monitor(&mut pending, ev, queue_limit, coalesce_monitor_update);
+                            pending.push(ev);
                             while let Ok(e) = rx.try_recv() {
-                                push_squash_monitor(&mut pending, e, queue_limit, coalesce_monitor_update);
+                                pending.push(e);
                             }
                         }
                         None => source_open = false,
@@ -2036,7 +2132,7 @@ fn spawn_monitor_subscriber(
                 }
                 _ = exec_rx.changed() => {}
                 _ = std::future::ready(()), if executing && !pending.is_empty() => {
-                    let mut value = pending.pop_front().expect("guarded non-empty");
+                    let mut value = pending.pop().expect("guarded non-empty");
                     // Subscription boundary (upstream descriptor change): emit
                     // MONITOR FINISH and end — the decoded counterpart of the raw
                     // path's `type_changed` branch.
@@ -7752,10 +7848,17 @@ fn build_monitor_payload(
 /// marked set is reconstructed by structurally diffing consecutive
 /// snapshots ([`crate::pvdata::encode::diff_changed_bitset`]).
 ///
-/// When the diff is empty (no leaf changed but the source still
-/// posted — e.g. an alarm-only re-post that decoded identically) the
-/// frame still carries an empty changed-bitset and no value bytes,
-/// matching pvxs posting an unmarked Value.
+/// When the diff is empty (no leaf changed but the source still posted —
+/// e.g. an alarm-only re-post that decoded identically) the frame carries
+/// an empty changed-bitset and no value bytes. That is NOT what pvxs does
+/// and must not be read as parity: pvxs marks the source's leaves
+/// *assigned-not-changed*, so `testmask` passes and the frame carries those
+/// leaves. Only a source that hands up an explicit marked set
+/// ([`build_monitor_payload_marked`]) reproduces pvxs here — such a set is
+/// mask-tested at enqueue by [`MonitorQueue::real`], so an all-masked-out
+/// update never reaches a frame builder at all. This diff path is the
+/// port's own narrowing for sources that mark nothing, and it stays
+/// deliberately narrower than pvxs.
 fn build_monitor_payload_partial(
     ioid: u32,
     intro: &FieldDesc,
@@ -8726,6 +8829,121 @@ mod tests {
         );
         assert!(m.type_changed, "boundary survives the squash");
         assert!(m.overrun.is_empty(), "boundary carries no overrun");
+    }
+
+    /// R12-32 — the `testmask` gate. pvxs `doPost` decides `real` BEFORE
+    /// touching the queue (`servermon.cpp:252-268`): the first post always
+    /// goes through, every later one must have a marked leaf inside `pvMask`
+    /// (`testmask`, `pvrequest.cpp:73-92`), and a masked-out post is dropped
+    /// — it does NOT occupy a FIFO slot and so cannot coalesce a real update
+    /// out of the tail.
+    ///
+    /// Tested by invariant boundary: first-post exemption, marked-inside-mask,
+    /// marked-outside-mask, the unmarked (`marked: None`) post that pvxs sees
+    /// as fully marked, the terminal boundary, and the squash-contents case
+    /// where the drop is what keeps a real update alive.
+    #[test]
+    fn monitor_queue_drops_updates_outside_the_request_mask() {
+        // { value, alarm { severity } } — bits: 0 root, 1 value, 2 alarm,
+        // 3 alarm.severity.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        // The client asked for `field(value)` only.
+        let mut mask = BitSet::new();
+        mask.set(1);
+
+        let upd = |tag: i32, marked: &[&str]| crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(tag)),
+            marked: Some(marked.iter().map(|s| s.to_string()).collect()),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let tags = |q: &MonitorQueue| {
+            q.pending
+                .iter()
+                .map(|u| u.value.clone())
+                .collect::<Vec<PvField>>()
+        };
+        let tag = |t: i32| PvField::Scalar(ScalarValue::Int(t));
+
+        // No seed: `first` is still set, so the FIRST post is exempt from the
+        // mask test even though `alarm.severity` lies outside `field(value)`.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        assert!(
+            q.push(upd(1, &["alarm.severity"])),
+            "the first post is always queued (MonitorOp::first)"
+        );
+        // ...and every later masked-out post is dropped.
+        assert!(
+            !q.push(upd(2, &["alarm.severity"])),
+            "a post whose marked leaves lie outside pvMask must be dropped"
+        );
+        assert!(
+            q.push(upd(3, &["value"])),
+            "a post marking a selected leaf is queued"
+        );
+        assert_eq!(
+            tags(&q),
+            vec![tag(1), tag(3)],
+            "the masked-out post never entered the FIFO"
+        );
+
+        // A seeded op consumes the `first` exemption, so its very first stream
+        // event is already mask-tested.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0));
+        assert!(
+            !q.push(upd(1, &["alarm.severity"])),
+            "the seed IS pvxs's first post; the next event is mask-tested"
+        );
+        assert_eq!(tags(&q), vec![tag(0)], "only the seed is queued");
+
+        // A source that marks nothing posts a wholly-changed value — pvxs's
+        // fully-marked Value, which `testmask` always passes.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0));
+        assert!(
+            q.push(crate::server_native::MonitorUpdate {
+                value: tag(1),
+                marked: None,
+                type_changed: false,
+                overrun: Vec::new(),
+            }),
+            "an unmarked post is fully marked to pvxs and always passes testmask"
+        );
+
+        // The terminal boundary is pvxs's null Value (`if(real || !val)`): it
+        // must queue regardless of the mask, or the MONITOR FINISH is lost.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0));
+        assert!(
+            q.push(crate::server_native::MonitorUpdate::type_change()),
+            "a descriptor boundary always queues"
+        );
+
+        // Squash CONTENTS: with limit 2 and the FIFO already full, a
+        // masked-out post must not coalesce the real tail. Pre-fix it took a
+        // slot and overwrote `value=3` with `value=4`.
+        let mut q = MonitorQueue::new(2, &intro, &mask);
+        q.seed(tag(0));
+        q.push(upd(3, &["value"]));
+        assert!(!q.push(upd(4, &["alarm.severity"])), "masked out → dropped");
+        assert_eq!(
+            tags(&q),
+            vec![tag(0), tag(3)],
+            "a masked-out post must not squash a real update out of the tail"
+        );
     }
 
     /// Boundary test for the bounded server-side monitor FIFO

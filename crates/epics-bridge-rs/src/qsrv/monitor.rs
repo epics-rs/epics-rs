@@ -618,7 +618,7 @@ mod tests {
 
         {
             let rec = db.get_record("MON_MARK").await.expect("rec exists");
-            let instance = rec.read().await;
+            let mut instance = rec.write().await;
             instance.notify_field("VAL", EventMask::VALUE);
         }
 
@@ -640,7 +640,7 @@ mod tests {
         // and so additionally marks `alarm` — still no display/control.
         {
             let rec = db.get_record("MON_MARK").await.expect("rec exists");
-            let instance = rec.read().await;
+            let mut instance = rec.write().await;
             instance.notify_field("VAL", EventMask::ALARM);
         }
         let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
@@ -684,7 +684,7 @@ mod tests {
         mon.start().await.expect("start ok");
         {
             let rec = db.get_record("MON_ENUM").await.expect("rec exists");
-            let instance = rec.read().await;
+            let mut instance = rec.write().await;
             instance.notify_field("VAL", EventMask::VALUE);
         }
         let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())

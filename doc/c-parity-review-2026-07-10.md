@@ -1925,6 +1925,225 @@ Impact: `caput scaler.RATE` fires a spurious .TP monitor event on C; the port's 
   fft; mqtt payload JSON DFS; modbus datatype combine/split; std epid/
   throttle.
 
+## Fix wave 8 — dispositions (2026-07-12)
+
+All 42 wave-8 items FIXED (nothing NOT-REAL this wave), one commit per
+finding, across 5 worktree fixers (a8/b8/c8/d8/e8), merged into
+review/parity-r6 and verified by main.
+
+Category A (a8):
+- R9-4 FIXED cec32fed — sCalc coerces a string in a numeric position
+  everywhere C's toDouble/atof does (never rejects).
+- R9-5 FIXED 055d2a49 — aCalc negative SQRT/LOG: 0 on a scalar
+  (status untouched), 0-elements with deferred status -1 on an array.
+- R9-6 FIXED baed4d6d — READ/WRITE are binary 2-operand conversions.
+- R9-7 FIXED 0aa75f90 — STRUCTURAL: rpcl/orpc/compiled_calc are no
+  longer Option; an empty or failed compile IS the empty program
+  (C END_EXPRESSION), which fails every run → CALC_ALARM/INVALID.
+  The process()-time lazy-compile fallback deleted with it.
+- R9-8 FIXED ceb26345, WIDENED — the missing symbols landed, and the
+  subrange bound rule got one owner (engine::subrange_bounds, C's
+  myMAX/myMIN + negative-index wrap): sCalc `[` AND aCalc `[`/`{` both
+  had an exclusive upper bound and no wrap. Compiled C: "hello"[1,4] =
+  "ello". opcode_supported_by_engine deleted (dead second gate).
+- R9-9 FIXED fdf0a920 — LITERAL_OPERAND rewinds and re-scans with a
+  ported strtod (new engine/strtod.rs); INFINITY consumes fully.
+- R10-1 FIXED b999760e — IXZ is C's interpolated first zero crossing.
+- R10-2 FIXED 12a85a89 — extremum reductions use C's seeded
+  strict-comparison scan (first maximum wins).
+- R10-3 FIXED 00209aaa — ISINF element-wise; FINITE/ISNAN fold over
+  every element of every arg.
+- R10-4 FIXED a1e039f7 — unary array ops answer a scalar operand with
+  C's scalar-branch results.
+- R10-5 FIXED 4408ead8 — IXNZ thresholds at SMALL.
+
+Category B (b8):
+- R10-16 FIXED 4f8b61df — one owner (cli::stat_to_str/sevr_to_str,
+  HWLIMIT at 11, "??" out of range); the three duplicated tool tables
+  deleted. Deliberately NOT delegated to recgbl::alarm_condition_string
+  (its out-of-range is "" — pvxs semantics).
+- R9-19 FIXED 0fba54ba — one owner for C's zeroed calloc readback
+  (cli::zero_dbr_value/zero_dbr_snapshot), shared by caget's
+  synchronous timeout and caput's zero_readback; only -c can reach
+  "*** no data available (timeout)".
+- R9-20 FIXED b658cbe4 — caget's exit status is C's !nConn count;
+  post-gate failures print their marker (one cli::ca_error_marker
+  owner) and exit 0.
+- R9-21 FIXED b545f969 — caput's two readbacks are one renderer
+  (readback_line); the Old: site cannot abort the put by construction.
+- R9-22 FIXED 195c533f — -S reaches the readback rendering.
+- R9-23 FIXED 58549e1a — WriteValue::echo_fallback deleted; a failed
+  New: read prints C's marker, never the submitted value.
+
+Category C (c8):
+- R10-31 FIXED 61fedd1a / R10-32 FIXED 90c8cc21 / R9-34 FIXED aebaf683 /
+  R9-33 FIXED a99e29e1 / R9-35 FIXED 7dc0597c — STRUCTURAL:
+  pvdata::convert is a port of pvxs Value::copyOut/copyOutScalar
+  (storage-switched, with the throwing and non-throwing outcomes both
+  explicit) and convert::kind is the separate type-class dispatch; the
+  bridge's duplicate scalar_as_bool/dbe_kind deleted. A new
+  ChannelSource::check_monitor_request INIT-time hook carries the pvxs
+  throw to the wire (MonitorRequestFatal → circuit reset, no reply).
+  record._options parsed for Monitor only, as pvxs.
+  SEMANTIC CHANGES (client-visible, all = C): non-scalar ackAny and
+  array-typed DBE now DROP the connection; pipeline "1"/"yes" leniency
+  removed (Warn + disabled); ackAny/queueSize strings are base 0
+  ("010" = 8). Boolean queueSize pinned as a non-divergence.
+
+Category D (d8):
+- R9-54 FIXED c10d5dd1 — timeout_from_secs single owner of every
+  operator f64 → AsynUser::timeout conversion (try_from_secs_f64,
+  panic unconstructible); @asyn(...,-1) → 1 s per DRV-42.
+- R9-51 FIXED ef1e3404 — every record ERRS text is C's; four writer
+  owners only.
+- R9-52 FIXED fc40fb19 — monitor_status refreshes TSIZ and marks a
+  foreign trace file "Unknown".
+- R9-53 FIXED 10335124 — PortHandle::has_interface registry (C's
+  findInterface) captured from driver capabilities() at registration;
+  *IV fields are pure readbacks. PUBLIC API change.
+- R9-55 FIXED ff16e3a5 — the caller's AsynUser threads down the whole
+  asynOption path (PortDriver::set_option(&mut self, user, key, value),
+  C's signature): record → TMOT, iocsh → 2 s, COM restoreSettings →
+  2 s. PUBLIC API change.
+- R9-56 FIXED 6a42c39b — InterposeStack::install inserts at the front
+  (last install = outermost, asynManager.c:2190-2220); push renamed
+  away so no call site keeps the LIFO model.
+- R9-57 FIXED 3a16cbe0 — unblocked by R9-55: AsynUser carries C's
+  port/trace linkage + errorMessage slot (PortActor the single
+  stamper); COM prints the unstuffed read at ASYN_TRACEIO_FILTER and
+  leaves the flow-control advisories in errorMessage.
+- R10-46 FIXED cadebb80 — report_not_connected stages STATE/MINOR;
+  IoOutcome::report_canceled owns both halves of the AQR cancel
+  (message + STATE/MAJOR) — neither reportable without its alarm.
+- R10-47 FIXED ee0e68d2 — reset_error() single owner at C's entry
+  points (process, special, connectDevice); SPC_MOD_FIELDS names the
+  dbd set because this port calls special for every put.
+- R10-48 FIXED 2615c583 — all twelve option arms dispatch
+  unconditionally; menu→text through one menu_choice lookup over C's
+  choice arrays.
+
+Category E (e8):
+- R9-73 FIXED 6e6ece5e — InputFetchPolicy::ReadAllGateOnFailure +
+  set_fetch_gate_failed(): the framework fetch outcome, not per-record
+  guards, gates the calc across calc/calcout/scalcout/acalcout/swait;
+  swait raises READ_ALARM/INVALID.
+- R9-74 FIXED c718fe55 — OOPT "On Change" is fabs(oval-val) > mdel
+  (scalcout + swait).
+- R9-75 FIXED f614c3ac — swait LA..LL, posted with the input's
+  monitor mask.
+- R9-76 FIXED fa0182f3 — swait INAV..INLV/DOLV link-status fields;
+  DOL read gated on !dolv.
+- R9-77 FIXED b1abe189 — RecordInstance::deadband_post() single owner
+  of C monitor()'s VAL post mask (four copy-pasted assemblies
+  replaced); event's VAL is a fields_posted_with_monitor_mask member.
+- R9-78 FIXED 56de6def — set_subroutine_status delivered on every
+  exit path; multi_output_links() returns the OUT links only when
+  status == 0 (C's single if (!status) gate).
+- R9-79 FIXED c395c1c7 — CircularBuffer gained control (C
+  scopeControl); push()/trigger() refuse while off, so Control owns
+  admission.
+- R9-80 FIXED 4096a465 — detect_color_mode deleted (NDArray::info()
+  was already the C-correct owner); the unconvertible path forwards
+  the frame (C:584) instead of dropping it.
+- R10-61 FIXED 1ef74d92 — the fire_coutp bool deleted; each of C's
+  two COUTP put sites emits its own WriteDbLink. The scaler-rs local
+  doc's SCAL-6 "Not copied" note RETRACTED by main (it contradicted
+  the R10-61 adjudication).
+- R10-62 FIXED 7808f31b — special() owns the db_post_events C's
+  special() makes (the RATE→TP copy-paste included);
+  monitor_side_effect_fields hands the list to the framework.
+
+### Merge-integration notes (fix wave 8)
+
+- a8 x e8 textual conflicts in calc.rs/calcout.rs/scalcout.rs/swait.rs
+  (R9-7's always-a-program eval vs R9-73's fetch gate) resolved by
+  main: the fetch gate wraps a8's unconditional eval, matching C's
+  `if (fetch_values()==0) calcPerform(...)` nesting exactly.
+- One merged-state test failure (both parents green):
+  event_val_monitor_mask's calc control built a record via
+  put_field("CALC") + direct PvDatabase::add_record, which never runs
+  init_record or special — it had relied on the process()-time
+  lazy-compile fallback R9-7 deleted. Adapted by main to
+  CalcRecord::new (fac0dc95), the sibling tests' existing pattern.
+- Verification (merged state, main): cargo fmt --all --check clean;
+  cargo clippy --workspace --all-targets -- -D warnings clean;
+  cargo nextest run --workspace 8046 passed / 0 failed / 2 skipped
+  (an interim run during concurrent fixer activity showed the five
+  documented stability.rs fixed-port cross-connect flakes; all pass
+  in isolation and in the final quiet run); doctests for
+  epics-base-rs/asyn-rs/scaler-rs/ad-plugins-rs/epics-ca-rs/
+  epics-pva-rs/epics-bridge-rs clean.
+
+## Open Findings — surfaced during fix wave 8 (reported by fixers, pending independent verify)
+
+Category A (calc engines; compiled-C evidence where noted):
+### R10-6: aCalc array stack values have no active window — C's stackElement carries firstEl/numEl (aCalcPerform.c:74-80, set by SUBRANGE/SUBRANGE_IP/CAT, honoured by every reduction via calcFirstLast :289-296); the port's bare Vec reduces over the zero fill. Compiled C: AMIN(AA[1,3])=20, AVG(AA[1,3])=30 with AA=[10..60]; port answers 0 and 15. Reachable since R9-8 made subrange compile
+Severity: Medium. Closing it = giving ArrayStackValue::Array C's buffer+window (public enum change, re-opens CAT/FITPOLY). Highest-priority candidate of this set.
+### R10-7: ISINF sign — glibc returns -1 for -inf; the port returns 1.0 (array.rs:349, numeric.rs:271, string.rs:402)
+Severity: Low.
+### R10-8: FITPOLY/FITMPOLY/FITQ/FITMQ arity and semantics — C FITPOLY is 1-operand and returns the fitted curve; the port is 2-operand and returns coefficients
+Severity: Medium.
+### R10-9: store-terminated compile — `A:=5` is CALC_ERR_INCOMPLETE in C; the port accepts it (postfix.rs ends_with_store depth-0 exemption)
+Severity: Low.
+### R10-10: NDERIV on a scalar — C promotes via toArray; the port raises TypeMismatch
+Severity: Low.
+### R10-11: aCalc DERIV/FITPOLY ignore C's status propagation
+Severity: Low.
+### R10-12: base 1e400/1e-400 — CALC_ERR_BAD_LITERAL in C (epicsParseDouble ERANGE); the port yields inf/0
+Severity: Low.
+### R10-13: TR_ESC/ESC escape tables diverge from epicsString.c (\a \b \f \v \' \" and NUL), and C treats a Double operand as a no-op where the port raises TypeMismatch
+Severity: Low.
+### R10-14: sCalc SUBRANGE with a string bound does a strstr search in C (sCalcPerform.c:1876-1892); the port raises TypeMismatch (bound arithmetic fixed in R9-8; this type gap deliberately left)
+Severity: Medium.
+### R10-15: sCalc BIN_READ %d order-dependence via C's shared `long l`
+Severity: Low.
+
+Category B (CA tools):
+### R10-17: caput-rs prints "error: channel disconnected" on stderr when the New:-read finds the channel gone; C's caget() returns from `if (!nConn) return 1` having printed nothing (caput.c:181,589) — the stderr line is port-invented (exit code matches)
+Severity: Low.
+### R10-18: caput-rs has no -# flag — C's getopt `:cnlhatsVS#:w:p:F:` accepts `caput -# 3` (the count is then overwritten, vestigial); clap exits 2 on the unknown flag
+Severity: Low.
+
+Category C (PVA):
+### R10-33: qsrv group.rs:209 negotiated_queue_size is a SECOND record._options.queueSize parser (decimal/int only) — and pvxs GroupSource::onSubscribe never reads a client queueSize at all (only servermon.cpp:533 does, into op->limit)
+Severity: Medium.
+### R10-34: server tcp.rs put_autoexec_from_request reads record._options.autoExec, which pvxs has NO server-side reader for (client-side SubBuilder flag only); also parses leniently
+Severity: Low.
+### R10-35: client ops_v2.rs MonitorFlowControl::from_record_options normalizes typed options to display strings then string-matches; pvxs clientmon.cpp:763-808 converts via as(bool)/as(uint32) and checks ackAny.type()==String first — client-side rules, distinct from the server family
+Severity: Medium.
+### R10-36: two divergent render_option_value approximations of pvxs's SB()<<Value (tcp.rs bare-scalar vs qsrv/channel.rs datafmt form) — diagnostic text only
+Severity: Low.
+### R10-37: DBE empty-mask logRemote fires at START in the port; pvxs emits it at INIT (inside onSubscribe, before connect())
+Severity: Low.
+
+Category D (asyn):
+### R10-49: C queueTimeoutCallbackProcess (asynRecord.c:920-926) has no analogue — no queue-timeout mechanism exists, so C's third STATE_ALARM site ("process queueRequest timeout" + STATE/MAJOR + forced completion callback) is unreachable
+Severity: Medium.
+### R10-50: AsynOption trait (interfaces/option.rs) has no in-tree implementor and duplicates PortDriver::set_option/get_option — existence question
+Severity: Low.
+### R10-51: HOSTINFO key casing — port writes/reads "hostinfo", C uses "hostInfo" (asynRecord.c:1825); self-consistent today, diverges from C's text
+Severity: Low.
+### R10-52: read_options_from_driver LBAUD parse — C's sscanf %d leaves LBAUD unchanged when the driver text carries no number; the port's unwrap_or(0) writes 0
+Severity: Low.
+### R10-53: read_options_from_driver accepts readback aliases C does not ("Yes"/"No"/"none" where C strcmps {"Unknown","N","Y"} only)
+Severity: Low.
+### R10-54: serial_port_win32.rs received the R9-55 signature change but is cfg(windows) — not compile-verified on this host
+Severity: Low (verification gap, not a known defect).
+### R10-55: GPIBIV is always 0 (no asynGpib interface exists), so UCMD/ACMD only ever take C's no-interface branch — structural, standing gap
+Severity: Low.
+
+Category E (records + AD):
+### R10-63: scaler change-posts Dn/Gn/PRn on process cycles where C posts nothing — the framework diffs every field against last_posted, so the gate→direction copy (scalerRecord.c:413-414, unposted in C) fires Dn monitors; R10-62 fixed the mask of these posts, not their existence
+Severity: Low.
+### R10-64: scaler special()'s COUTP put is deferred to the head of the next process cycle (no action channel in special); observationally identical for CNT (pp(TRUE)) but not C's ordering
+Severity: Low.
+### R10-65: scalcout never fetches its string input links INAA..INLL — multi_input_links() lists only the 12 numeric inputs
+Severity: Medium.
+### R10-66: scalcout exposes no PVAL/PSVL fields (C's previous-value pair behind the OOPT On-Change comparison)
+Severity: Low.
+### R10-67: swait has no CLCV field and no real alarm-severity plumbing — R9-7 added only the calc_alarm bool it needed
+Severity: Low.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -2097,3 +2316,25 @@ Impact: `caput scaler.RATE` fires a spurious .TP monitor event on C; the port's 
   copy-paste quirk). Finding volume declining (42→19→32→17→13) and
   severity ceiling dropped to Medium for the first time. Fix wave 8
   next: 42 items (29 confirmed carryovers + 13 new).
+- Fix wave 8 (2026-07-12): all 42 items FIXED (no NOT-REAL) across 5
+  worktree fixers, merged and verified by main — fmt/clippy -D warnings
+  clean, nextest 8046/8046 (2 skipped), doctests clean. Structural
+  owners landed: always-a-program CompiledExpr (Option modeling
+  deleted, R9-7), engine::subrange_bounds + ported strtod,
+  pvdata::convert (pvxs copyOut) + ChannelSource::check_monitor_request
+  INIT hook, timeout_from_secs, PortHandle::has_interface registry,
+  AsynUser through the whole asynOption path (TWO public API changes,
+  R9-53/R9-55), InterposeStack::install (last = outermost),
+  InputFetchPolicy::ReadAllGateOnFailure,
+  RecordInstance::deadband_post, CircularBuffer Control admission,
+  cli::stat_to_str/zero_dbr_value/ca_error_marker owners,
+  echo_fallback and detect_color_mode deleted. Client-visible semantic
+  changes (all = C): non-scalar ackAny / array-typed DBE drop the PVA
+  connection; option strings parse base 0; scaler COUTP double-fires
+  on user stop (scaler-rs local doc SCAL-6 retracted). Merge work by
+  main: 4-file a8 x e8 conflict resolution (fetch gate wraps the
+  unconditional eval) + one integration test adaptation (fac0dc95).
+  30 NEW fixer-surfaced findings recorded OPEN (R10-6..15, 17..18,
+  33..37, 49..55, 63..67) — notable: R10-6 aCalc array window
+  (firstEl/numEl) is the highest-priority candidate; R10-49 asynRecord
+  queue-timeout mechanism missing entirely. Next: R11 re-audit.

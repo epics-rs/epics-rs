@@ -2738,7 +2738,21 @@ impl RecordInstance {
             mask |= EventMask::LOG;
         }
 
-        let value = if mask.is_empty() {
+        // The closed set applies to THIS post too. `process_posted_fields` is
+        // "the CLOSED set of fields a process cycle of this record may post" —
+        // and the deadband post is a post. A record whose C `monitor()` never
+        // names the deadband field must not have one invented for it: transform
+        // `monitor()` (transformRecord.c:786-808) walks A..P and posts no VAL
+        // at all — VAL is an inert dummy (`:422`) — so an alarm cycle, whose
+        // `alarm_bits` alone make `mask` non-empty, was firing a `.VAL` monitor
+        // C never sends. Gating here rather than at each builder keeps the
+        // single owner of the deadband post the single enforcer of the set.
+        let in_closed_set = self
+            .record
+            .process_posted_fields()
+            .is_none_or(|allowed| allowed.contains(&field));
+
+        let value = if mask.is_empty() || !in_closed_set {
             None
         } else if field == "VAL" {
             self.record.val()

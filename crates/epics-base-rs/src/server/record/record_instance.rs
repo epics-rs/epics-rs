@@ -2100,6 +2100,132 @@ impl RecordInstance {
         Ok(status)
     }
 
+    /// The single owner of a process cycle's SUBSCRIBER posts — C `monitor()`'s
+    /// "post every subscribed field this cycle touched" loop.
+    ///
+    /// Every processing path (`process_record_with_links_inner`, the deferred
+    /// async-completion path, the simulation path, and [`Self::process_local`])
+    /// calls this; none of them may reimplement the rules, because a rule that
+    /// holds on one path and not another is a monitor that fires on a scan cycle
+    /// but not on an async completion. The per-field mask resolvers
+    /// ([`AuxPostMask`], [`crate::server::record::value_gate`]) were already
+    /// single-owned for the same reason — this is the loop around them.
+    ///
+    /// It also UPDATES `last_posted` for everything it emits, and it TAKES the
+    /// record's per-cycle post mask ([`Record::take_cycle_posted_fields`]), so
+    /// it must run exactly once per cycle.
+    ///
+    /// The rules, in order:
+    ///
+    /// * The deadband field (default VAL) and SEVR/STAT/AMSG/UDF are emitted by
+    ///   the caller with their own C masks and are skipped here.
+    /// * [`Record::event_posted_fields`] post from their own event path
+    ///   (waveform HASH) — never from change detection.
+    /// * [`Record::process_posted_fields`], when declared, is the closed set of
+    ///   fields a process cycle may post at all.
+    /// * A secondary value field ([`Record::fields_posted_with_value_mask`])
+    ///   carries VAL's monitor mask, gated per its [`ValuePostGate`].
+    /// * A CHANGED field carries [`AuxPostMask::mask_for`].
+    /// * An UNCHANGED field posts only if the record marked it this cycle:
+    ///   statically ([`Record::force_posted_fields`]), per-cycle
+    ///   ([`Record::take_cycle_posted_fields`]), on the alarm transition
+    ///   ([`Record::alarm_cycle_monitored_fields`]), or in the DBE_LOG sweep
+    ///   ([`Record::log_swept_fields`]).
+    pub(crate) fn collect_subscriber_posts(
+        &mut self,
+        deadband_field: &str,
+        deadband_mask: EventMask,
+        alarm_bits: EventMask,
+        aux_post: AuxPostMask,
+        include_val: bool,
+    ) -> Vec<(String, EpicsValue, EventMask)> {
+        use crate::server::record::{ValuePostGate, value_gate};
+
+        // C's default for a change-detected auxiliary post:
+        // `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400;
+        // motor `DBE_VAL_LOG` for marked fields, motorRecord.cc:3522-3645).
+        let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
+        let alarm_fanout: &[&str] = if alarm_bits.is_empty() {
+            &[]
+        } else {
+            self.record.alarm_cycle_monitored_fields()
+        };
+        let force_fields = self.record.force_posted_fields();
+        // TAKE — this also clears the state it answers from (C's
+        // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
+        let cycle_posted = self.record.take_cycle_posted_fields();
+        let log_swept = self.record.log_swept_fields();
+        let value_masked = self.record.fields_posted_with_value_mask();
+        let event_posted = self.record.event_posted_fields();
+        let process_posted = self.record.process_posted_fields();
+
+        let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
+        for (field, subs) in &self.subscribers {
+            if subs.is_empty()
+                || field == deadband_field
+                || field == "SEVR"
+                || field == "STAT"
+                || field == "AMSG"
+                || field == "UDF"
+                || event_posted.contains(&field.as_str())
+                || !process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
+            {
+                continue;
+            }
+            let Some(val) = self.resolve_field(field) else {
+                continue;
+            };
+            let changed = match self.last_posted.get(field) {
+                Some(prev) => prev != &val,
+                None => true,
+            };
+            if let Some(gate) = value_gate(value_masked, field) {
+                // C posts this secondary value field with VAL's own monitor_mask,
+                // from inside the guard that decides whether VAL posts at all —
+                // never a forced DBE_VALUE|DBE_LOG. `ValuePostGate` says whether C
+                // also re-tests the field's own value inside that guard (ai RVAL,
+                // aiRecord.c:462) or posts it whenever the guard fires (timestamp
+                // RVAL, timestampRecord.c:160).
+                let post = match gate {
+                    ValuePostGate::OnChange => changed && !deadband_mask.is_empty(),
+                    ValuePostGate::WithValue => include_val,
+                };
+                if post {
+                    sub_updates.push((field.clone(), val, deadband_mask));
+                }
+            } else if changed {
+                sub_updates.push((
+                    field.clone(),
+                    val,
+                    aux_post.mask_for(field, alarm_bits, deadband_mask),
+                ));
+            } else if force_fields.contains(&field.as_str())
+                || cycle_posted.contains(&field.as_str())
+            {
+                // C `monitor()` posts a re-marked field with
+                // `monitor_mask | DBE_VAL_LOG` even when unchanged — whether the
+                // mark is static (`force_posted_fields`) or this cycle's bit mask
+                // (`take_cycle_posted_fields`: aCalcout AMASK/NEWM).
+                sub_updates.push((field.clone(), val, aux_mask));
+            } else if alarm_fanout.contains(&field.as_str()) {
+                // C motor `monitor()` (motorRecord.cc:3513-3645) posts every listed
+                // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber
+                // observes the alarm moment on any of them.
+                sub_updates.push((field.clone(), val, alarm_bits));
+            } else if log_swept.contains(&field.as_str()) {
+                // C scalerRecord.c:770-787 `monitor()`: every idle process re-posts
+                // each S1..Snch with a literal DBE_LOG regardless of change. Sn does
+                // not change on an idle cycle, so changed/unchanged stay disjoint
+                // (no double post).
+                sub_updates.push((field.clone(), val, EventMask::LOG));
+            }
+        }
+        for (field, val, _) in &sub_updates {
+            self.last_posted.insert(field.clone(), val.clone());
+        }
+        sub_updates
+    }
+
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
     ///
@@ -2457,112 +2583,15 @@ impl RecordInstance {
             alarm_posts.push(("ACKS", EventMask::VALUE));
         }
 
-        // Add subscribed fields that actually changed since last notification.
-        // Exclude {deadband-field}/SEVR/STAT/AMSG/UDF — all five are already
-        // emitted by this path (the deadband field, default VAL, in
-        // `changed_fields`, SEVR/STAT/AMSG via `alarm_posts`, UDF via the
-        // explicit UDF push below). Mirrors the two `processing.rs`
-        // snapshot gates, which exclude the same five; excluding only the
-        // first three would double-post AMSG and UDF. Each carries
-        // DBE_VALUE|DBE_LOG plus the cycle's alarm bits — the C
-        // convention for change-detected auxiliary posts
-        // (`monitor_mask | DBE_VALUE | DBE_LOG`, calcRecord.c:420,
-        // subRecord.c:400; motor `DBE_VAL_LOG` for marked fields,
-        // motorRecord.cc:3522-3645).
-        //
-        // On a cycle whose alarm transition fired, fields named by
-        // `alarm_cycle_monitored_fields` post even when unchanged, with
-        // the alarm bits alone — C motor `monitor()`
-        // (motorRecord.cc:3513-3645) posts every listed field once
-        // `monitor_mask != 0`, so a `DBE_ALARM`-only subscriber
-        // observes the alarm moment on any of them.
-        let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
-        let alarm_fanout: &[&str] = if alarm_bits.is_empty() {
-            &[]
-        } else {
-            self.record.alarm_cycle_monitored_fields()
-        };
-        // Fields the record force-posts every cycle it recomputed them
-        // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
-        // see `Record::force_posted_fields`. Empty for most records.
-        let force_fields = self.record.force_posted_fields();
-        // Fields the record re-posts with DBE_LOG only every cycle it
-        // names them, regardless of change — see `Record::log_swept_fields`
-        // (the scaler's idle S1..Snch sweep). Empty for most records.
-        let log_swept = self.record.log_swept_fields();
-        // Secondary value fields posted with VAL's monitor_mask, gated
-        // inside C's `if (monitor_mask)` (ai RVAL, aiRecord.c:460-465) —
-        // see `Record::fields_posted_with_value_mask`. Empty for most.
-        let value_masked = self.record.fields_posted_with_value_mask();
-        // Fields the record posts itself via an event-driven path (HASH on
-        // a content-hash change, waveformRecord.c:317-319) — excluded from
-        // generic change-detection so they are neither double-posted nor
-        // spuriously posted. See `Record::event_posted_fields`.
-        let event_posted = self.record.event_posted_fields();
-        // The closed set of fields this record's C process()/monitor() posts,
-        // when it declares one — see `Record::process_posted_fields`. A field
-        // outside it is never posted by a process cycle.
-        let process_posted = self.record.process_posted_fields();
-        let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
-        for (field, subs) in &self.subscribers {
-            if !subs.is_empty()
-                && field != deadband_field
-                && field != "SEVR"
-                && field != "STAT"
-                && field != "AMSG"
-                && field != "UDF"
-                && !event_posted.contains(&field.as_str())
-                && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
-            {
-                if let Some(val) = self.resolve_field(field) {
-                    let changed = match self.last_posted.get(field) {
-                        Some(prev) => prev != &val,
-                        None => true,
-                    };
-                    if let Some(gate) = crate::server::record::value_gate(value_masked, field) {
-                        // C posts this secondary value field with VAL's own
-                        // monitor_mask, from inside the guard around the VAL
-                        // post — gated per `ValuePostGate` (ai RVAL re-tests
-                        // its own value, aiRecord.c:462; timestamp RVAL does
-                        // not, timestampRecord.c:160).
-                        let post = match gate {
-                            crate::server::record::ValuePostGate::OnChange => {
-                                changed && !deadband_mask.is_empty()
-                            }
-                            crate::server::record::ValuePostGate::WithValue => include_val,
-                        };
-                        if post {
-                            sub_updates.push((field.clone(), val, deadband_mask));
-                        }
-                    } else if changed {
-                        let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
-                        sub_updates.push((field.clone(), val, mask));
-                    } else if force_fields.contains(&field.as_str()) {
-                        // C `monitor()` posts a re-marked field with
-                        // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                        sub_updates.push((field.clone(), val, aux_mask));
-                    } else if alarm_fanout.contains(&field.as_str()) {
-                        sub_updates.push((field.clone(), val, alarm_bits));
-                    } else if log_swept.contains(&field.as_str()) {
-                        // C scalerRecord.c:770-787 `monitor()`: every idle
-                        // process re-posts each S1..Snch with a literal
-                        // DBE_LOG regardless of change. A value-only field
-                        // (e.g. Sn) posts DBE_VALUE only on a counting
-                        // change, so the DBE_LOG subscriber is served here
-                        // by the idle sweep — and Sn does not change on an
-                        // idle cycle, so changed/unchanged stay disjoint
-                        // (no double post).
-                        sub_updates.push((field.clone(), val, EventMask::LOG));
-                    }
-                }
-            }
-        }
-        if !sub_updates.is_empty() {
-            for (field, val, _) in &sub_updates {
-                self.last_posted.insert(field.clone(), val.clone());
-            }
-            changed_fields.extend(sub_updates);
-        }
+        // The cycle's subscriber posts — assembled by the single owner
+        // `collect_subscriber_posts`, shared with every `processing.rs` path.
+        changed_fields.extend(self.collect_subscriber_posts(
+            deadband_field,
+            deadband_mask,
+            alarm_bits,
+            aux_post,
+            include_val,
+        ));
         // C waveform/aai/aao `monitor()` posts HASH with a literal
         // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
         // 317-319), independent of the VAL post mask. `array_hash_changed`

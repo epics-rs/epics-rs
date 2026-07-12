@@ -959,6 +959,36 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Fields this cycle's C `monitor()` posted UNCONDITIONALLY, chosen per
+    /// cycle from record state — the DYNAMIC sibling of
+    /// [`Self::force_posted_fields`].
+    ///
+    /// Some records decide which fields to post from a per-cycle BIT MASK
+    /// rather than from a fixed list. aCalcout has two of them, and neither
+    /// consults the value: `afterCalc` posts exactly the AMASK-flagged array
+    /// fields — the ones the expression STORED into
+    /// (`aCalcoutRecord.c:293-297`) — and `monitor()` posts exactly the
+    /// NEWM-flagged ones — the input arrays whose link delivered a CHANGED
+    /// value (`:1031-1036`). `AA := AA` therefore still posts AA.
+    ///
+    /// Neither existing gate can express that. The change-detection loop posts
+    /// only what moved, so it drops the store-the-same-value case;
+    /// [`Self::force_posted_fields`] is `&'static`, so it cannot name a set
+    /// that varies per cycle (twelve arrays, 2^12 combinations) without
+    /// over-posting every one of them every cycle.
+    ///
+    /// TAKE semantics: called exactly once per process cycle, and the record
+    /// clears whatever state it answered from — C's `pcalc->newm = 0` (`:1036`)
+    /// is part of the same step. A field named here is posted with the same
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` a `force_posted_fields` entry gets,
+    /// and only when it did NOT already post through change detection, so the
+    /// two can never double-post.
+    ///
+    /// Default: empty — and `Vec::new()` does not allocate.
+    fn take_cycle_posted_fields(&mut self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     /// Fields the record's C `monitor()` re-posts with `DBE_LOG` ONLY on
     /// every cycle it names them, regardless of change — the analogue of
     /// an unconditional `db_post_events(field, DBE_LOG)` sweep.

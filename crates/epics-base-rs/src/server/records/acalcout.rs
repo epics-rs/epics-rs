@@ -94,10 +94,6 @@
 //!   input arrays are posted by the framework's change detection instead.
 //!   (`AMASK` — the arrays the EXPRESSION stored into — is a different mask and
 //!   is computed; see [`AcalcoutRecord::apply_stores`].)
-//! - Array posting is change-gated, not write-gated. C `afterCalc` posts every
-//!   array field flagged in `AMASK` (`:293-297`), so a store that writes the value
-//!   the field already held still posts. The framework posts on change, so that
-//!   one case posts nothing here.
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
@@ -2129,6 +2125,39 @@ impl Record for AcalcoutRecord {
             "PVAL", "POVL", "LALM", "ALST", "MLST", "CSTAT", "PA", "PB", "PC", "PD", "PE", "PF",
             "PG", "PH", "PI", "PJ", "PK", "PL",
         ]
+    }
+
+    /// C posts an aCalcout array field from a per-cycle BIT MASK, and neither
+    /// mask consults the value — a store that writes the value the field already
+    /// held still posts.
+    ///
+    /// `afterCalc` (`aCalcoutRecord.c:293-297`), the AMASK half:
+    ///
+    /// ```c
+    /// /* post array fields that aCalcPerform wrote to. */
+    /// for (j=0, panew=&pcalc->aa; j<ARRAY_MAX_FIELDS; j++, panew++) {
+    ///     if (*panew && (pcalc->amask & (1<<j))) {
+    ///         db_post_events(pcalc, *panew, DBE_VALUE|DBE_LOG);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// AMASK is the mask of arrays the EXPRESSION stored into: aCalcPerform
+    /// zeroes it at the top of every run (`aCalcPerform.c:326`) and sets bit i
+    /// in `STORE_AA..STORE_LL` (`:485-487`), so it is exactly this cycle's
+    /// stores. `AA := AA` sets the bit, changes nothing, and still posts AA —
+    /// the case the framework's change-detection loop drops.
+    ///
+    /// AMASK needs no clearing here: [`AcalcoutRecord::process`] assigns
+    /// `self.amask` from the pass's mask on every cycle, which is C's
+    /// `*amask = 0` at the head of aCalcPerform.
+    fn take_cycle_posted_fields(&mut self) -> Vec<&'static str> {
+        ARR_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.amask & (1u32 << i) != 0)
+            .map(|(_, name)| *name)
+            .collect()
     }
 }
 

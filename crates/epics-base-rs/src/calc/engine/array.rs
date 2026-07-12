@@ -481,12 +481,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         ArrayStackValue::Array(a) => a.as_slice(),
                         ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
                     };
-                    let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    stack.push(ArrayStackValue::Double(if arr.is_empty() {
-                        0.0
-                    } else {
-                        max
-                    }));
+                    stack.push(ArrayStackValue::Double(
+                        extremum(arr).map_or(0.0, |(v, _)| v),
+                    ));
                 }
                 ArrayOp::ArrayMin => {
                     let v = pop1(&mut stack)?;
@@ -494,38 +491,23 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         ArrayStackValue::Array(a) => a.as_slice(),
                         ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
                     };
-                    let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
-                    stack.push(ArrayStackValue::Double(if arr.is_empty() {
-                        0.0
-                    } else {
-                        min
-                    }));
+                    stack.push(ArrayStackValue::Double(
+                        extremum_by(arr, |x, best| x < best).map_or(0.0, |(v, _)| v),
+                    ));
                 }
                 ArrayOp::IndexMax => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(i, _)| i as f64)
-                        .unwrap_or(0.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    stack.push(ArrayStackValue::Double(
+                        extremum(arr).map_or(0.0, |(_, i)| i as f64),
+                    ));
                 }
                 ArrayOp::IndexMin => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .enumerate()
-                        .min_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(i, _)| i as f64)
-                        .unwrap_or(0.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    stack.push(ArrayStackValue::Double(
+                        extremum_by(arr, |x, best| x < best).map_or(0.0, |(_, i)| i as f64),
+                    ));
                 }
                 ArrayOp::IndexZero => {
                     let v = pop1(&mut stack)?;
@@ -686,6 +668,43 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         .last()
         .cloned()
         .unwrap_or(ArrayStackValue::Double(0.0)))
+}
+
+/// The single shape behind all four aCalc extremum reductions — `AMAX`, `AMIN`,
+/// `IXMAX`, `IXMIN` (`aCalcPerform.c:836-861`). C seeds both the running value
+/// and the running index from the FIRST element and then advances only on a
+/// STRICT comparison:
+///
+/// ```c
+/// for (i=firstEl+1, j=firstEl, d=ps->a[firstEl]; i<=lastEl; i++) {
+///     if (ps->a[i] > d) { d = ps->a[i]; j = i; }
+/// }
+/// ```
+///
+/// Two observables fall out of that shape, and neither survives an
+/// `Iterator::max_by` / `fold(NEG_INFINITY, f64::max)` rewrite:
+///
+/// - **Ties keep the FIRST winner.** `IXMAX([5,3,5])` is 0, not 2.
+/// - **A NaN seed sticks.** Every comparison against NaN is false, so
+///   `AMAX([NaN,3,5])` is NaN and `IXMAX` is 0 — where `f64::max` would
+///   discard the NaN and answer 5. (A NaN *later* in the array is skipped by
+///   the same false comparison, so it never wins.)
+///
+/// Returns `(value, index)` of the winner, or `None` for an empty array — C
+/// cannot reach that case (`arraySize >= 1`), and the callers answer 0 as the
+/// port's own empty-array convention.
+fn extremum(arr: &[f64]) -> Option<(f64, usize)> {
+    extremum_by(arr, |x, best| x > best)
+}
+
+fn extremum_by(arr: &[f64], better: impl Fn(f64, f64) -> bool) -> Option<(f64, usize)> {
+    let mut best = (*arr.first()?, 0usize);
+    for (i, &x) in arr.iter().enumerate().skip(1) {
+        if better(x, best.0) {
+            best = (x, i);
+        }
+    }
+    Some(best)
 }
 
 /// C `myNINT` (`aCalcPerform.c:50`): `(int)(a >= 0 ? a+0.5 : a-0.5)` — a

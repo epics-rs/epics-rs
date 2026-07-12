@@ -395,6 +395,13 @@ pub struct AsynRecord {
     // `check_alarms`, so the `take()` is the single clear point — no path
     // stages an alarm and then bypasses the consumer.
     io_alarm: Option<(u16, AlarmSeverity)>,
+    // C `old.traceFd` (asynRecord.c:203): the identity of the trace sink this
+    // record last saw or installed. `monitorStatus` compares the port's current
+    // sink against it and writes TFIL = "Unknown" when another thread re-pointed
+    // the trace file (:1119-1124). Shared with the out-of-band `exceptCallback`
+    // refresh, which runs the same comparison — one cell, so the two paths
+    // cannot disagree about which sink is "ours". `None` until the first sample.
+    old_trace_file_id: Arc<Mutex<Option<usize>>>,
 }
 
 impl Default for AsynRecord {
@@ -483,6 +490,7 @@ impl Default for AsynRecord {
             status_dirty: Arc::new(AtomicBool::new(false)),
             except_cb: None,
             io_alarm: None,
+            old_trace_file_id: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1071,6 +1079,61 @@ const OPTION_READBACK_FIELDS: &[&str] = &[
 /// EOS strings, whichever one was written.
 const EOS_READBACK_FIELDS: &[&str] = &["IEOS", "OEOS"];
 
+/// C `monitorStatus`'s trace half (asynRecord.c:1066-1124), sampled once: the
+/// three masks, the I/O truncate size, and C's "another thread re-pointed the
+/// trace file" verdict.
+///
+/// The single owner of that sample. Both refresh paths — the in-record
+/// [`AsynRecord::read_trace_state`] and the out-of-band `exceptCallback` post —
+/// take it from here, so neither can refresh a subset of what C refreshes.
+#[derive(Clone, Copy)]
+struct TraceReadback {
+    trace_mask: u32,
+    io_mask: u32,
+    info_mask: u32,
+    truncate_size: i32,
+    /// C: `traceFd != old.traceFd` (asynRecord.c:1119) — the record did not
+    /// install this sink itself, so it cannot know the file's name.
+    file_changed: bool,
+}
+
+/// Sample the trace manager and settle the TFIL verdict against the record's
+/// remembered sink identity — C's `old.traceFd` (asynRecord.c:1101,1119-1120).
+///
+/// The remembered id is updated here (C updates it in the same `if` body) and
+/// by [`AsynRecord::apply_trace_file`], which stores the id of the sink it is
+/// about to install *before* installing it — C does exactly that, and for the
+/// same reason: `setTraceFile` fires an exception whose callback re-enters this
+/// sample, and the record's own write must not be reported as foreign
+/// (asynRecord.c:470-475). A first sample (no id remembered yet) seeds the cache
+/// and reports no change: C's zero-initialised `old.traceFd` matches the default
+/// errlog sink's `FILE *` of 0, so its first `monitorStatus` is silent too.
+fn sample_trace_readback(
+    trace: &TraceManager,
+    port: &str,
+    addr: Option<i32>,
+    old_file_id: &Mutex<Option<usize>>,
+) -> TraceReadback {
+    let snap = trace.snapshot(port, addr);
+    let file_changed = match old_file_id.lock() {
+        Ok(mut cached) => cached
+            .replace(snap.file_id)
+            .is_some_and(|old| old != snap.file_id),
+        Err(_) => false,
+    };
+    TraceReadback {
+        trace_mask: snap.trace_mask.bits(),
+        io_mask: snap.io_mask.bits(),
+        info_mask: snap.info_mask.bits(),
+        truncate_size: snap.io_truncate_size as i32,
+        file_changed,
+    }
+}
+
+/// The TFIL text C writes when the trace file changed under the record
+/// (asynRecord.c:1122).
+const TFIL_UNKNOWN: &str = "Unknown";
+
 /// Build the asyn trace readback fields from the three trace masks — the
 /// single source of the mask→field mapping that C `monitorStatus`
 /// recomputes and posts (asynRecord.c:1066-1117). The bit assignments mirror
@@ -1081,13 +1144,16 @@ const EOS_READBACK_FIELDS: &[&str] = &["IEOS", "OEOS"];
 /// `process()`-path re-import (`read_trace_state`) cannot diverge. Field DBF
 /// types match `get_field`: the mask fields are `Long`, the bit fields
 /// `Short`.
-fn trace_readback_fields(
-    trace_mask: u32,
-    io_mask: u32,
-    info_mask: u32,
-) -> Vec<(String, EpicsValue)> {
+fn trace_readback_fields(rb: &TraceReadback) -> Vec<(String, EpicsValue)> {
+    let TraceReadback {
+        trace_mask,
+        io_mask,
+        info_mask,
+        truncate_size,
+        file_changed,
+    } = *rb;
     let bit = |mask: u32, flag: u32| EpicsValue::Short(i16::from(mask & flag != 0));
-    vec![
+    let mut fields = vec![
         ("TMSK".to_string(), EpicsValue::Long(trace_mask as i32)),
         ("TB0".to_string(), bit(trace_mask, TraceMask::ERROR.bits())),
         (
@@ -1128,7 +1194,16 @@ fn trace_readback_fields(
             "TINB3".to_string(),
             bit(info_mask, TraceInfoMask::THREAD.bits()),
         ),
-    ]
+        // C: `tsiz = (int)getTraceIOTruncateSize(pasynUser)` then POST_IF_NEW
+        // (asynRecord.c:1100,:1118).
+        ("TSIZ".to_string(), EpicsValue::Long(truncate_size)),
+    ];
+    if file_changed {
+        // C: the trace file is no longer the one this record installed, so its
+        // name is unknowable (asynRecord.c:1119-1124).
+        fields.push(("TFIL".to_string(), EpicsValue::String(TFIL_UNKNOWN.into())));
+    }
+    fields
 }
 
 /// The port-state half of C `monitorStatus`: AUCT / CNCT / ENBL re-read from
@@ -1781,6 +1856,13 @@ impl AsynRecord {
                 return;
             }
         };
+        // C stores the new `FILE *` in `old.traceFd` BEFORE calling setTraceFile,
+        // because setTraceFile fires an exception whose callback runs
+        // monitorStatus — which would otherwise see the record's own write as a
+        // foreign change and overwrite TFIL with "Unknown" (asynRecord.c:470-475).
+        if let Ok(mut cached) = self.old_trace_file_id.lock() {
+            *cached = Some(file.id());
+        }
         match self.trace_addr_target() {
             Some(addr) => entry.trace.set_device_trace_file(&self.port, addr, file),
             None => entry.trace.set_trace_file(Some(&self.port), file),
@@ -1789,32 +1871,34 @@ impl AsynRecord {
 
     /// Read current trace state from TraceManager into record fields.
     ///
-    /// C `monitorStatus` (asynRecord.c:1066-1084) refreshes the trace
-    /// mask, the trace I/O mask, AND the trace info mask (`TINM`/`TINB0..3`)
-    /// from the trace manager. Previously the info mask was never imported,
-    /// so a record connecting after a non-default `asynSetTraceInfoMask`
-    /// showed `TINM`/`TINB*` as zero.
+    /// C `monitorStatus` (asynRecord.c:1066-1124) refreshes the trace mask, the
+    /// trace I/O mask, the trace info mask (`TINM`/`TINB0..3`), the I/O truncate
+    /// size (`TSIZ`, :1100), and `TFIL` — which becomes "Unknown" whenever the
+    /// port's trace sink is no longer the one this record installed (:1119-1124).
+    /// The sample and the TFIL verdict come from [`sample_trace_readback`], the
+    /// same owner the out-of-band `exceptCallback` refresh uses.
     fn read_trace_state(&mut self) {
-        let (trace_mask, io_mask, info_mask) = match self.port_entry {
-            Some(ref entry) => {
-                let port = &self.port;
-                (
-                    entry.trace.get_trace_mask(Some(port)).bits(),
-                    entry.trace.get_trace_io_mask(Some(port)).bits(),
-                    entry.trace.get_trace_info_mask(Some(port)).bits(),
-                )
-            }
-            None => return,
+        let Some(entry) = self.port_entry.clone() else {
+            return;
         };
+        let addr = self.trace_addr_target();
+        let cache = Arc::clone(&self.old_trace_file_id);
+        let rb = sample_trace_readback(&entry.trace, &self.port, addr, &cache);
 
-        self.tmsk = trace_mask as i32;
+        self.tmsk = rb.trace_mask as i32;
         self.update_trace_bits_from_mask();
 
-        self.tiom = io_mask as i32;
+        self.tiom = rb.io_mask as i32;
         self.update_io_bits_from_mask();
 
-        self.tinm = info_mask as i32;
+        self.tinm = rb.info_mask as i32;
         self.update_info_bits_from_mask();
+
+        self.tsiz = rb.truncate_size;
+
+        if rb.file_changed {
+            self.tfil = TFIL_UNKNOWN.to_string();
+        }
     }
 
     /// Subscribe to the port's exceptions — C `exceptCallback`
@@ -1882,12 +1966,17 @@ impl AsynRecord {
         // exception. Seed it with the record's current values: `connect_device`
         // registers this callback only after its own `monitor_status`, so those
         // are the values C's `old` would hold at the same point.
+        let old_file_id = Arc::clone(&self.old_trace_file_id);
+        // The rung of C's findTracePvt chain this record's trace reads and writes
+        // both address (device when the port is multi-device, else the port).
+        let trace_addr = self.trace_addr_target();
         let last_posted: Arc<Mutex<HashMap<String, EpicsValue>>> = Arc::new(Mutex::new(
-            trace_readback_fields(
-                trace.get_trace_mask(Some(&port)).bits(),
-                trace.get_trace_io_mask(Some(&port)).bits(),
-                trace.get_trace_info_mask(Some(&port)).bits(),
-            )
+            trace_readback_fields(&sample_trace_readback(
+                &trace,
+                &port,
+                trace_addr,
+                &old_file_id,
+            ))
             .into_iter()
             .chain(connect_readback_fields(
                 self.auct != 0,
@@ -1909,11 +1998,12 @@ impl AsynRecord {
                 dirty.store(true, Ordering::Release);
                 return;
             };
-            let (port, trace, handle, last_posted) = (
+            let (port, trace, handle, last_posted, old_file_id) = (
                 port.clone(),
                 trace.clone(),
                 handle.clone(),
                 Arc::clone(&last_posted),
+                Arc::clone(&old_file_id),
             );
             rt.spawn(async move {
                 // The C `monitorStatus` body: re-import the trace masks from the
@@ -1925,11 +2015,12 @@ impl AsynRecord {
                 let auto = handle.is_auto_connect().await.unwrap_or(false);
                 let connected = handle.is_connected().await.unwrap_or(false);
                 let enabled = handle.is_enabled().await.unwrap_or(false);
-                let fields = trace_readback_fields(
-                    trace.get_trace_mask(Some(&port)).bits(),
-                    trace.get_trace_io_mask(Some(&port)).bits(),
-                    trace.get_trace_info_mask(Some(&port)).bits(),
-                )
+                let fields = trace_readback_fields(&sample_trace_readback(
+                    &trace,
+                    &port,
+                    trace_addr,
+                    &old_file_id,
+                ))
                 .into_iter()
                 .chain(connect_readback_fields(auto, connected, enabled));
                 let changed: Vec<(String, EpicsValue)> = {
@@ -3884,6 +3975,70 @@ mod tests {
             rec.tmsk as u32,
             (TraceMask::ERROR | TraceMask::IO_DRIVER).bits()
         );
+    }
+
+    /// R9-52: C `monitorStatus` refreshes TSIZ from `getTraceIOTruncateSize`
+    /// (asynRecord.c:1100) and writes TFIL = "Unknown" when the port's trace
+    /// sink is no longer the one this record installed (:1119-1124). Neither
+    /// readback was refreshed on any path.
+    #[test]
+    fn monitor_status_refreshes_tsiz_and_flags_a_foreign_trace_file() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct TsizDriver(PortDriverBase);
+        impl PortDriver for TsizDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "r9_52_tsiz";
+        let (tx, rx) = mpsc::channel(16);
+        let actor = PortActor::new(
+            Box::new(TsizDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(16)));
+        let trace = Arc::new(TraceManager::new());
+        register_port(port_name, handle, trace.clone());
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+        // The default truncate size lands in TSIZ on connect, and the first
+        // sample seeds the sink identity: no spurious "Unknown".
+        assert_eq!(rec.tsiz, 80);
+        assert_eq!(rec.tfil, "");
+
+        // A foreign `asynSetTraceIOTruncateSize` — the iocsh path, not this
+        // record — must show up in TSIZ on the next monitorStatus.
+        trace.set_io_truncate_size(Some(port_name), 17);
+        rec.monitor_status();
+        assert_eq!(rec.tsiz, 17);
+        assert_eq!(rec.tfil, "", "the trace file did not change");
+
+        // The record's own TFIL write must NOT read back as foreign.
+        rec.tfil = "<stdout>".to_string();
+        rec.special("TFIL", true).unwrap();
+        rec.monitor_status();
+        assert_eq!(rec.tfil, "<stdout>");
+
+        // A foreign `asynSetTraceFile` re-points the sink: C cannot know the
+        // new name, so TFIL becomes "Unknown".
+        trace.set_trace_file(Some(port_name), TraceFile::Stderr);
+        rec.monitor_status();
+        assert_eq!(rec.tfil, "Unknown");
     }
 
     #[test]

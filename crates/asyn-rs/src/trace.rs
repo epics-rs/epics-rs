@@ -229,6 +229,25 @@ pub enum TraceFile {
 }
 
 impl TraceFile {
+    /// Identity of the sink, the port's analogue of C's `FILE *` value.
+    ///
+    /// C `getTraceFile` (asynManager.c:2928-2940) returns the raw `FILE *`
+    /// — `0` for errlog, `stdout` / `stderr`, or the open file's pointer — and
+    /// asynRecord compares it against its remembered `old.traceFd` to decide
+    /// whether *another thread* re-pointed the trace file (asynRecord.c:1119).
+    /// Pointer identity is the whole content of that test, so the port exposes
+    /// the same thing: a stable token per distinct sink. Errlog is `0` as in C;
+    /// an open file is its `Arc` address, which cannot collide with the three
+    /// standard-sink sentinels.
+    pub fn id(&self) -> usize {
+        match self {
+            TraceFile::Errlog => 0,
+            TraceFile::Stdout => 1,
+            TraceFile::Stderr => 2,
+            TraceFile::File(f) => Arc::as_ptr(f) as usize,
+        }
+    }
+
     /// Write a complete line atomically (single write_all call under lock).
     pub fn write_line(&self, line: &str) {
         match self {
@@ -251,6 +270,18 @@ impl Default for TraceFile {
     fn default() -> Self {
         TraceFile::Stderr
     }
+}
+
+/// The effective trace configuration for one `(port, addr)` — see
+/// [`TraceManager::snapshot`].
+#[derive(Clone, Copy, Debug)]
+pub struct TraceSnapshot {
+    pub trace_mask: TraceMask,
+    pub io_mask: TraceIoMask,
+    pub info_mask: TraceInfoMask,
+    pub io_truncate_size: usize,
+    /// Identity of the trace sink — see [`TraceFile::id`].
+    pub file_id: usize,
 }
 
 /// Per-port (or global) trace configuration.
@@ -758,6 +789,37 @@ impl TraceManager {
             .lock()
             .map(|c| c.trace_io_mask)
             .unwrap_or(TraceIoMask::ASCII)
+    }
+
+    /// Every value C's `monitorStatus` reads back from the trace facility, for
+    /// one `(port, addr)`, resolved once.
+    ///
+    /// C reads them through `pasynTrace->getTraceMask/getTraceIOMask/
+    /// getTraceInfoMask/getTraceIOTruncateSize/getTraceFile` on the record's
+    /// `pasynUser` (asynRecord.c:1066-1101). All five resolve through the same
+    /// `findTracePvt` chain — device, else port, else global
+    /// (asynManager.c:546-551) — which is also the chain the record's `setTrace*`
+    /// writes target. One snapshot keeps read and write on the same rung: a
+    /// per-device write read back at port level would snap the record's field
+    /// back to the port's value on the next refresh.
+    pub fn snapshot(&self, port: &str, addr: Option<i32>) -> TraceSnapshot {
+        self.with_effective_config(port, addr, |cfg| TraceSnapshot {
+            trace_mask: cfg.trace_mask,
+            io_mask: cfg.trace_io_mask,
+            info_mask: cfg.trace_info_mask,
+            io_truncate_size: cfg.io_truncate_size,
+            file_id: cfg.file.id(),
+        })
+        .unwrap_or_else(|| {
+            let cfg = TraceConfig::default();
+            TraceSnapshot {
+                trace_mask: cfg.trace_mask,
+                io_mask: cfg.trace_io_mask,
+                info_mask: cfg.trace_info_mask,
+                io_truncate_size: cfg.io_truncate_size,
+                file_id: cfg.file.id(),
+            }
+        })
     }
 
     /// C parity: `getTraceInfoMask` (asynManager.c) — the per-port trace

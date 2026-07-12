@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::port::{PortDriver, QueuePriority};
 use crate::request::{CancelToken, RequestOp, RequestResult};
-use crate::user::AsynUser;
+use crate::user::{AsynUser, ConnectCheck};
 
 static ACTOR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -376,15 +376,31 @@ impl PortActor {
         // that a slow predecessor had merely delayed past its transfer budget —
         // the two clocks are separate in C too (`pasynUser->timeout` vs
         // `queueRequest`'s `timeout` argument, `AsynUser::queue_timeout` here).
-        let is_connect_priority = user.priority == QueuePriority::Connect;
 
-        // Connect ops and Connect-priority requests bypass enabled/connected checks
-        // (C parity: Connect priority processed even when disabled/disconnected)
-        if !is_connect_op && !is_connect_priority {
-            self.auto_connect_device(user.addr, user.reason);
-
-            // Check ready
-            if let Err(e) = self.driver.base().check_ready_addr(user.addr) {
+        // The queue gate. Which refusals apply is a property of the *request*,
+        // not of its op: `AsynUser::connect_check` reproduces C's
+        // `checkPortConnect` (asynManager.c:1536-1538), which waives the
+        // *connected* refusal for a Connect-priority request that either carries
+        // no device or carries `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`.
+        //
+        // That waiver is the only route C gives an operator to reconfigure a line
+        // that is down — repoint a dead IP port through HOSTINFO
+        // (asynRecord.c:566-569), read a down serial port's options back into the
+        // record (:1277-1280), run `asynSetOption`/`asynSetEos` from `st.cmd`
+        // before the crate is powered on (asynShellCommands.c:121,169,240,291) —
+        // and the port refused all of it. Bare Connect *priority* is not enough:
+        // C keeps the EOS readback at Low priority with no waiver (:1296), so
+        // IEOS/OEOS still stay blank on a disconnected port, and keying the
+        // waiver on the reason is what preserves that asymmetry.
+        if !is_connect_op {
+            let connect = user.connect_check();
+            // C drains the Connect queue *before* `autoConnectDevice`
+            // (asynManager.c:812-857): a waived request never triggers a connect
+            // attempt, it just runs on the dead line.
+            if connect == ConnectCheck::Required {
+                self.auto_connect_device(user.addr, user.reason);
+            }
+            if let Err(e) = self.driver.base().check_queue(user.addr, connect) {
                 let _ = reply.send(Err(e));
                 return;
             }
@@ -1920,6 +1936,84 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let r = send_and_wait(&tx, RequestOp::GetAutoConnect, user).unwrap();
         assert_eq!(r.int_val, Some(1));
+    }
+
+    /// C `queueRequest` (asynManager.c:1536-1552): a request queued at
+    /// `asynQueuePriorityConnect` carrying `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`
+    /// skips the `!pport->dpc.connected → asynDisconnected` refusal. Bare Connect
+    /// priority does not (unless the user carries no device, `addr == -1`) — that
+    /// is what keeps the record's Low-priority EOS readback (asynRecord.c:1296)
+    /// blank on a down port while its option readback (:1277-1280) fills in.
+    #[test]
+    fn queue_even_if_not_connected_reason_waives_only_the_connected_refusal() {
+        let mut drv = TestDriver::new();
+        drv.base.auto_connect = false; // no reconnect can rescue the request
+        drv.base.set_connected(false);
+        let tx = spawn_actor(drv);
+
+        // No waiver: refused, exactly as C's :1547-1552.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = send_and_wait(
+            &tx,
+            RequestOp::SetOption {
+                key: "hostinfo".into(),
+                value: "newhost:5000".into(),
+            },
+            user,
+        )
+        .unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+
+        // Connect priority alone is not the waiver: the user carries addr 0, so
+        // C's :1536-1538 leaves `checkPortConnect` set.
+        let user = AsynUser::new(0)
+            .with_timeout(Duration::from_secs(1))
+            .with_priority(QueuePriority::Connect);
+        let err = send_and_wait(
+            &tx,
+            RequestOp::SetOption {
+                key: "hostinfo".into(),
+                value: "newhost:5000".into(),
+            },
+            user,
+        )
+        .unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+
+        // With the waiver the put reaches the driver on the dead line — the
+        // operator's only route to repoint a wrong or moved host.
+        let user = AsynUser::new(0)
+            .with_timeout(Duration::from_secs(1))
+            .queue_even_if_not_connected();
+        send_and_wait(
+            &tx,
+            RequestOp::SetOption {
+                key: "hostinfo".into(),
+                value: "newhost:5000".into(),
+            },
+            user,
+        )
+        .expect("QUEUE_EVEN_IF_NOT_CONNECTED must reach the driver on a down port");
+
+        // And the readback comes back off the same dead line.
+        let user = AsynUser::new(0)
+            .with_timeout(Duration::from_secs(1))
+            .queue_even_if_not_connected();
+        let r = send_and_wait(
+            &tx,
+            RequestOp::GetOption {
+                key: "hostinfo".into(),
+            },
+            user,
+        )
+        .expect("the connect-time option readback is queued with the same waiver");
+        assert_eq!(r.option_value.as_deref(), Some("newhost:5000"));
     }
 
     #[test]

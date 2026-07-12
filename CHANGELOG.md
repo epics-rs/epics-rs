@@ -73,13 +73,17 @@ fixes (one commit per finding, PRs #11–#16) plus one additive test-sync API.
 
 - **Plugin tests no longer synchronize by sleeping.** The control→data
   param channel now carries a `Barrier` message the data thread acks only
-  after applying every previously queued change, exposed as
+  at full quiescence — every previously queued param change applied AND
+  the array queue drained — exposed as
   `PluginRuntimeHandle::wait_params_applied(timeout)` (additive API). All
   51 sleep-synchronized test sites across ad-core-rs and ad-plugins-rs are
   converted to the barrier fence or to polling an observable the frame
   flushes — the two tests that flaked on a loaded CI runner
   (`test_rewire_ndarray_port_at_runtime`, `test_driver_to_stats_pipeline`)
-  among them. (#16)
+  among them. The array-queue condition exists because arrays travel a
+  separate channel: a param applied while an older array still waits in
+  the queue would retroactively change how that array is processed.
+  (#16, #17)
 
 ## v0.22.1 — 2026-07-08
 

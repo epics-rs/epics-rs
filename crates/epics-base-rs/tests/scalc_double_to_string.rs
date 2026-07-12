@@ -73,7 +73,10 @@ fn nan_is_spelled_nan() {
         StackValue::Double(d) => assert_eq!(d, 3.0, "\"NaN\" is 3 bytes"),
         StackValue::Str(s) => panic!("LEN is a double, got {s:?}"),
     }
-    assert_eq!(eval_str("STR(ACOS(2))+\"!\""), "NaN!");
+    // The whole text, with the perform still finite: `atof("xNaN")` is 0.
+    // (`STR(ACOS(2))+"!"` would NOT survive — `atof("NaN!")` reads the NaN, and
+    // C fails the perform on a non-finite *presult.)
+    assert_eq!(eval_str("\"x\"+STR(ACOS(2))"), "xNaN");
 }
 
 /// PRINTF's `%s` conversion applies C's `toString` to a double argument

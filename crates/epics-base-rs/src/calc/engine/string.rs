@@ -537,8 +537,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Str(v.into_string_value()));
                 }
                 StringOp::ToDouble => {
+                    // C TO_DOUBLE runs its hunt only `if (isString(ps))`; a
+                    // double operand is left exactly as it is.
                     let v = pop1(&mut stack)?;
-                    stack.push(StackValue::Double(to_double(&v)));
+                    stack.push(StackValue::Double(match &v {
+                        StackValue::Double(d) => *d,
+                        StackValue::Str(s) => hunt_double(s.as_bytes()),
+                    }));
                 }
                 StringOp::Len => {
                     let v = pop1(&mut stack)?;
@@ -747,19 +752,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     // all succeeded still fails the perform when its value is not finite
     // (`LOG(0)` = -inf, `1e300*1e300` = +inf, `ACOS(2)` = NaN) — the record
     // then forces VAL=-1 / SVAL="***ERROR***" / CALC_ALARM.
-    if !to_double(&result).is_finite() {
+    if !result.to_double().is_finite() {
         return Err(CalcError::NonFiniteResult);
     }
     Ok(result)
 }
 
-/// C `to_double` (`sCalcPerform.c:83`) — `atof` of the stack element's string
-/// form; a double element is already its own double form.
-fn to_double(v: &StackValue) -> f64 {
-    match v {
-        StackValue::Double(d) => *d,
-        StackValue::Str(s) => s.as_str_lossy().trim().parse::<f64>().unwrap_or(0.0),
+/// C `TO_DOUBLE` — the `DBL` OPERATOR (`sCalcPerform.c:1505-1514), which is not
+/// the `toDouble` coercion ([`StackValue::to_double`]) and does not parse:
+///
+/// ```c
+/// s = strpbrk(ps->s, "0123456789");        /* the first DIGIT, anywhere */
+/// if ((s > ps->s) && (s[-1] == '.')) s--;  /* take a '.' before it */
+/// if ((s > ps->s) && (s[-1] == '-')) s--;  /* and a '-' before that */
+/// ps->d = s ? atof(s) : 0.0;
+/// ```
+///
+/// It HUNTS a number out of surrounding text, so it reads `-12.5` out of
+/// `"v=-12.5V"` where the coercion would give 0. The asymmetries are C's and
+/// compiled sCalc confirms each: a `+` sign is never taken (`"x+3"` is 3), only
+/// ONE `-` is (`"--5"` is -5), and a string with no digit at all is 0 even when
+/// `atof` would have read it (`DBL("inf")` is 0, `atof("inf")` is inf).
+fn hunt_double(s: &[u8]) -> f64 {
+    let Some(mut i) = s.iter().position(|c| c.is_ascii_digit()) else {
+        return 0.0;
+    };
+    if i > 0 && s[i - 1] == b'.' {
+        i -= 1;
     }
+    if i > 0 && s[i - 1] == b'-' {
+        i -= 1;
+    }
+    super::strtod::strtod(&s[i..]).0
 }
 
 /// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
@@ -1001,12 +1025,10 @@ fn simple_sscanf(input: &[u8], fmt: &[u8]) -> StackValue {
                     let text = std::str::from_utf8(&trimmed[..digits]).unwrap_or("");
                     StackValue::Double(text.parse::<i64>().unwrap_or(0) as f64)
                 }
-                b'f' | b'e' | b'g' => StackValue::Double(
-                    std::str::from_utf8(trimmed)
-                        .ok()
-                        .and_then(|t| t.parse::<f64>().ok())
-                        .unwrap_or(0.0),
-                ),
+                // C's `%e`/`%f`/`%g` conversion is strtod on the input, so it
+                // takes the longest numeric PREFIX and leaves the rest —
+                // `SSCANF("1.5V", "%f")` is 1.5, not a failed conversion.
+                b'f' | b'e' | b'g' => StackValue::Double(super::strtod::strtod(trimmed).0),
                 b's' => {
                     // Read until whitespace
                     let word: Vec<u8> = trimmed

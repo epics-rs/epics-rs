@@ -896,23 +896,11 @@ impl AdIoc {
                 .unwrap_or(5064),
         );
 
-        // Set crate paths for commonPlugins.cmd and .req file resolution
-        epics_base_rs::runtime::env::set_default(
-            "ADCORE",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../ad-core-rs"),
-        );
-        epics_base_rs::runtime::env::set_default(
-            "CALC",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../calc"),
-        );
-        epics_base_rs::runtime::env::set_default(
-            "BUSY",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../busy"),
-        );
-        epics_base_rs::runtime::env::set_default(
-            "AUTOSAVE",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../autosave"),
-        );
+        // `$(ADCORE)` resolves `$(ADCORE)/ioc/commonPlugins.cmd` and the
+        // `$(ADCORE)/db` templates. Take the path from ad-core-rs itself rather
+        // than guessing a sibling of this crate: only the owning crate can name
+        // its own directory under a version-suffixed registry checkout.
+        epics_base_rs::runtime::env::set_default("ADCORE", ad_core_rs::AD_CORE_DIR);
 
         Self {
             app: Some(app),

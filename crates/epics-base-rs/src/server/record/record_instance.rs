@@ -1834,26 +1834,22 @@ impl RecordInstance {
 
     /// Evaluate alarms based on record type and current value.
     /// Uses rec_gbl_set_sevr to accumulate into nsta/nsev.
+    ///
+    /// CALC_ALARM is NOT raised here. C raises it inside the record's own
+    /// `process()` (`calcRecord.c:121-123`, `calcoutRecord.c:238-241`,
+    /// `sCalcoutRecord.c:357-363`, `aCalcoutRecord.c:304-305`,
+    /// `swaitRecord.c:409-410`), and in the port [`Record::check_alarms`] — which
+    /// runs immediately before this — is that owner. It used to be raised here
+    /// instead, keyed on a hardcoded `rtype` list plus a `CALC_ALARM` pseudo-field
+    /// no DBD declares; swait is what that construction cost: it carried the flag
+    /// but was not on the list, so a failed `calcPerform` alarmed nowhere.
     pub fn evaluate_alarms(&mut self) {
-        use crate::server::recgbl::{self, alarm_status};
+        use crate::server::recgbl;
 
         // Check UDF first
         recgbl::rec_gbl_check_udf(&mut self.common);
 
-        // Check CALC_ALARM for calc/calcout records
         let rtype = self.record.record_type();
-        if rtype == "calc" || rtype == "calcout" || rtype == "scalcout" {
-            // calc_alarm is exposed as a boolean field - check it
-            if let Some(EpicsValue::Char(1)) = self.record.get_field("CALC_ALARM") {
-                recgbl::rec_gbl_set_sevr_msg(
-                    &mut self.common,
-                    alarm_status::CALC_ALARM,
-                    crate::server::record::AlarmSeverity::Invalid,
-                    "CALC expression evaluation failed",
-                );
-            }
-        }
-
         match rtype {
             "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
             | "sub" => {

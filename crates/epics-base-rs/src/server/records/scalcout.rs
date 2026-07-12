@@ -90,11 +90,10 @@ pub struct ScalcoutRecord {
     /// The private `prev_sval` it replaces was a copy of SVAL taken at the top of
     /// `process()` and read by nothing.
     psvl: PvString,
-    /// CALC_ALARM flag — set when the CALC or OCAL `sCalcPerform`
-    /// evaluation fails. synApps `sCalcoutRecord` raises `CALC_ALARM`
-    /// on a broken expression; the framework's `evaluate_alarms`
-    /// already inspects a `CALC_ALARM` field for `scalcout`, so this
-    /// flag is surfaced through `get_field("CALC_ALARM")`.
+    /// This cycle's `sCalcPerform` outcome — set when the CALC or OCAL
+    /// evaluation fails (C `sCalcoutRecord.c:357-363`, `:786-808`). A per-cycle
+    /// fact, not record state: `check_alarms` — the owner of this record's alarm
+    /// transitions — consumes it, so it cannot outlive the cycle that set it.
     calc_alarm: bool,
     /// This cycle's `fetch_values()` outcome, pushed by the framework through
     /// `set_fetch_gate_failed`. C `sCalcoutRecord.c::process` (356) runs
@@ -774,14 +773,6 @@ impl Record for ScalcoutRecord {
             return Ok(ProcessOutcome::complete());
         }
 
-        // Evaluate CALC. A fresh cycle clears CALC_ALARM; a broken CALC
-        // (compile failure OR an sCalcPerform eval failure) re-raises
-        // it. synApps `sCalcoutRecord` raises CALC_ALARM on any broken
-        // expression; without this a failing scalcout expression
-        // silently kept the previous cycle's VAL/SVAL with no invalid
-        // indication.
-        self.calc_alarm = false;
-
         // C `sCalcoutRecord.c::process` (356-367) runs the calc only
         // `if (fetch_values(pcalc)==0)`, and its `fetch_values` (885-887)
         // returns at the FIRST failing numeric `dbGetLink`. A failed input link
@@ -823,7 +814,7 @@ impl Record for ScalcoutRecord {
             self.calc_alarm = true;
             // C `sCalcoutRecord.c:361-363`: a failed sCalcPerform forces
             // VAL=-1 and SVAL="***ERROR***" (the CALC_ALARM severity itself
-            // is raised by the framework from the CALC_ALARM field). Before
+            // is raised by `check_alarms` from this flag). Before
             // this the failed cycle kept the previous VAL/SVAL with no value
             // sentinel, diverging from C.
             self.val = -1.0;
@@ -833,11 +824,10 @@ impl Record for ScalcoutRecord {
             // Set_to_IVOV sets `oval = ivov` (line 798) — NOT `val`. Only the
             // Don't_drive veto needs an in-record flag here; the OVAL=IVOV
             // substitution is owned by the framework's IVOA gate
-            // (`apply_invalid_output_value`), which fires because the
-            // CALC_ALARM the framework raises in `evaluate_alarms` drives this
-            // cycle INVALID. Setting `self.val = ivov` here was wrong: it
-            // clobbered VAL (C keeps VAL=-1) and duplicated the framework's
-            // OVAL write.
+            // (`apply_invalid_output_value`), which fires because the CALC_ALARM
+            // raised by `check_alarms` drives this cycle INVALID. Setting
+            // `self.val = ivov` here was wrong: it clobbered VAL (C keeps
+            // VAL=-1) and duplicated the framework's OVAL write.
             if self.ivoa == 1 {
                 ivoa_veto_out = true; // Don't drive outputs
             }
@@ -955,7 +945,6 @@ impl Record for ScalcoutRecord {
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::Short(self.dlya)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -1188,6 +1177,23 @@ impl Record for ScalcoutRecord {
 
     fn set_fetch_gate_failed(&mut self, failed: bool) {
         self.fetch_gate_failed = failed;
+    }
+
+    /// C `sCalcoutRecord.c:357-363` (CALC) and `:786-808` (OCAL, inside
+    /// `execOutput`) — a failed `sCalcPerform` is `recGblSetSevr(pcalc,
+    /// CALC_ALARM, INVALID_ALARM)`, raised in `process()` before `checkAlarms`.
+    ///
+    /// Consuming the flag keeps it a per-cycle fact: a cycle whose input fetch
+    /// failed runs no `sCalcPerform` (`:356`) and raises nothing.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if std::mem::take(&mut self.calc_alarm) {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::CALC_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                "CALC expression evaluation failed",
+            );
+        }
     }
 
     /// scalcout writes its computed output to the `OUT` link. The

@@ -103,16 +103,23 @@ fn an_accepted_empty_scalc_acalc_expression_still_fails_to_run() {
 // C runs perform() unconditionally in all five records, so an empty or
 // uncompilable CALC is CALC_ALARM on every process with VAL untouched.
 
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::server::records::swait::SwaitRecord;
-use epics_base_rs::types::EpicsValue;
 
-fn alarmed(rec: &dyn Record) -> bool {
-    matches!(rec.get_field("CALC_ALARM"), Some(EpicsValue::Char(1)))
+/// The real observable (R10-67): the alarm the record RAISES, read out of the
+/// pending `nsta`/`nsev` its own `check_alarms` — C's `checkAlarms()`, which the
+/// framework calls on every cycle right before `evaluate_alarms` — writes.
+/// This used to be a `CALC_ALARM` pseudo-field no DBD declares, which the
+/// framework read back through a hardcoded record-type list.
+fn alarmed(rec: &mut dyn Record) -> bool {
+    let mut common = CommonFields::default();
+    rec.check_alarms(&mut common);
+    common.nsta == epics_base_rs::server::recgbl::alarm_status::CALC_ALARM
+        && common.nsev == AlarmSeverity::Invalid
 }
 
 /// calc: `calcRecord.c:121-123`.
@@ -125,13 +132,16 @@ fn calc_alarms_every_process_on_an_empty_or_broken_calc() {
         rec.val = 42.0;
 
         rec.process().unwrap();
-        assert!(alarmed(&rec), "calc CALC={expr:?} must raise CALC_ALARM");
+        assert!(
+            alarmed(&mut rec),
+            "calc CALC={expr:?} must raise CALC_ALARM"
+        );
         assert_eq!(rec.val, 42.0, "a failed calcPerform must not write VAL");
 
         // "every process", not just the first.
         rec.process().unwrap();
         assert!(
-            alarmed(&rec),
+            alarmed(&mut rec),
             "calc CALC={expr:?} must alarm on EVERY process"
         );
     }
@@ -147,10 +157,13 @@ fn calcout_alarms_every_process_on_an_empty_or_broken_calc() {
         rec.val = 42.0;
 
         rec.process().unwrap();
-        assert!(alarmed(&rec), "calcout CALC={expr:?} must raise CALC_ALARM");
+        assert!(
+            alarmed(&mut rec),
+            "calcout CALC={expr:?} must raise CALC_ALARM"
+        );
         assert_eq!(rec.val, 42.0);
         rec.process().unwrap();
-        assert!(alarmed(&rec));
+        assert!(alarmed(&mut rec));
     }
 }
 
@@ -165,10 +178,13 @@ fn swait_alarms_every_process_on_an_empty_or_broken_calc() {
         rec.val = 42.0;
 
         rec.process().unwrap();
-        assert!(alarmed(&rec), "swait CALC={expr:?} must raise CALC_ALARM");
+        assert!(
+            alarmed(&mut rec),
+            "swait CALC={expr:?} must raise CALC_ALARM"
+        );
         assert_eq!(rec.val, 42.0, "a failed calcPerform must not write VAL");
         rec.process().unwrap();
-        assert!(alarmed(&rec));
+        assert!(alarmed(&mut rec));
     }
 }
 
@@ -184,7 +200,7 @@ fn scalcout_alarms_and_takes_the_error_sentinel_on_an_empty_calc() {
         rec.process().unwrap();
 
         assert!(
-            alarmed(&rec),
+            alarmed(&mut rec),
             "scalcout CALC={expr:?} must raise CALC_ALARM"
         );
         assert_eq!(rec.val, -1.0, "C forces VAL=-1 on a failed sCalcPerform");
@@ -214,14 +230,11 @@ fn acalcout_alarms_every_process_on_an_empty_or_broken_calc() {
 
         rec.process().unwrap();
         assert!(
-            matches!(rec.get_field("CALC_ALARM"), Some(EpicsValue::Char(1))),
+            alarmed(&mut rec),
             "acalcout CALC={expr:?} must raise CALC_ALARM"
         );
         rec.process().unwrap();
-        assert!(matches!(
-            rec.get_field("CALC_ALARM"),
-            Some(EpicsValue::Char(1))
-        ));
+        assert!(alarmed(&mut rec));
     }
 }
 
@@ -235,5 +248,5 @@ fn a_valid_calc_is_untouched() {
     rec.init_record(0).unwrap();
     rec.process().unwrap();
     assert_eq!(rec.val, 42.0);
-    assert!(!alarmed(&rec));
+    assert!(!alarmed(&mut rec));
 }

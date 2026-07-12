@@ -330,7 +330,15 @@ impl PortActor {
             // link sets `connected = false` when the hardware drops and *then*
             // publishes the status parameter announcing it — gating this op
             // discarded exactly the updates that matter most (R13-47).
-            | RequestOp::CallParamCallbacks { .. } => CDispatch::Direct,
+            | RequestOp::CallParamCallbacks { .. }
+            // `asynDrvUser->create` is called straight off the interface pointer,
+            // at record init and at connect time: asynRecord.c:1242-1254 and
+            // devAsynInt32.c:263-277. No `queueRequest` is anywhere in either
+            // path. It is a string → parameter-index lookup in the driver's own
+            // table and cannot fail for connectivity reasons; gating it made a
+            // record bound to a down driver resolve its DRVINFO to reason 0
+            // (R13-48).
+            | RequestOp::DrvUserCreate { .. } => CDispatch::Direct,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT/PCNCT put,
@@ -361,7 +369,6 @@ impl PortActor {
             | RequestOp::Flush
             | RequestOp::GetBoundsInt32
             | RequestOp::GetBoundsInt64
-            | RequestOp::DrvUserCreate { .. }
             | RequestOp::EnumRead
             | RequestOp::EnumWrite { .. }
             | RequestOp::Int32ArrayRead { .. }
@@ -2177,6 +2184,48 @@ mod tests {
                 "connected={connected} enabled={enabled}: the parameter published \
                  while the port was down must survive (it read back ParamUndefined \
                  when the op was queue-gated)"
+            );
+        }
+    }
+
+    /// R13-48: `asynDrvUser->create` is a direct interface call — asynRecord's
+    /// `connectDevice` (asynRecord.c:1242-1254) and `devAsynInt32::initCommon`
+    /// (devAsynInt32.c:263-277) both call `pasynDrvUser->create(drvPvt, pasynUser,
+    /// drvInfo, 0, 0)` straight off the interface pointer, with no `queueRequest`
+    /// in either path. It is a string → parameter-index lookup in the driver's own
+    /// table: it cannot fail for connectivity reasons. Queue-gating it made a
+    /// record whose device is down resolve its DRVINFO to reason 0 and report
+    /// "Error in asynDrvUser->create()" (asyn_record/mod.rs:2977-2993).
+    #[test]
+    fn drv_user_create_resolves_on_a_disconnected_or_disabled_port() {
+        for (connected, enabled) in [(false, true), (true, false), (false, false)] {
+            let mut drv = TestDriver::new();
+            drv.base.auto_connect = false;
+            drv.base.set_connected(connected);
+            drv.base.enabled = enabled;
+            let f64_reason = drv.base.find_param("F64").unwrap();
+            let tx = spawn_actor(drv);
+
+            let user = AsynUser::default().with_addr(0);
+            let r = send_and_wait(
+                &tx,
+                RequestOp::DrvUserCreate {
+                    drv_info: "F64".into(),
+                    addr: 0,
+                },
+                user,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "connected={connected} enabled={enabled}: C's drvUser->create is a \
+                     direct table lookup and cannot fail for connectivity, got {e:?}"
+                )
+            });
+            assert_eq!(
+                r.reason,
+                Some(f64_reason),
+                "connected={connected} enabled={enabled}: DRVINFO must resolve to the \
+                 driver's real reason, not fall back to 0"
             );
         }
     }

@@ -26,7 +26,36 @@ enum StackEntry {
         token: Token,
         in_stack_pri: u8,
     },
+    /// C's `(` element (`sCalcPostfix.c:102`): a `UNARY_OPERATOR` with
+    /// `in_stack_pri` 0 and code `NOT_GENERATED`. A barrier that emits nothing.
     LParen,
+    /// C's `[` and `{` elements (`sCalcPostfix.c:215-216`,
+    /// `aCalcPostfix.c:212-213`). They are NOT parens: they are
+    /// `BINARY_OPERATOR`s whose code IS generated — `CLOSE_BRACKET` /
+    /// `CLOSE_CURLY` emit it (`sCalcPostfix.c:686`, `:715`) after popping down to
+    /// this entry.
+    ///
+    /// Two numbers make them what they are. `in_stack_pri` 0 makes them a barrier
+    /// like `(`, so nothing pops them off. `in_coming_pri` **11** is the highest
+    /// value in any of the three tables — above a function's 9 — which is why a
+    /// `[` or `{` arriving right after a `)` does NOT pop the function still
+    /// sitting below it, and the function is therefore applied to the SUBRANGE /
+    /// REPLACE result rather than to its own argument (R13-2).
+    ///
+    /// This is a stack entry of its own rather than a second `LParen` because the
+    /// two are barriers for DIFFERENT things: C's `SEPARATOR` (`:614`) stops at
+    /// `(`, `[` and `{` alike, but only `CLOSE_PAREN` (`:653`) hands the argument
+    /// count to a vararg function below it. Sharing one variant let a `,` inside
+    /// `MAX(4,7)[0,0]`'s bracket bump `MAX`'s argument count.
+    Subrange {
+        /// `{` (sCalc `REPLACE`, aCalc `SUBRANGE_IP`) rather than `[` (`SUBRANGE`
+        /// in both).
+        in_place: bool,
+        /// C accumulates the effect ON this entry: `-1` from the table, then `-1`
+        /// more per `,` (`SEPARATOR`, `:630`). `CLOSE_BRACKET` adds the total
+        /// (`:687`). So `AA[i,j]` is -2 — subject and two arguments in, one out.
+        runtime_effect: i32,
+    },
     VarargFunc {
         func: FuncName,
         in_stack_pri: u8,
@@ -62,6 +91,8 @@ impl StackEntry {
         match self {
             StackEntry::Op { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::LParen => 0,
+            // `[` / `{`: in_stack_pri 0, like `(` — a barrier nothing pops.
+            StackEntry::Subrange { .. } => 0,
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::CondEnd => 0,
             StackEntry::Store { .. } => 1,
@@ -276,8 +307,24 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
     Opcode::Core(core)
 }
 
-fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
+/// Emit one operator-stack entry to the output — C's
+/// `*pout++ = pstacktop->code`, the single move every pop site performs.
+///
+/// `kind` is needed because `[` and `{` carry a per-engine code: `[` is
+/// `SUBRANGE` in both synApps tables but `{` is `REPLACE` in sCalc
+/// (`sCalcPostfix.c:216`) and `SUBRANGE_IP` in aCalc (`aCalcPostfix.c:213`).
+fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>, kind: ExprKind) {
     match entry {
+        StackEntry::Subrange { in_place, .. } => {
+            output.push(match (kind, in_place) {
+                (ExprKind::Array, false) => Opcode::Array(super::opcodes::ArrayOp::ArraySubrange),
+                (ExprKind::Array, true) => {
+                    Opcode::Array(super::opcodes::ArrayOp::ArraySubrangeInPlace)
+                }
+                (_, false) => Opcode::String(super::opcodes::StringOp::Subrange),
+                (_, true) => Opcode::String(super::opcodes::StringOp::Replace),
+            });
+        }
         StackEntry::Op {
             token: Token::Minus,
             in_stack_pri: 9,
@@ -349,8 +396,10 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     let mut runtime_depth: i32 = 0;
     let mut cond_count: i32 = 0;
     let mut pos = 0;
-    let mut bracket_depth: i32 = 0;
-    let mut brace_depth: i32 = 0;
+    // No `bracket_depth` / `brace_depth` counters: the open `[` / `{` IS a
+    // `StackEntry::Subrange` on the operator stack, exactly as in C, so the stack
+    // already answers "is one open, and which". A side counter was a second
+    // record of the same fact and could disagree with the stack.
 
     while pos < tokens.len() {
         let token = &tokens[pos];
@@ -422,21 +471,21 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
 
                 // Unary operators
                 Token::Minus => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::Minus,
                         in_stack_pri: 9,
                     });
                 }
                 Token::Bang => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::Bang,
                         in_stack_pri: 9,
                     });
                 }
                 Token::Tilde => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::Tilde,
                         in_stack_pri: 9,
@@ -454,7 +503,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 // halves have runtime_effect 0, and `operand_needed` is
                 // untouched — the loop body still owes an operand.
                 Token::UntilKeyword => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     let until_pc = output.len();
                     // Patched by `flush_stack_entry` when the paired `UntilEnd`
                     // entry comes off the stack.
@@ -463,7 +512,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 }
 
                 Token::Func(func) => {
-                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
                     if is_vararg(func) {
                         stack.push(StackEntry::VarargFunc {
                             func: func.clone(),
@@ -492,7 +541,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
             match token {
                 t if binary_op(t).is_some() => {
                     let (isp, icp) = binary_op(t).unwrap();
-                    pop_higher_or_equal(&mut stack, icp, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, icp, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: t.clone(),
                         in_stack_pri: isp,
@@ -500,59 +549,86 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     operand_needed = true;
                 }
 
-                Token::RParen => {
-                    loop {
-                        match stack.last() {
-                            None => return Err(CalcError::ParenNotOpen),
-                            Some(StackEntry::LParen) => {
-                                stack.pop();
-                                break;
-                            }
-                            _ => {
-                                let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
-                            }
+                // C `CLOSE_PAREN` (`sCalcPostfix.c:634-663`): pop to the `(`,
+                // remove it, and STOP. The function below the `(` is NOT emitted
+                // — it stays on the operator stack at in_stack_pri 9 and is
+                // emitted later, by whatever pops it.
+                //
+                // That deferral is the whole of R13-2. `[` and `{` come in at
+                // in_coming_pri 11, above 9, so they do not pop the function, and
+                // `LEN("abcd")[0,1]` compiles to `"abcd", 0, 1, SUBRANGE, LEN` —
+                // the function applied to the SUBRANGE. C's own postfix dump for
+                // `ABS(1)[0,1]` is `1, 0, 1, SUBRANGE, ABS_VAL`. The port used to
+                // flush the function here, which bound it to its own argument
+                // instead: compiled C vs the old port, `LEN("abcd")[0,1]` = 2 vs 4,
+                // `SQRT(4){"2","9"}` = 2 vs 9, `INT("12.9")[0,1]` = 12 vs 13, and
+                // aCalc `AMAX(AA)[0,1]` (AA=[3,1,2,9]) = 3 vs 9.
+                //
+                // Every OTHER operator has in_coming_pri <= 10, so it pops the
+                // function on arrival and the emitted order is unchanged: `SQRT(4)+1`
+                // is still `4, SQRT, 1, ADD`.
+                Token::RParen => loop {
+                    match stack.last() {
+                        None => return Err(CalcError::ParenNotOpen),
+                        Some(StackEntry::LParen) => {
+                            stack.pop();
+                            // C `:651-662`: a VARARG_OPERATOR below the `(`
+                            // inherits the paren's accumulated argument count.
+                            // The port keeps that count on the entry itself and
+                            // has been maintaining it at each `,`, so there is
+                            // nothing to transfer — and, like C, nothing to emit.
+                            break;
+                        }
+                        _ => {
+                            let entry = stack.pop().unwrap();
+                            runtime_depth += stack_effect(&entry);
+                            flush_stack_entry(&entry, &mut output, kind);
                         }
                     }
-                    if let Some(StackEntry::VarargFunc { .. }) = stack.last() {
-                        let entry = stack.pop().unwrap();
-                        runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output);
-                    } else if let Some(StackEntry::Op {
-                        token: Token::Func(_),
-                        ..
-                    }) = stack.last()
-                    {
-                        let entry = stack.pop().unwrap();
-                        runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output);
-                    }
-                }
+                },
 
+                // C `SEPARATOR` (`sCalcPostfix.c:612-631`): pop to the innermost
+                // `(`, `[` or `{` — all three are separator barriers — and charge
+                // one more argument to it.
                 Token::Comma => {
                     loop {
                         match stack.last() {
                             None => return Err(CalcError::BadSeparator),
-                            Some(StackEntry::LParen) => break,
+                            Some(e) if is_barrier(e) => break,
                             _ => {
                                 let entry = stack.pop().unwrap();
                                 runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
+                                flush_stack_entry(&entry, &mut output, kind);
                             }
                         }
                     }
-                    let lparen_idx = stack.len() - 1;
-                    if lparen_idx > 0 {
-                        if let StackEntry::VarargFunc { nargs, .. } = &mut stack[lparen_idx - 1] {
-                            *nargs += 1;
+                    match stack.last_mut() {
+                        // A `,` inside `[` / `{` belongs to the SUBRANGE, and C
+                        // charges it to that entry (`:630`). It must not reach a
+                        // vararg function further down: compiled C gives
+                        // `MAX(4,7)[0,0]` = 7, i.e. `MAX` still took two arguments,
+                        // not three. Sharing one stack variant with `(` is what let
+                        // the bracket's `,` bump the vararg's count.
+                        Some(StackEntry::Subrange { runtime_effect, .. }) => *runtime_effect -= 1,
+                        // A `,` directly inside a vararg call's `(` is one more
+                        // argument to that function.
+                        Some(StackEntry::LParen) => {
+                            let lparen_idx = stack.len() - 1;
+                            if lparen_idx > 0 {
+                                if let StackEntry::VarargFunc { nargs, .. } =
+                                    &mut stack[lparen_idx - 1]
+                                {
+                                    *nargs += 1;
+                                }
+                            }
                         }
+                        _ => unreachable!("the loop above only breaks on a barrier"),
                     }
                     operand_needed = true;
                 }
 
                 Token::Question => {
-                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth);
+                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
                     output.push(Opcode::Core(CoreOp::CondIf));
                     runtime_depth -= 1;
                     cond_count += 1;
@@ -560,7 +636,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 }
 
                 Token::Colon => {
-                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth);
+                    pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
                     output.push(Opcode::Core(CoreOp::CondElse));
                     runtime_depth -= 1;
                     cond_count -= 1;
@@ -578,7 +654,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                         }
                         let entry = stack.pop().unwrap();
                         runtime_depth += stack_effect(&entry);
-                        flush_stack_entry(&entry, &mut output);
+                        flush_stack_entry(&entry, &mut output, kind);
                     }
                     // A pending `UNTIL_END` is NOT closed here by a rule of its
                     // own: it is an ordinary operator-stack entry, so the loop
@@ -620,88 +696,62 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     operand_needed = true;
                 }
 
-                // `expr[i,j]` and `expr{i,j}`. Both delimiters are in all three
-                // synApps tables, but they do NOT mean the same thing in both
+                // `expr[i,j]` and `expr{i,j}`. Both delimiters are in the two
+                // synApps tables, but `{` does NOT mean the same thing in both
                 // engines: sCalc has `[`=SUBRANGE / `{`=REPLACE
                 // (sCalcPostfix.c:215-216) while aCalc has `[`=SUBRANGE /
                 // `{`=SUBRANGE_IP, the in-place variant (aCalcPostfix.c:212-213).
-                // The port emitted the STRING opcodes for both engines, so the
-                // array subrange — whose opcodes already existed — was
-                // unreachable.
-                Token::LBracket => {
-                    // Flush pending operators
-                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
-                    stack.push(StackEntry::LParen); // reuse LParen mechanics
+                // `flush_stack_entry` picks by `kind`.
+                //
+                // C reads them as BINARY_OPERATORs with in_coming_pri 11 — so the
+                // pop-on-arrival flushes only operators at in_stack_pri >= 11, and
+                // NOTHING in any table has one. In particular a function below a
+                // just-closed `)` (in_stack_pri 9) survives, which is R13-2.
+                Token::LBracket | Token::LBrace => {
+                    let in_place = matches!(token, Token::LBrace);
+                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth, kind);
+                    stack.push(StackEntry::Subrange {
+                        in_place,
+                        // The table's own `runtime_effect` column: -1
+                        // (sCalcPostfix.c:215-216). Each `,` charges one more.
+                        runtime_effect: -1,
+                    });
                     operand_needed = true;
-                    // Mark that we need to emit Subrange on RBracket
-                    bracket_depth += 1;
                 }
 
-                // Brace replace: expr{find,replace} → Replace
-                Token::LBrace => {
-                    pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
-                    stack.push(StackEntry::LParen);
-                    operand_needed = true;
-                    brace_depth += 1;
-                }
-
-                Token::RBracket => {
-                    if bracket_depth == 0 {
-                        return Err(CalcError::BracketNotOpen);
-                    }
-                    bracket_depth -= 1;
-                    // Pop until matching LParen
+                // C `CLOSE_BRACKET` / `CLOSE_CURLY` (`sCalcPostfix.c:666-719`):
+                // pop to the matching `[` / `{`, then emit THAT entry's code and
+                // add its accumulated runtime effect. The close delimiter itself
+                // generates nothing — the opener carries the opcode.
+                Token::RBracket | Token::RBrace => {
+                    let want_in_place = matches!(token, Token::RBrace);
+                    let not_open = if want_in_place {
+                        CalcError::BraceNotOpen
+                    } else {
+                        CalcError::BracketNotOpen
+                    };
                     loop {
                         match stack.last() {
-                            None => return Err(CalcError::BracketNotOpen),
-                            Some(StackEntry::LParen) => {
-                                stack.pop();
+                            None => return Err(not_open),
+                            Some(StackEntry::Subrange { in_place, .. })
+                                if *in_place == want_in_place =>
+                            {
+                                let entry = stack.pop().unwrap();
+                                runtime_depth += stack_effect(&entry);
+                                flush_stack_entry(&entry, &mut output, kind);
                                 break;
                             }
                             _ => {
                                 let entry = stack.pop().unwrap();
                                 runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
+                                flush_stack_entry(&entry, &mut output, kind);
                             }
                         }
                     }
-                    output.push(match kind {
-                        ExprKind::Array => Opcode::Array(super::opcodes::ArrayOp::ArraySubrange),
-                        _ => Opcode::String(super::opcodes::StringOp::Subrange),
-                    });
-                    runtime_depth -= 2; // consumes subject + 2 args, pushes 1
-                }
-
-                Token::RBrace => {
-                    if brace_depth == 0 {
-                        return Err(CalcError::BraceNotOpen);
-                    }
-                    brace_depth -= 1;
-                    loop {
-                        match stack.last() {
-                            None => return Err(CalcError::BraceNotOpen),
-                            Some(StackEntry::LParen) => {
-                                stack.pop();
-                                break;
-                            }
-                            _ => {
-                                let entry = stack.pop().unwrap();
-                                runtime_depth += stack_effect(&entry);
-                                flush_stack_entry(&entry, &mut output);
-                            }
-                        }
-                    }
-                    output.push(match kind {
-                        ExprKind::Array => {
-                            Opcode::Array(super::opcodes::ArrayOp::ArraySubrangeInPlace)
-                        }
-                        _ => Opcode::String(super::opcodes::StringOp::Replace),
-                    });
-                    runtime_depth -= 2; // consumes subject + 2 args, pushes 1
                 }
 
                 Token::PipeMinus => {
-                    pop_higher_or_equal(&mut stack, 6, &mut output, &mut runtime_depth);
+                    pop_higher_or_equal(&mut stack, 6, &mut output, &mut runtime_depth, kind);
                     stack.push(StackEntry::Op {
                         token: Token::PipeMinus,
                         in_stack_pri: 6,
@@ -728,7 +778,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
             StackEntry::LParen => return Err(CalcError::ParenOpen),
             _ => {
                 runtime_depth += stack_effect(&entry);
-                flush_stack_entry(&entry, &mut output);
+                flush_stack_entry(&entry, &mut output, kind);
             }
         }
     }
@@ -801,6 +851,9 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         StackEntry::CondEnd => 0,
         StackEntry::Store { .. } => -1,
         StackEntry::LParen => 0,
+        // The effect C accumulated on the `[` / `{` entry itself: -1 from the
+        // table plus -1 per `,`.
+        StackEntry::Subrange { runtime_effect, .. } => *runtime_effect,
         // C `sCalcPostfix.c:783` sets `runtime_effect = 0` on the UNTIL_END
         // element explicitly: the opcode only PEEKS the condition
         // (`sCalcPerform.c:1999`, `if (ps->d == 0)`), so the condition survives
@@ -809,23 +862,28 @@ fn stack_effect(entry: &StackEntry) -> i32 {
     }
 }
 
+/// A `(`, `[` or `{` still open. C's pop loops all stop here — every one of the
+/// three carries `in_stack_pri` 0, so no incoming operator's `>=` / `>` test can
+/// reach past it, and the explicit `while (pstacktop > stack)` guard keeps the
+/// bottom of the stack safe.
+fn is_barrier(entry: &StackEntry) -> bool {
+    matches!(entry, StackEntry::LParen | StackEntry::Subrange { .. })
+}
+
 fn pop_higher_or_equal(
     stack: &mut Vec<StackEntry>,
     incoming_pri: u8,
     output: &mut Vec<Opcode>,
     runtime_depth: &mut i32,
+    kind: ExprKind,
 ) {
     while let Some(entry) = stack.last() {
-        if matches!(entry, StackEntry::LParen) {
+        if is_barrier(entry) || entry.in_stack_pri() < incoming_pri {
             break;
         }
-        if entry.in_stack_pri() >= incoming_pri {
-            let entry = stack.pop().unwrap();
-            *runtime_depth += stack_effect(&entry);
-            flush_stack_entry(&entry, output);
-        } else {
-            break;
-        }
+        let entry = stack.pop().unwrap();
+        *runtime_depth += stack_effect(&entry);
+        flush_stack_entry(&entry, output, kind);
     }
 }
 
@@ -834,17 +892,14 @@ fn pop_higher_strict(
     incoming_pri: u8,
     output: &mut Vec<Opcode>,
     runtime_depth: &mut i32,
+    kind: ExprKind,
 ) {
     while let Some(entry) = stack.last() {
-        if matches!(entry, StackEntry::LParen) {
+        if is_barrier(entry) || entry.in_stack_pri() <= incoming_pri {
             break;
         }
-        if entry.in_stack_pri() > incoming_pri {
-            let entry = stack.pop().unwrap();
-            *runtime_depth += stack_effect(&entry);
-            flush_stack_entry(&entry, output);
-        } else {
-            break;
-        }
+        let entry = stack.pop().unwrap();
+        *runtime_depth += stack_effect(&entry);
+        flush_stack_entry(&entry, output, kind);
     }
 }

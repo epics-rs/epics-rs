@@ -7,9 +7,71 @@ use crate::runtime::sync::RwLock;
 use crate::server::record::{
     InputFetchPolicy, NotifyWaitSet, RecordInstance, ValuePostGate, value_gate,
 };
-use crate::types::EpicsValue;
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::{PvDatabase, apply_timestamp};
+
+/// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
+/// string field a string-input link writes into. The text therefore carries at
+/// most 39 bytes plus the NUL, which is what `epicsSnprintf(..., STRING_SIZE-1,
+/// ...)` and `epicsStrSnPrintEscaped(..., STRING_SIZE-1, ...)` enforce in C.
+const STRING_FIELD_MAX_LEN: usize = 39;
+
+/// Cut a string-link value to the C field width (see [`STRING_FIELD_MAX_LEN`]).
+fn truncate_string_field(s: PvString) -> PvString {
+    let bytes = s.as_bytes();
+    if bytes.len() <= STRING_FIELD_MAX_LEN {
+        return s;
+    }
+    PvString::from_bytes(&bytes[..STRING_FIELD_MAX_LEN])
+}
+
+/// The DBR_STRING view of a [`Record::string_input_links`] source, C
+/// `sCalcoutRecord.c::fetch_values` (895-937).
+///
+/// A `DBF_CHAR`/`DBF_UCHAR` source of more than one element is the one type C
+/// does NOT read as DBR_STRING (which would render element 0 as a number):
+/// it reads the array as text and escapes it with `epicsStrSnPrintEscaped`
+/// (`epicsString.c:230-261`), which is how a string longer than a DBR_STRING —
+/// or one carrying control characters — reaches a string calc. C caps the
+/// request at `STRING_SIZE-1` elements before the get and treats the result as
+/// a C string (`strlen(tmpstr)`), so the source is cut at 39 bytes and at the
+/// first NUL. Every other source type takes the plain `dbGetLink(DBR_STRING)`
+/// branch, i.e. the framework's own `DbFieldType::String` coercion.
+fn string_link_text(value: &EpicsValue) -> PvString {
+    let char_array_bytes = match value {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) if b.len() > 1 => Some(b),
+        _ => None,
+    };
+    if let Some(bytes) = char_array_bytes {
+        let src = &bytes[..bytes.len().min(STRING_FIELD_MAX_LEN)];
+        let src = &src[..src.iter().position(|&b| b == 0).unwrap_or(src.len())];
+        let mut out = String::with_capacity(src.len());
+        for &b in src {
+            match b {
+                0x07 => out.push_str("\\a"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x0b => out.push_str("\\v"),
+                b'\\' => out.push_str("\\\\"),
+                b'\'' => out.push_str("\\'"),
+                b'"' => out.push_str("\\\""),
+                // C `isprint` in the "C" locale: ASCII 0x20..0x7e. Everything
+                // else — including the high half — is escaped `\xHH`.
+                _ if b.is_ascii_graphic() || b == b' ' => out.push(b as char),
+                _ => out.push_str(&format!("\\x{b:02x}")),
+            }
+        }
+        return truncate_string_field(PvString::from(out));
+    }
+    match value.convert_to(DbFieldType::String) {
+        EpicsValue::String(s) => truncate_string_field(s),
+        _ => PvString::new(),
+    }
+}
 
 /// A cancellable, generation-gated handle that re-enters an async record's
 /// `process()` exactly once.
@@ -1846,6 +1908,84 @@ impl PvDatabase {
                     || (link_info.iter().any(|(s, _, _)| !s.is_empty())
                         && resolved_link_fields.is_empty()));
         }
+        // 1.6. String-input link fetch — C `sCalcoutRecord.c::fetch_values`'s
+        // SECOND loop (890-941), over INAA..INLL → AA..LL. It is a separate
+        // loop here for the same reason it is one in C: it does not feed the
+        // fetch gate (`return(0)` at :941, so a failing string link never
+        // suppresses sCalcPerform), a failed read writes a diagnostic INTO the
+        // value field instead of leaving it alone, and a multi-element
+        // DBF_CHAR/DBF_UCHAR source is read as escaped text. See
+        // `Record::string_input_links`.
+        let string_input_values: Vec<(String, EpicsValue)>;
+        {
+            let link_info: Vec<(String, &'static str)> = {
+                let instance = rec.read().await;
+                instance
+                    .record
+                    .string_input_links()
+                    .iter()
+                    .map(|(lf, vf)| {
+                        let link_str = instance
+                            .record
+                            .get_field(lf)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        (link_str.as_str_lossy().into_owned(), *vf)
+                    })
+                    .collect()
+            }; // read lock dropped
+            let mut results = Vec::with_capacity(link_info.len());
+            for (link_str, val_field) in &link_info {
+                // C (:895-911): an unset link is neither CA_LINK nor DB_LINK, so
+                // neither `dbGetLink` branch runs, `status` stays 0, and the
+                // string field keeps whatever was last put to it.
+                if link_str.is_empty() {
+                    continue;
+                }
+                let parsed = crate::server::record::parse_link_v2(link_str);
+                if let crate::server::record::ParsedLink::Db(ref db) = parsed {
+                    self.process_passive_db_source(db, visited, depth).await;
+                }
+                let (value, alarm) = self.read_link_with_alarm(&parsed).await;
+                if let Some(alarm) = alarm {
+                    match &parsed {
+                        crate::server::record::ParsedLink::Db(db) => {
+                            link_alarms.push((db.monitor_switch, alarm));
+                        }
+                        crate::server::record::ParsedLink::Ca(ca) => {
+                            link_alarms.push((ca.monitor_switch, alarm));
+                        }
+                        crate::server::record::ParsedLink::Pva(_)
+                        | crate::server::record::ParsedLink::PvaJson(_) => {
+                            link_alarms.push((
+                                crate::server::record::MonitorSwitch::MaximizeStatus,
+                                alarm,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let text = match value {
+                    Some(value) => string_link_text(&value),
+                    // C (:939-940): `epicsSnprintf(*psvalue, STRING_SIZE-1,
+                    // "%s:fetch(%s) failed", pcalc->name, sFldnames[i])` — the
+                    // failed fetch REPLACES the value with the diagnostic; the
+                    // previous string is not kept, and the record still computes.
+                    None => truncate_string_field(PvString::from(format!(
+                        "{name}:fetch({val_field}) failed"
+                    ))),
+                };
+                results.push((val_field.to_string(), EpicsValue::String(text)));
+            }
+            string_input_values = results;
+        }
+
         // PR #d0cf47c continued: feed the INP alarm (if any) into the
         // same `link_alarms` list the lock-section iterates over. Order
         // doesn't matter — `rec_gbl_set_sevr_msg` takes the maximum
@@ -1976,6 +2116,14 @@ impl PvDatabase {
                         .record
                         .put_field("SELN", EpicsValue::UShort(f as u16));
                 }
+            }
+
+            // Apply the string-input values (scalcout INAA..INLL -> AA..LL),
+            // fetched in step 1.6 above. `put_field_internal` is the coercion
+            // owner: it converts to the target field's declared `DbFieldType`,
+            // which is `String` for every one of these.
+            for (val_field, value) in string_input_values {
+                let _ = instance.record.put_field_internal(&val_field, value);
             }
 
             // Device support read (input records only, not output records)

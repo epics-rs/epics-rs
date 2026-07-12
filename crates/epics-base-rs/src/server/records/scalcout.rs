@@ -54,6 +54,12 @@ pub struct ScalcoutRecord {
     pub adel: f64,
     // Input link strings (INPA..INPL)
     pub inp_links: [String; 12],
+    // String-input link names (INAA..INLL, C `sCalcoutRecord.dbd:151-223`,
+    // DBF_INLINK). C `fetch_values` (890-941) reads each one as DBR_STRING into
+    // AA..LL; the record had no such fields at all, so the twelve string inputs
+    // could only ever be set by a client put and a `.INAA` put was rejected with
+    // `FieldNotFound`. See [`Record::string_input_links`].
+    pub str_inp_links: [String; 12],
     // Numeric input values A-L (mapped to vars A-P, but only 12 used)
     pub num_vals: [f64; 12],
     // String input values AA-LL
@@ -119,6 +125,7 @@ impl Default for ScalcoutRecord {
             mdel: 0.0,
             adel: 0.0,
             inp_links: Default::default(),
+            str_inp_links: Default::default(),
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             prev_val: 0.0,
@@ -231,7 +238,34 @@ impl ScalcoutRecord {
         ];
         NAMES.iter().position(|&n| n == name)
     }
+
+    /// INAA..INLL — the link name feeding string input AA..LL, in the same
+    /// index order as [`Self::str_var_index`] (C keeps them in one contiguous
+    /// array starting at `pcalc->inaa`, walked with `sFldnames`,
+    /// sCalcoutRecord.c:200-201,890-891).
+    fn str_inp_index(name: &str) -> Option<usize> {
+        SCALCOUT_STRING_INPUT_LINKS
+            .iter()
+            .position(|(lf, _)| *lf == name)
+    }
 }
+
+/// C `sCalcoutRecord.c::fetch_values`' second loop (890-941): INAA..LL → AA..LL.
+/// Order is C's `sFldnames` order, i.e. the `str_vals` index order.
+static SCALCOUT_STRING_INPUT_LINKS: &[(&str, &str)] = &[
+    ("INAA", "AA"),
+    ("INBB", "BB"),
+    ("INCC", "CC"),
+    ("INDD", "DD"),
+    ("INEE", "EE"),
+    ("INFF", "FF"),
+    ("INGG", "GG"),
+    ("INHH", "HH"),
+    ("INII", "II"),
+    ("INJJ", "JJ"),
+    ("INKK", "KK"),
+    ("INLL", "LL"),
+];
 
 static SCALCOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -505,6 +539,68 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "LL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    // INAA..INLL — the string-input links (sCalcoutRecord.dbd:151-223,
+    // DBF_INLINK). Served as strings, exactly like INPA..INPL.
+    FieldDesc {
+        name: "INAA",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INBB",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INCC",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INDD",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INEE",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INFF",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INGG",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INHH",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INII",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INJJ",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INKK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "INLL",
         dbf_type: DbFieldType::String,
         read_only: false,
     },
@@ -799,6 +895,9 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::inp_index(name) {
                     return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
                 }
+                if let Some(idx) = Self::str_inp_index(name) {
+                    return Some(EpicsValue::String(self.str_inp_links[idx].clone().into()));
+                }
                 None
             }
         }
@@ -961,6 +1060,15 @@ impl Record for ScalcoutRecord {
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
+                if let Some(idx) = Self::str_inp_index(name) {
+                    match value {
+                        EpicsValue::String(s) => {
+                            self.str_inp_links[idx] = s.as_str_lossy().into_owned();
+                            return Ok(());
+                        }
+                        _ => return Err(CaError::TypeMismatch(name.into())),
+                    }
+                }
                 Err(CaError::FieldNotFound(name.to_string()))
             }
         }
@@ -985,12 +1093,17 @@ impl Record for ScalcoutRecord {
 
     /// C `sCalcoutRecord.c::fetch_values` (885-887) `return`s at the first
     /// failing numeric `dbGetLink`, and `process` (356) gates `sCalcPerform` on
-    /// the status. (C's string-input loop that follows cannot fail the gate — it
-    /// swallows its own errors into the input string and returns 0 — and the
-    /// port does not fetch INAA..INLL at all, so only the numeric links are
-    /// represented here.)
+    /// the status. This policy covers the NUMERIC loop only; the string-input
+    /// loop that follows it in C swallows its own errors and returns 0, and it
+    /// is declared separately as [`Record::string_input_links`].
     fn input_fetch_policy(&self) -> InputFetchPolicy {
         InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    /// C `sCalcoutRecord.c::fetch_values` (890-941) — INAA..INLL → AA..LL, read
+    /// as DBR_STRING, outside the fetch gate.
+    fn string_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        SCALCOUT_STRING_INPUT_LINKS
     }
 
     fn set_fetch_gate_failed(&mut self, failed: bool) {

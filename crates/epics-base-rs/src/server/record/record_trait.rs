@@ -1252,8 +1252,51 @@ pub trait Record: Send + Sync + 'static {
     /// How C's `fetch_values()` for this record type reacts to a link read
     /// that fails. Drives the framework's [`Self::multi_input_links`] fetch
     /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].
+    ///
+    /// It governs the [`Self::multi_input_links`] loop ONLY.
+    /// [`Self::string_input_links`] is C's *second*, separately-gated fetch
+    /// loop and never participates in this policy.
     fn input_fetch_policy(&self) -> InputFetchPolicy {
         InputFetchPolicy::ReadAll
+    }
+
+    /// String-valued input links: `(link_field, value_field)` pairs read as
+    /// DBR_STRING, C `sCalcoutRecord.c::fetch_values` (890-941) — the SECOND
+    /// loop of that function, over `INAA`..`INLL` → `AA`..`LL`:
+    ///
+    /// ```c
+    /// for (i=0, plink=&pcalc->inaa, psvalue=pcalc->strs; i<STRING_MAX_FIELDS; ...) {
+    ///     ...
+    ///     if (((field_type==DBR_CHAR) || (field_type==DBR_UCHAR)) && nelm>1) {
+    ///         status = dbGetLink(plink, field_type, tmpstr, 0, &nelm);
+    ///         epicsStrSnPrintEscaped(*psvalue, STRING_SIZE-1, tmpstr, strlen(tmpstr));
+    ///     } else {
+    ///         status = dbGetLink(plink, DBR_STRING, *psvalue, 0, 0);
+    ///     }
+    ///     if (!RTN_SUCCESS(status))
+    ///         epicsSnprintf(*psvalue, STRING_SIZE-1, "%s:fetch(%s) failed", pcalc->name, sFldnames[i]);
+    /// }
+    /// return(0);
+    /// ```
+    ///
+    /// Three properties this loop does NOT share with [`Self::multi_input_links`],
+    /// which is why it is a separate list rather than more entries in that one:
+    ///
+    /// 1. **Ungated.** It ends in `return(0)` — a failing string link never
+    ///    makes `fetch_values` non-zero, so it cannot suppress the record body.
+    ///    The record's single [`Self::input_fetch_policy`] describes the numeric
+    ///    loop (`AbortOnFirstFailure` for scalcout) and cannot also describe this
+    ///    one.
+    /// 2. **A failed read still writes the field** — with the diagnostic text
+    ///    `"<record>:fetch(<FIELD>) failed"`, not with the previous value.
+    /// 3. **A `DBF_CHAR`/`DBF_UCHAR` array source is read as text**, C-escaped
+    ///    (`epicsStrSnPrintEscaped`), which is how a >40-char string reaches a
+    ///    string calc; every other source type converts as DBR_STRING.
+    ///
+    /// The value is delivered through [`Self::put_field_internal`], so the
+    /// target field's declared `DbFieldType` performs the final coercion.
+    fn string_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     /// Input links this record reads at OUTPUT time instead of during the

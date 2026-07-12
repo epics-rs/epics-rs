@@ -617,6 +617,18 @@ impl IoOutcome {
     fn report_error(&mut self, msg: String) {
         self.errs = Some(msg);
     }
+
+    /// The AQR-cancel outcome, C `special()`'s `wasQueued` branch
+    /// (asynRecord.c:397-400): `reportError(… "I/O request canceled")` **and**
+    /// `recGblSetSevr(pasynRec, STATE_ALARM, MAJOR_ALARM)`, then the forced
+    /// completion callback. The message and the severity are one event in C and
+    /// have one owner here, so a cancel cannot land in `ERRS` with the record
+    /// left in NO_ALARM. The completion re-entry that applies this outcome
+    /// (`apply_io_outcome` → `check_alarms`) is C's forced callback.
+    fn report_canceled(&mut self) {
+        self.report_error(CANCELED_MSG.to_string());
+        raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Major);
+    }
 }
 
 /// The status word C splices into the final octet read-error message
@@ -1052,7 +1064,7 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
     let mut out = IoOutcome::default();
 
     if cancel.is_cancelled() {
-        out.report_error(CANCELED_MSG.to_string());
+        out.report_canceled();
         return out;
     }
 
@@ -1075,7 +1087,7 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
             }
         };
         if cancel.is_cancelled() {
-            out.report_error(CANCELED_MSG.to_string());
+            out.report_canceled();
             return out;
         }
         record_phase_result(&plan, &mut out, phase, res);
@@ -2291,8 +2303,15 @@ impl AsynRecord {
     /// before the interface dispatch — because there is no port to ask about
     /// interfaces. Both the `process()` gate and [`Self::perform_io`] report it
     /// through here so the text has one owner.
+    ///
+    /// The refusal is an alarm, not just a message: C falls out of that branch
+    /// into `recGblSetSevr(pasynRec, STATE_ALARM, MINOR_ALARM)` (asynRecord.c:361)
+    /// on *every* such process, so a record whose port never came up sits in
+    /// STATE/MINOR rather than NO_ALARM. Staged in `io_alarm` and committed by
+    /// `check_alarms` on this cycle, like every other record alarm.
     fn report_not_connected(&mut self) {
         self.errs = "Not connect to a port".to_string();
+        self.io_alarm = Some((alarm_status::STATE_ALARM, AlarmSeverity::Minor));
     }
 
     /// C's "the port does not implement this interface" refusal: report and raise
@@ -3608,8 +3627,9 @@ impl Record for AsynRecord {
             // completion token is minted post-I/O and is always current
             // (mint advances the generation), so `cancel_async_reentry` could
             // only strand the record by racing the mint, never suppress it.
-            // STATE_ALARM/MAJOR_ALARM is not modeled (this record reports I/O
-            // errors via ERRS only, like its octet path).
+            // The C `wasQueued` branch's STATE_ALARM/MAJOR_ALARM (:399) rides on
+            // that same outcome: `IoOutcome::report_canceled` owns both halves of
+            // the cancel event, so the re-entry commits the alarm with the message.
             //
             // With no request in flight (synchronous port, or already
             // completed) AQR is the C `wasQueued==false` idle no-op.
@@ -3960,6 +3980,66 @@ mod tests {
         rec.process().unwrap();
         // C `process()` on stateNoDevice (asynRecord.c:357).
         assert_eq!(rec.errs, "Not connect to a port");
+    }
+
+    /// R10-46: the refusals C reports with `STATE_ALARM` must reach the record's
+    /// severity, not only its ERRS. A record processed with no port takes
+    /// `recGblSetSevr(pasynRec, STATE_ALARM, MINOR_ALARM)` on **every** such
+    /// process (asynRecord.c:361), so it sits in STATE/MINOR rather than
+    /// NO_ALARM while its port is down.
+    #[test]
+    fn a_process_with_no_port_raises_state_minor() {
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::Read as i32;
+
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "Not connect to a port");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::STATE_ALARM, AlarmSeverity::Minor),
+            "C asynRecord.c:361 alarms the stateNoDevice refusal STATE/MINOR"
+        );
+
+        // "on every such process": the second cycle alarms exactly like the first
+        // (C re-runs recGblSetSevr each time; the record does not latch it away).
+        rec.process().unwrap();
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::STATE_ALARM, AlarmSeverity::Minor),
+            "the refusal alarm is re-raised on the next process, not one-shot"
+        );
+    }
+
+    /// R10-46: the `AQR` cancel of a still-queued request is C's `wasQueued`
+    /// branch (asynRecord.c:397-400) — "I/O request canceled" **and**
+    /// `recGblSetSevr(pasynRec, STATE_ALARM, MAJOR_ALARM)`. The message and the
+    /// severity are one event, so the outcome that carries the text to the
+    /// completion re-entry carries the alarm with it.
+    #[tokio::test]
+    async fn a_canceled_queued_request_raises_state_major() {
+        let entry = canblock_int32_entry(11);
+        let cancel = CancelToken::new();
+        // C `cancelRequest` with the request still queued: `wasQueued == true`.
+        assert!(cancel.cancel(), "a queued request cancels");
+
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::Read as i32;
+        rec.iface = InterfaceType::Int32 as i32;
+        let plan = rec.build_io_plan();
+
+        let out = run_io_plan(entry.handle.clone(), plan, cancel).await;
+        rec.apply_io_outcome(out);
+
+        assert_eq!(rec.errs, "I/O request canceled");
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::STATE_ALARM, AlarmSeverity::Major),
+            "C asynRecord.c:399 alarms the canceled request STATE/MAJOR"
+        );
+        assert_eq!(
+            rec.i32inp, 0,
+            "the canceled request performed no I/O — the device value never landed"
+        );
     }
 
     /// R9-51: every ERRS text the record writes is one of C's, not an

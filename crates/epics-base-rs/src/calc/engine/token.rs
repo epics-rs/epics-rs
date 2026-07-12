@@ -146,7 +146,12 @@ pub enum Token {
     Bang, // !
     Question,
     Colon,
-
+    // NOTE: there are no `AND` / `OR` keyword tokens. All three C tables give the
+    // words the SAME `code` as the symbols `&` and `|` — `BIT_AND` and `BIT_OR`
+    // (postfix.c:174-175, sCalcPostfix.c:237-238, aCalcPostfix.c:234-235) — just
+    // as `XOR` shares `BIT_EXCL_OR` with `^`. They are alternate spellings of the
+    // bitwise operators, never of `&&` / `||`, so they lex straight to
+    // [`Token::BitAnd`] / [`Token::BitOr`] and no opcode mapping can diverge.
     LParen,
     RParen,
     Comma,
@@ -164,10 +169,6 @@ pub enum Token {
 
     MaxOp, // >?
     MinOp, // <?
-
-    // Keyword operators
-    AndKeyword, // AND
-    OrKeyword,  // OR
 
     UntilKeyword,
 }
@@ -296,8 +297,11 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("TAN", Token::Func(FuncName::Tan)),
         ("TANH", Token::Func(FuncName::Tanh)),
         ("VAL", Token::FetchVal),
-        ("AND", Token::AndKeyword),
-        ("OR", Token::OrKeyword),
+        // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
+        // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
+        // carry. They are not `&&`/`||`.
+        ("AND", Token::BitAnd),
+        ("OR", Token::BitOr),
         ("XOR", Token::BitXor),
         // Operators, postfix.c:145-179.
         ("!=", Token::Ne),
@@ -406,8 +410,11 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("VAL", Token::FetchVal),
         ("WRITE", Token::Func(FuncName::BinWrite)),
         ("XOR8", Token::Func(FuncName::Xor8)),
-        ("AND", Token::AndKeyword),
-        ("OR", Token::OrKeyword),
+        // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
+        // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
+        // carry. They are not `&&`/`||`.
+        ("AND", Token::BitAnd),
+        ("OR", Token::BitOr),
         ("XOR", Token::BitXor),
         // Operators, sCalcPostfix.c:217-255.
         ("!=", Token::Ne),
@@ -535,8 +542,11 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("TANH", Token::Func(FuncName::Tanh)),
         ("UNTIL", Token::UntilKeyword),
         ("VAL", Token::FetchVal),
-        ("AND", Token::AndKeyword),
-        ("OR", Token::OrKeyword),
+        // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
+        // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
+        // carry. They are not `&&`/`||`.
+        ("AND", Token::BitAnd),
+        ("OR", Token::BitOr),
         ("XOR", Token::BitXor),
         // Operators, aCalcPostfix.c:226-262. No `|-` (that is sCalc's
         // SUBLAST), no `>>>`.

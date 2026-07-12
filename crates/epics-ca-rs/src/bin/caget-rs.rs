@@ -244,8 +244,9 @@ struct Args {
     )]
     field_separator: Option<String>,
 
-    /// PV names to read.
-    #[arg(required_unless_present_any = ["version"])]
+    /// PV names to read. NOT clap-`required`: C's getopt loop has no
+    /// required positional — it parses, then `main` checks `nPvs < 1` and
+    /// reports C's own diagnostic (`CTool::no_pv_name`, caget.c:527-531).
     pv_names: Vec<String>,
 }
 
@@ -729,12 +730,18 @@ async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line
     // order of `-t`/`-a`/`-d` is recoverable for the C mutual-exclusion
     // rule (`resolve_output_mode`).
-    let matches = Args::command().get_matches();
+    let matches = TOOL.get_matches(Args::command());
     let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
 
     if args.version {
         println!("{VERSION_INFO}");
         return;
+    }
+
+    // C `caget.c:527-531`: the missing-PV check runs after the getopt loop,
+    // so `-V` above still wins and a bad option argument has already warned.
+    if args.pv_names.is_empty() {
+        TOOL.no_pv_name();
     }
 
     if args.callback {

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
     CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str,
@@ -131,8 +131,8 @@ struct Args {
     )]
     field_separator: Option<String>,
 
-    /// PV names to monitor.
-    #[arg(required_unless_present_any = ["version"])]
+    /// PV names to monitor. NOT clap-`required` — see `caget-rs`; C checks
+    /// `nPvs < 1` after the getopt loop (`camonitor.c:604-608`).
     pv_names: Vec<String>,
 }
 
@@ -177,11 +177,16 @@ impl Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args = Args::from_arg_matches(&TOOL.get_matches(Args::command()))
+        .expect("clap validated the arguments");
 
     if args.version {
         println!("{VERSION_INFO}");
         return;
+    }
+
+    if args.pv_names.is_empty() {
+        TOOL.no_pv_name();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");

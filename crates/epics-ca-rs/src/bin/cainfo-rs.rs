@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_ca_rs::DbFieldType;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::copt::CTool;
@@ -52,7 +52,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args = Args::from_arg_matches(&TOOL.get_matches(Args::command()))
+        .expect("clap validated the arguments");
 
     if args.version {
         println!("{VERSION_INFO}");
@@ -70,8 +71,7 @@ async fn main() {
     // non-zero `-s` level was selected. `--diag` (Rust-only) is an
     // explicit diagnostics request, so it likewise exempts the error.
     if !stat_mode && !args.diag && args.pv_names.is_empty() {
-        eprintln!("No pv name specified. ('cainfo -h' for help.)");
-        std::process::exit(1);
+        TOOL.no_pv_name();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");

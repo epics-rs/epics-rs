@@ -267,6 +267,99 @@ impl CTool {
         }
         style
     }
+
+    /// C's usage-error contract, shared by all four tools: ONE line on
+    /// stderr, `<what>. ('<tool> -h' for help.)`, and `return 1` from
+    /// `main` (`caget.c:527-531`, `camonitor.c:604-608`, `caput.c:457-465`,
+    /// `cainfo.c:202-205`, plus the getopt `'?'`/`':'` cases). No C CA tool
+    /// exits 2, and none dumps its usage block on an error.
+    pub fn usage_error(self, what: &str) -> ! {
+        eprintln!("{what}. ('{tool} -h' for help.)", tool = self.0);
+        std::process::exit(1)
+    }
+
+    /// C `if (nPvs < 1)` after the getopt loop. The C tools have NO required
+    /// positional — getopt parses, then `main` validates — so the Rust
+    /// binaries must not let clap's `required` fire either.
+    pub fn no_pv_name(self) -> ! {
+        self.usage_error("No pv name specified")
+    }
+
+    /// C `caput.c:462-465` `if (nPvs < 2)`.
+    pub fn no_value(self) -> ! {
+        self.usage_error("No value specified")
+    }
+
+    /// Parse `argv` through clap, but answer a *usage error* the way C's
+    /// getopt loop does. `-h`/`-V` still print and exit 0 (clap owns those);
+    /// every error path exits 1 with C's diagnostic, never clap's exit 2.
+    ///
+    /// This is the only entry point the binaries use, so a new option cannot
+    /// re-introduce an exit-2 path by being declared through the derive.
+    pub fn get_matches(self, cmd: clap::Command) -> clap::ArgMatches {
+        let spec = cmd.clone();
+        match cmd.try_get_matches() {
+            Ok(m) => m,
+            Err(e) => self.usage_exit(&spec, e),
+        }
+    }
+
+    fn usage_exit(self, spec: &clap::Command, e: clap::Error) -> ! {
+        use clap::error::{ContextKind, ErrorKind};
+
+        match e.kind() {
+            // Not errors: clap prints these on stdout and exits 0, exactly
+            // like C's `usage()` / `-V` paths.
+            ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => e.exit(),
+
+            // getopt `'?'`: `"Unrecognized option: '-%c'."` The token is
+            // echoed as the user typed it (C echoes `optopt`, which for a
+            // long-form token it never supports collapses to `'--'`).
+            ErrorKind::UnknownArgument => {
+                let arg = context_arg(&e, ContextKind::InvalidArg);
+                self.usage_error(&format!("Unrecognized option: '{arg}'"))
+            }
+
+            // getopt `':'`: `"Option '-%c' requires an argument."` clap
+            // reports the offending arg in its long form (`--wait <TIMEOUT>`)
+            // regardless of how it was typed, so resolve back to C's short
+            // letter through the command spec.
+            ErrorKind::InvalidValue
+                if e.get(ContextKind::InvalidValue).map(|v| v.to_string())
+                    == Some(String::new()) =>
+            {
+                let arg = context_arg(&e, ContextKind::InvalidArg);
+                let flag = short_flag_of(spec, &arg);
+                self.usage_error(&format!("Option '{flag}' requires an argument"))
+            }
+
+            // No other usage error exists in C. Keep clap's message (we have
+            // nothing truer to say) but not its exit code: 2 is not a status
+            // any CA tool returns.
+            _ => {
+                let _ = e.print();
+                std::process::exit(1)
+            }
+        }
+    }
+}
+
+/// The raw token clap blamed, e.g. `-X` or `--wait <TIMEOUT>`.
+fn context_arg(e: &clap::Error, kind: clap::error::ContextKind) -> String {
+    e.get(kind).map(|v| v.to_string()).unwrap_or_default()
+}
+
+/// `--wait <TIMEOUT>` → `-w`. Falls back to the long form when the option is
+/// a Rust-only extension with no short letter.
+fn short_flag_of(spec: &clap::Command, blamed: &str) -> String {
+    let long = blamed.split_whitespace().next().unwrap_or(blamed);
+    let name = long.trim_start_matches('-');
+    spec.get_arguments()
+        .find(|a| a.get_long() == Some(name) || a.get_id().as_str() == name)
+        .and_then(|a| a.get_short())
+        .map_or_else(|| long.to_string(), |c| format!("-{c}"))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
@@ -240,8 +240,8 @@ struct Args {
     )]
     field_separator: Option<String>,
 
-    /// Positional PV name.
-    #[arg(required_unless_present_any = ["version"])]
+    /// Positional PV name. NOT clap-`required` — see `caget-rs`; C checks
+    /// `nPvs < 1` after the getopt loop (`caput.c:457-461`).
     pv_name: Option<String>,
 
     /// Positional values. In `-a` mode the first element is the
@@ -266,7 +266,8 @@ impl Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args = Args::from_arg_matches(&TOOL.get_matches(Args::command()))
+        .expect("clap validated the arguments");
     // C warns inside its getopt loop, before any of the work below.
     args.scan_dead_element_count();
 
@@ -281,11 +282,14 @@ async fn main() {
     // no effect — matching C `caput`, where enumAsNr / enumAsString
     // only gate the DBR_ENUM branch.
 
-    let pv_name = args.pv_name.expect("clap enforces required");
+    // C `caput.c:457-465`: PV name first, then value — both are post-getopt
+    // checks with C's own one-line diagnostic and status 1.
+    let Some(pv_name) = args.pv_name else {
+        TOOL.no_pv_name();
+    };
 
     if args.values.is_empty() {
-        eprintln!("caput-rs: missing value");
-        std::process::exit(1);
+        TOOL.no_value();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");

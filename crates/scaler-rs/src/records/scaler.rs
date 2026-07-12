@@ -999,15 +999,33 @@ impl Record for ScalerRecord {
                             _ => {}
                         }
                     }
+                    // C:655 — `if (pscal->scan) scanOnce((void *)pscal);`,
+                    // the last statement of the handle-it-now arm. The state
+                    // change above (REQSTART / abort) is acted on by
+                    // `process()`, and a non-Passive scaler gets no process
+                    // from this put — without the scan-once it would sit on
+                    // the new state until the next periodic scan. The
+                    // `if (pscal->scan)` half of the guard belongs to the
+                    // framework (see `ProcessAction::ScanOnce`), which drops
+                    // the action for a Passive record whose put processes it
+                    // anyway. Not emitted in the delayed arm below: C does not
+                    // call `scanOnce` there either — `delayCallbackFunc` does,
+                    // when the delay expires.
+                    self.special_actions.push(ProcessAction::ScanOnce);
                 } else {
                     // C:657-661 — schedule the delayed start callback.
                     self.us = USER_STATE_WAITING;
                     self.delay_start = Some(Instant::now());
                 }
             }
-            // C scalerRecord.c:664-668 — CONT just rescans; the framework
-            // handles process-passive rescan, so nothing to do here.
-            "CONT" => {}
+            // C scalerRecord.c:664-668 — CONT. The write changes auto-count
+            // mode, which only `process()` acts on, so C rescans the record:
+            // `if (pscal->scan) scanOnce((void *)pscal);` (:667). A Passive
+            // scaler is processed by the put itself (CONT is `pp(TRUE)`) and the
+            // framework drops the action for it — same gate C writes inline.
+            "CONT" => {
+                self.special_actions.push(ProcessAction::ScanOnce);
+            }
             // C scalerRecord.c:670-677 — TP (truncating tp->pr1, d1=g1=1).
             "TP" => {
                 self.tp_to_pr1();

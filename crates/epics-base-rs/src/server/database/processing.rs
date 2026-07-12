@@ -3893,6 +3893,33 @@ impl PvDatabase {
                     // SDLY async-simulation defer.
                     self.schedule_delayed_reprocess(record_name, delay).await;
                 }
+                ProcessAction::ScanOnce => {
+                    // C `scanOnce(precord)`. The `if (precord->scan)` guard C
+                    // writes at every `special()` call site (scalerRecord.c:655,
+                    // :667) is owned HERE: a Passive record is already processed
+                    // by the put's own `pp(TRUE)` path (dbAccess.c:1265-1268), so
+                    // scanning it again would double-process; a non-Passive
+                    // record gets no process from the put at all, which is the
+                    // whole reason C makes the call — without it the state
+                    // change waits for the next periodic scan.
+                    let passive = {
+                        let instance = rec.read().await;
+                        instance.common.scan == crate::server::record::ScanType::Passive
+                    };
+                    if !passive {
+                        // Queued, not awaited: C's `scanOnce` hands the record
+                        // to the scan-once thread, which takes `dbScanLock` —
+                        // the process lands after the putting thread leaves
+                        // `dbPutField` and releases the record gate this call is
+                        // still holding.
+                        let db = self.clone();
+                        let name = record_name.to_string();
+                        tokio::spawn(async move {
+                            let mut visited = HashSet::new();
+                            let _ = db.process_record_with_links(&name, &mut visited, 0).await;
+                        });
+                    }
+                }
                 ProcessAction::WriteDbLinkNotify { link_field, value } => {
                     // C `sseqRecord.c` WAITn put-callback dependency: write
                     // the OUT link as a put-WITH-completion and re-enter THIS

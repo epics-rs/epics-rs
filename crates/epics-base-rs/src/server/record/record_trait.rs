@@ -194,6 +194,27 @@ pub enum ProcessAction {
     /// Equivalent to C EPICS `callbackRequestDelayed()` + `scanOnce()`.
     ReprocessAfter(std::time::Duration),
 
+    /// C `scanOnce(precord)` — queue ONE process of this record, now.
+    ///
+    /// A record's `special()` emits this when a put changed state the record
+    /// must act on but the put itself will not process the record. C guards
+    /// every such call with `if (precord->scan)` — scaler `special()`
+    /// (scalerRecord.c:655 CNT, :667 CONT), whose comment is exactly the
+    /// contract: *"Scan record if it's not Passive. (If it's Passive, it'll
+    /// get scanned automatically, since .cnt is a Process-Passive field.)"*
+    ///
+    /// The FRAMEWORK owns that gate, not the record: the framework owns SCAN
+    /// and owns the `pp(TRUE)` reprocess decision (`dbPutField`,
+    /// dbAccess.c:1265-1268), and a record's `special()` cannot see either. So
+    /// a record emits `ScanOnce` unconditionally wherever C calls `scanOnce`,
+    /// and the executor drops it for a Passive record — where the put's own
+    /// process already covers it and a second one would double-process.
+    ///
+    /// Queued, not inline: C's `scanOnce` hands the record to the scan-once
+    /// thread, which takes `dbScanLock` — so the process lands after the
+    /// putting thread leaves `dbPutField`.
+    ScanOnce,
+
     /// Send a named command to the device support driver.
     /// The framework calls `DeviceSupport::handle_command()` with this data.
     /// Used by scaler to request reset/arm/write_preset operations

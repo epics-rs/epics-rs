@@ -379,17 +379,6 @@ pub(crate) fn resolve_include_path(
     })
 }
 
-/// Override DTYP fields on records that already have a DTYP field.
-pub fn override_dtyp(records: &mut [DbRecordDef], dtyp: &str) {
-    for rec in records.iter_mut() {
-        for (name, value) in rec.fields.iter_mut() {
-            if name == "DTYP" {
-                *value = dtyp.to_string();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod macro_defns_tests {
     use super::*;

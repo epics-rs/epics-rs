@@ -633,13 +633,23 @@ fn test_until_count_ceiling_is_nine() {
 /// and st stays 0. This test pinned `Err(InvalidFormat)`, which no sCalc path
 /// produces.
 ///
-/// The VALUE compiled sCalc gives is `"00"` (its `hex()` reads a non-hex
-/// character as 0); making the port agree is R12-9. What is fixed here is only
-/// that it is not an error.
+/// C's `hex()` (`:232`) reads a non-hex character as 0 and its loop ignores a
+/// trailing odd one, so LRC has no failure mode at all. Compiled sCalc, and now
+/// the port (R12-9).
 #[test]
-fn test_lrc_non_hex_is_not_an_error() {
-    let mut inputs = StringInputs::new();
-    assert!(scalc(r#"LRC("0G")"#, &mut inputs).is_ok());
+fn test_lrc_accepts_every_operand_c_accepts() {
+    assert_eq!(eval_str(r#"LRC("0G")"#), StackValue::Str("00".into()));
+    assert_eq!(eval_str(r#"LRC("010")"#), StackValue::Str("FF".into()));
+    assert_eq!(eval_str(r#"LRC("0")"#), StackValue::Str("00".into()));
+    // AMODBUS runs the same helper, so it inherits both.
+    assert_eq!(
+        eval_str(r#"AMODBUS("0G")"#),
+        StackValue::Str(":0G00".into())
+    );
+    assert_eq!(
+        eval_str(r#"AMODBUS("010203")"#),
+        StackValue::Str(":010203FA".into())
+    );
 }
 
 #[test]

@@ -20,7 +20,7 @@ use epics_base_rs::server::recgbl::EventMask;
 use epics_pva_rs::pvdata::PvStructure;
 
 use super::provider::{AccessContext, PvaMonitor};
-use super::pvif::{NtType, snapshot_to_pv_structure};
+use super::pvif::{FieldMapping, NtType, snapshot_to_pv_structure};
 use crate::error::{BridgeError, BridgeResult};
 
 /// A PVA monitor backed by a DbSubscription for a single record.
@@ -152,6 +152,17 @@ impl BridgeMonitor {
         self.overflow_count.load(Ordering::Relaxed)
     }
 
+    /// The DBE mask the value subscription runs with: the client's
+    /// `record._options.DBE` override, else pvxs QSRV's default
+    /// `VALUE | ALARM` (`singlesource.cpp:141-143`). One owner, so the
+    /// mask [`PvaMonitor::start`] subscribes with and the no-field-log
+    /// fallback [`PvaMonitor::poll`] classifies with cannot diverge.
+    fn value_mask(&self) -> EventMask {
+        self.value_mask_override
+            .map(EventMask::from_bits)
+            .unwrap_or(EventMask::VALUE | EventMask::ALARM)
+    }
+
     /// Detachable enable/disable handles for this monitor's backing
     /// subscriptions — the value (VALUE|ALARM) and PROPERTY `dbChannel`s
     /// pvxs QSRV opens per single-record monitor. Used by the per-op
@@ -169,6 +180,38 @@ impl BridgeMonitor {
         }
         handles
     }
+}
+
+/// The `UpdateType` a *value* subscription event carries, porting pvxs
+/// `subscriptionValueCallback` (`singlesource.cpp:73-95`):
+///
+/// ```text
+/// change = pValueEventSubscription.mask;      // no field log (pre-7.0.6)
+/// if(pDbFieldLog) change = pDbFieldLog->mask; // else the event's own class
+/// if(change & DBE_ARCHIVE) change = (change&~DBE_ARCHIVE)|DBE_VALUE;
+/// if((change & (DBE_VALUE|DBE_ARCHIVE|DBE_ALARM)) == DBE_ALARM) change |= DBE_VALUE;
+/// change &= UpdateType::Everything;           // VALUE|ALARM|PROPERTY
+/// ```
+///
+/// `event_mask` is the event's own class (`db_field_log.mask`); an EMPTY
+/// one is the no-field-log case and falls back to `sub_mask`, the mask the
+/// subscription was opened with. `EventMask::LOG` is EPICS `DBE_ARCHIVE`.
+fn value_event_change(event_mask: EventMask, sub_mask: EventMask) -> EventMask {
+    let mut change = if event_mask.is_empty() {
+        sub_mask
+    } else {
+        event_mask
+    };
+    // ARCHIVE events get the same data fields as VALUE.
+    if change.contains(EventMask::LOG) {
+        change = EventMask::from_bits(change.bits() & !EventMask::LOG.bits()) | EventMask::VALUE;
+    }
+    // Promote a bare DBE_ALARM to also fetch the value.
+    if change & (EventMask::VALUE | EventMask::LOG | EventMask::ALARM) == EventMask::ALARM {
+        change |= EventMask::VALUE;
+    }
+    // UpdateType::Everything — does not include DBE_ARCHIVE.
+    change & (EventMask::VALUE | EventMask::ALARM | EventMask::PROPERTY)
 }
 
 impl PvaMonitor for BridgeMonitor {
@@ -198,9 +241,7 @@ impl PvaMonitor for BridgeMonitor {
         // `record.FIELD` binds the subscriber slot to that field's
         // subscribers vector.
         let pv_name = format!("{}.{}", self.record_name, self.field);
-        let value_mask = self
-            .value_mask_override
-            .unwrap_or_else(|| (EventMask::VALUE | EventMask::ALARM).bits());
+        let value_mask = self.value_mask().bits();
         // attach the channel-filter chain to the value subscription.
         let filters_opt = if self.filters.is_empty() {
             None
@@ -268,35 +309,70 @@ impl PvaMonitor for BridgeMonitor {
             return Some(super::provider::MonitorPoll::derive(initial));
         }
 
-        // wake on either the VALUE|ALARM subscription or
-        // the PROPERTY subscription — whichever the record posts
-        // first. snapshot_to_pv_structure rebuilds the full NT
-        // structure (with display/control/enums) on every wake,
-        // so either firing pushes fresh metadata to the client.
+        // wake on either the VALUE|ALARM subscription or the PROPERTY
+        // subscription — whichever the record posts first.
+        // snapshot_to_pv_structure rebuilds the full NT structure on every
+        // wake (the value pvxs merges into its persistent `currentValue`),
+        // and the arm that fired resolves the event's MARKED LEAVES.
         //
-        // a single-record monitor has no `+trigger`
-        // graph, so each update derives its own changed-bitset
-        // (`marked: None`).
-        match (
-            self.subscription.as_mut(),
-            self.property_subscription.as_mut(),
-        ) {
-            (Some(value_sub), Some(prop_sub)) => {
-                let snapshot = tokio::select! {
-                    snap = value_sub.recv_snapshot() => snap?,
-                    snap = prop_sub.recv_snapshot() => snap?,
-                };
-                Some(super::provider::MonitorPoll::derive(
-                    snapshot_to_pv_structure(&snapshot, self.nt_type),
-                ))
+        // The marking is owned HERE, by the event source, exactly as pvxs
+        // QSRV does it: `subscriptionCallback` runs `IOCSource::get` with
+        // the event's `UpdateType`, which assigns — and so marks — only
+        // that class's leaves, posts the clone, then `unmark()`s
+        // (`singlesource.cpp:47-68`). The PVA layer serializes
+        // `marked ∩ pvMask` (`servermon.cpp:172-174`). Deriving a full mask
+        // at frame time instead re-sent the whole value with an all-changed
+        // bitset on every tick, so a client's `isMarked()`/`ifMarked()` saw
+        // metadata as freshly changed on every value event.
+        let value_mask = self.value_mask();
+        loop {
+            let (snapshot, change) = match (
+                self.subscription.as_mut(),
+                self.property_subscription.as_mut(),
+            ) {
+                (Some(value_sub), Some(prop_sub)) => tokio::select! {
+                    ev = value_sub.recv_event() => {
+                        let ev = ev?;
+                        let change = value_event_change(ev.mask, value_mask);
+                        (ev.snapshot, change)
+                    }
+                    ev = prop_sub.recv_event() => {
+                        // pvxs passes `UpdateType::Property` unconditionally
+                        // for a property event (`singlesource.cpp:100`) — the
+                        // event's own DBE mask is not consulted.
+                        (ev?.snapshot, EventMask::PROPERTY)
+                    }
+                },
+                (Some(value_sub), None) => {
+                    let ev = value_sub.recv_event().await?;
+                    let change = value_event_change(ev.mask, value_mask);
+                    (ev.snapshot, change)
+                }
+                _ => return None,
+            };
+            // A single-record channel's NT IS the root, so the mapped node
+            // has an empty prefix. pvxs's `SingleInfo` carries a default
+            // `MappingInfo` — `MappingInfo::Scalar` — for every single
+            // record (`singlesource.cpp` never sets another type), so the
+            // leaf set is the Scalar one for NTScalar and NTEnum alike.
+            let marked = super::pvif::change_leaf_paths("", FieldMapping::Scalar, change);
+            if marked.is_empty() {
+                // The event's classes assign no leaf, so `IOCSource::get`
+                // writes nothing, `testmask` fails and `doPost` drops the
+                // post (`servermon.cpp:261`). Park for the next event —
+                // returning `None` here would read as source-close and emit
+                // a MONITOR FINISH.
+                continue;
             }
-            (Some(value_sub), None) => {
-                let snapshot = value_sub.recv_snapshot().await?;
-                Some(super::provider::MonitorPoll::derive(
-                    snapshot_to_pv_structure(&snapshot, self.nt_type),
-                ))
-            }
-            _ => None,
+            let value = snapshot_to_pv_structure(&snapshot, self.nt_type);
+            // An NTEnum's `value` node is `{index, choices}`; a value/alarm
+            // event assigns only `value.index` (`iocsource.cpp:107-109`),
+            // never the property-only `value.choices`.
+            let marked = super::pvif::narrow_enum_value_leaves(marked, &value);
+            return Some(super::provider::MonitorPoll {
+                value,
+                marked: Some(marked),
+            });
         }
     }
 
@@ -411,11 +487,23 @@ mod tests {
         let snap = polled
             .expect("PROPERTY event must wake poll within 500ms")
             .expect("snapshot delivered");
-        // Snapshot is a full NT structure; sanity-check that we got one.
-        // a single-record monitor carries no marked set.
-        assert!(
-            snap.marked.is_none(),
-            "single-record monitor must not carry an explicit marked set"
+        // The posted value is the full NT structure (pvxs merges into its
+        // persistent `currentValue`), but the MARKED set is the property
+        // leaves alone — `IOCSource::get` under `UpdateType::Property` runs
+        // getProperties and nothing else (`iocsource.cpp:327-334`).
+        let marked = snap
+            .marked
+            .as_ref()
+            .expect("a property event carries its marked leaves");
+        assert_eq!(
+            marked,
+            &vec![
+                "display".to_string(),
+                "control".to_string(),
+                "valueAlarm".to_string(),
+                "value.choices".to_string(),
+            ],
+            "a PROPERTY event marks only the property leaves"
         );
         assert!(
             !snap.value.fields.is_empty(),
@@ -499,6 +587,115 @@ mod tests {
             other => panic!("value must be a ScalarArray, got {other:?}"),
         }
 
+        mon.stop().await;
+    }
+
+    /// R12-31: a single-record monitor event must carry the DB event's
+    /// marked leaves, not `None` (which the PVA layer turns into a
+    /// full-selection changed-bitset and so re-sends the WHOLE value —
+    /// metadata included — on every value tick).
+    ///
+    /// pvxs QSRV: `subscriptionCallback` runs `IOCSource::get` with the
+    /// event's `UpdateType`, which assigns (and so marks) only that
+    /// class's leaves, posts the clone, then `unmark()`s
+    /// (`singlesource.cpp:47-68`); `to_wire_valid(R, ent, &pvMask)`
+    /// serializes `marked ∩ pvMask` (`servermon.cpp:172-174`).
+    ///
+    /// A DBE_VALUE post therefore marks `timeStamp` + `value` and NOT
+    /// `alarm` (`getTimeAlarm`'s alarm leaves are gated on
+    /// `change & Alarm`, `iocsource.cpp:183`), and never the display /
+    /// control / valueAlarm properties.
+    #[tokio::test]
+    async fn value_event_marks_only_value_and_timestamp() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MON_MARK", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        let mut mon =
+            BridgeMonitor::new(db.clone(), "MON_MARK".into(), "VAL".into(), NtType::Scalar);
+        mon.start().await.expect("start ok");
+
+        {
+            let rec = db.get_record("MON_MARK").await.expect("rec exists");
+            let instance = rec.read().await;
+            instance.notify_field("VAL", EventMask::VALUE);
+        }
+
+        let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+            .await
+            .expect("VALUE event must wake poll within 500ms")
+            .expect("event delivered");
+        let marked = snap
+            .marked
+            .as_ref()
+            .expect("a value event carries its marked leaves");
+        assert_eq!(
+            marked,
+            &vec!["timeStamp".to_string(), "value".to_string()],
+            "a DBE_VALUE event marks timeStamp + value only"
+        );
+
+        // A DBE_ALARM post promotes to VALUE|ALARM (`singlesource.cpp:90-92`)
+        // and so additionally marks `alarm` — still no display/control.
+        {
+            let rec = db.get_record("MON_MARK").await.expect("rec exists");
+            let instance = rec.read().await;
+            instance.notify_field("VAL", EventMask::ALARM);
+        }
+        let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+            .await
+            .expect("ALARM event must wake poll within 500ms")
+            .expect("event delivered");
+        assert_eq!(
+            snap.marked.as_ref().expect("marked set"),
+            &vec![
+                "timeStamp".to_string(),
+                "alarm".to_string(),
+                "value".to_string()
+            ],
+            "a DBE_ALARM event promotes to VALUE|ALARM"
+        );
+
+        // The value is still the FULL snapshot — pvxs posts a clone of the
+        // whole `currentValue`; only the marked set narrows the wire frame.
+        assert!(
+            snap.value.get_field("display").is_some(),
+            "the posted value stays complete; the marked set is what narrows"
+        );
+
+        mon.stop().await;
+    }
+
+    /// An NTEnum single record must mark `value.index` on a value event —
+    /// never the bare `value` node, whose whole-subtree expansion would
+    /// re-send the property-only `value.choices` array on every tick
+    /// (pvxs `iocsource.cpp:107-109` assigns only `index`).
+    #[tokio::test]
+    async fn enum_value_event_marks_value_index() {
+        use epics_base_rs::server::records::bi::BiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("MON_ENUM", Box::new(BiRecord::new(0)))
+            .await
+            .unwrap();
+
+        let mut mon = BridgeMonitor::new(db.clone(), "MON_ENUM".into(), "VAL".into(), NtType::Enum);
+        mon.start().await.expect("start ok");
+        {
+            let rec = db.get_record("MON_ENUM").await.expect("rec exists");
+            let instance = rec.read().await;
+            instance.notify_field("VAL", EventMask::VALUE);
+        }
+        let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+            .await
+            .expect("VALUE event must wake poll")
+            .expect("event delivered");
+        assert_eq!(
+            snap.marked.as_ref().expect("marked set"),
+            &vec!["timeStamp".to_string(), "value.index".to_string()],
+            "an NTEnum value event marks value.index, never the bare value node"
+        );
         mon.stop().await;
     }
 }

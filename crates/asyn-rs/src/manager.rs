@@ -362,10 +362,13 @@ mod tests {
         // process-wide authority on port names, matching C
         // asynManager::registerPort.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Stands in for a port published by another creator; no actor loop
+        // runs behind it, so its `ActorId` is never current on any thread.
         let ext = crate::port_handle::PortHandle::new(
             tx,
             "extowned".to_string(),
             Arc::new(crate::interrupt::InterruptManager::new(4)),
+            crate::port_actor::ActorId::new(),
         );
         crate::asyn_record::register_port(
             "extowned",

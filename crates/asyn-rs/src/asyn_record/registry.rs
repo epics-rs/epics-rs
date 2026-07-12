@@ -147,7 +147,15 @@ mod tests {
 
     fn dummy_handle(name: &str) -> PortHandle {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        PortHandle::new(tx, name.to_string(), Arc::new(InterruptManager::new(4)))
+        // No actor loop runs for this handle, so its `ActorId` is never
+        // published on any thread — no caller can be this port's actor,
+        // which is the truth these registry tests need.
+        PortHandle::new(
+            tx,
+            name.to_string(),
+            Arc::new(InterruptManager::new(4)),
+            crate::port_actor::ActorId::new(),
+        )
     }
 
     /// C parity: `asynManager::registerPort` refuses a duplicate name

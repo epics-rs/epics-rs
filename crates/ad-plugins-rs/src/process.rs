@@ -162,6 +162,25 @@ pub struct ProcessState {
     last_output: Option<NDArray>,
 }
 
+/// C's recursive-filter term: `if (coef) acc += coef * term`
+/// (NDPluginProcess.cpp:206-207 and :221-225 — all six terms of the filter are
+/// written this way).
+///
+/// The guard is not an optimisation, it is semantics: `0.0 * NaN` and
+/// `0.0 * inf` are NaN in IEEE-754, so multiplying an unused term by a zero
+/// coefficient does NOT drop it — it poisons the sum. C's `if` drops it. That
+/// matters most for `filter[]`, which feeds the next frame: one non-finite
+/// sample (a Float64/Float32 input carrying NaN, or an inf produced by a large
+/// coefficient) makes every later output NaN for as long as the filter lives,
+/// even with the filter coefficients set to zero to disable that term.
+///
+/// `coef != 0.0` is exactly C's truth test on a double: false for `+0.0` and
+/// `-0.0`, true for everything else including NaN.
+#[inline]
+fn accumulate(acc: f64, coef: f64, term: f64) -> f64 {
+    if coef != 0.0 { acc + coef * term } else { acc }
+}
+
 impl ProcessState {
     pub fn new(config: ProcessConfig) -> Self {
         Self {
@@ -519,12 +538,16 @@ impl ProcessState {
             let filter = self.filter_state.as_mut().unwrap();
 
             if reset_filter {
-                // C++: filter[i] = rOffset + rc1*filter[i] + rc2*data[i]
+                // C++ NDPluginProcess.cpp:204-209:
+                //   newFilter = rOffset;
+                //   if (rc1) newFilter += rc1*filter[i];
+                //   if (rc2) newFilter += rc2*data[i];
                 let r_offset = fc.r_offset;
                 let rc1 = fc.rc[0];
                 let rc2 = fc.rc[1];
                 for i in 0..n {
-                    let new_filter = r_offset + rc1 * filter[i] + rc2 * values[i];
+                    let mut new_filter = accumulate(r_offset, rc1, filter[i]);
+                    new_filter = accumulate(new_filter, rc2, values[i]);
                     filter[i] = new_filter;
                 }
                 self.num_filtered = 0;
@@ -544,17 +567,23 @@ impl ProcessState {
             let o_offset = fc.o_offset;
             let f_offset = fc.f_offset;
 
-            // C++ NDPluginProcess.cpp:220-227 doProcess:
-            //   newData   = oOffset + O1*filter[i] + O2*data[i];
-            //   newFilter = fOffset + F1*filter[i] + F2*data[i];
+            // C++ NDPluginProcess.cpp:219-227 doProcess:
+            //   newData   = oOffset;
+            //   if (O1) newData += O1 * filter[i];
+            //   if (O2) newData += O2 * data[i];
+            //   newFilter = fOffset;
+            //   if (F1) newFilter += F1 * filter[i];
+            //   if (F2) newFilter += F2 * data[i];
             //   data[i]   = newData;
             //   filter[i] = newFilter;
             // Both newData AND newFilter are computed from the ORIGINAL
             // data[i]; data[i] = newData is assigned only afterward. So the
             // filter-state update must use the original input, not new_data.
             for i in 0..n {
-                let new_data = o_offset + o1 * filter[i] + o2 * values[i];
-                let new_filter = f_offset + f1 * filter[i] + f2 * values[i];
+                let mut new_data = accumulate(o_offset, o1, filter[i]);
+                new_data = accumulate(new_data, o2, values[i]);
+                let mut new_filter = accumulate(f_offset, f1, filter[i]);
+                new_filter = accumulate(new_filter, f2, values[i]);
                 values[i] = new_data;
                 filter[i] = new_filter;
             }
@@ -1817,5 +1846,56 @@ mod tests {
                 expected_filter[k]
             );
         }
+    }
+    /// R12-63. C guards every filter term with `if (coef)`
+    /// (NDPluginProcess.cpp:206-207, 221-225), so a ZERO coefficient DROPS its
+    /// term. Multiplying instead is not equivalent: `0.0 * NaN` is NaN, so a
+    /// single non-finite input sample poisons `filter[]` — permanently, because
+    /// filter[] feeds the next frame — even though the coefficients say that
+    /// term is unused.
+    ///
+    /// Setup: RC1=RC2=0 with ROFFSET=5, so C's reset writes `filter[i] = 5` and
+    /// never touches the NaN it seeded the filter from. OC3=OC4=0 (O2=0) and
+    /// FC3=FC4=0 (F2=0), so the NaN input data is dropped from both sums too.
+    /// C output: `oOffset + O1*filter[i]` = 5 for EVERY element.
+    #[test]
+    fn r12_63_a_zero_coefficient_drops_its_term_instead_of_multiplying_it() {
+        let input = make_f64_array(&[1.0, f64::NAN, 3.0]);
+
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_filter: true,
+            filter: FilterConfig {
+                num_filter: 2,
+                rc: [0.0, 0.0],
+                r_offset: 5.0,
+                oc: [1.0, 0.0, 0.0, 0.0],
+                fc: [1.0, 0.0, 0.0, 0.0],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let result = state.process(&input).unwrap();
+        let NDDataBuffer::F64(ref v) = result.data else {
+            panic!("expected an F64 output buffer, got {:?}", result.data);
+        };
+        assert_eq!(
+            v.as_slice(),
+            [5.0, 5.0, 5.0],
+            "RC1=RC2=0 makes C's reset `filter[i] = rOffset`; O2=0 drops the NaN \
+             data term. Every element is rOffset — 0.0 * NaN must not be summed in"
+        );
+
+        // And the poison must not be latent in the filter state either: a second,
+        // fully finite frame still comes out clean.
+        let clean = make_f64_array(&[7.0, 8.0, 9.0]);
+        let result = state.process(&clean).unwrap();
+        let NDDataBuffer::F64(ref v) = result.data else {
+            panic!("expected an F64 output buffer");
+        };
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "the NaN must not survive in filter[] across frames: {v:?}"
+        );
     }
 }

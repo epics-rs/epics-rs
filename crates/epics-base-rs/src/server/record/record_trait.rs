@@ -194,6 +194,27 @@ pub enum ProcessAction {
     /// Equivalent to C EPICS `callbackRequestDelayed()` + `scanOnce()`.
     ReprocessAfter(std::time::Duration),
 
+    /// C `scanOnce(precord)` — queue ONE process of this record, now.
+    ///
+    /// A record's `special()` emits this when a put changed state the record
+    /// must act on but the put itself will not process the record. C guards
+    /// every such call with `if (precord->scan)` — scaler `special()`
+    /// (scalerRecord.c:655 CNT, :667 CONT), whose comment is exactly the
+    /// contract: *"Scan record if it's not Passive. (If it's Passive, it'll
+    /// get scanned automatically, since .cnt is a Process-Passive field.)"*
+    ///
+    /// The FRAMEWORK owns that gate, not the record: the framework owns SCAN
+    /// and owns the `pp(TRUE)` reprocess decision (`dbPutField`,
+    /// dbAccess.c:1265-1268), and a record's `special()` cannot see either. So
+    /// a record emits `ScanOnce` unconditionally wherever C calls `scanOnce`,
+    /// and the executor drops it for a Passive record — where the put's own
+    /// process already covers it and a second one would double-process.
+    ///
+    /// Queued, not inline: C's `scanOnce` hands the record to the scan-once
+    /// thread, which takes `dbScanLock` — so the process lands after the
+    /// putting thread leaves `dbPutField`.
+    ScanOnce,
+
     /// Send a named command to the device support driver.
     /// The framework calls `DeviceSupport::handle_command()` with this data.
     /// Used by scaler to request reset/arm/write_preset operations
@@ -965,23 +986,27 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Distinct from [`Self::force_posted_fields`], which posts with
     /// `DBE_VALUE | DBE_LOG`: these post with `DBE_LOG` alone, so only a
-    /// `DBE_LOG` (archiver) subscriber receives the unchanged-value
-    /// event. The LOG sweep lands only for fields that did not change
-    /// this cycle (the change/no-change branches are disjoint), so a
-    /// field that also changed is not double-posted. For a field that is
-    /// ALSO a [`Self::value_only_change_fields`] member the change post
-    /// carries `DBE_VALUE` only, so this idle sweep is the sole source of
-    /// its `DBE_LOG` events — which is exactly C's split (counting cycle
-    /// → `DBE_VALUE`, idle `monitor()` → `DBE_LOG`); the scaler never
-    /// changes `Sn` on an idle cycle, so the two never collide.
+    /// `DBE_LOG` (archiver) subscriber receives the event.
     ///
-    /// C `scalerRecord.c` `monitor()` (scalerRecord.c:770-787) runs on
-    /// every IDLE process and posts each active channel `S1..Snch` with a
-    /// literal `DBE_LOG`. The scaler returns those channel field names
-    /// here ONLY while idle (it reads its own `ss` state), so an archiver
-    /// `camonitor SCALER:Sn` gets an event every idle scan even when the
-    /// count is unchanged — while a counting cycle (which does not run C
-    /// `monitor()`) returns empty.
+    /// The sweep is an INDEPENDENT post, NOT an alternative to the
+    /// change-detected post. C's `db_post_events` calls compose: on the
+    /// scaler's count-completion cycle `updateCounts()` posts each changed
+    /// `Sn` with `DBE_VALUE` (scalerRecord.c:582) and then `monitor()` —
+    /// reached because the done-interrupt set `ss = IDLE` (`:367`,
+    /// `:510`) — posts the SAME `Sn` again with a literal `DBE_LOG`
+    /// (`:757-773`). Two events, one field, one cycle. So the framework
+    /// emits the sweep post in addition to whatever the change detection
+    /// produced; gating it on "did not change" would silently drop the
+    /// `DBE_LOG` half on exactly the cycle that carries the final counts.
+    ///
+    /// For a field that is ALSO a [`Self::value_only_change_fields`]
+    /// member (scaler `Sn`) the change post carries `DBE_VALUE` only, so
+    /// this sweep is the sole source of its `DBE_LOG` events, matching C.
+    ///
+    /// The record returns the names ONLY on the cycles whose C `monitor()`
+    /// runs — the scaler reads its own `ss` state and returns `S1..Snch`
+    /// while idle, empty while counting (a counting cycle never reaches C
+    /// `monitor()`).
     ///
     /// Default: empty — most record types have no LOG-only sweep.
     fn log_swept_fields(&self) -> &'static [&'static str] {
@@ -1138,12 +1163,14 @@ pub trait Record: Send + Sync + 'static {
     /// * a field the record WRITES during `process()` but C never posts
     ///   (scaler's gate→direction copy, `scalerRecord.c:413-414`: `pdir[i] =
     ///   pgate[i]` with no `db_post_events` — C posts `Dn` only from
-    ///   `special()`), and
-    /// * a field a PUT already posted, whose `last_posted` the put path does
-    ///   not advance, so the next process cycle change-detects it a second
-    ///   time (`Gn`, `PRn`).
+    ///   `special()`).
     ///
-    /// `Some(list)` closes both by construction: a field outside the list is
+    /// (A field a PUT already posted is NOT in that category: the put's own
+    /// post advances `last_posted` — see the `RecordInstance::last_posted`
+    /// contract — so the next process cycle does not change-detect it. This
+    /// hook must not be used to paper over a framework double post.)
+    ///
+    /// `Some(list)` closes it by construction: a field outside the list is
     /// never posted by a process cycle — its only monitors come from its own
     /// put and from [`Self::monitor_side_effect_fields`]. The list is a
     /// whitelist, not a blacklist, so a field added to the record later stays
@@ -1362,6 +1389,24 @@ pub trait Record: Send + Sync + 'static {
     /// Whether processing this record should clear UDF.
     /// Override to return false for record types that don't produce a valid value every cycle.
     fn clears_udf(&self) -> bool {
+        true
+    }
+
+    /// Whether this record type raises UDF_ALARM at all.
+    ///
+    /// C has no framework-level UDF alarm: every record that reports one does
+    /// it itself, with the guard at the top of its own `checkAlarms` —
+    /// `if (prec->udf) { recGblSetSevr(prec, UDF_ALARM, prec->udfs); return; }`
+    /// (`aiRecord.c:319-323`, `calcRecord.c:300-304`, …). A record whose
+    /// support has no such guard NEVER reports UDF_ALARM, no matter what its
+    /// `UDF` field says — `swaitRecord.c` is the case in point: its two only
+    /// `udf` statements are `udf = FALSE` (`:411`, `:419`); it has no
+    /// `checkAlarms` and never names UDF_ALARM.
+    ///
+    /// The framework raises UDF_ALARM centrally (`rec_gbl_check_udf`), so this
+    /// hook is where a record type says C does not. Default `true` — the base
+    /// analog/binary/string records all carry the guard.
+    fn raises_udf_alarm(&self) -> bool {
         true
     }
 

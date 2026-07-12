@@ -9,14 +9,16 @@
 //! nothing for; `Dn` is posted only from `special()`.
 //!
 //! The framework's generic rule ("post every subscribed field that changed
-//! since its last post") invented two families of events on top of C:
+//! since its last post") invented `Dn` events on top of C: `Dn` is changed by
+//! the count-start copy and never posted by C's process.
+//! `Record::process_posted_fields` closes that by declaring C's set — a field
+//! outside it is never posted by a process cycle.
 //!
-//!   * `Dn` — changed by the count-start copy, never posted by C's process;
-//!   * `Gn`/`PRn` — already posted by their own put, then change-detected a
-//!     second time on the next process cycle because the put path does not
-//!     advance `last_posted`.
-//!
-//! `Record::process_posted_fields` closes both by declaring C's set.
+//! (`Gn`/`PRn` were once double-posted here too — posted by their own put, then
+//! change-detected a second time on the next cycle. That was R11-C10, a
+//! FRAMEWORK defect: the put-time post did not advance `last_posted`. It is
+//! fixed at the framework — every value-class post now advances it — so this
+//! hook no longer carries that load.)
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;

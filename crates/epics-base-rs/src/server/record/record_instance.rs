@@ -307,8 +307,37 @@ pub struct RecordInstance {
     // taken + `leave`d when the record's processing completes. `None`
     // outside any put-notify. See [`NotifyWaitSet`].
     pub notify: Option<Arc<NotifyWaitSet>>,
-    // Last posted values for subscribed fields (generic change detection)
-    pub last_posted: HashMap<String, EpicsValue>,
+    /// The value of each subscribed field as ALREADY PUBLISHED to that
+    /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
+    /// change-detection loop in every snapshot builder posts a field only
+    /// when its current value differs from this — so this map is what
+    /// C's per-record `*_lst` / MARK state is to `monitor()`.
+    ///
+    /// # Invariant (CONTRACT)
+    ///
+    /// A field's value MUST NOT be published twice by the framework.
+    /// Concretely: every value-class post (a `db_post_events` carrying
+    /// `DBE_VALUE` and/or `DBE_LOG`) MUST advance this map for the field it
+    /// posts; an alarm-only / property-only post MUST NOT (those classes do
+    /// not deliver the value to a `DBE_VALUE`/`DBE_LOG` subscriber, so the
+    /// change is still owed to them).
+    ///
+    /// In C, `dbPut` (dbAccess.c:1407-1414) is the record's ONLY post for a
+    /// put: `db_post_events(precord, pfieldsave, DBE_VALUE|DBE_LOG)`. No
+    /// record's `monitor()` re-posts that field — it posts a closed set and
+    /// compares against its own `*_lst` fields. A framework that posts on the
+    /// put and then change-detects the same field on the next process cycle
+    /// sends an event C never sends.
+    ///
+    /// # Owner
+    ///
+    /// [`RecordInstance::record_value_post`] is the SINGLE writer. The field
+    /// is private so no path outside this module can advance (or fail to
+    /// advance) it: the snapshot builders read it through
+    /// [`RecordInstance::posted_value`] and every poster —
+    /// [`RecordInstance::notify_field_with_origin`] included — advances it
+    /// through the owner.
+    last_posted: HashMap<String, EpicsValue>,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -463,6 +492,31 @@ impl RecordInstance {
         self.info.get(key).map(|s| s.as_str())
     }
 
+    /// The value of `field` already published to its `DBE_VALUE`/`DBE_LOG`
+    /// subscribers, or `None` when the framework has never published one.
+    /// The read side of the `last_posted` contract — see the field's docs.
+    pub(crate) fn posted_value(&self, field: &str) -> Option<&EpicsValue> {
+        self.last_posted.get(field)
+    }
+
+    /// SINGLE OWNER of `last_posted`: record that `value` has been published
+    /// to `field`'s `DBE_VALUE`/`DBE_LOG` subscribers, so no later cycle
+    /// change-detects and re-publishes it.
+    ///
+    /// Every value-class post — the snapshot builders' change-detected posts,
+    /// the intermediate async-notify posts, and the put-time
+    /// [`Self::notify_field_with_origin`] post that C makes from `dbPut`
+    /// (dbAccess.c:1414) — routes through here. Alarm-only / property-only
+    /// posts MUST NOT call it: they deliver nothing to a value-class
+    /// subscriber, so the value is still owed.
+    pub(crate) fn record_value_post(&mut self, field: &str, value: EpicsValue) {
+        if let Some(slot) = self.last_posted.get_mut(field) {
+            *slot = value;
+        } else {
+            self.last_posted.insert(field.to_string(), value);
+        }
+    }
+
     /// Invalidate the metadata cache. Called after writing any
     /// metadata-class field (EGU, PREC, HOPR/LOPR, alarm limits,
     /// DRVH/DRVL, enum strings). The next snapshot will rebuild the
@@ -497,7 +551,7 @@ impl RecordInstance {
     /// know the field is non-metadata) can keep using
     /// [`notify_field_written`].
     // must post EventMask::PROPERTY to all field subscribers when metadata changes
-    pub fn notify_field_written_if_changed(&self, field: &str, prev: Option<&EpicsValue>) {
+    pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
         if !is_metadata_field(&upper) {
             return;
@@ -1856,8 +1910,12 @@ impl RecordInstance {
     pub fn evaluate_alarms(&mut self) {
         use crate::server::recgbl;
 
-        // Check UDF first
-        recgbl::rec_gbl_check_udf(&mut self.common);
+        // Check UDF first — but only for record types whose C support carries
+        // the `if (prec->udf) recGblSetSevr(..., UDF_ALARM, ...)` guard. C has
+        // no central UDF alarm; see `Record::raises_udf_alarm`.
+        if self.record.raises_udf_alarm() {
+            recgbl::rec_gbl_check_udf(&mut self.common);
+        }
 
         let rtype = self.record.record_type();
         match rtype {
@@ -2309,7 +2367,7 @@ impl RecordInstance {
             // no alarm transition ran on this pending pass.
             let mut changed_fields = Vec::new();
             for (name, val) in fields {
-                let changed = match self.last_posted.get(&name) {
+                let changed = match self.posted_value(&name) {
                     Some(prev) => prev != &val,
                     None => true,
                 };
@@ -2320,7 +2378,7 @@ impl RecordInstance {
                             self.common.mlst = Some(f);
                         }
                     }
-                    self.last_posted.insert(name.clone(), val.clone());
+                    self.record_value_post(&name, val.clone());
                     changed_fields.push((name, val, EventMask::VALUE | EventMask::LOG));
                 }
             }
@@ -2515,7 +2573,7 @@ impl RecordInstance {
                 && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
             {
                 if let Some(val) = self.resolve_field(field) {
-                    let changed = match self.last_posted.get(field) {
+                    let changed = match self.posted_value(field) {
                         Some(prev) => prev != &val,
                         None => true,
                     };
@@ -2532,26 +2590,28 @@ impl RecordInstance {
                             crate::server::record::ValuePostGate::WithValue => include_val,
                         };
                         if post {
-                            sub_updates.push((field.clone(), val, deadband_mask));
+                            sub_updates.push((field.clone(), val.clone(), deadband_mask));
                         }
                     } else if changed {
                         let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
-                        sub_updates.push((field.clone(), val, mask));
+                        sub_updates.push((field.clone(), val.clone(), mask));
                     } else if force_fields.contains(&field.as_str()) {
                         // C `monitor()` posts a re-marked field with
                         // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                        sub_updates.push((field.clone(), val, aux_mask));
+                        sub_updates.push((field.clone(), val.clone(), aux_mask));
                     } else if alarm_fanout.contains(&field.as_str()) {
-                        sub_updates.push((field.clone(), val, alarm_bits));
-                    } else if log_swept.contains(&field.as_str()) {
-                        // C scalerRecord.c:770-787 `monitor()`: every idle
-                        // process re-posts each S1..Snch with a literal
-                        // DBE_LOG regardless of change. A value-only field
-                        // (e.g. Sn) posts DBE_VALUE only on a counting
-                        // change, so the DBE_LOG subscriber is served here
-                        // by the idle sweep — and Sn does not change on an
-                        // idle cycle, so changed/unchanged stay disjoint
-                        // (no double post).
+                        sub_updates.push((field.clone(), val.clone(), alarm_bits));
+                    }
+                    // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
+                    // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
+                    // scalerRecord.c:510). That sweep is INDEPENDENT of the change post,
+                    // not an alternative to it: on the count-completion cycle `ss` is
+                    // IDLE and `updateCounts()` has ALREADY posted each changed Sn with
+                    // DBE_VALUE (:582), so C emits two events for that field in that one
+                    // cycle — DBE_VALUE, then DBE_LOG. Making this an `else if` on
+                    // `changed` dropped the DBE_LOG half exactly when it matters: a
+                    // DBE_LOG-only archiver would never receive the final counts.
+                    if log_swept.contains(&field.as_str()) {
                         sub_updates.push((field.clone(), val, EventMask::LOG));
                     }
                 }
@@ -2559,7 +2619,7 @@ impl RecordInstance {
         }
         if !sub_updates.is_empty() {
             for (field, val, _) in &sub_updates {
-                self.last_posted.insert(field.clone(), val.clone());
+                self.record_value_post(field, val.clone());
             }
             changed_fields.extend(sub_updates);
         }
@@ -2682,7 +2742,21 @@ impl RecordInstance {
             mask |= EventMask::LOG;
         }
 
-        let value = if mask.is_empty() {
+        // The closed set applies to THIS post too. `process_posted_fields` is
+        // "the CLOSED set of fields a process cycle of this record may post" —
+        // and the deadband post is a post. A record whose C `monitor()` never
+        // names the deadband field must not have one invented for it: transform
+        // `monitor()` (transformRecord.c:786-808) walks A..P and posts no VAL
+        // at all — VAL is an inert dummy (`:422`) — so an alarm cycle, whose
+        // `alarm_bits` alone make `mask` non-empty, was firing a `.VAL` monitor
+        // C never sends. Gating here rather than at each builder keeps the
+        // single owner of the deadband post the single enforcer of the set.
+        let in_closed_set = self
+            .record
+            .process_posted_fields()
+            .is_none_or(|allowed| allowed.contains(&field));
+
+        let value = if mask.is_empty() || !in_closed_set {
             None
         } else if field == "VAL" {
             self.record.val()
@@ -2899,7 +2973,7 @@ impl RecordInstance {
     }
 
     /// Notify subscribers of a specific field, filtering by event mask.
-    pub fn notify_field(&self, field: &str, mask: crate::server::recgbl::EventMask) {
+    pub fn notify_field(&mut self, field: &str, mask: crate::server::recgbl::EventMask) {
         self.notify_field_with_origin(field, mask, 0);
     }
 
@@ -2909,7 +2983,7 @@ impl RecordInstance {
     /// value (the per-field `notify_field` already filters by mask
     /// intersection). Used by the alarm-acknowledge (ACKT/ACKS) put path so
     /// an alarm-mask monitor on any field observes the acknowledgement.
-    pub fn notify_record_alarm(&self) {
+    pub fn notify_record_alarm(&mut self) {
         let fields: Vec<String> = self.subscribers.keys().cloned().collect();
         for field in fields {
             self.notify_field(&field, crate::server::recgbl::EventMask::ALARM);
@@ -2917,15 +2991,35 @@ impl RecordInstance {
     }
 
     /// Notify subscribers with an origin tag for self-write filtering.
+    ///
+    /// This is C `db_post_events(precord, pfield, mask)` for one field, and —
+    /// per the `last_posted` contract — the poster that advances the
+    /// already-published value when `mask` carries a value class. Taking
+    /// `&mut self` is what makes that unbypassable: there is no way to publish
+    /// a field's value through the framework without the change detector
+    /// learning that it was published.
     pub fn notify_field_with_origin(
-        &self,
+        &mut self,
         field: &str,
         mask: crate::server::recgbl::EventMask,
         origin: u64,
     ) {
         use crate::server::database::filters::FilteredMonitorEvent;
+        // A value-class post publishes the field to its DBE_VALUE/DBE_LOG
+        // subscribers, exactly as C's `dbPut` does for the put field
+        // (dbAccess.c:1414) — record it so the next process cycle's
+        // change-detection loop does not publish the same value a second
+        // time. An alarm-only / property-only post publishes no value, so it
+        // leaves the map alone.
+        let publishes_value = mask.intersects(
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+        );
+        let mut posted: Option<EpicsValue> = None;
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
+                if publishes_value {
+                    posted = Some(value.clone());
+                }
                 let mon_snap = self.make_monitor_snapshot(field, value);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
@@ -2962,6 +3056,15 @@ impl RecordInstance {
                     }
                 }
             }
+        }
+        // The value is now published to this field's value-class subscribers:
+        // hand it to the `last_posted` owner so the change detector does not
+        // publish it again. Delivery to any individual subscriber may have
+        // been filtered out, exactly as C's `db_post_events` may find an empty
+        // `mlis` — C still leaves `monitor()`'s `*_lst` state advanced by the
+        // cycle that ran, so the post, not the delivery, is what counts.
+        if let Some(value) = posted {
+            self.record_value_post(field, value);
         }
     }
 
@@ -3479,7 +3582,7 @@ mod metadata_cache_tests {
     /// the existing `notify_field_written` short-circuit.
     #[test]
     fn notify_field_written_if_changed_skips_non_metadata_field() {
-        let inst = ai_instance();
+        let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
         assert!(inst.metadata_cache.lock().unwrap().is_some());
         // VAL is not in is_metadata_field set — must be skipped even
@@ -3898,14 +4001,17 @@ mod metadata_cache_tests {
         }
     }
 
-    /// C scalerRecord.c:770-787 `monitor()` sweeps each active channel
-    /// with a literal `DBE_LOG` on every idle process: an UNCHANGED swept
-    /// field re-posts with `DBE_LOG` ONLY, while a CHANGED swept field is
-    /// delivered once by change-detection with `DBE_VALUE|DBE_LOG` (NOT
-    /// double-posted by the sweep). A non-swept field never re-posts when
-    /// unchanged. `add_subscriber` seeds `last_posted` with the current
-    /// value (the initial value goes out via EVENT_ADD), so a freshly
-    /// subscribed unchanged field already takes the sweep path on cycle 1.
+    /// C `scalerRecord.c::monitor():757-773` sweeps each active channel with a
+    /// literal `DBE_LOG` on every cycle it runs, unconditionally — the sweep is
+    /// INDEPENDENT of the change post, not an alternative to it (R12-62). So an
+    /// UNCHANGED swept field posts `DBE_LOG` only, and a CHANGED swept field
+    /// posts TWICE on that one cycle: once by change-detection, and once by the
+    /// sweep with `DBE_LOG`. (In C's scaler those two are `updateCounts()`'s
+    /// `DBE_VALUE` at `:582` and `monitor()`'s `DBE_LOG` at `:771`.) A
+    /// non-swept field never re-posts when unchanged. `add_subscriber` seeds
+    /// `last_posted` with the current value (the initial value goes out via
+    /// EVENT_ADD), so a freshly subscribed unchanged field already takes the
+    /// sweep path on cycle 1.
     #[test]
     fn log_swept_field_reposts_unchanged_with_log_mask_only() {
         use crate::server::recgbl::EventMask;
@@ -3964,20 +4070,32 @@ mod metadata_cache_tests {
             "idle sweep posts DBE_LOG only (no DBE_VALUE)"
         );
 
-        // Cycle 2: S1's count changed. Change-detection delivers it ONCE
-        // with DBE_VALUE|DBE_LOG; the sweep does NOT add a second post.
+        // Cycle 2: S1's count changed. Change-detection delivers it, and the
+        // sweep delivers it AGAIN with DBE_LOG — the two C `db_post_events`
+        // calls of the count-completion cycle.
         inst.record.put_field("S1", EpicsValue::Long(8)).unwrap();
         let (snap2, _) = inst.process_local().unwrap();
         assert_eq!(
             count_of(&snap2, "S1"),
-            1,
-            "a changed swept field posts exactly once (no double-post): {:?}",
+            2,
+            "a changed swept field posts twice — change post + independent \
+             DBE_LOG sweep: {:?}",
             snap2.changed_fields
         );
+        let s1_masks: Vec<u16> = snap2
+            .changed_fields
+            .iter()
+            .filter(|(n, _, _)| n == "S1")
+            .map(|(_, _, m)| m.bits())
+            .collect();
         assert_eq!(
-            mask_of(&snap2, "S1").unwrap().bits(),
-            (EventMask::VALUE | EventMask::LOG).bits(),
-            "a changed swept field posts VALUE|LOG via change-detection"
+            s1_masks,
+            vec![
+                (EventMask::VALUE | EventMask::LOG).bits(),
+                EventMask::LOG.bits()
+            ],
+            "change post first (VALUE|LOG here — this stub is not a \
+             value_only_change_fields record), then the sweep's literal DBE_LOG"
         );
 
         // Cycle 3: unchanged again — back to the DBE_LOG-only sweep.

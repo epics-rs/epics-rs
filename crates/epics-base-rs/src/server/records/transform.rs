@@ -4,8 +4,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue};
 
-use crate::calc::NumericInputs;
-use crate::calc::{CompiledExpr, compile, eval};
+use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_eval, scalc_result};
 
 const NUM_CHANNELS: usize = 16; // A-P
 
@@ -82,11 +81,21 @@ impl TransformRecord {
         Self::default()
     }
 
+    /// C `transformRecord.c` compiles every CLCx with **sCalcPostfix**, not
+    /// base's `postfix()`: `POSTFIX_SIZE` is `SCALC_INFIX_TO_POSTFIX_SIZE(...)`
+    /// (`:208`) and the evaluator is `sCalcPerform` (`:593`). The two engines
+    /// are not interchangeable — they have different element tables, and, the
+    /// reason this matters here, different failure rules (see the eval site in
+    /// `process`).
+    ///
+    /// C's `postfix_ok = *pclcbuf && (*prpcbuf != BAD_EXPRESSION)` (`:585`): an
+    /// EMPTY CLCx is not compiled and not evaluated — which is why the empty
+    /// case is `None` rather than sCalc's empty-but-valid program.
     fn recompile(&mut self, idx: usize) {
         if self.calcs[idx].is_empty() {
             self.compiled[idx] = None;
         } else {
-            self.compiled[idx] = compile(&self.calcs[idx]).ok();
+            self.compiled[idx] = scalc_compile(&self.calcs[idx]).ok();
         }
     }
 
@@ -554,16 +563,36 @@ impl Record for TransformRecord {
                 continue;
             }
             if let Some(ref compiled) = self.compiled[i] {
-                let mut inputs = NumericInputs::new();
-                inputs.vars[..NUM_CHANNELS].copy_from_slice(&self.vals);
-                // C `transformRecord.c:593` calls `sCalcPerform(&ptran->a, 16,
-                // ..., pval, ...)` with `pval = &ptran->a + i` (`:564`, `:569`),
-                // so the `VAL` token in CLCx pushes *this channel's* current
-                // value — not a single record-wide previous VAL, and not 0.
+                // C `transformRecord.c:593`:
+                //
+                //   sCalcPerform(&ptran->a, 16, NULL, 0, pval, NULL, 0, prpcbuf, ptran->prec)
+                //
+                // — the sCalc engine, with the record's sixteen channels as the
+                // numeric args and no string args. NOT base's `calcPerform`.
+                // The engines differ in the rule that decides this record's
+                // alarm: `sCalcPerform` ends with
+                //
+                //   return (((isnan(*presult)||isinf(*presult)) ? -1 : 0));   // :2056
+                //
+                // so a non-finite result — `1/0` → +inf, `0/0` → NaN — is a
+                // FAILURE, and `:593-596` turns it into CALC_ALARM/INVALID +
+                // udf. Base's `calcPerform` has no such check and returns 0 with
+                // the infinity in hand, which is what the port used to do:
+                // `CLCx = "1/0"` yielded `inf` with NO_ALARM. `scalc_eval` is
+                // the port's `sCalcPerform`, and it already owns the
+                // non-finite rule (`CalcError::NonFiniteResult`).
+                let mut inputs = StringInputs::new();
+                inputs.num_vars[..NUM_CHANNELS].copy_from_slice(&self.vals);
+                // `pval = &ptran->a + i` (`:564`, `:569`) is C's `presult`, and
+                // the `VAL` token (`FETCH_VAL`) pushes `*presult` — *this
+                // channel's* current value, not a record-wide previous VAL.
                 inputs.prev_val = self.vals[i];
-                match eval(compiled, &mut inputs) {
+                match scalc_eval(compiled, &mut inputs) {
                     Ok(result) => {
-                        self.vals[i] = result;
+                        // C's epilogue with `psresult == NULL`: `*presult` takes
+                        // the double, coercing a string result through `atof`.
+                        // `scalc_result` is the single owner of that coercion.
+                        self.vals[i] = scalc_result(&result).0;
                     }
                     Err(_) => {
                         // C `transformRecord.c:593-596`:
@@ -796,6 +825,23 @@ impl Record for TransformRecord {
         ]
     }
 
+    /// C `transformRecord.c::monitor()` (`:786-808`) is the record's ONLY
+    /// `db_post_events` caller, and it posts exactly the sixteen channels
+    /// A..P — the changed ones (plus every one of them on the first post).
+    /// Nothing else. In particular it does NOT post `VAL`: transform's VAL is
+    /// an inert dummy that `init_record` zeroes once (`:422`, *"Gotta have a
+    /// .val field"*) and no other line of the record reads, writes or posts.
+    ///
+    /// Declaring the closed set is what stops the framework from inventing a
+    /// `.VAL` monitor: the deadband post fires whenever ANY class fired, and
+    /// on an alarm cycle the alarm bits alone are enough — so a transform
+    /// whose input went INVALID was posting `.VAL` where C posts nothing.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+        ])
+    }
+
     /// Transform's UDF is C's `ptran->udf`: cleared at the top of every
     /// `process()` and set only by a failing channel calc. It is NOT derived
     /// from VAL — VAL is an inert dummy (R9-62).
@@ -858,28 +904,20 @@ static INP_FIELD_NAMES: [&str; NUM_CHANNELS] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calc::{CoreOp, ExprKind, Opcode};
     use crate::server::record::CommonFields;
 
-    /// A compiled program that compiles clean but fails at eval — the port's
-    /// analogue of C `sCalcPerform()` returning non-zero. Two constants and no
-    /// operator leave 2 values on the stack, which the numeric engine reports
-    /// as `CalcError::Internal`. The infix compiler's end-of-expression depth
-    /// check rejects every *string* form of this (see
-    /// `s6_transform_broken_calc_does_not_abort_sibling_channels`), so the
-    /// failing postfix program has to be installed directly — exactly the state
-    /// C guards against with its runtime check.
-    fn eval_failing_program() -> CompiledExpr {
-        CompiledExpr {
-            code: vec![
-                Opcode::Core(CoreOp::PushConst(1.0)),
-                Opcode::Core(CoreOp::PushConst(2.0)),
-                Opcode::Core(CoreOp::End),
-            ],
-            kind: ExprKind::Numeric,
-            loop_pairs: Vec::new(),
-        }
-    }
+    /// An expression that compiles clean and FAILS at eval — C
+    /// `sCalcPerform()` returning non-zero.
+    ///
+    /// `"1/0"` is the whole thing: it is a well-formed sCalc expression, it
+    /// evaluates to `+inf`, and `sCalcPerform` ends
+    /// `return (((isnan(*presult)||isinf(*presult)) ? -1 : 0));`
+    /// (sCalcPerform.c:2056) — so a non-finite result IS the failure. This is
+    /// reachable through the record's own CLCx put; no hand-built postfix
+    /// program is needed (the port previously evaluated CLCx with base's
+    /// numeric engine, which has no such check and hands back the infinity
+    /// with a zero return — hence `1/0` yielding `inf` and NO_ALARM).
+    const DIVIDE_BY_ZERO: &str = "1/0";
 
     /// R9-63 — a failing channel calc raises CALC_ALARM/INVALID and sets UDF.
     ///
@@ -890,8 +928,8 @@ mod tests {
     #[test]
     fn r9_63_calc_failure_raises_calc_alarm_and_udf() {
         let mut rec = TransformRecord::new();
-        rec.calcs[0] = "bad".into();
-        rec.compiled[0] = Some(eval_failing_program());
+        rec.put_field("CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()))
+            .unwrap();
         rec.process().unwrap();
 
         assert!(
@@ -921,8 +959,8 @@ mod tests {
     #[test]
     fn r9_63_calc_success_clears_the_previous_failure() {
         let mut rec = TransformRecord::new();
-        rec.calcs[0] = "bad".into();
-        rec.compiled[0] = Some(eval_failing_program());
+        rec.put_field("CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()))
+            .unwrap();
         rec.process().unwrap();
         assert!(rec.value_is_undefined());
 

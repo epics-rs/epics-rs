@@ -1483,7 +1483,18 @@ impl Record for AcalcoutRecord {
         }
 
         // C afterCalc line 304-305: a failed aCalcPerform raises CALC_ALARM.
-        if self.calc_alarm {
+        //
+        // `calc_alarm` is a pending flag with ONE producer (the calc, above) and
+        // ONE consumer (this hook) — the same shape as `calc`/`calcout`/
+        // `scalcout`/`swait`. Take it, so no later reader can mistake it for
+        // "the record is INVALID": severity belongs to `common`, and the record
+        // must ask the framework, never this flag. It survives the ODLY
+        // delaying cycle un-taken on purpose — that cycle returns
+        // `AsyncPendingNotify` before the framework runs `check_alarms` (C
+        // returns ASYNC before `monitor()`, so `nsta`/`nsev` stay pending too),
+        // and the DLYA continuation consumes it here, exactly where C's
+        // `recGblResetAlarms` commits the pending `nsev`.
+        if std::mem::take(&mut self.calc_alarm) {
             recgbl::rec_gbl_set_sevr_msg(
                 common,
                 alarm_status::CALC_ALARM,
@@ -1545,14 +1556,23 @@ impl Record for AcalcoutRecord {
     }
 
     /// IVOA=SetIVOV severity hook. The framework calls this when SEVR is
-    /// INVALID and IVOA=2; `process()` already owns the calc-failure path, so
-    /// this only reinforces the same field write (idempotently). Overriding
-    /// the trait default (which writes VAL via `set_val`) avoids a divergent
-    /// VAL write under `DOPT=Use OCAL`, where the OUT link reads OAV, not VAL.
-    /// Gated on `calc_alarm` + the OOPT decision so it stays consistent with
-    /// `process()` (C `execOutput` runs IVOA only when the record outputs).
+    /// INVALID and IVOA=2. Overriding the trait default (which writes VAL via
+    /// `set_val`) targets the field OUT consumes, not VAL — see the module doc.
+    ///
+    /// The ONLY record-side gate is the output decision: C reaches the IVOA
+    /// switch through `execOutput` (aCalcoutRecord.c:933-937), and `execOutput`
+    /// runs only when `afterCalc`'s OOPT decision says the record outputs
+    /// (:338-352, and the DLYA continuation at :425-428). The severity test
+    /// inside it is `if (pcalc->nsev < INVALID_ALARM)` (:915) — the RECORD's
+    /// severity, from ANY source: a CALC failure, an MS input link, a limit
+    /// alarm at INVALID severity, UDF at UDFS=INVALID. It was gated on
+    /// `calc_alarm` as well, which silently narrowed C's rule to the calc
+    /// failure alone — an acalcout driven INVALID by HIHI/HHSV or by an MS link
+    /// then drove the computed value at IVOA=SetIVOV instead of IVOV. The
+    /// framework already evaluated `nsev` (it is why this hook was called), so
+    /// asking a private flag for the severity is both wrong and redundant.
     fn apply_invalid_output_value(&mut self, _ivov: EpicsValue) -> CaResult<()> {
-        if self.calc_alarm && self.cached_should_output {
+        if self.cached_should_output {
             self.set_output_to_ivov();
         }
         Ok(())
@@ -1608,7 +1628,6 @@ impl Record for AcalcoutRecord {
             "AMEM" => Some(EpicsValue::Long(self.amem)),
             "PMEM" => Some(EpicsValue::Long(self.pmem)),
             "VERS" => Some(EpicsValue::Double(VERSION)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));

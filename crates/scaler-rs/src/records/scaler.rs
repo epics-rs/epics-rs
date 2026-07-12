@@ -999,15 +999,33 @@ impl Record for ScalerRecord {
                             _ => {}
                         }
                     }
+                    // C:655 — `if (pscal->scan) scanOnce((void *)pscal);`,
+                    // the last statement of the handle-it-now arm. The state
+                    // change above (REQSTART / abort) is acted on by
+                    // `process()`, and a non-Passive scaler gets no process
+                    // from this put — without the scan-once it would sit on
+                    // the new state until the next periodic scan. The
+                    // `if (pscal->scan)` half of the guard belongs to the
+                    // framework (see `ProcessAction::ScanOnce`), which drops
+                    // the action for a Passive record whose put processes it
+                    // anyway. Not emitted in the delayed arm below: C does not
+                    // call `scanOnce` there either — `delayCallbackFunc` does,
+                    // when the delay expires.
+                    self.special_actions.push(ProcessAction::ScanOnce);
                 } else {
                     // C:657-661 — schedule the delayed start callback.
                     self.us = USER_STATE_WAITING;
                     self.delay_start = Some(Instant::now());
                 }
             }
-            // C scalerRecord.c:664-668 — CONT just rescans; the framework
-            // handles process-passive rescan, so nothing to do here.
-            "CONT" => {}
+            // C scalerRecord.c:664-668 — CONT. The write changes auto-count
+            // mode, which only `process()` acts on, so C rescans the record:
+            // `if (pscal->scan) scanOnce((void *)pscal);` (:667). A Passive
+            // scaler is processed by the put itself (CONT is `pp(TRUE)`) and the
+            // framework drops the action for it — same gate C writes inline.
+            "CONT" => {
+                self.special_actions.push(ProcessAction::ScanOnce);
+            }
             // C scalerRecord.c:670-677 — TP (truncating tp->pr1, d1=g1=1).
             "TP" => {
                 self.tp_to_pr1();
@@ -1297,10 +1315,16 @@ impl Record for ScalerRecord {
     /// change — so an archiver `camonitor SCALER:Sn` receives an event on
     /// every idle scan, even when the count is unchanged. A counting or
     /// WAITING cycle does not call `monitor()`, so the sweep is empty
-    /// there. The framework's snapshot builder posts each returned field
-    /// with `DBE_LOG` only (a field that also changed this cycle is
-    /// already delivered with `DBE_VALUE|DBE_LOG`, so it is not
-    /// double-posted). Slicing the static `SN_FIELD_NAMES` to `nch`
+    /// there.
+    ///
+    /// The sweep is INDEPENDENT of the change post, and the
+    /// count-completion cycle is where that matters: the done-interrupt
+    /// sets `ss = IDLE` (`:367`), `updateCounts()` posts each changed `Sn`
+    /// with `DBE_VALUE` (`:582`), and `monitor()` then posts the SAME `Sn`
+    /// with `DBE_LOG` (`:771`). Both events fire on that one cycle, so the
+    /// framework emits the sweep post in addition to the change post — the
+    /// final counts are the only `Sn` value a `DBE_LOG`-only archiver ever
+    /// cares about. Slicing the static `SN_FIELD_NAMES` to `nch`
     /// avoids a per-call allocation; the unsafe `'static` re-view matches
     /// `field_list` above (the `LazyLock` lives for the program and
     /// `active_channels() <= SN_FIELD_NAMES.len()`).
@@ -1326,17 +1350,19 @@ impl Record for ScalerRecord {
 
     /// C's scaler posts a FIXED list from a process cycle (see
     /// [`PROCESS_POSTED_BY_NCH`]) and leaves every other field it wrote silent.
-    /// Declaring that list closes two spurious-event families the framework's
+    /// Declaring that list closes the spurious-event family the framework's
     /// generic "post whatever changed" rule opened:
     ///
     /// * `D1..Dnch` — `process()` copies the gates into them on every count
     ///   start (`scalerRecord.c:413-414`, `:525-526`) and posts NOTHING; C's
     ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:704`). The port
     ///   change-detected the copy and fired a `Dn` monitor C never sends.
-    /// * `G1..Gnch`, `PR2..PRnch` — a put posts them (C `dbPut`), but the put
-    ///   path does not advance `last_posted`, so the next process cycle
-    ///   change-detected them a SECOND time. C's `process()` posts no `Gn` at
-    ///   all, and `PRn` only for n = 1.
+    ///
+    /// `G1..Gnch` and `PR2..PRnch` stay outside the set for the same C reason —
+    /// `process()` posts no `Gn` at all, and `PRn` only for n = 1 — NOT to
+    /// compensate for a framework defect: the put-time double post (R11-C10,
+    /// `last_posted` not advanced by the put's own post) is fixed at the
+    /// framework, in `RecordInstance::notify_field_with_origin`.
     ///
     /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
     /// count-start preset recompute moved it.

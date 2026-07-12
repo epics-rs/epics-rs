@@ -3499,7 +3499,7 @@ async fn test_dbnd_filter_passes_alarm_events() {
     // But an ALARM-tagged emission with the SAME value MUST pass —
     // the filter's "always-pass alarm" rule.
     {
-        let inst = rec.read().await;
+        let mut inst = rec.write().await;
         inst.notify_field("VAL", EventMask::ALARM);
     }
     rx.try_recv().expect("alarm event passes the filter");
@@ -3533,7 +3533,7 @@ async fn test_notify_field_respects_mask() {
         (value_rx, alarm_rx)
     };
     {
-        let inst = rec.read().await;
+        let mut inst = rec.write().await;
         inst.notify_field("VAL", EventMask::VALUE);
     }
     assert!(value_rx.try_recv().is_ok());
@@ -9791,4 +9791,75 @@ async fn test_state_oval_not_monitor_posted() {
         oval_rx.try_recv().is_err(),
         "OVAL is a SPC_NOMOD tracker C never posts; it must not monitor-post"
     );
+}
+
+/// R11-C10 — a put's `db_post_events` is the record's ONLY post for that put.
+///
+/// C `dbAccess.c::dbPut:1407-1414` posts the put field once with
+/// `DBE_VALUE|DBE_LOG`, and no record's `monitor()` re-posts it: `monitor()`
+/// posts a closed set and compares against the record's own `*_lst` / MARK
+/// state, which the put never touched but the put's post did satisfy.
+///
+/// The port's put path posted the field but did not advance `last_posted`, so
+/// the NEXT process cycle's generic change-detection loop compared the new
+/// value against the pre-put one, found it "changed", and published a SECOND
+/// event that C never sends. `SVAL` (ai simulation value) is the sample: a
+/// plain, non-`pp(TRUE)`, non-metadata auxiliary field.
+#[tokio::test]
+async fn test_put_time_post_is_the_only_post_for_that_put() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("PUTPOST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sval_rx = {
+        let rec = db.get_record("PUTPOST").await.expect("record exists");
+        let mut inst = rec.write().await;
+        inst.add_subscriber("SVAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("SVAL subscription accepted")
+    };
+
+    // The put itself: C posts SVAL once (DBE_VALUE|DBE_LOG). SVAL is not
+    // pp(TRUE), so `dbPutField` runs no process cycle either.
+    db.put_record_field_from_ca("PUTPOST", "SVAL", EpicsValue::Double(7.5))
+        .await
+        .unwrap();
+    sval_rx
+        .try_recv()
+        .expect("the put must post SVAL exactly once");
+    assert!(
+        sval_rx.try_recv().is_err(),
+        "the put must post SVAL exactly once"
+    );
+
+    // The next process cycle re-reads every subscribed field. SVAL has not
+    // moved since the put published it, so C's `monitor()` sends nothing.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PUTPOST", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        sval_rx.try_recv().is_err(),
+        "process must NOT re-post a field the put already published"
+    );
+
+    // The change detector is still live: a value that moves without a post
+    // still publishes on the next cycle.
+    {
+        let rec = db.get_record("PUTPOST").await.expect("record exists");
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("SVAL", EpicsValue::Double(9.0))
+            .unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PUTPOST", &mut visited, 0)
+        .await
+        .unwrap();
+    sval_rx
+        .try_recv()
+        .expect("an unposted SVAL change must still publish on the next cycle");
 }

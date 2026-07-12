@@ -47,6 +47,16 @@ pub struct SwaitRecord {
     /// (the fetch gate failed, or the record is simulated) therefore raises no
     /// CALC_ALARM, exactly as C's per-cycle `nsev`/`nsta` do.
     calc_alarm: bool,
+    /// A successful `calcPerform` ran this cycle — C `swaitRecord.c:411`
+    /// (`} else pwait->udf = FALSE;`), the ONLY place swait's own code clears
+    /// UDF (the other, `:419`, is the simulation SIOL read, which the
+    /// framework's simulation owner performs). Same producer/consumer shape as
+    /// [`Self::calc_alarm`]: raised by the calc, consumed by
+    /// [`Record::check_alarms`], which is the only code allowed to touch
+    /// `common.udf` on swait's behalf. C never sets `udf = TRUE` and never
+    /// re-derives it from VAL, so nothing else may either — see
+    /// [`Record::clears_udf`]/[`Record::raises_udf_alarm`] below.
+    calc_succeeded: bool,
     pub oopt: i16,
     pub dopt: i16,
     // DOLN ("DOL PV Name", C `swaitRecord.dbd:150`, DBF_STRING/SPC_MOD) and
@@ -173,6 +183,7 @@ impl Default for SwaitRecord {
             compiled_calc: CompiledExpr::empty(ExprKind::Numeric),
             clcv: 0,
             calc_alarm: false,
+            calc_succeeded: false,
             oopt: 0,
             dopt: 0,
             doln: String::new(),
@@ -881,6 +892,35 @@ impl Record for SwaitRecord {
         if self.fetch_gate_failed {
             recgbl::rec_gbl_set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
         }
+
+        // C `swaitRecord.c:411` — the ONE swait-owned UDF write, and it only
+        // ever clears. Applied here because `check_alarms` is the only hook
+        // that owns `common`; the calc raised the flag, this consumes it. A
+        // cycle whose calc failed, or that never ran one (fetch gate, or a
+        // simulated cycle — where the framework's SIOL owner has already done
+        // C `:419` itself), leaves UDF exactly as it was.
+        if std::mem::take(&mut self.calc_succeeded) {
+            common.udf = false;
+        }
+    }
+
+    /// C `swaitRecord.c` never assigns `udf = TRUE` and never re-derives UDF
+    /// from VAL — the record has no `checkAlarms` at all. So the framework's
+    /// per-cycle `udf = value_is_undefined()` must not run: it invented a UDF
+    /// that C does not have (a `0/0` VAL is NaN, yet C's `calcPerform` returns
+    /// 0 and `:411` clears UDF) and, conversely, cleared the UDF of a swait
+    /// whose calc had never once succeeded, just because VAL happened not to be
+    /// NaN. UDF is set only at init and cleared only by `check_alarms` (:411)
+    /// and by the simulation SIOL read (:419).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// C swait has no UDF guard anywhere (`swaitRecord.c` names UDF_ALARM in no
+    /// line), so an undefined swait reports NO alarm from UDF — only the
+    /// CALC/READ/SIMM alarms above. See [`Record::raises_udf_alarm`].
+    fn raises_udf_alarm(&self) -> bool {
+        false
     }
 
     /// C `swaitRecord.c::fetch_values` (686-705) returns at the FIRST input that
@@ -961,7 +1001,15 @@ impl Record for SwaitRecord {
             // fails here every cycle.
             let mut inputs = self.build_inputs(self.val);
             match calc_eval(&self.compiled_calc, &mut inputs) {
-                Ok(v) => self.val = v,
+                Ok(v) => {
+                    self.val = v;
+                    // C `:411` — `} else pwait->udf = FALSE;`. calcPerform's
+                    // status is the whole test: a NaN/Inf result is a SUCCESS
+                    // to base's calcPerform (it has no isnan check, unlike
+                    // sCalcPerform), so `0/0` clears UDF here just as `1+1`
+                    // does. `check_alarms` applies it.
+                    self.calc_succeeded = true;
+                }
                 Err(_) => self.calc_alarm = true,
             }
         }

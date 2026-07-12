@@ -2462,7 +2462,7 @@ impl PvDatabase {
                 // DBE_ALARM bit.
                 let mut changed_fields = Vec::new();
                 for (name, val) in fields {
-                    let changed = match instance.last_posted.get(&name) {
+                    let changed = match instance.posted_value(&name) {
                         Some(prev) => prev != &val,
                         None => true,
                     };
@@ -2473,7 +2473,7 @@ impl PvDatabase {
                                 instance.common.mlst = Some(f);
                             }
                         }
-                        instance.last_posted.insert(name.clone(), val.clone());
+                        instance.record_value_post(&name, val.clone());
                         changed_fields.push((
                             name,
                             val,
@@ -3075,7 +3075,7 @@ impl PvDatabase {
                     && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
                 {
                     if let Some(val) = instance.resolve_field(field) {
-                        let changed = match instance.last_posted.get(field) {
+                        let changed = match instance.posted_value(field) {
                             Some(prev) => prev != &val,
                             None => true,
                         };
@@ -3093,27 +3093,28 @@ impl PvDatabase {
                                 ValuePostGate::WithValue => include_val,
                             };
                             if post {
-                                sub_updates.push((field.clone(), val, deadband_mask));
+                                sub_updates.push((field.clone(), val.clone(), deadband_mask));
                             }
                         } else if changed {
                             let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
-                            sub_updates.push((field.clone(), val, mask));
+                            sub_updates.push((field.clone(), val.clone(), mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
                             // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                            sub_updates.push((field.clone(), val, aux_mask));
+                            sub_updates.push((field.clone(), val.clone(), aux_mask));
                         } else if alarm_fanout.contains(&field.as_str()) {
-                            sub_updates.push((field.clone(), val, alarm_bits));
-                        } else if log_swept.contains(&field.as_str()) {
-                            // C scalerRecord.c:770-787 `monitor()`: every
-                            // idle process re-posts each S1..Snch with a
-                            // literal DBE_LOG regardless of change. A
-                            // value-only field (e.g. Sn) posts DBE_VALUE
-                            // only on a counting change, so the DBE_LOG
-                            // subscriber is served here by the idle sweep;
-                            // Sn does not change on an idle cycle, so
-                            // changed/unchanged stay disjoint (no double
-                            // post).
+                            sub_updates.push((field.clone(), val.clone(), alarm_bits));
+                        }
+                        // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
+                        // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
+                        // scalerRecord.c:510). That sweep is INDEPENDENT of the change post,
+                        // not an alternative to it: on the count-completion cycle `ss` is
+                        // IDLE and `updateCounts()` has ALREADY posted each changed Sn with
+                        // DBE_VALUE (:582), so C emits two events for that field in that one
+                        // cycle — DBE_VALUE, then DBE_LOG. Making this an `else if` on
+                        // `changed` dropped the DBE_LOG half exactly when it matters: a
+                        // DBE_LOG-only archiver would never receive the final counts.
+                        if log_swept.contains(&field.as_str()) {
                             sub_updates.push((field.clone(), val, EventMask::LOG));
                         }
                     }
@@ -3121,7 +3122,7 @@ impl PvDatabase {
             }
             if !sub_updates.is_empty() {
                 for (field, val, _) in &sub_updates {
-                    instance.last_posted.insert(field.clone(), val.clone());
+                    instance.record_value_post(field, val.clone());
                 }
                 changed_fields.extend(sub_updates);
             }
@@ -3187,7 +3188,10 @@ impl PvDatabase {
 
         // 3. Notify subscribers (outside lock)
         {
-            let instance = rec.read().await;
+            // Write guard: a value-class post advances the record's
+            // already-published state (`RecordInstance::record_value_post`),
+            // so posting is a `&mut` operation.
+            let mut instance = rec.write().await;
             instance.notify_from_snapshot(&snapshot);
             // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
             // individual C masks — see recGblResetAlarms above.
@@ -3889,6 +3893,33 @@ impl PvDatabase {
                     // SDLY async-simulation defer.
                     self.schedule_delayed_reprocess(record_name, delay).await;
                 }
+                ProcessAction::ScanOnce => {
+                    // C `scanOnce(precord)`. The `if (precord->scan)` guard C
+                    // writes at every `special()` call site (scalerRecord.c:655,
+                    // :667) is owned HERE: a Passive record is already processed
+                    // by the put's own `pp(TRUE)` path (dbAccess.c:1265-1268), so
+                    // scanning it again would double-process; a non-Passive
+                    // record gets no process from the put at all, which is the
+                    // whole reason C makes the call — without it the state
+                    // change waits for the next periodic scan.
+                    let passive = {
+                        let instance = rec.read().await;
+                        instance.common.scan == crate::server::record::ScanType::Passive
+                    };
+                    if !passive {
+                        // Queued, not awaited: C's `scanOnce` hands the record
+                        // to the scan-once thread, which takes `dbScanLock` —
+                        // the process lands after the putting thread leaves
+                        // `dbPutField` and releases the record gate this call is
+                        // still holding.
+                        let db = self.clone();
+                        let name = record_name.to_string();
+                        tokio::spawn(async move {
+                            let mut visited = HashSet::new();
+                            let _ = db.process_record_with_links(&name, &mut visited, 0).await;
+                        });
+                    }
+                }
                 ProcessAction::WriteDbLinkNotify { link_field, value } => {
                     // C `sseqRecord.c` WAITn put-callback dependency: write
                     // the OUT link as a put-WITH-completion and re-enter THIS
@@ -4229,7 +4260,7 @@ impl PvDatabase {
                     && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
                 {
                     if let Some(val) = instance.resolve_field(field) {
-                        let changed = match instance.last_posted.get(field) {
+                        let changed = match instance.posted_value(field) {
                             Some(prev) => prev != &val,
                             None => true,
                         };
@@ -4247,27 +4278,28 @@ impl PvDatabase {
                                 ValuePostGate::WithValue => include_val,
                             };
                             if post {
-                                sub_updates.push((field.clone(), val, deadband_mask));
+                                sub_updates.push((field.clone(), val.clone(), deadband_mask));
                             }
                         } else if changed {
                             let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
-                            sub_updates.push((field.clone(), val, mask));
+                            sub_updates.push((field.clone(), val.clone(), mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
                             // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                            sub_updates.push((field.clone(), val, aux_mask));
+                            sub_updates.push((field.clone(), val.clone(), aux_mask));
                         } else if alarm_fanout.contains(&field.as_str()) {
-                            sub_updates.push((field.clone(), val, alarm_bits));
-                        } else if log_swept.contains(&field.as_str()) {
-                            // C scalerRecord.c:770-787 `monitor()`: every
-                            // idle process re-posts each S1..Snch with a
-                            // literal DBE_LOG regardless of change. A
-                            // value-only field (e.g. Sn) posts DBE_VALUE
-                            // only on a counting change, so the DBE_LOG
-                            // subscriber is served here by the idle sweep;
-                            // Sn does not change on an idle cycle, so
-                            // changed/unchanged stay disjoint (no double
-                            // post).
+                            sub_updates.push((field.clone(), val.clone(), alarm_bits));
+                        }
+                        // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
+                        // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
+                        // scalerRecord.c:510). That sweep is INDEPENDENT of the change post,
+                        // not an alternative to it: on the count-completion cycle `ss` is
+                        // IDLE and `updateCounts()` has ALREADY posted each changed Sn with
+                        // DBE_VALUE (:582), so C emits two events for that field in that one
+                        // cycle — DBE_VALUE, then DBE_LOG. Making this an `else if` on
+                        // `changed` dropped the DBE_LOG half exactly when it matters: a
+                        // DBE_LOG-only archiver would never receive the final counts.
+                        if log_swept.contains(&field.as_str()) {
                             sub_updates.push((field.clone(), val, EventMask::LOG));
                         }
                     }
@@ -4275,7 +4307,7 @@ impl PvDatabase {
             }
             if !sub_updates.is_empty() {
                 for (field, val, _) in &sub_updates {
-                    instance.last_posted.insert(field.clone(), val.clone());
+                    instance.record_value_post(field, val.clone());
                 }
                 changed_fields.extend(sub_updates);
             }
@@ -4394,7 +4426,10 @@ impl PvDatabase {
 
         // Notify subscribers
         {
-            let instance = rec.read().await;
+            // Write guard: a value-class post advances the record's
+            // already-published state (`RecordInstance::record_value_post`),
+            // so posting is a `&mut` operation.
+            let mut instance = rec.write().await;
             instance.notify_from_snapshot(&snapshot);
             // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
             // individual C masks — see recGblResetAlarms above.
@@ -5360,7 +5395,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
             && !event_posted.contains(&field.as_str())
         {
             if let Some(val) = instance.resolve_field(field) {
-                let changed = match instance.last_posted.get(field) {
+                let changed = match instance.posted_value(field) {
                     Some(prev) => prev != &val,
                     None => true,
                 };
@@ -5373,25 +5408,28 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                         ValuePostGate::WithValue => include_val,
                     };
                     if post {
-                        sub_updates.push((field.clone(), val, deadband_mask));
+                        sub_updates.push((field.clone(), val.clone(), deadband_mask));
                     }
                 } else if changed {
                     let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
-                    sub_updates.push((field.clone(), val, mask));
+                    sub_updates.push((field.clone(), val.clone(), mask));
                 } else if force_fields.contains(&field.as_str()) {
                     // C `monitor()` posts a re-marked field with
                     // `monitor_mask | DBE_VAL_LOG` even when unchanged.
-                    sub_updates.push((field.clone(), val, aux_mask));
+                    sub_updates.push((field.clone(), val.clone(), aux_mask));
                 } else if alarm_fanout.contains(&field.as_str()) {
-                    sub_updates.push((field.clone(), val, alarm_bits));
-                } else if log_swept.contains(&field.as_str()) {
-                    // C scalerRecord.c:770-787 `monitor()`: every idle
-                    // process re-posts each S1..Snch with a literal
-                    // DBE_LOG regardless of change. A value-only field
-                    // (e.g. Sn) posts DBE_VALUE only on a counting change,
-                    // so the DBE_LOG subscriber is served here by the idle
-                    // sweep; Sn does not change on an idle cycle, so
-                    // changed/unchanged stay disjoint (no double post).
+                    sub_updates.push((field.clone(), val.clone(), alarm_bits));
+                }
+                // C `scalerRecord.c::monitor():757-773` posts EVERY S1..Snch with a
+                // literal DBE_LOG on every cycle it runs (it runs when `ss == IDLE`,
+                // scalerRecord.c:510). That sweep is INDEPENDENT of the change post,
+                // not an alternative to it: on the count-completion cycle `ss` is
+                // IDLE and `updateCounts()` has ALREADY posted each changed Sn with
+                // DBE_VALUE (:582), so C emits two events for that field in that one
+                // cycle — DBE_VALUE, then DBE_LOG. Making this an `else if` on
+                // `changed` dropped the DBE_LOG half exactly when it matters: a
+                // DBE_LOG-only archiver would never receive the final counts.
+                if log_swept.contains(&field.as_str()) {
                     sub_updates.push((field.clone(), val, EventMask::LOG));
                 }
             }
@@ -5399,7 +5437,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     }
     if !sub_updates.is_empty() {
         for (field, val, _) in &sub_updates {
-            instance.last_posted.insert(field.clone(), val.clone());
+            instance.record_value_post(field, val.clone());
         }
         changed_fields.extend(sub_updates);
     }

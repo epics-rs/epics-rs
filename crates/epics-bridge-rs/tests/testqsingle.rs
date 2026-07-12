@@ -533,7 +533,7 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     mon.start().await.expect("start");
     {
         let rec = db.get_record("TEST:filt_wf").await.expect("rec");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
         .await
@@ -937,7 +937,7 @@ async fn monitor_stop_disables_backing_subscription() {
 
     async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
         let rec = db.get_record("TEST:gate_ai").await.expect("rec");
-        rec.read().await.notify_field("VAL", mask);
+        rec.write().await.notify_field("VAL", mask);
     }
 
     // Active (post-START): a VALUE post is delivered.

@@ -330,7 +330,7 @@ async fn group_monitor_subscribes_archive_log_events() {
     // initial frame), so this delta must wake poll() directly.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        let inst = rec.read().await;
+        let mut inst = rec.write().await;
         inst.notify_field("VAL", EventMask::LOG);
     }
 
@@ -733,7 +733,7 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
     mon.start().await.expect("start");
     for rec_name in ["TEST:level_na", "TEST:count_na"] {
         let rec = db.get_record(rec_name).await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
         .await
@@ -898,7 +898,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     // A `level` post triggers only `count`.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -914,7 +914,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     // A `count` post triggers only `level`.
     {
         let rec = db.get_record("TEST:count").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -962,7 +962,7 @@ async fn br_fr12_pure_self_trigger_derives_bitset() {
     // rather than carrying an explicit marked set.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1009,7 +1009,7 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
     // Only `level` changes after start; `count` never posts.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1498,7 +1498,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
 
     async fn post(db: &Arc<PvDatabase>) {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.read().await.notify_field("VAL", EventMask::VALUE);
+        rec.write().await.notify_field("VAL", EventMask::VALUE);
     }
 
     // Active (post-START): a member post wakes the group poll.

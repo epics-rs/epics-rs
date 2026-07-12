@@ -1379,6 +1379,19 @@ const OPTION_READBACK_KEYS: &[&str] = &[
     "disconnectOnReadTimeout",
 ];
 
+/// The fields C `monitorStatus` POST_IF_NEWs (asynRecord.c:1102-1141) — the
+/// readbacks it re-imports from the trace manager and the port, plus the two it
+/// posts because `special()` changed them behind the operator's back (REASON and
+/// the DRVINFO its put blanks, :488-489).
+///
+/// TFIL is in the list: C posts it from the same function, substituting
+/// "Unknown" when another thread re-pointed the trace file (:1119-1124).
+const MONITOR_STATUS_FIELDS: &[&str] = &[
+    "TMSK", "TB0", "TB1", "TB2", "TB3", "TB4", "TB5", "TIOM", "TIB0", "TIB1", "TIB2", "TINM",
+    "TINB0", "TINB1", "TINB2", "TINB3", "TSIZ", "TFIL", "AUCT", "CNCT", "PCNCT", "REASON",
+    "DRVINFO", "ENBL", "OCTETIV", "OPTIONIV", "GPIBIV", "I32IV", "UI32IV", "F64IV",
+];
+
 /// The driver option key C's HOSTINFO field writes (asynRecord.c:1802-1806) —
 /// the one option put C queues on a port that is not connected.
 const HOSTINFO_OPTION_KEY: &str = "hostinfo";
@@ -4093,13 +4106,30 @@ impl Record for AsynRecord {
             }
 
             // REASON change. C `special()` case asynRecordREASON
-            // (asynRecord.c:487-492) assigns `pasynUser->reason` and then calls
-            // `cancelIOInterruptScan` — the registration was made for the old
-            // reason.
+            // (asynRecord.c:487-492) runs four statements, and the port ran two.
+            //
+            // `strcpy(pasynRec->drvinfo, "")` (:489) is not cosmetic — it is what
+            // makes the operator's put *stick*. DRVINFO is the other way to set
+            // REASON: `connectDevice` re-resolves it through
+            // `asynDrvUser->create` and assigns the result over REASON whenever
+            // DRVINFO is non-empty (:1248-1254). Leaving the old DRVINFO in place
+            // meant the next reconnect — a PORT/ADDR put, a PCNCT=1, an IOC
+            // restart with a saved DRVINFO — silently re-resolved REASON from a
+            // string the operator had just overridden by hand.
+            //
+            // `monitorStatus` (:491) is the only place C posts DRVINFO
+            // (:1129-1132), so without it the blank never reaches the operator's
+            // screen; it also re-imports the trace / enable / auto-connect /
+            // connect readbacks, which is why the whole [`MONITOR_STATUS_FIELDS`]
+            // set is what gets POST_IF_NEW'd here and not just DRVINFO.
             "REASON" => {
                 self.resolved_reason = self.reason as usize;
+                let before = self.field_snapshot(MONITOR_STATUS_FIELDS);
+                self.drvinfo.clear();
                 self.cancel_io_interrupt_scan();
                 self.publish_io_intr_binding();
+                self.monitor_status();
+                self.post_if_new(&before);
             }
 
             // --- Serial options ---
@@ -8769,6 +8799,51 @@ mod tests {
             rec.errs, "asynDrvUser not supported but drvInfo not blank",
             "C reportError text (asynRecord.c:1264-1265)"
         );
+    }
+
+    /// R11-C8: a REASON put blanks DRVINFO — and that is what makes the put
+    /// stick.
+    ///
+    /// C's `special()` REASON arm runs four statements (asynRecord.c:487-492):
+    /// assign `pasynUser->reason`, `strcpy(pasynRec->drvinfo, "")`,
+    /// `cancelIOInterruptScan`, `monitorStatus`. The blank is load-bearing:
+    /// DRVINFO is the *other* way to set REASON, and `connectDevice` re-resolves
+    /// it through `asynDrvUser->create` and assigns the result over REASON
+    /// whenever it is non-empty (:1248-1254). Keeping the stale string meant the
+    /// next reconnect silently undid the operator's put.
+    #[test]
+    fn a_reason_put_blanks_drvinfo_so_a_reconnect_cannot_undo_it() {
+        let port_name = "r11_c8_reason_put";
+        register_param_port(port_name, "GAIN");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "GAIN".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.reason, 1, "DRVINFO resolved GAIN to parameter 1");
+        assert_eq!(rec.resolved_reason, 1);
+
+        // The operator overrides REASON by hand.
+        rec.reason = 3;
+        rec.special("REASON", true).unwrap();
+        assert_eq!(
+            rec.resolved_reason, 3,
+            "C assigns pasynUser->reason from the field (asynRecord.c:488)"
+        );
+        assert_eq!(
+            rec.drvinfo, "",
+            "C blanks DRVINFO in the same arm (asynRecord.c:489)"
+        );
+
+        // The reconnect any PORT/ADDR put, PCNCT=1 or IOC restart performs must
+        // now leave the operator's REASON alone: there is no DRVINFO left to
+        // re-resolve it from.
+        rec.connect_device().unwrap();
+        assert_eq!(
+            rec.reason, 3,
+            "a stale DRVINFO would have re-resolved REASON back to 1"
+        );
+        assert_eq!(rec.resolved_reason, 3, "and the I/O user with it");
     }
 
     /// R11-48: the zeroing is unconditional — C runs `pasynRec->reason = 0` above

@@ -539,27 +539,32 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
     }
 }
 
-/// a group monitor stamps the *per-operation
-/// negotiated* `record._options.queueSize` — the value resolved
-/// from the MONITOR INIT pvRequest — not a hardcoded constant.
-/// pvxs `servermon.cpp:533-540` parses `record._options.queueSize`
-/// (kept iff >= 2) into `op->limit`, then `groupsource.cpp:359`
-/// stamps `stats.limitQueue` into the monitor value.
+/// R10-33 — a group monitor stamps the queue limit the SERVER negotiated,
+/// and NEVER re-reads the client's `record._options.queueSize`.
+///
+/// pvxs `GroupSource::onSubscribe` asks the subscription control what depth
+/// it actually got — `subscriptionControl->stats(stats)` then
+/// `currentValue["record._options.queueSize"] = stats.limitQueue`
+/// (groupsource.cpp:401-404) — where `stats.limitQueue` is the server's
+/// `MonitorOp::limit` (servermon.cpp:313). It parses no option itself; the
+/// ONE reader of `queueSize` is the server's INIT negotiation
+/// (servermon.cpp:533-543), whose result reaches the source as
+/// `MonitorOptions::queue_size`.
+///
+/// The port had a SECOND reader in `qsrv::group::negotiated_queue_size` — a
+/// decimal-only i32 parser that disagreed with the server's own
+/// `Value::as<uint32>` on every shape the latter accepts (hex/octal strings,
+/// reals). Both halves below fail against it.
 #[tokio::test]
-async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
-    use epics_base_rs::server::recgbl::EventMask;
-    use epics_bridge_rs::qsrv::group::{
-        GROUP_DEFAULT_QUEUE_SIZE, GroupMonitor, negotiated_queue_size,
-    };
-    use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    use std::time::Duration;
+async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
+    use epics_bridge_rs::qsrv::QsrvPvStore;
+    use epics_pva_rs::server_native::MonitorOptions;
+    use epics_pva_rs::server_native::source::{AccessGate, ChannelContext, ChannelSource};
 
-    // Build a MONITOR INIT pvRequest carrying
-    // `record._options.queueSize = 32`.
-    let mk_request = |qsize: i32| {
+    /// The pvRequest a client sent, carrying its own `queueSize` claim.
+    fn ctx_requesting(queue_size: PvField) -> ChannelContext {
         let mut opts = PvStructure::new("");
-        opts.fields
-            .push(("queueSize".into(), PvField::Scalar(ScalarValue::Int(qsize))));
+        opts.fields.push(("queueSize".into(), queue_size));
         let mut record = PvStructure::new("");
         record
             .fields
@@ -567,89 +572,94 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
         let mut req = PvStructure::new("epics:nt/NTRequest:1.0");
         req.fields
             .push(("record".into(), PvField::Structure(record)));
-        req
-    };
+        ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "anonymous".into(),
+            host: "host1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: Some(PvField::Structure(req)),
+            log: Default::default(),
+        }
+    }
 
-    // Negotiation rule (pvxs `servermon.cpp:533`): >= 2 honoured.
-    assert_eq!(negotiated_queue_size(&mk_request(32)), 32);
-    // < 2 → default kept.
-    assert_eq!(
-        negotiated_queue_size(&mk_request(1)),
-        GROUP_DEFAULT_QUEUE_SIZE
-    );
-    // Absent `record._options.queueSize` → default.
-    assert_eq!(
-        negotiated_queue_size(&empty_request()),
-        GROUP_DEFAULT_QUEUE_SIZE
-    );
-
-    // The monitor stamps the negotiated value into its snapshots.
-    let queue_size_in_snapshot =
-        |def: epics_bridge_rs::qsrv::GroupPvDef, db: Arc<PvDatabase>, negotiated: i32| async move {
-            let mut mon = GroupMonitor::new(db.clone(), def).with_queue_size(negotiated);
-            mon.start().await.expect("start");
-            // A member post wakes the delta-driven monitor; the emitted
-            // value carries the stamped record._options.queueSize.
-            for rec_name in ["TEST:level", "TEST:count"] {
-                let rec = db.get_record(rec_name).await.expect("rec exists");
-                rec.read().await.notify_field("VAL", EventMask::VALUE);
-            }
-            let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
-                .await
-                .expect("first monitor delta within 2s")
-                .expect("snapshot");
-            mon.stop().await;
-            let record = match snap
-                .value
-                .fields
-                .iter()
-                .find(|(n, _)| n == "record")
-                .map(|(_, v)| v)
-            {
-                Some(PvField::Structure(s)) => s.clone(),
-                other => panic!("record sub-structure missing: {other:?}"),
-            };
-            let options = match record
-                .fields
-                .iter()
-                .find(|(n, _)| n == "_options")
-                .map(|(_, v)| v)
-            {
-                Some(PvField::Structure(s)) => s.clone(),
-                other => panic!("record._options missing: {other:?}"),
-            };
-            match options
-                .fields
-                .iter()
-                .find(|(n, _)| n == "queueSize")
-                .map(|(_, v)| v)
-            {
-                Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
-                other => panic!("queueSize missing: {other:?}"),
-            }
+    /// `record._options.queueSize` stamped on the monitor's seed value.
+    async fn stamped_queue_size(ctx: ChannelContext, opts: MonitorOptions) -> i32 {
+        let db = make_db().await;
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load");
+        let store = QsrvPvStore::new(provider);
+        let checked = AccessGate::open()
+            .check("TEST:grp", "host1", "alice", "anonymous", "")
+            .await;
+        let seed = store
+            .subscribe_seeded(checked, ctx, opts)
+            .await
+            .expect("group monitor subscribes");
+        let initial = match seed
+            .initial
+            .expect("a group monitor seeds from its monitor-stamped value")
+        {
+            PvField::Structure(s) => s,
+            other => panic!("group seed must be a structure: {other:?}"),
         };
+        let record = match find_field(&initial, "record") {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("record sub-structure missing: {other:?}"),
+        };
+        let options = match record
+            .fields
+            .iter()
+            .find(|(n, _)| n == "_options")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Structure(s)) => s.clone(),
+            other => panic!("record._options missing: {other:?}"),
+        };
+        match options
+            .fields
+            .iter()
+            .find(|(n, _)| n == "queueSize")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+            other => panic!("queueSize missing: {other:?}"),
+        }
+    }
 
-    // Negotiated 32 → snapshot carries 32.
-    let db = make_db().await;
-    let provider = Arc::new(BridgeProvider::new(db.clone()));
-    provider.load_group_config(GROUP_JSON).expect("load");
-    let def = provider.groups().get("TEST:grp").cloned().expect("grp");
-    let qs = queue_size_in_snapshot(def, db, negotiated_queue_size(&mk_request(32))).await;
+    // The server negotiated 32 (its `Value::as<uint32>` reads the string
+    // "0x20" BASE 0, as `stoull(s,&idx,0)` does). The source stamps THAT —
+    // it does not re-parse "0x20", which the deleted decimal-only parser
+    // refused outright.
+    let stamped = stamped_queue_size(
+        ctx_requesting(PvField::Scalar(ScalarValue::String("0x20".into()))),
+        MonitorOptions {
+            queue_size: 32,
+            ..MonitorOptions::default()
+        },
+    )
+    .await;
     assert_eq!(
-        qs, 32,
-        "monitor must stamp the negotiated queueSize (32), not a hardcoded default"
+        stamped, 32,
+        "the monitor must stamp the server's negotiated limit (stats.limitQueue)"
     );
 
-    // No negotiation → default GROUP_DEFAULT_QUEUE_SIZE.
-    let db2 = make_db().await;
-    let provider2 = Arc::new(BridgeProvider::new(db2.clone()));
-    provider2.load_group_config(GROUP_JSON).expect("load");
-    let def2 = provider2.groups().get("TEST:grp").cloned().expect("grp");
-    let qs_default =
-        queue_size_in_snapshot(def2, db2, negotiated_queue_size(&empty_request())).await;
+    // Negative control: the client's `queueSize` is NOT an input to the
+    // source. With the SAME pvRequest claiming 99 but a server limit of 4
+    // (e.g. the request was refused as `< 2`, or never reached this source),
+    // the stamp is 4. The old parser answered 99.
+    let stamped = stamped_queue_size(
+        ctx_requesting(PvField::Scalar(ScalarValue::Int(99))),
+        MonitorOptions {
+            queue_size: 4,
+            ..MonitorOptions::default()
+        },
+    )
+    .await;
     assert_eq!(
-        qs_default, GROUP_DEFAULT_QUEUE_SIZE,
-        "absent queueSize → monitor stamps the default"
+        stamped, 4,
+        "the source must report the negotiated limit, never the client's request"
     );
 }
 

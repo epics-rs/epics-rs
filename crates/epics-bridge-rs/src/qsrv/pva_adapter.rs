@@ -251,6 +251,7 @@ async fn open_monitor(
     pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
     checked: epics_pva_rs::server_native::source::AccessChecked,
     ctx: epics_pva_rs::server_native::source::ChannelContext,
+    opts: epics_pva_rs::server_native::MonitorOptions,
 ) -> Option<OpenedMonitor> {
     if !checked.allows_read() {
         return None;
@@ -291,14 +292,14 @@ async fn open_monitor(
         }
         _ => None,
     };
-    // resolve the per-operation negotiated monitor
-    // queue depth from the MONITOR INIT pvRequest's
-    // `record._options.queueSize` — pvxs `servermon.cpp:533` then
-    // `groupsource.cpp:359` stamps `stats.limitQueue`.
-    let queue_size = match ctx.pv_request {
-        Some(PvField::Structure(ref req)) => crate::qsrv::group::negotiated_queue_size(req),
-        _ => crate::qsrv::group::GROUP_DEFAULT_QUEUE_SIZE,
-    };
+    // R10-33: the negotiated monitor queue limit is the SERVER's, not a
+    // second reading of the pvRequest. pvxs `GroupSource::onSubscribe` asks
+    // the subscription control what depth it actually got
+    // (`subscriptionControl->stats(stats)` → `stats.limitQueue`, which is
+    // `MonitorOp::limit`, servermon.cpp:313) and stamps THAT into
+    // `record._options.queueSize` (groupsource.cpp:401-404); it never reads
+    // the client's `queueSize` option itself. `opts.queue_size` is that
+    // limit, resolved once by the server's INIT negotiation.
     let mut monitor = match channel {
         crate::qsrv::AnyChannel::Single(single) => {
             single.create_monitor_with_value_mask(dbe_mask).await.ok()?
@@ -307,7 +308,7 @@ async fn open_monitor(
             .create_monitor()
             .await
             .ok()?
-            .with_queue_size(queue_size),
+            .with_queue_size(opts.queue_size),
     };
     monitor.start().await.ok()?;
     Some(OpenedMonitor::Db(monitor))
@@ -716,7 +717,18 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // Legacy cooked path: plain `PvField`s, no marked set. The
             // PVA layer's `subscribe_checked_opts_marked` (below) is what
             // carries the `+trigger` marked set to the wire.
-            match open_monitor(provider, pva_pvs, checked, ctx).await? {
+            // No `MonitorOptions` on this legacy entry — nothing was
+            // negotiated, so the source sees the per-op defaults (pvxs
+            // `MonitorOp::limit = 4u`).
+            match open_monitor(
+                provider,
+                pva_pvs,
+                checked,
+                ctx,
+                epics_pva_rs::server_native::MonitorOptions::default(),
+            )
+            .await?
+            {
                 OpenedMonitor::Native(rx) => Some(rx),
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
@@ -762,14 +774,14 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-        _opts: epics_pva_rs::server_native::MonitorOptions,
+        opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> impl std::future::Future<
         Output = Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>>,
     > + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            match open_monitor(provider, pva_pvs, checked, ctx).await? {
+            match open_monitor(provider, pva_pvs, checked, ctx, opts).await? {
                 OpenedMonitor::Native(rx) => {
                     Some(epics_pva_rs::server_native::plain_monitor_updates(rx))
                 }
@@ -792,7 +804,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-        _opts: epics_pva_rs::server_native::MonitorOptions,
+        opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> impl std::future::Future<
         Output = Option<
             epics_pva_rs::server_native::source::SubscriptionSeed<
@@ -803,7 +815,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            let opened = open_monitor(provider, pva_pvs, checked.clone(), ctx.clone()).await?;
+            let opened =
+                open_monitor(provider, pva_pvs, checked.clone(), ctx.clone(), opts).await?;
             match opened {
                 OpenedMonitor::Native(rx) => {
                     // Native-registered PVA PVs (NDPluginPva etc.) serve the

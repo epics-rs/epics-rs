@@ -3093,11 +3093,22 @@ impl AsynRecord {
                 // `asynQueuePriorityConnect` carrying
                 // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynRecord.c:1277-1280),
                 // so a record attaching to a *down* serial or IP port still shows
-                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown". C's asymmetry is
-                // deliberate and preserved: the EOS readback right below it is
-                // queued at Low priority with no waiver (:1296), so IEOS/OEOS do
-                // stay blank until the port connects.
+                // its BAUD/PRTY/HOSTINFO/… instead of "Unknown".
                 self.read_options_from_driver(&entry.handle, OptionQueue::EvenIfNotConnected);
+
+                // …and the EOS readback C queues right after it, gated on the port
+                // having asynOctet (`if(pasynRec->octetiv)`, asynRecord.c:1289-1300)
+                // — so a fresh record shows the EOS the *driver* holds instead of a
+                // blank IEOS/OEOS until someone happens to write one.
+                //
+                // C's asymmetry with the option readback above is deliberate and is
+                // preserved by the user this runs under: `callbackGetEos` is queued
+                // at `asynQueuePriorityLow` and never has its reason overwritten
+                // (`duplicateAsynUser` copies it, asynManager.c:1229), so it carries
+                // no waiver — on a *disconnected* port the queue gate refuses it
+                // (asynManager.c:1547-1552) and IEOS/OEOS stay blank, while the
+                // options still fill in.
+                self.read_eos_from_driver(&entry.handle);
 
                 // Attached to the port (C `connectDevice` sets PCNCT=1,
                 // asynRecord.c:1305).
@@ -8866,6 +8877,76 @@ mod tests {
             rec.errs, "asynDrvUser not supported but drvInfo not blank",
             "C reportError text (asynRecord.c:1264-1265)"
         );
+    }
+
+    /// W10-D3: `connectDevice` reads the EOS back from the driver.
+    ///
+    /// C queues a `callbackGetEos` whenever the port has asynOctet
+    /// (asynRecord.c:1289-1300), right after the option readback, so a fresh
+    /// record shows the EOS the *driver* holds. The port queued only the option
+    /// readback, so IEOS/OEOS stayed blank until an operator wrote one — a record
+    /// on a port whose driver was configured with `asynOctetSetInputEos` in
+    /// st.cmd showed nothing.
+    ///
+    /// C's asymmetry with the option readback is real and is asserted here too:
+    /// `callbackGetEos` is queued at `asynQueuePriorityLow` with no
+    /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:1296), so on a *disconnected*
+    /// port the queue gate refuses it (asynManager.c:1547-1552) and the fields
+    /// stay blank, while the option readback — which does carry the waiver
+    /// (:1277-1280) — still fills in.
+    #[test]
+    fn connect_device_reads_the_eos_back_from_the_driver() {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct EosPort(PortDriverBase);
+        impl PortDriver for EosPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
+            let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+            // The driver already holds an EOS — st.cmd's `asynOctetSetInputEos`.
+            base.input_eos = b"\r\n".to_vec();
+            base.output_eos = b"\n".to_vec();
+            base.auto_connect = false;
+            base.init_connected(connected);
+            let (rt, jh) = create_port_runtime(EosPort(base), RuntimeConfig::default());
+            std::mem::forget(jh);
+            register_port(
+                port_name,
+                rt.port_handle().clone(),
+                Arc::new(TraceManager::new()),
+            );
+            std::mem::forget(rt);
+
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device().unwrap();
+
+            if connected {
+                assert_eq!(
+                    rec.ieos, "\\r\\n",
+                    "connectDevice queues callbackGetEos (asynRecord.c:1289-1300)"
+                );
+                assert_eq!(rec.oeos, "\\n");
+            } else {
+                // The Low-priority readback carries no waiver: C's gate refuses it.
+                assert_eq!(
+                    rec.ieos, "",
+                    "a disconnected port's EOS readback is refused (asynRecord.c:1296)"
+                );
+                assert_eq!(rec.oeos, "");
+            }
+        }
     }
 
     /// W10-D2: every `asynCallbackSpecial` arm ends in `monitorStatus`

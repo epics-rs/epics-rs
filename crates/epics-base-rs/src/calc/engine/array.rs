@@ -512,12 +512,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 ArrayOp::IndexZero => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .position(|&x| x == 0.0)
-                        .map(|i| i as f64)
-                        .unwrap_or(-1.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    stack.push(ArrayStackValue::Double(index_zero_crossing(arr)));
                 }
                 ArrayOp::IndexNonZero => {
                     let v = pop1(&mut stack)?;
@@ -705,6 +700,43 @@ fn extremum_by(arr: &[f64], better: impl Fn(f64, f64) -> bool) -> Option<(f64, u
         }
     }
     Some(best)
+}
+
+/// aCalc `IXZ` — the **real (fractional) index of the first zero crossing**
+/// (`aCalcPerform.c:879-892`), NOT the index of the first exactly-zero element.
+/// The exact-zero reading is C's `#if 0` dead code (`:866-877`).
+///
+/// ```c
+/// for (i=firstEl+1, j=-1, d=0.; i<=lastEl; i++) {
+///     if ((ps->a[i]>0) != (ps->a[firstEl]>0)) {
+///         j = i-1;
+///         d = fabs(ps->a[j])/fabs(ps->a[j]-ps->a[j+1]);
+///         break;
+///     }
+/// }
+/// ps->d = j+d;
+/// ```
+///
+/// Two details the shape depends on: the sign test is against the FIRST element,
+/// not the previous one, and it is `> 0` — so an exact 0 is grouped with the
+/// negatives. `j` and `j+1` therefore always straddle the crossing with
+/// different `>0` verdicts, which is why the denominator cannot be zero.
+///
+/// No crossing answers `-1` (`j=-1`, `d=0`) — including for the common case of
+/// an all-positive waveform, where the old exact-zero reading also answered -1
+/// but for the wrong reason.
+fn index_zero_crossing(arr: &[f64]) -> f64 {
+    let Some(&first) = arr.first() else {
+        return -1.0;
+    };
+    for i in 1..arr.len() {
+        if (arr[i] > 0.0) != (first > 0.0) {
+            let j = i - 1;
+            let d = arr[j].abs() / (arr[j] - arr[i]).abs();
+            return j as f64 + d;
+        }
+    }
+    -1.0
 }
 
 /// C `myNINT` (`aCalcPerform.c:50`): `(int)(a >= 0 ? a+0.5 : a-0.5)` — a

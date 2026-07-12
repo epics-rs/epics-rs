@@ -56,8 +56,30 @@ fn format_client_timestamp() -> String {
     format_server_timestamp(SystemTime::now().into())
 }
 
-/// What C's `caget()` (`caput.c:130-240`) prints for one readback, WITHOUT
-/// the `Old : ` / `New : ` prefix its caller already emitted.
+/// The SINGLE owner of what a `caput` readback may write to STDERR.
+///
+/// C's `caget()` (`caput.c:130-240`) has exactly ONE `fprintf(stderr, ...)`:
+/// the `ca_pend_io` timeout warning (`caput.c:186-188`). Every other outcome
+/// is silent on stderr —
+///
+/// * a CA error or read denial renders its `*** ...` marker on STDOUT inside
+///   the print loop (`caput.c:200-206`) and `caget()` still returns 0;
+/// * `!nConn` returns 1 from `caput.c:181` BEFORE the print loop, so C emits
+///   nothing on EITHER stream for that PV.
+///
+/// Routing both readback sites through one exhaustive match is what keeps a
+/// caller from inventing a diagnostic C never prints: `caput-rs` used to
+/// `eprintln!("error: {e}")` on the `New :` disconnect path, which has no C
+/// counterpart (the exit code already matched).
+fn readback_stderr(rb: &Readback) -> Option<&'static str> {
+    match rb {
+        Readback::TimedOut(..) => Some("Read operation timed out: PV data was not read."),
+        Readback::Value(..) | Readback::Disconnected | Readback::Other(_) => None,
+    }
+}
+
+/// What C's `caget()` (`caput.c:130-240`) prints on STDOUT for one readback,
+/// WITHOUT the `Old : ` / `New : ` prefix its caller already emitted.
 ///
 /// `None` means C returned from `if (!nConn) return 1` (`caput.c:181`) BEFORE
 /// reaching its print loop — it printed nothing at all, not even a newline,
@@ -89,7 +111,7 @@ fn readback_line(
                 (false, _) => format!("{name_col}{sep}{rendered}"),
             })
         }
-        Readback::Disconnected(_) => None,
+        Readback::Disconnected => None,
         Readback::Other(e) => {
             let marker = ca_error_marker(e.to_eca_status());
             Some(if terse {
@@ -352,10 +374,11 @@ async fn main() {
             read_elems,
             long_mode,
         );
-        if matches!(rb, Readback::TimedOut(..)) {
-            // C caput.c:186-188 warns and keeps going, printing the zeroed
-            // buffer on the `Old :` line.
-            eprintln!("Read operation timed out: PV data was not read.");
+        // C's `caget()` emits its stderr warning (if any) BEFORE the print
+        // loop (`caput.c:186-188` then `:191`). `readback_stderr` is the only
+        // source of it.
+        if let Some(warning) = readback_stderr(&rb) {
+            eprintln!("{warning}");
         }
         match readback_line(&rb, &name_col, sep, &fmt, false, long_mode) {
             Some(line) => println!("{line}"),
@@ -448,18 +471,19 @@ async fn main() {
         read_elems,
         long_mode,
     );
-    if matches!(rb, Readback::TimedOut(..)) {
-        eprintln!("Read operation timed out: PV data was not read.");
+    if let Some(warning) = readback_stderr(&rb) {
+        eprintln!("{warning}");
     }
     match readback_line(&rb, &name_col, sep, &fmt, args.terse, long_mode) {
         Some(line) => println!("{line}"),
-        // `!nConn`: C's caget() printed nothing and returned 1, which IS
-        // caput's exit status here (caput.c:589).
+        // `!nConn`: C's `caget()` returns 1 from `caput.c:181` BEFORE its
+        // print loop, so it emits NOTHING for this PV — no stdout line (not
+        // even a newline after the `New : ` prefix) and no stderr
+        // diagnostic. That return value IS caput's exit status
+        // (`caput.c:583,589`). Flush so the bare prefix reaches stdout
+        // before the process exits.
         None => {
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            if let Readback::Disconnected(e) = &rb {
-                eprintln!("error: {e}");
-            }
             std::process::exit(1);
         }
     }
@@ -502,9 +526,15 @@ enum Readback {
     /// falls through to the print loop with the ZEROED buffer. Exit stays 0.
     TimedOut(EpicsValue, Option<Snapshot>),
     /// No channel connected: C `caget()` returns 1 from `if (!nConn) return
-    /// 1` (`caput.c:181`) before printing anything, and caput propagates it
-    /// as the exit status (`caput.c:583,589`).
-    Disconnected(CaError),
+    /// 1` (`caput.c:181`) BEFORE its print loop, and caput propagates that as
+    /// the exit status (`caput.c:583,589`).
+    ///
+    /// The variant is deliberately payload-free. C prints nothing at all on
+    /// this path — not the PV's `*** not connected` marker (the print loop is
+    /// never reached) and not any stderr diagnostic — so there is no CA error
+    /// text to render, and carrying one only invited the port-invented
+    /// `error: channel disconnected` line this replaces.
+    Disconnected,
     /// Any other readback failure. C's `ca_array_get` failing *synchronously*
     /// — most notably read-access-denied, which libca rejects client-side with
     /// `ECA_NORDACCESS` before any I/O is outstanding — leaves `ca_pend_io` at
@@ -551,7 +581,7 @@ fn classify_readback(
             let (value, snap) = zero_readback(native, as_string, count, long_mode);
             Readback::TimedOut(value, snap)
         }
-        Err(e @ (CaError::Disconnected | CaError::Shutdown)) => Readback::Disconnected(e),
+        Err(CaError::Disconnected | CaError::Shutdown) => Readback::Disconnected,
         Err(e) => Readback::Other(e),
     }
 }
@@ -890,8 +920,8 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Readback, WriteValue, build_write_value, classify_readback, raw_from_escaped,
-        raw_from_escaped_string, zero_readback,
+        Args, Readback, ValueFormat, WriteValue, build_write_value, classify_readback,
+        raw_from_escaped, raw_from_escaped_string, readback_line, readback_stderr, zero_readback,
     };
     use clap::Parser;
     use epics_base_rs::types::WallTime;
@@ -1023,6 +1053,52 @@ mod tests {
         );
     }
 
+    /// C's `caget()` inside caput has exactly ONE `fprintf(stderr, ...)` — the
+    /// `ca_pend_io` timeout warning (`caput.c:186-188`). Everything else is
+    /// silent on stderr: a CA error / read denial renders its `*** ...` marker
+    /// on STDOUT (`caput.c:200-206`), and the `!nConn` path returns from
+    /// `caput.c:181` BEFORE the print loop, emitting nothing on EITHER stream.
+    ///
+    /// Pre-fix, `caput-rs`'s `New :` disconnect path wrote a port-invented
+    /// `error: channel disconnected` to stderr (the exit code already matched
+    /// C's `return 1`). The `Readback::Disconnected` variant is now
+    /// payload-free, so there is no error text left to render, and both
+    /// readback sites take their stderr from this one function.
+    #[test]
+    fn readback_disconnect_prints_nothing_on_either_stream() {
+        let fmt = ValueFormat::default();
+
+        // `!nConn`: silent on stdout AND stderr, in every output mode.
+        assert_eq!(readback_stderr(&Readback::Disconnected), None);
+        for (terse, long_mode) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                readback_line(&Readback::Disconnected, "PV", ' ', &fmt, terse, long_mode),
+                None,
+                "C never reaches its print loop (terse={terse}, long={long_mode})"
+            );
+        }
+
+        // The ONE stderr line C does print.
+        assert_eq!(
+            readback_stderr(&Readback::TimedOut(EpicsValue::Double(0.0), None)),
+            Some("Read operation timed out: PV data was not read.")
+        );
+
+        // Negative control: a CA error is NOT silent — but it speaks on
+        // STDOUT, via the marker, and still says nothing on stderr.
+        let other = Readback::Other(CaError::ServerError(epics_ca_rs::protocol::ECA_NORDACCESS));
+        assert_eq!(readback_stderr(&other), None);
+        let line = readback_line(&other, "PV", ' ', &fmt, true, false)
+            .expect("a CA error still reaches C's print loop");
+        assert_eq!(line, "*** no read access");
+
+        // A good readback is silent on stderr too.
+        assert_eq!(
+            readback_stderr(&Readback::Value(EpicsValue::Double(1.0), None)),
+            None
+        );
+    }
+
     /// Only `!nConn` (`caput.c:181`) makes C's readback return non-zero.
     #[test]
     fn readback_disconnect_is_fatal() {
@@ -1035,11 +1111,11 @@ mod tests {
                 1,
                 false
             ),
-            Readback::Disconnected(_)
+            Readback::Disconnected
         ));
         assert!(matches!(
             classify_readback(Err(CaError::Shutdown), DbFieldType::Double, false, 1, false),
-            Readback::Disconnected(_)
+            Readback::Disconnected
         ));
     }
 

@@ -718,6 +718,27 @@ static VALUE_ONLY_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Every `db_post_events` C's scaler makes from a PROCESS cycle, enumerated —
+/// [`ScalerRecord::process_posted_fields`]. `process()`: `CNT` (:372), `PR1`
+/// (:425, only when the count-start recompute moved it), `TP` (:427), `FREQ`
+/// (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T` (:588); `monitor()`:
+/// `S1..Snch` (:771). That is the whole list — C writes `D1..Dnch` in process
+/// (:413-414, :525-526) and posts none of them, and it posts `Gn`/`PRn`(n>1)
+/// only from `special()`.
+///
+/// Indexed by `nch`: the fixed head plus the `Sn` of the active channels, so
+/// the `Sn` of a channel the record does not have stays out of the set (C's
+/// post loops are bounded by `nch` too).
+static PROCESS_POSTED_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
+    (0..=MAX_SCALER_CHANNELS)
+        .map(|nch| {
+            let mut v: Vec<&'static str> = vec!["VAL", "T", "CNT", "PR1", "TP", "FREQ"];
+            v.extend(SN_FIELD_NAMES.iter().take(nch).copied());
+            v
+        })
+        .collect()
+});
+
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
         "scaler"
@@ -1301,6 +1322,26 @@ impl Record for ScalerRecord {
     /// sees `PRn`/`Gn`/`Dn`, matching C.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         &VALUE_ONLY_BY_NCH[self.active_channels()]
+    }
+
+    /// C's scaler posts a FIXED list from a process cycle (see
+    /// [`PROCESS_POSTED_BY_NCH`]) and leaves every other field it wrote silent.
+    /// Declaring that list closes two spurious-event families the framework's
+    /// generic "post whatever changed" rule opened:
+    ///
+    /// * `D1..Dnch` — `process()` copies the gates into them on every count
+    ///   start (`scalerRecord.c:413-414`, `:525-526`) and posts NOTHING; C's
+    ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:704`). The port
+    ///   change-detected the copy and fired a `Dn` monitor C never sends.
+    /// * `G1..Gnch`, `PR2..PRnch` — a put posts them (C `dbPut`), but the put
+    ///   path does not advance `last_posted`, so the next process cycle
+    ///   change-detected them a SECOND time. C's `process()` posts no `Gn` at
+    ///   all, and `PRn` only for n = 1.
+    ///
+    /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
+    /// count-start preset recompute moved it.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&PROCESS_POSTED_BY_NCH[self.active_channels()])
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that

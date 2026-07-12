@@ -1033,6 +1033,45 @@ pub trait Record: Send + Sync + 'static {
     /// `db_post_events(prec, &prec->hash, DBE_VALUE)` only when the content
     /// hash changed (waveformRecord.c:317-319), never via VAL's change.
     ///
+    /// The CLOSED set of fields a process cycle of this record may post —
+    /// the record's C `process()` + `monitor()` `db_post_events` calls,
+    /// enumerated.
+    ///
+    /// `None` (the default) leaves the framework's generic rule in force:
+    /// every subscribed field that changed since its last post is posted.
+    /// That rule is right for a record whose C `monitor()` walks its fields
+    /// and posts whatever moved (calc, sub, ai …). It is WRONG for a record
+    /// whose C `monitor()` posts a fixed list and leaves every other field it
+    /// wrote silent — the framework then invents events C never sends:
+    ///
+    /// * a field the record WRITES during `process()` but C never posts
+    ///   (scaler's gate→direction copy, `scalerRecord.c:413-414`: `pdir[i] =
+    ///   pgate[i]` with no `db_post_events` — C posts `Dn` only from
+    ///   `special()`), and
+    /// * a field a PUT already posted, whose `last_posted` the put path does
+    ///   not advance, so the next process cycle change-detects it a second
+    ///   time (`Gn`, `PRn`).
+    ///
+    /// `Some(list)` closes both by construction: a field outside the list is
+    /// never posted by a process cycle — its only monitors come from its own
+    /// put and from [`Self::monitor_side_effect_fields`]. The list is a
+    /// whitelist, not a blacklist, so a field added to the record later stays
+    /// silent unless C posts it.
+    ///
+    /// Fields inside the list keep their normal treatment (change detection,
+    /// [`Self::value_only_change_fields`] mask, deadband, `log_swept_fields`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+
+    /// Fields the record posts itself via an event-driven, individually
+    /// masked path rather than the generic change-detection loop. The
+    /// framework excludes these from that loop so they are neither
+    /// double-posted nor spuriously posted on a cycle the event did not
+    /// fire. C waveform/aai/aao `monitor()` posts `HASH` this way —
+    /// `db_post_events(prec, &prec->hash, DBE_VALUE)` only when the content
+    /// hash changed (waveformRecord.c:317-319), never via VAL's change.
+    ///
     /// Default: empty.
     fn event_posted_fields(&self) -> &'static [&'static str] {
         &[]

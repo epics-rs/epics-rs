@@ -2494,6 +2494,10 @@ impl RecordInstance {
         // generic change-detection so they are neither double-posted nor
         // spuriously posted. See `Record::event_posted_fields`.
         let event_posted = self.record.event_posted_fields();
+        // The closed set of fields this record's C process()/monitor() posts,
+        // when it declares one — see `Record::process_posted_fields`. A field
+        // outside it is never posted by a process cycle.
+        let process_posted = self.record.process_posted_fields();
         let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2503,6 +2507,7 @@ impl RecordInstance {
                 && field != "AMSG"
                 && field != "UDF"
                 && !event_posted.contains(&field.as_str())
+                && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
             {
                 if let Some(val) = self.resolve_field(field) {
                     let changed = match self.last_posted.get(field) {

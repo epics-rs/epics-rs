@@ -156,59 +156,64 @@ const VERSION_INFO: &str = concat!(
     disable_version_flag = true
 )]
 struct Args {
-    #[arg(short = 'V', long, hide = true)]
-    version: bool,
+    /// Every option below is `Append` (value option) or `Count` (flag):
+    /// C's getopt loop accepts every option any number of times, last one
+    /// winning (R13-17, see [`epics_ca_rs::copt`]).
+    #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
+    version: u8,
 
     /// CA timeout in seconds (`epicsScanDouble`; a bad value warns and keeps
     /// the default — `caput.c:323-332`). Raw `String`: every C-scanned option
     /// argument is resolved by [`epics_ca_rs::copt`], never by clap.
-    #[arg(short = 'w', long = "timeout", allow_hyphen_values = true)]
-    timeout: Option<String>,
+    #[arg(short = 'w', long = "timeout", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    timeout: Vec<String>,
 
     /// Wait for completion callback (`ca_put_callback`).
-    #[arg(short = 'c', long = "callback")]
-    callback: bool,
+    #[arg(short = 'c', long = "callback", action = clap::ArgAction::Count)]
+    callback: u8,
 
     /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
     /// and `-p 500` both clamp to 99 in C, `caput.c:344-351`).
-    #[arg(short = 'p', long, allow_hyphen_values = true)]
-    priority: Option<String>,
+    #[arg(short = 'p', long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    priority: Vec<String>,
 
     /// Terse output: print only the new value (no `Old :`/`New :`
     /// prefix, no PV name).
-    #[arg(short = 't', long)]
-    terse: bool,
+    #[arg(short = 't', long, action = clap::ArgAction::Count)]
+    terse: u8,
 
     /// Long mode: post-write read prints `name timestamp value stat
     /// sevr` like `caget -a`.
-    #[arg(short = 'l', long = "long")]
-    long_mode: bool,
+    #[arg(short = 'l', long = "long", action = clap::ArgAction::Count)]
+    long_mode: u8,
 
     /// Force interpretation of values as numbers (overrides ENUM
     /// auto-string-resolution). C `caput.c:298-305` makes `-n` and `-s`
     /// a mutually-exclusive pair where the LAST one given wins (each case
-    /// sets its flag and clears the other), with no conflict error —
-    /// `overrides_with` reproduces that last-wins semantics.
-    #[arg(short = 'n', long = "num-enum", overrides_with = "force_string")]
-    force_numeric: bool,
+    /// sets its flag and clears the other), with no conflict error. Both are
+    /// `Count` (R13-17: every C option repeats), so the pairing is resolved
+    /// from the command-line indices by [`last_of_pair`] — clap's
+    /// `overrides_with` cannot express it once a repeat is legal.
+    #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
+    force_numeric: u8,
 
     /// Force interpretation of values as strings (overrides numeric
     /// parse for ENUM). Paired with `-n` (last one wins, caput.c:302-305).
-    #[arg(short = 's', long = "string-enum", overrides_with = "force_numeric")]
-    force_string: bool,
+    #[arg(short = 's', long = "string-enum", action = clap::ArgAction::Count)]
+    force_string: u8,
 
     /// Put long string as an array of chars (long-string convention).
     /// C `caput.c:306-319` makes `-S` and `-a` a mutually-exclusive pair
-    /// where the LAST one given wins (each clears the other) — modelled
-    /// with `overrides_with` so the two flags can never both be set.
-    #[arg(short = 'S', long = "long-string", overrides_with = "array_mode")]
-    long_string: bool,
+    /// where the LAST one given wins (each clears the other), resolved by
+    /// [`last_of_pair`] for the same reason as `-n`/`-s`.
+    #[arg(short = 'S', long = "long-string", action = clap::ArgAction::Count)]
+    long_string: u8,
 
     /// Put as array. The remaining positionals are
     /// `<count> <v0> <v1> ...`. Paired with `-S` (last one wins,
     /// caput.c:316-319).
-    #[arg(short = 'a', long = "array", overrides_with = "long_string")]
-    array_mode: bool,
+    #[arg(short = 'a', long = "array", action = clap::ArgAction::Count)]
+    array_mode: u8,
 
     /// Vestigial array element count. C's getopt string accepts `-# <n>`
     /// (`caput.c:290`, `":cnlhatsVS#:w:p:F:"`) and scans it into `count`
@@ -226,9 +231,10 @@ struct Args {
         short = '#',
         long = "max-elements",
         value_name = "COUNT",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    max_elements: Option<String>,
+    max_elements: Vec<String>,
 
     /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
     /// character, discarding the rest (`caput.c:353`).
@@ -236,9 +242,10 @@ struct Args {
         short = 'F',
         long = "field-separator",
         value_name = "OFS",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    field_separator: Option<String>,
+    field_separator: Vec<String>,
 
     /// Positional PV name. NOT clap-`required` — see `caget-rs`; C checks
     /// `nPvs < 1` after the getopt loop (`caput.c:457-461`).
@@ -260,21 +267,59 @@ impl Args {
     /// cannot drift from `caget` on what "not a valid array element count"
     /// means. The returned count is deliberately discarded.
     fn scan_dead_element_count(&self) {
-        let _ = TOOL.req_elems_int(self.max_elements.as_deref());
+        let _ = TOOL.req_elems_int(&self.max_elements);
+    }
+}
+
+/// C `caput.c:298-319`: `-n`/`-s` and `-S`/`-a` are pairs where each case
+/// SETS its own flag and CLEARS its partner, so the LAST occurrence of either
+/// member decides — and neither can be on when the other is. Both members
+/// repeat (R13-17), and clap records the index of each flag's last
+/// occurrence, which is exactly what "last of the pair wins" needs.
+///
+/// Returns `(this_wins, that_wins)`; both `false` when neither was given.
+///
+/// `get_count` is the gate, not `indices_of`: clap hands an ABSENT `Count`
+/// flag its `0` default and still reports an index for it, so an
+/// `indices_of`-only test reads every unused flag as present.
+fn last_of_pair(matches: &clap::ArgMatches, this_id: &str, that_id: &str) -> (bool, bool) {
+    let last = |id: &str| {
+        (matches.get_count(id) > 0)
+            .then(|| matches.indices_of(id).and_then(|mut i| i.next_back()))
+            .flatten()
+    };
+    match (last(this_id), last(that_id)) {
+        (None, None) => (false, false),
+        (Some(_), None) => (true, false),
+        (None, Some(_)) => (false, true),
+        (Some(a), Some(b)) => (a > b, b > a),
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::from_arg_matches(&TOOL.get_matches(Args::command()))
-        .expect("clap validated the arguments");
+    let matches = TOOL.get_matches(Args::command());
+    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
     // C warns inside its getopt loop, before any of the work below.
     args.scan_dead_element_count();
 
-    if args.version {
+    // The two mutually-clearing pairs, resolved in command-line order.
+    let (force_numeric, force_string) = last_of_pair(&matches, "force_numeric", "force_string");
+    let (long_string, array_mode) = last_of_pair(&matches, "long_string", "array_mode");
+    let terse = args.terse > 0;
+    let callback = args.callback > 0;
+
+    if args.version > 0 {
         println!("{VERSION_INFO}");
         return;
     }
+
+    // C's ENTIRE getopt loop runs before the `nPvs < 1` / `nPvs < 2` checks
+    // (`caput.c:290-455`, then `:457`), so every option argument is scanned —
+    // and every warning emitted — even when no PV name or value follows.
+    // `scan_dead_element_count` above is `-#`; these two are the rest.
+    let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
+    let priority = TOOL.priority(&args.priority);
 
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for
@@ -293,14 +338,7 @@ async fn main() {
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    // C `-w`: `epicsScanDouble` overwrites the env-loaded `caTimeout` only on
-    // a successful scan; a bad value warns and the put still runs.
-    let timeout = epics_ca_rs::cli::timeout_duration(TOOL.timeout(
-        args.timeout.as_deref(),
-        epics_ca_rs::cli::env_default_timeout(),
-    ));
-
-    let priority = TOOL.priority(args.priority.as_deref());
+    let timeout = epics_ca_rs::cli::timeout_duration(ca_timeout);
     // -p selects the priority virtual circuit. C `caput.c:406-410` runs the
     // same `connect_pvs` barrier as caget/cainfo ("If the connection fails,
     // we're done"): its ECA_TIMEOUT diagnostic names the single PV, and the
@@ -348,13 +386,13 @@ async fn main() {
     // requested in the STRING form for an ENUM field unless `-n`, so the
     // echoed value is the state label, not the index. `-l` keeps the
     // TIME-class string so the timestamp + alarm line is still populated.
-    let enum_dbr = enum_string_readback_dbr(native_type, args.long_mode, !args.force_numeric);
+    let enum_dbr = enum_string_readback_dbr(native_type, args.long_mode > 0, !force_numeric);
 
     // Read the pre-put value for the `Old :` display. Long mode also
     // wants the server timestamp + alarm pair captured BEFORE the put so
     // the `Old :` line reflects the actual pre-put state — the regular
     // path stays on the cheaper plain GET.
-    let long_mode = args.long_mode;
+    let long_mode = args.long_mode > 0;
     let read_display = move |ch: CaChannel| async move {
         match (long_mode, enum_dbr) {
             // Long mode + ENUM default: DBR_TIME_STRING (label + ts/alarm).
@@ -388,10 +426,10 @@ async fn main() {
     // not just the wire value. `format_value` owns C's gate
     // (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`).
     let mut fmt = ValueFormat {
-        char_array_as_string: args.long_string,
+        char_array_as_string: long_string,
         ..ValueFormat::default()
     };
-    if let Some(c) = TOOL.field_separator(args.field_separator.as_deref()) {
+    if let Some(c) = TOOL.field_separator(&args.field_separator) {
         fmt.field_separator = c;
     }
     let sep = fmt.field_separator;
@@ -418,7 +456,7 @@ async fn main() {
     // gets its put, and a PV that dropped since the connect barrier prints
     // nothing at all (C returns from `!nConn` before its print loop) and lets
     // the PUT report the disconnect.
-    if !args.terse {
+    if !terse {
         print!("Old : ");
         let rb = classify_readback(
             read_display(ch.clone()).await,
@@ -450,10 +488,10 @@ async fn main() {
     let parsed_value = match build_write_value(
         &args.values,
         native_type,
-        args.force_numeric,
-        args.force_string,
-        args.long_string,
-        args.array_mode,
+        force_numeric,
+        force_string,
+        long_string,
+        array_mode,
         &enum_menu,
     ) {
         Ok(v) => v,
@@ -468,7 +506,7 @@ async fn main() {
             // C-tool wire model: send the explicit DBR type (DBR_STRING /
             // DBR_CHAR) and let the server convert. The CLI `-w` timeout
             // owns the callback wait, matching caput.c:556-567.
-            if args.callback {
+            if callback {
                 ch.put_as_dbr_with_timeout(*dbr_type, value, timeout).await
             } else {
                 ch.put_as_dbr_nowait(*dbr_type, value).await
@@ -483,7 +521,7 @@ async fn main() {
             // default which dropped `-w`.
             let v = epics_ca_rs::EpicsValue::String(s.clone());
             let dbr = epics_ca_rs::DbFieldType::String as u16;
-            if args.callback {
+            if callback {
                 ch.put_as_dbr_with_timeout(dbr, &v, timeout).await
             } else {
                 ch.put_as_dbr_nowait(dbr, &v).await
@@ -494,7 +532,7 @@ async fn main() {
             // each element. Same single timeout owner as above.
             let arr = epics_ca_rs::EpicsValue::StringArray(v.clone());
             let dbr = epics_ca_rs::DbFieldType::String as u16;
-            if args.callback {
+            if callback {
                 ch.put_as_dbr_with_timeout(dbr, &arr, timeout).await
             } else {
                 ch.put_as_dbr_nowait(dbr, &arr).await
@@ -513,7 +551,7 @@ async fn main() {
     // (caput.c:583,589), and inside `caget()` only `!nConn` yields a non-zero
     // return (`caput.c:181`) — see [`Readback`]. A read TIMEOUT does NOT:
     // C prints `New : <name> <zeroed value>` and exits 0.
-    if !args.terse {
+    if !terse {
         // C `caput -t` suppresses the label, not the read (caput.c:580-583).
         print!("New : ");
     }
@@ -527,7 +565,7 @@ async fn main() {
     if let Some(warning) = readback_stderr(&rb) {
         eprintln!("{warning}");
     }
-    match readback_line(&rb, &name_col, sep, &fmt, args.terse, long_mode) {
+    match readback_line(&rb, &name_col, sep, &fmt, terse, long_mode) {
         Some(line) => println!("{line}"),
         // `!nConn`: C's `caget()` returns 1 from `caput.c:181` BEFORE its
         // print loop, so it emits NOTHING for this PV — no stdout line (not
@@ -974,9 +1012,10 @@ fn build_enum_array(
 mod tests {
     use super::{
         Args, Readback, ValueFormat, WriteValue, build_write_value, classify_readback,
-        raw_from_escaped, raw_from_escaped_string, readback_line, readback_stderr, zero_readback,
+        last_of_pair, raw_from_escaped, raw_from_escaped_string, readback_line, readback_stderr,
+        zero_readback,
     };
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use epics_base_rs::types::WallTime;
     use epics_ca_rs::cli::EPICS_EPOCH_UNIX_SECS;
     use epics_ca_rs::copt::scan_i32;
@@ -1002,7 +1041,7 @@ mod tests {
         // Scalar: `-# 3` parses, and the value list is untouched.
         let a = Args::try_parse_from(["caput", "-#", "3", "PV", "42"])
             .expect("C's getopt accepts -# (caput.c:290); clap must too");
-        assert_eq!(a.max_elements.as_deref(), Some("3"));
+        assert_eq!(a.max_elements, vals(&["3"]));
         assert_eq!(a.pv_name.as_deref(), Some("PV"));
         assert_eq!(a.values, vals(&["42"]));
         // The count that reaches the wire comes from the values, never from
@@ -1013,14 +1052,14 @@ mod tests {
         // Array mode: `-# 1` must not truncate the 3-element write.
         let a = Args::try_parse_from(["caput", "-a", "-#", "1", "WF", "3", "1", "2", "3"])
             .expect("-# parses alongside -a");
-        assert!(a.array_mode);
+        assert!(a.array_mode > 0);
         assert_eq!(a.values, vals(&["3", "1", "2", "3"]));
 
         // A non-numeric argument: C's `sscanf` fails, warns, and keeps going
         // (caput.c:337-342). It must NOT be a hard error.
         let a = Args::try_parse_from(["caput", "-#", "abc", "PV", "42"])
             .expect("C warns on a bad -# argument, it does not exit");
-        assert_eq!(a.max_elements.as_deref(), Some("abc"));
+        assert_eq!(a.max_elements, vals(&["abc"]));
         assert_eq!(scan_i32("abc"), None, "the owner warns and falls back to 0");
         // C's `sscanf("%d")` takes a LEADING integer and ignores the tail, so
         // `3x` scans fine and warns nothing.
@@ -1031,44 +1070,49 @@ mod tests {
     /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two
     /// mutually-exclusive last-wins pairs via a getopt switch (each case
     /// sets its flag and clears the paired one), with NO conflict error.
-    /// `overrides_with` must reproduce that for every order boundary.
+    /// [`last_of_pair`] must reproduce that for every order boundary —
+    /// including a REPEAT of either member (R13-17), which clap's former
+    /// `overrides_with` spelling could not express.
     #[test]
     fn enum_and_array_flags_are_last_wins_pairs() {
-        let parse = |extra: &[&str]| {
+        let enum_pair = |extra: &[&str]| {
             let mut argv = vec!["caput-rs"];
             argv.extend_from_slice(extra);
             argv.extend_from_slice(&["PV", "1"]);
-            Args::try_parse_from(argv).expect("flags must parse without a conflict error")
+            let m = Args::command().get_matches_from(argv);
+            last_of_pair(&m, "force_numeric", "force_string")
+        };
+        let array_pair = |extra: &[&str]| {
+            let mut argv = vec!["caput-rs"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["PV", "1"]);
+            let m = Args::command().get_matches_from(argv);
+            last_of_pair(&m, "long_string", "array_mode")
         };
 
         // -n / -s: last one wins, neither errors.
-        let a = parse(&["-n", "-s"]);
-        assert!(
-            a.force_string && !a.force_numeric,
-            "-n -s → string (last wins)"
+        assert_eq!(enum_pair(&["-n", "-s"]), (false, true), "-n -s → string");
+        assert_eq!(enum_pair(&["-s", "-n"]), (true, false), "-s -n → numeric");
+        assert_eq!(enum_pair(&["-n"]), (true, false), "-n alone → numeric");
+        assert_eq!(enum_pair(&["-s"]), (false, true), "-s alone → string");
+        assert_eq!(enum_pair(&[]), (false, false), "neither given");
+        assert_eq!(
+            enum_pair(&["-n", "-s", "-n"]),
+            (true, false),
+            "a repeat is legal and the LAST occurrence still wins"
         );
-        let a = parse(&["-s", "-n"]);
-        assert!(
-            a.force_numeric && !a.force_string,
-            "-s -n → numeric (last wins)"
-        );
-        let a = parse(&["-n"]);
-        assert!(a.force_numeric && !a.force_string, "-n alone → numeric");
-        let a = parse(&["-s"]);
-        assert!(a.force_string && !a.force_numeric, "-s alone → string");
 
         // -S / -a: last one wins, never both set.
-        let a = parse(&["-a", "-S"]);
-        assert!(
-            a.long_string && !a.array_mode,
-            "-a -S → long string (last wins)"
+        assert_eq!(array_pair(&["-a", "-S"]), (true, false), "-a -S → long str");
+        assert_eq!(array_pair(&["-S", "-a"]), (false, true), "-S -a → array");
+        assert_eq!(array_pair(&["-a"]), (false, true), "-a alone → array");
+        assert_eq!(array_pair(&["-S"]), (true, false), "-S alone → long str");
+        assert_eq!(array_pair(&[]), (false, false), "neither given");
+        assert_eq!(
+            array_pair(&["-S", "-a", "-S"]),
+            (true, false),
+            "a repeat is legal and the LAST occurrence still wins"
         );
-        let a = parse(&["-S", "-a"]);
-        assert!(a.array_mode && !a.long_string, "-S -a → array (last wins)");
-        let a = parse(&["-a"]);
-        assert!(a.array_mode && !a.long_string, "-a alone → array");
-        let a = parse(&["-S"]);
-        assert!(a.long_string && !a.array_mode, "-S alone → long string");
     }
 
     /// A readback timeout is NOT fatal in C. `ca_pend_io` returning

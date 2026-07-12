@@ -32,37 +32,70 @@ enum OutputMode {
     SpecifiedDbr,
 }
 
-/// C `caget.c:369-375` `complainIfNotPlainAndSet`: `-t`, `-a`, `-d` are
-/// mutually exclusive output formats applied in command-line order — the
-/// second one warns and the later option wins. clap collapses the three
-/// into independent fields, so the order is recovered from the parsed
-/// argument indices.
-fn resolve_output_mode(matches: &clap::ArgMatches) -> OutputMode {
-    use clap::parser::ValueSource;
-    // `index_of` returns a bogus index for an arg left at its default,
-    // so only an option actually supplied on the command line counts —
-    // gate on `ValueSource::CommandLine`, then use its index for order.
-    let mut opts: Vec<(usize, OutputMode)> = Vec::new();
-    for (id, m) in [
-        ("terse", OutputMode::Terse),
-        ("wide", OutputMode::All),
-        ("dbr_type", OutputMode::SpecifiedDbr),
-    ] {
-        if matches.value_source(id) == Some(ValueSource::CommandLine)
-            && let Some(i) = matches.index_of(id)
-        {
-            opts.push((i, m));
+/// The `-t` / `-a` / `-d` half of C's getopt loop, replayed in command-line
+/// order — the ONE owner of both `format` and `type` (`caget.c:386-434`).
+///
+/// C's `complainIfNotPlainAndSet` (`caget.c:369-375`) warns whenever the
+/// format is not still `plain`, so every occurrence past the first warns and
+/// the LAST one wins. `-d` additionally scans its argument: an invalid type
+/// warns AND reverts `format` to `plain` (`caget.c:430-434`), which is what
+/// un-arms the next occurrence's mutual-exclusion warning — so the three
+/// cannot be resolved independently of each other, or of `-d`'s validity.
+///
+/// All three repeat (R13-17): clap gives every `-d` occurrence its own index,
+/// and for the two flags it records the count plus the index of the last one.
+/// Replaying a flag's occurrences at that index is exact for the two things C
+/// derives from them — which option wins (the highest index) and how many
+/// mutual-exclusion warnings fire (one per occurrence past the first).
+///
+/// Returns C's `(format, type)` pair: `type` is the LAST `-d`'s scanned code,
+/// `None` when that scan failed (C's `type == -1`).
+fn resolve_format(matches: &clap::ArgMatches) -> (OutputMode, Option<u16>) {
+    #[derive(Clone)]
+    enum Opt<'a> {
+        Terse,
+        All,
+        Dbr(&'a str),
+    }
+    let mut events: Vec<(usize, Opt<'_>)> = Vec::new();
+    for (id, ev) in [("terse", Opt::Terse), ("wide", Opt::All)] {
+        let n = matches.get_count(id);
+        if let Some(i) = matches.indices_of(id).and_then(|mut i| i.next_back()) {
+            events.extend(std::iter::repeat_n((i, ev), usize::from(n)));
         }
     }
-    opts.sort_by_key(|&(i, _)| i);
+    if let (Some(idx), Some(vals)) = (
+        matches.indices_of("dbr_type"),
+        matches.get_many::<String>("dbr_type"),
+    ) {
+        events.extend(idx.zip(vals).map(|(i, v)| (i, Opt::Dbr(v.as_str()))));
+    }
+    events.sort_by_key(|&(i, _)| i);
+
     let mut format = OutputMode::Plain;
-    for (_, requested) in opts {
+    let mut d_type: Option<u16> = None;
+    for (_, opt) in events {
         if format != OutputMode::Plain {
             eprintln!("Options t,d,a are mutually exclusive. ('caget -h' for help.)");
         }
-        format = requested;
+        format = match opt {
+            Opt::Terse => OutputMode::Terse,
+            Opt::All => OutputMode::All,
+            Opt::Dbr(arg) => {
+                d_type = parse_dbr_type(arg);
+                if d_type.is_none() {
+                    eprintln!(
+                        "Requested dbr type out of range or invalid - ignored. \
+                         ('caget -h' for help.)"
+                    );
+                    OutputMode::Plain
+                } else {
+                    OutputMode::SpecifiedDbr
+                }
+            }
+        };
     }
-    format
+    (format, d_type)
 }
 
 /// C `caget.c` writes ONE `int type` that both `-d` and `-0<base>` assign,
@@ -76,7 +109,7 @@ fn resolve_output_mode(matches: &clap::ArgMatches) -> OutputMode {
 /// ```
 ///
 /// clap has no notion of that sequence, so the winner is recovered from the
-/// argument indices — the same mechanism `resolve_output_mode` uses. An
+/// argument indices — the same mechanism `resolve_format` uses. An
 /// invalid base (`-0q`) never reaches the assignment in C (it is guarded by
 /// `if (outType != dec)`), which is why the caller passes the ALREADY
 /// RESOLVED [`IntStyle`] rather than the raw argument.
@@ -130,45 +163,50 @@ const VERSION_INFO: &str = concat!(
 )]
 struct Args {
     /// Help / version are short-circuited in `parse_argv` before clap.
-    #[arg(short = 'V', long, hide = true)]
-    version: bool,
+    ///
+    /// Every option below is declared `Append` (value option) or `Count`
+    /// (flag) because C's getopt loop accepts every option any number of
+    /// times, last one winning — see [`epics_ca_rs::copt`], whose
+    /// `get_matches` refuses to run a spec that says otherwise.
+    #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
+    version: u8,
 
     /// CA timeout in seconds (`epicsScanDouble`; a bad value warns and keeps
     /// the `EPICS_CA_TIMEOUT` default). Raw `String`: every C-scanned option
     /// argument is resolved by [`epics_ca_rs::copt`], never by clap.
     /// C ref: `caget.c:437-443`, `tool_lib.c:use_ca_timeout_env`.
-    #[arg(short = 'w', long = "wait", allow_hyphen_values = true)]
-    timeout: Option<String>,
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    timeout: Vec<String>,
 
     /// Asynchronous get (`ca_get_callback`); waits for completion.
     /// Today the Rust client always waits via the GET response, so
     /// this flag is accepted for parity but does not change behaviour.
-    #[arg(short = 'c', long)]
-    callback: bool,
+    #[arg(short = 'c', long, action = clap::ArgAction::Count)]
+    callback: u8,
 
     /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`). `-p -1`
     /// and `-p 500` are NOT errors in C — both clamp to 99 (`caget.c:455-462`).
-    #[arg(short = 'p', long, allow_hyphen_values = true)]
-    priority: Option<String>,
+    #[arg(short = 'p', long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    priority: Vec<String>,
 
     /// Terse: print only the value (no PV name column).
-    #[arg(short = 't', long)]
-    terse: bool,
+    #[arg(short = 't', long, action = clap::ArgAction::Count)]
+    terse: u8,
 
     /// Wide: print `name timestamp value stat sevr` (DBR_TIME_xxx).
-    #[arg(short = 'a', long)]
-    wide: bool,
+    #[arg(short = 'a', long, action = clap::ArgAction::Count)]
+    wide: u8,
 
     /// Request a specific DBR type by name (e.g. `DOUBLE`,
     /// `DBR_TIME_DOUBLE`) or numeric DBR id. The named family selects
     /// the GET request class (STS/TIME/GR/CTRL or plain value).
-    #[arg(short = 'd', long = "dbr-type")]
-    dbr_type: Option<String>,
+    #[arg(short = 'd', long = "dbr-type", action = clap::ArgAction::Append)]
+    dbr_type: Vec<String>,
 
     /// Print enums as numeric index (default is enum string when
     /// the server returns one).
-    #[arg(short = 'n', long = "num-enum")]
-    enum_as_number: bool,
+    #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
+    enum_as_number: u8,
 
     /// C's `reqElems` (`sscanf("%d")`, `caget.c:447-453`). `0` — including
     /// `-# 0` and an unscannable `-#` — is C's "not specified", i.e. ALL
@@ -177,13 +215,14 @@ struct Args {
         short = '#',
         long = "max-elements",
         value_name = "COUNT",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    max_elements: Option<String>,
+    max_elements: Vec<String>,
 
     /// Render `DBR_CHAR` arrays as a NUL-terminated string.
-    #[arg(short = 'S', long = "char-as-string")]
-    char_array_as_string: bool,
+    #[arg(short = 'S', long = "char-as-string", action = clap::ArgAction::Count)]
+    char_array_as_string: u8,
 
     /// `%e` float format with the given precision (`sscanf("%d")` + the
     /// `0..=VALID_DOUBLE_DIGITS` gate; both failures warn and keep the
@@ -192,33 +231,36 @@ struct Args {
         short = 'e',
         long = "format-e",
         value_name = "PRECISION",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    fmt_e: Option<String>,
+    fmt_e: Vec<String>,
 
     /// `%f` float format with the given precision.
     #[arg(
         short = 'f',
         long = "format-f",
         value_name = "PRECISION",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    fmt_f: Option<String>,
+    fmt_f: Vec<String>,
 
     /// `%g` float format with the given precision (the default style).
     #[arg(
         short = 'g',
         long = "format-g",
         value_name = "PRECISION",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    fmt_g: Option<String>,
+    fmt_g: Vec<String>,
 
     /// Get value as string (honors server-side precision).
     /// Accepted for parity; today returns the same as default since
     /// the server already serialises floats with its own precision.
-    #[arg(short = 's', long = "string-format")]
-    string_format: bool,
+    #[arg(short = 's', long = "string-format", action = clap::ArgAction::Count)]
+    string_format: u8,
 
     /// `-0<base>`: print integers in base `x` (hex), `o` (octal) or `b`
     /// (binary), and request the value as `DBR_LONG`. C spells this as a
@@ -240,9 +282,10 @@ struct Args {
         short = 'F',
         long = "field-separator",
         value_name = "OFS",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    field_separator: Option<String>,
+    field_separator: Vec<String>,
 
     /// PV names to read. NOT clap-`required`: C's getopt loop has no
     /// required positional — it parses, then `main` checks `nPvs < 1` and
@@ -257,10 +300,12 @@ impl Args {
     fn value_format(&self) -> ValueFormat {
         let mut fmt = ValueFormat::default();
         // All three are scanned (not short-circuited) so that EACH malformed
-        // precision emits its own warning, as C's getopt loop does.
-        let e = self.fmt_e.as_deref().and_then(|a| TOOL.digits('e', a));
-        let f = self.fmt_f.as_deref().and_then(|a| TOOL.digits('f', a));
-        let g = self.fmt_g.as_deref().and_then(|a| TOOL.digits('g', a));
+        // precision emits its own warning, as C's getopt loop does. A repeated
+        // `-e` overwrites `dblFormatStr` again, so only the LAST occurrence of
+        // each letter can be the effective one (`copt::last`).
+        let e = TOOL.digits('e', &self.fmt_e);
+        let f = TOOL.digits('f', &self.fmt_f);
+        let g = TOOL.digits('g', &self.fmt_g);
         if let Some(precision) = e {
             fmt.float = FloatFormat {
                 style: FloatStyle::E,
@@ -282,10 +327,10 @@ impl Args {
         // `outTypeF` (floats, via round-to-long). They never cross.
         fmt.int_style = TOOL.base('0', &self.int_base);
         fmt.float_style = TOOL.base('l', &self.float_base);
-        fmt.enum_as_number = self.enum_as_number;
-        fmt.char_array_as_string = self.char_array_as_string;
-        fmt.req_elems = TOOL.req_elems_int(self.max_elements.as_deref());
-        if let Some(c) = TOOL.field_separator(self.field_separator.as_deref()) {
+        fmt.enum_as_number = self.enum_as_number > 0;
+        fmt.char_array_as_string = self.char_array_as_string > 0;
+        fmt.req_elems = TOOL.req_elems_int(&self.max_elements);
+        if let Some(c) = TOOL.field_separator(&self.field_separator) {
             fmt.field_separator = c;
         }
         fmt
@@ -729,14 +774,35 @@ fn read_timeout(
 async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line
     // order of `-t`/`-a`/`-d` is recoverable for the C mutual-exclusion
-    // rule (`resolve_output_mode`).
+    // rule (`resolve_format`).
     let matches = TOOL.get_matches(Args::command());
     let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
 
-    if args.version {
+    if args.version > 0 {
         println!("{VERSION_INFO}");
         return;
     }
+
+    // C's ENTIRE getopt loop runs before any post-loop check, so every option
+    // argument is scanned — and every warning emitted — while `nPvs` is still
+    // unread (`caget.c:398-525`, then `:527`). `caget -w abc` with no PV name
+    // therefore prints the timeout warning AND the missing-PV diagnostic; a
+    // scan deferred until after the `nPvs` check would print neither.
+    //
+    // `value_format` is what scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`,
+    // and `resolve_format` is what scans `-t`/`-a`/`-d`; between them and the
+    // two below, every C-scanned argument in this tool is resolved here, once.
+    let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
+    let priority = TOOL.priority(&args.priority);
+    // Built ONCE: `value_format` is what scans the `-0`/`-l` base arguments,
+    // so calling it twice would double every "Invalid argument" warning.
+    let fmt = args.value_format();
+    // Resolve `-t`/`-a`/`-d` in command-line order — C's getopt loop writes
+    // `format` and `type` from the same three cases, and an invalid `-d`
+    // reverts `format` to plain (`caget.c:369-375,416-434`). `-0<base>` never
+    // sets `format` in C, so a `-0x` alongside an invalid `-d` must not
+    // rescue `specifiedDbr`.
+    let (mode, d_type) = resolve_format(&matches);
 
     // C `caget.c:527-531`: the missing-PV check runs after the getopt loop,
     // so `-V` above still wins and a bad option argument has already warned.
@@ -744,21 +810,8 @@ async fn main() {
         TOOL.no_pv_name();
     }
 
-    if args.callback {
-        // GET already waits for the response — note silently.
-    }
-
     let client = CaClient::new().await.expect("failed to create CA client");
-    // C `-w`: `epicsScanDouble` overwrites the env-loaded `caTimeout` only on
-    // a successful scan; a bad value warns and the get still runs.
-    let timeout = epics_ca_rs::cli::timeout_duration(TOOL.timeout(
-        args.timeout.as_deref(),
-        epics_ca_rs::cli::env_default_timeout(),
-    ));
-
-    // Route -p into the priority circuit (libca
-    // `tool_lib.c` passes `caPriority` to `ca_create_channel`).
-    let priority = TOOL.priority(args.priority.as_deref());
+    let timeout = epics_ca_rs::cli::timeout_duration(ca_timeout);
     // C `caget.c:553-556`: `connect_pvs` gates the ENTIRE get+print phase.
     // Any PV that fails to connect inside the one `ca_pend_io` window
     // aborts before `caget()` runs, so stdout carries zero value lines and
@@ -783,38 +836,10 @@ async fn main() {
     // `-n`: render ENUM fields as the numeric index. Without it the
     // default readback requests the STRING form (state label), see the
     // per-PV get below (C `caget.c:178-181`).
-    let enum_as_number = args.enum_as_number;
+    let enum_as_number = args.enum_as_number > 0;
     // `-s` (C `floatAsString`): request a native FLOAT/DOUBLE field's value
     // in string form so the SERVER converts it (C `caget.c:183-187`).
-    let float_as_string = args.string_format;
-    // Built ONCE: `value_format` is what scans the `-0`/`-l` base arguments,
-    // so calling it twice would double every "Invalid argument" warning.
-    let fmt = args.value_format();
-    // resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
-    // getopt-time resolution (`caget.c:416-434`). The "out of range or
-    // invalid" diagnostic prints exactly once (not per PV).
-    let d_type: Option<u16> = match args.dbr_type.as_deref() {
-        Some(s) => {
-            let t = parse_dbr_type(s);
-            if t.is_none() {
-                eprintln!(
-                    "Requested dbr type out of range or invalid - ignored. \
-                     ('caget -h' for help.)"
-                );
-            }
-            t
-        }
-        None => None,
-    };
-    // Resolve the output format from `-t`/`-a`/`-d` (command-line order,
-    // mutual-exclusion warning). C `caget.c:430-434`: an invalid `-d`
-    // type reverts `format` to plain. This gate reads the `-d` type ALONE:
-    // `-0<base>` never sets `format` in C, so a `-0x` alongside an invalid
-    // `-d` must not rescue `specifiedDbr`.
-    let mut mode = resolve_output_mode(&matches);
-    if mode == OutputMode::SpecifiedDbr && d_type.is_none() {
-        mode = OutputMode::Plain;
-    }
+    let float_as_string = args.string_format > 0;
     // `-0<base>` assigns the SAME `int type` as `-d` (`caget.c:493`), racing
     // it in getopt order. The type only reaches the wire under
     // `specifiedDbr`, which is why `mode` is settled first.
@@ -831,7 +856,7 @@ async fn main() {
     // C `caget.c:197-218` resolves that count differently per request mode:
     // callback (`-c`) preserves a count-0 autosize request, the synchronous
     // path rewrites 0 → native. Captured as a Copy for the same reason.
-    let callback = args.callback;
+    let callback = args.callback > 0;
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
@@ -1128,7 +1153,7 @@ mod tests {
     use super::{
         Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, caget_req_count,
         dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,
-        resolve_output_mode, specified_dbr_report,
+        resolve_format, specified_dbr_report,
     };
     use clap::{CommandFactory, FromArgMatches, Parser};
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
@@ -1149,7 +1174,7 @@ mod tests {
 
     fn mode_of(argv: &[&str]) -> OutputMode {
         let m = Args::command().get_matches_from(argv);
-        resolve_output_mode(&m)
+        resolve_format(&m).0
     }
 
     /// R12-16. C declares the two base options as getopt options TAKING AN
@@ -1193,7 +1218,7 @@ mod tests {
         let resolve = |argv: &[&str]| {
             let m = Args::command().get_matches_from(argv);
             let a = Args::from_arg_matches(&m).expect("parsed");
-            let d = a.dbr_type.as_deref().and_then(parse_dbr_type);
+            let d = resolve_format(&m).1;
             resolve_dbr_type(&m, a.value_format().int_style, d)
         };
         assert_eq!(resolve(&["caget", "-0x", "PV"]), Some(DBR_LONG));

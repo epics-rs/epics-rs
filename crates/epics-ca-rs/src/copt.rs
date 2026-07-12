@@ -14,8 +14,67 @@
 //! text and C's exact fallback value. clap must never type-check such an
 //! option: a `value_parser` on one of them re-introduces the hard exit-2
 //! failure this module exists to remove, and it does so silently.
+//!
+//! # Repeatability (R13-17)
+//!
+//! `getopt(3)` has NO notion of "this option was already used": it hands the
+//! loop one `(opt, optarg)` pair per occurrence, and the loop body simply
+//! overwrites the variable it owns. So EVERY C option is repeatable and the
+//! LAST occurrence wins — `caget -w 5 -w 2 PV` waits 2 s, `caget -t -t PV`
+//! warns and prints terse. clap's default actions (`Set`/`SetTrue`) are the
+//! opposite: a repeat is a hard error with clap's multi-line usage block,
+//! which no C tool ever prints.
+//!
+//! [`CTool::get_matches`] therefore REFUSES to run a command whose options
+//! are not all declared `ArgAction::Append` (value options) or
+//! `ArgAction::Count` (flags) — see [`assert_repeatable`]. The check fires on
+//! every invocation, so a newly declared option cannot silently re-open the
+//! family; and the resolvers here take the whole occurrence list, so
+//! "last wins" is the only shape a caller can express.
 
 use crate::cli::IntStyle;
+
+/// C's "last occurrence wins" for a value-taking option: the getopt loop
+/// overwrites its variable on each pass, so the final assignment is the one
+/// that survives (`caget.c:398-505` and the identical loops in the other
+/// three tools). `None` is "the option was never given", which is what every
+/// resolver in this module treats as C's untouched default.
+pub fn last(occurrences: &[String]) -> Option<&str> {
+    occurrences.last().map(String::as_str)
+}
+
+/// Every option a C tool declares must survive a repeat, because `getopt(3)`
+/// cannot fail one. This walks the clap spec and rejects any option that
+/// would: a `Set`/`SetTrue` action makes the second occurrence a clap usage
+/// error, which is a divergence no test of the option's *value* can catch.
+///
+/// It panics rather than warns because the failure is a DECLARATION bug, not
+/// a user input: every binary and every `cli_*` integration test runs
+/// [`CTool::get_matches`], so the panic surfaces the moment the bad option is
+/// added. Positionals are exempt (C's `argv` tail is not a getopt option).
+fn assert_repeatable(cmd: &clap::Command) {
+    use clap::ArgAction;
+    for a in cmd.get_arguments() {
+        if a.is_positional() {
+            continue;
+        }
+        match a.get_action() {
+            // Repeatable: the resolvers here fold the occurrence list.
+            ArgAction::Append | ArgAction::Count => {}
+            // clap's own help/version actions terminate the parse, exactly as
+            // C's `case 'h'` / `case 'V'` return from `main`; a repeat of
+            // either is harmless.
+            ArgAction::Help | ArgAction::HelpShort | ArgAction::HelpLong | ArgAction::Version => {}
+            other => panic!(
+                "option '{id}' is declared with {other:?}, so a repeat would be a clap usage \
+                 error; C's getopt accepts every option any number of times (last wins). \
+                 Declare it `action = clap::ArgAction::Append` (value option, `Vec<String>`) \
+                 or `action = clap::ArgAction::Count` (flag, `u8`) — see epics_ca_rs::copt.",
+                id = a.get_id()
+            ),
+        }
+    }
+}
 
 /// C `tool_lib.h:50` `DEFAULT_CA_PRIORITY`.
 pub const DEFAULT_CA_PRIORITY: u8 = 0;
@@ -102,21 +161,23 @@ impl CTool {
 
     /// C `-w`: `epicsScanDouble` into `caTimeout`, which is LEFT AT ITS
     /// CURRENT VALUE on a bad scan — that value being the `EPICS_CA_TIMEOUT`
-    /// env default already loaded by `use_ca_timeout_env`, which is what the
-    /// warning echoes back (`caget.c:437-443`).
-    pub fn timeout(self, arg: Option<&str>, default: f64) -> f64 {
-        let Some(a) = arg else { return default };
-        match scan_double(a) {
-            Some(v) => v,
-            None => {
-                eprintln!(
-                    "'{a}' is not a valid timeout value - ignored, using '{default:.1}'. \
+    /// env default already loaded by `use_ca_timeout_env`, or whatever an
+    /// EARLIER `-w` set. The warning echoes that surviving value back
+    /// (`caget.c:437-443`), so `caget -w 5 -w abc` warns `using '5.0'` and
+    /// waits 5 s.
+    pub fn timeout(self, occurrences: &[String], default: f64) -> f64 {
+        let mut t = default;
+        for a in occurrences {
+            match scan_double(a) {
+                Some(v) => t = v,
+                None => eprintln!(
+                    "'{a}' is not a valid timeout value - ignored, using '{t:.1}'. \
                      ('{tool} -h' for help.)",
                     tool = self.0
-                );
-                default
+                ),
             }
         }
+        t
     }
 
     /// C `-#` in `caget`/`caput`: `sscanf("%d")` into an `int count`
@@ -130,38 +191,48 @@ impl CTool {
     /// (`count = 0; /* 0 = not specified by -# option */`, `caget.c:386`).
     /// Returning a bare `u64` — not an `Option` — is what keeps that single
     /// meaning: there is no `Some(0)` that can drift away from `None`.
-    pub fn req_elems_int(self, arg: Option<&str>) -> u64 {
-        let Some(a) = arg else { return 0 };
-        match scan_i32(a) {
-            Some(v) => v as i64 as u64, // C's int → unsigned long widening
-            None => {
-                eprintln!(
-                    "'{a}' is not a valid array element count - ignored. \
-                     ('{tool} -h' for help.)",
-                    tool = self.0
-                );
-                0
+    ///
+    /// A repeat re-runs the whole case, so a bad `-#` after a good one RESETS
+    /// the count to 0 (unlike `-w`, which keeps its previous value).
+    pub fn req_elems_int(self, occurrences: &[String]) -> u64 {
+        let mut count = 0u64;
+        for a in occurrences {
+            match scan_i32(a) {
+                Some(v) => count = v as i64 as u64, // C's int → unsigned long widening
+                None => {
+                    eprintln!(
+                        "'{a}' is not a valid array element count - ignored. \
+                         ('{tool} -h' for help.)",
+                        tool = self.0
+                    );
+                    count = 0;
+                }
             }
         }
+        count
     }
 
     /// C `-#` in `camonitor`: `sscanf("%lu")` STRAIGHT into the `unsigned
     /// long reqElems` (`camonitor.c:445-452`) — no 32-bit hop, so a big
     /// count survives where `caget`'s `%d` would truncate it. Same `0` =
-    /// "not specified" contract as [`CTool::req_elems_int`].
-    pub fn req_elems_ulong(self, arg: Option<&str>) -> u64 {
-        let Some(a) = arg else { return 0 };
-        match scan_u64(a) {
-            Some(v) => v,
-            None => {
-                eprintln!(
-                    "'{a}' is not a valid array element count - ignored. \
-                     ('{tool} -h' for help.)",
-                    tool = self.0
-                );
-                0
+    /// "not specified" contract, and the same reset-on-bad-repeat rule, as
+    /// [`CTool::req_elems_int`].
+    pub fn req_elems_ulong(self, occurrences: &[String]) -> u64 {
+        let mut count = 0u64;
+        for a in occurrences {
+            match scan_u64(a) {
+                Some(v) => count = v,
+                None => {
+                    eprintln!(
+                        "'{a}' is not a valid array element count - ignored. \
+                         ('{tool} -h' for help.)",
+                        tool = self.0
+                    );
+                    count = 0;
+                }
             }
         }
+        count
     }
 
     /// C `-p`: `sscanf("%u")` into an `unsigned caPriority`, then
@@ -170,41 +241,48 @@ impl CTool {
     /// priority is not an error in C — it clamps to 99, silently. Observed:
     /// `caget -p -1 TST:LO` and `caget -p 500 TST:LO` both read the PV with
     /// no diagnostic at all.
-    pub fn priority(self, arg: Option<&str>) -> u8 {
-        let Some(a) = arg else {
-            return DEFAULT_CA_PRIORITY;
-        };
-        let raw = match scan_u32(a) {
-            Some(v) => v,
-            None => {
-                eprintln!(
-                    "'{a}' is not a valid CA priority - ignored. ('{tool} -h' for help.)",
-                    tool = self.0
-                );
-                u32::from(DEFAULT_CA_PRIORITY)
-            }
-        };
-        u8::try_from(raw)
-            .unwrap_or(CA_PRIORITY_MAX)
-            .min(CA_PRIORITY_MAX)
+    ///
+    /// The clamp lives INSIDE the case, so it re-runs per occurrence; a bad
+    /// `-p` after a good one resets to `DEFAULT_CA_PRIORITY`.
+    pub fn priority(self, occurrences: &[String]) -> u8 {
+        let mut prio = DEFAULT_CA_PRIORITY;
+        for a in occurrences {
+            let raw = match scan_u32(a) {
+                Some(v) => v,
+                None => {
+                    eprintln!(
+                        "'{a}' is not a valid CA priority - ignored. ('{tool} -h' for help.)",
+                        tool = self.0
+                    );
+                    u32::from(DEFAULT_CA_PRIORITY)
+                }
+            };
+            prio = u8::try_from(raw)
+                .unwrap_or(CA_PRIORITY_MAX)
+                .min(CA_PRIORITY_MAX);
+        }
+        prio
     }
 
     /// C `cainfo -s`: `sscanf("%u")` into `statLevel`, `0` on a bad scan
     /// (`cainfo.c:167-174`). Any non-zero level selects `ca_client_status`
     /// mode, so the `%u` wrap matters: `-s -1` is a non-zero level and DOES
     /// enter status mode.
-    pub fn stat_level(self, arg: Option<&str>) -> u32 {
-        let Some(a) = arg else { return 0 };
-        match scan_u32(a) {
-            Some(v) => v,
-            None => {
-                eprintln!(
-                    "'{a}' is not a valid interest level - ignored. ('{tool} -h' for help.)",
-                    tool = self.0
-                );
-                0
+    pub fn stat_level(self, occurrences: &[String]) -> u32 {
+        let mut level = 0u32;
+        for a in occurrences {
+            match scan_u32(a) {
+                Some(v) => level = v,
+                None => {
+                    eprintln!(
+                        "'{a}' is not a valid interest level - ignored. ('{tool} -h' for help.)",
+                        tool = self.0
+                    );
+                    level = 0;
+                }
             }
         }
+        level
     }
 
     /// C `-e` / `-f` / `-g`: `sscanf("%d", &digits)` and then a range gate
@@ -216,26 +294,36 @@ impl CTool {
     /// `opt` is the option letter, which C interpolates into the message and
     /// also uses as the printf conversion (`sprintf(dblFormatStr,
     /// "%%-.%d%c", digits, opt)`).
-    pub fn digits(self, opt: char, arg: &str) -> Option<u32> {
-        let Some(d) = scan_i32(arg) else {
-            eprintln!("Invalid precision argument '{arg}' for option '-{opt}' - ignored.");
-            return None;
-        };
-        if (0..=VALID_DOUBLE_DIGITS).contains(&d) {
-            Some(d as u32)
-        } else {
-            eprintln!("Precision {d} for option '-{opt}' out of range - ignored.");
-            None
+    ///
+    /// EVERY occurrence is scanned (so each bad one gets its own warning) and
+    /// the LAST VALID one wins: the `sprintf` that rewrites `dblFormatStr`
+    /// sits in the valid branch only, so `caget -e 99 -e 3` warns about 99 and
+    /// still formats with `%.3e`, and `caget -e 3 -e 99` warns and keeps
+    /// `%.3e`.
+    pub fn digits(self, opt: char, occurrences: &[String]) -> Option<u32> {
+        let mut digits = None;
+        for arg in occurrences {
+            let Some(d) = scan_i32(arg) else {
+                eprintln!("Invalid precision argument '{arg}' for option '-{opt}' - ignored.");
+                continue;
+            };
+            if (0..=VALID_DOUBLE_DIGITS).contains(&d) {
+                digits = Some(d as u32);
+            } else {
+                eprintln!("Precision {d} for option '-{opt}' out of range - ignored.");
+            }
         }
+        digits
     }
 
     /// C `-F`: `fieldSeparator = (char) *optarg` (`caget.c:505`) — the FIRST
     /// character of the argument, the rest discarded. Observed:
     /// `caget -F abc TST:LO` → `TST:LOa200`. An empty argument yields
-    /// `'\0'`, which C then dutifully prints between elements.
-    pub fn field_separator(self, arg: Option<&str>) -> Option<char> {
+    /// `'\0'`, which C then dutifully prints between elements. The assignment
+    /// cannot fail, so a repeat is a plain last-wins overwrite.
+    pub fn field_separator(self, occurrences: &[String]) -> Option<char> {
         let _ = self.0;
-        arg.map(|a| a.chars().next().unwrap_or('\0'))
+        last(occurrences).map(|a| a.chars().next().unwrap_or('\0'))
     }
 
     /// C `-0<base>` / `-l<base>`: `switch ((char) *optarg)` over `x`/`b`/`o`
@@ -295,8 +383,10 @@ impl CTool {
     /// every error path exits 1 with C's diagnostic, never clap's exit 2.
     ///
     /// This is the only entry point the binaries use, so a new option cannot
-    /// re-introduce an exit-2 path by being declared through the derive.
+    /// re-introduce an exit-2 path by being declared through the derive — nor
+    /// a non-repeatable option, which [`assert_repeatable`] rejects here.
     pub fn get_matches(self, cmd: clap::Command) -> clap::ArgMatches {
+        assert_repeatable(&cmd);
         let spec = cmd.clone();
         match cmd.try_get_matches() {
             Ok(m) => m,
@@ -368,6 +458,15 @@ mod tests {
 
     const CAGET: CTool = CTool::new("caget");
 
+    /// One occurrence of an option, the shape every resolver now takes.
+    fn one(s: &str) -> [String; 1] {
+        [s.to_string()]
+    }
+
+    fn many(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     /// Observed on the compiled C `caget` (EPICS 7.0.10.1-DEV, linux-x86_64):
     ///   `caget -0x -0q PV` → warns, still prints `0xC8`
     ///   `caget -0xyz PV`   → prints `0xC8`, no warning
@@ -432,16 +531,16 @@ mod tests {
     /// to 99 with NO diagnostic; only an unscannable argument warns.
     #[test]
     fn priority_wraps_then_clamps_like_c() {
-        assert_eq!(CAGET.priority(Some("3")), 3);
-        assert_eq!(CAGET.priority(Some("99")), 99);
-        assert_eq!(CAGET.priority(Some("500")), 99);
+        assert_eq!(CAGET.priority(&one("3")), 3);
+        assert_eq!(CAGET.priority(&one("99")), 99);
+        assert_eq!(CAGET.priority(&one("500")), 99);
         assert_eq!(
-            CAGET.priority(Some("-1")),
+            CAGET.priority(&one("-1")),
             99,
             "%u wraps, then the clamp fires"
         );
-        assert_eq!(CAGET.priority(Some("abc")), 0);
-        assert_eq!(CAGET.priority(None), 0);
+        assert_eq!(CAGET.priority(&one("abc")), 0);
+        assert_eq!(CAGET.priority(&[]), 0);
     }
 
     /// C's `-#` has exactly ONE "not specified" value: `0`. A failed scan
@@ -449,28 +548,28 @@ mod tests {
     /// while still reading as "requested".
     #[test]
     fn req_elems_has_a_single_unspecified_value() {
-        assert_eq!(CAGET.req_elems_int(None), 0);
-        assert_eq!(CAGET.req_elems_int(Some("0")), 0, "-# 0 IS 'not specified'");
-        assert_eq!(CAGET.req_elems_int(Some("abc")), 0);
-        assert_eq!(CAGET.req_elems_int(Some("3")), 3);
-        assert_eq!(CAGET.req_elems_int(Some("3x")), 3);
-        assert_eq!(CAGET.req_elems_int(Some("-3")), u64::MAX - 2);
+        assert_eq!(CAGET.req_elems_int(&[]), 0);
+        assert_eq!(CAGET.req_elems_int(&one("0")), 0, "-# 0 IS 'not specified'");
+        assert_eq!(CAGET.req_elems_int(&one("abc")), 0);
+        assert_eq!(CAGET.req_elems_int(&one("3")), 3);
+        assert_eq!(CAGET.req_elems_int(&one("3x")), 3);
+        assert_eq!(CAGET.req_elems_int(&one("-3")), u64::MAX - 2);
 
         // camonitor's %lu keeps 64 bits where caget's %d truncates.
         let cam = CTool::new("camonitor");
-        assert_eq!(cam.req_elems_ulong(Some("5000000000")), 5_000_000_000);
-        assert_eq!(CAGET.req_elems_int(Some("5000000000")), 705_032_704);
+        assert_eq!(cam.req_elems_ulong(&one("5000000000")), 5_000_000_000);
+        assert_eq!(CAGET.req_elems_int(&one("5000000000")), 705_032_704);
     }
 
     /// Any non-zero level selects `ca_client_status` mode, so the `%u` wrap
     /// on `-s -1` is load-bearing (`cainfo.c:167-174`).
     #[test]
     fn stat_level_wraps_like_sscanf_u() {
-        assert_eq!(CAGET.stat_level(Some("10")), 10);
-        assert_eq!(CAGET.stat_level(Some("-1")), 4_294_967_295);
-        assert_eq!(CAGET.stat_level(Some("+3abc")), 3);
-        assert_eq!(CAGET.stat_level(Some("abc")), 0);
-        assert_eq!(CAGET.stat_level(None), 0);
+        assert_eq!(CAGET.stat_level(&one("10")), 10);
+        assert_eq!(CAGET.stat_level(&one("-1")), 4_294_967_295);
+        assert_eq!(CAGET.stat_level(&one("+3abc")), 3);
+        assert_eq!(CAGET.stat_level(&one("abc")), 0);
+        assert_eq!(CAGET.stat_level(&[]), 0);
     }
 
     /// Observed on the compiled C `caget`:
@@ -481,32 +580,116 @@ mod tests {
     /// All four still read the PV.
     #[test]
     fn digits_gates_on_c_range() {
-        assert_eq!(CAGET.digits('e', "3"), Some(3));
-        assert_eq!(CAGET.digits('e', "3x"), Some(3));
-        assert_eq!(CAGET.digits('e', "0"), Some(0));
-        assert_eq!(CAGET.digits('e', "18"), Some(18), "VALID_DOUBLE_DIGITS");
-        assert_eq!(CAGET.digits('e', "19"), None);
-        assert_eq!(CAGET.digits('e', "-2"), None);
-        assert_eq!(CAGET.digits('f', "abc"), None);
+        assert_eq!(CAGET.digits('e', &one("3")), Some(3));
+        assert_eq!(CAGET.digits('e', &one("3x")), Some(3));
+        assert_eq!(CAGET.digits('e', &one("0")), Some(0));
+        assert_eq!(
+            CAGET.digits('e', &one("18")),
+            Some(18),
+            "VALID_DOUBLE_DIGITS"
+        );
+        assert_eq!(CAGET.digits('e', &one("19")), None);
+        assert_eq!(CAGET.digits('e', &one("-2")), None);
+        assert_eq!(CAGET.digits('f', &one("abc")), None);
     }
 
     /// C takes `(char) *optarg` — the first byte, rest discarded.
     /// Observed: `caget -F abc TST:LO` → `TST:LOa200`.
     #[test]
     fn field_separator_is_the_first_char() {
-        assert_eq!(CAGET.field_separator(Some("abc")), Some('a'));
-        assert_eq!(CAGET.field_separator(Some(",")), Some(','));
-        assert_eq!(CAGET.field_separator(Some("")), Some('\0'));
-        assert_eq!(CAGET.field_separator(None), None);
+        assert_eq!(CAGET.field_separator(&one("abc")), Some('a'));
+        assert_eq!(CAGET.field_separator(&one(",")), Some(','));
+        assert_eq!(CAGET.field_separator(&one("")), Some('\0'));
+        assert_eq!(CAGET.field_separator(&[]), None);
     }
 
     /// A bad `-w` leaves the env/default timeout in place and the tool RUNS.
     #[test]
     fn timeout_keeps_the_default_on_a_bad_scan() {
-        assert_eq!(CAGET.timeout(Some("2.5"), 1.0), 2.5);
-        assert_eq!(CAGET.timeout(Some(" 2.5 "), 1.0), 2.5);
-        assert_eq!(CAGET.timeout(Some("abc"), 1.0), 1.0);
-        assert_eq!(CAGET.timeout(Some("3x"), 1.0), 1.0);
-        assert_eq!(CAGET.timeout(None, 1.0), 1.0);
+        assert_eq!(CAGET.timeout(&one("2.5"), 1.0), 2.5);
+        assert_eq!(CAGET.timeout(&one(" 2.5 "), 1.0), 2.5);
+        assert_eq!(CAGET.timeout(&one("abc"), 1.0), 1.0);
+        assert_eq!(CAGET.timeout(&one("3x"), 1.0), 1.0);
+        assert_eq!(CAGET.timeout(&[], 1.0), 1.0);
+    }
+
+    /// R13-17. `getopt(3)` re-enters the same `case` on every occurrence, so
+    /// a repeat is legal and the loop body decides what survives. The four
+    /// C bodies do NOT agree on that, and each difference is observable:
+    ///
+    /// * `-w` (`caget.c:437-443`): a bad scan leaves `caTimeout` alone, so a
+    ///   good value SURVIVES a later bad one.
+    /// * `-#` (`:447-453`) and `-p` (`:455-462`): a bad scan RESETS to the
+    ///   documented default (`0` / `DEFAULT_CA_PRIORITY`).
+    /// * `-e`/`-f`/`-g` (`:470-484`): only the valid branch rewrites
+    ///   `dblFormatStr`, so the last VALID occurrence wins.
+    /// * `-F` (`:505`): a bare assignment — plain last-wins.
+    #[test]
+    fn a_repeated_option_folds_the_way_its_c_case_does() {
+        assert_eq!(CAGET.timeout(&many(&["5", "2"]), 1.0), 2.0, "last wins");
+        assert_eq!(
+            CAGET.timeout(&many(&["5", "abc"]), 1.0),
+            5.0,
+            "caTimeout is untouched by a bad scan"
+        );
+
+        assert_eq!(CAGET.req_elems_int(&many(&["2", "3"])), 3);
+        assert_eq!(
+            CAGET.req_elems_int(&many(&["3", "abc"])),
+            0,
+            "a bad -# resets count to 0"
+        );
+
+        assert_eq!(CAGET.priority(&many(&["1", "2"])), 2);
+        assert_eq!(
+            CAGET.priority(&many(&["5", "abc"])),
+            DEFAULT_CA_PRIORITY,
+            "a bad -p resets to DEFAULT_CA_PRIORITY"
+        );
+
+        assert_eq!(CAGET.digits('e', &many(&["2", "6"])), Some(6));
+        assert_eq!(
+            CAGET.digits('e', &many(&["3", "99"])),
+            Some(3),
+            "an out-of-range repeat never reaches the sprintf"
+        );
+        assert_eq!(CAGET.digits('e', &many(&["99", "3"])), Some(3));
+
+        assert_eq!(CAGET.field_separator(&many(&[",", ";"])), Some(';'));
+        assert_eq!(CAGET.stat_level(&many(&["1", "2"])), 2);
+        assert_eq!(CAGET.stat_level(&many(&["1", "abc"])), 0);
+    }
+
+    /// R13-17's structural guard: a value option declared with clap's default
+    /// `Set` action makes `caget -w 5 -w 2` a usage error, which C's getopt
+    /// cannot produce. `get_matches` must refuse to run such a spec rather
+    /// than let the divergence ship.
+    #[test]
+    #[should_panic(expected = "C's getopt accepts every option any number of times")]
+    fn a_non_repeatable_option_is_rejected_at_the_spec() {
+        let cmd = clap::Command::new("caget").arg(
+            clap::Arg::new("wait")
+                .short('w')
+                .action(clap::ArgAction::Set),
+        );
+        assert_repeatable(&cmd);
+    }
+
+    /// The shapes a C option IS allowed to take.
+    #[test]
+    fn append_and_count_options_are_accepted() {
+        let cmd = clap::Command::new("caget")
+            .arg(
+                clap::Arg::new("wait")
+                    .short('w')
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
+                clap::Arg::new("terse")
+                    .short('t')
+                    .action(clap::ArgAction::Count),
+            )
+            .arg(clap::Arg::new("pv").num_args(0..));
+        assert_repeatable(&cmd); // must not panic
     }
 }

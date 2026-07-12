@@ -33,37 +33,40 @@ const VERSION_INFO: &str = concat!(
     disable_version_flag = true
 )]
 struct Args {
-    #[arg(short = 'V', long, hide = true)]
-    version: bool,
+    /// Every option below is `Append` (value option) or `Count` (flag):
+    /// C's getopt loop accepts every option any number of times, last one
+    /// winning (R13-17, see [`epics_ca_rs::copt`]).
+    #[arg(short = 'V', long, hide = true, action = clap::ArgAction::Count)]
+    version: u8,
 
     /// CA timeout in seconds (initial connection wait). `epicsScanDouble`;
     /// a bad value warns and keeps the default (`camonitor.c:263-272`). Raw
     /// `String`: every C-scanned option argument is resolved by
     /// [`epics_ca_rs::copt`], never by clap.
-    #[arg(short = 'w', long = "wait", allow_hyphen_values = true)]
-    timeout: Option<String>,
+    #[arg(short = 'w', long = "wait", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    timeout: Vec<String>,
 
     /// CA event mask `<msk>`: any combination of `v` (value), `a`
     /// (alarm), `l` (log/archive), `p` (property). The subscription is
     /// issued with the resulting DBE_* mask; absent → value+log+alarm.
-    #[arg(short = 'm', long, value_name = "MASK")]
-    event_mask: Option<String>,
+    #[arg(short = 'm', long, value_name = "MASK", action = clap::ArgAction::Append)]
+    event_mask: Vec<String>,
 
     /// CA priority (`sscanf("%u")`, clamped to `CA_PRIORITY_MAX`; `-p -1`
     /// and `-p 500` both clamp to 99 in C, `camonitor.c:281-288`).
-    #[arg(short = 'p', long, allow_hyphen_values = true)]
-    priority: Option<String>,
+    #[arg(short = 'p', long, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    priority: Vec<String>,
 
     /// Timestamp source(s) and kind. Sources: `s`=CA server/remote
     /// (default), `c`=CA client/local receive time (shown in `()`).
     /// Kind: `n`=none, `r`=relative since program start, `i`=incremental
     /// across all channels, `I`=incremental per channel. `r`/`i`/`I`
     /// require `s` or `c`. Sources combine, e.g. `-t sc`, `-t cr`.
-    #[arg(short = 't', long = "timestamp", value_name = "KEY")]
-    timestamp_key: Option<String>,
+    #[arg(short = 't', long = "timestamp", value_name = "KEY", action = clap::ArgAction::Append)]
+    timestamp_key: Vec<String>,
 
-    #[arg(short = 'n', long = "num-enum")]
-    enum_as_number: bool,
+    #[arg(short = 'n', long = "num-enum", action = clap::ArgAction::Count)]
+    enum_as_number: u8,
 
     /// C's `reqElems`, scanned with `sscanf("%lu")` — 64-bit, unlike
     /// `caget`'s `%d` (`camonitor.c:273-280`). `0` (no `-#`, `-# 0`, or an
@@ -72,12 +75,13 @@ struct Args {
         short = '#',
         long = "max-elements",
         value_name = "COUNT",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    max_elements: Option<String>,
+    max_elements: Vec<String>,
 
-    #[arg(short = 'S', long = "char-as-string")]
-    char_array_as_string: bool,
+    #[arg(short = 'S', long = "char-as-string", action = clap::ArgAction::Count)]
+    char_array_as_string: u8,
 
     /// `%e`/`%f`/`%g` float format with the given precision (`sscanf("%d")`
     /// plus the `0..=VALID_DOUBLE_DIGITS` gate; both failures warn and keep
@@ -86,26 +90,29 @@ struct Args {
         short = 'e',
         long = "format-e",
         value_name = "PRECISION",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    fmt_e: Option<String>,
+    fmt_e: Vec<String>,
     #[arg(
         short = 'f',
         long = "format-f",
         value_name = "PRECISION",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    fmt_f: Option<String>,
+    fmt_f: Vec<String>,
     #[arg(
         short = 'g',
         long = "format-g",
         value_name = "PRECISION",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    fmt_g: Option<String>,
+    fmt_g: Vec<String>,
 
-    #[arg(short = 's', long = "string-format")]
-    string_format: bool,
+    #[arg(short = 's', long = "string-format", action = clap::ArgAction::Count)]
+    string_format: u8,
 
     /// `-0<base>`: print integers in base `x`/`o`/`b`. C spells this as a
     /// getopt option TAKING AN ARGUMENT (`camonitor.c:224`
@@ -127,9 +134,10 @@ struct Args {
         short = 'F',
         long = "field-separator",
         value_name = "OFS",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        action = clap::ArgAction::Append
     )]
-    field_separator: Option<String>,
+    field_separator: Vec<String>,
 
     /// PV names to monitor. NOT clap-`required` — see `caget-rs`; C checks
     /// `nPvs < 1` after the getopt loop (`camonitor.c:604-608`).
@@ -141,9 +149,9 @@ impl Args {
         let mut fmt = ValueFormat::default();
         // All three are scanned (not short-circuited) so that EACH malformed
         // precision emits its own warning, as C's getopt loop does.
-        let e = self.fmt_e.as_deref().and_then(|a| TOOL.digits('e', a));
-        let f = self.fmt_f.as_deref().and_then(|a| TOOL.digits('f', a));
-        let g = self.fmt_g.as_deref().and_then(|a| TOOL.digits('g', a));
+        let e = TOOL.digits('e', &self.fmt_e);
+        let f = TOOL.digits('f', &self.fmt_f);
+        let g = TOOL.digits('g', &self.fmt_g);
         if let Some(precision) = e {
             fmt.float = FloatFormat {
                 style: FloatStyle::E,
@@ -165,10 +173,10 @@ impl Args {
         // sets `outTypeF` (floats, via round-to-long). They never cross.
         fmt.int_style = TOOL.base('0', &self.int_base);
         fmt.float_style = TOOL.base('l', &self.float_base);
-        fmt.enum_as_number = self.enum_as_number;
-        fmt.char_array_as_string = self.char_array_as_string;
-        fmt.req_elems = TOOL.req_elems_ulong(self.max_elements.as_deref());
-        if let Some(c) = TOOL.field_separator(self.field_separator.as_deref()) {
+        fmt.enum_as_number = self.enum_as_number > 0;
+        fmt.char_array_as_string = self.char_array_as_string > 0;
+        fmt.req_elems = TOOL.req_elems_ulong(&self.max_elements);
+        if let Some(c) = TOOL.field_separator(&self.field_separator) {
             fmt.field_separator = c;
         }
         fmt
@@ -180,35 +188,41 @@ async fn main() {
     let args = Args::from_arg_matches(&TOOL.get_matches(Args::command()))
         .expect("clap validated the arguments");
 
-    if args.version {
+    if args.version > 0 {
         println!("{VERSION_INFO}");
         return;
     }
+
+    // C's ENTIRE getopt loop runs before the `nPvs < 1` check
+    // (`camonitor.c:224-600`, then `:604`), so every option argument is
+    // scanned — and every warning emitted — even when no PV name follows.
+    // `value_format` scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`; the three
+    // below cover the rest. `-m` and `-t` are bare re-scans, so a repeat is
+    // plain last-wins (`copt::last`, R13-17).
+    let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
+    let priority = TOOL.priority(&args.priority);
+    let fmt = Arc::new(args.value_format());
+    // The `-m <msk>` DBE_* mask + the `-t` timestamp mode, resolved once for
+    // all PVs. `prev_all`/`start` back the relative and incremental timestamp
+    // renderings.
+    let mask = parse_event_mask(epics_ca_rs::copt::last(&args.event_mask));
+    let spec = parse_timestamp_spec(epics_ca_rs::copt::last(&args.timestamp_key));
 
     if args.pv_names.is_empty() {
         TOOL.no_pv_name();
     }
 
     let client = CaClient::new().await.expect("failed to create CA client");
-    // -p selects the priority virtual circuit.
-    let priority = TOOL.priority(args.priority.as_deref());
 
     let connected_flags: Vec<Arc<AtomicBool>> = args
         .pv_names
         .iter()
         .map(|_| Arc::new(AtomicBool::new(false)))
         .collect();
-
-    let fmt = Arc::new(args.value_format());
-    // resolve the `-m <msk>` DBE_* mask + `-t` timestamp mode
-    // once for all PVs. `prev_all`/`start` back the relative and
-    // incremental timestamp renderings.
-    let mask = parse_event_mask(args.event_mask.as_deref());
-    let spec = parse_timestamp_spec(args.timestamp_key.as_deref());
     // `-s` (`floatAsString`): request DBR_TIME_STRING for FLOAT/DOUBLE
     // fields so the server renders the value at record precision
     // (C `camonitor.c:162-166`).
-    let float_as_string = args.string_format;
+    let float_as_string = args.string_format > 0;
     // C `camonitor.c:168-169` applies the user's `-#` count to the
     // `ca_create_subscription` request count (clamped to the native element
     // count at connect); `reqElems == 0` — no `-#`, `-# 0`, or an unscannable
@@ -259,11 +273,7 @@ async fn main() {
     }
 
     // Initial connection wait (C: ca_pend_event(caTimeout))
-    let timeout_secs = TOOL.timeout(
-        args.timeout.as_deref(),
-        epics_ca_rs::cli::env_default_timeout(),
-    );
-    tokio::time::sleep(epics_ca_rs::cli::timeout_duration(timeout_secs)).await;
+    tokio::time::sleep(epics_ca_rs::cli::timeout_duration(ca_timeout)).await;
 
     // Print "*** Not connected" for PVs that didn't connect within
     // the wait window. Mirrors `tool_lib.c::print_time_val_sts` line

@@ -115,11 +115,14 @@ enum MonitorPipelineRequest {
     /// Parsed options to apply (pipeline on or off).
     Options(PipelineOptions),
     /// pvxs `servermon.cpp:537-540`: `pipeline=true` with a PRESENT but
-    /// invalid (`<2` or unparseable) `queueSize`. The pipeline
+    /// invalid (`<2` or unconvertible) `queueSize`. The pipeline
     /// sub-protocol requires agreement on `queueSize`, so the INIT is
     /// rejected with an error (`ctrl->error(...)` + `return`) rather
-    /// than silently downgraded to a non-pipeline monitor.
-    Reject,
+    /// than silently downgraded to a non-pipeline monitor. Carries the
+    /// error text pvxs sends (`SB()<<"can not pipeline invalid queueSize : "
+    /// <<queueSize`), so the offending value reaches the client — a
+    /// `queueSize` the CONVERSION accepts never lands here.
+    Reject(String),
 }
 
 /// pvxs `Value::as(uint32_t&)` — i.e. `tryAs<uint32_t>` — applied to a scalar
@@ -625,7 +628,6 @@ fn parse_monitor_init_nack(
 /// when `pipeline=true` is paired with a PRESENT-but-invalid
 /// `queueSize` (pvxs `servermon.cpp:537-540`).
 fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
-    use crate::pvdata::ScalarValue;
     let root = match req {
         PvField::Structure(s) => s,
         _ => return None,
@@ -698,18 +700,21 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         .iter()
         .find_map(|(k, v)| (k == "queueSize").then_some(v));
     let queue_size_present = queue_size_field.is_some();
-    let queue_size = queue_size_field.and_then(|v| match v {
-        PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().parse::<u32>().ok(),
-        PvField::Scalar(ScalarValue::Byte(i)) => u32::try_from(*i).ok(),
-        PvField::Scalar(ScalarValue::UByte(i)) => Some(u32::from(*i)),
-        PvField::Scalar(ScalarValue::Short(i)) => u32::try_from(*i).ok(),
-        PvField::Scalar(ScalarValue::UShort(i)) => Some(u32::from(*i)),
-        PvField::Scalar(ScalarValue::Int(i)) => u32::try_from(*i).ok(),
-        PvField::Scalar(ScalarValue::UInt(i)) => Some(*i),
-        PvField::Scalar(ScalarValue::Long(l)) => u32::try_from(*l).ok(),
-        PvField::Scalar(ScalarValue::ULong(l)) => u32::try_from(*l).ok(),
-        _ => None,
-    });
+    // pvxs `queueSize.as(qSize)` with `uint32_t qSize` (`servermon.cpp:534`) —
+    // the same one conversion `pipeline` uses, targeting `StoreType::UInteger`
+    // ([`crate::pvdata::convert::as_u32`]). It converts a real
+    // (`uint64_t(double(src))`) and parses a string with `parseTo<uint64_t>` =
+    // `stoull(s, &idx, 0)`, i.e. BASE 0 — so `Double(8.0)` is 8, `"0x10"` is
+    // 16, `"010"` is 8. The hand-rolled match this replaces dropped
+    // Float/Double entirely and parsed strings as decimal-only, so a
+    // `queueSize` pvxs converts was rejected here: an enabled pipeline got the
+    // port's invented "can not pipeline invalid queueSize" error and a plain
+    // monitor got a spurious Warn plus the default depth (R10-32). A negative
+    // or oversized integer WRAPS through the uint64 cast and the uint32
+    // narrowing rather than being refused (`Int(-1)` → `0xFFFF_FFFF`), which is
+    // a valid — enormous — limit; the monitor queue grows lazily, so a hostile
+    // value costs no memory until the events actually arrive.
+    let queue_size = queue_size_field.and_then(|v| crate::pvdata::convert::as_u32(v).ok());
     // pvxs `servermon.cpp:554` — `record._options.ackAny`. Parsed only
     // for an enabled pipeline (`ackAt` is meaningless without one).
     let ack_any = opt_s
@@ -737,7 +742,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
                     diagnostics,
                 }
             }
-            // PRESENT but invalid (`<2` or unparseable): pvxs
+            // PRESENT but invalid (`<2` or unconvertible): pvxs
             // `servermon.cpp:537-540` rejects the INIT — the pipeline
             // sub-protocol requires agreement on `queueSize`. Do NOT
             // downgrade to a non-pipeline monitor. pvxs answers this with
@@ -747,7 +752,14 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
             // pipeline required a recognized `pipeline=true`, which emits
             // no Warn, and `ackAny` is never reached), so dropping it
             // matches pvxs.
-            _ if queue_size_present => return Some(MonitorPipelineRequest::Reject),
+            _ if queue_size_present => {
+                let rendered = queue_size_field
+                    .map(render_option_value)
+                    .unwrap_or_default();
+                return Some(MonitorPipelineRequest::Reject(format!(
+                    "can not pipeline invalid queueSize : {rendered}"
+                )));
+            }
             // ABSENT: pvxs keeps the default `limit` (4) and leaves
             // pipeline enabled.
             _ => {
@@ -6303,22 +6315,19 @@ async fn handle_op(
             _ => None,
         };
         // pvxs `servermon.cpp:537-540`: a MONITOR pipeline request whose
-        // PRESENT `queueSize` is invalid (`<2`/unparseable) is a
+        // PRESENT `queueSize` is invalid (`<2` or unconvertible) is a
         // negotiation error — reject the INIT (`ctrl->error(...)` +
         // `return`) instead of silently downgrading to a non-pipeline
         // monitor. GET/PUT/RPC never negotiate pipeline (pvxs
         // `serverget` ignores these options), so the reject is
-        // monitor-only.
-        if kind == OpKind::Monitor && matches!(pipeline_req, Some(MonitorPipelineRequest::Reject)) {
-            send_chan_op_error(
-                &chan_tx,
-                kind,
-                ioid,
-                subcmd,
-                "can not pipeline invalid queueSize (must be >= 2)",
-                order,
-            )
-            .await?;
+        // monitor-only. The text is pvxs's, carrying the offending value;
+        // the port used to append an invented "(must be >= 2)" and to reach
+        // this path for values pvxs's conversion accepts (a real, a hex or
+        // octal string).
+        if kind == OpKind::Monitor
+            && let Some(MonitorPipelineRequest::Reject(msg)) = &pipeline_req
+        {
+            send_chan_op_error(&chan_tx, kind, ioid, subcmd, msg, order).await?;
             return Ok(());
         }
         // pvxs `servermon.cpp:529/542/567/572` — emit `ServerConn::logRemote()`
@@ -8879,8 +8888,8 @@ mod tests {
     fn parsed_opts(req: &PvField) -> PipelineOptions {
         match monitor_pipeline_options(req) {
             Some(MonitorPipelineRequest::Options(o)) => o,
-            Some(MonitorPipelineRequest::Reject) => {
-                panic!("expected parsed options, got a pipeline-negotiation Reject")
+            Some(MonitorPipelineRequest::Reject(msg)) => {
+                panic!("expected parsed options, got a pipeline-negotiation Reject: {msg}")
             }
             None => panic!("expected parsed options, got None (no _options structure)"),
         }
@@ -8932,7 +8941,7 @@ mod tests {
         assert!(
             matches!(
                 monitor_pipeline_options(&req),
-                Some(MonitorPipelineRequest::Reject)
+                Some(MonitorPipelineRequest::Reject(_))
             ),
             "pipeline + queueSize<2 must reject the INIT, not downgrade",
         );
@@ -8940,18 +8949,106 @@ mod tests {
 
     #[test]
     fn pva_r20_pipeline_unparseable_queue_size_rejects() {
-        // PRESENT but unparseable queueSize under pipeline → Reject
+        // PRESENT but unconvertible queueSize under pipeline → Reject
         // (pvxs `queueSize.as(qSize)` fails, then `op->pipeline` → error).
         let req = make_pipeline_request(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::String("not-a-number".into())),
         );
+        let got = monitor_pipeline_options(&req);
+        let Some(MonitorPipelineRequest::Reject(msg)) = got else {
+            panic!("pipeline + unconvertible queueSize must reject the INIT");
+        };
+        // pvxs `ctrl->error(SB()<<"can not pipeline invalid queueSize : "
+        // <<queueSize)` — the offending value, no invented "(must be >= 2)".
+        assert!(
+            msg.starts_with("can not pipeline invalid queueSize : "),
+            "pvxs error text: {msg}"
+        );
+        assert!(msg.contains("not-a-number"), "the value is named: {msg}");
+    }
+
+    /// R10-32: pvxs `queueSize.as(qSize)` converts a REAL
+    /// (`uint64_t(double(src))`) and parses a STRING with `parseTo<uint64_t>`
+    /// = `stoull(s,&idx,0)`, base 0. The port dropped Float/Double and read
+    /// strings as decimal-only, so each of these was refused: under pipeline
+    /// with the port's invented "can not pipeline invalid queueSize" error,
+    /// and on a plain monitor with a spurious Warn plus the default depth.
+    #[test]
+    fn pva_r10_32_queue_size_converts_reals_and_base_zero_strings() {
+        for (v, want) in [
+            (ScalarValue::Double(8.0), 8u32),
+            (ScalarValue::Double(8.9), 8),
+            (ScalarValue::Float(16.0), 16),
+            (ScalarValue::String("0x10".into()), 16),
+            (ScalarValue::String("010".into()), 8),
+            (ScalarValue::String("12".into()), 12),
+            (ScalarValue::UInt(5), 5),
+        ] {
+            let req = make_pipeline_request(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(v.clone()),
+            );
+            let opts = parsed_opts(&req);
+            assert!(opts.enabled, "queueSize = {v:?} must not disable pipeline");
+            assert_eq!(opts.queue_size, want, "queueSize = {v:?}");
+            // `op->limit = qSize` sits OUTSIDE `if(op->pipeline)`, so the
+            // squash override applies to a non-pipeline monitor too.
+            assert_eq!(opts.requested_queue_size, Some(want));
+            assert!(
+                opts.diagnostics.is_empty(),
+                "a converted queueSize must not warn: {:?}",
+                opts.diagnostics
+            );
+        }
+    }
+
+    /// R10-32 (non-pipeline half): the same conversion feeds `op->limit` for a
+    /// PLAIN monitor — no pipeline, no Warn, requested depth honored.
+    #[test]
+    fn pva_r10_32_real_queue_size_sets_a_plain_monitor_depth() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Double(8.0)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(!opts.enabled);
+        assert_eq!(opts.requested_queue_size, Some(8));
+        assert!(
+            opts.diagnostics.is_empty(),
+            "a converted queueSize must not warn: {:?}",
+            opts.diagnostics
+        );
+    }
+
+    /// R10-32 (boundary): a negative / oversized integer WRAPS through
+    /// `uint64_t(int64_t(src))` and the `uint32_t` narrowing rather than being
+    /// refused — pvxs sets `op->limit = 0xFFFF_FFFF`. NOT a rejection.
+    #[test]
+    fn pva_r10_32_negative_queue_size_wraps_like_the_c_cast() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(-1)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(opts.enabled);
+        assert_eq!(opts.queue_size, 0xFFFF_FFFF);
+    }
+
+    /// R10-32 (documented non-divergence): a BOOLEAN queueSize converts to
+    /// 0/1, which is `< 2`, so both pvxs and the port treat it as invalid.
+    #[test]
+    fn pva_r10_32_boolean_queue_size_is_still_invalid() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Boolean(true)),
+        );
         assert!(
             matches!(
                 monitor_pipeline_options(&req),
-                Some(MonitorPipelineRequest::Reject)
+                Some(MonitorPipelineRequest::Reject(_))
             ),
-            "pipeline + unparseable queueSize must reject the INIT",
+            "Boolean queueSize converts to 1, which is < 2 → invalid",
         );
     }
 

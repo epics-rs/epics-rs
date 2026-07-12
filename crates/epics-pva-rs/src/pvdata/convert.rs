@@ -240,6 +240,110 @@ pub fn as_bool(f: &PvField) -> Result<bool, NoConvert> {
     }
 }
 
+/// pvxs `Value::as<uint64_t>()` / `Value::as(uint64_t&)` — `copyOut` into
+/// `StoreType::UInteger`.
+///
+/// Every storage class C-casts to `uint64_t` (`copyOutScalar`,
+/// `data.cpp:404`): a bool becomes 0/1, a signed integer WRAPS
+/// (`uint64_t(int64_t(-1))` is `u64::MAX`), a real truncates toward zero,
+/// and a string goes through [`parse_to_u64`] — pvxs `parseTo<uint64_t>`,
+/// which is `stoull(s, &idx, 0)`, i.e. BASE 0 (`util.cpp:786-799`).
+///
+/// DEVIATION, deliberate and recorded: `uint64_t(double)` for a negative,
+/// NaN, or overflowing real is undefined behavior in C++, so the port takes
+/// Rust's defined saturating cast (`-1.0` and `NaN` → 0) rather than
+/// reproducing an undefined result.
+pub fn as_u64(f: &PvField) -> Result<u64, NoConvert> {
+    match store_of(f) {
+        Store::Bool(b) => Ok(u64::from(b)),
+        Store::Integer(n) => Ok(n as u64),
+        Store::UInteger(n) => Ok(n),
+        Store::Real(n) => Ok(n as u64),
+        Store::Str(s) => parse_to_u64(&s),
+        Store::Compound(Some(inner)) => as_u64(inner),
+        Store::Array | Store::Compound(None) | Store::Null => Err(no_scalar_arm(f, "uint64")),
+    }
+}
+
+/// pvxs `Value::as<uint32_t>()` — [`as_u64`] narrowed by
+/// `StoreTransform<uint32_t>::out` (`data.h:81-86, 625-631`), which binds the
+/// `uint64_t` store to a `const uint32_t&` and so TRUNCATES. `ackAny = -1`
+/// therefore reaches `op->ackAt` as `0xFFFF_FFFF`, not as 1 or 0.
+pub fn as_u32(f: &PvField) -> Result<u32, NoConvert> {
+    as_u64(f).map(|v| v as u32)
+}
+
+/// pvxs `Value::as<uint8_t>()` — [`as_u64`] truncated to the low byte, the
+/// form `ioc/singlesource.cpp:135` uses for `record._options.DBE`.
+pub fn as_u8(f: &PvField) -> Result<u8, NoConvert> {
+    as_u64(f).map(|v| v as u8)
+}
+
+/// pvxs `parseTo<uint64_t>` (`util.cpp:786-799`) — `std::stoull(s, &idx, 0)`
+/// followed by a trailing-whitespace skip and an "extraneous characters"
+/// check.
+///
+/// `strtoull` with base 0 is not a decimal parse: it skips leading
+/// whitespace, takes an optional sign, then picks the radix from the prefix —
+/// `0x`/`0X` → 16, a leading `0` → 8, otherwise 10. A leading `-` NEGATES the
+/// parsed unsigned value (defined by C, not an error), so `"-1"` is
+/// `u64::MAX`. Overflow is `std::out_of_range` → `NoConvert`.
+///
+/// So `"0x10"` is 16, `"010"` is 8, `"10"` is 10, and `"12abc"` is NoConvert
+/// (the `abc` is extraneous). The port's decimal-only `str::parse` rejected
+/// the first two and accepted nothing pvxs rejects.
+pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let negate = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    // base 0 radix selection, exactly as strtoull does it.
+    let (radix, start) = match (b.get(i), b.get(i + 1)) {
+        (Some(b'0'), Some(b'x' | b'X')) => (16u32, i + 2),
+        (Some(b'0'), _) => (8u32, i),
+        _ => (10u32, i),
+    };
+    let mut end = start;
+    while end < b.len() && (b[end] as char).is_digit(radix) {
+        end += 1;
+    }
+    if end == start {
+        // No digit sequence at all — `std::stoull` raises `invalid_argument`,
+        // which `parseTo` re-raises as NoConvert. (A bare `"0x"` differs in
+        // wording only: strtoull consumes the `0` and leaves `x` extraneous.)
+        return Err(NoConvert::new(format!("Invalid input : \"{s}\"")));
+    }
+    let mut v = u64::from_str_radix(&s[start..end], radix)
+        .map_err(|_| NoConvert::new(format!("Out of range : \"{s}\"")))?;
+    if negate {
+        // C: "if the subject sequence begins with a minus sign, the value is
+        // negated" — a wrap, not an error.
+        v = v.wrapping_neg();
+    }
+    let mut j = end;
+    while j < b.len() && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j != b.len() {
+        return Err(NoConvert::new(format!(
+            "Extraneous characters after integer: \"{s}\""
+        )));
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +436,91 @@ mod tests {
             )))),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn as_u64_casts_every_scalar_storage_class() {
+        // `copyOutScalar` → `uint64_t(src)` for bool / signed / unsigned /
+        // real. Signed WRAPS; real truncates toward zero.
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Boolean(true))), Ok(1));
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Int(7))), Ok(7));
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Int(-1))), Ok(u64::MAX));
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::ULong(9))), Ok(9));
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Double(8.0))), Ok(8));
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Double(8.9))), Ok(8));
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Float(3.5))), Ok(3));
+        // Documented deviation: C++ UB for a negative / NaN real; the port
+        // takes Rust's defined saturating cast.
+        assert_eq!(as_u64(&PvField::Scalar(ScalarValue::Double(-1.0))), Ok(0));
+        assert_eq!(
+            as_u64(&PvField::Scalar(ScalarValue::Double(f64::NAN))),
+            Ok(0)
+        );
+        // No arm for array / struct storage.
+        assert!(
+            as_u64(&PvField::ScalarArrayTyped(TypedScalarArray::Int(
+                vec![4].into()
+            )))
+            .is_err()
+        );
+        assert!(as_u64(&PvField::Structure(PvStructure::new(""))).is_err());
+    }
+
+    #[test]
+    fn as_u32_truncates_like_store_transform() {
+        // `StoreTransform<uint32_t>::out` binds the uint64 store to a
+        // `const uint32_t&` — a truncation, not a range check.
+        assert_eq!(
+            as_u32(&PvField::Scalar(ScalarValue::Int(-1))),
+            Ok(0xFFFF_FFFF)
+        );
+        assert_eq!(
+            as_u32(&PvField::Scalar(ScalarValue::ULong(0x1_0000_0005))),
+            Ok(5)
+        );
+        assert_eq!(as_u8(&PvField::Scalar(ScalarValue::Int(0x1_05))), Ok(5));
+    }
+
+    #[test]
+    fn parse_to_u64_is_stoull_base_zero() {
+        // Radix from the prefix, exactly as `strtoull(s, &end, 0)` picks it.
+        assert_eq!(parse_to_u64("16"), Ok(16));
+        assert_eq!(parse_to_u64("0x10"), Ok(16));
+        assert_eq!(parse_to_u64("0X10"), Ok(16));
+        assert_eq!(parse_to_u64("010"), Ok(8));
+        assert_eq!(parse_to_u64("0"), Ok(0));
+        // A leading '-' negates the unsigned value (C, not an error).
+        assert_eq!(parse_to_u64("-1"), Ok(u64::MAX));
+        assert_eq!(parse_to_u64("+7"), Ok(7));
+        // Leading and trailing whitespace are skipped; anything else is not.
+        assert_eq!(parse_to_u64("  12  "), Ok(12));
+        for bad in ["", "abc", "12abc", "1.5", "0x", "8", "9"].iter().take(5) {
+            assert!(parse_to_u64(bad).is_err(), "{bad:?} must be NoConvert");
+        }
+        // Octal radix rejects 8/9 as digits — they become extraneous.
+        assert!(parse_to_u64("08").is_err());
+        // Overflow is `std::out_of_range` → NoConvert.
+        assert!(parse_to_u64("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn as_u64_parses_a_string_store_base_zero() {
+        // pvxs `copyOut` String→UInteger goes through `parseTo<uint64_t>`
+        // (data.cpp:451-453), so a hex / octal / negative option STRING
+        // converts.
+        assert_eq!(
+            as_u64(&PvField::Scalar(ScalarValue::String("0x10".into()))),
+            Ok(16)
+        );
+        assert_eq!(
+            as_u64(&PvField::Scalar(ScalarValue::String("010".into()))),
+            Ok(8)
+        );
+        assert_eq!(
+            as_u32(&PvField::Scalar(ScalarValue::String("-1".into()))),
+            Ok(0xFFFF_FFFF)
+        );
+        assert!(as_u64(&PvField::Scalar(ScalarValue::String("50%".into()))).is_err());
     }
 
     #[test]

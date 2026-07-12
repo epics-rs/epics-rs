@@ -5,6 +5,14 @@ use super::value::StackValue;
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
+    // C `sCalcPerform.c:396` — `if (*post == END_EXPRESSION) return(-1);`,
+    // checked before anything else, so an empty CALC (which sCalcPostfix
+    // ACCEPTS, CLCV 0) and a failed one behave identically at run time: the
+    // record alarms every process and VAL/SVAL keep their previous values.
+    if expr.is_empty() {
+        return Err(CalcError::EmptyProgram);
+    }
+
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -37,6 +45,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::R2D => {
                     stack.push(StackValue::Double(180.0 / std::f64::consts::PI));
                 }
+                // C `CONST_S2R` / `CONST_R2S` (`sCalcPerform.c:952-962`):
+                // arcseconds <-> radians, `PI/(180*3600)` and its reciprocal.
+                CoreOp::S2R => {
+                    stack.push(StackValue::Double(std::f64::consts::PI / (180.0 * 3600.0)));
+                }
+                CoreOp::R2S => {
+                    stack.push(StackValue::Double((180.0 * 3600.0) / std::f64::consts::PI));
+                }
 
                 CoreOp::Random => {
                     stack.push(StackValue::Double(simple_random()));
@@ -64,38 +80,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::Add => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            stack.push(StackValue::Double(x + y));
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(x, y) => StackValue::Double(x + y),
+                        Pair::Strings(mut x, y) => {
+                            x.push_str(&y);
+                            StackValue::Str(x)
                         }
-                        (StackValue::Str(x), StackValue::Str(y)) => {
-                            let mut result = x.clone();
-                            result.push_str(y);
-                            stack.push(StackValue::Str(result));
-                        }
-                        _ => return Err(CalcError::TypeMismatch),
-                    }
+                    });
                 }
                 CoreOp::Sub => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    match (&a, &b) {
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            stack.push(StackValue::Double(x - y));
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(x, y) => StackValue::Double(x - y),
+                        // C SUBLAST: remove the first occurrence of y from x.
+                        Pair::Strings(mut x, y) => {
+                            if let Some(pos) = x.find(y.as_str()) {
+                                x.replace_range(pos..pos + y.len(), "");
+                            }
+                            StackValue::Str(x)
                         }
-                        (StackValue::Str(x), StackValue::Str(y)) => {
-                            // Remove first occurrence of y from x
-                            let result = if let Some(pos) = x.find(y.as_str()) {
-                                let mut s = x.clone();
-                                s.replace_range(pos..pos + y.len(), "");
-                                s
-                            } else {
-                                x.clone()
-                            };
-                            stack.push(StackValue::Str(result));
-                        }
-                        _ => return Err(CalcError::TypeMismatch),
-                    }
+                    });
                 }
                 CoreOp::Mul => {
                     let (a, b) = pop2_f64(&mut stack)?;
@@ -156,70 +161,66 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: fabs(a-b) < SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() < SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x == y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() < SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x == y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Ne => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: fabs(a-b) > SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y).abs() > SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x != y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() > SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x != y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Lt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (b - a) > SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (y - x) > SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x < y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (y - x) > SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x < y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Le => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (fabs(a-b) < SMALL) || (a < b)
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < SMALL || x < y
-                        }
-                        (StackValue::Str(x), StackValue::Str(y)) => x <= y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() < SMALL || x < y,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x <= y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Gt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (a - b) > SMALL
-                        (StackValue::Double(x), StackValue::Double(y)) => (x - y) > SMALL,
-                        (StackValue::Str(x), StackValue::Str(y)) => x > y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y) > SMALL,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x > y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
                 CoreOp::Ge => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let result = match (&a, &b) {
+                    let result = match Pair::of(a, b) {
                         // C: (fabs(a-b) < SMALL) || (a > b)
-                        (StackValue::Double(x), StackValue::Double(y)) => {
-                            (x - y).abs() < SMALL || x > y
-                        }
-                        (StackValue::Str(x), StackValue::Str(y)) => x >= y,
-                        _ => return Err(CalcError::TypeMismatch),
+                        Pair::Numeric(x, y) => (x - y).abs() < SMALL || x > y,
+                        // C compares two strings with strcmp.
+                        Pair::Strings(x, y) => x >= y,
                     };
                     stack.push(StackValue::Double(if result { 1.0 } else { 0.0 }));
                 }
@@ -585,15 +586,21 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(result);
                 }
                 StringOp::BinRead => {
-                    let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    let result = bin_read(s);
-                    stack.push(StackValue::Str(result));
+                    // C `BIN_READ` (sCalcPerform.c:1693): pop the format, then
+                    // the subject; both must be strings. The result is a
+                    // DOUBLE (`ps->s = NULL`).
+                    let fmt = pop1(&mut stack)?;
+                    let subject = pop1(&mut stack)?;
+                    let value = bin_read(subject.as_str_ref()?, fmt.as_str_ref()?)?;
+                    stack.push(StackValue::Double(value));
                 }
                 StringOp::BinWrite => {
-                    let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    let result = bin_write(s);
+                    // C `BIN_WRITE` (sCalcPerform.c:1569): pop the value, then
+                    // the format; only the format must be a string. The result
+                    // is the raw bytes, escaped back into a string.
+                    let val = pop1(&mut stack)?;
+                    let fmt = pop1(&mut stack)?;
+                    let result = bin_write(fmt.as_str_ref()?, &val)?;
                     stack.push(StackValue::Str(result));
                 }
                 StringOp::Crc16 => {
@@ -651,18 +658,32 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Str(result));
                 }
                 StringOp::Subrange => {
-                    // Pop: string, start, end
+                    // C `sCalcPerform.c:1869-1901`. Pop: string, i, j — and BOTH
+                    // bounds are inclusive:
+                    //
+                    // ```c
+                    // for (s1=s+i, s2=s+j ; *s1 && s1 <= s2; ) *s++ = *s1++;
+                    // ```
+                    //
+                    // so `"hello"[1,4]` is "ello" and `"hello"[2,2]` is "l". The
+                    // bound arithmetic itself is `subrange_bounds`, shared with
+                    // aCalc's `[`.
                     let end_val = pop1(&mut stack)?;
                     let start_val = pop1(&mut stack)?;
                     let s = pop1(&mut stack)?;
                     let s = s.as_str_ref()?;
-                    let start = start_val.as_f64()? as i64;
-                    let end = end_val.as_f64()? as i64;
-                    let len = s.len() as i64;
-                    let start = start.max(0).min(len) as usize;
-                    let end = end.max(0).min(len) as usize;
-                    let end = end.max(start);
-                    stack.push(StackValue::Str(s[start..end].to_string()));
+                    let k = s.len() as i64;
+                    let (i, j) = super::subrange_bounds(
+                        subrange_index(&start_val)?,
+                        subrange_index(&end_val)?,
+                        k,
+                    );
+                    let out = if j < i {
+                        String::new()
+                    } else {
+                        s[i as usize..(j + 1).min(k) as usize].to_string()
+                    };
+                    stack.push(StackValue::Str(out));
                 }
                 StringOp::Replace => {
                     // Pop: string, find, replace
@@ -863,15 +884,15 @@ fn simple_printf(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
             let fmt_str = std::str::from_utf8(&bytes[spec_start..i]).unwrap();
             match spec {
                 b'd' | b'i' => {
-                    let v = val.as_f64().unwrap_or(0.0) as i64;
+                    let v = val.to_double() as i64;
                     result.push_str(&c_format_int(fmt_str, v));
                 }
                 b'f' | b'e' | b'g' | b'E' | b'G' => {
-                    let v = val.as_f64().unwrap_or(0.0);
+                    let v = val.to_double();
                     result.push_str(&c_format_float(fmt_str, v));
                 }
                 b'x' | b'X' | b'o' => {
-                    let v = val.as_f64().unwrap_or(0.0) as i64;
+                    let v = val.to_double() as i64;
                     result.push_str(&c_format_int(fmt_str, v));
                 }
                 b's' => {
@@ -1011,14 +1032,261 @@ fn simple_sscanf(input: &str, fmt: &str) -> StackValue {
     StackValue::Double(0.0)
 }
 
-fn bin_read(s: &str) -> String {
-    // Decode escape sequences in binary data
-    translate_escapes(s)
+/// C `myNINT` (sCalcPerform.c:40) — round half away from zero.
+fn my_nint(d: f64) -> f64 {
+    if d >= 0.0 { d + 0.5 } else { d - 0.5 }.trunc()
 }
 
-fn bin_write(s: &str) -> String {
-    // Encode binary data with escape sequences
-    escape_string(s)
+/// The binary field a printf/scanf conversion character names, with `h`/`l`
+/// applied. This is the one place that reads C's `s[-1]` length modifier, so
+/// BIN_READ and BIN_WRITE cannot disagree about a width.
+///
+/// `Int(4)` reads back UNSIGNED, and that is C, not a slip. C reads a 4-byte
+/// `%d` with `memcpy(&l, s1, 4)` into `long l = 0L` (sCalcPerform.c:321,1764) —
+/// on LP64 that is a 4-byte store into a zero-initialised 8-byte object, so the
+/// value is zero-extended. Compiled C agrees: `READ("\xff\xff\xff\xff", "%d")`
+/// is 4294967295, the same answer `%x` gives. Only `%hd` sign-extends, because
+/// `short h` really is two bytes wide, and `%c` because `char c` really is one.
+#[derive(Clone, Copy, PartialEq)]
+enum BinField {
+    Int(usize),   // 'd','i' — 2 bytes with `h`, else 4
+    Uint(usize),  // 'o','u','x','X' — 2 bytes with `h`, else 4
+    Float(usize), // 'e','E','f','g','G' — 8 bytes with `l`, else 4
+    Char,         // 'c' — 1 byte
+}
+
+impl BinField {
+    /// `conv` is the conversion character and `prev` the character before it
+    /// (C's `s[-1]`), which is where the `h`/`l` modifier lives.
+    fn parse(conv: u8, prev: Option<u8>) -> Option<BinField> {
+        Some(match conv {
+            b'd' | b'i' => BinField::Int(if prev == Some(b'h') { 2 } else { 4 }),
+            b'o' | b'u' | b'x' | b'X' => BinField::Uint(if prev == Some(b'h') { 2 } else { 4 }),
+            b'e' | b'E' | b'f' | b'g' | b'G' => {
+                BinField::Float(if prev == Some(b'l') { 8 } else { 4 })
+            }
+            b'c' => BinField::Char,
+            // C's `default:` and its explicit `case 's'` both `return(-1)`.
+            _ => return None,
+        })
+    }
+
+    fn width(self) -> usize {
+        match self {
+            BinField::Int(w) | BinField::Uint(w) | BinField::Float(w) => w,
+            BinField::Char => 1,
+        }
+    }
+}
+
+/// C `BIN_WRITE` (sCalcPerform.c:1569-1633): write `val` into `fmt`'s field as
+/// raw little-endian bytes, then escape those bytes back into a string.
+///
+/// C finds the conversion character with its own inline scan — skip every `%%`,
+/// take the next `%`, then the first character of `*cdeEfgGiousxX` after it —
+/// and bails out (`return -1`) on `*` (suppressed assignment), on `s`, and when
+/// there is no conversion character at all.
+fn bin_write(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
+    let f = fmt.as_bytes();
+
+    // `while ((s1 = strstr(s, "%%"))) {s = s1+2;}` — advance past the LAST `%%`.
+    let mut i = 0;
+    while let Some(p) = find_sub(&f[i..], b"%%") {
+        i += p + 2;
+    }
+    let pct = find_byte(&f[i..], b'%').ok_or(CalcError::InvalidFormat)? + i;
+    let conv = f[pct + 1..]
+        .iter()
+        .position(|b| b"*cdeEfgGiousxX".contains(b))
+        .ok_or(CalcError::InvalidFormat)?
+        + pct
+        + 1;
+
+    let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
+        .ok_or(CalcError::InvalidFormat)?;
+
+    // C `toDouble(ps1)`: the value operand is coerced, never rejected. C's
+    // `myNINT` casts to `int`, so the integer conversions see a 32-bit value
+    // and `memcpy` then takes its low `width` bytes.
+    let d = val.to_double();
+    let n = my_nint(d) as i32;
+    let raw: Vec<u8> = match field {
+        BinField::Char => vec![n as u8],
+        BinField::Int(w) | BinField::Uint(w) => n.to_le_bytes()[..w].to_vec(),
+        BinField::Float(4) => (d as f32).to_le_bytes().to_vec(),
+        BinField::Float(_) => d.to_le_bytes().to_vec(),
+    };
+    Ok(escaped_from_raw(&raw))
+}
+
+/// C `BIN_READ` (sCalcPerform.c:1693-1794): un-escape `subject` into raw bytes
+/// and read `fmt`'s field out of them as a double.
+///
+/// Unlike BIN_WRITE this uses `findConversionIndicator`, which skips
+/// assignment-suppressed conversions (`%*...`); the suppressed ones are then
+/// re-read as a byte count to skip over before the value is taken.
+fn bin_read(subject: &str, fmt: &str) -> Result<f64, CalcError> {
+    let f = fmt.as_bytes();
+    let conv = find_conversion_indicator(f).ok_or(CalcError::InvalidFormat)?;
+    let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
+        .ok_or(CalcError::InvalidFormat)?;
+
+    let raw = raw_from_escaped(subject);
+    let skip = match find_byte(f, b'*') {
+        // `s2 && s2 < s`: a suppressed conversion ahead of the live one.
+        Some(star) if star < conv => suppressed_skip_bytes(&f[star + 1..]),
+        _ => 0,
+    };
+
+    let w = field.width();
+    let bytes = raw.get(skip..skip + w).ok_or(CalcError::InvalidFormat)?;
+    Ok(match field {
+        // `char c` / `short h`: exactly as wide as the field, so these sign-extend.
+        BinField::Char => bytes[0] as i8 as f64,
+        BinField::Int(2) => i16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+        // `long l = 0L` with a 4-byte memcpy: zero-extended. See BinField.
+        BinField::Int(_) | BinField::Uint(4) => {
+            u32::from_le_bytes(bytes.try_into().unwrap()) as f64
+        }
+        BinField::Uint(_) => u16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+        BinField::Float(4) => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+        BinField::Float(_) => f64::from_le_bytes(bytes.try_into().unwrap()),
+    })
+}
+
+/// How many bytes a suppressed conversion (`%*2hd`, `%*2c`, `%*2`) covers.
+/// `tail` starts just after the `*`. C reads an optional repeat count and then
+/// scales it by the width the following conversion names (sCalcPerform.c:1717).
+fn suppressed_skip_bytes(tail: &[u8]) -> usize {
+    let digits = tail.iter().take_while(|b| b.is_ascii_digit()).count();
+    let count: usize = std::str::from_utf8(&tail[..digits])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let rest = &tail[digits..];
+    // C switches on the character right after the digits, so `%*2` with no
+    // conversion at all skips `count` bare bytes.
+    match rest.first() {
+        Some(b'h') => count * 2,
+        Some(b'l') => {
+            if rest.iter().any(|b| b"diouxX".contains(b)) {
+                count * 4
+            } else {
+                count * 8
+            }
+        }
+        Some(b'd' | b'i' | b'o' | b'u' | b'x' | b'X') => count * 4,
+        Some(b'e' | b'E' | b'f' | b'g' | b'G') => count * 4,
+        _ => count,
+    }
+}
+
+/// C `findConversionIndicator` (sCalcPerform.c:105): the byte offset of the
+/// first conversion character whose assignment is NOT suppressed, skipping
+/// `%%` pairs. Returns `None` when there is none.
+fn find_conversion_indicator(f: &[u8]) -> Option<usize> {
+    const CONV: &[u8] = b"pwn$c[deEfgGiousxX";
+    let mut i = 0;
+    while i < f.len() {
+        if let Some(p) = find_sub(&f[i..], b"%%") {
+            if find_byte(&f[i..], b'%') == Some(p) {
+                i += p + 2;
+                continue;
+            }
+        }
+        let pct = find_byte(&f[i..], b'%')? + i;
+        let cc = f[pct..].iter().position(|b| CONV.contains(b))? + pct;
+        match find_byte(&f[pct..], b'*') {
+            // Suppressed: skip past this conversion and keep looking.
+            Some(star) if star + pct < cc => i = cc + 1,
+            _ => return Some(cc),
+        }
+    }
+    None
+}
+
+fn find_byte(h: &[u8], n: u8) -> Option<usize> {
+    h.iter().position(|b| *b == n)
+}
+
+fn find_sub(h: &[u8], n: &[u8]) -> Option<usize> {
+    h.windows(n.len()).position(|w| w == n)
+}
+
+/// C `epicsStrnEscapedFromRaw` (epicsString.c:120), which is what
+/// `epicsStrSnPrintEscaped` resolves to. Raw bytes in, printable string out:
+/// the C escapes, `\0` for NUL, `\xNN` (lower-case) for anything else
+/// unprintable, and the byte itself when `isprint`.
+fn escaped_from_raw(src: &[u8]) -> String {
+    let mut out = String::new();
+    for &c in src {
+        match c {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'"' => out.push_str("\\\""),
+            0 => out.push_str("\\0"),
+            // C `isprint` in the C locale: the printable ASCII range.
+            0x20..=0x7e => out.push(c as char),
+            _ => out.push_str(&format!("\\x{c:02x}")),
+        }
+    }
+    out
+}
+
+/// C `dbTranslateEscape` -> `epicsStrnRawFromEscaped` (epicsString.c:49).
+/// Escaped string in, raw bytes out. An unknown escape yields the character
+/// itself, and a `\x` with no hex digit behind it yields a literal `x`.
+fn raw_from_escaped(src: &str) -> Vec<u8> {
+    let s = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'\\' {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&c) = s.get(i) else { break };
+        i += 1;
+        match c {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'\'' => out.push(b'\''),
+            b'"' => out.push(b'"'),
+            b'0' => out.push(0),
+            b'x' => {
+                let digits = s[i..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_hexdigit())
+                    .count()
+                    .min(2);
+                if digits == 0 {
+                    // C falls back through `goto input`: the `x` is literal.
+                    out.push(b'x');
+                } else {
+                    let hex = std::str::from_utf8(&s[i..i + digits]).unwrap();
+                    out.push(u8::from_str_radix(hex, 16).unwrap());
+                    i += digits;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn format_double(d: f64) -> String {
@@ -1076,9 +1344,55 @@ fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
 
+/// C's mixed-type rule for the binary operators that HAVE a string branch —
+/// ADD, SUB/SUBLAST, and the six comparisons (sCalcPerform.c:964-978 and the
+/// comparison cases). Each is written the same way:
+///
+/// ```c
+/// if (isDouble(ps))       { toDouble(ps1);  /* numeric */ }
+/// else if (isDouble(ps1)) { to_double(ps);  /* numeric */ }
+/// else                    { /* the string branch */ }
+/// ```
+///
+/// so the string branch runs ONLY when both operands are strings; if either
+/// side is already a double, the other is coerced and the operator is numeric.
+/// Classifying the pair once means these operators cannot grow a third,
+/// mixed-type outcome — there is no `_` arm left to reject.
+enum Pair {
+    Numeric(f64, f64),
+    Strings(String, String),
+}
+
+impl Pair {
+    fn of(a: StackValue, b: StackValue) -> Pair {
+        match (a, b) {
+            (StackValue::Str(x), StackValue::Str(y)) => Pair::Strings(x, y),
+            (a, b) => Pair::Numeric(a.to_double(), b.to_double()),
+        }
+    }
+}
+
+/// A `SUBRANGE` bound. This is NOT one of the numeric positions C coerces: C
+/// branches on the bound's TYPE (sCalcPerform.c:1876-1888) — a double is the
+/// index itself, while a STRING is searched for with `strstr` and positions the
+/// range at the match. The port implements only the numeric branch, so a string
+/// bound is still rejected here; running it through `to_double` instead would
+/// silently answer 0 for "abc" rather than looking for it. The missing branch is
+/// an open gap, reported, not papered over.
+fn subrange_index(v: &StackValue) -> Result<i64, CalcError> {
+    match v {
+        StackValue::Double(d) => Ok(*d as i64),
+        StackValue::Str(_) => Err(CalcError::TypeMismatch),
+    }
+}
+
+/// Pop a NUMERIC operand. C reaches every one of these through `toDouble`
+/// (sCalcPerform.c: MULT, DIV, POWER, MODULO, the trig/log/abs/sqrt functions,
+/// COND_IF, REL_AND/OR/NOT, the bit ops, ...), which coerces a string instead
+/// of rejecting it — so this cannot fail on type, only on underflow.
 fn pop1_f64(stack: &mut Vec<StackValue>) -> Result<f64, CalcError> {
     let v = stack.pop().ok_or(CalcError::Underflow)?;
-    v.as_f64()
+    Ok(v.to_double())
 }
 
 fn pop2_f64(stack: &mut Vec<StackValue>) -> Result<(f64, f64), CalcError> {

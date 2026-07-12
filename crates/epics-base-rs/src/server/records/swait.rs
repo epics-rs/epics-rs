@@ -1,5 +1,6 @@
+use super::calc_compile;
 use crate::calc::NumericInputs;
-use crate::calc::{CompiledExpr, compile as calc_compile, eval as calc_eval};
+use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
@@ -14,7 +15,13 @@ use crate::types::{DbFieldType, EpicsValue};
 pub struct SwaitRecord {
     pub val: f64,
     pub calc: String,
-    compiled_calc: Option<CompiledExpr>,
+    /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
+    /// empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run, so
+    /// the record alarms on every process. See [`calc_compile`].
+    compiled_calc: CompiledExpr,
+    /// C `recGblSetSevr(pwait, CALC_ALARM, INVALID_ALARM)` on a `calcPerform`
+    /// failure (`swaitRecord.c:409-410`). Same marker field as calc/calcout.
+    pub calc_alarm: bool,
     pub oopt: i16,
     pub dopt: i16,
     // DOLN ("DOL PV Name", C `swaitRecord.dbd:150`, DBF_STRING/SPC_MOD) and
@@ -75,7 +82,8 @@ impl Default for SwaitRecord {
         Self {
             val: 0.0,
             calc: String::new(),
-            compiled_calc: None,
+            compiled_calc: CompiledExpr::empty(ExprKind::Numeric),
+            calc_alarm: false,
             oopt: 0,
             dopt: 0,
             doln: String::new(),
@@ -105,7 +113,10 @@ impl SwaitRecord {
     /// `postfix()`, not `sCalcPostfix()`. Its grammar is therefore epics-base
     /// calc's: no SVAL, no string literals, no sCalc string functions.
     fn recompile(&mut self) {
-        self.compiled_calc = calc_compile(&self.calc).ok();
+        // Through the compile owner, so a bad CALC gets C's errlog line and
+        // leaves the empty program behind — `.ok()` discarded both, and the
+        // record then had nothing to run and nothing to alarm about.
+        self.compiled_calc = calc_compile::postfix("swait", "CALC", &self.calc).program;
     }
 
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
@@ -479,13 +490,16 @@ impl Record for SwaitRecord {
         // the OOPT decision.
         let old_val = self.oval;
 
-        if let Some(ref compiled) = self.compiled_calc {
-            let mut inputs = self.build_inputs(self.val);
-            // C `swaitRecord.c:409` — `calcPerform(&pwait->a, &pwait->val,
-            // pwait->rpcl)`: the numeric engine, whose result is a double.
-            if let Ok(v) = calc_eval(compiled, &mut inputs) {
+        // C `swaitRecord.c:409-410` — `calcPerform` runs unconditionally, and a
+        // -1 is CALC_ALARM/INVALID with VAL left alone. An empty or uncompilable
+        // CALC is the empty program and fails here every cycle.
+        let mut inputs = self.build_inputs(self.val);
+        match calc_eval(&self.compiled_calc, &mut inputs) {
+            Ok(v) => {
                 self.val = v;
+                self.calc_alarm = false;
             }
+            Err(_) => self.calc_alarm = true,
         }
 
         // Cache before framework calls should_output() via trait dispatch.
@@ -611,6 +625,7 @@ impl Record for SwaitRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
+            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLN" => Some(EpicsValue::String(self.doln.clone().into())),

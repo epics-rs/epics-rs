@@ -1,3 +1,4 @@
+use super::array_value::ArrayStackValue::Double;
 use super::array_value::{ArrayStackValue, zip_map};
 use super::cast::{c_int, c_long, d2ui};
 use super::error::CalcError;
@@ -12,9 +13,27 @@ use crate::calc::math::{derivative, fitting, stats};
 const MY_MAXFLOAT: f64 = 1e35f32 as f64;
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
+    // C `aCalcPerform.c:312-314` — `if (*postfix == END_EXPRESSION) return(-1);`,
+    // ahead of even the value-stack allocation. Same contract as the other two
+    // engines: an empty or failed compile is a program that fails every run.
+    if expr.is_empty() {
+        return Err(CalcError::EmptyProgram);
+    }
+
     let mut stack: Vec<ArrayStackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
+
+    // C's `status` (`aCalcPerform.c:422`) — a deferred failure flag, NOT an early
+    // return. An operator that trips it (the array SQRT/LOG domain guard) sets it
+    // and execution CONTINUES to the end of the expression; only then does
+    // aCalcPerform bail (`:1602-1605`) without writing p_dresult/p_aresult.
+    //
+    // The deferral is observable: aCalc's store opcodes write straight into the
+    // record's A..P / AA..LL fields, so a store sequenced AFTER the failing
+    // operator still lands in C. Returning early from the operator's arm would
+    // silently skip it.
+    let mut status: Option<CalcError> = None;
 
     while pc < code.len() {
         let op = &code[pc];
@@ -41,6 +60,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Pi => stack.push(ArrayStackValue::Double(std::f64::consts::PI)),
                 CoreOp::D2R => stack.push(ArrayStackValue::Double(std::f64::consts::PI / 180.0)),
                 CoreOp::R2D => stack.push(ArrayStackValue::Double(180.0 / std::f64::consts::PI)),
+                // C `CONST_S2R` / `CONST_R2S` (`aCalcPerform.c:559-569`):
+                // arcseconds <-> radians, `PI/(180*3600)` and its reciprocal.
+                CoreOp::S2R => stack.push(ArrayStackValue::Double(
+                    std::f64::consts::PI / (180.0 * 3600.0),
+                )),
+                CoreOp::R2S => stack.push(ArrayStackValue::Double(
+                    (180.0 * 3600.0) / std::f64::consts::PI,
+                )),
 
                 CoreOp::Random => stack.push(ArrayStackValue::Double(simple_random())),
                 CoreOp::NormalRandom => {
@@ -263,7 +290,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 CoreOp::Sqrt => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.sqrt()));
+                    stack.push(domain_guarded(a, f64::sqrt, &mut status));
                 }
                 CoreOp::Exp => {
                     let a = pop1(&mut stack)?;
@@ -271,11 +298,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 CoreOp::Log10 => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.log10()));
+                    stack.push(domain_guarded(a, f64::log10, &mut status));
                 }
                 CoreOp::LogE => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.ln()));
+                    stack.push(domain_guarded(a, f64::ln, &mut status));
                 }
                 CoreOp::Sin => {
                     let a = pop1(&mut stack)?;
@@ -332,37 +359,36 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     }));
                 }
 
+                // ISNAN and FINITE are aCalc's two VARARG predicates
+                // (`aCalcPerform.c:1114-1146`), and each folds over EVERY ELEMENT
+                // of EVERY argument — an array argument is not collapsed to its
+                // a[0]:
+                //   FINITE = AND of finite() over all elements of all args
+                //   ISNAN  = OR  of isnan()  over all elements of all args
+                // Both reduce to a plain double (`toDouble(ps); ps->d = j`).
                 CoreOp::IsNan(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = false;
-                    for _ in 0..n {
-                        let v = pop1_f64(&mut stack)?;
-                        result = result || v.is_nan();
-                    }
-                    stack.push(ArrayStackValue::Double(if result { 1.0 } else { 0.0 }));
-                }
-                CoreOp::IsInf => {
-                    let a = pop1_f64(&mut stack)?;
-                    stack.push(ArrayStackValue::Double(if a.is_infinite() {
-                        1.0
-                    } else {
-                        0.0
-                    }));
+                    let args = popn(&mut stack, *nargs as usize)?;
+                    let any_nan = args
+                        .iter()
+                        .flat_map(ArrayStackValue::elements)
+                        .any(f64::is_nan);
+                    stack.push(ArrayStackValue::Double(f64::from(u8::from(any_nan))));
                 }
                 CoreOp::Finite(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = true;
-                    for _ in 0..n {
-                        let v = pop1_f64(&mut stack)?;
-                        result = result && v.is_finite();
-                    }
-                    stack.push(ArrayStackValue::Double(if result { 1.0 } else { 0.0 }));
+                    let args = popn(&mut stack, *nargs as usize)?;
+                    let all_finite = args
+                        .iter()
+                        .flat_map(ArrayStackValue::elements)
+                        .all(f64::is_finite);
+                    stack.push(ArrayStackValue::Double(f64::from(u8::from(all_finite))));
+                }
+                // ISINF is NOT a reduction: it is one of aCalc's element-wise unary
+                // operators (`aCalcPerform.c:826` in the isArray branch, :1085 in
+                // the scalar one), so an array operand yields an ARRAY result with
+                // the predicate applied per element.
+                CoreOp::IsInf => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| f64::from(u8::from(x.is_infinite()))));
                 }
 
                 CoreOp::Atan2 => {
@@ -445,139 +471,137 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 ArrayOp::Average => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(stats::average(arr)));
+                    stack.push(unary(v, |a| Double(stats::average(a)), PASS_THROUGH));
                 }
                 ArrayOp::StdDev => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(stats::std_dev(arr)));
+                    stack.push(unary(v, |a| Double(stats::std_dev(a)), ZERO));
                 }
                 ArrayOp::Fwhm => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(stats::fwhm(arr)));
+                    stack.push(unary(v, |a| Double(stats::fwhm(a)), ZERO));
                 }
                 ArrayOp::ArraySum => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(arr.iter().sum()));
+                    stack.push(unary(v, |a| Double(a.iter().sum()), PASS_THROUGH));
                 }
                 ArrayOp::ArrayMax => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    stack.push(ArrayStackValue::Double(if arr.is_empty() {
-                        0.0
-                    } else {
-                        max
-                    }));
+                    stack.push(unary(
+                        v,
+                        |a| Double(extremum(a).map_or(0.0, |(v, _)| v)),
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::ArrayMin => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
-                    stack.push(ArrayStackValue::Double(if arr.is_empty() {
-                        0.0
-                    } else {
-                        min
-                    }));
+                    stack.push(unary(
+                        v,
+                        |a| Double(extremum_by(a, |x, best| x < best).map_or(0.0, |(v, _)| v)),
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::IndexMax => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(i, _)| i as f64)
-                        .unwrap_or(0.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    stack.push(unary(
+                        v,
+                        |a| Double(extremum(a).map_or(0.0, |(_, i)| i as f64)),
+                        ZERO,
+                    ));
                 }
                 ArrayOp::IndexMin => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .enumerate()
-                        .min_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(i, _)| i as f64)
-                        .unwrap_or(0.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            Double(
+                                extremum_by(a, |x, best| x < best).map_or(0.0, |(_, i)| i as f64),
+                            )
+                        },
+                        ZERO,
+                    ));
                 }
                 ArrayOp::IndexZero => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .position(|&x| x == 0.0)
-                        .map(|i| i as f64)
-                        .unwrap_or(-1.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    // C `:1090` — a scalar IS its own element 0, so it "contains a
+                    // zero" exactly when it is (near-)zero itself.
+                    stack.push(unary(
+                        v,
+                        |a| Double(index_zero_crossing(a)),
+                        |d| if d.abs() < SMALL { 0.0 } else { -1.0 },
+                    ));
                 }
                 ArrayOp::IndexNonZero => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let idx = arr
-                        .iter()
-                        .position(|&x| x != 0.0)
-                        .map(|i| i as f64)
-                        .unwrap_or(-1.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    // C `aCalcPerform.c:893-898` thresholds at SMALL — `fabs(a[i])
+                    // > SMALL` — it is not an exact `!= 0.0`. Below 1e-9 an element
+                    // counts as zero and is skipped. (aCalc's other zero tests —
+                    // logical AND/OR/NOT, the conditional, the DIV/MOD zero divisor
+                    // — really are C's exact truthiness, so SMALL stays here.)
+                    // Scalar: C `:1091`, the mirror image of IXZ's.
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            Double(
+                                a.iter()
+                                    .position(|&x| x.abs() > SMALL)
+                                    .map_or(-1.0, |i| i as f64),
+                            )
+                        },
+                        |d| if d.abs() > SMALL { 0.0 } else { -1.0 },
+                    ));
                 }
 
                 ArrayOp::Smooth => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Array(stats::smooth(arr)));
+                    stack.push(unary(
+                        v,
+                        |a| ArrayStackValue::Array(stats::smooth(a)),
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::NSmooth => {
                     let n = pop1_f64(&mut stack)? as usize;
                     let v = pop1(&mut stack)?;
+                    // NSMOOTH is NOT in C's unary switch — it is its own case
+                    // (`aCalcPerform.c:579-591`) and it indexes `ps->a[]` with no
+                    // `toArray` first, so a scalar operand dereferences a NULL array
+                    // in C. There is no C behaviour to match; refusing is the
+                    // deliberate deviation.
                     let arr = v.as_array()?;
                     stack.push(ArrayStackValue::Array(stats::nsmooth(arr, n)));
                 }
                 ArrayOp::Deriv => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Array(derivative::deriv(arr)));
+                    stack.push(unary(
+                        v,
+                        |a| ArrayStackValue::Array(derivative::deriv(a)),
+                        ZERO,
+                    ));
                 }
                 ArrayOp::NDeriv => {
                     let n = pop1_f64(&mut stack)? as usize;
                     let v = pop1(&mut stack)?;
+                    // NDERIV is NOT in C's unary switch either (`:594-618`), and its
+                    // own case PROMOTES a scalar with `toArray(ps,1)` rather than
+                    // answering 0. Refusing here is a divergence from that promotion,
+                    // reported separately — it is not R10-4's family.
                     let arr = v.as_array()?;
                     stack.push(ArrayStackValue::Array(derivative::nderiv(arr, n)));
                 }
                 ArrayOp::Cum => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let mut result = arr.to_vec();
-                    for i in 1..result.len() {
-                        result[i] += result[i - 1];
-                    }
-                    stack.push(ArrayStackValue::Array(result));
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            let mut result = a.to_vec();
+                            for i in 1..result.len() {
+                                result[i] += result[i - 1];
+                            }
+                            ArrayStackValue::Array(result)
+                        },
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::Cat => {
                     let b = pop1(&mut stack)?;
@@ -596,27 +620,104 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let arr: Vec<f64> = (0..inputs.array_size).map(|_| simple_random()).collect();
                     stack.push(ArrayStackValue::Array(arr));
                 }
-                ArrayOp::ArraySubrange => {
-                    let end_val = pop1_f64(&mut stack)? as i64;
-                    let start_val = pop1_f64(&mut stack)? as i64;
-                    let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let len = arr.len() as i64;
-                    let start = start_val.max(0).min(len) as usize;
-                    let end = end_val.max(0).min(len) as usize;
-                    let end = end.max(start);
-                    stack.push(ArrayStackValue::Array(arr[start..end].to_vec()));
+                ArrayOp::ArraySubrange | ArrayOp::ArraySubrangeInPlace => {
+                    // C `aCalcPerform.c:1520-1549`. Both bounds are INCLUSIVE, a
+                    // negative bound counts back from the end, and the result is
+                    // still a full `arraySize` buffer: `[` shifts the selected
+                    // elements down to index 0 and zero-fills the tail, `{` leaves
+                    // them where they are and zeroes everything outside.
+                    let n = inputs.array_size as i64;
+                    let (i, j) = pop_subrange_bounds(&mut stack, n)?;
+                    let mut a = pop1(&mut stack)?.to_array(inputs.array_size);
+                    a.resize(inputs.array_size, 0.0);
+                    let out = if matches!(aop, ArrayOp::ArraySubrange) {
+                        let mut out = vec![0.0; inputs.array_size];
+                        // C: `for (k=0; i<=j; k++, i++) ps->a[k] = ps->a[i];`
+                        // then `for ( ; k<arraySize; k++) ps->a[k] = 0.;`
+                        for (k, src) in (i..=j).enumerate() {
+                            match (out.get_mut(k), a.get(src as usize)) {
+                                (Some(dst), Some(&v)) => *dst = v,
+                                _ => break,
+                            }
+                        }
+                        out
+                    } else {
+                        // C: zero `[0,i)` and `(j,arraySize)`, keep the rest in place.
+                        for (k, cell) in a.iter_mut().enumerate() {
+                            let k = k as i64;
+                            if k < i || k > j {
+                                *cell = 0.0;
+                            }
+                        }
+                        a
+                    };
+                    stack.push(ArrayStackValue::Array(out));
                 }
-                ArrayOp::ArraySubrangeInPlace => {
-                    let end_val = pop1_f64(&mut stack)? as i64;
-                    let start_val = pop1_f64(&mut stack)? as i64;
+                ArrayOp::ANeg => {
+                    // C `:772` (array) / `:1046` (scalar) — ANEG zeroes the
+                    // NEGATIVE elements and keeps the rest.
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let len = arr.len() as i64;
-                    let start = start_val.max(0).min(len) as usize;
-                    let end = end_val.max(0).min(len) as usize;
-                    let end = end.max(start);
-                    stack.push(ArrayStackValue::Array(arr[start..end].to_vec()));
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            ArrayStackValue::Array(
+                                a.iter().map(|&x| if x < 0.0 { 0.0 } else { x }).collect(),
+                            )
+                        },
+                        |d| if d < 0.0 { 0.0 } else { d },
+                    ));
+                }
+                ArrayOp::APos => {
+                    // C `:773` (array) / `:1047` (scalar) — APOS zeroes the
+                    // POSITIVE elements.
+                    let v = pop1(&mut stack)?;
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            ArrayStackValue::Array(
+                                a.iter().map(|&x| if x > 0.0 { 0.0 } else { x }).collect(),
+                            )
+                        },
+                        |d| if d > 0.0 { 0.0 } else { d },
+                    ));
+                }
+                ArrayOp::FetchAval => {
+                    // C `FETCH_AVAL` (`:534-539`) — push `p_aresult`, the record's
+                    // previous array result. The array counterpart of `VAL`.
+                    let mut prev = inputs.prev_aval.clone();
+                    prev.resize(inputs.array_size, 0.0);
+                    stack.push(ArrayStackValue::Array(prev));
+                }
+                ArrayOp::DynFetch => {
+                    // C `A_FETCH` (`:1461-1477`) — `@x` is the scalar argument x
+                    // INDEXES (`@1` is B). C rounds the index with myNINT and
+                    // answers 0 (with a console message) when it is out of range.
+                    let idx = my_nint(pop1_f64(&mut stack)?);
+                    let v = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| inputs.num_vars.get(i).copied())
+                        .unwrap_or(0.0);
+                    stack.push(ArrayStackValue::Double(v));
+                }
+                ArrayOp::DynAFetch => {
+                    // C `A_AFETCH` (`:1479-1494`) — `@@x` is the ARRAY argument x
+                    // indexes (`@@1` is BB). Out of range, and an argument the
+                    // record never allocated, are both an all-zero array — and the
+                    // result is an array either way (C `toArray(ps,0)`).
+                    let idx = my_nint(pop1_f64(&mut stack)?);
+                    let mut arr = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| inputs.arrays.get(i))
+                        .cloned()
+                        .unwrap_or_default();
+                    arr.resize(inputs.array_size, 0.0);
+                    stack.push(ArrayStackValue::Array(arr));
+                }
+                ArrayOp::LenNoop => {
+                    // C has no `case LEN` and no `default:` in aCalcPerform's
+                    // switch (`aCalcPostfix.c:199`: "Array length not
+                    // implemented"), so the opcode falls through and the operand
+                    // stays on the stack untouched. Compiled C: `LEN(AA)` is AA.
                 }
                 ArrayOp::FitPoly => {
                     let y = pop1(&mut stack)?;
@@ -682,10 +783,167 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         }
     }
 
+    // C `:1602-1605`: the deferred failure is consumed HERE, after the whole
+    // expression has run (and after its stores have landed), and it suppresses the
+    // result write entirely.
+    if let Some(err) = status {
+        return Err(err);
+    }
+
     Ok(stack
         .last()
         .cloned()
         .unwrap_or(ArrayStackValue::Double(0.0)))
+}
+
+/// aCalc's three domain-guarded unary operators — `SQRT`/`SQR`, `LOG`, `LN`.
+/// Their two branches do NOT agree, and the asymmetry is the contract:
+///
+/// - **scalar** (`aCalcPerform.c:1044-1072`): a negative operand becomes 0 and
+///   the evaluation continues with **no error at all** — C only prints a line.
+///   `SQRT(-4)` is 0 with a healthy record.
+/// - **array** (`:775-812`): every negative ELEMENT becomes 0 **and** `status` is
+///   set to -1, so aCalcPerform ultimately returns -1 without writing
+///   p_dresult/p_aresult — the record keeps its previous VAL/AVAL and raises
+///   CALC_ALARM/INVALID.
+///
+/// Neither branch ever yields NaN, which is what a bare `sqrt`/`log` gives and
+/// what the port used to produce. Note the guard is `< 0`, so `LOG(0)` is not
+/// caught here: it yields -inf, and the record's own non-finite check owns that.
+///
+/// This is aCalc's rule only. base `calcPerform` takes the bare sqrt/log (NaN,
+/// no error) and sCalc returns -1 immediately (`sCalcPerform.c:521-541`); both
+/// are already faithful in `numeric.rs` and `string.rs`.
+fn domain_guarded(
+    v: ArrayStackValue,
+    f: fn(f64) -> f64,
+    status: &mut Option<CalcError>,
+) -> ArrayStackValue {
+    match v {
+        ArrayStackValue::Double(d) => Double(if d < 0.0 { 0.0 } else { f(d) }),
+        ArrayStackValue::Array(a) => {
+            let out = a
+                .into_iter()
+                .map(|x| {
+                    if x < 0.0 {
+                        *status = Some(CalcError::DomainError);
+                        0.0
+                    } else {
+                        f(x)
+                    }
+                })
+                .collect();
+            ArrayStackValue::Array(out)
+        }
+    }
+}
+
+/// C's unary array-operator dispatch (`aCalcPerform.c:769-1101`) is ONE operator
+/// with TWO branches, chosen by the operand's shape:
+///
+/// ```c
+/// if (isArray(ps)) { switch (op) { ... } } else { switch (op) { ... } }
+/// ```
+///
+/// The scalar branch is not a degenerate case to be refused — C defines an answer
+/// for **every** operator in that switch. `AVG(5)` is 5 and `STD(5)` is 0; there
+/// is no type error anywhere in it. Routing all of them through this helper makes
+/// the scalar answer a mandatory argument, so an operator cannot be added back
+/// with an `as_array()?` that turns a legal expression into CALC_ALARM.
+///
+/// Only operators that C really lists in that switch belong here. `NSMOOTH`,
+/// `NDERIV`, `CAT`, `SUBRANGE` and the `FIT*` family are separate C cases with
+/// their own scalar handling and do NOT use this.
+fn unary(
+    v: ArrayStackValue,
+    on_array: impl FnOnce(&[f64]) -> ArrayStackValue,
+    on_scalar: impl FnOnce(f64) -> f64,
+) -> ArrayStackValue {
+    match v {
+        ArrayStackValue::Array(a) => on_array(&a),
+        ArrayStackValue::Double(d) => ArrayStackValue::Double(on_scalar(d)),
+    }
+}
+
+/// C `case AVERAGE: break;` — the scalar branch leaves `ps->d` untouched, so the
+/// scalar IS the answer. Shared by AVERAGE, SMOOTH, ARRSUM, CUM, AMAX and AMIN.
+const PASS_THROUGH: fn(f64) -> f64 = |d| d;
+
+/// C `case STD_DEV: ps->d = 0;` — shared by STD_DEV, FWHM, DERIV, IXMAX and IXMIN.
+const ZERO: fn(f64) -> f64 = |_| 0.0;
+
+/// The single shape behind all four aCalc extremum reductions — `AMAX`, `AMIN`,
+/// `IXMAX`, `IXMIN` (`aCalcPerform.c:836-861`). C seeds both the running value
+/// and the running index from the FIRST element and then advances only on a
+/// STRICT comparison:
+///
+/// ```c
+/// for (i=firstEl+1, j=firstEl, d=ps->a[firstEl]; i<=lastEl; i++) {
+///     if (ps->a[i] > d) { d = ps->a[i]; j = i; }
+/// }
+/// ```
+///
+/// Two observables fall out of that shape, and neither survives an
+/// `Iterator::max_by` / `fold(NEG_INFINITY, f64::max)` rewrite:
+///
+/// - **Ties keep the FIRST winner.** `IXMAX([5,3,5])` is 0, not 2.
+/// - **A NaN seed sticks.** Every comparison against NaN is false, so
+///   `AMAX([NaN,3,5])` is NaN and `IXMAX` is 0 — where `f64::max` would
+///   discard the NaN and answer 5. (A NaN *later* in the array is skipped by
+///   the same false comparison, so it never wins.)
+///
+/// Returns `(value, index)` of the winner, or `None` for an empty array — C
+/// cannot reach that case (`arraySize >= 1`), and the callers answer 0 as the
+/// port's own empty-array convention.
+fn extremum(arr: &[f64]) -> Option<(f64, usize)> {
+    extremum_by(arr, |x, best| x > best)
+}
+
+fn extremum_by(arr: &[f64], better: impl Fn(f64, f64) -> bool) -> Option<(f64, usize)> {
+    let mut best = (*arr.first()?, 0usize);
+    for (i, &x) in arr.iter().enumerate().skip(1) {
+        if better(x, best.0) {
+            best = (x, i);
+        }
+    }
+    Some(best)
+}
+
+/// aCalc `IXZ` — the **real (fractional) index of the first zero crossing**
+/// (`aCalcPerform.c:879-892`), NOT the index of the first exactly-zero element.
+/// The exact-zero reading is C's `#if 0` dead code (`:866-877`).
+///
+/// ```c
+/// for (i=firstEl+1, j=-1, d=0.; i<=lastEl; i++) {
+///     if ((ps->a[i]>0) != (ps->a[firstEl]>0)) {
+///         j = i-1;
+///         d = fabs(ps->a[j])/fabs(ps->a[j]-ps->a[j+1]);
+///         break;
+///     }
+/// }
+/// ps->d = j+d;
+/// ```
+///
+/// Two details the shape depends on: the sign test is against the FIRST element,
+/// not the previous one, and it is `> 0` — so an exact 0 is grouped with the
+/// negatives. `j` and `j+1` therefore always straddle the crossing with
+/// different `>0` verdicts, which is why the denominator cannot be zero.
+///
+/// No crossing answers `-1` (`j=-1`, `d=0`) — including for the common case of
+/// an all-positive waveform, where the old exact-zero reading also answered -1
+/// but for the wrong reason.
+fn index_zero_crossing(arr: &[f64]) -> f64 {
+    let Some(&first) = arr.first() else {
+        return -1.0;
+    };
+    for i in 1..arr.len() {
+        if (arr[i] > 0.0) != (first > 0.0) {
+            let j = i - 1;
+            let d = arr[j].abs() / (arr[j] - arr[i]).abs();
+            return j as f64 + d;
+        }
+    }
+    -1.0
 }
 
 /// C `myNINT` (`aCalcPerform.c:50`): `(int)(a >= 0 ? a+0.5 : a-0.5)` — a
@@ -759,8 +1017,29 @@ fn shift_elements(a: &mut [f64], e: f64) {
     }
 }
 
+/// Pop the two bounds of an aCalc subrange. C `toDouble`s both
+/// (`aCalcPerform.c:1526,1530`) — so an ARRAY bound collapses to its first
+/// element — and casts each with a truncating `(int)`, not `myNINT`. The rest of
+/// the rule is [`super::subrange_bounds`], shared with sCalc.
+fn pop_subrange_bounds(
+    stack: &mut Vec<ArrayStackValue>,
+    array_size: i64,
+) -> Result<(i64, i64), CalcError> {
+    let j = pop1_f64(stack)? as i64;
+    let i = pop1_f64(stack)? as i64;
+    Ok(super::subrange_bounds(i, j, array_size))
+}
+
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
+}
+
+/// Pop the `n` arguments of a VARARG operator, keeping their shapes intact.
+fn popn(stack: &mut Vec<ArrayStackValue>, n: usize) -> Result<Vec<ArrayStackValue>, CalcError> {
+    if stack.len() < n {
+        return Err(CalcError::Underflow);
+    }
+    Ok(stack.split_off(stack.len() - n))
 }
 
 fn pop1_f64(stack: &mut Vec<ArrayStackValue>) -> Result<f64, CalcError> {

@@ -1,5 +1,6 @@
 use super::ExprKind;
 use super::error::CalcError;
+use super::strtod;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuncName {
@@ -39,6 +40,17 @@ pub enum FuncName {
     // String functions (Phase 2B)
     TrEsc,
     Esc,
+    /// aCalc `ANEG` / `APOS` (`aCalcPostfix.c:153-154`).
+    ANeg,
+    APos,
+    /// aCalc `@` / `@@` (`aCalcPostfix.c:93-94`) — fetch the scalar/array
+    /// argument that the operand indexes.
+    DynFetch,
+    DynAFetch,
+    /// aCalc `LEN` (`aCalcPostfix.c:199`) — a table entry with no implementation
+    /// in `aCalcPerform`, so it compiles and does nothing. Distinct from the
+    /// sCalc `LEN` string length ([`FuncName::Len`]), which IS implemented.
+    ALenNoop,
     Printf,
     Sscanf,
     BinRead,
@@ -82,6 +94,11 @@ pub enum ConstName {
     Pi,
     D2R,
     R2D,
+    /// `S2R` / `R2S` — arc-seconds <-> radians. In the sCalc AND aCalc element
+    /// tables (`sCalcPostfix.c:136,173`, `aCalcPostfix.c:186,195`); base has
+    /// neither, so they stay out of BASE_TABLE.
+    S2R,
+    R2S,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +118,8 @@ pub enum Token {
 
     Plus,
     Minus,
+    /// aCalc `AVAL` — the array-valued `VAL` (`aCalcPostfix.c:118`, OPERAND).
+    FetchAval,
     Star,
     Slash,
     Percent,
@@ -194,9 +213,26 @@ struct ElementTable {
     /// True when the table has `LITERAL_STRING` elements (`"` and `'`) —
     /// sCalcPostfix.c:97-98 only.
     string_literals: bool,
+    /// The table's word-shaped `LITERAL_OPERAND` elements: `INF` and `NAN` in
+    /// base (`postfix.c:111,125`) and sCalc (`sCalcPostfix.c:149,167`), and
+    /// NOTHING in aCalc, whose table has neither — `INF` lexes there as the
+    /// operands `I`, `N`, `F`.
+    ///
+    /// These are elements, not constants. A `LITERAL_OPERAND` name only says
+    /// WHERE a literal starts: C rewinds past the name it just matched
+    /// (`psrc -= strlen(pel->name)`, postfix.c:258 / sCalcPostfix.c:491) and
+    /// re-scans from the first character with strtod, so strtod alone decides
+    /// how far the literal runs. `INFINITY` is a literal `inf` because strtod
+    /// eats all eight characters; `INFO` is CALC_ERR_SYNTAX because strtod eats
+    /// `INF` and the `O` left behind matches no element.
+    literal_words: &'static [&'static str],
     /// How a numeric literal is parsed once its first character has matched.
     hex: HexLiteral,
 }
+
+/// The `LITERAL_OPERAND` words shared by base and sCalc. aCalc's table has no
+/// such element, so it gets `&[]`.
+static INF_NAN: &[&str] = &["INF", "NAN"];
 
 /// C's two literal-parsing paths, one per table shape.
 #[derive(Clone, Copy, PartialEq)]
@@ -228,7 +264,6 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("FINITE", Token::Func(FuncName::Finite)),
         ("FLOOR", Token::Func(FuncName::Floor)),
         ("FMOD", Token::Func(FuncName::Fmod)),
-        ("INF", Token::Number(f64::INFINITY)),
         ("ISINF", Token::Func(FuncName::IsInf)),
         ("ISNAN", Token::Func(FuncName::IsNan)),
         ("LN", Token::Func(FuncName::Ln)),
@@ -237,7 +272,6 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("MAX", Token::Func(FuncName::Max)),
         ("MIN", Token::Func(FuncName::Min)),
         ("NINT", Token::Func(FuncName::Nint)),
-        ("NAN", Token::Number(f64::NAN)),
         ("NOT", Token::Func(FuncName::Not)),
         ("PI", Token::Const(ConstName::Pi)),
         ("R2D", Token::Const(ConstName::R2D)),
@@ -288,6 +322,7 @@ static BASE_TABLE: ElementTable = ElementTable {
     last_var: b'U' - b'A',
     last_double_var: None,
     string_literals: false,
+    literal_words: INF_NAN,
     hex: HexLiteral::Uint32Element,
 };
 
@@ -309,10 +344,17 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("DBL", Token::Func(FuncName::Dbl)),
         ("D2R", Token::Const(ConstName::D2R)),
         ("ESC", Token::Func(FuncName::Esc)),
+        // The `$`-spellings are the SAME elements, not new ones — C lists each
+        // twice with an identical opcode row (sCalcPostfix.c:136,173-194).
+        ("$E", Token::Func(FuncName::Esc)),
+        ("$P", Token::Func(FuncName::Printf)),
+        ("$R", Token::Func(FuncName::BinRead)),
+        ("$S", Token::Func(FuncName::Sscanf)),
+        ("$T", Token::Func(FuncName::TrEsc)),
+        ("$W", Token::Func(FuncName::BinWrite)),
         ("EXP", Token::Func(FuncName::Exp)),
         ("FINITE", Token::Func(FuncName::Finite)),
         ("FLOOR", Token::Func(FuncName::Floor)),
-        ("INF", Token::Number(f64::INFINITY)),
         // sCalcPostfix.c:150 — `INT` is an ALIAS of `NINT`: it rounds.
         ("INT", Token::Func(FuncName::Int)),
         ("ISINF", Token::Func(FuncName::IsInf)),
@@ -325,13 +367,14 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("MAX", Token::Func(FuncName::Max)),
         ("MIN", Token::Func(FuncName::Min)),
         ("MODBUS", Token::Func(FuncName::ModBus)),
-        ("NAN", Token::Number(f64::NAN)),
         ("NINT", Token::Func(FuncName::Nint)),
         ("NOT", Token::Func(FuncName::Not)),
         ("NRNDM", Token::Nrndm),
         ("PI", Token::Const(ConstName::Pi)),
         ("PRINTF", Token::Func(FuncName::Printf)),
         ("R2D", Token::Const(ConstName::R2D)),
+        ("R2S", Token::Const(ConstName::R2S)),
+        ("S2R", Token::Const(ConstName::S2R)),
         // sCalcPostfix.c:180 `{"READ", ..., BIN_READ}` — the C symbol is
         // `READ`, not `BIN_READ`.
         ("READ", Token::Func(FuncName::BinRead)),
@@ -387,6 +430,12 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("|", Token::BitOr),
         ("||", Token::OrOr),
         ("|-", Token::PipeMinus),
+        // `-|` is NOT a new operator: C gives it the SUB opcode, the same one
+        // plain `-` has (sCalcPostfix.c:243 vs :237). It is a second spelling
+        // that says "subtract the FIRST occurrence" out loud, the behaviour `-`
+        // already has. Compiled sCalc, AA="abcabc" BB="bc": AA-|BB and AA-BB are
+        // both "aabc"; only AA|-BB ("abca") differs.
+        ("-|", Token::Minus),
         (">?", Token::MaxOp),
         ("<?", Token::MinOp),
         ("!", Token::Bang),
@@ -395,6 +444,7 @@ static SCALC_TABLE: ElementTable = ElementTable {
     last_var: b'P' - b'A',
     last_double_var: Some(b'L' - b'A'),
     string_literals: true,
+    literal_words: INF_NAN,
     hex: HexLiteral::Strtod,
 };
 
@@ -411,6 +461,14 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("ATAN", Token::Func(FuncName::Atan)),
         ("ATAN2", Token::Func(FuncName::Atan2)),
         ("AVG", Token::Func(FuncName::Avg)),
+        // aCalc-only elements the port had never lexed (aCalcPostfix.c:93-94,
+        // 118, 153-154, 199).
+        ("@", Token::Func(FuncName::DynFetch)),
+        ("@@", Token::Func(FuncName::DynAFetch)),
+        ("AVAL", Token::FetchAval),
+        ("ANEG", Token::Func(FuncName::ANeg)),
+        ("APOS", Token::Func(FuncName::APos)),
+        ("LEN", Token::Func(FuncName::ALenNoop)),
         ("CAT", Token::Func(FuncName::Cat)),
         ("CEIL", Token::Func(FuncName::Ceil)),
         ("COS", Token::Func(FuncName::Cos)),
@@ -450,6 +508,8 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("NSMOO", Token::Func(FuncName::NSmoo)),
         ("PI", Token::Const(ConstName::Pi)),
         ("R2D", Token::Const(ConstName::R2D)),
+        ("R2S", Token::Const(ConstName::R2S)),
+        ("S2R", Token::Const(ConstName::S2R)),
         ("RNDM", Token::Rndm),
         ("SIN", Token::Func(FuncName::Sin)),
         ("SINH", Token::Func(FuncName::Sinh)),
@@ -507,6 +567,9 @@ static ACALC_TABLE: ElementTable = ElementTable {
     last_var: b'P' - b'A',
     last_double_var: Some(b'L' - b'A'),
     string_literals: false,
+    // aCalcPostfix.c:98-108 — the table's only LITERAL_OPERANDs are `.` and the
+    // digits. It has no `INF` and no `NAN` element.
+    literal_words: &[],
     hex: HexLiteral::Strtod,
 };
 
@@ -585,14 +648,11 @@ impl<'a> Tokenizer<'a> {
         let rem = &self.input[self.pos..];
         let mut best: Option<(usize, &Token)> = None;
         for (name, tok) in self.table.symbols {
+            if !starts_with_ci(rem, name) {
+                continue;
+            }
             let n = name.len();
-            if rem.len() < n {
-                continue;
-            }
-            if !rem[..n].eq_ignore_ascii_case(name.as_bytes()) {
-                continue;
-            }
-            if best.map_or(true, |(blen, _)| n > blen) {
+            if best.is_none_or(|(blen, _)| n > blen) {
                 best = Some((n, tok));
             }
         }
@@ -626,115 +686,72 @@ impl<'a> Tokenizer<'a> {
         None
     }
 
-    /// A `LITERAL_OPERAND` element (`.`, `0`..`9`, and base's own `0X`).
-    fn read_number(&mut self) -> Result<f64, CalcError> {
-        let start = self.pos;
-        let is_hex = self.input[start] == b'0'
-            && matches!(self.input.get(start + 1), Some(b'x' | b'X'))
-            && self.input.get(start + 2).is_some_and(u8::is_ascii_hexdigit);
-
-        if is_hex && self.table.hex == HexLiteral::Uint32Element {
-            // base postfix.c:79 has a `{"0X", ..., LITERAL_INT}` element, and
-            // postfix.c:283 parses it with `epicsParseUInt32` — a 32-bit
-            // unsigned value; anything wider is CALC_ERR_BAD_LITERAL.
-            self.pos = start + 2;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-                self.pos += 1;
-            }
-            let s = std::str::from_utf8(&self.input[start + 2..self.pos]).unwrap();
-            return u32::from_str_radix(s, 16)
-                .map(|v| v as f64)
-                .map_err(|_| CalcError::BadLiteral);
+    /// Does a `LITERAL_OPERAND` element of this table start here?
+    ///
+    /// Every table has `.` and `0`..`9` (postfix.c:77-88, sCalcPostfix.c:104-114,
+    /// aCalcPostfix.c:98-108); base and sCalc add the words `INF` and `NAN`. This
+    /// decides only WHERE the literal starts — `read_literal` decides how far it
+    /// runs, exactly as C's rewind-then-strtod does.
+    fn at_literal(&self) -> bool {
+        let rem = &self.input[self.pos..];
+        match rem.first() {
+            None => false,
+            Some(b) if b.is_ascii_digit() || *b == b'.' => true,
+            _ => self
+                .table
+                .literal_words
+                .iter()
+                .any(|w| starts_with_ci(rem, w)),
         }
-        if is_hex {
-            // sCalc/aCalc have no `0X` element: `0x1F` matches `{"0"}` and is
-            // then re-scanned by `epicsStrtod` from the `0`, i.e. C99 strtod,
-            // which parses hex at full double width (`0x1FFFFFFFFF` is
-            // 137438953471, not a bad literal).
-            return Ok(self.read_hex_strtod(start));
-        }
-
-        while self.pos < self.input.len()
-            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.')
-        {
-            self.pos += 1;
-        }
-        if self.pos < self.input.len()
-            && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
-        {
-            let exp_start = self.pos;
-            self.pos += 1;
-            if self.pos < self.input.len()
-                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
-            {
-                self.pos += 1;
-            }
-            let digits = self.pos;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
-            if self.pos == digits {
-                // `1E` with no exponent digits: strtod stops before the `E`.
-                self.pos = exp_start;
-            }
-        }
-
-        let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-        s.parse::<f64>().map_err(|_| CalcError::BadLiteral)
     }
 
-    /// C99 `strtod` on a `0x` prefix: hex mantissa, optional hex fraction,
-    /// optional binary (`p`) exponent.
-    fn read_hex_strtod(&mut self, start: usize) -> f64 {
-        self.pos = start + 2;
-        let mut value = 0.0f64;
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-            value = value * 16.0 + hex_digit(self.input[self.pos]) as f64;
-            self.pos += 1;
+    /// C's `LITERAL_OPERAND` case: rewind to the element's first character and
+    /// hand the text to strtod (`epicsParseDouble`, postfix.c:261; `epicsStrtod`,
+    /// sCalcPostfix.c:492 and aCalcPostfix.c:462). The literal covers exactly the
+    /// text strtod consumes, and strtod consuming NOTHING is
+    /// `CALC_ERR_BAD_LITERAL` (C tests `pnext == psrc`) — which is why a lone `.`
+    /// is a bad literal rather than a syntax error.
+    ///
+    /// The scan itself is `strtod::strtod`, shared with sCalc's `atof` coercion.
+    /// A sign or leading whitespace never reaches it here: `at_literal` only
+    /// fires on a digit, a `.`, or one of the table's literal words.
+    fn read_literal(&mut self) -> Result<f64, CalcError> {
+        let start = self.pos;
+        let rem = &self.input[start..];
+
+        // base alone has a `{"0X", ..., LITERAL_INT}` element (postfix.c:79),
+        // and it is NOT strtod: postfix.c:283 parses it with `epicsParseUInt32`,
+        // so the value is 32-bit unsigned and anything wider is a bad literal.
+        // sCalc/aCalc have no such element — their `0x1F` matches `{"0"}` and
+        // goes to strtod, which reads hex at full double width.
+        let is_hex = rem.first() == Some(&b'0')
+            && matches!(rem.get(1), Some(b'x' | b'X'))
+            && rem.get(2).is_some_and(u8::is_ascii_hexdigit);
+        if is_hex && self.table.hex == HexLiteral::Uint32Element {
+            let end = 2 + rem[2..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            self.pos = start + end;
+            let digits = std::str::from_utf8(&rem[2..end]).unwrap();
+            return u32::from_str_radix(digits, 16)
+                .map(f64::from)
+                .map_err(|_| CalcError::BadLiteral);
         }
-        if self.pos < self.input.len() && self.input[self.pos] == b'.' {
-            self.pos += 1;
-            let mut scale = 1.0 / 16.0;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-                value += hex_digit(self.input[self.pos]) as f64 * scale;
-                scale /= 16.0;
-                self.pos += 1;
-            }
+
+        let (value, len) = strtod::strtod(rem);
+        if len == 0 {
+            return Err(CalcError::BadLiteral);
         }
-        if self.pos < self.input.len() && matches!(self.input[self.pos], b'p' | b'P') {
-            let exp_start = self.pos;
-            self.pos += 1;
-            let mut negative = false;
-            if self.pos < self.input.len()
-                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
-            {
-                negative = self.input[self.pos] == b'-';
-                self.pos += 1;
-            }
-            let digits = self.pos;
-            let mut exp: i32 = 0;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                exp = exp
-                    .saturating_mul(10)
-                    .saturating_add((self.input[self.pos] - b'0') as i32);
-                self.pos += 1;
-            }
-            if self.pos == digits {
-                self.pos = exp_start; // no exponent digits: `p` is not consumed
-            } else {
-                value *= 2.0f64.powi(if negative { -exp } else { exp });
-            }
-        }
-        value
+        self.pos += len;
+        Ok(value)
     }
 }
 
-fn hex_digit(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        _ => b - b'A' + 10,
-    }
+/// C `epicsStrnCaseCmp(text, name, strlen(name)) == 0`: does `name` prefix
+/// `text`, ignoring case? This is how `get_element` matches every element.
+fn starts_with_ci(text: &[u8], name: &str) -> bool {
+    strtod::starts_with_ci(text, name.as_bytes())
 }
 
 /// Lex `input` with the `ELEMENT` table of the C compiler `kind` names.
@@ -750,15 +767,11 @@ pub fn tokenize(input: &str, kind: ExprKind) -> Result<Vec<Token>, CalcError> {
         tokenizer.skip_whitespace();
         let Some(b) = tokenizer.peek() else { break };
 
-        // LITERAL_OPERAND: `.` and `0`..`9` (and base's `0X`).
-        if b.is_ascii_digit()
-            || (b == b'.'
-                && tokenizer
-                    .input
-                    .get(tokenizer.pos + 1)
-                    .is_some_and(u8::is_ascii_digit))
-        {
-            let n = tokenizer.read_number()?;
+        // LITERAL_OPERAND. Checked before the other elements because C's
+        // longest-match `get_element` cannot prefer one: no table has a
+        // non-literal element that starts with a digit, a `.`, `INF` or `NAN`.
+        if tokenizer.at_literal() {
+            let n = tokenizer.read_literal()?;
             tokens.push(Token::Number(n));
             continue;
         }

@@ -183,10 +183,13 @@ fn test_add_xor8_append() {
 
 // --- Subrange [] ---
 
+/// C `sCalcPerform.c:1897` (`s1 <= s2`) — the upper bound is INCLUSIVE.
+/// Compiled sCalc: `"hello"[1,4]` = "ello". This test previously pinned the
+/// port's exclusive-end reading ("ell").
 #[test]
 fn test_subrange_basic() {
     let result = eval_str(r#""hello"[1,4]"#);
-    assert_eq!(result, StackValue::Str("ell".into()));
+    assert_eq!(result, StackValue::Str("ello".into()));
 }
 
 #[test]
@@ -201,10 +204,27 @@ fn test_subrange_clamp() {
     assert_eq!(result, StackValue::Str("hello".into()));
 }
 
+/// `i == j` selects ONE character, not none — the bounds are inclusive.
+/// Compiled sCalc: `"hello"[2,2]` = "l". An empty selection takes `i > j`.
 #[test]
-fn test_subrange_empty() {
+fn test_subrange_single_char() {
     let result = eval_str(r#""hello"[2,2]"#);
+    assert_eq!(result, StackValue::Str("l".into()));
+}
+
+/// Compiled sCalc: `"hello"[3,1]` = "".
+#[test]
+fn test_subrange_inverted_is_empty() {
+    let result = eval_str(r#""hello"[3,1]"#);
     assert_eq!(result, StackValue::Str("".into()));
+}
+
+/// A negative bound counts back from the end (C `:1878,1885`: `if (i < 0) i += k`).
+/// Compiled sCalc: `"hello"[-2,-1]` = "lo", `"hello"[-3,10]` = "llo".
+#[test]
+fn test_subrange_negative_bounds_wrap() {
+    assert_eq!(eval_str(r#""hello"[-2,-1]"#), StackValue::Str("lo".into()));
+    assert_eq!(eval_str(r#""hello"[-3,10]"#), StackValue::Str("llo".into()));
 }
 
 // --- Replace {} ---
@@ -286,26 +306,13 @@ fn test_until_loop_limit() {
 }
 
 // --- READ / WRITE (C `BIN_READ` / `BIN_WRITE` opcodes) ---
-
-// C spells these ops `READ` and `WRITE` (sCalcPostfix.c:180,199 — `$R`/`$W`
-// are the aliases); `BIN_READ`/`BIN_WRITE`, which these cases used to name, are
-// in no C table. The two cases pin the port's EXISTING op behaviour under the
-// correct symbol; C's `READ`/`WRITE` are 2-operand (`runtime_effect -1`) while
-// this port's op is 1-operand, and that gap is an open finding, not something
-// these assertions bless.
-#[test]
-fn test_bin_read() {
-    let result = eval_str(r#"READ("hello\\nworld")"#);
-    assert_eq!(result, StackValue::Str("hello\nworld".into()));
-}
-
-#[test]
-fn test_bin_write() {
-    let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "hello\nworld".into();
-    let result = scalc("WRITE(AA)", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Str("hello\\nworld".into()));
-}
+//
+// The two cases that lived here pinned the port's 1-operand op, which computed
+// an unescape/escape — TR_ESC and ESC under another name. Their own comment
+// recorded that C's READ/WRITE are 2-operand and called the gap an open
+// finding. It is now closed: READ/WRITE are the binary field conversions they
+// are in C, and tests/calc_string_bin_read_write.rs owns them, byte for byte
+// against the compiled engine.
 
 // --- Edge cases ---
 

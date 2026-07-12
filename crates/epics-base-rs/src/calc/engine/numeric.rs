@@ -4,6 +4,16 @@ use super::opcodes::{CoreOp, Opcode};
 use super::{CompiledExpr, NumericInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, CalcError> {
+    // C `calcPerform` runs the empty program's loop zero times and leaves the
+    // stack empty, so its closing `if (ptop != stack + 1) return -1`
+    // (`calcPerform.c:419-420`) fails it — and `*presult` is never written, so
+    // the record keeps the previous VAL and goes to CALC_ALARM/INVALID. A
+    // failed compile leaves exactly this program behind, which is how C makes a
+    // broken CALC alarm on EVERY process rather than once at compile time.
+    if expr.is_empty() {
+        return Err(CalcError::EmptyProgram);
+    }
+
     let mut stack: Vec<f64> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -27,6 +37,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 CoreOp::Pi => stack.push(std::f64::consts::PI),
                 CoreOp::D2R => stack.push(std::f64::consts::PI / 180.0),
                 CoreOp::R2D => stack.push(180.0 / std::f64::consts::PI),
+                CoreOp::S2R | CoreOp::R2S => {
+                    // The arcsecond constants are synApps-only (`sCalcPostfix.c:136,173`,
+                    // `aCalcPostfix.c:186,195`); base's element table has no S2R/R2S,
+                    // so `calcPerform` can never see them. Same shared-tokenizer
+                    // reachability as `FetchSval` below.
+                    return Err(CalcError::Internal);
+                }
 
                 // Random
                 CoreOp::Random => {
@@ -364,17 +381,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
         }
     }
 
-    // C calcPerform.c:418-422 — the stack must hold exactly one value at
+    // C calcPerform.c:419-420 — the stack must hold exactly one value at
     // END_EXPRESSION; otherwise the postfix was malformed.
-    // The empty-expression program ([End] only) is a deliberate Rust
-    // special case (`compile("")`) and yields 0.0; every other program
-    // must leave exactly one residual value.
-    let is_empty_program = code
-        .iter()
-        .all(|op| matches!(op, Opcode::Core(CoreOp::End)));
-    if is_empty_program {
-        return Ok(stack.first().copied().unwrap_or(0.0));
-    }
     if stack.len() != 1 {
         return Err(CalcError::Internal);
     }
@@ -477,11 +485,22 @@ mod parity_tests {
         assert_eq!(eval(&prog, &mut inp), Err(CalcError::Internal));
     }
 
+    /// This asserted that the empty program yields 0.0. It does not: base
+    /// `postfix("")` never even produces one (`CALC_ERR_NULL_ARG`,
+    /// postfix.c:235-241), and the empty program a FAILED compile leaves behind
+    /// makes `calcPerform` return -1 (its closing `ptop != stack + 1`,
+    /// calcPerform.c:419-420) — which is how a broken CALC alarms on every
+    /// process. Compiled C confirms both. See tests/calc_empty_program.rs.
     #[test]
-    fn c1_empty_program_still_yields_zero() {
-        let compiled = compile("").unwrap();
+    fn c1_the_empty_program_is_an_evaluation_error() {
+        use crate::calc::{CompiledExpr, ExprKind};
+        assert_eq!(compile("").err(), Some(CalcError::NullArg));
+
         let mut inp = NumericInputs::new();
-        assert_eq!(eval(&compiled, &mut inp).unwrap(), 0.0);
+        assert_eq!(
+            eval(&CompiledExpr::empty(ExprKind::Numeric), &mut inp),
+            Err(CalcError::EmptyProgram)
+        );
     }
 
     // compiler rejects net runtime depth != 1.

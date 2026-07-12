@@ -20,7 +20,15 @@ pub use engine::opcodes::ArrayOp;
 /// sCalc string functions, aCalc array functions, `UNTIL`, `AA`..`LL`, `>?`,
 /// `<?`, `NRNDM`, `INT`) are `CalcError::Syntax` — C's `CALC_ERR_SYNTAX`,
 /// raised at compile time (`CLCV != 0`), not at first evaluation.
+///
+/// The empty expression is `CALC_ERR_NULL_ARG` (`postfix.c:235-241` lumps
+/// `*psrc == '\0'` in with the NULL-pointer arguments), which is where base
+/// parts company with sCalc and aCalc — they accept it. Whitespace-only is not
+/// empty: it lexes to nothing and comes out `Incomplete`, as in C.
 pub fn compile(expr: &str) -> CalcResult<CompiledExpr> {
+    if expr.is_empty() {
+        return Err(CalcError::NullArg);
+    }
     let tokens = engine::token::tokenize(expr, ExprKind::Numeric)?;
     engine::postfix::compile(&tokens, ExprKind::Numeric)
 }
@@ -40,7 +48,14 @@ pub fn calc(expr: &str, inputs: &mut NumericInputs) -> CalcResult<f64> {
 /// `sCalcPostfix()`, used by scalcout. Its element table is its own: no `FMOD`,
 /// no `>>>`, operands `A`..`P` / `AA`..`LL`, plus the string symbols base has
 /// never had.
+///
+/// Unlike base, the empty expression SUCCEEDS with the empty program
+/// (`sCalcPostfix.c:432-434`) — so `CLCV` reads 0 — and `sCalcPerform` then
+/// fails on it every cycle ([`CompiledExpr::empty`]).
 pub fn scalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
+    if expr.is_empty() {
+        return Ok(CompiledExpr::empty(ExprKind::String));
+    }
     let tokens = engine::token::tokenize(expr, ExprKind::String)?;
     engine::postfix::compile(&tokens, ExprKind::String)
 }
@@ -58,7 +73,13 @@ pub fn scalc(expr: &str, inputs: &mut StringInputs) -> CalcResult<StackValue> {
 /// `aCalcPostfix()`, used by acalcout. Its element table is its own: no `FMOD`,
 /// no `>>>`, no `INF`/`NAN` literal and no `SVAL`, operands `A`..`P` /
 /// `AA`..`LL`, plus the array symbols.
+///
+/// As in sCalc, the empty expression succeeds with the empty program
+/// (`aCalcPostfix.c:439-441`), which `aCalcPerform` then refuses to run.
 pub fn acalc_compile(expr: &str) -> CalcResult<CompiledExpr> {
+    if expr.is_empty() {
+        return Ok(CompiledExpr::empty(ExprKind::Array));
+    }
     let tokens = engine::token::tokenize(expr, ExprKind::Array)?;
     engine::postfix::compile(&tokens, ExprKind::Array)
 }

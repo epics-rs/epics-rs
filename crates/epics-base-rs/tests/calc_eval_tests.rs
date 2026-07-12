@@ -463,12 +463,14 @@ fn test_keyword_and_or() {
     assert_calc("1 OR 0", &[], 1.0);
 }
 
+/// This asserted `compile("")` succeeds and evaluates to 0.0. Base C does
+/// neither: `postfix("")` is `CALC_ERR_NULL_ARG` (-1, `postfix.c:235-241`), and
+/// the empty program it leaves in RPCL makes `calcPerform` return -1 — which is
+/// how a calc record with an empty CALC alarms on every process instead of
+/// quietly reading 0. tests/calc_empty_program.rs covers the rule in full.
 #[test]
 fn test_empty_expression() {
-    let compiled = compile("").unwrap();
-    let mut inputs = NumericInputs::new();
-    let result = eval(&compiled, &mut inputs).unwrap();
-    assert!((result - 0.0).abs() < 1e-9);
+    assert_eq!(compile("").err(), Some(CalcError::NullArg));
 }
 
 /// `LOG2` is in no C element table — base, sCalc and aCalc all lex it as `LOG`

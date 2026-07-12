@@ -131,8 +131,13 @@ fn func_arity(func: &FuncName) -> u8 {
         // 2-arg core math (numeric.rs: Atan2/Fmod pop2).
         FuncName::Atan2 | FuncName::Fmod => 2,
 
-        // 2-arg string ops (string.rs: Printf/Sscanf pop2).
-        FuncName::Printf | FuncName::Sscanf => 2,
+        // 2-arg string ops (string.rs: Printf/Sscanf/BinRead/BinWrite pop2).
+        // C's element table settles this: `runtime_effect` is -1 for PRINTF
+        // ($P), SSCANF ($S), BIN_READ ($R, READ) and BIN_WRITE ($W, WRITE)
+        // alike (sCalcPostfix.c:173-195) — one net operand consumed, i.e. two
+        // popped and one pushed. Only elements with `runtime_effect` 0 are
+        // 1-in-1-out.
+        FuncName::Printf | FuncName::Sscanf | FuncName::BinRead | FuncName::BinWrite => 2,
 
         // 2-arg array ops.
         //   NSmoo  -> ArrayOp::NSmooth   (array.rs:527 — pop n, pop array)
@@ -153,8 +158,8 @@ fn func_arity(func: &FuncName) -> u8 {
         //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Sin,
         //     Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Ceil, Floor,
         //     Nint, Int, IsInf, Not
-        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, BinRead,
-        //     BinWrite, Crc16, ModBus, Lrc, AModBus, Xor8, AddXor8
+        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, Crc16, ModBus,
+        //     Lrc, AModBus, Xor8, AddXor8
         //   array 1-arg: Avg, Std, FwhmFunc, Sum, AMax, AMin, IxMax,
         //     IxMin, IxZ, IxNz, Arr, AToD, Smoo, Deriv, Cum
         // Vararg funcs (Min, Max, Finite, IsNan) are unreachable here.
@@ -198,6 +203,11 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::Dbl => return Opcode::String(super::opcodes::StringOp::ToDouble),
         FuncName::Str => return Opcode::String(super::opcodes::StringOp::ToString),
         FuncName::Len => return Opcode::String(super::opcodes::StringOp::Len),
+        FuncName::ANeg => return Opcode::Array(super::opcodes::ArrayOp::ANeg),
+        FuncName::APos => return Opcode::Array(super::opcodes::ArrayOp::APos),
+        FuncName::DynFetch => return Opcode::Array(super::opcodes::ArrayOp::DynFetch),
+        FuncName::DynAFetch => return Opcode::Array(super::opcodes::ArrayOp::DynAFetch),
+        FuncName::ALenNoop => return Opcode::Array(super::opcodes::ArrayOp::LenNoop),
         FuncName::Byte => return Opcode::String(super::opcodes::StringOp::Byte),
         FuncName::TrEsc => return Opcode::String(super::opcodes::StringOp::TrEsc),
         FuncName::Esc => return Opcode::String(super::opcodes::StringOp::Esc),
@@ -285,47 +295,20 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
     }
 }
 
-/// Can `kind`'s evaluator execute `op`?
-///
-/// This is NOT the C element-table gate — `token::ElementTable` owns that, one
-/// table per C compiler, applied while lexing exactly as C's `get_element`
-/// does. By the time a token stream reaches here, every symbol in it is one
-/// this engine's C table spells.
-///
-/// What is left is the port's own evaluator coverage. One case is live: `[`
-/// and `{` are in aCalcPostfix.c's operator table (`SUBRANGE`,
-/// `SUBRANGE_IP` — an array slice), but this port only implements the sCalc
-/// string forms of them, so an aCalc subrange has to be refused at compile
-/// rather than mis-executed as a string op at runtime. That is a port gap, not
-/// a C behaviour, and it is the only reason this function still exists.
-fn opcode_supported_by_engine(kind: &ExprKind, op: &Opcode) -> bool {
-    match op {
-        // String ops: sCalc only. Reachable in an aCalc compile solely through
-        // `[`/`{` (the unimplemented array subrange).
-        Opcode::String(_) => matches!(kind, ExprKind::String),
-        // Array ops: aCalc only. Unreachable from another engine's table.
-        Opcode::Array(_) => matches!(kind, ExprKind::Array),
-        // FETCH_SVAL: sCalc only. Unreachable from another engine's table.
-        Opcode::Core(CoreOp::FetchSval) => matches!(kind, ExprKind::String),
-        Opcode::Control(_) | Opcode::Core(_) => true,
-    }
-}
-
 /// Compile a token stream for ONE engine.
 ///
 /// `tokens` must come from `token::tokenize(_, kind)`: that is where the C
 /// compiler's `ELEMENT` table is applied, so every symbol here is one this
 /// engine has. The resulting `CompiledExpr` carries only opcodes its evaluator
 /// can execute.
+/// Compile a token stream. A source with no tokens is NOT special-cased: C only
+/// short-circuits the literal empty string (`*psrc == '\0'`), and an expression
+/// that merely *lexes* to nothing — `"   "` — walks the normal path and comes
+/// out `CALC_ERR_INCOMPLETE`, because `operand_needed` is still set at the end.
+/// Compiled C, all three engines: `postfix("   ")` = -1, error 8. The empty
+/// SOURCE is handled by each engine's entry point in `calc::mod`, where C puts
+/// it.
 pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcError> {
-    if tokens.is_empty() {
-        return Ok(CompiledExpr {
-            code: vec![Opcode::Core(CoreOp::End)],
-            kind,
-            loop_pairs: Vec::new(),
-        });
-    }
-
     let mut output: Vec<Opcode> = Vec::new();
     let mut stack: Vec<StackEntry> = Vec::new();
     let mut operand_needed = true;
@@ -362,6 +345,11 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     runtime_depth += 1;
                     operand_needed = false;
                 }
+                Token::FetchAval => {
+                    output.push(Opcode::Array(super::opcodes::ArrayOp::FetchAval));
+                    runtime_depth += 1;
+                    operand_needed = false;
+                }
                 Token::FetchSval => {
                     output.push(Opcode::Core(CoreOp::FetchSval));
                     runtime_depth += 1;
@@ -384,6 +372,8 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                         ConstName::Pi => output.push(Opcode::Core(CoreOp::Pi)),
                         ConstName::D2R => output.push(Opcode::Core(CoreOp::D2R)),
                         ConstName::R2D => output.push(Opcode::Core(CoreOp::R2D)),
+                        ConstName::S2R => output.push(Opcode::Core(CoreOp::S2R)),
+                        ConstName::R2S => output.push(Opcode::Core(CoreOp::R2S)),
                     }
                     runtime_depth += 1;
                     operand_needed = false;
@@ -617,7 +607,14 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     operand_needed = true;
                 }
 
-                // Bracket subrange: expr[start,end] → Subrange
+                // `expr[i,j]` and `expr{i,j}`. Both delimiters are in all three
+                // synApps tables, but they do NOT mean the same thing in both
+                // engines: sCalc has `[`=SUBRANGE / `{`=REPLACE
+                // (sCalcPostfix.c:215-216) while aCalc has `[`=SUBRANGE /
+                // `{`=SUBRANGE_IP, the in-place variant (aCalcPostfix.c:212-213).
+                // The port emitted the STRING opcodes for both engines, so the
+                // array subrange — whose opcodes already existed — was
+                // unreachable.
                 Token::LBracket => {
                     // Flush pending operators
                     pop_higher_or_equal(&mut stack, 11, &mut output, &mut runtime_depth);
@@ -655,8 +652,11 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                             }
                         }
                     }
-                    output.push(Opcode::String(super::opcodes::StringOp::Subrange));
-                    runtime_depth -= 2; // consumes string + 2 args, pushes 1
+                    output.push(match kind {
+                        ExprKind::Array => Opcode::Array(super::opcodes::ArrayOp::ArraySubrange),
+                        _ => Opcode::String(super::opcodes::StringOp::Subrange),
+                    });
+                    runtime_depth -= 2; // consumes subject + 2 args, pushes 1
                 }
 
                 Token::RBrace => {
@@ -678,8 +678,13 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                             }
                         }
                     }
-                    output.push(Opcode::String(super::opcodes::StringOp::Replace));
-                    runtime_depth -= 2; // consumes string + 2 args, pushes 1
+                    output.push(match kind {
+                        ExprKind::Array => {
+                            Opcode::Array(super::opcodes::ArrayOp::ArraySubrangeInPlace)
+                        }
+                        _ => Opcode::String(super::opcodes::StringOp::Replace),
+                    });
+                    runtime_depth -= 2; // consumes subject + 2 args, pushes 1
                 }
 
                 Token::PipeMinus => {
@@ -739,27 +744,27 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     //   - depth > 1                     -> residual values (`1 2`, `A;B`)
     //                                      -> Incomplete (TooMany already
     //                                      fired at any `;`).
-    // The empty-program case (`output` is empty before the End sentinel) is
-    // a deliberate Rust special case and is exempt.
+    //
+    // A source that produced no opcodes at all is NOT exempt: `operand_needed`
+    // is still set, so it lands on Incomplete — which is what C answers for a
+    // whitespace-only expression, the only way to get here (the empty string
+    // never reaches the compiler; see `calc::compile`).
     let ends_with_store = matches!(
         output.last(),
         Some(Opcode::Core(CoreOp::StoreVar(_))) | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
     );
     let depth_ok = runtime_depth == 1 || (runtime_depth == 0 && ends_with_store);
-    if !output.is_empty() && (operand_needed || !depth_ok) {
+    if operand_needed || !depth_ok {
         return Err(CalcError::Incomplete);
     }
 
     output.push(Opcode::Core(CoreOp::End));
 
-    // An op this engine's evaluator does not implement is a compile error, not
-    // a runtime one (see `opcode_supported_by_engine`).
-    if output
-        .iter()
-        .any(|op| !opcode_supported_by_engine(&kind, op))
-    {
-        return Err(CalcError::Syntax);
-    }
+    // No post-pass gate on which opcodes this engine may emit: `token::ElementTable`
+    // is the single owner of that (one table per C compiler, applied while lexing,
+    // exactly as C's `get_element` does), and every token it spells now compiles to
+    // an opcode this engine's evaluator runs — including `[` and `{`, which are a
+    // string slice in sCalc and an array subrange in aCalc.
 
     Ok(CompiledExpr {
         code: output,

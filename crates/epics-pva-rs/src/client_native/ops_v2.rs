@@ -121,11 +121,21 @@ pub struct MonitorFlow {
     /// pvxs `op->pipeline`. When false no credit window is negotiated:
     /// INIT carries no pipeline bit / `nack` trailer and no ACK is sent.
     pub pipeline: bool,
-    /// pvxs `op->queueSize` — the credit window written as the INIT
-    /// `nack` trailer. Only meaningful when `pipeline`.
+    /// pvxs `op->queueSize` (`clientmon.cpp:52`, default 4) — the NEGOTIATED
+    /// monitor queue depth. Reported as `SubscriptionStat::limit_queue` (pvxs
+    /// `ret.limitQueue = queueSize`, `clientmon.cpp:152`) and, when `pipeline`,
+    /// written as the INIT `nack` trailer.
+    ///
+    /// This is resolved whether or not pipelining is on, exactly as pvxs
+    /// resolves it — the `queueSize` block sits outside any `if(pipeline)`
+    /// (`clientmon.cpp:763-773`). It used to collapse to `0` for a
+    /// non-pipelined monitor, which gave the field two meanings ("no pipeline"
+    /// vs. a real depth) and made a `record[queueSize=16]` monitor report
+    /// `limit_queue = 0` (R10-35). `pipeline` alone gates the wire.
     pub queue_size: u32,
-    /// pvxs `op->ackAt` — refill the server's window after this many
-    /// delivered events. Only meaningful when `pipeline`.
+    /// pvxs `op->ackAt` (`clientmon.cpp:796-808`) — refill the server's window
+    /// after this many delivered events. Resolved unconditionally, as pvxs
+    /// does; consumed only when `pipeline`.
     pub ack_at: u32,
 }
 
@@ -134,6 +144,12 @@ impl MonitorFlow {
     /// window is the single source of truth (no caller pvRequest to
     /// honor). `pipeline_size == 0` disables pipelining entirely,
     /// matching the pre-`MonitorFlow` `pipeline_size > 0` gate.
+    ///
+    /// A non-pipelined monitor still has a queue depth — pvxs's builder
+    /// default `queueSize = 4` stands whatever `pipeline` is
+    /// (`clientmon.cpp:52`), and it is what `stats()` reports. So the
+    /// `pipeline_size == 0` arm keeps [`DEFAULT_PIPELINE_SIZE`] as the depth
+    /// rather than reporting `0`.
     pub fn window(pipeline_size: u32) -> Self {
         if pipeline_size > 0 {
             Self {
@@ -144,8 +160,8 @@ impl MonitorFlow {
         } else {
             Self {
                 pipeline: false,
-                queue_size: 0,
-                ack_at: 0,
+                queue_size: DEFAULT_PIPELINE_SIZE,
+                ack_at: ack_threshold(DEFAULT_PIPELINE_SIZE),
             }
         }
     }
@@ -164,79 +180,132 @@ impl MonitorFlow {
     /// `default_window` is the client's configured pipeline window
     /// (`PvaClientBuilder::pipeline_size`), used as the `queueSize`
     /// fallback the way pvxs uses its `MonitorBuilder` default of 4.
+    ///
+    /// Every option is read through the CONVERSION owner
+    /// ([`crate::pvdata::convert`], the port's `Value::copyOut`), because that
+    /// is what pvxs's `Value::as<T>()` is. This used to normalise each option
+    /// to its DISPLAY STRING and then string-match, which diverged three ways
+    /// (R10-35):
+    ///
+    /// * `pipeline` matched the texts `"true"`/`"1"`/`"yes"`. pvxs runs
+    ///   `as(bool)`: bool, ANY non-zero integer or real is true
+    ///   (`data.cpp:405`), while a STRING converts only as the exact tokens
+    ///   `"true"`/`"false"` (`data.cpp:466-469`). So `pipeline = Int(2)` ran a
+    ///   pipelined monitor against pvxs and a plain one here, and `"yes"` did
+    ///   the reverse.
+    /// * `queueSize` was parsed as a DECIMAL string. pvxs runs `as(uint32)`,
+    ///   which casts a real and parses a string with `parseTo<uint64_t>` =
+    ///   `stoull(s, &idx, 0)` — BASE 0. `"0x10"` is 16 and `Double(8.5)` is 8.
+    /// * `ackAny` took the percent branch off the RENDERED text. pvxs gates it
+    ///   on `ackAny.type()==TypeCode::String` (`clientmon.cpp:777`) and only
+    ///   then reads the `"N%"` form.
+    ///
+    /// Note this is the CLIENT's conversion topology, which is NOT the
+    /// server's: `servermon.cpp:556` runs the THROWING `ackAny.as<std::string>()`
+    /// ahead of both branches, so a non-convertible `ackAny` resets the circuit
+    /// there. The client's `type()==String` guard means nothing here can throw.
     pub fn from_record_options(
         record_options: &[(String, crate::pvdata::ScalarValue)],
         default_window: u32,
     ) -> Self {
-        // Record options are now typed (`bool pipeline`, `uint queueSize`)
-        // or string (parsed-text path). Normalise each to its display
-        // string so one parser handles both shapes — `Boolean(true)` and
-        // `String("true")` both render `"true"`, `UInt(8)` renders `"8"`.
-        let get = |key: &str| {
+        use crate::pvdata::{PvField, convert};
+        // The extractor only lifts SCALAR leaves out of `record._options`, so a
+        // non-scalar option arrives as absent. That matches pvxs's outcome for
+        // one: every `as<T>()` it would run on an array / struct is `NoConvert`,
+        // and `as(x)` answers false, leaving the default in place.
+        let get = |key: &str| -> Option<PvField> {
             record_options
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| PvField::Scalar(v.clone()))
         };
-        // pvxs `options["pipeline"].as(op->pipeline)` — absent ⟹ false.
-        let pipeline = get("pipeline")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
-        if !pipeline {
-            // No pipeline ⟹ no credit window and no ACK trailer. A
-            // requested `queueSize` still travels inside the pvRequest
-            // bytes (the server's squash depth) but the client sends no
-            // `nack` and never ACKs — pvxs only writes the trailer
-            // `if(pipeline)` (`clientmon.cpp:340-348`).
-            return Self {
-                pipeline: false,
-                queue_size: 0,
-                ack_at: 0,
-            };
-        }
-        // pvxs `clientmon.cpp:763-773`: `queueSize` honored only when
-        // present, parseable, and `Q > 1`; else the builder default. A
-        // pipeline window must be `>= 2`, so a 0/1 configured default
-        // falls back to the pvxs default of 4.
+
+        // `clientmon.cpp:763-773` — `if(queueSize.as(Q) && Q>1) op->queueSize = Q;`
+        // else keep the default. Resolved OUTSIDE any pipeline gate, exactly
+        // where pvxs resolves it. A pipeline window must be >= 2, so a 0/1
+        // configured default falls back to pvxs's 4.
         let fallback = if default_window > 1 {
             default_window
         } else {
             DEFAULT_PIPELINE_SIZE
         };
         let queue_size = get("queueSize")
-            .and_then(|v| v.trim().parse::<u32>().ok())
+            .and_then(|f| convert::as_u32(&f).ok())
             .filter(|&q| q > 1)
             .unwrap_or(fallback);
-        let ack_at = ack_at_from_request(get("ackAny").as_deref(), queue_size);
+
+        // `clientmon.cpp:775` — `(void)options["pipeline"].as(op->pipeline);`
+        // An absent or unconvertible value leaves the `false` default.
+        let pipeline = get("pipeline")
+            .and_then(|f| convert::as_bool(&f).ok())
+            .unwrap_or(false);
+
+        // `clientmon.cpp:777-808`. Resolved unconditionally, as pvxs does;
+        // only a pipelined monitor ever consumes it.
+        let ack_any = record_options
+            .iter()
+            .find(|(k, _)| k == "ackAny")
+            .map(|(_, v)| v.clone());
+        let ack_at = ack_at_from_request(ack_any.as_ref(), queue_size);
+
         Self {
-            pipeline: true,
+            pipeline,
             queue_size,
             ack_at,
         }
     }
 }
 
-/// pvxs `clientmon.cpp:777-808` — derive the pipeline ACK-refill
-/// threshold `ackAt` from a string-valued `record._options.ackAny` and
-/// the negotiated `queue_size`. A `"N%"` value is a percent of the
-/// window (honored only for `0 < N <= 100`); otherwise an integer
-/// count. An absent/unparseable/out-of-range value, or an explicit `0`,
-/// resolves to `queue_size / 2`; the result clamps to `[1, queue_size]`.
-/// This is the client-string twin of the server's `ack_at_from`
-/// (which reads a typed `PvField`); `queue_size` is always `>= 2` here.
-fn ack_at_from_request(ack_any: Option<&str>, queue_size: u32) -> u32 {
+/// pvxs `clientmon.cpp:777-808` — derive the ACK-refill threshold `ackAt`
+/// from `record._options.ackAny` and the negotiated `queue_size`.
+///
+/// pvxs's order, which this mirrors exactly:
+///
+/// 1. `if(ackAny.type()==TypeCode::String)` — ONLY a string-STORED value can
+///    take the percent branch, and only in the `"N%"` shape (`size()>1` and a
+///    trailing `%`). The percent must land in `(0, 100]`, else pvxs throws to
+///    its own `catch` and leaves `ackAt` at 0. Note the branch is chosen by
+///    STORAGE, not by how the value happens to render — the port used to strip
+///    a `%` off the displayed text of any value.
+/// 2. `if(ackAt==0) { if(ackAny.as(count)) ackAt = count; }` — the integer
+///    conversion, run for EVERY storage including string. That is `as(uint32)`,
+///    so a string parses BASE 0 (`"0x10"` → 16), a real casts (`Double(3.7)` →
+///    3), and a bool converts (`true` → 1). The port used a decimal-only
+///    `str::parse::<u32>`, which refused all three.
+/// 3. `if(ackAt==0) ackAt = queueSize/2;` then clamp to `[1, queueSize]`.
+///
+/// The distinction between the string that FAILS the percent parse and one
+/// that never had a `%` is invisible in the result: both fall through to step
+/// 2, which re-reads the WHOLE string as an integer (`"50%"` fails that too),
+/// then to the half-window default.
+///
+/// `queue_size` is always `>= 2` here (the caller's `Q > 1` filter and its
+/// `>= 2` fallback), so the clamp cannot invert.
+fn ack_at_from_request(ack_any: Option<&crate::pvdata::ScalarValue>, queue_size: u32) -> u32 {
+    use crate::pvdata::{PvField, ScalarValue, convert};
+
     let mut ack_at: u32 = 0;
-    if let Some(s) = ack_any {
-        if let Some(pct) = s.strip_suffix('%') {
-            if let Ok(percent) = pct.trim().parse::<f64>() {
-                if percent > 0.0 && percent <= 100.0 {
-                    ack_at = (percent / 100.0 * queue_size as f64) as u32;
-                }
+    if let Some(v) = ack_any {
+        // Step 1 — `ackAny.type()==TypeCode::String`, the STORAGE test.
+        if let ScalarValue::String(s) = v {
+            let s = s.as_str_lossy();
+            if s.len() > 1
+                && let Some(pct) = s.strip_suffix('%')
+                && let Ok(percent) = pct.trim().parse::<f64>()
+                && percent > 0.0
+                && percent <= 100.0
+            {
+                ack_at = (percent / 100.0 * queue_size as f64) as u32;
             }
-        } else if let Ok(count) = s.parse::<u32>() {
+        }
+        // Step 2 — `ackAny.as(count)`, the conversion owner, every storage.
+        if ack_at == 0
+            && let Ok(count) = convert::as_u32(&PvField::Scalar(v.clone()))
+        {
             ack_at = count;
         }
     }
+    // Step 3.
     if ack_at == 0 {
         ack_at = queue_size / 2;
     }
@@ -7026,17 +7095,20 @@ mod tests {
         assert_eq!(f.queue_size, 2);
         assert_eq!(f.ack_at, 1);
 
-        // pipeline=false → no window, no ACK, no trailer regardless of
-        // the builder default being nonzero.
+        // pipeline=false → no trailer and no ACK, but the queue depth is
+        // still resolved: pvxs's `queueSize` block sits outside any pipeline
+        // gate (clientmon.cpp:763-773) and its value is what `stats()` reports
+        // as `limitQueue` (:152). R10-35 — this used to answer 0.
         let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "false")]), 4);
         assert!(!f.pipeline);
-        assert_eq!(f.queue_size, 0);
-        assert_eq!(f.ack_at, 0);
+        assert_eq!(f.queue_size, 4, "the builder default depth still stands");
 
-        // No pipeline option at all → pvxs default false.
+        // No pipeline option at all → pvxs default false, and an explicit
+        // queueSize is STILL honored (it is the client's queue depth, and it
+        // travels in the pvRequest as the server's squash depth).
         let f = MonitorFlow::from_record_options(&opts(&[("queueSize", "16")]), 4);
         assert!(!f.pipeline);
-        assert_eq!(f.queue_size, 0);
+        assert_eq!(f.queue_size, 16);
 
         // pipeline=true, no queueSize → builder default window.
         let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "true")]), 8);
@@ -7127,7 +7199,9 @@ mod tests {
     /// A forwarded plain monitor request (no `record._options`) must
     /// extract nothing and derive a plain (non-pipeline) flow — pvxs
     /// servers enable pipeline only from the pvRequest, so the client must
-    /// not send a `nack` trailer / ACKs the server would ignore.
+    /// not send a `nack` trailer / ACKs the server would ignore. The queue
+    /// depth is still the caller's default (pvxs `SubscriptionImpl` seeds
+    /// `queueSize=4` and only `pipeline` gates the trailer).
     #[test]
     fn record_options_from_request_plain_request_yields_no_pipeline() {
         let req = PvField::Structure(crate::pvdata::PvStructure {
@@ -7137,14 +7211,15 @@ mod tests {
         assert!(record_options_from_request(&req).is_empty());
         let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
         assert!(!flow.pipeline);
-        assert_eq!(flow.queue_size, 0);
-        assert_eq!(flow.ack_at, 0);
+        assert_eq!(flow.queue_size, 4);
     }
 
     /// A forwarded request naming `queueSize` but NOT `pipeline` must stay
     /// plain (pvxs `clientmon.cpp` defaults `pipeline` false): the gateway
     /// forwarding such a request opens a plain upstream monitor, not a
-    /// pipelined one driven by the client's builder default.
+    /// pipelined one driven by the client's builder default. The depth it
+    /// asks for is still honored — `queueSize` is parsed outside the
+    /// `pipeline` gate in pvxs (clientmon.cpp:763-773).
     #[test]
     fn record_options_queue_size_without_pipeline_stays_plain() {
         let req = pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::UInt(16)))]);
@@ -7152,7 +7227,87 @@ mod tests {
         assert_eq!(extracted.len(), 1);
         let flow = MonitorFlow::from_record_options(&extracted, 4);
         assert!(!flow.pipeline);
-        assert_eq!(flow.queue_size, 0);
+        assert_eq!(flow.queue_size, 16);
+    }
+
+    /// R10-35 — the option values are CONVERTED (pvxs `Value::as<T>()`), not
+    /// string-matched against a display-normalized rendering. Each case here
+    /// fails on the pre-fix parser, which compared `v.to_string()` to the
+    /// literals `"true"`/`"1"` and ran `str::parse::<u32>()`.
+    #[test]
+    fn record_options_convert_like_pvxs_value_as() {
+        // `pipeline` goes through `as(bool)`: any non-zero integer or real is
+        // true. The old parser saw "2"/"-1"/"0.5" and answered false.
+        for truthy in [
+            ScalarValue::Int(2),
+            ScalarValue::Int(-1),
+            ScalarValue::Double(0.5),
+            ScalarValue::UByte(7),
+        ] {
+            let req = pv_request_with_options(&[("pipeline", PvField::Scalar(truthy.clone()))]);
+            let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+            assert!(flow.pipeline, "{truthy:?} must convert to pipeline=true");
+        }
+        // ... and a zero of any storage is false (negative control).
+        for falsy in [ScalarValue::Int(0), ScalarValue::Double(0.0)] {
+            let req = pv_request_with_options(&[("pipeline", PvField::Scalar(falsy.clone()))]);
+            let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+            assert!(!flow.pipeline, "{falsy:?} must convert to pipeline=false");
+        }
+
+        // `queueSize` goes through `as(uint32)`: strings are base-0 (so `0x10`
+        // is 16, matching `stoull(s, &idx, 0)`), and reals truncate.
+        let req = pv_request_with_options(&[(
+            "queueSize",
+            PvField::Scalar(ScalarValue::String("0x10".into())),
+        )]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.queue_size, 16, "string queueSize is base-0 like pvxs");
+
+        let req =
+            pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::Double(8.5)))]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.queue_size, 8, "real queueSize truncates like a C cast");
+
+        // An unconvertible `queueSize` falls back to the caller's default —
+        // pvxs's `catch(std::exception&)` around the conversion (:769-772).
+        let req = pv_request_with_options(&[(
+            "queueSize",
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        )]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.queue_size, 4);
+
+        // `ackAny` percent syntax applies ONLY to String storage
+        // (clientmon.cpp:783 checks `ackAny.type()==TypeCode::String` first);
+        // every other storage is an absolute count via `as(uint32)`.
+        let req = pv_request_with_options(&[
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            ("ackAny", PvField::Scalar(ScalarValue::UInt(2))),
+        ]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.ack_at, 2);
+
+        // A typed real ackAny converts too — the old parser only handled a
+        // decimal string.
+        let req = pv_request_with_options(&[
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            ("ackAny", PvField::Scalar(ScalarValue::Double(3.0))),
+        ]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.ack_at, 3);
+
+        // Unconvertible `ackAny` → pvxs's `ackAt = queueSize/2` fallback,
+        // clamped into [1, queueSize].
+        let req = pv_request_with_options(&[
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            (
+                "ackAny",
+                PvField::Scalar(ScalarValue::String("junk".into())),
+            ),
+        ]);
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert_eq!(flow.ack_at, 8);
     }
 
     fn idle_sub_state() -> Arc<SubscriptionState> {

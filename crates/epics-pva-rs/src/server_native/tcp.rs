@@ -67,33 +67,38 @@ struct MonitorOptionDiag {
     message: String,
 }
 
-/// Render a monitor `_options` scalar value for a pvxs-shaped
-/// `logRemote` message. pvxs streams the option `Value` through
-/// `operator<<` (`SB()<<…<<pipeline`); the scalar text form is the
-/// faithful approximation. Non-scalar fields render as `<non-scalar>`.
-fn render_option_value(f: &PvField) -> String {
-    match f {
-        PvField::Scalar(sv) => sv.to_string(),
-        _ => "<non-scalar>".to_string(),
-    }
-}
+/// Render a monitor `_options` value for a pvxs-shaped `logRemote` message.
+///
+/// pvxs streams the option `Value` through `operator<<` (`SB()<<…<<pipeline`,
+/// `servermon.cpp:529`), i.e. the default TREE formatter — `<typecode> =
+/// <value>` with the trailing newline the formatter always writes. That is
+/// [`crate::pvdata::render_value`], the one owner shared with the QSRV
+/// bridge's `record._options.process` diagnostic. This used to render a bare
+/// scalar (`maybe` where pvxs sends `string = "maybe"\n`) while the bridge
+/// rendered a third, differently-typed form (R10-36).
+use crate::pvdata::render_value as render_option_value;
 
 #[derive(Debug)]
 struct PipelineOptions {
     enabled: bool,
-    queue_size: u32,
-    /// The client-requested `record._options.queueSize`, recorded ONLY
-    /// when it was present and valid (`>= 2`), independent of pipeline
-    /// enablement. pvxs assigns `op->limit = qSize` for any valid
-    /// `queueSize` outside the `if(op->pipeline)` block
-    /// (`servermon.cpp:533-543`), so a non-pipeline monitor's queue depth
-    /// is the requested value too. `None` means absent/invalid → the
-    /// server keeps its configured default depth. `queue_size` above is
-    /// the negotiated pipeline queue depth (`op->limit`, defaults to 4);
-    /// it is NOT the initial credit window — that is the separate per-INIT
+    /// The NEGOTIATED per-op queue limit — pvxs `MonitorOp::limit`
+    /// (`servermon.cpp:66`), seeded from
+    /// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]
+    /// and overridden by a valid (`>= 2`) `record._options.queueSize`
+    /// whether or not pipeline is enabled (`op->limit = qSize` sits
+    /// OUTSIDE the `if(op->pipeline)` block, `:533-543`).
+    ///
+    /// ONE meaning on every path: it is the squash threshold, the base of
+    /// the `ackAny` arithmetic, and the depth reported to the source. The
+    /// port used to carry a SECOND copy (`requested_queue_size:
+    /// Option<u32>`, `None` = "use the server default") whose default (64)
+    /// differed from this field's (4), so a plain monitor's squash depth
+    /// and its negotiated limit were different numbers (R11-31).
+    ///
+    /// It is NOT the initial credit window — that is the separate per-INIT
     /// `nack` rider (see [`parse_monitor_init_nack`]), which defaults to 0
-    /// when absent. Both are separate from this squash-threshold override.
-    requested_queue_size: Option<u32>,
+    /// when absent.
+    queue_size: u32,
     /// pvxs `MonitorOp::ackAt` (`servermon.cpp:68`) — the pipeline
     /// ACK-refill threshold parsed from `record._options.ackAny`. It
     /// caps the source-provided monitor watermarks at `ack_at - 1`
@@ -484,48 +489,6 @@ fn monitor_filter_chain_json(req: &PvField) -> Option<String> {
     }
 }
 
-/// epics-base PR `70735383350b` parity: extract
-/// `record._options.autoExec` from a decoded pvRequest. Returns
-/// `Some(false)` only when the field is explicitly set to "false"
-/// (case-insensitive); `Some(true)` for "true"; `None` when the
-/// option is absent (caller defaults to true / immediate execute).
-fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
-    use crate::pvdata::ScalarValue;
-    let root = match req? {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let record = root
-        .fields
-        .iter()
-        .find_map(|(k, v)| (k == "record").then_some(v))?;
-    let record_s = match record {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let options = record_s
-        .fields
-        .iter()
-        .find_map(|(k, v)| (k == "_options").then_some(v))?;
-    let opt_s = match options {
-        PvField::Structure(s) => s,
-        _ => return None,
-    };
-    let raw = opt_s.fields.iter().find_map(|(k, v)| {
-        (k == "autoExec").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => {
-                Some(s.as_str_lossy().trim().to_ascii_lowercase())
-            }
-            _ => None,
-        })
-    })?;
-    match raw.as_str() {
-        "true" | "yes" | "1" => Some(true),
-        "false" | "no" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 /// Consume the optional u32 `nack` (initial pipeline window) that a
 /// pvxs client appends to a MONITOR INIT body when it sets the
 /// pipeline bit (pvxs `servermon.cpp:494-495` / `clientmon.cpp:341-342`).
@@ -559,37 +522,54 @@ fn parse_monitor_init_nack(
     })
 }
 
-/// Inspect a decoded pvRequest for `record._options.pipeline` and
-/// `record._options.queueSize`. pvxs `Subscription` defaults to
-/// `queueSize = 4` when pipeline is enabled; we follow.
+/// Inspect a decoded pvRequest for `record._options.pipeline`,
+/// `record._options.queueSize` and `record._options.ackAny` — pvxs
+/// `ServerConn::handle_MONITOR`'s INIT half (`servermon.cpp:519-582`).
 ///
-/// `Ok(None)` only when there is no `record._options` structure to
-/// negotiate (a plain monitor). A present `_options` yields
-/// [`MonitorPipelineRequest::Options`], or [`MonitorPipelineRequest::Reject`]
-/// when `pipeline=true` is paired with a PRESENT-but-invalid
-/// `queueSize` (pvxs `servermon.cpp:537-540`).
+/// `default_limit` is the limit a fresh `MonitorOp` starts with (pvxs
+/// `limit=4u`, `servermon.cpp:66`; here
+/// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]).
+/// Every returned [`PipelineOptions`] names a resolved
+/// [`PipelineOptions::queue_size`], so no caller re-derives the depth.
+///
+/// [`MonitorPipelineRequest::Options`] on success — including for a
+/// pvRequest with no `record._options` at all, which negotiates nothing and
+/// therefore lands on the defaults. [`MonitorPipelineRequest::Reject`] when
+/// `pipeline=true` is paired with a PRESENT-but-invalid `queueSize` (pvxs
+/// `servermon.cpp:537-540`).
 ///
 /// `Err(NoConvert)` is pvxs's THIRD outcome, and the only one that is not a
 /// reply: an `ackAny` whose storage no `copyOut` arm converts throws out of
 /// `handle_MONITOR` and resets the circuit (see [`ack_at_from`]). The caller
 /// must fail the connection, not answer the INIT.
-fn monitor_pipeline_options(req: &PvField) -> Result<Option<MonitorPipelineRequest>, NoConvert> {
+fn monitor_pipeline_options(
+    req: &PvField,
+    default_limit: u32,
+) -> Result<MonitorPipelineRequest, NoConvert> {
+    let plain = || {
+        MonitorPipelineRequest::Options(PipelineOptions {
+            enabled: false,
+            queue_size: default_limit,
+            ack_at: 1,
+            diagnostics: Vec::new(),
+        })
+    };
     let PvField::Structure(root) = req else {
-        return Ok(None);
+        return Ok(plain());
     };
     let Some(PvField::Structure(record_s)) = root
         .fields
         .iter()
         .find_map(|(k, v)| (k == "record").then_some(v))
     else {
-        return Ok(None);
+        return Ok(plain());
     };
     let Some(PvField::Structure(opt_s)) = record_s
         .fields
         .iter()
         .find_map(|(k, v)| (k == "_options").then_some(v))
     else {
-        return Ok(None);
+        return Ok(plain());
     };
     // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
     // options, accumulated alongside the effective options without
@@ -664,94 +644,63 @@ fn monitor_pipeline_options(req: &PvField) -> Result<Option<MonitorPipelineReque
         .fields
         .iter()
         .find_map(|(k, v)| (k == "ackAny").then_some(v));
-    // A valid (`>= 2`) explicit `queueSize` is the per-op queue-depth
-    // override regardless of pipeline (pvxs `op->limit = qSize` sits
-    // OUTSIDE the `if(op->pipeline)` block, servermon.cpp:533-543).
-    let requested_queue_size = match queue_size {
-        Some(n) if n >= 2 => Some(n),
-        _ => None,
-    };
-    let opts = if enabled {
-        match queue_size {
-            // Valid: use the requested window (pvxs `op->limit = qSize`).
-            Some(n) if n >= 2 => {
-                let (ack_at, ack_diag) = ack_at_from(ack_any, n)?;
-                diagnostics.extend(ack_diag);
-                PipelineOptions {
-                    enabled: true,
-                    queue_size: n,
-                    requested_queue_size,
-                    ack_at,
-                    diagnostics,
-                }
-            }
-            // PRESENT but invalid (`<2` or unconvertible): pvxs
-            // `servermon.cpp:537-540` rejects the INIT — the pipeline
-            // sub-protocol requires agreement on `queueSize`. Do NOT
-            // downgrade to a non-pipeline monitor. pvxs answers this with
-            // `ctrl->error(...)` (a per-op error), NOT a logRemote, and
-            // returns BEFORE the `ackAny` block — so no diagnostics are
-            // owed. `diagnostics` is provably empty here (a rejected
-            // pipeline required a recognized `pipeline=true`, which emits
-            // no Warn, and `ackAny` is never reached), so dropping it
-            // matches pvxs.
-            _ if queue_size_present => {
-                let rendered = queue_size_field
-                    .map(render_option_value)
-                    .unwrap_or_default();
-                return Ok(Some(MonitorPipelineRequest::Reject(format!(
-                    "can not pipeline invalid queueSize : {rendered}"
-                ))));
-            }
-            // ABSENT: pvxs keeps the default `limit` (4) and leaves
-            // pipeline enabled.
-            _ => {
-                let (ack_at, ack_diag) = ack_at_from(ack_any, 4)?;
-                diagnostics.extend(ack_diag);
-                PipelineOptions {
-                    enabled: true,
-                    queue_size: 4,
-                    requested_queue_size,
-                    ack_at,
-                    diagnostics,
-                }
-            }
-        }
+    // pvxs `servermon.cpp:533-543`: `uint32_t qSize = op->limit;` then
+    // `if(queueSize.as(qSize) && qSize>=2) op->limit = qSize;`. ONE limit,
+    // seeded with the per-op default and overridden by a valid request —
+    // the assignment sits OUTSIDE `if(op->pipeline)`, so it holds for a
+    // plain monitor too. Everything downstream (squash threshold, `ackAt`
+    // arithmetic, reported depth) reads this single value.
+    let requested_limit = queue_size.filter(|&n| n >= 2);
+    let limit = requested_limit.unwrap_or(default_limit);
+    // present + not-accepted == pvxs's `!(queueSize.as(qSize) && qSize>=2)`
+    // (an unconvertible value or a `< 2` one). A CONFIGURED default that
+    // happens to equal the rejected request does not make it accepted.
+    let queue_size_invalid = queue_size_present && requested_limit.is_none();
+    if enabled && queue_size_invalid {
+        // PRESENT but invalid (`<2` or unconvertible) under pipeline: pvxs
+        // `servermon.cpp:537-540` rejects the INIT — the pipeline
+        // sub-protocol requires agreement on `queueSize`. Do NOT downgrade
+        // to a non-pipeline monitor. pvxs answers this with
+        // `ctrl->error(...)` (a per-op error), NOT a logRemote, and returns
+        // BEFORE the `ackAny` block — so no diagnostics are owed.
+        // `diagnostics` is provably empty here (a rejected pipeline
+        // required a recognized `pipeline=true`, which emits no Warn, and
+        // `ackAny` is never reached), so dropping it matches pvxs.
+        let rendered = queue_size_field
+            .map(render_option_value)
+            .unwrap_or_default();
+        return Ok(MonitorPipelineRequest::Reject(format!(
+            "can not pipeline invalid queueSize : {rendered}"
+        )));
+    }
+    if queue_size_invalid {
+        // pvxs `servermon.cpp:541-543`: the same present-but-invalid
+        // `queueSize` on a NON-pipeline monitor keeps the default depth and
+        // emits a Warn logRemote ("Unable to use …").
+        let rendered = queue_size_field
+            .map(render_option_value)
+            .unwrap_or_default();
+        diagnostics.push(MonitorOptionDiag {
+            level: MessageType::Warning,
+            message: format!("Unable to use record._options.queueSize : {rendered}"),
+        });
+    }
+    // pvxs parses `ackAny` only inside `if(op->pipeline)` (`:546-582`);
+    // without a credit window there is no ACK cadence to threshold, so a
+    // plain monitor keeps `ackAt` at its `1` initializer (`:68`).
+    let ack_at = if enabled {
+        let (ack_at, ack_diag) = ack_at_from(ack_any, limit)?;
+        diagnostics.extend(ack_diag);
+        ack_at
     } else {
-        // Non-pipeline: a valid `queueSize` sets the queue depth
-        // (pvxs sets `op->limit` regardless of pipeline); an invalid or
-        // absent one keeps the default depth 4. The pipeline credit
-        // window does not apply to a non-pipeline monitor, while
-        // `requested_queue_size` carries the squash override to the send
-        // loop.
-        let queue_size = match queue_size {
-            Some(n) if n >= 2 => n,
-            _ => 4,
-        };
-        // pvxs `servermon.cpp:541-543`: a PRESENT-but-invalid `queueSize`
-        // on a NON-pipeline monitor keeps the default depth and emits a
-        // Warn logRemote ("Unable to use …"). (Under pipeline the same
-        // case is the Reject above, not a Warn.) `requested_queue_size`
-        // is `Some` only for a valid `>= 2` value, so
-        // present + `None` == present-invalid.
-        if queue_size_present && requested_queue_size.is_none() {
-            let rendered = queue_size_field
-                .map(render_option_value)
-                .unwrap_or_default();
-            diagnostics.push(MonitorOptionDiag {
-                level: MessageType::Warning,
-                message: format!("Unable to use record._options.queueSize : {rendered}"),
-            });
-        }
-        PipelineOptions {
-            enabled: false,
-            queue_size,
-            requested_queue_size,
-            ack_at: 1,
-            diagnostics,
-        }
+        1
     };
-    Ok(Some(MonitorPipelineRequest::Options(opts)))
+    Ok(MonitorPipelineRequest::Options(PipelineOptions {
+        enabled,
+        queue_size: limit,
+        ack_at,
+        diagnostics,
+    }))
 }
 
 #[derive(Clone)]
@@ -1253,15 +1202,6 @@ struct OpState {
     /// the event cause the iteration to continue without sending.
     /// Empty chain (the default) is a no-op.
     monitor_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
-    /// `record._options.autoExec` from the INIT pvRequest. pvxs
-    /// uses this purely client-side to decide whether to send the
-    /// PUT EXEC immediately after INIT or wait for an explicit
-    /// `reExec()` call (clientget.cpp:123). The server has no
-    /// queueing role — pvxs `serverget.cpp:488-492` calls `onPut`
-    /// the moment a CMD_PUT with !init arrives, regardless of the
-    /// client's autoExec setting. We keep the field for diagnostic
-    /// echoing but DO NOT gate write commits on it.
-    put_auto_exec: bool,
     /// full INIT pvRequest value (decoded). PVA PUT INIT
     /// carries per-operation options (`record._options.process` /
     /// `block`, etc.) that the data-phase payload does NOT carry.
@@ -4089,7 +4029,6 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         monitor_op_id: next_op_id(),
         monitor_filters: Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
-        put_auto_exec: true,
         pv_request: None,
         monitor_options: crate::server_native::source::MonitorOptions::default(),
         data_task_abort: None,
@@ -6262,22 +6201,25 @@ async fn handle_op(
         // port used to log a Crit CMD_MESSAGE and serve the monitor on with
         // `ackAt = 1` (R9-33).
         let pipeline_req = match req_value.as_ref().filter(|_| kind == OpKind::Monitor) {
-            Some(v) => monitor_pipeline_options(v).map_err(|e| {
-                PvaError::Decode(format!(
-                    "MONITOR INIT: record._options.ackAny is not convertible: {e}"
-                ))
-            })?,
+            Some(v) => Some(
+                monitor_pipeline_options(v, config.monitor_queue_limit()).map_err(|e| {
+                    PvaError::Decode(format!(
+                        "MONITOR INIT: record._options.ackAny is not convertible: {e}"
+                    ))
+                })?,
+            ),
             None => None,
         };
-        // The client-requested `queueSize` overrides the server's default
-        // monitor queue depth for THIS operation, whether or not pipeline
-        // flow control is enabled (pvxs `op->limit = qSize` sits outside
-        // `if(op->pipeline)`, servermon.cpp:533-543). Captured before
-        // `pipeline_req` is consumed by the move below; `None` means the
-        // server keeps its configured `monitor_queue_depth`.
-        let requested_queue_size = match &pipeline_req {
-            Some(MonitorPipelineRequest::Options(o)) => o.requested_queue_size,
-            _ => None,
+        // The ONE negotiated per-op queue limit (pvxs `op->limit`): the
+        // server's per-op default unless a valid `record._options.queueSize`
+        // replaced it, whether or not pipeline flow control is enabled
+        // (`op->limit = qSize` sits outside `if(op->pipeline)`,
+        // servermon.cpp:533-543). Captured before `pipeline_req` is consumed
+        // by the move below — and read from the Options REGARDLESS of
+        // `enabled`, because the limit is not a pipeline property.
+        let negotiated_limit = match &pipeline_req {
+            Some(MonitorPipelineRequest::Options(o)) => o.queue_size,
+            _ => config.monitor_queue_limit(),
         };
         // pvxs `servermon.cpp:537-540`: a MONITOR pipeline request whose
         // PRESENT `queueSize` is invalid (`<2` or unconvertible) is a
@@ -6397,17 +6339,6 @@ async fn handle_op(
             Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
         };
 
-        // pvxs autoExec is purely client-side timing control
-        // (clientget.cpp:123 — controls when the client sends the
-        // PUT EXEC frame). The server-side handler runs onPut
-        // unconditionally on every CMD_PUT !init regardless of
-        // autoExec. We parse the option for diagnostic echo only.
-        let put_auto_exec = if kind == OpKind::Put {
-            put_autoexec_from_request(req_value.as_ref()).unwrap_or(true)
-        } else {
-            true
-        };
-
         // Stash the INIT pvRequest so the data-phase
         // dispatch can forward it through `ChannelContext.pv_request`.
         // PUT needs `record._options.process|block`; MONITOR needs
@@ -6435,7 +6366,7 @@ async fn handle_op(
         let monitor_options = if kind == OpKind::Monitor {
             crate::server_native::source::MonitorOptions {
                 pipeline: pipeline_opt.is_some(),
-                queue_size: requested_queue_size,
+                queue_size: negotiated_limit,
                 server_filter: !monitor_filters.is_empty(),
             }
         } else {
@@ -6498,6 +6429,19 @@ async fn handle_op(
                     ch.name
                 )));
             }
+            // R10-37: the source's `onSubscribe` diagnostics are INIT-time.
+            // pvxs records them INSIDE `onSubscribe` — `singlesource.cpp:129`'s
+            // `record._options.DBE=… selects empty mask` is written before
+            // `connect()` emits the INIT reply — so the client sees the
+            // CMD_MESSAGE ahead of that reply. The port opens the subscription
+            // at START, and used to let this hook parse against a discarded log
+            // and re-parse at START to log there, putting the message AFTER the
+            // INIT reply (and emitting it for group / native-PVA channels, whose
+            // pvxs sources never read DBE at all). Draining here, before the
+            // reply is built, is pvxs's order. Only on the Ok path: a DBE that
+            // THROWS resets the circuit without a reply, and pvxs's throw
+            // happens before its logRemote.
+            flush_remote_log(&init_ctx.log, ioid, order, &chan_tx).await;
         }
 
         ch.ops.insert(
@@ -6517,7 +6461,6 @@ async fn handle_op(
                 monitor_wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 monitor_op_id: next_op_id(),
                 monitor_filters,
-                put_auto_exec,
                 pv_request: stashed_pv_request,
                 monitor_options,
                 data_task_abort: None,
@@ -6537,16 +6480,15 @@ async fn handle_op(
         // DESTROY-before-START always tears the upstream down.
         if kind == OpKind::Monitor {
             let pv_name = ch.name.clone();
-            // Per-op squash threshold: the client-requested
-            // `record._options.queueSize` (captured at INIT into
-            // `monitor_options.queue_size`) overrides the server-wide default,
-            // matching pvxs `op->limit = qSize` for both pipeline and plain
-            // monitors (servermon.cpp:533-543).
+            // Per-op squash threshold: the negotiated limit resolved at INIT
+            // (`monitor_options.queue_size` — the server's per-op default
+            // unless a valid `record._options.queueSize` replaced it). pvxs
+            // squashes against that one `op->limit` for pipeline and plain
+            // monitors alike (`queue.size() < limit`, servermon.cpp:273).
             let queue_depth = ch
                 .ops
                 .get(&ioid)
-                .and_then(|s| s.monitor_options.queue_size)
-                .map(|n| n as usize)
+                .map(|s| s.monitor_options.queue_size as usize)
                 .unwrap_or(config.monitor_queue_depth);
             let high_watermark = config.monitor_high_watermark;
             // Read the per-op state back out of the just-inserted `OpState`
@@ -8889,15 +8831,24 @@ mod tests {
         })
     }
 
+    /// Negotiate `req` against the pvxs per-op default limit
+    /// (`MonitorOp::limit = 4u`), which is also this server's default
+    /// `monitor_queue_depth`.
+    fn negotiate_opts(req: &PvField) -> Result<MonitorPipelineRequest, NoConvert> {
+        monitor_pipeline_options(
+            req,
+            crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT,
+        )
+    }
+
     /// Unwrap the parsed options, asserting the request was NOT a
     /// pipeline-negotiation reject and did NOT throw.
     fn parsed_opts(req: &PvField) -> PipelineOptions {
-        match monitor_pipeline_options(req) {
-            Ok(Some(MonitorPipelineRequest::Options(o))) => o,
-            Ok(Some(MonitorPipelineRequest::Reject(msg))) => {
+        match negotiate_opts(req) {
+            Ok(MonitorPipelineRequest::Options(o)) => o,
+            Ok(MonitorPipelineRequest::Reject(msg)) => {
                 panic!("expected parsed options, got a pipeline-negotiation Reject: {msg}")
             }
-            Ok(None) => panic!("expected parsed options, got None (no _options structure)"),
             Err(e) => panic!("expected parsed options, got a circuit-resetting NoConvert: {e}"),
         }
     }
@@ -8946,10 +8897,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Int(1)),
         );
         assert!(
-            matches!(
-                monitor_pipeline_options(&req),
-                Ok(Some(MonitorPipelineRequest::Reject(_)))
-            ),
+            matches!(negotiate_opts(&req), Ok(MonitorPipelineRequest::Reject(_))),
             "pipeline + queueSize<2 must reject the INIT, not downgrade",
         );
     }
@@ -8962,8 +8910,8 @@ mod tests {
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::String("not-a-number".into())),
         );
-        let got = monitor_pipeline_options(&req);
-        let Ok(Some(MonitorPipelineRequest::Reject(msg))) = got else {
+        let got = negotiate_opts(&req);
+        let Ok(MonitorPipelineRequest::Reject(msg)) = got else {
             panic!("pipeline + unconvertible queueSize must reject the INIT");
         };
         // pvxs `ctrl->error(SB()<<"can not pipeline invalid queueSize : "
@@ -8973,6 +8921,61 @@ mod tests {
             "pvxs error text: {msg}"
         );
         assert!(msg.contains("not-a-number"), "the value is named: {msg}");
+    }
+
+    /// R10-36: `SB()<<queueSize` streams the option `Value` through pvxs's
+    /// DEFAULT (tree) formatter — `<typecode> = <value>` plus the newline the
+    /// formatter always writes — not the bare scalar text this used to append.
+    /// Every diagnostic that names an option value shares that one renderer
+    /// ([`crate::pvdata::render_value`]) with the QSRV bridge.
+    #[test]
+    fn pva_r10_36_option_diagnostics_render_the_value_like_pvxs() {
+        // Reject text (`servermon.cpp:538`).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::String("not-a-number".into())),
+        );
+        let Ok(MonitorPipelineRequest::Reject(msg)) = negotiate_opts(&req) else {
+            panic!("pipeline + unconvertible queueSize must reject the INIT");
+        };
+        assert_eq!(
+            msg, "can not pipeline invalid queueSize : string = \"not-a-number\"\n",
+            "pre-R10-36 this rendered the bare scalar (`not-a-number`)"
+        );
+
+        // Warn text on a NON-pipeline monitor (`servermon.cpp:542`).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to use record._options.queueSize : string = \"garbage\"\n"
+        );
+
+        // `pipeline` Warn (`servermon.cpp:529`) — a string `as<bool>` refuses.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("maybe".into())),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to parse record._options.pipeline : string = \"maybe\"\n"
+        );
+
+        // Negative control: a NON-scalar option is no longer flattened to
+        // `<non-scalar>`; it renders as pvxs's tree form for that value.
+        let req = make_pipeline_request(
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![1, 2].into())),
+            PvField::Scalar(ScalarValue::Int(8)),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(
+            opts.diagnostics[0].message,
+            "Unable to parse record._options.pipeline : int32_t[] = {2}[1, 2]\n"
+        );
     }
 
     /// R10-32: pvxs `queueSize.as(qSize)` converts a REAL
@@ -8999,9 +9002,6 @@ mod tests {
             let opts = parsed_opts(&req);
             assert!(opts.enabled, "queueSize = {v:?} must not disable pipeline");
             assert_eq!(opts.queue_size, want, "queueSize = {v:?}");
-            // `op->limit = qSize` sits OUTSIDE `if(op->pipeline)`, so the
-            // squash override applies to a non-pipeline monitor too.
-            assert_eq!(opts.requested_queue_size, Some(want));
             assert!(
                 opts.diagnostics.is_empty(),
                 "a converted queueSize must not warn: {:?}",
@@ -9020,11 +9020,152 @@ mod tests {
         );
         let opts = parsed_opts(&req);
         assert!(!opts.enabled);
-        assert_eq!(opts.requested_queue_size, Some(8));
+        // `op->limit = qSize` sits OUTSIDE `if(op->pipeline)`, so the
+        // squash override applies to a non-pipeline monitor too.
+        assert_eq!(opts.queue_size, 8);
         assert!(
             opts.diagnostics.is_empty(),
             "a converted queueSize must not warn: {:?}",
             opts.diagnostics
+        );
+    }
+
+    /// Build a pvRequest carrying exactly the named `record._options`.
+    fn make_options_request(pairs: &[(&str, PvField)]) -> PvField {
+        let options = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        });
+        let record = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options)],
+        });
+        PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record)],
+        })
+    }
+
+    /// R11-31 — the per-op queue limit is ONE value: pvxs seeds
+    /// `uint32_t qSize = op->limit` from the `MonitorOp::limit = 4u`
+    /// initializer (servermon.cpp:66) and overwrites it only for a valid
+    /// `queueSize >= 2` (`:533-543`). That single `op->limit` is the squash
+    /// threshold (`:273`), the base of the `ackAny` arithmetic
+    /// (`:564,578,581`) and the reported depth (`:313`).
+    ///
+    /// The port kept TWO: the squash depth defaulted to the server-wide
+    /// `monitor_queue_depth` (64) while the SAME negotiation defaulted the
+    /// `ackAny` base to a hardcoded 4. The assertions below distinguish them —
+    /// with a non-default server default, the pre-fix code answered 4 where
+    /// pvxs answers the server's limit.
+    #[test]
+    fn pva_r11_31_one_negotiated_limit_seeded_from_the_server_default() {
+        use crate::server_native::runtime::PvaServerConfig;
+
+        // The default IS the pvxs per-op initializer, not a 64-deep queue.
+        assert_eq!(
+            PvaServerConfig::default().monitor_queue_depth,
+            4,
+            "pvxs MonitorOp::limit = 4u (servermon.cpp:66)"
+        );
+        assert_eq!(
+            PvaServerConfig::default().monitor_queue_limit(),
+            crate::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT
+        );
+        // The documented `depth * 3 / 4` relation held for 64/48 and must
+        // still hold now that the depth is the pvxs per-op default.
+        assert_eq!(
+            PvaServerConfig::default().monitor_high_watermark,
+            PvaServerConfig::default().monitor_queue_depth * 3 / 4
+        );
+
+        // A deployment that raised the per-op default — the same deviation as
+        // building pvxs with a different `limit` initializer.
+        const SERVER_DEFAULT: u32 = 16;
+
+        // No `record._options` at all: nothing negotiated, so the limit is the
+        // server's. (The parser used to answer `None` here and leave each
+        // consumer to pick its own fallback.)
+        let plain = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![],
+        });
+        let Ok(MonitorPipelineRequest::Options(o)) =
+            monitor_pipeline_options(&plain, SERVER_DEFAULT)
+        else {
+            panic!("a pvRequest with no _options negotiates the defaults");
+        };
+        assert!(!o.enabled);
+        assert_eq!(o.queue_size, SERVER_DEFAULT);
+
+        // Pipeline ON, queueSize ABSENT, `ackAny = 50%`: pvxs takes the percent
+        // of `op->limit`, which is the SERVER default here — 8, not 2 (50% of
+        // the 4 the port hardcoded as the pipeline default).
+        let req = make_options_request(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("ackAny", PvField::Scalar(ScalarValue::String("50%".into()))),
+        ]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, SERVER_DEFAULT)
+        else {
+            panic!("an absent queueSize is not a negotiation error");
+        };
+        assert!(o.enabled);
+        assert_eq!(
+            o.queue_size, SERVER_DEFAULT,
+            "absent queueSize keeps op->limit"
+        );
+        assert_eq!(
+            o.ack_at, 8,
+            "ackAny percent is a fraction of the NEGOTIATED limit"
+        );
+
+        // Pipeline ON, queueSize ABSENT, ackAny PRESENT but zero: pvxs's
+        // `if(ackAt==0) ackAt = op->limit/2` (servermon.cpp:578) — the half is
+        // of the negotiated limit (8), not of the hardcoded pipeline default
+        // (2). (An ABSENT ackAny never reaches that line: `ackAt` is
+        // initialised to `1u` at `:68`, so it is not 0 — see
+        // `ack_at_defaults_to_one_when_ack_any_absent`.)
+        let req = make_options_request(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("ackAny", PvField::Scalar(ScalarValue::UInt(0))),
+        ]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, SERVER_DEFAULT)
+        else {
+            panic!("pipeline with a zero ackAny is a valid request");
+        };
+        assert_eq!(o.queue_size, SERVER_DEFAULT);
+        assert_eq!(o.ack_at, SERVER_DEFAULT / 2);
+
+        // A valid client `queueSize` still wins over the server default, and it
+        // is the ack base too (`ackAny=50%` of 8 → 4).
+        let req = make_options_request(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(8))),
+            ("ackAny", PvField::Scalar(ScalarValue::String("50%".into()))),
+        ]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, SERVER_DEFAULT)
+        else {
+            panic!("a valid queueSize is not a negotiation error");
+        };
+        assert_eq!(o.queue_size, 8);
+        assert_eq!(o.ack_at, 4);
+
+        // Boundary (negative control): `queueSize = 1` is REFUSED (pvxs
+        // `qSize>=2`) on a plain monitor — the limit stays the server default
+        // and a Warn is logged, even when the server default is itself 1, so a
+        // refused request is never mistaken for an accepted one.
+        let req = make_options_request(&[("queueSize", PvField::Scalar(ScalarValue::UInt(1)))]);
+        let Ok(MonitorPipelineRequest::Options(o)) = monitor_pipeline_options(&req, 1) else {
+            panic!("an invalid queueSize on a plain monitor is a Warn, not a reject");
+        };
+        assert_eq!(o.queue_size, 1, "the server default stands");
+        assert_eq!(
+            o.diagnostics.len(),
+            1,
+            "a refused queueSize warns even when it equals the default"
         );
     }
 
@@ -9051,10 +9192,7 @@ mod tests {
             PvField::Scalar(ScalarValue::Boolean(true)),
         );
         assert!(
-            matches!(
-                monitor_pipeline_options(&req),
-                Ok(Some(MonitorPipelineRequest::Reject(_)))
-            ),
+            matches!(negotiate_opts(&req), Ok(MonitorPipelineRequest::Reject(_))),
             "Boolean queueSize converts to 1, which is < 2 → invalid",
         );
     }
@@ -10091,7 +10229,7 @@ mod tests {
                 PvField::Scalar(ScalarValue::Int(16)),
                 ack_any,
             );
-            let got = monitor_pipeline_options(&req);
+            let got = negotiate_opts(&req);
             assert!(
                 got.is_err(),
                 "non-scalar ackAny must throw (circuit reset), not serve: {label} → {got:?}"
@@ -12227,8 +12365,7 @@ mod tests {
         // ...yet the requested queueSize is preserved as the per-op squash
         // depth the START path consumes (was discarded before the fix).
         assert_eq!(
-            op.monitor_options.queue_size,
-            Some(2),
+            op.monitor_options.queue_size, 2,
             "non-pipeline queueSize=2 must be the per-op squash threshold, \
              not the server default {}",
             config.monitor_queue_depth
@@ -12441,7 +12578,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -13399,7 +13535,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -17466,7 +17601,6 @@ mod tests {
                 monitor_filters: Arc::new(
                     epics_base_rs::server::database::filters::FilterChain::new(),
                 ),
-                put_auto_exec: true,
                 pv_request: None,
                 monitor_options: crate::server_native::source::MonitorOptions::default(),
                 data_task_abort: None,
@@ -19481,14 +19615,146 @@ mod tests {
 
 #[cfg(test)]
 mod autoexec_tests {
-    //! epics-base PR `70735383350b` regression: the
-    //! `record._options.autoExec` pvRequest option must parse
-    //! correctly into the per-op `put_auto_exec` flag.
+    //! R10-34: `autoExec` is a pvxs CLIENT-side builder flag
+    //! (`SubBuilder::autoExec`, `src/pvxs/client.h:698` → `op->autoExec`,
+    //! `clientget.cpp:633`), never a pvRequest member. pvxs has NO
+    //! server-side reader for it: `serverget.cpp:488-492` runs `onPut` on
+    //! every `CMD_PUT` with `!init`, whatever the client's `autoExec`.
+    //!
+    //! The port used to parse `record._options.autoExec` server-side into a
+    //! per-op flag. These tests pin the contract that replaces it: the
+    //! option is INERT on the server. They fail if a server-side gate is
+    //! reintroduced.
 
     use super::*;
-    use crate::pvdata::{PvField, PvStructure, ScalarValue};
+    use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::SharedSource;
+    use crate::server_native::runtime::PvaServerConfig;
+    use crate::server_native::shared_pv::SharedPV;
+    use crate::server_native::tcp::ClientCredentials;
+    use std::sync::Arc;
 
-    fn build_request(autoexec: Option<&str>) -> PvField {
+    // Local test scaffolding, per this file's convention for `#[cfg(test)]`
+    // sub-modules (`mod tests` keeps its copies private).
+    fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
+        let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
+        Frame { header, payload }
+    }
+
+    fn discard_mon_fin() -> mpsc::UnboundedSender<MonitorFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    fn discard_exec_fin() -> mpsc::UnboundedSender<ExecFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    /// Drive a PUT INIT (carrying `pv_request`) + PUT EXEC (writing 2.5)
+    /// through `handle_op`, and return the PV's value afterwards.
+    async fn put_through(pv_request: PvField) -> Option<PvField> {
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 77;
+
+        let pv = SharedPV::build_mailbox();
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let mut initial = PvStructure::new("epics:nt/NTScalar:1.0");
+        initial
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        pv.open(intro.clone(), PvField::Structure(initial)).unwrap();
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv.clone());
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        let req_desc = pv_request.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&pv_request, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Put, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _ = rx.recv().await.expect("INIT resp");
+
+        let new_val = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+            PvField::Structure(s)
+        };
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x00);
+        let bs = BitSet::all_set(intro.total_bits());
+        bs.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
+        let exec_frame = synth_frame(Command::Put, order, exec_payload);
+        handle_op(
+            &exec_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("PUT EXEC ok");
+        let _ = rx.recv().await.expect("PUT EXEC response emitted");
+        pv.current()
+    }
+
+    fn request_with_autoexec(autoexec: Option<&str>) -> PvField {
         let mut options = PvStructure::new("");
         if let Some(s) = autoexec {
             options.fields.push((
@@ -19506,60 +19772,51 @@ mod autoexec_tests {
         PvField::Structure(root)
     }
 
-    #[test]
-    fn parses_explicit_false() {
-        let req = build_request(Some("false"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), Some(false));
-    }
-
-    #[test]
-    fn parses_explicit_true() {
-        let req = build_request(Some("true"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), Some(true));
-    }
-
-    #[test]
-    fn parses_alternate_truthy_strings() {
-        for v in ["yes", "1", "TRUE"] {
-            let req = build_request(Some(v));
-            assert_eq!(
-                put_autoexec_from_request(Some(&req)),
-                Some(true),
-                "{v} must parse as true"
-            );
-        }
-        for v in ["no", "0", "FALSE"] {
-            let req = build_request(Some(v));
-            assert_eq!(
-                put_autoexec_from_request(Some(&req)),
-                Some(false),
-                "{v} must parse as false"
-            );
+    fn value_of(pv: Option<PvField>) -> f64 {
+        match pv {
+            Some(PvField::Structure(s)) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::Double(v))) => *v,
+                other => panic!("unexpected value member: {other:?}"),
+            },
+            other => panic!("unexpected PV shape: {other:?}"),
         }
     }
 
-    #[test]
-    fn missing_field_returns_none() {
-        let req = build_request(None);
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    /// `record._options.autoExec=false` must NOT suppress the write: pvxs
+    /// never reads the option server-side, so the EXEC commits.
+    #[tokio::test]
+    async fn autoexec_false_still_commits_the_put() {
+        let after = put_through(request_with_autoexec(Some("false"))).await;
+        assert_eq!(
+            value_of(after),
+            2.5,
+            "autoExec=false is a client-side flag; the server must still commit the EXEC"
+        );
     }
 
-    #[test]
-    fn no_request_returns_none() {
-        assert_eq!(put_autoexec_from_request(None), None);
+    /// Negative control: with the option absent the EXEC commits too — so
+    /// the assertion above is pinning "the option is inert", not merely
+    /// "PUT works".
+    #[tokio::test]
+    async fn put_without_autoexec_commits_identically() {
+        let after = put_through(request_with_autoexec(None)).await;
+        assert_eq!(value_of(after), 2.5);
     }
 
-    #[test]
-    fn malformed_request_returns_none() {
-        // Plain scalar — not a Structure. Must not panic.
-        let req = PvField::Scalar(ScalarValue::Double(42.0));
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
-    }
-
-    #[test]
-    fn unknown_string_returns_none() {
-        let req = build_request(Some("maybe"));
-        assert_eq!(put_autoexec_from_request(Some(&req)), None);
+    /// The option is inert for EVERY spelling — including the ones the
+    /// deleted parser treated as false (`"no"`, `"0"`) and the ones it
+    /// rejected outright (`"maybe"`). No server-side branch may depend on
+    /// this text.
+    #[tokio::test]
+    async fn every_autoexec_spelling_is_inert() {
+        for v in ["false", "FALSE", "no", "0", "true", "maybe"] {
+            let after = put_through(request_with_autoexec(Some(v))).await;
+            assert_eq!(
+                value_of(after),
+                2.5,
+                "autoExec={v:?} must not gate the server-side write"
+            );
+        }
     }
 }
 

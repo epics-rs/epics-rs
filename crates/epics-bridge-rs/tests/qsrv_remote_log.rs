@@ -456,13 +456,14 @@ async fn group_put_const_member_without_putorder_emits_no_message() {
 // ---------------------------------------------------------------------------
 
 /// Drive a MONITOR INIT + START and return every frame the server sent up
-/// to (and including) the first MONITOR *data* frame. pvxs raises its
-/// `logRemote` inside `onSubscribe`, i.e. before the INIT reply its
-/// `connect()` sends; the Rust subscription is opened by the per-op
-/// subscriber task the read loop spawns, so the diagnostic lands just
-/// after the INIT reply instead. Same ioid, level and text — only its
-/// position relative to the INIT reply differs, so the caller inspects
-/// the set of frames rather than a fixed slot.
+/// to (and including) the first MONITOR *data* frame.
+///
+/// pvxs raises its `logRemote` inside `onSubscribe`, i.e. BEFORE the INIT
+/// reply its `connect()` sends. Since R10-37 the port matches that: the
+/// `record._options.DBE` read is the INIT-time `check_monitor_request` hook and
+/// the wire layer drains its log before building the reply. Frame ORDER is
+/// therefore part of the contract — see
+/// [`monitor_dbe_empty_mask_precedes_the_init_reply`].
 fn monitor_until_data(
     c: &mut FrameReader,
     codec: &PvaCodec,
@@ -524,6 +525,92 @@ async fn monitor_dbe_empty_mask_warns_over_the_wire() {
     assert_eq!(*msg_ioid, ioid, "the diagnostic carries the MONITOR's ioid");
     assert_eq!(*mtype, MessageType::Warning as u8);
     assert_eq!(text, "record._options.DBE=\"LOG\" selects empty mask");
+}
+
+/// R10-37: the empty-mask diagnostic is an INIT-time event, so it must reach
+/// the client BEFORE the MONITOR INIT reply.
+///
+/// pvxs records it inside `onSubscribe` (`singlesource.cpp:128-130`), which
+/// runs before the `connect()` that emits the INIT reply — so a pvxs client
+/// reads CMD_MESSAGE, then the INIT reply. The port used to parse DBE twice:
+/// once at INIT against a discarded log (for the `NoConvert` throw only) and
+/// again at START to log, which put the message AFTER the reply. Now the
+/// INIT-time `check_monitor_request` hook owns both outcomes and the wire layer
+/// drains its log before building the reply.
+///
+/// This asserts the ORDER the set-based tests above deliberately do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_empty_mask_precedes_the_init_reply() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 71;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let req =
+        pv_request_with_options(&[("DBE", PvField::Scalar(ScalarValue::String("LOG".into())))]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    let message_at = frames
+        .iter()
+        .position(|f| f.header.command == Command::Message.code())
+        .expect("the empty-mask diagnostic is owed");
+    // The MONITOR INIT reply — Command::Monitor with the INIT bit (0x08) set.
+    let init_reply_at = frames
+        .iter()
+        .position(|f| {
+            f.header.command == Command::Monitor.code() && {
+                let mut cur = f.cursor();
+                let _ioid = cur.get_u32(ORDER).unwrap();
+                cur.get_u8().unwrap() & 0x08 != 0
+            }
+        })
+        .expect("the MONITOR INIT reply is owed");
+
+    assert!(
+        message_at < init_reply_at,
+        "pvxs logs from inside onSubscribe, before connect() sends the INIT \
+         reply: the CMD_MESSAGE must precede it (message at {message_at}, \
+         INIT reply at {init_reply_at})"
+    );
+}
+
+/// Negative control for the ordering above: a group MONITOR carrying the same
+/// empty-mask DBE draws NO diagnostic at all. pvxs serves groups through
+/// `GroupSource::onSubscribe` (`ioc/groupsource.cpp:395-405`), which reads
+/// `atomic` and never `DBE` — so there is nothing to report. Logging from the
+/// START-time parse (as the port used to) warned here as well, for an option
+/// pvxs's group source never looks at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_monitor_empty_mask_dbe_draws_no_diagnostic() {
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_MIXED_PUTORDER)
+        .expect("group config loads");
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 72;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:grp");
+
+    let req =
+        pv_request_with_options(&[("DBE", PvField::Scalar(ScalarValue::String("LOG".into())))]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    let messages: Vec<_> = frames
+        .iter()
+        .filter(|f| f.header.command == Command::Message.code())
+        .map(parse_message_frame)
+        .collect();
+    assert!(
+        messages.is_empty(),
+        "GroupSource::onSubscribe never reads DBE, so no diagnostic is owed: {messages:?}"
+    );
 }
 
 /// A lowercase token is the same trap: pvxs's substring search is case

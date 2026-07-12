@@ -167,7 +167,7 @@ pub struct ChannelContext {
 /// Field projection (the pvRequest field mask) is intentionally NOT
 /// represented here: it is pure downstream-local masking the server
 /// applies after fanout, and is transparent through a gateway.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitorOptions {
     /// `record._options.pipeline` — the client requested the
     /// flow-controlled credit/ACK monitor sub-protocol. This is flow
@@ -177,18 +177,55 @@ pub struct MonitorOptions {
     /// propagates backpressure upstream via the per-PV `Pauser`
     ///. It therefore does NOT make a monitor non-transparent.
     pub pipeline: bool,
-    /// `record._options.queueSize` when the client set it explicitly
-    /// (pvxs default 4). `None` means the client did not request a
-    /// specific queue depth. Like `pipeline`, this is a downstream
-    /// buffer-depth request the gateway honors on its per-downstream
-    /// outbox; it does not change upstream event production.
-    pub queue_size: Option<u32>,
+    /// The NEGOTIATED per-operation monitor queue limit — pvxs
+    /// `MonitorOp::limit` (`servermon.cpp:66`, initialised to `4u`),
+    /// overridden by a valid `record._options.queueSize >= 2`
+    /// (`:533-543`) whether or not pipeline flow control is on.
+    ///
+    /// ALWAYS resolved: this is the one representation of the depth, so
+    /// no consumer re-derives it and none of them can disagree. It is
+    /// what pvxs squashes against (`queue.size() < limit`, `:273`), what
+    /// its `ackAt` arithmetic is a fraction of (`:564,578,581`), and what
+    /// it reports as `stats().limitQueue` (`:313`). The port used to
+    /// carry `Option<u32>` — `None` meaning "consult the server-wide
+    /// default" — alongside a SECOND, separately-defaulted copy inside
+    /// the pipeline options; the two defaults were different numbers
+    /// (server 64 vs pipeline 4), so a plain monitor squashed at a depth
+    /// the ACK arithmetic never saw (R11-31).
+    ///
+    /// Like `pipeline`, this is downstream buffer depth: a gateway honors
+    /// it on its per-downstream outbox and it does not change upstream
+    /// event production.
+    pub queue_size: u32,
     /// True when the downstream pvRequest carried a server-side
     /// `record._options._filter` chain. A stateful filter (e.g.
     /// deadband) changes which events are *produced*; running it at a
     /// fanout gateway on a shared upstream stream is not equivalent to
     /// the upstream server running it per subscription.
     pub server_filter: bool,
+}
+
+/// pvxs `MonitorOp::limit = 4u` (`servermon.cpp:66`) — the depth a
+/// server-side monitor queue starts with, before the client's
+/// `record._options.queueSize` gets a say. It is a PER-OPERATION
+/// initializer, not a server-wide capacity: pvxs has no server knob for
+/// it at all, and [`crate::server_native::runtime::PvaServerConfig::monitor_queue_depth`]
+/// is exactly this initializer made configurable.
+pub const DEFAULT_MONITOR_QUEUE_LIMIT: u32 = 4;
+
+impl Default for MonitorOptions {
+    /// A plain monitor with no negotiated options: no pipeline, no
+    /// server-side filter, and the pvxs per-op default depth. The depth
+    /// is never 0 — [`MonitorOptions::queue_size`] is a resolved limit by
+    /// construction, so a `default()` used for a non-MONITOR operation
+    /// still names a legal one.
+    fn default() -> Self {
+        Self {
+            pipeline: false,
+            queue_size: DEFAULT_MONITOR_QUEUE_LIMIT,
+            server_filter: false,
+        }
+    }
 }
 
 impl MonitorOptions {

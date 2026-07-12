@@ -16,7 +16,7 @@ use epics_base_rs::server::record::{
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-use crate::error::AsynResult;
+use crate::error::{AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::interpose::EomReason;
 use crate::port_handle::PortHandle;
@@ -907,11 +907,19 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
             }
         }
+        // The three scalar reads share one rule for a driver that answers `Ok`
+        // without a typed value. C cannot express that state — `read(&value)`
+        // fills the out-parameter whenever it returns `asynSuccess` — so there
+        // is no C diagnostic to port: the readback field keeps its previous
+        // value and ERRS stays untouched. (An invented "returned no value" text
+        // used to reach the operator from the Int32 and Float64 arms only, while
+        // UInt32Digital was already silent.)
         InterfaceType::Int32 => match res {
-            Ok(result) => match result.int_val {
-                Some(v) => out.i32inp = Some(v),
-                None => out.report_error("read: int32 read returned no value".to_string()),
-            },
+            Ok(result) => {
+                if let Some(v) = result.int_val {
+                    out.i32inp = Some(v);
+                }
+            }
             // C performInt32IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
             // (asynRecord.c:1393).
             Err(e) => {
@@ -947,10 +955,11 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             }
         },
         InterfaceType::Float64 => match res {
-            Ok(result) => match result.float_val {
-                Some(v) => out.f64inp = Some(v),
-                None => out.report_error("read: float64 read returned no value".to_string()),
-            },
+            Ok(result) => {
+                if let Some(v) = result.float_val {
+                    out.f64inp = Some(v);
+                }
+            }
             // C performFloat64IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
             // (asynRecord.c:1465).
             Err(e) => {
@@ -1765,8 +1774,10 @@ impl AsynRecord {
         let tfil = self.tfil.clone();
         let file = match open_trace_file(&tfil) {
             Ok(file) => file,
-            Err(e) => {
-                self.errs = format!("Error opening trace file: {tfil}: {e}");
+            Err(_) => {
+                // C reports the path alone — `fopen` leaves no message to splice
+                // (asynRecord.c:465-466).
+                self.errs = format!("Error opening trace file: {tfil}");
                 return;
             }
         };
@@ -2229,13 +2240,24 @@ impl AsynRecord {
     }
 
     /// Attempt to connect to the port specified in the PORT field.
-    fn connect_device(&mut self) {
+    ///
+    /// C `connectDevice` (asynRecord.c:1142-1321). The `Err` payload is C's
+    /// `pasynUser->errorMessage` — the manager-level text
+    /// `pasynManager->connectDevice` leaves on the asynUser
+    /// (asynManager.c:1331,1339) — which the caller splices into its own
+    /// diagnostic: `special()` reports `"connectDevice failed: %s"` with it
+    /// (asynRecord.c:515), while the init and PCNCT paths report nothing further
+    /// and leave this function's own `"Connect error, status=%d, %s"`
+    /// (asynRecord.c:1158) in ERRS.
+    fn connect_device(&mut self) -> Result<(), String> {
         if self.port.is_empty() {
             self.pcnct = 0;
             self.port_entry = None;
             self.refresh_connected_state();
             self.clear_exception_callback();
-            return;
+            return Err(self.report_connect_error(
+                "asynManager:connectDevice no port name provided".to_string(),
+            ));
         }
 
         match registry::get_port(&self.port) {
@@ -2250,8 +2272,11 @@ impl AsynRecord {
                             self.resolved_reason = info.reason;
                             self.reason = info.reason as i32;
                         }
-                        Err(e) => {
-                            self.errs = format!("drvUserCreate failed: {e}");
+                        Err(_) => {
+                            // C reports the bare literal — the driver's own text
+                            // reaches the operator through the trace file, not
+                            // ERRS (asynRecord.c:1255).
+                            self.errs = "Error in asynDrvUser->create()".to_string();
                             self.resolved_reason = 0;
                         }
                     }
@@ -2294,15 +2319,33 @@ impl AsynRecord {
                 if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
                     self.errs.clear();
                 }
+                Ok(())
             }
             None => {
-                self.errs = format!("port '{}' not found", self.port);
                 self.pcnct = 0;
                 self.port_entry = None;
                 self.refresh_connected_state();
                 self.clear_exception_callback();
+                Err(self.report_connect_error(format!(
+                    "asynManager:connectDevice port {} not found",
+                    self.port
+                )))
             }
         }
+    }
+
+    /// C `connectDevice`'s own failure diagnostic (asynRecord.c:1157-1159):
+    /// `reportError(status, "Connect error, status=%d, %s", status,
+    /// pasynUser->errorMessage)`, where `status` is the numeric `asynStatus`
+    /// the manager returned (`asynError` = 3 for every `connectDevice` failure,
+    /// asynManager.c:1331-1345). Returns the manager-level message so the
+    /// caller can splice it into its own text.
+    fn report_connect_error(&mut self, manager_message: String) -> String {
+        self.errs = format!(
+            "Connect error, status={}, {manager_message}",
+            AsynStatus::Error as i32
+        );
+        manager_message
     }
 
     /// The I/O timeout this cycle carries — the single owner of TMOT's
@@ -2525,7 +2568,9 @@ impl AsynRecord {
         let entry = match &self.port_entry {
             Some(e) => e.clone(),
             None => {
-                self.errs = "not connected".to_string();
+                // C `process()` on `state == stateNoDevice` (asynRecord.c:356-357)
+                // — the record never reaches `performIO` without a device.
+                self.errs = "Not connect to a port".to_string();
                 return Ok(());
             }
         };
@@ -3053,7 +3098,10 @@ impl Record for AsynRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 && !self.port.is_empty() {
-            self.connect_device();
+            // C init_record (asynRecord.c:281-283) ignores the returned status
+            // beyond the state it sets; `connectDevice`'s own "Connect error…"
+            // text is what stays in ERRS.
+            let _ = self.connect_device();
         }
         Ok(())
     }
@@ -3064,9 +3112,13 @@ impl Record for AsynRecord {
         }
 
         match field {
-            // Connection fields → reconnect
+            // Connection fields → reconnect. C overwrites `connectDevice`'s own
+            // diagnostic with its own on failure (asynRecord.c:514-516):
+            // "connectDevice failed: <pasynUser->errorMessage>".
             "PORT" | "ADDR" | "DRVINFO" => {
-                self.connect_device();
+                if let Err(manager_message) = self.connect_device() {
+                    self.errs = format!("connectDevice failed: {manager_message}");
+                }
             }
 
             // Trace mask (numeric) → update bit fields and apply
@@ -3197,7 +3249,9 @@ impl Record for AsynRecord {
             // touched either way.
             "PCNCT" => {
                 if self.pcnct != 0 {
-                    self.connect_device();
+                    // C asynRecord.c:520-521 keeps `connectDevice`'s own
+                    // "Connect error…" text; it adds no wrapper of its own.
+                    let _ = self.connect_device();
                 } else {
                     self.port_entry = None;
                     self.clear_exception_callback();
@@ -3657,7 +3711,7 @@ mod tests {
     fn test_connect_nonexistent_port() {
         let mut rec = AsynRecord::default();
         rec.port = "NONEXISTENT".to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 0);
         assert!(rec.errs.contains("not found"));
     }
@@ -3665,7 +3719,7 @@ mod tests {
     #[test]
     fn test_connect_empty_port() {
         let mut rec = AsynRecord::default();
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 0);
         assert!(rec.port_entry.is_none());
     }
@@ -3683,7 +3737,87 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.tmod = TransferMode::Read as i32;
         rec.process().unwrap();
-        assert_eq!(rec.errs, "not connected");
+        // C `process()` on stateNoDevice (asynRecord.c:357).
+        assert_eq!(rec.errs, "Not connect to a port");
+    }
+
+    /// R9-51: every ERRS text the record writes is one of C's, not an
+    /// invented one. C's connect diagnostics are `connectDevice`'s own
+    /// "Connect error, status=%d, %s" (asynRecord.c:1158) — where `%s` is the
+    /// manager's `pasynUser->errorMessage` (asynManager.c:1331,1339) — and,
+    /// on the `special()` PORT/ADDR/DRVINFO path only, the wrapper
+    /// "connectDevice failed: %s" (asynRecord.c:515).
+    #[test]
+    fn connect_failure_errs_texts_are_c_texts() {
+        // init / PCNCT path: connectDevice's own text.
+        let mut rec = AsynRecord::default();
+        rec.port = "NO_SUCH_PORT_R9_51".to_string();
+        rec.init_record(1).unwrap();
+        assert_eq!(
+            rec.errs,
+            "Connect error, status=3, asynManager:connectDevice port NO_SUCH_PORT_R9_51 not found"
+        );
+
+        // special() PORT path: the wrapper overwrites it.
+        let mut rec = AsynRecord::default();
+        rec.port = "NO_SUCH_PORT_R9_51".to_string();
+        rec.special("PORT", true).unwrap();
+        assert_eq!(
+            rec.errs,
+            "connectDevice failed: asynManager:connectDevice port NO_SUCH_PORT_R9_51 not found"
+        );
+
+        // An empty PORT reaches the manager's other rejection.
+        let mut rec = AsynRecord::default();
+        rec.special("PORT", true).unwrap();
+        assert_eq!(
+            rec.errs,
+            "connectDevice failed: asynManager:connectDevice no port name provided"
+        );
+    }
+
+    /// R9-51: TFIL open failure reports the path alone — C has no OS message
+    /// to splice (asynRecord.c:465-466).
+    #[test]
+    fn trace_file_open_failure_errs_text_is_the_c_text() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct TfilDriver(PortDriverBase);
+        impl PortDriver for TfilDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "r9_51_tfil";
+        let (tx, rx) = mpsc::channel(16);
+        let actor = PortActor::new(
+            Box::new(TfilDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(16)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+        rec.tfil = "/nonexistent-dir-r9-51/trace.log".to_string();
+        rec.special("TFIL", true).unwrap();
+        assert_eq!(
+            rec.errs,
+            "Error opening trace file: /nonexistent-dir-r9-51/trace.log"
+        );
     }
 
     #[test]
@@ -3835,7 +3969,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.addr = 3;
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1);
         assert!(rec.trace_addr_target() == Some(3));
 
@@ -3854,7 +3988,7 @@ mod tests {
         let mut rec0 = AsynRecord::default();
         rec0.port = port_name.to_string();
         rec0.addr = -1; // unaddressed -> port-wide
-        rec0.connect_device();
+        let _ = rec0.connect_device();
         assert!(rec0.trace_addr_target().is_none());
     }
 
@@ -3900,7 +4034,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1);
 
         assert_eq!(
@@ -3955,7 +4089,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.tmod = TransferMode::NoIo as i32; // process() does no I/O
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1);
         assert_eq!(rec.tinm as u32, TraceInfoMask::TIME.bits());
         assert_eq!(rec.tinb0, 1); // TIME
@@ -4036,7 +4170,7 @@ mod tests {
         // ASCII read: AINP gets the (lossy) text; BINP must stay untouched.
         let mut ascii = AsynRecord::default();
         ascii.port = port_name.to_string();
-        ascii.connect_device();
+        let _ = ascii.connect_device();
         ascii.iface = 0; // asynOctet
         ascii.tmod = TransferMode::Read as i32;
         ascii.imax = 256;
@@ -4056,7 +4190,7 @@ mod tests {
         // Binary read: BINP gets the raw bytes; AINP must stay untouched.
         let mut binary = AsynRecord::default();
         binary.port = port_name.to_string();
-        binary.connect_device();
+        let _ = binary.connect_device();
         binary.iface = 0;
         binary.tmod = TransferMode::Read as i32;
         binary.imax = 256;
@@ -4136,7 +4270,7 @@ mod tests {
         // which memsets only `inptr` (the ASCII buffer here).
         let mut ascii = AsynRecord::default();
         ascii.port = port_name.to_string();
-        ascii.connect_device();
+        let _ = ascii.connect_device();
         ascii.iface = 0; // asynOctet
         ascii.tmod = TransferMode::Read as i32;
         ascii.imax = 256;
@@ -4161,7 +4295,7 @@ mod tests {
         // Binary read failure: BINP cleared, AINP (not selected) untouched.
         let mut binary = AsynRecord::default();
         binary.port = port_name.to_string();
-        binary.connect_device();
+        let _ = binary.connect_device();
         binary.iface = 0;
         binary.tmod = TransferMode::Read as i32;
         binary.imax = 256;
@@ -4186,7 +4320,7 @@ mod tests {
         // Write failure: NAWT reset to 0 (C assigns nbytesTransfered=0).
         let mut writer = AsynRecord::default();
         writer.port = port_name.to_string();
-        writer.connect_device();
+        let _ = writer.connect_device();
         writer.iface = 0;
         writer.tmod = TransferMode::Write as i32;
         writer.ofmt = ASYN_FMT_ASCII;
@@ -4296,7 +4430,7 @@ mod tests {
         let reg = |iface: InterfaceType, tmod: TransferMode| -> String {
             let mut rec = AsynRecord::default();
             rec.port = port_name.to_string();
-            rec.connect_device();
+            let _ = rec.connect_device();
             rec.iface = iface as i32;
             rec.tmod = tmod as i32;
             rec.process().unwrap();
@@ -4332,7 +4466,7 @@ mod tests {
         // Option / EOS puts — the same C reportError anchor.
         let mut opt = AsynRecord::default();
         opt.port = port_name.to_string();
-        opt.connect_device();
+        let _ = opt.connect_device();
         opt.lbaud = 9600;
         opt.special("LBAUD", true).unwrap();
         assert_eq!(opt.errs, "Error setting option, opt boom");
@@ -4431,7 +4565,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
 
         // The operator asks for 115200. The set succeeds; the driver stays at
         // 9600. C's getOptions fall-through snaps LBAUD (and the BAUD menu
@@ -4525,7 +4659,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         rec.iface = InterfaceType::Octet as i32;
         rec.tmod = TransferMode::WriteRead as i32;
         rec.ofmt = ASYN_FMT_ASCII;
@@ -4619,7 +4753,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         rec.iface = InterfaceType::Octet as i32;
         rec.tmod = TransferMode::Read as i32;
         rec.ifmt = ASYN_FMT_ASCII;
@@ -4707,7 +4841,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         rec.iface = 0; // asynOctet
         rec.tmod = TransferMode::Read as i32;
         rec.imax = 256;
@@ -4731,7 +4865,7 @@ mod tests {
         // Binary IFMT takes the same transfer through BINP.
         let mut bin = AsynRecord::default();
         bin.port = port_name.to_string();
-        bin.connect_device();
+        let _ = bin.connect_device();
         bin.iface = 0;
         bin.tmod = TransferMode::Read as i32;
         bin.imax = 256;
@@ -4805,7 +4939,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         // The actor auto-connected the port at startup; CNCT reads that back
         // rather than latching on the attach.
         assert_eq!(rec.cnct, 1, "CNCT is the port's transport state");
@@ -4936,7 +5070,7 @@ mod tests {
 
             let mut rec = AsynRecord::default();
             rec.port = port_name.to_string();
-            rec.connect_device();
+            let _ = rec.connect_device();
             rec.iface = 0; // asynOctet
             rec.tmod = TransferMode::Write as i32;
             rec.ofmt = ASYN_FMT_ASCII;
@@ -5060,7 +5194,7 @@ mod tests {
         let mk = |iface: i32, tmod: TransferMode| {
             let mut rec = AsynRecord::default();
             rec.port = port_name.to_string();
-            rec.connect_device();
+            let _ = rec.connect_device();
             rec.iface = iface;
             rec.tmod = tmod as i32;
             rec.imax = 256;
@@ -5277,7 +5411,7 @@ mod tests {
     fn read_rec(port_name: &str, ifmt: i32, imax: i32, nrrd: i32) -> AsynRecord {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         rec.iface = 0;
         rec.tmod = TransferMode::Read as i32;
         rec.ifmt = ifmt;
@@ -5367,7 +5501,7 @@ mod tests {
 
         let mut rec = AsynRecord::default();
         rec.port = port.to_string();
-        rec.connect_device();
+        let _ = rec.connect_device();
         rec.iface = InterfaceType::Octet as i32;
         rec.tmod = TransferMode::WriteRead as i32;
         rec.ofmt = ASYN_FMT_ASCII;
@@ -6092,7 +6226,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.set_async_context(rec_name.to_string(), db.async_handle());
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1, "record must connect to the registered port");
         assert_eq!(rec.tmsk, 0, "baseline trace mask is empty");
 
@@ -6202,7 +6336,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.set_async_context(rec_name.to_string(), db.async_handle());
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1, "record must connect to the registered port");
         db.add_record(rec_name, Box::new(rec)).await.unwrap();
 
@@ -6309,7 +6443,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.set_async_context(rec_name.to_string(), db.async_handle());
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1, "the port starts connected");
         assert_eq!(rec.enbl, 1, "the port starts enabled");
         db.add_record(rec_name, Box::new(rec)).await.unwrap();
@@ -6387,7 +6521,7 @@ mod tests {
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
         rec.tmod = TransferMode::NoIo as i32;
-        rec.connect_device();
+        let _ = rec.connect_device();
         assert_eq!(rec.cnct, 1);
 
         handle.disconnect_blocking().unwrap();

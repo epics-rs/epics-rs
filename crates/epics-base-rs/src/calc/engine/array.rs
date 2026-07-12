@@ -2,7 +2,7 @@ use super::array_value::ArrayStackValue::Double;
 use super::array_value::{ArrayCell, ArrayStackValue, zip_map};
 use super::cast::{c_int, c_long, d2ui};
 use super::error::CalcError;
-use super::opcodes::{ArrayOp, CoreOp, Opcode};
+use super::opcodes::{ArrayOp, ControlOp, CoreOp, Opcode};
 use super::{ArrayInputs, CompiledExpr};
 use crate::calc::math::{derivative, fitting, stats};
 
@@ -11,6 +11,29 @@ use crate::calc::math::{derivative, fitting, stats};
 /// not `1e35` exactly. aCalc's MODULO uses it for a zero divisor where base
 /// uses NaN and sCalc returns an error.
 const MY_MAXFLOAT: f64 = 1e35f32 as f64;
+
+/// C `until_scratch[MAX_UNTIL_OP]` with `MAX_UNTIL_OP 10` (`aCalcPerform.c:297`,
+/// `:307`), guarded by `if (i > (MAX_UNTIL_OP-1)) return(-1)` (`:369-373`).
+/// Compiled aCalc fails the perform on the tenth distinct UNTIL, so the usable
+/// ceiling is nine — the same ceiling sCalc has.
+const MAX_UNTILS: usize = 9;
+
+/// C `volatile int aCalcLoopMax = 1000` (`aCalcPerform.c:70`), exported to the ioc
+/// shell with `epicsExportAddress(int, aCalcLoopMax)` — a settable global, not a
+/// constant, and a SEPARATE one from `sCalcLoopMax`. It bounds the TOTAL number of
+/// `UNTIL_END` arrivals in one perform, across every UNTIL in the program, and
+/// running out is not an error: C stops looping and carries on (`:1571`).
+static ACALC_LOOP_MAX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
+
+/// Read `aCalcLoopMax`.
+pub fn acalc_loop_max() -> i32 {
+    ACALC_LOOP_MAX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Write `aCalcLoopMax` — the ioc-shell `var aCalcLoopMax, <n>`.
+pub fn set_acalc_loop_max(n: i32) {
+    ACALC_LOOP_MAX.store(n, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// C's `stackElement` (`aCalcPerform.c:74-80`) as the evaluator sees it: the value
 /// — which is itself a buffer plus a window, see [`ArrayCell`] — plus the third
@@ -62,6 +85,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     let mut pc = 0;
 
     let mut status = Status::default();
+
+    // C's `until_scratch[MAX_UNTIL_OP]` (`aCalcPerform.c:307`): for each UNTIL, the
+    // stack pointer it last saw. `loopsDone` (`:311`) is shared by all of them.
+    let mut until_marks: Vec<(usize, usize)> = Vec::new();
+    let mut loops_done: i32 = 0;
 
     while pc < code.len() {
         let op = &code[pc];
@@ -915,6 +943,80 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let coeffs = fit_into_window(&mut cell, Some(&mask), &mut status);
                     store_fit_coefficients(inputs, targets, coeffs);
                     push(&mut stack, ArrayStackValue::Array(cell));
+                }
+            },
+
+            // aCalc has its own copy of sCalc's UNTIL machinery — the pre-scan at
+            // `aCalcPerform.c:349-390` and these two cases at `:1551-1590` — and it
+            // is the same code with `ps` walking cells instead of doubles. The
+            // element table compiles `UNTIL` (`aCalcPostfix.c:200`), so an aCalc
+            // program can reach these opcodes; the port had no `Opcode::Control`
+            // arm at all and fell into the `_` catch-all, failing every aCalc
+            // expression that contained an UNTIL loop.
+            Opcode::Control(ctrl) => match ctrl {
+                // C `:1551-1567` — UNTIL only records where the stack was, so that
+                // UNTIL_END can wind it back before re-running the body. `until_loc`
+                // is the key C matches on, and `pc - 1` is that key here.
+                ControlOp::Until(_end_pc) => {
+                    let until_pc = pc - 1;
+                    match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
+                        Some((_, depth)) => *depth = stack.len(),
+                        None => {
+                            // C's `until_scratch[MAX_UNTIL_OP]` with
+                            // `if (i > (MAX_UNTIL_OP-1)) return(-1)` (`:369-373`):
+                            // the TENTH distinct UNTIL fails the perform, so nine
+                            // is the ceiling.
+                            if until_marks.len() >= MAX_UNTILS {
+                                return Err(CalcError::Overflow);
+                            }
+                            until_marks.push((until_pc, stack.len()));
+                        }
+                    }
+                }
+                // C `:1569-1590`, in this order:
+                //
+                // ```c
+                // if (++loopsDone > aCalcLoopMax) break;   /* give up, no error */
+                // if (ps->d == 0) { ...wind back and re-run the body... }
+                // ```
+                //
+                // `loopsDone` counts every arrival at an UNTIL_END and is shared by
+                // all the UNTILs in one program; when it runs out C simply STOPS
+                // LOOPING — the perform continues and returns 0. There is no
+                // loop-limit error and the record does not alarm.
+                ControlOp::UntilEnd(start_pc) => {
+                    loops_done += 1;
+                    if loops_done > acalc_loop_max() {
+                        continue;
+                    }
+                    // C PEEKS the condition (`:1573`: `if (ps->d == 0)`) — it pops
+                    // nothing, which is why UNTIL_END has a runtime effect of 0.
+                    //
+                    // Deliberate deviation: C reads the cell's `d` field RAW here,
+                    // with no `toDouble`, so an ARRAY-valued condition tests
+                    // whatever `d` happened to hold — for a cell that has only ever
+                    // been an array, uninitialised memory. The port reads element 0,
+                    // C's own `to_double` (`:121`). Every condition an UNTIL is
+                    // written to carry (a comparison) is a scalar, where the two
+                    // agree.
+                    let cond = match stack.last() {
+                        Some(c) => c.v.as_f64()?,
+                        None => return Err(CalcError::Underflow),
+                    };
+                    if cond == 0.0 {
+                        // Wind the stack back to where the paired UNTIL saw it — C
+                        // restores the saved `ps` wholesale, so everything the body
+                        // pushed (the condition included) is discarded.
+                        let Some((_, depth)) = until_marks.iter().find(|(k, _)| k == start_pc)
+                        else {
+                            // C's `printf("aCalcPerform: UNTIL not found"); return(-1)`.
+                            return Err(CalcError::Internal);
+                        };
+                        stack.truncate(*depth);
+                        pc = *start_pc + 1;
+                    }
+                    // Condition true: fall out with the condition value still on the
+                    // stack. It is the value of the `UNTIL(...)`.
                 }
             },
 

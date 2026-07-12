@@ -429,7 +429,6 @@ async fn main() {
     // (caput.c:583,589), and inside `caget()` only `!nConn` yields a non-zero
     // return (`caput.c:181`) — see [`Readback`]. A read TIMEOUT does NOT:
     // C prints `New : <name> <zeroed value>` and exits 0.
-    let echo_fallback = parsed_value.echo_fallback();
     if !args.terse {
         // C `caput -t` suppresses the label, not the read (caput.c:580-583).
         print!("New : ");
@@ -444,13 +443,6 @@ async fn main() {
     if matches!(rb, Readback::TimedOut(..)) {
         eprintln!("Read operation timed out: PV data was not read.");
     }
-    // C prints a `*** ...` marker for a non-fatal readback failure and exits 0;
-    // the port echoes the submitted value instead, keeping C's exit code (see
-    // R9-23 — the remaining stdout divergence on this path).
-    let rb = match rb {
-        Readback::Other(_) => Readback::Value(echo_fallback.clone(), None),
-        other => other,
-    };
     match readback_line(&rb, &name_col, sep, &fmt, args.terse, long_mode) {
         Some(line) => println!("{line}"),
         // `!nConn`: C's caget() printed nothing and returned 1, which IS
@@ -489,18 +481,6 @@ enum WriteValue {
     /// the server resolves against the record's menu. See
     /// `CaChannel::put_string_array`.
     EnumStringArray(Vec<epics_ca_rs::PvString>),
-}
-
-impl WriteValue {
-    /// Value used to echo `New :` if the post-put read-back fails
-    /// non-fatally (see [`postput_read_fatal`]).
-    fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
-        match self {
-            WriteValue::Wire { value, .. } => value.clone(),
-            WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
-            WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
-        }
-    }
 }
 
 /// One `caput` readback — the `Old :` read (`caput.c:535`) and the `New :`

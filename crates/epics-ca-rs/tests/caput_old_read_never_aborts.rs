@@ -191,3 +191,56 @@ async fn caput_writes_a_read_denied_pv_and_exits_zero() {
         "the put must run even though the Old: read failed (caput.c:539-548)"
     );
 }
+
+/// Regression test (R9-23): a failed `New :` read prints C's marker, NOT the
+/// value that was submitted.
+///
+/// The post-put `caget()` (`caput.c:583`) is the same print loop: a non-NORMAL
+/// per-PV status takes the `*** no read access` / `*** CA error <msg>` branch
+/// (`caput.c:201-206`) and `caget()` returns 0 (`caput.c:239`). caput-rs echoed
+/// the submitted value on that line instead, so a PV whose readback failed
+/// reported the write as if it had been read back and confirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn caput_new_read_error_prints_the_marker_not_the_submitted_value() {
+    let server_port = free_port();
+    let server = CaServer::builder()
+        .port(server_port)
+        .record("R923:NOREAD", AiRecord::new(1.0))
+        .build()
+        .await
+        .expect("build CA server");
+    tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let proxy_port = read_denying_proxy(server_port).await;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
+        .args(["-w", "2", "R923:NOREAD", "42"])
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{proxy_port}"))
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_SERVER_PORT", proxy_port.to_string())
+        .output()
+        .await
+        .expect("run caput-rs");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let new_line = stdout
+        .lines()
+        .find(|l| l.starts_with("New : "))
+        .unwrap_or_else(|| panic!("caput must still print a New line; got: {stdout:?}"));
+
+    assert!(
+        new_line.contains("*** no read access"),
+        "a failed post-put read prints C's marker (caput.c:203-204); got: {new_line:?}"
+    );
+    assert!(
+        !new_line.contains("42"),
+        "the submitted value must NOT be echoed as if it had been read back; \
+         got: {new_line:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the marker path still returns 0 (caput.c:239); stdout: {stdout:?}"
+    );
+}

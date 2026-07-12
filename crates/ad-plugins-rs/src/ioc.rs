@@ -14,6 +14,7 @@ use ad_core_rs::ioc::{
 };
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
+use asyn_rs::manager::PortManager;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
@@ -876,6 +877,7 @@ where
 pub struct AdIoc {
     app: Option<IocApplication>,
     mgr: Arc<PluginManager>,
+    ports: Arc<PortManager>,
     trace: Arc<TraceManager>,
     /// Resources kept alive for the IOC's lifetime (e.g. driver runtimes).
     _resources: Vec<Box<dyn std::any::Any + Send>>,
@@ -886,10 +888,15 @@ impl AdIoc {
     pub fn new() -> Self {
         let trace = Arc::new(TraceManager::new());
         let mgr = PluginManager::new(trace.clone());
+        // The asyn iocsh commands resolve ports and mutate trace state through
+        // this manager, so it shares the IOC's `TraceManager` — a manager with
+        // a `TraceManager` of its own would make `asynSetTrace*` mutate state
+        // that no driver or plugin ever reads.
+        let ports = Arc::new(PortManager::with_trace_manager(trace.clone()));
 
         asyn_rs::asyn_record::register_asyn_record_type();
 
-        let app = IocApplication::new().port(
+        let mut app = IocApplication::new().port(
             std::env::var("EPICS_CA_SERVER_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -914,9 +921,29 @@ impl AdIoc {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../autosave"),
         );
 
+        // Everything the IOC always needs is wired here, once. The protocol
+        // runner is the only thing `run` and `run_with_pva` disagree about;
+        // configuring the application separately per runner is how a command
+        // set ends up present on one path and missing from the other.
+        app = register_all_plugins(app, &mgr);
+        app = register_noop_commands(app);
+        app = app.autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())));
+
+        // Universal asyn device support — handles all standard asyn DTYPs
+        // (asynInt32, asynFloat64, asynOctet, array types) via @asyn() links.
+        app = asyn_rs::adapter::register_asyn_device_support(app);
+
+        // The asyn iocsh command set: port creation (`drvAsynIPPortConfigure`
+        // and friends), `asynOctetSetInputEos` / `asynOctetSetOutputEos`,
+        // `asynSetOption`, `asynReport` and the trace mutators — on the startup
+        // shell as well as the interactive one. A socket detector's st.cmd
+        // creates its port and sets the EOS before `iocInit`.
+        app = asyn_rs::iocsh::register_asyn_commands(app, ports.clone());
+
         Self {
             app: Some(app),
             mgr,
+            ports,
             trace,
             _resources: Vec::new(),
         }
@@ -927,9 +954,31 @@ impl AdIoc {
         &self.mgr
     }
 
+    /// Access the shared [`PortManager`] — the manager the asyn iocsh commands
+    /// resolve against.
+    ///
+    /// A detector crate registers its driver port here (or through the
+    /// `drvAsyn*PortConfigure` iocsh commands, which publish to the same
+    /// registry) so that `asynReport`, `asynSetOption` and the EOS commands can
+    /// act on it from st.cmd.
+    pub fn ports(&self) -> &Arc<PortManager> {
+        &self.ports
+    }
+
     /// Access the shared `TraceManager`.
     pub fn trace(&self) -> &Arc<TraceManager> {
         &self.trace
+    }
+
+    /// The configured [`IocApplication`] this IOC will run.
+    ///
+    /// `AdIoc` wires the application at construction, so
+    /// [`IocApplication::startup_commands`] here is exactly the surface the
+    /// startup script will be executed against.
+    pub fn app(&self) -> &IocApplication {
+        self.app
+            .as_ref()
+            .expect("AdIoc application is taken only by run()")
     }
 
     /// Register a record type (equivalent to C EPICS dbd record type registration).
@@ -1009,35 +1058,7 @@ impl AdIoc {
 
     /// Run the IOC with a given startup script path.
     pub async fn run(self, script: &str) -> CaResult<()> {
-        let mut app = self.app.unwrap();
-
-        // Register all standard plugin configure commands
-        app = register_all_plugins(app, &self.mgr);
-        app = register_noop_commands(app);
-
-        // Enable autosave startup commands (C-compatible iocsh commands)
-        let autosave_config = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
-        app = app.autosave_startup(autosave_config);
-
-        // Universal asyn device support — handles all standard asyn DTYPs
-        // (asynInt32, asynFloat64, asynOctet, array types) via @asyn() links.
-        app = asyn_rs::adapter::register_asyn_device_support(app);
-
-        // asynReport shell command
-        let mgr_r = self.mgr.clone();
-        app = app.register_shell_command(CommandDef::new(
-            "asynReport",
-            vec![ArgDesc {
-                name: "level",
-                arg_type: ArgType::Int,
-                optional: true,
-            }],
-            "asynReport [level] - Report registered ports and plugins",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
-                mgr_r.report();
-                Ok(CommandOutcome::Continue)
-            },
-        ));
+        let app = self.app.unwrap();
 
         app.startup_script(script)
             // CA links resolve with zero further setup: the `ca` link set
@@ -1056,29 +1077,7 @@ impl AdIoc {
     /// registered during st.cmd are wired into the PVA server automatically.
     #[cfg(feature = "pva")]
     pub async fn run_with_pva(self, script: &str) -> CaResult<()> {
-        let mut app = self.app.unwrap();
-
-        app = register_all_plugins(app, &self.mgr);
-        app = register_noop_commands(app);
-
-        let autosave_config = Arc::new(Mutex::new(AutosaveStartupConfig::new()));
-        app = app.autosave_startup(autosave_config);
-        app = asyn_rs::adapter::register_asyn_device_support(app);
-
-        let mgr_r = self.mgr.clone();
-        app = app.register_shell_command(CommandDef::new(
-            "asynReport",
-            vec![ArgDesc {
-                name: "level",
-                arg_type: ArgType::Int,
-                optional: true,
-            }],
-            "asynReport [level] - Report registered ports and plugins",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
-                mgr_r.report();
-                Ok(CommandOutcome::Continue)
-            },
-        ));
+        let app = self.app.unwrap();
 
         app.startup_script(script)
             // External links resolve with zero further setup: both link

@@ -46,6 +46,25 @@ impl PortRegistry {
         let reg = self.inner.lock().ok()?;
         reg.get(name).cloned()
     }
+
+    /// Names of every published port, in arbitrary order.
+    ///
+    /// C parity: `asynManager::report` with no port argument walks the
+    /// global port list. Since every port creator publishes here, this is
+    /// that list.
+    pub fn names(&self) -> Vec<String> {
+        match self.inner.lock() {
+            Ok(reg) => reg.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Withdraw a port. A name that was never published is a no-op.
+    pub fn remove(&self, name: &str) {
+        if let Ok(mut reg) = self.inner.lock() {
+            reg.remove(name);
+        }
+    }
 }
 
 // ===== Global fallback (backward compatibility) =====
@@ -65,6 +84,21 @@ pub fn register_port(name: &str, handle: PortHandle, trace: Arc<TraceManager>) {
 /// Look up a port via the global registry.
 pub fn get_port(name: &str) -> Option<PortEntry> {
     global_registry().get(name)
+}
+
+/// Names of every port published to the global registry.
+///
+/// This is the process-wide port list: driver ports, ports created by the
+/// `drvAsyn*PortConfigure` iocsh commands, areaDetector plugin ports, and
+/// every port registered through a [`crate::manager::PortManager`]. It is
+/// what `asynReport` with no port argument enumerates.
+pub fn port_names() -> Vec<String> {
+    global_registry().names()
+}
+
+/// Withdraw a port from the global registry.
+pub fn unregister_port(name: &str) {
+    global_registry().remove(name);
 }
 
 /// Return the asyn record type factory for injection into IocBuilder.

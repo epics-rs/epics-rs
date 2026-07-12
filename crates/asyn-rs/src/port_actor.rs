@@ -322,7 +322,15 @@ impl PortActor {
             | RequestOp::PushDelayInterpose { .. }
             | RequestOp::BlockProcess
             | RequestOp::UnblockProcess
-            | RequestOp::ShutdownPort => CDispatch::Direct,
+            | RequestOp::ShutdownPort
+            // `asynPortDriver::callParamCallbacks` (asynPortDriver.cpp:1785-1794)
+            // is a plain method — `getParamList` then `pList->callCallbacks(addr)`.
+            // Driver code calls it directly; it never goes near `queueRequest`, so
+            // no enabled or connected check runs. A driver that models its device
+            // link sets `connected = false` when the hardware drops and *then*
+            // publishes the status parameter announcing it — gating this op
+            // discarded exactly the updates that matter most (R13-47).
+            | RequestOp::CallParamCallbacks { .. } => CDispatch::Direct,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT/PCNCT put,
@@ -368,7 +376,6 @@ impl PortActor {
             | RequestOp::Int64ArrayWrite { .. }
             | RequestOp::Float32ArrayRead { .. }
             | RequestOp::Float32ArrayWrite { .. }
-            | RequestOp::CallParamCallbacks { .. }
             | RequestOp::GetOption { .. }
             | RequestOp::SetOption { .. }
             | RequestOp::Report { .. }
@@ -2117,6 +2124,61 @@ mod tests {
         )
         .expect("the connect-time option readback is queued with the same waiver");
         assert_eq!(r.option_value.as_deref(), Some("newhost:5000"));
+    }
+
+    /// R13-47: `asynPortDriver::callParamCallbacks` (asynPortDriver.cpp:1785-1794)
+    /// is a plain method call — `getParamList(list)` then `pList->callCallbacks(addr)`.
+    /// It is invoked from driver code, never through `queueRequest`, so neither
+    /// the `asynDisabled` (asynManager.c:1541-1546) nor the `asynDisconnected`
+    /// (:1547-1552) refusal is reachable from it. A driver's parameter publish
+    /// must land on a disconnected *and* on a disabled port — that is precisely
+    /// when a driver publishes its status/health parameters.
+    #[test]
+    fn a_parameter_publish_lands_on_a_disconnected_or_disabled_port() {
+        for (connected, enabled) in [(false, true), (true, false), (false, false)] {
+            let mut drv = TestDriver::new();
+            drv.base.auto_connect = false; // no reconnect can rescue the update
+            drv.base.set_connected(connected);
+            drv.base.enabled = enabled;
+            let val = drv.base.find_param("VAL").unwrap();
+            let tx = spawn_actor(drv);
+
+            // C: the driver's own publish, on a port whose line is down / disabled.
+            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            send_and_wait(
+                &tx,
+                RequestOp::CallParamCallbacks {
+                    addr: 0,
+                    updates: vec![crate::request::ParamSetValue::Int32 {
+                        reason: val,
+                        addr: 0,
+                        value: 42,
+                    }],
+                },
+                user,
+            )
+            .unwrap_or_else(|e| {
+                panic!("connected={connected} enabled={enabled}: C never gates callParamCallbacks, got {e:?}")
+            });
+
+            // Bring the port up and re-enable it, then read the parameter back:
+            // the publish must be *there*, not lost to a refusal the driver never
+            // saw (`set_params_and_notify` drops the reply channel).
+            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user).unwrap();
+            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            send_and_wait(&tx, RequestOp::Connect, user).unwrap();
+
+            let user = AsynUser::new(val).with_timeout(Duration::from_secs(1));
+            let r = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
+            assert_eq!(
+                r.int_val,
+                Some(42),
+                "connected={connected} enabled={enabled}: the parameter published \
+                 while the port was down must survive (it read back ParamUndefined \
+                 when the op was queue-gated)"
+            );
+        }
     }
 
     /// R12-48: C conditions **only** `checkPortConnect` on the priority

@@ -593,20 +593,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // C `:596` — `j = ps->d`, a truncating int cast, and the value is
                     // the number of points on EACH SIDE of the fit.
                     let npts = i64::from(c_int(pop_f64(&mut stack)?));
-                    // NDERIV is NOT in C's unary switch either (`:594-617`), and its
-                    // own case PROMOTES a scalar with `toArray(ps,1)` rather than
-                    // answering 0. Refusing here is a divergence from that promotion,
-                    // reported separately — it is not R10-4's family.
+                    // NDERIV is NOT in C's unary switch (`:594-617`), so it never
+                    // reaches the `ps->d = 0` scalar arm. Its own case PROMOTES the
+                    // operand with `toArray(ps,1)` (`:599`) — a scalar becomes the
+                    // broadcast buffer (NaN filling 0, `to_array` `:135-137`), whose
+                    // derivative is a constant's: zero. Compiled C, arraySize 5, A=3:
+                    // `NDERIV(A,2)` -> [3.55e-15, 1.78e-15, 0, -1.78e-15, -3.55e-15],
+                    // status 0. Refusing it as a type error was the divergence.
                     //
-                    // Unlike NSMOOTH it DOES honour the window: its `calcFirstLast`
-                    // runs after `DEC(ps)`, on the array itself (`:600`).
-                    try_unary_op(&mut stack, |v| {
-                        let mut cell = v.as_cell()?.clone();
+                    // Promotion also resets numEl (`to_array` `:130`), so a promoted
+                    // scalar's window is the whole buffer; an array operand keeps the
+                    // window it carries, because C's `calcFirstLast` runs after
+                    // `DEC(ps)`, on the array itself (`:600`). `into_cell` is that same
+                    // `toArray`, so both properties come from one rule.
+                    let array_size = inputs.array_size;
+                    unary_op(&mut stack, |v| {
+                        let mut cell = v.into_cell(array_size);
                         let d = derivative::nderiv(cell.window(), npts)
                             .unwrap_or_else(|| vec![0.0; cell.window().len()]);
                         cell.window_mut().copy_from_slice(&d);
                         cell.clear_outside_window();
-                        Ok(ArrayStackValue::Array(cell))
+                        ArrayStackValue::Array(cell)
                     })?
                 }
                 ArrayOp::Cum => {

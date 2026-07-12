@@ -97,6 +97,26 @@ pub enum AsynError {
         nbytes: usize,
     },
 
+    /// The request waited in the port queue past the deadline its
+    /// `queueRequest` was given, so it was removed and **never ran**.
+    ///
+    /// C `queueTimeoutCallback` (asynManager.c:647-700): the timer
+    /// `queueRequest(pasynUser, priority, timeout)` armed at enqueue
+    /// (asynManager.c:1617-1623) fires while `isQueued` is still true, the
+    /// request is unlinked from the port's queue list, and the caller's
+    /// `timeoutUser` runs **instead of** its `processUser`. Only a caller that
+    /// asked for a queue deadline can see this — device support passes
+    /// `queueRequest(..., 0.0)` (devAsynInt32.c:838) and arms no timer at all,
+    /// while `asynRecord` passes `QUEUE_TIMEOUT` = 10 s for both its process and
+    /// its special requests (asynRecord.c:71,343,572).
+    ///
+    /// Distinct from `AsynStatus::Timeout`, which means the driver *did* run and
+    /// the device did not answer in time. C reports this one as plain
+    /// `asynError` (asynRecord.c:919-926), which is what [`AsynError::status`]'s
+    /// default branch gives it.
+    #[error("queueRequest timeout on port {port}")]
+    QueueTimeout { port: String },
+
     #[error("port not found: {0}")]
     PortNotFound(String),
 
@@ -198,6 +218,26 @@ impl AsynError {
                 source.message()
             }
             other => other.to_string(),
+        }
+    }
+
+    /// True iff the request never ran because it sat in the port queue past its
+    /// deadline — C's `queueTimeoutCallback` outcome, see
+    /// [`AsynError::QueueTimeout`].
+    ///
+    /// The single owner of that test. Callers that arm a queue deadline MUST ask
+    /// through this rather than matching the variant, and MUST NOT treat the
+    /// failure as an I/O result: C runs `timeoutUser` *instead of* `processUser`,
+    /// so nothing the request would have done happened — no bytes moved, no
+    /// option was written, and none of the follow-up work a completed request
+    /// implies (asynRecord's `setOption` → `getOptions` fall-through) may run.
+    pub fn is_queue_timeout(&self) -> bool {
+        match self {
+            AsynError::QueueTimeout { .. } => true,
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.is_queue_timeout()
+            }
+            _ => false,
         }
     }
 

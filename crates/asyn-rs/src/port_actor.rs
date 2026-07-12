@@ -30,6 +30,17 @@ pub(crate) struct ActorMessage {
     pub seq: u64,
     pub priority: QueuePriority,
     pub block_token: Option<u64>,
+    /// When this request stops being allowed to wait — C
+    /// `epicsTimerStartDelay(puserPvt->timer, timeout)` at enqueue
+    /// (asynManager.c:1617-1623). `None` is C's `queueRequest(..., 0.0)`: no
+    /// timer, the request waits as long as the queue makes it.
+    ///
+    /// Stamped **here**, from [`AsynUser::queue_timeout`], so the clock starts
+    /// when the request is queued rather than when someone gets around to
+    /// looking at it — every submit path funnels through this constructor, so no
+    /// caller can enqueue a request whose deadline is measured from the wrong
+    /// instant.
+    pub queue_deadline: Option<Instant>,
 }
 
 impl ActorMessage {
@@ -41,6 +52,7 @@ impl ActorMessage {
     ) -> Self {
         let priority = user.priority;
         let block_token = user.block_token;
+        let queue_deadline = user.queue_timeout.map(|d| Instant::now() + d);
         Self {
             op,
             user,
@@ -49,6 +61,7 @@ impl ActorMessage {
             seq: ACTOR_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
             priority,
             block_token,
+            queue_deadline,
         }
     }
 }
@@ -308,16 +321,40 @@ impl PortActor {
             mut user,
             cancel,
             reply,
+            queue_deadline,
             ..
         } = msg;
+
+        // The queue-wait deadline, enforced where C enforces it: at the boundary
+        // between "queued" and "running". C arms a timer at `queueRequest`
+        // (asynManager.c:1617-1623) and its callback unlinks the request only
+        // while `isQueued` (:655-661); the port thread cancels the timer as it
+        // dequeues (:827,:906). Both halves reduce to one rule — *a request that
+        // waited past its deadline never runs* — and the token is where that
+        // rule is settled, so a deadline, an `AQR` cancel and this dequeue race
+        // through one CAS and exactly one of them wins.
+        if queue_deadline.is_some_and(|at| Instant::now() >= at) && cancel.time_out_if_queued() {
+            let _ = reply.send(Err(AsynError::QueueTimeout {
+                port: self.driver.base().port_name.clone(),
+            }));
+            return;
+        }
 
         // Claim the request for execution. This is the C dequeue under
         // `asynManagerLock`: `begin_running` transitions the cancel token
         // `Queued -> Running`, which closes the window in which an `AQR`
         // `cancelRequest` could report `wasQueued==1` (asynManager.c:1661-1666).
-        // It fails only if the request was already cancelled while queued, in
-        // which case it was removed from the queue and must be dropped.
+        // It fails only if the request left the queue without running — an `AQR`
+        // cancel, or a queue-wait deadline the *waiter* resolved first (the
+        // async path arms its own timer, `PortHandle::submit_cancellable`) — in
+        // which case it must be dropped, reporting the outcome that won.
         if !cancel.begin_running() {
+            if cancel.is_timed_out() {
+                let _ = reply.send(Err(AsynError::QueueTimeout {
+                    port: self.driver.base().port_name.clone(),
+                }));
+                return;
+            }
             let _ = reply.send(Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "request cancelled".into(),
@@ -332,18 +369,13 @@ impl PortActor {
 
         let is_connect_op = Self::is_lifecycle_op(&op);
 
-        // C parity: a request that reaches the head of the queue always
-        // executes — a dequeued request is never aborted by a queue
-        // timeout. C arms a *queue-wait* timer only when queueRequest is
-        // passed timeout > 0 (asynManager.c:1590-1623), and the port
-        // thread cancels that timer the instant it dequeues the request
-        // (:906/:827); standard device support passes
-        // `queueRequest(..., 0.0)`, arming no timer at all. `user.timeout`
-        // is the *I/O* timeout handed to the driver's read/write, not a
-        // queue pre-execution deadline — reusing it as one aborted a
-        // request that a slow predecessor had merely delayed past its I/O
-        // budget. A genuine queue-wait timeout would be a separate async
-        // timer, not derived from the I/O timeout.
+        // From here on `user.timeout` is the *I/O* timeout handed to the driver's
+        // read/write, and nothing else: a request that begins running is never
+        // aborted by a queue deadline (the gate above is the only place one is
+        // read). Reusing the I/O timeout as a queue deadline aborted a request
+        // that a slow predecessor had merely delayed past its transfer budget —
+        // the two clocks are separate in C too (`pasynUser->timeout` vs
+        // `queueRequest`'s `timeout` argument, `AsynUser::queue_timeout` here).
         let is_connect_priority = user.priority == QueuePriority::Connect;
 
         // Connect ops and Connect-priority requests bypass enabled/connected checks
@@ -1445,6 +1477,7 @@ mod tests {
                 seq,
                 priority: QueuePriority::Medium,
                 block_token: None,
+                queue_deadline: None,
             }
         };
         let mut heap = BinaryHeap::new();
@@ -1469,6 +1502,7 @@ mod tests {
                 seq,
                 priority,
                 block_token: None,
+                queue_deadline: None,
             }
         };
         let mut heap = BinaryHeap::new();

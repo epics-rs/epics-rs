@@ -658,6 +658,22 @@ impl IoOutcome {
         self.report_error(CANCELED_MSG.to_string());
         raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Major);
     }
+
+    /// The queue-timeout outcome of a **process** request, C
+    /// `queueTimeoutCallbackProcess` (asynRecord.c:919-926): `reportError(…
+    /// "process queueRequest timeout")`, `recGblSetSevr(STATE_ALARM,
+    /// MAJOR_ALARM)`, then `callbackRequestProcessCallback` to complete the
+    /// record that is still sitting at `pact = TRUE`.
+    ///
+    /// The same shape as [`Self::report_canceled`], and for the same reason: both
+    /// are "the queued request left the queue without running", so the message
+    /// and the severity are one event with one owner, and the completion re-entry
+    /// that applies this outcome is C's forced callback. The remaining phases of
+    /// the plan do **not** run — C never entered `performIO` at all.
+    fn report_queue_timeout(&mut self) {
+        self.report_error(PROCESS_QUEUE_TIMEOUT_MSG.to_string());
+        raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Major);
+    }
 }
 
 /// The status word C splices into the final octet read-error message
@@ -697,12 +713,15 @@ fn io_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason)
         .with_addr(plan.addr)
         .with_timeout(plan.timeout)
+        .with_queue_timeout(QUEUE_TIMEOUT)
 }
 
 /// Build the `asynUser` for a `Flush` phase. C `asynRecord.c` issues the flush
 /// with the same reason/addr but no transfer timeout.
 fn flush_user(plan: &IoPlan) -> AsynUser {
-    AsynUser::new(plan.reason).with_addr(plan.addr)
+    AsynUser::new(plan.reason)
+        .with_addr(plan.addr)
+        .with_queue_timeout(QUEUE_TIMEOUT)
 }
 
 /// One phase of a `performIO` cycle.
@@ -1049,6 +1068,19 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
     }
 }
 
+/// Whether the `performIO` cycle continues after a phase.
+///
+/// A phase that *ran* and failed reports and the cycle carries on, exactly as C
+/// `performIO` does (a failed write is still followed by the read). A phase that
+/// never ran — its queued request was removed by the queue-wait deadline — ends
+/// the cycle: in C that request never entered `performIO` at all, and what runs
+/// instead is `queueTimeoutCallbackProcess`.
+#[must_use]
+enum PhaseFlow {
+    Continue,
+    Aborted,
+}
+
 /// Record one phase's result into the outcome — the phase→recorder mapping,
 /// shared by the synchronous and off-thread runners so a phase cannot be handled
 /// differently on the two paths. As in C `performIO`, a failed phase reports but
@@ -1058,7 +1090,19 @@ fn record_phase_result(
     out: &mut IoOutcome,
     phase: IoPhase,
     res: AsynResult<RequestResult>,
-) {
+) -> PhaseFlow {
+    // The queue-wait deadline, ahead of every per-phase recorder — including the
+    // flush's "discard the status" one, which would otherwise swallow it. This is
+    // not an I/O failure to report as one: the request never reached the driver,
+    // so there is no transfer to publish (no NAWT, no NORD, no EOMR) and no
+    // driver diagnostic to splice. C reports it from a different callback
+    // entirely (`queueTimeoutCallbackProcess`), which is what this is.
+    if let Err(e) = &res {
+        if e.is_queue_timeout() {
+            out.report_queue_timeout();
+            return PhaseFlow::Aborted;
+        }
+    }
     match phase {
         IoPhase::Flush => {
             // C `performOctetIO` calls the flush for its side effect only and
@@ -1078,6 +1122,7 @@ fn record_phase_result(
         IoPhase::Write => record_write_result(plan, out, res),
         IoPhase::Read => record_read_result(plan, out, res),
     }
+    PhaseFlow::Continue
 }
 
 /// Run `performIO`'s flush/write/read phases off the scan thread against the
@@ -1119,7 +1164,9 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
             out.report_canceled();
             return out;
         }
-        record_phase_result(&plan, &mut out, phase, res);
+        if let PhaseFlow::Aborted = record_phase_result(&plan, &mut out, phase, res) {
+            return out;
+        }
     }
 
     out
@@ -1128,6 +1175,27 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
 /// C `reportError(pasynRec, status, "I/O request canceled")` for a dequeued
 /// `AQR` request (asynRecord.c:398).
 const CANCELED_MSG: &str = "I/O request canceled";
+
+/// C `QUEUE_TIMEOUT` (asynRecord.c:71): how long a record request may wait in
+/// the port queue before it is removed and reported as never having run.
+///
+/// The record passes it to **every** `queueRequest` it makes — the process I/O
+/// (:343), the special option/EOS callback (:572), and the getOption/getEos
+/// requests `connectDevice` queues (:1281,:1297) — and it is the only caller in
+/// asyn that asks for one at all (device support passes 0.0, devAsynInt32.c:838).
+/// So it belongs to the record, not to the port: it rides on
+/// [`AsynUser::queue_timeout`] of the users the record builds below.
+const QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// C `queueTimeoutCallbackProcess` (asynRecord.c:919-926) — the process request
+/// waited out `QUEUE_TIMEOUT` and was removed from the queue.
+const PROCESS_QUEUE_TIMEOUT_MSG: &str = "process queueRequest timeout";
+
+/// C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) — the special
+/// (option / EOS / connect readback) request waited out `QUEUE_TIMEOUT`.
+/// Unlike the process one, C raises **no** record severity here: it reports,
+/// returns the record to `stateIdle`, and frees the request.
+const SPECIAL_QUEUE_TIMEOUT_MSG: &str = "special queueRequest timeout";
 
 /// The fields asynRecord.dbd marks `special(SPC_MOD)` — the complete set of puts
 /// that reach C `special()` (dbAccess only calls `special` for an SPC_MOD field).
@@ -1151,6 +1219,24 @@ const SPC_MOD_FIELDS: &[&str] = &[
 const OPTION_READBACK_FIELDS: &[&str] = &[
     "BAUD", "LBAUD", "PRTY", "DBIT", "SBIT", "MCTL", "FCTL", "IXON", "IXOFF", "IXANY", "HOSTINFO",
     "DRTO",
+];
+
+/// The driver option keys C `getOptions` reads (asynRecord.c:1864-1937), in C's
+/// order. The record reads them in one pass so a queue-wait timeout — which in C
+/// means the single request carrying *all* of them never ran — can abort the
+/// whole readback rather than half of it.
+const OPTION_READBACK_KEYS: &[&str] = &[
+    "baud",
+    "parity",
+    "bits",
+    "stop",
+    "crtscts",
+    "clocal",
+    "ixon",
+    "ixoff",
+    "ixany",
+    "hostinfo",
+    "disconnectOnReadTimeout",
 ];
 
 /// The fields C `getEos` re-reads and posts (asynRecord.c:2016-2024) — both
@@ -2141,18 +2227,24 @@ impl AsynRecord {
         if !handle.has_interface(crate::interfaces::InterfaceType::Option) {
             return;
         }
+        // Every `getOption` C's `getOptions` runs happens *inside* one queued
+        // request (`callbackGetOption`), so they stand or fall together: if that
+        // request never ran, no option was read.
+        let Some(opts) = self.get_options(handle, OPTION_READBACK_KEYS) else {
+            return;
+        };
         // Baud rate. C reads the driver's text once and derives both fields from
         // it: `sscanf(optbuff, "%d", &lbaud)` and the `baud_choices` walk
         // (asynRecord.c:1866-1871). BAUD is matched against the choice *text*,
         // not against the parsed number, so a driver reporting something no menu
         // choice carries leaves BAUD at "Unknown" while LBAUD still shows the
         // rate.
-        if let Ok(val) = handle.get_option_blocking("baud") {
+        if let Some(val) = opts.get("baud") {
             self.lbaud = val.parse::<i32>().unwrap_or(0);
-            self.baud = baud_choice_index(&val);
+            self.baud = baud_choice_index(val);
         }
         // Parity
-        if let Ok(val) = handle.get_option_blocking("parity") {
+        if let Some(val) = opts.get("parity") {
             self.prty = match val.as_str() {
                 "none" => 1,
                 "even" => 2,
@@ -2165,7 +2257,7 @@ impl AsynRecord {
         // "bits"); `"csize"` is consumed by no driver, so the readback
         // must use "bits" to match the DBIT write path (write_option
         // "bits" below).
-        if let Ok(val) = handle.get_option_blocking("bits") {
+        if let Some(val) = opts.get("bits") {
             self.dbit = match val.as_str() {
                 "5" => 1,
                 "6" => 2,
@@ -2175,7 +2267,7 @@ impl AsynRecord {
             };
         }
         // Stop bits
-        if let Ok(val) = handle.get_option_blocking("stop") {
+        if let Some(val) = opts.get("stop") {
             self.sbit = match val.as_str() {
                 "1" => 1,
                 "2" => 2,
@@ -2183,7 +2275,7 @@ impl AsynRecord {
             };
         }
         // Flow control
-        if let Ok(val) = handle.get_option_blocking("crtscts") {
+        if let Some(val) = opts.get("crtscts") {
             self.fctl = match val.as_str() {
                 "Y" | "Yes" => 2,         // Hardware
                 "N" | "No" | "none" => 1, // None
@@ -2191,7 +2283,7 @@ impl AsynRecord {
             };
         }
         // Modem control
-        if let Ok(val) = handle.get_option_blocking("clocal") {
+        if let Some(val) = opts.get("clocal") {
             self.mctl = match val.as_str() {
                 "Y" | "Yes" => 1, // CLOCAL
                 "N" | "No" => 2,  // YES (hardware modem control)
@@ -2199,21 +2291,21 @@ impl AsynRecord {
             };
         }
         // XON/XOFF
-        if let Ok(val) = handle.get_option_blocking("ixon") {
+        if let Some(val) = opts.get("ixon") {
             self.ixon = match val.as_str() {
                 "Y" | "Yes" => 2,
                 "N" | "No" => 1,
                 _ => 0,
             };
         }
-        if let Ok(val) = handle.get_option_blocking("ixoff") {
+        if let Some(val) = opts.get("ixoff") {
             self.ixoff = match val.as_str() {
                 "Y" | "Yes" => 2,
                 "N" | "No" => 1,
                 _ => 0,
             };
         }
-        if let Ok(val) = handle.get_option_blocking("ixany") {
+        if let Some(val) = opts.get("ixany") {
             self.ixany = match val.as_str() {
                 "Y" | "Yes" => 2,
                 "N" | "No" => 1,
@@ -2221,16 +2313,45 @@ impl AsynRecord {
             };
         }
         // IP options
-        if let Ok(val) = handle.get_option_blocking("hostinfo") {
-            self.hostinfo = val;
+        if let Some(val) = opts.get("hostinfo") {
+            self.hostinfo = val.clone();
         }
-        if let Ok(val) = handle.get_option_blocking("disconnectOnReadTimeout") {
+        if let Some(val) = opts.get("disconnectOnReadTimeout") {
             self.drto = match val.as_str() {
                 "Y" | "Yes" => 2,
                 "N" | "No" => 1,
                 _ => 0,
             };
         }
+    }
+
+    /// Read the driver's options under the record's queued `AsynUser`.
+    ///
+    /// A key the driver does not know leaves its field alone — C's `getOption`
+    /// failure branch reports nothing and the record keeps what it had. A
+    /// **queue-wait timeout** is different in kind: the request never reached the
+    /// driver, so nothing was read and the whole readback is off. C reports that
+    /// through `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) and the
+    /// `getOptions` inside that request simply never happen — `None` here.
+    fn get_options(
+        &mut self,
+        handle: &PortHandle,
+        keys: &[&str],
+    ) -> Option<HashMap<String, String>> {
+        let mut opts = HashMap::new();
+        for key in keys {
+            match handle.get_option_blocking(self.option_user(), key) {
+                Ok(val) => {
+                    opts.insert((*key).to_string(), val);
+                }
+                Err(e) if e.is_queue_timeout() => {
+                    self.report_special_queue_timeout();
+                    return None;
+                }
+                Err(_) => {}
+            }
+        }
+        Some(opts)
     }
 
     /// Read both EOS strings back from the driver into IEOS/OEOS — C `getEos`
@@ -2249,17 +2370,32 @@ impl AsynRecord {
         let mut ieos = String::new();
         let mut oeos = String::new();
         if self.octetiv != 0 {
-            match handle.get_input_eos_blocking() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    ieos = crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE);
+            // As in `get_options`: a queue-wait timeout means the request never
+            // ran, so neither EOS was read and the fields must not be rewritten
+            // from a readback that did not happen.
+            let read = |res: AsynResult<Vec<u8>>| -> Result<String, bool> {
+                match res {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        Ok(crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE))
+                    }
+                    Ok(_) => Ok(String::new()),
+                    Err(e) if e.is_queue_timeout() => Err(true),
+                    Err(_) => Ok(String::new()),
                 }
-                _ => {}
+            };
+            match read(handle.get_input_eos_blocking(self.option_user())) {
+                Ok(v) => ieos = v,
+                Err(_) => {
+                    self.report_special_queue_timeout();
+                    return;
+                }
             }
-            match handle.get_output_eos_blocking() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    oeos = crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE);
+            match read(handle.get_output_eos_blocking(self.option_user())) {
+                Ok(v) => oeos = v,
+                Err(_) => {
+                    self.report_special_queue_timeout();
+                    return;
                 }
-                _ => {}
             }
         }
         self.ieos = ieos;
@@ -2339,6 +2475,16 @@ impl AsynRecord {
             .handle
             .set_option_blocking(self.option_user(), key, value)
         {
+            // The queued special request never ran (C `queueTimeoutCallbackSpecial`,
+            // asynRecord.c:929-938): no option was written, and the
+            // `setOption -> getOptions` fall-through lives *inside* that request
+            // (:845-849), so the readback does not happen either. Reporting the
+            // set failure and then re-reading would claim a driver round-trip the
+            // port never made.
+            if e.is_queue_timeout() {
+                self.report_special_queue_timeout();
+                return;
+            }
             self.errs = format!("Error setting option, {}", e.message());
         }
         let before = self.field_snapshot(OPTION_READBACK_FIELDS);
@@ -2389,6 +2535,18 @@ impl AsynRecord {
     fn report_no_interface(&mut self, asyn_name: &str) {
         self.errs = format!("No {asyn_name} interface");
         self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
+    }
+
+    /// C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938): the option / EOS /
+    /// connect-readback request waited out `QUEUE_TIMEOUT` and was removed from
+    /// the queue. C reports the text, returns the record to `stateIdle` and frees
+    /// the request — and, unlike the process timeout, raises **no** severity, so
+    /// this must not go through `report_no_interface`'s alarm-raising shape.
+    ///
+    /// The single owner of that outcome for every request the record's
+    /// [`Self::option_user`] builds.
+    fn report_special_queue_timeout(&mut self) {
+        self.errs = SPECIAL_QUEUE_TIMEOUT_MSG.to_string();
     }
 
     /// The record's I/O Intr machinery, shared with its `asynRecordDevice`
@@ -2509,11 +2667,21 @@ impl AsynRecord {
         let field = if output { &self.oeos } else { &self.ieos };
         let bytes = translate_escape(field);
         let res = if output {
-            entry.handle.set_output_eos_blocking(&bytes)
+            entry
+                .handle
+                .set_output_eos_blocking(self.option_user(), &bytes)
         } else {
-            entry.handle.set_input_eos_blocking(&bytes)
+            entry
+                .handle
+                .set_input_eos_blocking(self.option_user(), &bytes)
         };
         if let Err(e) = res {
+            // Same rule as `write_option`: a queued special request that timed out
+            // wrote nothing and runs no `getEos` fall-through (asynRecord.c:851-854).
+            if e.is_queue_timeout() {
+                self.report_special_queue_timeout();
+                return;
+            }
             let which = if output { "output" } else { "input" };
             self.errs = format!("Error setting {which} eos, {}", e.message());
         }
@@ -2757,6 +2925,11 @@ impl AsynRecord {
         AsynUser::new(self.resolved_reason)
             .with_addr(self.addr)
             .with_timeout(self.io_timeout())
+            // C `special()` queues the option callback with `QUEUE_TIMEOUT`
+            // (asynRecord.c:571-572), and `connectDevice` queues its
+            // getOption/getEos readbacks with the same (:1281,:1297) — every
+            // request built from this user is one of those.
+            .with_queue_timeout(QUEUE_TIMEOUT)
     }
 
     /// Clamp the operator's requested transfer sizes into the record fields —
@@ -2959,7 +3132,9 @@ impl AsynRecord {
                     .handle
                     .submit_blocking(io_read_op(&plan), io_user(&plan)),
             };
-            record_phase_result(&plan, &mut out, phase, res);
+            if let PhaseFlow::Aborted = record_phase_result(&plan, &mut out, phase, res) {
+                break;
+            }
         }
 
         self.apply_io_outcome(out);
@@ -7546,6 +7721,135 @@ mod tests {
         rec.ieos = "\\n".to_string();
         rec.special("IEOS", true).unwrap();
         assert_ne!(rec.errs, "No asynOctet interface");
+    }
+
+    // ===== R10-49: the record's QUEUE_TIMEOUT =====
+
+    /// R10-49. C `asynRecord` is the one caller in asyn that asks `queueRequest`
+    /// for a queue-wait deadline, and it asks for the same one everywhere:
+    /// `QUEUE_TIMEOUT` = 10.0 s (asynRecord.c:71) on the process I/O (:343), on
+    /// the special option/EOS callback (:572) and on the getOption/getEos
+    /// readbacks `connectDevice` queues (:1281,:1297). The port armed no queue
+    /// deadline at all.
+    #[test]
+    fn every_record_request_carries_c_queue_timeout() {
+        use std::time::Duration;
+
+        assert_eq!(
+            QUEUE_TIMEOUT,
+            Duration::from_secs(10),
+            "C `#define QUEUE_TIMEOUT 10.0`"
+        );
+
+        let mut rec = AsynRecord::default();
+        let plan = rec.build_io_plan();
+        assert_eq!(io_user(&plan).queue_timeout, Some(QUEUE_TIMEOUT));
+        assert_eq!(flush_user(&plan).queue_timeout, Some(QUEUE_TIMEOUT));
+        assert_eq!(rec.option_user().queue_timeout, Some(QUEUE_TIMEOUT));
+
+        // Negative control: a user built anywhere else (device support, iocsh,
+        // a driver's own request) arms no timer — C's `queueRequest(..., 0.0)`.
+        assert_eq!(AsynUser::default().queue_timeout, None);
+        assert_eq!(AsynUser::new(3).with_addr(1).queue_timeout, None);
+    }
+
+    /// R10-49. C `queueTimeoutCallbackProcess` (asynRecord.c:919-926): the
+    /// process request that never ran reports "process queueRequest timeout",
+    /// raises STATE_ALARM/MAJOR_ALARM and forces the record's completion. It is
+    /// **not** an I/O result: no transfer happened, so no NAWT/NORD/EOMR is
+    /// published and the rest of the cycle's phases do not run.
+    #[test]
+    fn a_process_queue_timeout_reports_the_c_text_and_state_major() {
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::WriteRead as i32;
+        let plan = rec.build_io_plan();
+
+        let mut out = IoOutcome::default();
+        let flow = record_phase_result(
+            &plan,
+            &mut out,
+            IoPhase::Write,
+            Err(crate::error::AsynError::QueueTimeout { port: "p".into() }),
+        );
+        assert!(
+            matches!(flow, PhaseFlow::Aborted),
+            "the request never ran: C never entered performIO, so no read follows"
+        );
+        assert_eq!(out.errs.as_deref(), Some("process queueRequest timeout"));
+        assert_eq!(
+            out.alarm,
+            Some((alarm_status::STATE_ALARM, AlarmSeverity::Major))
+        );
+        assert_eq!(out.nawt, None, "nothing was written — nothing to publish");
+
+        // The same on a read phase, and through the flush phase too — whose
+        // recorder discards every *I/O* status (C :1521) but must not swallow a
+        // request that never ran.
+        for phase in [IoPhase::Read, IoPhase::Flush] {
+            let mut out = IoOutcome::default();
+            let flow = record_phase_result(
+                &plan,
+                &mut out,
+                phase,
+                Err(crate::error::AsynError::QueueTimeout { port: "p".into() }),
+            );
+            assert!(matches!(flow, PhaseFlow::Aborted), "{phase:?}");
+            assert_eq!(out.errs.as_deref(), Some("process queueRequest timeout"));
+            assert_eq!(
+                out.alarm,
+                Some((alarm_status::STATE_ALARM, AlarmSeverity::Major)),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// Negative control for the gate above: an ordinary I/O failure is a *result*
+    /// — the request ran, the device did not answer. It reports the driver's text
+    /// with the read-error severity, and the cycle carries on (C `performIO` runs
+    /// the read after a failed write).
+    #[test]
+    fn an_io_timeout_is_not_a_queue_timeout() {
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::WriteRead as i32;
+        let plan = rec.build_io_plan();
+
+        let mut out = IoOutcome::default();
+        let flow = record_phase_result(
+            &plan,
+            &mut out,
+            IoPhase::Read,
+            Err(crate::error::AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "no response".into(),
+            }),
+        );
+        assert!(
+            matches!(flow, PhaseFlow::Continue),
+            "a phase that ran and failed does not abort the cycle"
+        );
+        let errs = out.errs.clone().unwrap();
+        assert!(
+            errs.contains("timeout") && !errs.contains("queueRequest"),
+            "the driver's read-error text, not the queue timeout's: {errs}"
+        );
+    }
+
+    /// R10-49. C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) reports
+    /// "special queueRequest timeout", returns the record to `stateIdle` and
+    /// frees the request — and raises **no** severity, unlike its process twin.
+    #[test]
+    fn a_special_queue_timeout_reports_the_c_text_and_no_severity() {
+        let mut rec = AsynRecord::default();
+        rec.report_special_queue_timeout();
+        assert_eq!(rec.errs, "special queueRequest timeout");
+
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(
+            c.nsev,
+            AlarmSeverity::NoAlarm,
+            "C raises no recGblSetSevr in queueTimeoutCallbackSpecial"
+        );
     }
 
     // ===== R11-46: SCAN="I/O Intr" =====

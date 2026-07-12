@@ -172,10 +172,14 @@ fn asyn_set_eos(
     let eos = raw_from_escaped(&arg_str(args, 2).unwrap_or_default());
     match mgr.find_port_handle(&port) {
         Ok(handle) => {
+            // The shell's own user — no queue-wait deadline: `QUEUE_TIMEOUT` is
+            // asynRecord's, and every other C caller passes
+            // `queueRequest(..., 0.0)`. (`_addr` stays unused here, as before.)
+            let user = crate::user::AsynUser::default();
             let res = if set_input {
-                handle.set_input_eos_blocking(&eos)
+                handle.set_input_eos_blocking(user, &eos)
             } else {
-                handle.set_output_eos_blocking(&eos)
+                handle.set_output_eos_blocking(user, &eos)
             };
             if let Err(e) = res {
                 ctx.println(&format!("{cmd}: {e}"));

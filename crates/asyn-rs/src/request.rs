@@ -552,10 +552,21 @@ impl RequestResult {
 /// finished, `wasQueued==0` and the I/O runs to completion and is reported
 /// normally (asynManager.c:1645-1659). `Queued` is the only state a cancel can
 /// win from; the executor's `Queued -> Running` transition closes that window.
+///
+/// The queue-wait timeout (C `queueTimeoutCallback`, asynManager.c:647-700) is
+/// the second way a request can leave the queue without running, and it obeys
+/// the same rule: the timer callback returns immediately when `!isQueued`
+/// (:655-661), so a request the port thread has already dequeued always
+/// completes. `TimedOut` is therefore a sibling of `Cancelled` — a terminal
+/// state reachable only from `Queued` — and the two together are the complete
+/// set of "this request never ran" outcomes. Which one won is what tells the
+/// caller *which* C callback to report ("I/O request canceled" vs "process
+/// queueRequest timeout"), so they are distinct states rather than one flag.
 const STATE_QUEUED: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_DONE: u8 = 2;
 const STATE_CANCELLED: u8 = 3;
+const STATE_TIMED_OUT: u8 = 4;
 
 /// Token tracking the queue/execution lifecycle of an off-thread request.
 ///
@@ -590,18 +601,40 @@ impl CancelToken {
             .is_ok()
     }
 
+    /// C `queueTimeoutCallback` (asynManager.c:647-700): the queue-wait deadline
+    /// expired. Removes the request from the queue iff it is still queued —
+    /// C's `if(!puserPvt->isQueued) { ...; return; }` guard (:655-661) — and
+    /// returns whether it won.
+    ///
+    /// `false` means the port thread had already dequeued the request: the timer
+    /// fired too late, the I/O runs to completion and reports normally, and the
+    /// caller must keep waiting for it. This is the same `isQueued` gate
+    /// [`Self::cancel`] answers for `AQR`, so a cancel and a timeout racing the
+    /// same request cannot both win.
+    pub fn time_out_if_queued(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATE_QUEUED,
+                STATE_TIMED_OUT,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Executor at dequeue: claim the request for execution (C dequeue under
     /// `asynManagerLock`, asynManager.c:1661-1666 is the cancel counterpart).
     ///
-    /// Returns `false` iff the request was cancelled while queued, in which
-    /// case the executor must drop it and report cancellation. Otherwise the
-    /// token enters `Running`. A multi-phase plan re-claims the same token for
-    /// its next phase from `Done`, so this transitions from either `Queued` or
-    /// `Done`; only `Cancelled` is terminal.
+    /// Returns `false` iff the request left the queue without running — it was
+    /// cancelled (`AQR`) or its queue-wait deadline expired — in which case the
+    /// executor must drop it and report that outcome. Otherwise the token enters
+    /// `Running`. A multi-phase plan re-claims the same token for its next phase
+    /// from `Done`, so this transitions from either `Queued` or `Done`;
+    /// `Cancelled` and `TimedOut` are terminal.
     pub fn begin_running(&self) -> bool {
         let mut cur = self.0.load(AtomicOrdering::Acquire);
         loop {
-            if cur == STATE_CANCELLED {
+            if cur == STATE_CANCELLED || cur == STATE_TIMED_OUT {
                 return false;
             }
             match self.0.compare_exchange_weak(
@@ -634,6 +667,14 @@ impl CancelToken {
     /// `false` and the completed I/O applies normally.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(AtomicOrdering::Acquire) == STATE_CANCELLED
+    }
+
+    /// True iff the request was removed from the queue by its queue-wait
+    /// deadline — the C `queueTimeoutCallback` outcome. Mutually exclusive with
+    /// [`Self::is_cancelled`]: both transition out of `Queued`, so exactly one
+    /// can win.
+    pub fn is_timed_out(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire) == STATE_TIMED_OUT
     }
 }
 

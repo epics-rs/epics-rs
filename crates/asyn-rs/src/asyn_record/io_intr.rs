@@ -211,11 +211,32 @@ impl IoIntrScan {
         self.sample.lock().unwrap().take()
     }
 
+    /// C `process`'s `gotValue = 0` at `done:` (asynRecord.c:370) for the cycles
+    /// that did NOT consume the value — the `stateNoDevice` refusal, the
+    /// completion re-entry, the "Special is active" arm. C clears the flag on
+    /// every path that reaches `done:`, so an interrupt the record could not act
+    /// on is discarded, never carried into a later cycle.
+    pub(crate) fn clear_sample(&self) {
+        *self.sample.lock().unwrap() = None;
+    }
+
     /// The single owner of the registration invariant (see the module doc):
     /// the subscription exists exactly while the record is on the I/O Intr list,
     /// is bound to a port, and the port implements IFACE.
     fn refresh(&self) -> Result<(), String> {
         let mut reg = self.reg.lock().unwrap();
+
+        // Every binding change discards whatever the *previous* binding pushed.
+        // C clears `gotValue` when it (re)registers (`getIoIntInfo` cmd == 0,
+        // asynRecord.c:589) — "a fresh registration never inherits a value left
+        // over from a previous one" — and its `process` `done:` clears it on the
+        // cancel side. Doing it here, on every path through the single owner of
+        // the subscription, is the same rule with one owner instead of two: the
+        // sample and the subscription that produced it are replaced together, so
+        // a value from a port the record is no longer bound to cannot be
+        // published.
+        *self.sample.lock().unwrap() = None;
+
         let binding = match (reg.active && reg.started, reg.binding.clone()) {
             (true, Some(b)) => b,
             // Not on the scan list (or not bound / not yet running): C
@@ -281,10 +302,6 @@ impl IoIntrScan {
             },
         );
 
-        // C `getIoIntInfo(cmd == 0)` clears `gotValue` before registering
-        // (:589): a fresh scan registration never inherits a value left over
-        // from a previous one.
-        *self.sample.lock().unwrap() = None;
         reg.sub = Some(sub);
         Ok(())
     }

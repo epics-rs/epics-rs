@@ -17,7 +17,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record, ScanType,
+    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record, RecordProcessResult, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -4188,7 +4188,65 @@ impl Record for AsynRecord {
         Ok(())
     }
 
+    /// C `process()` (asynRecord.c:329-372). The body is [`Self::process_cycle`];
+    /// this wrapper is C's `done:` label (:369-371), whose `gotValue = 0` is the
+    /// invariant that keeps the interrupt cell honest:
+    ///
+    /// > **An interrupt sample MUST NOT outlive the process cycle it was visible
+    /// > to.** The only cycle that may leave it set is one that returns with
+    /// > `pact = TRUE` — C returns from *inside* the `stateIdle` arm (:349-351)
+    /// > and never reaches `done:`.
+    ///
+    /// Every other arm — the completion re-entry, the `stateNoDevice` refusal,
+    /// the interrupt-driven cycle itself, the inline `performIO`, a failed
+    /// `queueRequest` — falls into `done:` and clears the flag. Enforcing that
+    /// here, at the single exit, is what makes it hold by construction: no arm
+    /// of `process_cycle` can forget to discard a sample it did not consume.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        let outcome = self.process_cycle();
+        let went_async = matches!(
+            &outcome,
+            Ok(o) if matches!(
+                o.result,
+                RecordProcessResult::AsyncPending | RecordProcessResult::AsyncPendingNotify(_)
+            )
+        );
+        if !went_async {
+            self.io_intr.clear_sample();
+        }
+        outcome
+    }
+
+    /// C `getIoIntInfo` (asynRecord.c:582-597), reached from `dbScan`'s
+    /// `scanAdd` / `scanDelete`: register the driver interrupt callbacks when
+    /// the record joins the I/O Intr scan list, cancel them when it leaves.
+    ///
+    /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
+    /// report the error and leave the record Passive (dbScan.c:278-293). The
+    /// port's `setup_io_intr` runs the same demotion off
+    /// [`device::AsynRecordDevice::io_intr_receiver`]; for a *runtime* SCAN put
+    /// the failure text is what reaches the operator, in ERRS, exactly as C's
+    /// `reportError` puts it there (:617,:627,:637,:647).
+    fn set_io_intr_scan(&mut self, active: bool) {
+        if let Err(msg) = self.io_intr.set_active(active) {
+            self.errs = msg;
+        }
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn clears_udf(&self) -> bool {
+        true
+    }
+}
+
+impl AsynRecord {
+    /// The body of C's `process()` — every arm of its `state` chain. The
+    /// `done:` epilogue that closes the interrupt-cell invariant lives in the
+    /// [`Record::process`] wrapper that calls this.
+    fn process_cycle(&mut self) -> CaResult<ProcessOutcome> {
         // Completion re-entry of a non-blocking I/O cycle: the off-thread
         // orchestration filled the result slot and fired the async-record
         // token, re-entering here. This is C's `process()` `pact==TRUE`
@@ -4224,38 +4282,40 @@ impl Record for AsynRecord {
         // here is both of C's.
         self.reset_error();
 
-        // C `process()`: "If we got value from interrupt no need to read"
-        // (asynRecord.c:340-341) — `if (pasynRecPvt->gotValue) goto done`. The
-        // cycle a driver interrupt drove queues nothing: no UCMD/ACMD, no
-        // performIO, no queueRequest. It stores the pushed value, posts its
-        // monitors (the framework's field diffing, C's `monitor()`) and fires
-        // FLNK.
+        // C dispatches on `state` FIRST, and the nesting is load-bearing:
+        // `process()` is an if / else-if chain on `state` (asynRecord.c:331-361)
+        // whose `stateIdle` arm holds everything else. `stateNoDevice` — the
+        // record has no working port (`:312`, `:513`) — takes its own arm: it
+        // reports "Not connect to a port" with STATE_ALARM/MINOR and queues
+        // nothing, so a pending UCMD/ACMD stays pending for a cycle that has a
+        // port to send it to.
         //
-        // Taking the sample IS C's `gotValue = 0` at the end of process (:370):
-        // one cell, one operation — there is no window where the value has been
-        // consumed but the gate is still armed, or the other way round.
-        //
-        // The gate sits below `reset_error` (C's :339 precedes the check) and
-        // above every dispatch — including the `stateNoDevice` refusal below,
-        // which C tests at :356, *after* this — because C's `goto done` jumps
-        // past the `queueRequest` that would have run `asynCallbackProcess` at
-        // all.
-        if let Some(sample) = self.io_intr.take_sample() {
-            self.apply_io_intr_sample(sample);
-            return Ok(ProcessOutcome::complete());
-        }
-
-        // C refuses on `state` before it queues anything, and the order is
-        // load-bearing: `process()` tests `state == stateNoDevice`
-        // (asynRecord.c:356-357) — the record has no working port (`:312`, `:513`)
-        // — above the queued callback that dispatches UCMD / ACMD / performIO.
-        // So a record with no port dispatches nothing at all: it reports "Not
-        // connect to a port" with STATE_ALARM/MINOR, and a pending UCMD/ACMD stays
-        // pending for a cycle that has a port to send it to.
+        // A record with no port therefore never even *looks* at the interrupt
+        // flag; whatever a driver pushed before the port went away is discarded
+        // by `done:` (the `process` wrapper above), not published. Placing the
+        // interrupt gate above this refusal — which the wave-9 d9xg9 merge did,
+        // on a misreading of C's :340-341 as textually-above-means-first — let a
+        // portless record publish a stale interrupt value with NO_ALARM and an
+        // empty ERRS, looking healthy and freshly updated.
         let Some(entry) = self.port_entry.clone() else {
             self.report_not_connected();
             return Ok(ProcessOutcome::complete());
         };
+
+        // C `process()`, inside the `stateIdle` arm: "If we got value from
+        // interrupt no need to read" (asynRecord.c:340-341) —
+        // `if (pasynRecPvt->gotValue) goto done`. The cycle a driver interrupt
+        // drove queues nothing: no UCMD/ACMD, no performIO, no queueRequest. It
+        // stores the pushed value, posts its monitors (the framework's field
+        // diffing, C's `monitor()`) and fires FLNK.
+        //
+        // The gate sits below `reset_error` (C's :339 precedes it) and above the
+        // dispatch, because C's `goto done` jumps past the `queueRequest` that
+        // would have run `asynCallbackProcess` at all.
+        if let Some(sample) = self.io_intr.take_sample() {
+            self.apply_io_intr_sample(sample);
+            return Ok(ProcessOutcome::complete());
+        }
 
         // C asynCallbackProcess (asynRecord.c:819-827) dispatches by priority: a
         // pending UCMD universal GPIB command first, else a pending ACMD addressed
@@ -4309,30 +4369,6 @@ impl Record for AsynRecord {
 
         self.perform_io(plan)?;
         Ok(ProcessOutcome::complete())
-    }
-
-    /// C `getIoIntInfo` (asynRecord.c:582-597), reached from `dbScan`'s
-    /// `scanAdd` / `scanDelete`: register the driver interrupt callbacks when
-    /// the record joins the I/O Intr scan list, cancel them when it leaves.
-    ///
-    /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
-    /// report the error and leave the record Passive (dbScan.c:278-293). The
-    /// port's `setup_io_intr` runs the same demotion off
-    /// [`device::AsynRecordDevice::io_intr_receiver`]; for a *runtime* SCAN put
-    /// the failure text is what reaches the operator, in ERRS, exactly as C's
-    /// `reportError` puts it there (:617,:627,:637,:647).
-    fn set_io_intr_scan(&mut self, active: bool) {
-        if let Err(msg) = self.io_intr.set_active(active) {
-            self.errs = msg;
-        }
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn clears_udf(&self) -> bool {
-        true
     }
 }
 
@@ -8791,6 +8827,149 @@ mod tests {
         );
         rec.process().unwrap();
         assert_eq!(rec.i32inp, 11);
+    }
+
+    /// R12-46. C dispatches on `state` FIRST: `if (pasynRecPvt->gotValue) goto
+    /// done` (asynRecord.c:341) sits *inside* the `state == stateIdle` arm of an
+    /// if/else-if chain whose first test is `state` (:331-361). A record with no
+    /// port takes the `stateNoDevice` arm — "Not connect to a port" +
+    /// STATE_ALARM/MINOR (:356-361) — and never consults the interrupt flag at
+    /// all; `done:` then clears it (:370), so the value is DISCARDED, not
+    /// published.
+    ///
+    /// The wave-9 d9xg9 merge placed the gate above the port check, reading
+    /// C's :340-341 as textually-above-means-first. This pins the two boundaries
+    /// that inversion crossed: the refusal cycle publishes nothing and alarms,
+    /// and the sample does not survive it.
+    #[test]
+    fn an_interrupt_sample_does_not_survive_a_cycle_with_no_port() {
+        use crate::param::ParamValue;
+
+        let (rt, _reads) = io_intr_port("r12_46_no_port");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r12_46_no_port".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        // The port goes away *after* the driver pushed a value — a PORT put that
+        // fails to resolve, which nulls `port_entry` (C `stateNoDevice`).
+        rec.port = "R12_46_NO_SUCH_PORT".to_string();
+        let _ = rec.connect_device();
+        assert!(rec.port_entry.is_none(), "the record now has no port");
+
+        rec.process().unwrap();
+        assert_eq!(
+            rec.errs, "Not connect to a port",
+            "C takes the stateNoDevice arm and never looks at gotValue"
+        );
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::STATE_ALARM, AlarmSeverity::Minor),
+            "C asynRecord.c:361 alarms the refusal STATE/MINOR"
+        );
+        assert_eq!(
+            rec.i32inp, 0,
+            "the stale interrupt value was never published — a portless record \
+             must not look healthy and freshly updated"
+        );
+
+        // C's `done:` cleared `gotValue` on that refusal cycle (:370), so the
+        // value is gone for good: it cannot surface on a later cycle either.
+        rec.process().unwrap();
+        assert_eq!(
+            rec.i32inp, 0,
+            "the discarded sample does not resurface on the next cycle"
+        );
+    }
+
+    /// R12-46, the cell invariant. C clears `gotValue` when it (re)registers
+    /// (`getIoIntInfo` cmd == 0, asynRecord.c:589) — "a fresh registration never
+    /// inherits a value left over from a previous one" — and again at `done:`
+    /// (:370) on every cycle that reaches it. So a value pushed under an old
+    /// registration can never be published under a new one.
+    #[test]
+    fn a_re_armed_scan_does_not_inherit_the_previous_registrations_value() {
+        use crate::param::ParamValue;
+
+        let (rt, _reads) = io_intr_port("r12_46_rearm");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r12_46_rearm".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        // The operator moves SCAN off "I/O Intr" before the record ever
+        // processed that value, then back on: C's cmd==1 cancel followed by a
+        // cmd==0 register, which clears the flag.
+        rec.set_io_intr_scan(false);
+        rec.set_io_intr_scan(true);
+
+        rec.process().unwrap();
+        assert_eq!(
+            rec.i32inp, 42,
+            "the re-armed scan performed a real read — it did not inherit the 7 \
+             pushed under the previous registration"
+        );
+    }
+
+    /// R12-46. The companion boundary: with the port present, the gate still
+    /// fires — moving it below the port check must not disable I/O Intr mode.
+    #[test]
+    fn the_interrupt_gate_still_fires_when_the_record_has_a_port() {
+        use crate::param::ParamValue;
+
+        let (rt, reads) = io_intr_port("r12_46_with_port");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r12_46_with_port".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 7, "the interrupt value, not a read");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "C `goto done` queues no I/O on an interrupt-driven cycle"
+        );
+        assert_eq!(rec.errs, "", "an interrupt-driven cycle raises nothing");
     }
 
     /// R11-46. Each IFACE has its own callback writing its own input field:

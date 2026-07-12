@@ -105,6 +105,10 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             RequestOp::GetInputEos => Self::GetInputEos,
             RequestOp::GetOutputEos => Self::GetOutputEos,
+            RequestOp::GpibUniversalCmd { cmd } => Self::GpibUniversalCmd { cmd: *cmd },
+            RequestOp::GpibAddressedCmd { data } => Self::GpibAddressedCmd { data: data.clone() },
+            RequestOp::GpibIfc => Self::GpibIfc,
+            RequestOp::GpibRen { enable } => Self::GpibRen { enable: *enable },
         }
     }
 }
@@ -218,6 +222,10 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             PortCommand::GetInputEos => Self::GetInputEos,
             PortCommand::GetOutputEos => Self::GetOutputEos,
+            PortCommand::GpibUniversalCmd { cmd } => Self::GpibUniversalCmd { cmd: *cmd },
+            PortCommand::GpibAddressedCmd { data } => Self::GpibAddressedCmd { data: data.clone() },
+            PortCommand::GpibIfc => Self::GpibIfc,
+            PortCommand::GpibRen { enable } => Self::GpibRen { enable: *enable },
         }
     }
 }

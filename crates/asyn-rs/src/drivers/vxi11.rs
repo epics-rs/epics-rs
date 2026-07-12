@@ -249,6 +249,16 @@ impl DrvVxi11Port {
     pub fn has_hw_support() -> bool {
         cfg!(feature = "vxi11")
     }
+
+    /// The failure every VXI-11 bus operation takes while the RPC transport is
+    /// a scaffold: the C method exists and is real (`vxiWriteCmd` →
+    /// `device_docmd`), but there is nothing here to send it over.
+    fn no_transport(c_method: &str) -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{c_method}: VXI-11 RPC transport not implemented"),
+        }
+    }
 }
 
 impl PortDriver for DrvVxi11Port {
@@ -296,6 +306,36 @@ impl PortDriver for DrvVxi11Port {
             status: AsynStatus::Error,
             message: "VXI-11 hardware path not yet implemented".into(),
         })
+    }
+
+    // --- asynGpib, C `vxi11` asynGpibPort (drvVxi11.c:170-186) ---
+    //
+    // All four command methods are real in C: each frames its bytes and hands
+    // them to `vxiWriteCmd` (drvVxi11.c:454-469), which sends them over the
+    // VXI-11 `device_docmd` RPC with ATN asserted — `vxiUniversalCmd` (:1406),
+    // `vxiAddressedCmd` (:1360), `vxiIfc` (:1426), `vxiRen` (:1472).
+    //
+    // This driver is an iocsh-parity scaffold with no RPC transport (see
+    // `connect`), so every bus command fails where the transport is missing,
+    // exactly as `connect` does. The interface is still *declared*
+    // (`capabilities`): C registers asynGpib for this port, so its GPIBIV is 1,
+    // and a UCMD/ACMD must reach the driver and report the driver's own failure
+    // rather than take asynRecord's "No asynGpib interface" branch.
+
+    fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
+        Err(Self::no_transport("vxiUniversalCmd"))
+    }
+
+    fn gpib_addressed_cmd(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+        Err(Self::no_transport("vxiAddressedCmd"))
+    }
+
+    fn gpib_ifc(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        Err(Self::no_transport("vxiIfc"))
+    }
+
+    fn gpib_ren(&mut self, _user: &mut AsynUser, _enable: bool) -> AsynResult<()> {
+        Err(Self::no_transport("vxiRen"))
     }
 }
 

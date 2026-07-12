@@ -887,6 +887,45 @@ impl PortHandle {
         self.submit_blocking(RequestOp::PushDelayInterpose { delay }, AsynUser::new(0))?;
         Ok(())
     }
+
+    // --- asynGpib convenience methods ---
+    //
+    // C's `pasynGpib` is a global vtable a gpib-aware user calls after
+    // `findInterface(asynGpibType)` (asynGpibDriver.h:45-62); each method is
+    // passed straight to the driver (asynGpib.c:472-496). Here the handle *is*
+    // that vtable — ask [`Self::has_interface`] first (the `findInterface`), then
+    // call. Each takes the caller's `AsynUser` because in C the caller's
+    // `pasynUser` is what the command runs under: its `addr` selects the GPIB
+    // device (`vxiAddressedCmd` reads it with `getAddr`, drvVxi11.c:1371) and its
+    // `timeout` bounds the bus traffic.
+
+    /// C `pasynGpib->universalCmd` — send one universal command byte
+    /// (asynGpib.c:480-484). The byte comes from
+    /// [`crate::interfaces::gpib::universal_cmd_byte`].
+    pub fn gpib_universal_cmd_blocking(&self, user: AsynUser, cmd: u8) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::GpibUniversalCmd { cmd }, user)?;
+        Ok(())
+    }
+
+    /// C `pasynGpib->addressedCmd` — send an addressed-command frame
+    /// (asynGpib.c:472-478). The frame comes from
+    /// [`crate::interfaces::gpib::addressed_request`].
+    pub fn gpib_addressed_cmd_blocking(&self, user: AsynUser, data: Vec<u8>) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::GpibAddressedCmd { data }, user)?;
+        Ok(())
+    }
+
+    /// C `pasynGpib->ifc` — assert Interface Clear (asynGpib.c:486-490).
+    pub fn gpib_ifc_blocking(&self, user: AsynUser) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::GpibIfc, user)?;
+        Ok(())
+    }
+
+    /// C `pasynGpib->ren` — set the Remote Enable line (asynGpib.c:492-496).
+    pub fn gpib_ren_blocking(&self, user: AsynUser, enable: bool) -> AsynResult<()> {
+        self.submit_blocking(RequestOp::GpibRen { enable }, user)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1098,96 @@ mod tests {
         handle.set_enable_blocking(true).unwrap();
         // C `enable` fires on every transition; both calls land.
         assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// R10-55. The handle is the `pasynGpib` vtable: each of C's four command
+    /// methods (asynGpibDriver.h:47-51) reaches the driver through the actor,
+    /// carrying the caller's `AsynUser` (C passes the caller's `pasynUser`
+    /// straight through, asynGpib.c:472-496).
+    #[test]
+    fn gpib_commands_reach_the_driver_through_the_actor() {
+        use crate::interfaces::gpib::IBDCL;
+        use std::sync::Mutex as StdMutex;
+
+        static CALLS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+        struct GpibDrv(PortDriverBase);
+        impl PortDriver for GpibDrv {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<Capability> {
+                vec![
+                    Capability::Gpib,
+                    Capability::OctetRead,
+                    Capability::OctetWrite,
+                ]
+            }
+            fn gpib_universal_cmd(&mut self, user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
+                CALLS
+                    .lock()
+                    .unwrap()
+                    .push(format!("universal {cmd:#04x} addr {}", user.addr));
+                Ok(())
+            }
+            fn gpib_addressed_cmd(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+                CALLS.lock().unwrap().push(format!("addressed {data:02x?}"));
+                Ok(())
+            }
+            fn gpib_ifc(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                CALLS.lock().unwrap().push("ifc".into());
+                Ok(())
+            }
+            fn gpib_ren(&mut self, _user: &mut AsynUser, enable: bool) -> AsynResult<()> {
+                CALLS.lock().unwrap().push(format!("ren {enable}"));
+                Ok(())
+            }
+        }
+
+        let mut handle = make_handle(GpibDrv(PortDriverBase::new(
+            "gpib_vtable",
+            1,
+            PortFlags::default(),
+        )));
+        handle.set_interfaces(vec![Capability::Gpib]);
+        assert!(handle.has_interface(InterfaceType::Gpib), "findInterface");
+
+        handle
+            .gpib_universal_cmd_blocking(AsynUser::new(0).with_addr(7), IBDCL)
+            .unwrap();
+        handle
+            .gpib_addressed_cmd_blocking(AsynUser::new(0), vec![0x5f, 0x3f, 0x27, 0x08])
+            .unwrap();
+        handle.gpib_ifc_blocking(AsynUser::new(0)).unwrap();
+        handle.gpib_ren_blocking(AsynUser::new(0), true).unwrap();
+
+        assert_eq!(
+            CALLS.lock().unwrap().as_slice(),
+            [
+                "universal 0x14 addr 7",
+                "addressed [5f, 3f, 27, 08]",
+                "ifc",
+                "ren true",
+            ]
+        );
+    }
+
+    /// A port that does not implement the interface refuses every GPIB command:
+    /// in C there is no `asynGpib` interface to find at all, so the caller has
+    /// nothing to call (asynRecord checks GPIBIV first, asynRecord.c:1647).
+    #[test]
+    fn a_port_without_the_gpib_interface_refuses_the_commands() {
+        let handle = make_handle(TestDriver::new());
+        assert!(!handle.has_interface(InterfaceType::Gpib));
+
+        let err = handle
+            .gpib_universal_cmd_blocking(AsynUser::new(0), 0x14)
+            .unwrap_err();
+        assert_eq!(err.message(), "port has no asynGpib interface");
+        assert!(handle.gpib_ifc_blocking(AsynUser::new(0)).is_err());
     }
 
     /// C parity: `asynRecord` AUCT writes call

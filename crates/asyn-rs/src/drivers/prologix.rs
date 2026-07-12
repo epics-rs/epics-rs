@@ -52,7 +52,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::interfaces::gpib::{AsynGpib, GpibCommand, GpibUniversalCommand, SrqStatus};
 use crate::interpose::EomReason;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
@@ -638,22 +637,23 @@ impl PortDriver for DrvAsynPrologixPort {
         let eom = read_eom(remaining, buf.len(), eos.is_some());
         Ok((n, eom))
     }
-}
 
-/// GPIB bus-control interface, mirroring C `prologixMethods`
-/// (drvPrologixGPIB.c:527-545). Most IEEE-488 control operations are
-/// unimplemented by the Prologix bridge driver in C; only `ifc` and
-/// `srqStatus` are real. This is the first (and only) implementor of
-/// [`AsynGpib`].
-///
-/// NOTE: there is no Rust devGpib / asynManager `findInterface(asynGpibType)`
-/// discovery layer yet, so nothing in the current stack *reaches* this
-/// interface — it provides the bridge's real GPIB command behavior for a
-/// future GPIB device-support layer (the discovery wiring is a separate,
-/// larger gap, not closed here).
-impl AsynGpib for DrvAsynPrologixPort {
+    // --- asynGpib, C `prologixMethods` (drvPrologixGPIB.c:527-545) ---
+    //
+    // The bridge driver implements almost none of IEEE-488 bus control: only
+    // `ifc` is real. The rest return asynError with the driver's own text, which
+    // asynRecord splices into ERRS — the whole point of registering the
+    // interface anyway (C's GPIBIV is 1 for this port, so UCMD reaches
+    // `prologixUniversalCmd` and reports *its* failure, not "No asynGpib
+    // interface").
+    //
+    // Not ported (no in-tree consumer): `prologixSrqStatus` (:493, always 0),
+    // `prologixSrqEnable` (:500, no-op), `prologixSerialPollBegin` / `SerialPoll`
+    // / `SerialPollEnd` (:506-524, all unimplemented). They exist in C only to
+    // feed asynGpib's SRQ poll thread.
+
     /// C `prologixAddressedCmd` (drvPrologixGPIB.c:461-467): unimplemented.
-    fn addressed_cmd(&mut self, _user: &AsynUser, _cmd: GpibCommand, _addr: i32) -> AsynResult<()> {
+    fn gpib_addressed_cmd(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
         Err(AsynError::Status {
             status: AsynStatus::Error,
             message: "prologixAddressedCmd unimplemented".into(),
@@ -661,7 +661,7 @@ impl AsynGpib for DrvAsynPrologixPort {
     }
 
     /// C `prologixUniversalCmd` (drvPrologixGPIB.c:469-474): unimplemented.
-    fn universal_cmd(&mut self, _user: &AsynUser, _cmd: GpibUniversalCommand) -> AsynResult<()> {
+    fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
         Err(AsynError::Status {
             status: AsynStatus::Error,
             message: "prologixUniversalCmd unimplemented".into(),
@@ -669,42 +669,20 @@ impl AsynGpib for DrvAsynPrologixPort {
     }
 
     /// C `prologixIfc` (drvPrologixGPIB.c:476-484): assert Interface Clear by
-    /// writing the bridge command `++ifc\n` to the TCP transport.
-    fn ifc(&mut self, _user: &AsynUser) -> AsynResult<()> {
+    /// writing the bridge command `++ifc\n` to the TCP transport. C writes it
+    /// with `pasynOctetSyncIO->write(..., 1.0, &nt)` — its own 1 s timeout, not
+    /// the caller's.
+    fn gpib_ifc(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
         let mut bridge_user = AsynUser::default().with_timeout(Duration::from_secs(1));
         self.inner.write_octet(&mut bridge_user, b"++ifc\n")?;
         Ok(())
     }
 
     /// C `prologixRen` (drvPrologixGPIB.c:486-491): unimplemented.
-    fn ren(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
+    fn gpib_ren(&mut self, _user: &mut AsynUser, _enable: bool) -> AsynResult<()> {
         Err(AsynError::Status {
             status: AsynStatus::Error,
             message: "prologixRen unimplemented".into(),
-        })
-    }
-
-    /// C `prologixSrqStatus` (drvPrologixGPIB.c:493-498): always reports SRQ
-    /// not asserted (`*srqStatus = 0`) — the bridge driver does not surface
-    /// SRQ state.
-    fn srq_status(&self, _user: &AsynUser) -> AsynResult<SrqStatus> {
-        Ok(SrqStatus {
-            srq_asserted: false,
-            status_byte: None,
-        })
-    }
-
-    /// C `prologixSrqEnable` (drvPrologixGPIB.c:500-504): no-op success.
-    fn srq_enable(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
-        Ok(())
-    }
-
-    /// C `prologixSerialPoll` (drvPrologixGPIB.c:513-518): unimplemented
-    /// (serialPollBegin / serialPoll / serialPollEnd all return asynError).
-    fn serial_poll(&mut self, _user: &AsynUser) -> AsynResult<u8> {
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "prologixSerialPoll unimplemented".into(),
         })
     }
 }
@@ -873,15 +851,16 @@ mod tests {
         );
     }
 
-    /// DRV-50: `AsynGpib::ifc` asserts Interface Clear by writing `++ifc\n`
-    /// to the bridge (C `prologixIfc`, drvPrologixGPIB.c:476-484).
+    /// DRV-50 / R10-55: `PortDriver::gpib_ifc` asserts Interface Clear by
+    /// writing `++ifc\n` to the bridge (C `prologixIfc`,
+    /// drvPrologixGPIB.c:476-484).
     #[test]
     fn gpib_ifc_writes_bridge_command() {
         let (port, rx) = start_mock_bridge();
         let mut drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
         drv.connect(&AsynUser::default().with_addr(-1)).unwrap();
 
-        drv.ifc(&AsynUser::default().with_timeout(Duration::from_secs(2)))
+        drv.gpib_ifc(&mut AsynUser::default().with_timeout(Duration::from_secs(2)))
             .unwrap();
 
         drv.disconnect(&AsynUser::default().with_addr(-1)).unwrap();
@@ -893,29 +872,27 @@ mod tests {
         assert_eq!(&s[init_end..], "++ifc\n", "ifc must write ++ifc\\n");
     }
 
-    /// DRV-50: the GPIB command interface matches C `prologixMethods`
-    /// (drvPrologixGPIB.c:527-545) — `srqStatus` reports not-asserted,
-    /// `srqEnable` is a no-op success, and every other operation is
-    /// unimplemented (asynError).
+    /// DRV-50 / R10-55: the GPIB command interface matches C `prologixMethods`
+    /// (drvPrologixGPIB.c:527-545) — `ifc` is the only real bus operation; the
+    /// other three report the C driver's own "unimplemented" text, which is what
+    /// a UCMD/ACMD put lands in ERRS.
     #[test]
     fn gpib_command_interface_matches_c_methods() {
         let mut drv = DrvAsynPrologixPort::new("p", "127.0.0.1:1234", false).unwrap();
-        let user = AsynUser::default();
+        let mut user = AsynUser::default();
 
-        // srqStatus: always not asserted (C *srqStatus = 0).
-        let srq = drv.srq_status(&user).unwrap();
-        assert!(!srq.srq_asserted);
-        assert_eq!(srq.status_byte, None);
+        let err = drv
+            .gpib_universal_cmd(&mut user, crate::interfaces::gpib::IBDCL)
+            .unwrap_err();
+        assert_eq!(err.message(), "prologixUniversalCmd unimplemented");
 
-        // srqEnable: no-op success.
-        assert!(drv.srq_enable(&user, true).is_ok());
-        assert!(drv.srq_enable(&user, false).is_ok());
+        let err = drv
+            .gpib_addressed_cmd(&mut user, &[0x5f, 0x3f, 0x27, 0x08, 0x5f, 0x3f])
+            .unwrap_err();
+        assert_eq!(err.message(), "prologixAddressedCmd unimplemented");
 
-        // The rest are unimplemented in C → asynError.
-        assert!(drv.addressed_cmd(&user, GpibCommand::GET, 7).is_err());
-        assert!(drv.universal_cmd(&user, GpibUniversalCommand::DCL).is_err());
-        assert!(drv.ren(&user, true).is_err());
-        assert!(drv.serial_poll(&user).is_err());
+        let err = drv.gpib_ren(&mut user, true).unwrap_err();
+        assert_eq!(err.message(), "prologixRen unimplemented");
     }
 
     #[test]

@@ -59,6 +59,13 @@ pub struct LonginRecord {
     pub siml: String,
     #[field(type = "String")]
     pub siol: String,
+    // SVAL is `DBF_LONG` (longinRecord.dbd.pod:466-468) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
+    // &prec->sval)`, longinRecord.c:416) before publishing `val = sval`. An
+    // unset (constant) SIOL reads status 0 without touching it, which is what
+    // makes `caput REC.SIMM 1; caput REC.SVAL 42` simulate against a constant.
+    #[field(type = "Long")]
+    pub sval: i32,
     #[field(type = "Short")]
     pub sims: i16,
 }
@@ -89,6 +96,7 @@ impl Default for LonginRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
         }
     }

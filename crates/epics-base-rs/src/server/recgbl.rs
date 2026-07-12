@@ -1,5 +1,7 @@
 use crate::server::record::{AlarmSeverity, CommonFields};
 
+pub mod simm;
+
 /// Alarm status codes matching EPICS base's `menuAlarmStat.dbd` /
 /// `epicsAlarmCondition` (libcom/src/misc/alarm.h) wire format. The
 /// numeric values are baked into the CA wire protocol's `stat` byte,

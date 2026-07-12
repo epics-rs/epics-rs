@@ -4835,6 +4835,116 @@ impl PvDatabase {
         }
     }
 
+    /// C `dbGetLink` / `dbTryGetLink` on a SIMULATION link (SIML or SIOL),
+    /// classified into the three outcomes C's `(status, buffer)` pair can
+    /// carry — see [`crate::server::recgbl::simm::SimLinkFetch`].
+    ///
+    /// The generic [`Self::read_link_value_no_process`] collapses two of them:
+    /// it hands back the CONSTANT link's parsed text as if the link had
+    /// delivered it this cycle, and `None` both for "constant with nothing to
+    /// give" and for "the read failed". C keeps them apart —
+    /// `dbConstGetValue` (`dbConstLink.c:219-225`) returns SUCCESS and writes
+    /// nothing, because a constant's value was already loaded into the
+    /// record's buffer at `init_record` — and every simulation-mode decision
+    /// hangs off that distinction. So the simulation path gets its own
+    /// classifier; the constant's value still reaches the record, through
+    /// [`Self::rec_gbl_init_simm`].
+    pub(crate) async fn fetch_sim_link(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> crate::server::recgbl::simm::SimLinkFetch {
+        use crate::server::recgbl::simm::SimLinkFetch;
+        if crate::server::recgbl::simm::is_constant(link) {
+            return SimLinkFetch::NoData;
+        }
+        match self.read_link_value_no_process(link).await {
+            Some(v) => SimLinkFetch::Value(v),
+            None => SimLinkFetch::Failed,
+        }
+    }
+
+    /// C `recGblGetSimm` (`recGbl.c:448-457`) — **the single owner of the
+    /// SIMM transition at process time**, and the only site allowed to write
+    /// SIMM from SIML.
+    ///
+    /// ```c
+    /// recGblSaveSimm(*psscn, poldsimm, *psimm);
+    /// status = dbTryGetLink(psiml, DBR_USHORT, psimm, 0);
+    /// if (status && !pcommon->nsev) pcommon->nsta = LINK_ALARM;
+    /// recGblCheckSimm(pcommon, psscn, *poldsimm, *psimm);
+    /// ```
+    ///
+    /// Called from `check_simulation_mode` on every `pact == FALSE` entry —
+    /// C's `if (!prec->pact)` guard around it (aiRecord.c:475).
+    pub(crate) async fn rec_gbl_get_simm(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+        siml: &crate::server::record::ParsedLink,
+    ) {
+        use crate::server::recgbl::simm::SimLinkFetch;
+        // `dbTryGetLink`: a CONSTANT (or unset) SIML delivers NOTHING here —
+        // its value was loaded into SIMM once, at init (`rec_gbl_init_simm`).
+        // So a `caput REC.SIMM YES` on a record with a constant SIML STAYS
+        // YES; re-reading the constant every cycle (the pre-fix behaviour of
+        // `read_link_value_no_process`) would stomp the operator's put back to
+        // the constant on the very next process.
+        if let SimLinkFetch::Value(v) = self.fetch_sim_link(siml).await {
+            let simm = v.to_f64().unwrap_or(0.0) as i16;
+            let mut instance = rec.write().await;
+            let _ = instance
+                .record
+                .put_field_internal("SIMM", EpicsValue::Short(simm));
+        }
+    }
+
+    /// C `recGblInitSimm` (`recGbl.c:439-446`) plus the
+    /// `recGblInitConstantLink(&prec->siol, …, &prec->sval)` that every
+    /// SIML/SIOL-bearing `init_record` pairs with it (longinRecord.c:99-100,
+    /// aiRecord.c:103-104, busyRecord.c:138, swaitRecord.c:663-670).
+    ///
+    /// A CONSTANT link hands its value to the record exactly ONCE, here, via
+    /// `dbLoadLink` — at process time `dbGetLink` on a constant delivers
+    /// nothing. This is the other half of the rule
+    /// [`Self::fetch_sim_link`] enforces; without it a `field(SIOL, "42")`
+    /// would never reach SVAL at all.
+    ///
+    /// Must be called once per record, after its fields are applied — the
+    /// `init_record(1)` sites (`ioc_builder`, `dbLoadRecords`).
+    pub(crate) async fn rec_gbl_init_simm(&self, rec: &Arc<RwLock<RecordInstance>>) {
+        let mut instance = rec.write().await;
+        // No SIMM field -> no simulation block -> nothing to init.
+        if instance.record.get_field("SIMM").is_none() {
+            return;
+        }
+        let link_of = |instance: &RecordInstance, field: &str| {
+            instance.record.get_field(field).and_then(|v| {
+                if let EpicsValue::String(s) = v {
+                    Some(crate::server::record::parse_link_v2(
+                        s.as_str_lossy().as_ref(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        };
+        // `if (dbLinkIsConstant(psiml)) dbLoadLink(psiml, DBF_USHORT, psimm);`
+        if let Some(siml) = link_of(&instance, "SIML") {
+            if let Some(v) = crate::server::recgbl::simm::constant_load_value(&siml) {
+                let _ = instance.record.put_field_internal("SIMM", v);
+            }
+        }
+        // `recGblInitConstantLink(&prec->siol, DBF_<sval>, &prec->sval)` — the
+        // records with no SVAL (waveform/aai read into `bptr`, lsi into `val`)
+        // load nothing here, exactly as their C `init_record` does.
+        if instance.record.get_field("SVAL").is_some() {
+            if let Some(siol) = link_of(&instance, "SIOL") {
+                if let Some(v) = crate::server::recgbl::simm::constant_load_value(&siol) {
+                    let _ = instance.record.put_field_internal("SVAL", v);
+                }
+            }
+        }
+    }
+
     /// Check simulation mode for a record. Returns
     /// `SimOutcome::Simulated` when a simulated INPUT handled the value (the
     /// caller still runs the forward-link tail),
@@ -4961,8 +5071,17 @@ impl PvDatabase {
                 .and_then(|v| v.to_f64())
                 .unwrap_or(-1.0);
 
-            if siml.is_empty() && siol.is_empty() {
-                return SimOutcome::NotSimulated; // No simulation configured
+            // The entry gate is the SIM BLOCK's own marker — the SIMM field.
+            // C's `readValue`/`writeValue` exists only on a record whose dbd
+            // declares SIMM, and it dispatches on SIMM alone; the SIML/SIOL
+            // links are read INSIDE that dispatch, never as a precondition for
+            // it. Gating on "SIML and SIOL are both empty" (the pre-fix gate)
+            // made `caput REC.SIMM 1` + `caput REC.SVAL 42` — simulate against
+            // a constant, the standard idiom — a complete no-op on every
+            // record, because an unset SIOL is exactly the case C serves from
+            // SVAL (R12-61).
+            if instance.record.get_field("SIMM").is_none() {
+                return SimOutcome::NotSimulated; // no simulation block
             }
 
             let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
@@ -5005,34 +5124,28 @@ impl PvDatabase {
         // entry persists SIMM via `put_field` below, so a later held
         // continuation reads it back latched. (The pre-fix port only read a
         // `ParsedLink::Db` SIML, ignoring a CA/PVA/constant source.)
+        //
+        // The read itself goes through the SIMM transition owner
+        // (`rec_gbl_get_simm`, C `recGblGetSimm`), which is the ONLY site that
+        // writes SIMM.
         if !pact_held {
-            if let Some(val) = self.read_link_value_no_process(&siml_link).await {
-                let simm_val = val.to_f64().unwrap_or(0.0) as i16;
-                let mut instance = rec.write().await;
-                let _ = instance
-                    .record
-                    .put_field("SIMM", EpicsValue::Short(simm_val));
-            }
+            self.rec_gbl_get_simm(rec, &siml_link).await;
         }
 
         // Check SIMM
-        let simm = {
+        let mode = {
             let instance = rec.read().await;
-            instance
-                .record
-                .get_field("SIMM")
-                .and_then(|v| {
-                    if let EpicsValue::Short(s) = v {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0)
+            crate::server::recgbl::simm::SimMode::from_index(
+                instance
+                    .record
+                    .get_field("SIMM")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0) as i16,
+            )
         };
 
-        if simm == 0 {
-            return SimOutcome::NotSimulated; // NO simulation, proceed normally
+        if !mode.is_simulated() {
+            return SimOutcome::NotSimulated; // menuSimmNO — proceed normally
         }
 
         // epics-base 7.0.7 (SIMM menu):
@@ -5043,7 +5156,7 @@ impl PvDatabase {
         //             implementation, which treats records lacking
         //             a raw value as "YES" since there's nothing
         //             else to copy.
-        let raw_mode = simm == 2;
+        let raw_mode = mode == crate::server::recgbl::simm::SimMode::Raw;
 
         // SDLY async simulation — C `aiRecord.c::readValue` (488) /
         // `aoRecord.c::writeValue` (571): `if (prec->pact || prec->sdly < 0)`
@@ -5079,14 +5192,21 @@ impl PvDatabase {
         // the PENDING alarm (`rec_gbl_set_sevr` is C's MAXIMIZE) before the body
         // runs, so a body-raised alarm maximizes against it exactly as in C.
         if input_stage {
-            let siol_val = self.read_link_value_no_process(&siol_link).await;
+            let fetch = self.fetch_sim_link(&siol_link).await;
             let mut instance = rec.write().await;
-            // C `:417-420` — a FAILED read changes neither VAL nor UDF; only the
-            // SIMM_ALARM below is unconditional.
-            if let Some(siol_val) = siol_val {
-                let sval = EpicsValue::Double(siol_val.to_f64().unwrap_or(0.0));
-                let _ = instance.record.put_field_internal("SVAL", sval.clone());
-                let _ = instance.record.set_val(sval);
+            // C `:417-420` — `if (status == 0) { val = sval; udf = FALSE; }`.
+            // A CONSTANT (or unset) SIOL is `status == 0` with SVAL untouched
+            // (`dbConstGetValue`), so it still copies SVAL into VAL; only a
+            // FAILED read changes neither VAL nor UDF. The SIMM_ALARM below is
+            // unconditional either way.
+            if fetch.is_ok() {
+                if let crate::server::recgbl::simm::SimLinkFetch::Value(v) = fetch {
+                    let sval = EpicsValue::Double(v.to_f64().unwrap_or(0.0));
+                    let _ = instance.record.put_field_internal("SVAL", sval);
+                }
+                if let Some(sval) = instance.record.get_field("SVAL") {
+                    let _ = instance.record.set_val(sval);
+                }
                 instance.common.udf = false;
             }
             let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
@@ -5138,11 +5258,49 @@ impl PvDatabase {
         // `readValue` precedes the body, so the SIOL read + convert are done
         // in place and the caller short-circuits.
         {
-            // Read from SIOL -> set VAL/RVAL. Uniform across Db (with
-            // locality fallback) / Ca / Pva / constant via
-            // `read_link_value_no_process` (C `dbGetLink`).
-            if let Some(siol_val) = self.read_link_value_no_process(&siol_link).await {
-                let mut instance = rec.write().await;
+            // Read from SIOL -> SVAL -> VAL/RVAL. Uniform across Db (with
+            // locality fallback) / Ca / Pva / constant via `fetch_sim_link`
+            // (C `dbGetLink`), which keeps C's three outcomes apart: a value,
+            // a CONSTANT link's "status 0 with the buffer untouched", and a
+            // failure.
+            let fetch = self.fetch_sim_link(&siol_link).await;
+            let mut instance = rec.write().await;
+
+            // C's SIOL read buffer is `&prec->sval` on every scalar SIML/SIOL
+            // record (`longinRecord.c:416` `dbGetLink(&prec->siol, DBR_LONG,
+            // &prec->sval)`, then `prec->val = prec->sval`). The records with
+            // no SVAL field read straight into the value —
+            // `waveform`/`aai` into `bptr` (waveformRecord.c:351), `lsi` into
+            // `val` (lsiRecord.c:244) — so for them the fetched value IS the
+            // landed value and a constant SIOL lands nothing.
+            //
+            // Routing the read through SVAL is what makes `caput REC.SIMM 1;
+            // caput REC.SVAL 42` work (R12-61): the unset SIOL delivers no
+            // data (status 0), and C's `val = sval` then publishes the SVAL
+            // the operator wrote.
+            let has_sval = instance.record.get_field("SVAL").is_some();
+            let landed: Option<EpicsValue> = match &fetch {
+                crate::server::recgbl::simm::SimLinkFetch::Value(v) => {
+                    if has_sval {
+                        // `put_field_internal` is the DBR-coercion owner
+                        // (C `dbGetLink(DBF_<sval>)`).
+                        let _ = instance.record.put_field_internal("SVAL", v.clone());
+                        instance.record.get_field("SVAL")
+                    } else {
+                        Some(v.clone())
+                    }
+                }
+                crate::server::recgbl::simm::SimLinkFetch::NoData => {
+                    if has_sval {
+                        instance.record.get_field("SVAL")
+                    } else {
+                        None
+                    }
+                }
+                crate::server::recgbl::simm::SimLinkFetch::Failed => None,
+            };
+
+            if let Some(siol_val) = landed {
                 let target_supports_raw = raw_mode && instance.record.get_field("RVAL").is_some();
                 if target_supports_raw {
                     // PR #ac92e3e follow-up: SIMM=RAW on records
@@ -5205,10 +5363,18 @@ impl PvDatabase {
                     // VAL; no conversion to run.
                     let _ = instance.record.set_val(siol_val);
                 }
-                // Simulation alarm + per-field monitor tail — see
-                // `sim_process_tail`.
-                sim_process_tail(&mut instance, sims);
             }
+
+            // Simulation alarm + per-field monitor tail — see
+            // `sim_process_tail`. C raises `recGblSetSevr(prec, SIMM_ALARM,
+            // prec->sims)` at the TOP of the SIMM branch, BEFORE the SIOL read
+            // (longinRecord.c:413-414), and `process()` runs its
+            // timestamp/alarm/monitor/forward-link tail whatever the read
+            // returned — so the tail is unconditional, not gated on a value
+            // having landed (R12-61). UDF is the one part C does gate on the
+            // read's status (`if (status == 0) prec->udf = FALSE`), and a
+            // constant SIOL is status 0.
+            sim_process_tail(&mut instance, sims, fetch.is_ok());
         }
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
@@ -5263,11 +5429,15 @@ impl PvDatabase {
 /// result — every simulated cycle re-sent unchanged alarm fields,
 /// stamped `DBE_ALARM` on cycles whose alarm state never moved, and
 /// bypassed the MDEL/ADEL deadband entirely.
-fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
+fn sim_process_tail(instance: &mut RecordInstance, sims: i16, clear_udf: bool) {
     use crate::server::recgbl::EventMask;
 
     apply_timestamp(&mut instance.common, true);
-    instance.common.udf = false;
+    // C clears UDF only on a `status == 0` SIOL read (`longinRecord.c:418`,
+    // `waveformRecord.c:352`) — a failed read leaves the record undefined.
+    if clear_udf {
+        instance.common.udf = false;
+    }
 
     let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
     crate::server::recgbl::rec_gbl_set_sevr(

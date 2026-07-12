@@ -215,16 +215,21 @@ impl IocBuilder {
             // the .db path only: an inline record has no parsed common
             // fields to classify or fold.
             if let Some(rec_arc) = db.get_record(&name).await {
-                let mut instance = rec_arc.write().await;
-                if let Err(e) = instance.record.init_record(0) {
-                    eprintln!("init_record(0) failed for {name}: {e}");
+                {
+                    let mut instance = rec_arc.write().await;
+                    if let Err(e) = instance.record.init_record(0) {
+                        eprintln!("init_record(0) failed for {name}: {e}");
+                    }
+                    if let Err(e) = instance.record.init_record(1) {
+                        eprintln!("init_record(1) failed for {name}: {e}");
+                    }
+                    // Seed MLST/ALST/LALM from val so the first process posts a
+                    // monitor only on a real change (C init_record invariant).
+                    instance.record.seed_deadband_tracking();
                 }
-                if let Err(e) = instance.record.init_record(1) {
-                    eprintln!("init_record(1) failed for {name}: {e}");
-                }
-                // Seed MLST/ALST/LALM from val so the first process posts a
-                // monitor only on a real change (C init_record invariant).
-                instance.record.seed_deadband_tracking();
+                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
+                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
+                db.rec_gbl_init_simm(&rec_arc).await;
             }
         }
 
@@ -334,6 +339,14 @@ impl IocBuilder {
                 // may have changed val) so the first process posts a monitor
                 // only on a real change (C init_record invariant).
                 instance.record.seed_deadband_tracking();
+
+                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
+                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
+                // The lock is released and retaken by the owner, which is the
+                // only site allowed to load a constant SIML/SIOL.
+                drop(instance);
+                db.rec_gbl_init_simm(&rec_arc).await;
+                let mut instance = rec_arc.write().await;
 
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();

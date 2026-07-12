@@ -23,6 +23,10 @@ pub struct MbbiDirectRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    // SVAL is `DBF_LONG` (mbbiDirectRecord.dbd.pod:203-205) — the BUFFER C's
+    // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_LONG,
+    // &prec->sval)`, mbbiDirectRecord.c:283) before publishing `val = sval`.
+    pub sval: i32,
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
@@ -47,6 +51,7 @@ impl Default for MbbiDirectRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: 0,
             sims: 0,
             sdly: -1.0,
             skip_convert: false,

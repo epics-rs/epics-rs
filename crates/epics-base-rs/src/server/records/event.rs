@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_YES_NO, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// `event` record — software-event source.
 ///
@@ -28,6 +28,10 @@ pub struct EventRecord {
     pub simm: i16,
     pub siml: String,
     pub siol: String,
+    /// SVAL is `DBF_STRING` (eventRecord.dbd.pod:143-145) — the BUFFER C's
+    /// `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_STRING,
+    /// &prec->sval)`, eventRecord.c:185) before publishing `val = sval`.
+    pub sval: PvString,
     pub sims: i16,
 }
 
@@ -66,6 +70,7 @@ impl Default for EventRecord {
             simm: 0,
             siml: String::new(),
             siol: String::new(),
+            sval: PvString::new(),
             sims: 0,
         }
     }

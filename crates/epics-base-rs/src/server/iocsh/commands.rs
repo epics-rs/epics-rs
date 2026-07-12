@@ -1188,6 +1188,11 @@ fn cmd_db_load_records() -> CommandDef {
                             inst.record.init_links(&inst.common);
                         }
                     }
+                    // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
+                    // &sval)`, run from every SIML-bearing `init_record`
+                    // (pass 1) — the only site that loads a constant
+                    // SIML/SIOL into SIMM/SVAL.
+                    ctx.db().rec_gbl_init_simm(&rec_arc).await;
                     Ok(())
                 });
                 if let Err(e) = added {

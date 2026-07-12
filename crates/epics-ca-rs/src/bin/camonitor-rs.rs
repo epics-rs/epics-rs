@@ -6,8 +6,8 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, base_style, format_value, sevr_to_str,
-    stat_to_str,
+    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, base_style, format_value,
+    sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 
@@ -356,7 +356,13 @@ async fn monitor_pv(
                 .unwrap_or_default();
                 drop(fs);
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
+                let rendered = format_value(
+                    &snap.value,
+                    &fmt,
+                    enum_strings,
+                    req_elems_present,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = snap.value.count() == 1;
                 let name_col = if is_scalar && sep == ' ' {
                     format!("{pv_name:<width$}", width = PV_NAME_WIDTH)

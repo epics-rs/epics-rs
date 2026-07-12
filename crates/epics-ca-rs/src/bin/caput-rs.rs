@@ -3,8 +3,8 @@ use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str, stat_to_str,
-    zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str,
+    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
@@ -23,10 +23,18 @@ fn format_server_timestamp(ts: WallTime) -> String {
 /// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
 fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> String {
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-    // caput has no `-#` element-count flag, so req_elems is always false:
-    // an array count prefix is emitted only when the array length itself
-    // exceeds 1 (matches C `caget.c` / `tool_lib.c` PRN_TIME_VAL_STS gating).
-    let val = format_value(&snap.value, fmt, enum_strings, false);
+    // C `caput.c:535,583` calls its `caget()` with `reqElems = 0`, so the
+    // count prefix reduces to `nElems > 1` and the `-S` long-string gate to
+    // `reqElems(0) || reqElems_pv > 1` — `req_elems` is always false here even
+    // though `-#` is accepted on the command line (its value is overwritten
+    // before the put, `caput.c:418,441`).
+    let val = format_value(
+        &snap.value,
+        fmt,
+        enum_strings,
+        false,
+        CountPrefix::IfRequestedOrArray,
+    );
     let ts = format_server_timestamp(snap.timestamp);
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
@@ -71,7 +79,7 @@ fn readback_line(
         // C treats a timed-out read exactly like a successful one here: the
         // zeroed buffer is still a buffer (see `zero_readback`).
         Readback::Value(v, snap) | Readback::TimedOut(v, snap) => {
-            let rendered = format_value(v, fmt, None, false);
+            let rendered = format_value(v, fmt, None, false, CountPrefix::IfRequestedOrArray);
             if terse {
                 return Some(rendered);
             }

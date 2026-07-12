@@ -3,7 +3,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, base_style,
+    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, base_style,
     ca_error_marker, dbr_value_field_type, format_c_g, format_value, sevr_to_str, stat_to_str,
     zero_dbr_snapshot, zero_dbr_value,
 };
@@ -449,6 +449,7 @@ fn specified_dbr_report(
     req_type: u16,
     snap: &Snapshot,
     fmt: &ValueFormat,
+    req_elems: bool,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -471,10 +472,18 @@ fn specified_dbr_report(
         let _ = writeln!(out, "    Class Name:       {cn}");
     } else {
         let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-        // C's specifiedDbr Value line joins elements WITHOUT a leading
-        // count (unlike plain mode), so render with req_elems_present=false;
-        // a scalar therefore renders as the bare value.
-        let rendered = format_value(&snap.value, fmt, enum_strings, false);
+        // C `caget.c:328-334`: this block already printed `Element count:` on
+        // its own line, so its Value loop joins the elements BARE — there is
+        // no `printf("%lu%c", nElems, ...)` here, unlike the plain/terse loop
+        // at `:286`. `reqElems` still reaches the `-S` long-string gate
+        // (`caget.c:318`), so it is passed through unchanged.
+        let rendered = format_value(
+            &snap.value,
+            fmt,
+            enum_strings,
+            req_elems,
+            CountPrefix::Never,
+        );
         let _ = writeln!(out, "    Element count:    {}", snap.value.count());
         let _ = writeln!(out, "    Value:            {rendered}");
         let ext = dbr_extended_str(req_type, snap);
@@ -887,9 +896,10 @@ async fn main() {
 
     let fmt = args.value_format();
     let sep = fmt.field_separator;
-    // C `caget.c:286` gates the array count prefix on
-    // `reqElems || nElems > 1`. `reqElems` is non-zero iff the user
-    // passed `-#` on the command line.
+    // C's `reqElems` — non-zero iff the user passed `-#`. It feeds BOTH the
+    // plain/terse count-prefix gate (`caget.c:286`) and the `-S` long-string
+    // gate on every block (`caget.c:273,318`); the specifiedDbr Value loop
+    // takes the second but not the first (`CountPrefix::Never`).
     let req_elems_present = args.max_elements.is_some();
     // Mirror C `caget.c::main` (line 260): pad the PV name column to
     // 30 characters only when the value is a scalar AND the field
@@ -910,7 +920,13 @@ async fn main() {
     {
         match result {
             Ok(GetResult::Plain(value)) => {
-                let rendered = format_value(value, &fmt, None, req_elems_present);
+                let rendered = format_value(
+                    value,
+                    &fmt,
+                    None,
+                    req_elems_present,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = value.count() == 1;
                 if mode == OutputMode::Terse {
                     println!("{rendered}");
@@ -926,7 +942,13 @@ async fn main() {
                 // fields) on NO_ALARM. Mirror that exactly using the
                 // alarm pair the DBR_TIME response carried.
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(&snap.value, &fmt, enum_strings, req_elems_present);
+                let rendered = format_value(
+                    &snap.value,
+                    &fmt,
+                    enum_strings,
+                    req_elems_present,
+                    CountPrefix::IfRequestedOrArray,
+                );
                 let is_scalar = snap.value.count() == 1;
                 let ts = format_server_timestamp(snap.timestamp);
                 let stat = snap.alarm.status;
@@ -956,7 +978,14 @@ async fn main() {
             }) => {
                 print!(
                     "{}",
-                    specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
+                    specified_dbr_report(
+                        pv_name,
+                        *native,
+                        *req_type,
+                        snap,
+                        &fmt,
+                        req_elems_present
+                    )
                 );
             }
             Err(e) => {
@@ -1054,8 +1083,8 @@ mod tests {
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
     use epics_base_rs::types::WallTime;
     use epics_base_rs::types::{
-        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_STRING,
-        DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_LONG,
+        DBR_STRING, DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
     use epics_ca_rs::cli::{
         EPICS_EPOCH_UNIX_SECS, FloatFormat, FloatStyle, ValueFormat, zero_dbr_snapshot,
@@ -1329,6 +1358,7 @@ mod tests {
             DBR_CTRL_DOUBLE,
             &snap,
             &ValueFormat::default(),
+            false,
         );
         assert!(out.starts_with("ai:temp\n"), "{out}");
         assert!(out.contains("    Native data type: DBF_DOUBLE\n"), "{out}");
@@ -1396,6 +1426,7 @@ mod tests {
                 DBR_CTRL_DOUBLE,
                 &snap,
                 &fmt,
+                false,
             );
             assert!(
                 out.contains("    Lo disp limit:    8.76543\n"),
@@ -1423,11 +1454,45 @@ mod tests {
             DBR_CTRL_DOUBLE,
             &snap,
             &f9,
+            false,
         );
         assert!(
             out.contains("    Value:            1.500000000\n"),
             "-f 9 must still reach the Value line: {out}"
         );
+    }
+
+    /// C `caget.c:317-335`: the specifiedDbr block prints `Element count:` on
+    /// its own line and then a BARE value loop — unlike the plain loop at
+    /// `:286` it carries no `printf("%lu%c", nElems, sep)` count prefix.
+    ///
+    /// Pre-fix, `format_value`'s array renderers prefixed the count whenever
+    /// `total > 1` regardless of the `false` passed here, so `caget -d
+    /// DBR_LONG` on a 3-element array printed `Value:            3 10 20 30`
+    /// where C prints `Value:            10 20 30`.
+    #[test]
+    fn specified_report_value_line_has_no_count_prefix() {
+        let snap = Snapshot::new(
+            EpicsValue::LongArray(vec![10, 20, 30]),
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        );
+        for req_elems in [false, true] {
+            let out = specified_dbr_report(
+                "wf:x",
+                Some(DbFieldType::Long),
+                DBR_LONG,
+                &snap,
+                &ValueFormat::default(),
+                req_elems,
+            );
+            assert!(out.contains("    Element count:    3\n"), "{out}");
+            assert!(
+                out.contains("    Value:            10 20 30\n"),
+                "the -d Value loop is bare (req_elems={req_elems}): {out}"
+            );
+        }
     }
 
     /// C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
@@ -1447,6 +1512,7 @@ mod tests {
             DBR_CLASS_NAME,
             &snap,
             &ValueFormat::default(),
+            false,
         );
         assert!(
             out.contains("    Request type:     DBR_CLASS_NAME\n"),

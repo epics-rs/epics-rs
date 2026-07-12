@@ -1287,18 +1287,32 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Whether this record type owns the simulation-mode SCAN swap — the C
-    /// `field(SSCN)` + `field(OLDSIMM)` pair, and the `special(SPC_MOD)` on SIMM
-    /// that routes to `recGblSaveSimm` / `recGblCheckSimm` (`recGbl.c:421-437`).
+    /// Whether this record type's support reads SIML through the `recGbl`
+    /// simulation helpers (`recGblGetSimm`/`recGblInitSimm`, and therefore
+    /// `recGblSaveSimm`/`recGblCheckSimm`) rather than a bare `dbGetLink`.
+    ///
+    /// ONE C fact, two consequences — which is why it is one predicate:
+    ///
+    /// - **The SCAN swap.** The helpers take `&prec->sscn` and `&prec->oldsimm`,
+    ///   so only a record that declares those fields can call them, and only
+    ///   such a record swaps SCAN with SSCN on a SIMM transition
+    ///   (`recGblCheckSimm`, `recGbl.c:427-437`).
+    /// - **The alarm on a failed SIML read.** `recGblGetSimm` reads SIML with
+    ///   `dbTryGetLink` — which does NOT call `setLinkAlarm` — and then raises
+    ///   the alarm itself, by writing `nsta` DIRECTLY:
+    ///   `if (status && !pcommon->nsev) pcommon->nsta = LINK_ALARM;`
+    ///   (`recGbl.c:454`). SEVR is left alone. A record reading SIML with a
+    ///   plain `dbGetLink` (`busyRecord.c:399`, `swaitRecord.c:402`) instead
+    ///   gets `setLinkAlarm` (`dbLink.c:319-323`) →
+    ///   `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`, a full severity raise.
     ///
     /// The 21 base records that declare SSCN answer `true`; `busy` and `swait`
-    /// carry SIMM/SIML/SIOL but neither SSCN nor OLDSIMM, and their C never
-    /// calls either function — a SIMM transition must leave their SCAN alone.
-    /// Records with no simulation block answer `false` trivially.
+    /// carry SIMM/SIML/SIOL but neither SSCN nor OLDSIMM. Records with no
+    /// simulation block answer `false` trivially.
     ///
     /// The default consults [`record_type_has_sscn`](crate::server::recgbl::simm::record_type_has_sscn),
     /// which is enumerated from the C dbd files, so no record has to restate it.
-    fn has_sim_mode_scan(&self) -> bool {
+    fn uses_recgbl_simm_helpers(&self) -> bool {
         crate::server::recgbl::simm::record_type_has_sscn(self.record_type())
     }
 

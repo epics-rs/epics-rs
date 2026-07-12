@@ -1391,7 +1391,7 @@ impl RecordInstance {
     /// A record type with no SSCN/OLDSIMM in its C dbd (`busy`, `swait`) passes
     /// neither pointer to any recGbl helper: no-op here.
     pub fn rec_gbl_save_simm(&mut self) {
-        if !self.record.has_sim_mode_scan() {
+        if !self.record.uses_recgbl_simm_helpers() {
             return;
         }
         if self.common.sscn == SimModeScan::DoNotUse {
@@ -1432,7 +1432,7 @@ impl RecordInstance {
     /// the SIMM value moved — C `special(SPC_MOD)` pass 1, and the tail of
     /// `recGblGetSimm`/`recGblInitSimm`.
     pub fn rec_gbl_check_simm(&mut self) -> CommonFieldPutResult {
-        if !self.record.has_sim_mode_scan() {
+        if !self.record.uses_recgbl_simm_helpers() {
             return CommonFieldPutResult::NoChange;
         }
         let SimModeScan::Scan(sim_scan) = self.common.sscn else {

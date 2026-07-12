@@ -4894,12 +4894,43 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour of
         // `read_link_value_no_process`) would stomp the operator's put back to
         // the constant on the very next process.
-        if let SimLinkFetch::Value(v) = self.fetch_sim_link(siml).await {
-            let simm = v.to_f64().unwrap_or(0.0) as i16;
-            let mut instance = rec.write().await;
-            let _ = instance
-                .record
-                .put_field_internal("SIMM", EpicsValue::Short(simm));
+        match self.fetch_sim_link(siml).await {
+            SimLinkFetch::Value(v) => {
+                let simm = v.to_f64().unwrap_or(0.0) as i16;
+                let mut instance = rec.write().await;
+                let _ = instance
+                    .record
+                    .put_field_internal("SIMM", EpicsValue::Short(simm));
+            }
+            // status 0, nothing written — SIMM keeps what init loaded.
+            SimLinkFetch::NoData => {}
+            // The read FAILED. Two C shapes, keyed on which SIML reader the
+            // record's support uses (`Record::uses_recgbl_simm_helpers`):
+            SimLinkFetch::Failed => {
+                let mut instance = rec.write().await;
+                if instance.record.uses_recgbl_simm_helpers() {
+                    // `recGblGetSimm` (recGbl.c:453-454):
+                    //     if (status && !pcommon->nsev) pcommon->nsta = LINK_ALARM;
+                    // `dbTryGetLink` does NOT call `setLinkAlarm`, and this is a
+                    // DIRECT write of `nsta` — NOT `recGblSetSevr`. So the record
+                    // publishes STAT=LINK_ALARM with SEVR still NO_ALARM. That
+                    // asymmetry is C's, quirk and all; reproduce it exactly.
+                    if instance.common.nsev == crate::server::record::AlarmSeverity::NoAlarm {
+                        instance.common.nsta = crate::server::recgbl::alarm_status::LINK_ALARM;
+                    }
+                } else {
+                    // `busyRecord.c:399` / `swaitRecord.c:402` read SIML with a
+                    // plain `dbGetLink`, whose failure path calls `setLinkAlarm`
+                    // (dbLink.c:319-323) — a full
+                    // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field %s")`.
+                    crate::server::recgbl::rec_gbl_set_sevr_msg(
+                        &mut instance.common,
+                        crate::server::recgbl::alarm_status::LINK_ALARM,
+                        crate::server::record::AlarmSeverity::Invalid,
+                        "field SIML",
+                    );
+                }
+            }
         }
         // `recGblCheckSimm(pcommon, psscn, *poldsimm, *psimm)` — a SIML-driven
         // SIMM transition swaps SCAN with SSCN exactly like a `caput REC.SIMM`

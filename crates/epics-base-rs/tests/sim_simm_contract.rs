@@ -257,3 +257,84 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
         Some(EpicsValue::Enum(SCAN_PASSIVE))
     );
 }
+
+// ---------------------------------------------------------------------------
+// R12-65 — a FAILED SIML read raises LINK_ALARM
+// ---------------------------------------------------------------------------
+//
+// Two C shapes, and the difference is not cosmetic:
+//
+// `recGblGetSimm` (recGbl.c:448-457) reads SIML with `dbTryGetLink`, which —
+// unlike `dbGetLink` — does NOT call `setLinkAlarm`. It then raises the alarm
+// by writing `nsta` DIRECTLY:
+//
+// ```c
+// status = dbTryGetLink(psiml, DBR_USHORT, psimm, 0);
+// if (status && !pcommon->nsev) pcommon->nsta = LINK_ALARM;
+// ```
+//
+// NOT `recGblSetSevr`. So `recGblResetAlarms` publishes STAT=LINK_ALARM with
+// SEVR still NO_ALARM — an alarm status with no severity. `busy` and `swait`
+// read SIML with a plain `dbGetLink` (busyRecord.c:399, swaitRecord.c:402),
+// whose failure path DOES go through `setLinkAlarm` (dbLink.c:319-323) →
+// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`, a full severity raise.
+//
+// The port raised neither.
+
+use epics_base_rs::server::recgbl::alarm_status;
+
+/// The 21 recGblGetSimm records: STAT=LINK_ALARM, SEVR untouched.
+#[tokio::test]
+async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
+    let db = PvDatabase::new();
+    let mut li = LonginRecord::new(5);
+    // A DB link to a record that does not exist: `dbTryGetLink` fails.
+    li.siml = "NO:SUCH:RECORD".to_string();
+    db.add_record("SIMLFAIL", Box::new(li)).await.unwrap();
+    // VAL written so the record's own UDF alarm (INVALID) cannot mask the
+    // severity-less LINK_ALARM we are asserting on.
+    db.put_pv("SIMLFAIL", EpicsValue::Long(5)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("SIMLFAIL", &mut v, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("SIMLFAIL").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "C `pcommon->nsta = LINK_ALARM` on the failed dbTryGetLink"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "C writes nsta DIRECTLY, not through recGblSetSevr — SEVR stays NO_ALARM"
+    );
+}
+
+/// `busy` reads SIML with a plain `dbGetLink`, so its failure is a full
+/// `setLinkAlarm` — LINK_ALARM at INVALID severity.
+#[tokio::test]
+async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
+    let db = PvDatabase::new();
+    let mut b = BusyRecord::new();
+    b.siml = "NO:SUCH:RECORD".to_string();
+    db.add_record("BUSYFAIL", Box::new(b)).await.unwrap();
+    db.put_pv("BUSYFAIL", EpicsValue::Short(0)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("BUSYFAIL", &mut v, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("BUSYFAIL").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.stat, alarm_status::LINK_ALARM);
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "C `dbGetLink` -> `setLinkAlarm` -> recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)"
+    );
+}

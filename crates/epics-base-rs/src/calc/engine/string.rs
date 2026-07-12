@@ -2,7 +2,7 @@ use super::cast::{c_int, c_long, d2ui};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
-use super::value::{ScalcString, StackValue};
+use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
@@ -572,20 +572,40 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     }));
                 }
                 StringOp::TrEsc => {
+                    // C TR_ESC (sCalcPerform.c:1798-1802):
+                    //
+                    //     if (isString(ps)) {
+                    //         i = dbTranslateEscape(tmpstr, ps->s);
+                    //         strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1);
+                    //     }
+                    //
+                    // so the table is epicsString.c's, a double operand is left
+                    // alone, and a `\0` escape produces a NUL byte that the
+                    // strNcpy then reads as the end of the value — which
+                    // `StackValue::str` (the same strNcpy) reproduces.
                     let v = pop1(&mut stack)?;
-                    let s = match v {
-                        StackValue::Str(s) => s,
-                        StackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(StackValue::str(translate_escapes(s.as_bytes())));
+                    stack.push(match v {
+                        StackValue::Double(d) => StackValue::Double(d),
+                        StackValue::Str(s) => StackValue::str(raw_from_escaped(s.as_bytes())),
+                    });
                 }
                 StringOp::Esc => {
+                    // C ESC (sCalcPerform.c:1805-1815) — the same table run
+                    // backwards, and a double is again left alone. Its result is
+                    // bounded at THIRTY-EIGHT bytes, not 39: C passes
+                    // `SCALC_STRING_SIZE-1` as epicsStrSnPrintEscaped's dstlen,
+                    // and that function writes at most `dstlen-1` bytes before
+                    // its NUL (epicsString.c:133 `if (--rem > 0) *dst++ = chr`).
+                    // Compiled C: 20 newlines escape to 40 bytes and come back 38.
                     let v = pop1(&mut stack)?;
-                    let s = match v {
-                        StackValue::Str(s) => s,
-                        StackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(StackValue::str(escape_string(s.as_bytes())));
+                    stack.push(match v {
+                        StackValue::Double(d) => StackValue::Double(d),
+                        StackValue::Str(s) => {
+                            let mut esc = escaped_from_raw(s.as_bytes()).into_bytes();
+                            esc.truncate(SCALC_STRING_SIZE - 2);
+                            StackValue::str(esc)
+                        }
+                    });
                 }
                 StringOp::Printf => {
                     // Pop format string, then one value
@@ -799,76 +819,6 @@ fn hunt_double(s: &[u8]) -> f64 {
 const SMALL: f64 = 1e-11;
 
 const MAX_LOOP_ITERATIONS: usize = 1000;
-
-fn translate_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'n' => {
-                    result.push(b'\n');
-                    i += 2;
-                }
-                b't' => {
-                    result.push(b'\t');
-                    i += 2;
-                }
-                b'r' => {
-                    result.push(b'\r');
-                    i += 2;
-                }
-                b'\\' => {
-                    result.push(b'\\');
-                    i += 2;
-                }
-                b'x' if i + 3 < bytes.len() => {
-                    if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 2]), hex_val(bytes[i + 3])) {
-                        result.push((hi << 4) | lo);
-                        i += 4;
-                    } else {
-                        result.push(b'\\');
-                        i += 1;
-                    }
-                }
-                _ => {
-                    result.push(b'\\');
-                    i += 1;
-                }
-            }
-        } else {
-            result.push(bytes[i]);
-            i += 1;
-        }
-    }
-    result
-}
-
-fn escape_string(bytes: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    for &b in bytes {
-        match b {
-            b'\n' => result.extend_from_slice(b"\\n"),
-            b'\t' => result.extend_from_slice(b"\\t"),
-            b'\r' => result.extend_from_slice(b"\\r"),
-            b'\\' => result.extend_from_slice(b"\\\\"),
-            0x00..=0x1f | 0x7f..=0xff => {
-                result.extend_from_slice(format!("\\x{b:02x}").as_bytes());
-            }
-            _ => result.push(b),
-        }
-    }
-    result
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
 
 /// C PRINTF (`sCalcPerform.c:1535-1567`).
 ///
@@ -1463,49 +1413,73 @@ fn escaped_from_raw(src: &[u8]) -> String {
     out
 }
 
-/// C `dbTranslateEscape` -> `epicsStrnRawFromEscaped` (epicsString.c:49).
-/// Escaped string in, raw bytes out. An unknown escape yields the character
-/// itself, and a `\x` with no hex digit behind it yields a literal `x`.
+/// C `dbTranslateEscape` -> `epicsStrnRawFromEscaped` (epicsString.c:49-118):
+/// escaped text in, raw bytes out. The owner of the escape table for TR_ESC and
+/// BIN_READ, since C gives both the same function.
+///
+/// The `\x` cases follow C's `goto input`, which re-enters the loop with the
+/// offending character rather than backing up over it — so the `x` is SWALLOWED
+/// and the character is processed as if the `\x` had not been there. Compiled C:
+/// `\xZ` is `Z` (not `xZ`), `\xA!` is `0x0a` then `!`, and a trailing `\x` is
+/// nothing at all. Re-entering also means the character can itself start an
+/// escape.
+///
+/// (C's `!c` breaks are its string terminator; a [`ScalcString`] cannot contain a
+/// NUL, so `s.len()` is C's `strlen` and those breaks have nothing to do here.)
 fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
+    fn nibble(c: u8) -> u8 {
+        (c as char).to_digit(16).expect("checked is_ascii_hexdigit") as u8
+    }
+
     let mut out = Vec::new();
     let mut i = 0;
-    while i < s.len() {
-        if s[i] != b'\\' {
-            out.push(s[i]);
-            i += 1;
-            continue;
-        }
+    'next: while i < s.len() {
+        let mut c = s[i];
         i += 1;
-        let Some(&c) = s.get(i) else { break };
-        i += 1;
-        match c {
-            b'a' => out.push(0x07),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b't' => out.push(b'\t'),
-            b'v' => out.push(0x0b),
-            b'\\' => out.push(b'\\'),
-            b'\'' => out.push(b'\''),
-            b'"' => out.push(b'"'),
-            b'0' => out.push(0),
-            b'x' => {
-                let digits = s[i..]
-                    .iter()
-                    .take_while(|b| b.is_ascii_hexdigit())
-                    .count()
-                    .min(2);
-                if digits == 0 {
-                    // C falls back through `goto input`: the `x` is literal.
-                    out.push(b'x');
-                } else {
-                    let hex = std::str::from_utf8(&s[i..i + digits]).unwrap();
-                    out.push(u8::from_str_radix(hex, 16).unwrap());
-                    i += digits;
-                }
+        // C's `input:` label — `goto input` comes back here with a new `c`.
+        loop {
+            if c != b'\\' {
+                out.push(c);
+                continue 'next;
             }
-            other => out.push(other),
+            let Some(&e) = s.get(i) else { break 'next };
+            i += 1;
+            match e {
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0c),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'v' => out.push(0x0b),
+                b'\\' => out.push(b'\\'),
+                b'\'' => out.push(b'\''),
+                b'"' => out.push(b'"'),
+                b'0' => out.push(0),
+                b'x' => {
+                    // `if (!srclen--) goto done;` — a trailing `\x` ends it.
+                    let Some(&c1) = s.get(i) else { return out };
+                    i += 1;
+                    if !c1.is_ascii_hexdigit() {
+                        c = c1; // goto input
+                        continue;
+                    }
+                    let u = nibble(c1);
+                    let Some(&c2) = s.get(i) else {
+                        out.push(u);
+                        return out;
+                    };
+                    i += 1;
+                    if !c2.is_ascii_hexdigit() {
+                        out.push(u);
+                        c = c2; // goto input
+                        continue;
+                    }
+                    out.push((u << 4) | nibble(c2));
+                }
+                other => out.push(other),
+            }
+            continue 'next;
         }
     }
     out

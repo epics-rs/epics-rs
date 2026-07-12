@@ -1559,9 +1559,11 @@ pub struct ScalcResult {
 /// `:770`). The string evaluator never sees `precision`: its `to_string` is
 /// `cvtDoubleToString(d, s, 8)` (`:90-96`), hardcoded. Compiled sCalc, `PI`:
 ///
-///     program    PREC=0   PREC=2   PREC=8        PREC=12
-///     numeric    "3"      "3.14"   "3.14159265"  " 3.141592653590e+00"
-///     string     "3.14159265" whatever the PREC
+/// ```text
+/// program    PREC=0   PREC=2   PREC=8        PREC=12
+/// numeric    "3"      "3.14"   "3.14159265"  " 3.141592653590e+00"
+/// string     "3.14159265" whatever the PREC
+/// ```
 ///
 /// so at the shipped default PREC=0 a numeric scalcout's SVAL is "3", and the
 /// port's uniform precision-8 rendering was wrong for every record that had not

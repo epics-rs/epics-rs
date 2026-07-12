@@ -1,3 +1,4 @@
+use super::array_value::ArrayStackValue::Double;
 use super::array_value::{ArrayStackValue, zip_map};
 use super::cast::{c_int, c_long, d2ui};
 use super::error::CalcError;
@@ -444,121 +445,137 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 ArrayOp::Average => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(stats::average(arr)));
+                    stack.push(unary(v, |a| Double(stats::average(a)), PASS_THROUGH));
                 }
                 ArrayOp::StdDev => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(stats::std_dev(arr)));
+                    stack.push(unary(v, |a| Double(stats::std_dev(a)), ZERO));
                 }
                 ArrayOp::Fwhm => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(stats::fwhm(arr)));
+                    stack.push(unary(v, |a| Double(stats::fwhm(a)), ZERO));
                 }
                 ArrayOp::ArraySum => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(arr.iter().sum()));
+                    stack.push(unary(v, |a| Double(a.iter().sum()), PASS_THROUGH));
                 }
                 ArrayOp::ArrayMax => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(
-                        extremum(arr).map_or(0.0, |(v, _)| v),
+                    stack.push(unary(
+                        v,
+                        |a| Double(extremum(a).map_or(0.0, |(v, _)| v)),
+                        PASS_THROUGH,
                     ));
                 }
                 ArrayOp::ArrayMin => {
                     let v = pop1(&mut stack)?;
-                    let arr = match &v {
-                        ArrayStackValue::Array(a) => a.as_slice(),
-                        ArrayStackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(ArrayStackValue::Double(
-                        extremum_by(arr, |x, best| x < best).map_or(0.0, |(v, _)| v),
+                    stack.push(unary(
+                        v,
+                        |a| Double(extremum_by(a, |x, best| x < best).map_or(0.0, |(v, _)| v)),
+                        PASS_THROUGH,
                     ));
                 }
                 ArrayOp::IndexMax => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Double(
-                        extremum(arr).map_or(0.0, |(_, i)| i as f64),
+                    stack.push(unary(
+                        v,
+                        |a| Double(extremum(a).map_or(0.0, |(_, i)| i as f64)),
+                        ZERO,
                     ));
                 }
                 ArrayOp::IndexMin => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Double(
-                        extremum_by(arr, |x, best| x < best).map_or(0.0, |(_, i)| i as f64),
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            Double(
+                                extremum_by(a, |x, best| x < best).map_or(0.0, |(_, i)| i as f64),
+                            )
+                        },
+                        ZERO,
                     ));
                 }
                 ArrayOp::IndexZero => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Double(index_zero_crossing(arr)));
+                    // C `:1090` — a scalar IS its own element 0, so it "contains a
+                    // zero" exactly when it is (near-)zero itself.
+                    stack.push(unary(
+                        v,
+                        |a| Double(index_zero_crossing(a)),
+                        |d| if d.abs() < SMALL { 0.0 } else { -1.0 },
+                    ));
                 }
                 ArrayOp::IndexNonZero => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
                     // C `aCalcPerform.c:893-898` thresholds at SMALL — `fabs(a[i])
                     // > SMALL` — it is not an exact `!= 0.0`. Below 1e-9 an element
                     // counts as zero and is skipped. (aCalc's other zero tests —
                     // logical AND/OR/NOT, the conditional, the DIV/MOD zero divisor
                     // — really are C's exact truthiness, so SMALL stays here.)
-                    let idx = arr
-                        .iter()
-                        .position(|&x| x.abs() > SMALL)
-                        .map(|i| i as f64)
-                        .unwrap_or(-1.0);
-                    stack.push(ArrayStackValue::Double(idx));
+                    // Scalar: C `:1091`, the mirror image of IXZ's.
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            Double(
+                                a.iter()
+                                    .position(|&x| x.abs() > SMALL)
+                                    .map_or(-1.0, |i| i as f64),
+                            )
+                        },
+                        |d| if d.abs() > SMALL { 0.0 } else { -1.0 },
+                    ));
                 }
 
                 ArrayOp::Smooth => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Array(stats::smooth(arr)));
+                    stack.push(unary(
+                        v,
+                        |a| ArrayStackValue::Array(stats::smooth(a)),
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::NSmooth => {
                     let n = pop1_f64(&mut stack)? as usize;
                     let v = pop1(&mut stack)?;
+                    // NSMOOTH is NOT in C's unary switch — it is its own case
+                    // (`aCalcPerform.c:579-591`) and it indexes `ps->a[]` with no
+                    // `toArray` first, so a scalar operand dereferences a NULL array
+                    // in C. There is no C behaviour to match; refusing is the
+                    // deliberate deviation.
                     let arr = v.as_array()?;
                     stack.push(ArrayStackValue::Array(stats::nsmooth(arr, n)));
                 }
                 ArrayOp::Deriv => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Array(derivative::deriv(arr)));
+                    stack.push(unary(
+                        v,
+                        |a| ArrayStackValue::Array(derivative::deriv(a)),
+                        ZERO,
+                    ));
                 }
                 ArrayOp::NDeriv => {
                     let n = pop1_f64(&mut stack)? as usize;
                     let v = pop1(&mut stack)?;
+                    // NDERIV is NOT in C's unary switch either (`:594-618`), and its
+                    // own case PROMOTES a scalar with `toArray(ps,1)` rather than
+                    // answering 0. Refusing here is a divergence from that promotion,
+                    // reported separately — it is not R10-4's family.
                     let arr = v.as_array()?;
                     stack.push(ArrayStackValue::Array(derivative::nderiv(arr, n)));
                 }
                 ArrayOp::Cum => {
                     let v = pop1(&mut stack)?;
-                    let arr = v.as_array()?;
-                    let mut result = arr.to_vec();
-                    for i in 1..result.len() {
-                        result[i] += result[i - 1];
-                    }
-                    stack.push(ArrayStackValue::Array(result));
+                    stack.push(unary(
+                        v,
+                        |a| {
+                            let mut result = a.to_vec();
+                            for i in 1..result.len() {
+                                result[i] += result[i - 1];
+                            }
+                            ArrayStackValue::Array(result)
+                        },
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::Cat => {
                     let b = pop1(&mut stack)?;
@@ -668,6 +685,40 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         .cloned()
         .unwrap_or(ArrayStackValue::Double(0.0)))
 }
+
+/// C's unary array-operator dispatch (`aCalcPerform.c:769-1101`) is ONE operator
+/// with TWO branches, chosen by the operand's shape:
+///
+/// ```c
+/// if (isArray(ps)) { switch (op) { ... } } else { switch (op) { ... } }
+/// ```
+///
+/// The scalar branch is not a degenerate case to be refused — C defines an answer
+/// for **every** operator in that switch. `AVG(5)` is 5 and `STD(5)` is 0; there
+/// is no type error anywhere in it. Routing all of them through this helper makes
+/// the scalar answer a mandatory argument, so an operator cannot be added back
+/// with an `as_array()?` that turns a legal expression into CALC_ALARM.
+///
+/// Only operators that C really lists in that switch belong here. `NSMOOTH`,
+/// `NDERIV`, `CAT`, `SUBRANGE` and the `FIT*` family are separate C cases with
+/// their own scalar handling and do NOT use this.
+fn unary(
+    v: ArrayStackValue,
+    on_array: impl FnOnce(&[f64]) -> ArrayStackValue,
+    on_scalar: impl FnOnce(f64) -> f64,
+) -> ArrayStackValue {
+    match v {
+        ArrayStackValue::Array(a) => on_array(&a),
+        ArrayStackValue::Double(d) => ArrayStackValue::Double(on_scalar(d)),
+    }
+}
+
+/// C `case AVERAGE: break;` — the scalar branch leaves `ps->d` untouched, so the
+/// scalar IS the answer. Shared by AVERAGE, SMOOTH, ARRSUM, CUM, AMAX and AMIN.
+const PASS_THROUGH: fn(f64) -> f64 = |d| d;
+
+/// C `case STD_DEV: ps->d = 0;` — shared by STD_DEV, FWHM, DERIV, IXMAX and IXMIN.
+const ZERO: fn(f64) -> f64 = |_| 0.0;
 
 /// The single shape behind all four aCalc extremum reductions — `AMAX`, `AMIN`,
 /// `IXMAX`, `IXMIN` (`aCalcPerform.c:836-861`). C seeds both the running value

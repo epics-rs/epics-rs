@@ -342,10 +342,16 @@ fn test_atod_empty() {
 fn test_sum_empty() {
     let mut inputs = ArrayInputs::new(3);
     inputs.arrays[0] = vec![];
-    // SUM of empty array (empty AA returns Double(0.0) which is TypeMismatch for SUM)
-    // Actually empty AA returns Double(0.0), so SUM(0.0) is TypeMismatch
-    let result = acalc("SUM(AA)", &mut inputs);
-    assert!(result.is_err());
+    // An unset array field is pushed as Double(0.0) (see the PushDoubleVar arm),
+    // and SUM of a scalar is C's pass-through scalar branch (`case ARRSUM: break;`,
+    // aCalcPerform.c:1098) — so this is 0, not an error. C reaches the same 0 by a
+    // different route: acalcout always allocates AA with NELM zeroed elements, so
+    // SUM(AA) sums nelm zeros. Compiled aCalcPerform with AA unset: dresult=0.
+    // This used to assert TypeMismatch, which is the CALC_ALARM R10-4 removed.
+    assert_eq!(
+        acalc("SUM(AA)", &mut inputs).unwrap(),
+        ArrayStackValue::Double(0.0)
+    );
 }
 
 #[test]

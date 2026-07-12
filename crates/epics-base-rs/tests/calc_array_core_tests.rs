@@ -47,7 +47,9 @@ fn test_array_var_store() {
     let mut inputs = ArrayInputs::new(3);
     inputs.arrays[0] = vec![1.0, 2.0, 3.0];
     inputs.arrays[1] = vec![0.0; 3];
-    acalc("BB:=AA", &mut inputs).unwrap();
+    // R10-9: `BB:=AA` alone leaves the runtime stack empty and is
+    // CALC_ERR_INCOMPLETE in aCalcPostfix — the program has to name its result.
+    acalc("BB:=AA;BB", &mut inputs).unwrap();
     assert_eq!(inputs.arrays[1], vec![1.0, 2.0, 3.0]);
 }
 

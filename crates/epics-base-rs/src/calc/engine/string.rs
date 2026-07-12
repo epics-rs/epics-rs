@@ -1,7 +1,8 @@
 use super::cast::{c_int, c_long, d2ui};
+use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
-use super::value::StackValue;
+use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
@@ -82,9 +83,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let a = pop1(&mut stack)?;
                     stack.push(match Pair::of(a, b) {
                         Pair::Numeric(x, y) => StackValue::Double(x + y),
-                        Pair::Strings(mut x, y) => {
-                            x.push_str(&y);
-                            StackValue::Str(x)
+                        // C `strncat(ps->s, ps1->s, SCALC_STRING_SIZE-strlen(ps->s)-1)`
+                        // (sCalcPerform.c:975) — the concatenation is written into
+                        // the 40-byte stack element, so it is bounded. That bound
+                        // is `StackValue::str`.
+                        Pair::Strings(x, y) => {
+                            StackValue::str([x.as_bytes(), y.as_bytes()].concat())
                         }
                     });
                 }
@@ -93,12 +97,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let a = pop1(&mut stack)?;
                     stack.push(match Pair::of(a, b) {
                         Pair::Numeric(x, y) => StackValue::Double(x - y),
-                        // C SUBLAST: remove the first occurrence of y from x.
-                        Pair::Strings(mut x, y) => {
-                            if let Some(pos) = x.find(y.as_str()) {
-                                x.replace_range(pos..pos + y.len(), "");
+                        // C SUB: remove the first occurrence of y from x.
+                        Pair::Strings(x, y) => {
+                            let mut out = x.into_bytes();
+                            if let Some(pos) = find_sub(&out, y.as_bytes()) {
+                                out.drain(pos..pos + y.len());
                             }
-                            StackValue::Str(x)
+                            StackValue::str(out)
                         }
                     });
                 }
@@ -400,7 +405,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::IsInf => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(if a.is_infinite() { 1.0 } else { 0.0 }));
+                    stack.push(StackValue::Double(super::c_isinf(a)));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;
@@ -440,13 +445,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                             }
                             stack.push(StackValue::Double(result));
                         }
-                        StackValue::Str(result) => {
-                            let mut result = result.clone();
+                        StackValue::Str(mut result) => {
                             for _ in 1..n {
                                 let v = pop1(&mut stack)?;
-                                let s = v.as_str_ref()?;
-                                if s > result.as_str() {
-                                    result = s.to_string();
+                                let s = v.as_bytes()?;
+                                if s > result.as_bytes() {
+                                    result = ScalcString::from_c(s);
                                 }
                             }
                             stack.push(StackValue::Str(result));
@@ -469,13 +473,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                             }
                             stack.push(StackValue::Double(result));
                         }
-                        StackValue::Str(result) => {
-                            let mut result = result.clone();
+                        StackValue::Str(mut result) => {
                             for _ in 1..n {
                                 let v = pop1(&mut stack)?;
-                                let s = v.as_str_ref()?;
-                                if s < result.as_str() {
-                                    result = s.to_string();
+                                let s = v.as_bytes()?;
+                                if s < result.as_bytes() {
+                                    result = ScalcString::from_c(s);
                                 }
                             }
                             stack.push(StackValue::Str(result));
@@ -498,21 +501,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     inputs.num_vars[*idx as usize] = v;
                 }
                 CoreOp::StoreDoubleVar(idx) => {
+                    // C STORE_AA..STORE_LL (`sCalcPerform.c:888-895`):
+                    //
+                    //     toString(ps);
+                    //     strncpy(psarg[op - STORE_AA], ps->s, SCALC_STRING_SIZE);
+                    //
+                    // `AA:=` names a STRING field, so the value is coerced, not
+                    // dispatched on: a double is converted and stored as text,
+                    // and no store of `AA` ever reaches the numeric args.
                     let v = pop1(&mut stack)?;
-                    match v {
-                        StackValue::Str(s) => {
-                            inputs.str_vars[*idx as usize] = s;
-                        }
-                        StackValue::Double(d) => {
-                            inputs.num_vars[*idx as usize] = d;
-                        }
-                    }
+                    inputs.str_vars[*idx as usize] = v.into_string_value();
                 }
             },
 
             Opcode::String(sop) => match sop {
                 StringOp::PushString(s) => {
-                    stack.push(StackValue::Str(s.clone()));
+                    // C LITERAL_STRING (sCalcPerform.c:1493-1502) copies the
+                    // literal out of the postfix into the 40-byte element with
+                    // `for (i=0; (i<SCALC_STRING_SIZE-1) && *post; )` — so an
+                    // over-long literal is truncated at RUN time, not compile
+                    // time.
+                    stack.push(StackValue::str(s));
                 }
                 StringOp::PushStringVar(idx) => {
                     stack.push(StackValue::Str(inputs.str_vars[*idx as usize].clone()));
@@ -522,19 +531,19 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     inputs.str_vars[*idx as usize] = v.into_string_value();
                 }
                 StringOp::ToString => {
+                    // C TO_STRING (sCalcPerform.c:1516-1519) is `toString(ps)`,
+                    // no more — the one conversion, not a formatter of its own.
                     let v = pop1(&mut stack)?;
-                    match v {
-                        StackValue::Double(d) => {
-                            stack.push(StackValue::Str(format_double(d)));
-                        }
-                        StackValue::Str(s) => {
-                            stack.push(StackValue::Str(s));
-                        }
-                    }
+                    stack.push(StackValue::Str(v.into_string_value()));
                 }
                 StringOp::ToDouble => {
+                    // C TO_DOUBLE runs its hunt only `if (isString(ps))`; a
+                    // double operand is left exactly as it is.
                     let v = pop1(&mut stack)?;
-                    stack.push(StackValue::Double(to_double(&v)));
+                    stack.push(StackValue::Double(match &v {
+                        StackValue::Double(d) => *d,
+                        StackValue::Str(s) => hunt_double(s.as_bytes()),
+                    }));
                 }
                 StringOp::Len => {
                     let v = pop1(&mut stack)?;
@@ -545,44 +554,71 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(len));
                 }
                 StringOp::Byte => {
+                    // C BYTE (sCalcPerform.c:1528-1533):
+                    //
+                    //     if (isString(ps)) { ps->d = ps->s[0]; ps->s = NULL; }
+                    //
+                    // `ps->s[0]` is a `char`, which is SIGNED on the reference
+                    // platform, so a byte with the high bit set reads NEGATIVE:
+                    // compiled C gives BYTE("\xff") = -1 and BYTE("\x80") = -128,
+                    // not 255 and 128. (The same signed read is already in
+                    // BIN_READ's `%c`.) The empty string reads its NUL: 0. And a
+                    // DOUBLE operand falls through the `isString` guard
+                    // untouched — it is not an error and not zero.
                     let v = pop1(&mut stack)?;
-                    let byte_val = match &v {
-                        StackValue::Str(s) => s.bytes().next().map(|b| b as f64).unwrap_or(0.0),
-                        StackValue::Double(_) => 0.0,
-                    };
-                    stack.push(StackValue::Double(byte_val));
+                    stack.push(StackValue::Double(match &v {
+                        StackValue::Double(d) => *d,
+                        StackValue::Str(s) => s.as_bytes().first().map_or(0.0, |b| *b as i8 as f64),
+                    }));
                 }
                 StringOp::TrEsc => {
+                    // C TR_ESC (sCalcPerform.c:1798-1802):
+                    //
+                    //     if (isString(ps)) {
+                    //         i = dbTranslateEscape(tmpstr, ps->s);
+                    //         strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1);
+                    //     }
+                    //
+                    // so the table is epicsString.c's, a double operand is left
+                    // alone, and a `\0` escape produces a NUL byte that the
+                    // strNcpy then reads as the end of the value — which
+                    // `StackValue::str` (the same strNcpy) reproduces.
                     let v = pop1(&mut stack)?;
-                    let s = match v {
-                        StackValue::Str(s) => s,
-                        StackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(StackValue::Str(translate_escapes(&s)));
+                    stack.push(match v {
+                        StackValue::Double(d) => StackValue::Double(d),
+                        StackValue::Str(s) => StackValue::str(raw_from_escaped(s.as_bytes())),
+                    });
                 }
                 StringOp::Esc => {
+                    // C ESC (sCalcPerform.c:1805-1815) — the same table run
+                    // backwards, and a double is again left alone. Its result is
+                    // bounded at THIRTY-EIGHT bytes, not 39: C passes
+                    // `SCALC_STRING_SIZE-1` as epicsStrSnPrintEscaped's dstlen,
+                    // and that function writes at most `dstlen-1` bytes before
+                    // its NUL (epicsString.c:133 `if (--rem > 0) *dst++ = chr`).
+                    // Compiled C: 20 newlines escape to 40 bytes and come back 38.
                     let v = pop1(&mut stack)?;
-                    let s = match v {
-                        StackValue::Str(s) => s,
-                        StackValue::Double(_) => return Err(CalcError::TypeMismatch),
-                    };
-                    stack.push(StackValue::Str(escape_string(&s)));
+                    stack.push(match v {
+                        StackValue::Double(d) => StackValue::Double(d),
+                        StackValue::Str(s) => {
+                            let mut esc = escaped_from_raw(s.as_bytes()).into_bytes();
+                            esc.truncate(SCALC_STRING_SIZE - 2);
+                            StackValue::str(esc)
+                        }
+                    });
                 }
                 StringOp::Printf => {
                     // Pop format string, then one value
                     let val = pop1(&mut stack)?;
                     let fmt = pop1(&mut stack)?;
-                    let fmt_str = fmt.as_str_ref()?;
-                    let result = simple_printf(fmt_str, &val)?;
-                    stack.push(StackValue::Str(result));
+                    let result = simple_printf(fmt.as_bytes()?, &val)?;
+                    stack.push(StackValue::str(result));
                 }
                 StringOp::Sscanf => {
                     // Pop format string, then input string
                     let fmt = pop1(&mut stack)?;
                     let input = pop1(&mut stack)?;
-                    let input_str = input.as_str_ref()?;
-                    let fmt_str = fmt.as_str_ref()?;
-                    let result = simple_sscanf(input_str, fmt_str);
+                    let result = simple_sscanf(input.as_bytes()?, fmt.as_bytes()?);
                     stack.push(result);
                 }
                 StringOp::BinRead => {
@@ -591,7 +627,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // DOUBLE (`ps->s = NULL`).
                     let fmt = pop1(&mut stack)?;
                     let subject = pop1(&mut stack)?;
-                    let value = bin_read(subject.as_str_ref()?, fmt.as_str_ref()?)?;
+                    let value = bin_read(subject.as_bytes()?, fmt.as_bytes()?)?;
                     stack.push(StackValue::Double(value));
                 }
                 StringOp::BinWrite => {
@@ -600,31 +636,29 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // is the raw bytes, escaped back into a string.
                     let val = pop1(&mut stack)?;
                     let fmt = pop1(&mut stack)?;
-                    let result = bin_write(fmt.as_str_ref()?, &val)?;
-                    stack.push(StackValue::Str(result));
+                    let result = bin_write(fmt.as_bytes()?, &val)?;
+                    stack.push(StackValue::str(result));
                 }
                 StringOp::Crc16 => {
                     let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    let crc = super::checksum::crc16(s.as_bytes());
+                    let crc = super::checksum::crc16(v.as_bytes()?);
                     stack.push(StackValue::Double(crc as f64));
                 }
                 StringOp::Crc16Append => {
                     // MODBUS: append CRC16 as two bytes (little-endian)
                     let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    let crc = super::checksum::crc16(s.as_bytes());
-                    let mut result = s.to_string();
-                    result.push((crc & 0xFF) as u8 as char);
-                    result.push(((crc >> 8) & 0xFF) as u8 as char);
-                    stack.push(StackValue::Str(result));
+                    let s = v.as_bytes()?;
+                    let crc = super::checksum::crc16(s);
+                    let mut result = s.to_vec();
+                    result.push((crc & 0xFF) as u8);
+                    result.push(((crc >> 8) & 0xFF) as u8);
+                    stack.push(StackValue::str(result));
                 }
                 StringOp::Lrc => {
                     let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    match super::checksum::lrc(s) {
+                    match super::checksum::lrc(v.as_bytes()?) {
                         Some(lrc_str) => {
-                            stack.push(StackValue::Str(lrc_str));
+                            stack.push(StackValue::str(lrc_str));
                         }
                         None => return Err(CalcError::InvalidFormat),
                     }
@@ -632,91 +666,79 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 StringOp::LrcAppend => {
                     // AMODBUS: append LRC hex string
                     let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
+                    let s = v.as_bytes()?;
                     match super::checksum::lrc(s) {
                         Some(lrc_str) => {
-                            let mut result = s.to_string();
-                            result.push_str(&lrc_str);
-                            stack.push(StackValue::Str(result));
+                            let mut result = s.to_vec();
+                            result.extend_from_slice(lrc_str.as_bytes());
+                            stack.push(StackValue::str(result));
                         }
                         None => return Err(CalcError::InvalidFormat),
                     }
                 }
                 StringOp::Xor8 => {
                     let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    let xor = super::checksum::xor8(s.as_bytes());
+                    let xor = super::checksum::xor8(v.as_bytes()?);
                     stack.push(StackValue::Double(xor as f64));
                 }
                 StringOp::Xor8Append => {
                     // ADD_XOR8: append XOR8 as one byte
                     let v = pop1(&mut stack)?;
-                    let s = v.as_str_ref()?;
-                    let xor = super::checksum::xor8(s.as_bytes());
-                    let mut result = s.to_string();
-                    result.push(xor as char);
-                    stack.push(StackValue::Str(result));
+                    let s = v.as_bytes()?;
+                    let xor = super::checksum::xor8(s);
+                    let mut result = s.to_vec();
+                    result.push(xor);
+                    stack.push(StackValue::str(result));
                 }
                 StringOp::Subrange => {
-                    // C `sCalcPerform.c:1869-1901`. Pop: string, i, j — and BOTH
-                    // bounds are inclusive:
+                    // C `sCalcPerform.c:1869-1901`. Pop: string, i, j. BOTH bounds
+                    // are inclusive:
                     //
                     // ```c
                     // for (s1=s+i, s2=s+j ; *s1 && s1 <= s2; ) *s++ = *s1++;
                     // ```
                     //
                     // so `"hello"[1,4]` is "ello" and `"hello"[2,2]` is "l". The
-                    // bound arithmetic itself is `subrange_bounds`, shared with
-                    // aCalc's `[`.
+                    // subject is `toString(ps)`, not a string-only operand.
                     let end_val = pop1(&mut stack)?;
                     let start_val = pop1(&mut stack)?;
-                    let s = pop1(&mut stack)?;
-                    let s = s.as_str_ref()?;
+                    let subject = pop1(&mut stack)?.into_string_value();
+                    let s = subject.as_bytes();
                     let k = s.len() as i64;
-                    let (i, j) = super::subrange_bounds(
-                        subrange_index(&start_val)?,
-                        subrange_index(&end_val)?,
-                        k,
-                    );
+                    let (i, j) = subrange_bounds(s, &start_val, &end_val);
                     let out = if j < i {
-                        String::new()
+                        &[][..]
                     } else {
-                        s[i as usize..(j + 1).min(k) as usize].to_string()
+                        &s[i as usize..(j + 1).min(k) as usize]
                     };
-                    stack.push(StackValue::Str(out));
+                    stack.push(StackValue::str(out));
                 }
                 StringOp::Replace => {
                     // Pop: string, find, replace
                     let replace_val = pop1(&mut stack)?;
                     let find_val = pop1(&mut stack)?;
                     let s = pop1(&mut stack)?;
-                    let s = s.as_str_ref()?;
-                    let find = find_val.as_str_ref()?;
-                    let replace = replace_val.as_str_ref()?;
+                    let s = s.as_bytes()?;
+                    let find = find_val.as_bytes()?;
+                    let replace = replace_val.as_bytes()?;
                     // Replace first occurrence only
-                    let result = if let Some(pos) = s.find(find) {
-                        let mut r = s.to_string();
-                        r.replace_range(pos..pos + find.len(), replace);
-                        r
-                    } else {
-                        s.to_string()
-                    };
-                    stack.push(StackValue::Str(result));
+                    let mut result = s.to_vec();
+                    if let Some(pos) = find_sub(s, find) {
+                        result.splice(pos..pos + find.len(), replace.iter().copied());
+                    }
+                    stack.push(StackValue::str(result));
                 }
                 StringOp::SubLast => {
                     // Remove last occurrence of substring
                     let pattern = pop1(&mut stack)?;
                     let s = pop1(&mut stack)?;
-                    let s = s.as_str_ref()?;
-                    let pat = pattern.as_str_ref()?;
-                    let result = if let Some(pos) = s.rfind(pat) {
-                        let mut r = s.to_string();
-                        r.replace_range(pos..pos + pat.len(), "");
-                        r
-                    } else {
-                        s.to_string()
-                    };
-                    stack.push(StackValue::Str(result));
+                    let s = s.as_bytes()?;
+                    let pat = pattern.as_bytes()?;
+                    let mut result = s.to_vec();
+                    if let Some(pos) = rfind_sub(s, pat) {
+                        result.drain(pos..pos + pat.len());
+                    }
+                    stack.push(StackValue::str(result));
                 }
             },
 
@@ -726,16 +748,29 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // The actual loop jump happens at UntilEnd.
                 }
                 super::opcodes::ControlOp::UntilEnd(start_pc) => {
-                    // Pop condition from stack: if false (0), jump back to loop start
-                    let cond = pop1_f64(&mut stack)?;
+                    // C PEEKS the condition (`sCalcPerform.c:1999`: `if (ps->d == 0)`).
+                    // It pops nothing.
+                    let cond = match stack.last() {
+                        Some(v) => v.to_double(),
+                        None => return Err(CalcError::Underflow),
+                    };
                     if cond == 0.0 {
+                        // Loop back. C restores `ps` to the stack pointer it saved
+                        // when it ran UNTIL (`:2004`) — i.e. to before the
+                        // condition — so the condition value is discarded on the
+                        // way round, and the next iteration pushes a fresh one.
+                        stack.pop();
                         pc = *start_pc + 1; // jump to instruction after UNTIL marker
                         loop_count += 1;
                         if loop_count > MAX_LOOP_ITERATIONS {
                             return Err(CalcError::LoopLimitExceeded);
                         }
                     }
-                    // else: condition true, continue past loop
+                    // Condition true: fall out of the loop with the condition value
+                    // still on the stack. C leaves `ps` alone, which is why the
+                    // compile-time ledger gives UNTIL_END a runtime effect of 0
+                    // and why the body of an UNTIL has to be an assignment for the
+                    // program to end at depth 1.
                 }
             },
 
@@ -753,19 +788,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     // all succeeded still fails the perform when its value is not finite
     // (`LOG(0)` = -inf, `1e300*1e300` = +inf, `ACOS(2)` = NaN) — the record
     // then forces VAL=-1 / SVAL="***ERROR***" / CALC_ALARM.
-    if !to_double(&result).is_finite() {
+    if !result.to_double().is_finite() {
         return Err(CalcError::NonFiniteResult);
     }
     Ok(result)
 }
 
-/// C `to_double` (`sCalcPerform.c:83`) — `atof` of the stack element's string
-/// form; a double element is already its own double form.
-fn to_double(v: &StackValue) -> f64 {
-    match v {
-        StackValue::Double(d) => *d,
-        StackValue::Str(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+/// C `TO_DOUBLE` — the `DBL` OPERATOR (`sCalcPerform.c:1505-1514), which is not
+/// the `toDouble` coercion ([`StackValue::to_double`]) and does not parse:
+///
+/// ```c
+/// s = strpbrk(ps->s, "0123456789");        /* the first DIGIT, anywhere */
+/// if ((s > ps->s) && (s[-1] == '.')) s--;  /* take a '.' before it */
+/// if ((s > ps->s) && (s[-1] == '-')) s--;  /* and a '-' before that */
+/// ps->d = s ? atof(s) : 0.0;
+/// ```
+///
+/// It HUNTS a number out of surrounding text, so it reads `-12.5` out of
+/// `"v=-12.5V"` where the coercion would give 0. The asymmetries are C's and
+/// compiled sCalc confirms each: a `+` sign is never taken (`"x+3"` is 3), only
+/// ONE `-` is (`"--5"` is -5), and a string with no digit at all is 0 even when
+/// `atof` would have read it (`DBL("inf")` is 0, `atof("inf")` is inf).
+fn hunt_double(s: &[u8]) -> f64 {
+    let Some(mut i) = s.iter().position(|c| c.is_ascii_digit()) else {
+        return 0.0;
+    };
+    if i > 0 && s[i - 1] == b'.' {
+        i -= 1;
     }
+    if i > 0 && s[i - 1] == b'-' {
+        i -= 1;
+    }
+    super::strtod::strtod(&s[i..]).value
 }
 
 /// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
@@ -774,218 +828,329 @@ const SMALL: f64 = 1e-11;
 
 const MAX_LOOP_ITERATIONS: usize = 1000;
 
-fn translate_escapes(s: &str) -> String {
-    let mut result = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'n' => {
-                    result.push('\n');
-                    i += 2;
-                }
-                b't' => {
-                    result.push('\t');
-                    i += 2;
-                }
-                b'r' => {
-                    result.push('\r');
-                    i += 2;
-                }
-                b'\\' => {
-                    result.push('\\');
-                    i += 2;
-                }
-                b'x' if i + 3 < bytes.len() => {
-                    if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 2]), hex_val(bytes[i + 3])) {
-                        result.push(((hi << 4) | lo) as char);
-                        i += 4;
-                    } else {
-                        result.push('\\');
-                        i += 1;
-                    }
-                }
-                _ => {
-                    result.push('\\');
-                    i += 1;
-                }
+/// C PRINTF (`sCalcPerform.c:1535-1567`).
+///
+/// ```c
+/// s = ps->s;
+/// while ((s1 = strstr(s, "%%"))) {s = s1+2;}          /* PAST the LAST "%%" */
+/// if (((s = strpbrk(s, "%")) == NULL) ||
+///     ((s = strpbrk(s+1, "*cdeEfgGiousxX")) == NULL)) {
+///     strcpy(tmpstr, ps->s);                          /* the RAW format */
+/// } else {
+///     switch (*s) {
+///     default: case '*':  return(-1);
+///     case 'c','d','i','o','u','x','X': toDouble(ps1); l = myNINT(ps1->d);
+///                                       snprintf(tmpstr, N, ps->s, l);    break;
+///     case 'e','E','f','g','G':         toDouble(ps1);
+///                                       snprintf(tmpstr, N, ps->s, ps1->d); break;
+///     case 's':                         toString(ps1);
+///                                       snprintf(tmpstr, N, ps->s, ps1->s); break;
+///     }
+/// }
+/// ```
+///
+/// Two things the port got wrong follow from that scan, and compiled C confirms
+/// both:
+///
+///   * When the scan finds no conversion, C copies the format RAW — `%%` and
+///     all. `PRINTF("100%%", x)` is `100%%`, not `100%`; and because the scan
+///     starts AFTER the last `%%`, a conversion that sits BEFORE one is not a
+///     conversion at all: `PRINTF("%.2f%%", 3.14159)` is the literal `%.2f%%`.
+///   * When it does find one, C hands the WHOLE format to `snprintf` with that
+///     single argument — so every flag, width and precision applies, and the
+///     `%%` earlier in the format collapse: `PRINTF("a%%b %5.2f!", 3.14159)` is
+///     `a%b  3.14!`.
+fn simple_printf(fmt: &[u8], val: &StackValue) -> Result<Vec<u8>, CalcError> {
+    match conversion_index(fmt) {
+        // `strcpy(tmpstr, ps->s)` — not a re-render of the format, a copy of it.
+        None => Ok(fmt.to_vec()),
+        // C's `case '*': return(-1)`. (Its `default:` is unreachable: the scan's
+        // strpbrk set contains nothing else.)
+        Some(i) if fmt[i] == b'*' => Err(CalcError::InvalidFormat),
+        Some(_) => Ok(c_snprintf(fmt, val)),
+    }
+}
+
+/// The conversion the C scan finds in a PRINTF/BIN_WRITE format — the index of
+/// the character, since BIN_WRITE also needs the `h`/`l` modifier in front of it
+/// (`s[-1]`). C runs the identical block in both (`sCalcPerform.c:1541-1544` and
+/// `:1574-1577`), so it is one function here; the two differ only in what they do
+/// when there is no conversion (PRINTF copies the format, BIN_WRITE fails).
+///
+/// This is NOT `findConversionIndicator` (`:105-150`), which SSCANF and BIN_READ
+/// use: that one also skips assign-suppressed conversions and knows `%[...]`.
+fn conversion_index(fmt: &[u8]) -> Option<usize> {
+    // `while ((s1 = strstr(s, "%%"))) {s = s1+2;}`
+    let mut s = 0usize;
+    while let Some(p) = find_sub(&fmt[s..], b"%%") {
+        s += p + 2;
+    }
+    // `if ((s = strpbrk(s, "%")) == NULL) ...`
+    let pct = find_byte(&fmt[s..], b'%')? + s;
+    // `if ((s = strpbrk(s+1, "*cdeEfgGiousxX")) == NULL) ...` — note this scans
+    // to the END of the format, not to the end of the spec.
+    let conv = fmt[pct + 1..]
+        .iter()
+        .position(|b| b"*cdeEfgGiousxX".contains(b))?;
+    Some(pct + 1 + conv)
+}
+
+/// One conversion specification: `%[flags][width][.precision][length]conv`.
+struct Spec {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    alt: bool,
+    width: usize,
+    precision: Option<usize>,
+    conv: u8,
+    /// One past the conversion character.
+    end: usize,
+}
+
+/// Parse the spec that starts at `fmt[i] == b'%'`. `None` when what follows is
+/// not a conversion C would render (`%z`, a trailing `%`), which `snprintf` then
+/// emits literally.
+fn parse_spec(fmt: &[u8], i: usize) -> Option<Spec> {
+    let mut j = i + 1;
+    let (mut minus, mut plus, mut space, mut zero, mut alt) = (false, false, false, false, false);
+    while let Some(&c) = fmt.get(j) {
+        match c {
+            b'-' => minus = true,
+            b'+' => plus = true,
+            b' ' => space = true,
+            b'0' => zero = true,
+            b'#' => alt = true,
+            _ => break,
+        }
+        j += 1;
+    }
+    let mut width = 0usize;
+    while let Some(&c) = fmt.get(j) {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        width = width * 10 + (c - b'0') as usize;
+        j += 1;
+    }
+    let mut precision = None;
+    if fmt.get(j) == Some(&b'.') {
+        j += 1;
+        let mut p = 0usize;
+        while let Some(&c) = fmt.get(j) {
+            if !c.is_ascii_digit() {
+                break;
             }
-        } else {
-            result.push(bytes[i] as char);
+            p = p * 10 + (c - b'0') as usize;
+            j += 1;
+        }
+        precision = Some(p);
+    }
+    // Length modifiers: C passes a `long` or a `double` whatever the format says,
+    // so these change nothing here.
+    while matches!(
+        fmt.get(j),
+        Some(b'h' | b'l' | b'L' | b'q' | b'j' | b'z' | b't')
+    ) {
+        j += 1;
+    }
+    let conv = *fmt.get(j)?;
+    if !b"cdiouxXeEfgGs".contains(&conv) {
+        return None;
+    }
+    Some(Spec {
+        minus,
+        plus,
+        space,
+        zero,
+        alt,
+        width,
+        precision,
+        conv,
+        end: j + 1,
+    })
+}
+
+/// C `snprintf(tmpstr, TMPSTR_SIZE, format, arg)` with ONE argument: the format
+/// is walked from the start, `%%` becomes `%`, and the argument lands in the
+/// first conversion.
+///
+/// A format with a SECOND conversion is undefined behaviour in C (snprintf reads
+/// a vararg that was never passed), so there is no behaviour to match: the extra
+/// spec is copied out literally rather than fed an invented value.
+fn c_snprintf(fmt: &[u8], val: &StackValue) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    let mut consumed = false;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            out.push(fmt[i]);
             i += 1;
+            continue;
+        }
+        if fmt.get(i + 1) == Some(&b'%') {
+            out.push(b'%');
+            i += 2;
+            continue;
+        }
+        match parse_spec(fmt, i) {
+            Some(spec) if !consumed => {
+                consumed = true;
+                out.extend_from_slice(&render_spec(&spec, val));
+                i = spec.end;
+            }
+            Some(spec) => {
+                out.extend_from_slice(&fmt[i..spec.end]);
+                i = spec.end;
+            }
+            None => {
+                out.push(fmt[i]);
+                i += 1;
+            }
         }
     }
-    result
+    out
 }
 
-fn escape_string(s: &str) -> String {
-    let mut result = String::new();
-    for b in s.bytes() {
-        match b {
-            b'\n' => result.push_str("\\n"),
-            b'\t' => result.push_str("\\t"),
-            b'\r' => result.push_str("\\r"),
-            b'\\' => result.push_str("\\\\"),
-            0x00..=0x1f | 0x7f..=0xff => {
-                result.push_str(&format!("\\x{:02x}", b));
+fn render_spec(spec: &Spec, val: &StackValue) -> Vec<u8> {
+    let body = match spec.conv {
+        b's' => {
+            let text = val.clone().into_string_value();
+            let mut b = text.as_bytes().to_vec();
+            // `%.Ns` prints at most N bytes.
+            if let Some(p) = spec.precision {
+                b.truncate(p);
             }
-            _ => result.push(b as char),
+            return pad(b, spec.width, spec.minus, false);
         }
-    }
-    result
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn simple_printf(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
-    // Find first format specifier
-    let bytes = fmt.as_bytes();
-    let mut i = 0;
-    let mut result = String::new();
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'%' {
-                result.push('%');
-                i += 2;
-                continue;
-            }
-            // Parse format specifier: %[flags][width][.precision]type
-            let spec_start = i;
-            i += 1; // skip %
-            // Skip flags
-            while i < bytes.len() && matches!(bytes[i], b'-' | b'+' | b' ' | b'0' | b'#') {
-                i += 1;
-            }
-            // Skip width
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            // Skip precision
-            if i < bytes.len() && bytes[i] == b'.' {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            if i >= bytes.len() {
-                return Err(CalcError::InvalidFormat);
-            }
-            let spec = bytes[i];
-            i += 1;
-            let fmt_str = std::str::from_utf8(&bytes[spec_start..i]).unwrap();
-            match spec {
-                b'd' | b'i' => {
-                    let v = val.to_double() as i64;
-                    result.push_str(&c_format_int(fmt_str, v));
-                }
-                b'f' | b'e' | b'g' | b'E' | b'G' => {
-                    let v = val.to_double();
-                    result.push_str(&c_format_float(fmt_str, v));
-                }
-                b'x' | b'X' | b'o' => {
-                    let v = val.to_double() as i64;
-                    result.push_str(&c_format_int(fmt_str, v));
-                }
-                b's' => {
-                    let s = match val {
-                        StackValue::Str(s) => s.clone(),
-                        StackValue::Double(d) => format!("{}", d),
-                    };
-                    result.push_str(&s);
-                }
-                _ => return Err(CalcError::InvalidFormat),
-            }
-            // Append rest of format string literally
-            while i < bytes.len() {
-                result.push(bytes[i] as char);
-                i += 1;
-            }
-            return Ok(result);
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
+        // C `l = myNINT(ps1->d)` and then a `%d`/`%x`/... conversion, which reads
+        // an INT out of the vararg: the value is the low 32 bits of that long.
+        b'c' | b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
+            let l = my_nint(val.to_double()) as i64;
+            return pad(render_int(spec, l), spec.width, spec.minus, spec.zero);
         }
-    }
-    // No format specifier found, return format string as-is
-    Ok(result)
-}
-
-fn c_format_int(fmt: &str, val: i64) -> String {
-    // Parse width and type from format string
-    let bytes = fmt.as_bytes();
-    let spec = bytes[bytes.len() - 1];
-    // Extract flags, width
-    let inner = &fmt[1..fmt.len() - 1]; // between % and type
-    let width: usize = inner
-        .trim_start_matches(|c: char| !c.is_ascii_digit())
-        .parse()
-        .unwrap_or(0);
-    let left_align = inner.contains('-');
-    let zero_pad = inner.starts_with('0') && !left_align;
-
-    let formatted = match spec {
-        b'd' | b'i' => format!("{}", val),
-        b'x' => format!("{:x}", val as u64),
-        b'X' => format!("{:X}", val as u64),
-        b'o' => format!("{:o}", val as u64),
-        _ => format!("{}", val),
+        b'e' | b'E' => cvt::fmt_e(
+            val.to_double(),
+            spec.precision.unwrap_or(6),
+            spec.conv == b'E',
+        ),
+        b'f' => cvt::fmt_f(val.to_double(), spec.precision.unwrap_or(6)),
+        b'g' | b'G' => cvt::fmt_g(
+            val.to_double(),
+            spec.precision.unwrap_or(6),
+            spec.conv == b'G',
+            spec.alt,
+        ),
+        _ => unreachable!("parse_spec only returns C's conversion characters"),
     };
-
-    if width > formatted.len() {
-        let pad = width - formatted.len();
-        if left_align {
-            format!("{}{}", formatted, " ".repeat(pad))
-        } else if zero_pad {
-            format!("{}{}", "0".repeat(pad), formatted)
-        } else {
-            format!("{}{}", " ".repeat(pad), formatted)
-        }
-    } else {
-        formatted
+    // Float: the sign flags, the `#` decimal point, then the padding. C does not
+    // zero-pad a non-finite value.
+    let d = val.to_double();
+    let mut body = body;
+    if spec.alt && !body.contains('.') && d.is_finite() {
+        body.push('.');
     }
+    if d.is_sign_positive() && !body.starts_with('+') {
+        if spec.plus {
+            body.insert(0, '+');
+        } else if spec.space {
+            body.insert(0, ' ');
+        }
+    }
+    pad(
+        body.into_bytes(),
+        spec.width,
+        spec.minus,
+        spec.zero && d.is_finite(),
+    )
 }
 
-fn c_format_float(fmt: &str, val: f64) -> String {
-    let bytes = fmt.as_bytes();
-    let spec = bytes[bytes.len() - 1];
-    let inner = &fmt[1..fmt.len() - 1];
-
-    // Parse precision
-    let precision = if let Some(dot_pos) = inner.find('.') {
-        inner[dot_pos + 1..].parse::<usize>().unwrap_or(6)
-    } else {
-        6
-    };
-
-    match spec {
-        b'f' => format!("{:.prec$}", val, prec = precision),
-        b'e' => format!("{:.prec$e}", val, prec = precision),
-        b'E' => format!("{:.prec$E}", val, prec = precision),
-        b'g' | b'G' => {
-            // Use shorter of %f and %e
-            let f_str = format!("{:.prec$}", val, prec = precision);
-            let e_str = format!("{:.prec$e}", val, prec = precision);
-            if e_str.len() < f_str.len() {
-                e_str
+fn render_int(spec: &Spec, l: i64) -> Vec<u8> {
+    if spec.conv == b'c' {
+        return vec![l as u8];
+    }
+    let (mut prefix, digits) = match spec.conv {
+        b'd' | b'i' => {
+            let v = l as i32;
+            let sign = if v < 0 {
+                "-".to_string()
+            } else if spec.plus {
+                "+".to_string()
+            } else if spec.space {
+                " ".to_string()
             } else {
-                f_str
-            }
+                String::new()
+            };
+            (sign, v.unsigned_abs().to_string())
         }
-        _ => format!("{}", val),
-    }
+        b'u' => (String::new(), (l as u32).to_string()),
+        b'o' => {
+            let d = format!("{:o}", l as u32);
+            let p = if spec.alt && !d.starts_with('0') {
+                "0".to_string()
+            } else {
+                String::new()
+            };
+            (p, d)
+        }
+        b'x' | b'X' => {
+            let v = l as u32;
+            let d = if spec.conv == b'x' {
+                format!("{v:x}")
+            } else {
+                format!("{v:X}")
+            };
+            let p = match (spec.alt, v, spec.conv) {
+                (true, 0, _) => String::new(),
+                (true, _, b'x') => "0x".to_string(),
+                (true, _, _) => "0X".to_string(),
+                _ => String::new(),
+            };
+            (p, d)
+        }
+        _ => unreachable!("render_int only sees C's integer conversions"),
+    };
+    // `%.Nd` is a MINIMUM digit count, zero-filled, and it turns the `0` flag off.
+    let digits = match spec.precision {
+        Some(p) if digits.len() < p => format!("{}{digits}", "0".repeat(p - digits.len())),
+        _ => digits,
+    };
+    prefix.push_str(&digits);
+    prefix.into_bytes()
 }
 
-fn simple_sscanf(input: &str, fmt: &str) -> StackValue {
-    let bytes = fmt.as_bytes();
+/// The width field. `zero` pads with `0` after any sign or `0x` prefix, and is
+/// ignored when the value is left-justified (C: "the 0 flag is ignored with -").
+fn pad(body: Vec<u8>, width: usize, minus: bool, zero: bool) -> Vec<u8> {
+    if body.len() >= width {
+        return body;
+    }
+    let fill = width - body.len();
+    if minus {
+        let mut out = body;
+        out.extend(std::iter::repeat_n(b' ', fill));
+        return out;
+    }
+    if !zero {
+        let mut out = vec![b' '; fill];
+        out.extend(body);
+        return out;
+    }
+    // Keep the sign / `0x` in front of the zeros.
+    let skip = match body.first() {
+        Some(b'-' | b'+' | b' ') => 1,
+        _ if body.starts_with(b"0x") || body.starts_with(b"0X") => 2,
+        _ => 0,
+    };
+    let mut out = body[..skip].to_vec();
+    out.extend(std::iter::repeat_n(b'0', fill));
+    out.extend_from_slice(&body[skip..]);
+    out
+}
+
+fn simple_sscanf(input: &[u8], fmt: &[u8]) -> StackValue {
+    let bytes = fmt;
     let mut i = 0;
     // Find format specifier
     while i < bytes.len() {
@@ -999,30 +1164,28 @@ fn simple_sscanf(input: &str, fmt: &str) -> StackValue {
                 return StackValue::Double(0.0);
             }
             let spec = bytes[i];
+            let trimmed = trim_ascii(input);
             return match spec {
                 b'd' | b'i' => {
-                    let trimmed = input.trim();
-                    match trimmed.parse::<i64>() {
-                        Ok(v) => StackValue::Double(v as f64),
-                        Err(_) => {
-                            // Try parsing leading digits
-                            let num_str: String = trimmed
-                                .chars()
-                                .take_while(|c| c.is_ascii_digit() || *c == '-')
-                                .collect();
-                            StackValue::Double(num_str.parse::<i64>().unwrap_or(0) as f64)
-                        }
-                    }
+                    let digits = trimmed
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit() || **b == b'-')
+                        .count();
+                    let text = std::str::from_utf8(&trimmed[..digits]).unwrap_or("");
+                    StackValue::Double(text.parse::<i64>().unwrap_or(0) as f64)
                 }
-                b'f' | b'e' | b'g' => {
-                    let trimmed = input.trim();
-                    StackValue::Double(trimmed.parse::<f64>().unwrap_or(0.0))
-                }
+                // C's `%e`/`%f`/`%g` conversion is strtod on the input, so it
+                // takes the longest numeric PREFIX and leaves the rest —
+                // `SSCANF("1.5V", "%f")` is 1.5, not a failed conversion.
+                b'f' | b'e' | b'g' => StackValue::Double(super::strtod::strtod(trimmed).value),
                 b's' => {
                     // Read until whitespace
-                    let trimmed = input.trim_start();
-                    let word: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
-                    StackValue::Str(word)
+                    let word: Vec<u8> = trimmed
+                        .iter()
+                        .copied()
+                        .take_while(|b| !b.is_ascii_whitespace())
+                        .collect();
+                    StackValue::str(word)
                 }
                 _ => StackValue::Double(0.0),
             };
@@ -1030,6 +1193,20 @@ fn simple_sscanf(input: &str, fmt: &str) -> StackValue {
         i += 1;
     }
     StackValue::Double(0.0)
+}
+
+/// C `isspace`-trimmed both ends, the way `sscanf`'s numeric conversions skip
+/// leading whitespace.
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
+    &s[start..end]
 }
 
 /// C `myNINT` (sCalcPerform.c:40) — round half away from zero.
@@ -1082,25 +1259,12 @@ impl BinField {
 /// C `BIN_WRITE` (sCalcPerform.c:1569-1633): write `val` into `fmt`'s field as
 /// raw little-endian bytes, then escape those bytes back into a string.
 ///
-/// C finds the conversion character with its own inline scan — skip every `%%`,
-/// take the next `%`, then the first character of `*cdeEfgGiousxX` after it —
-/// and bails out (`return -1`) on `*` (suppressed assignment), on `s`, and when
-/// there is no conversion character at all.
-fn bin_write(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
-    let f = fmt.as_bytes();
-
-    // `while ((s1 = strstr(s, "%%"))) {s = s1+2;}` — advance past the LAST `%%`.
-    let mut i = 0;
-    while let Some(p) = find_sub(&f[i..], b"%%") {
-        i += p + 2;
-    }
-    let pct = find_byte(&f[i..], b'%').ok_or(CalcError::InvalidFormat)? + i;
-    let conv = f[pct + 1..]
-        .iter()
-        .position(|b| b"*cdeEfgGiousxX".contains(b))
-        .ok_or(CalcError::InvalidFormat)?
-        + pct
-        + 1;
+/// C finds the conversion character with the same scan PRINTF uses
+/// ([`conversion_index`]) and bails out (`return -1`) on `*` (suppressed
+/// assignment), on `s`, and — unlike PRINTF — when there is no conversion
+/// character at all.
+fn bin_write(f: &[u8], val: &StackValue) -> Result<String, CalcError> {
+    let conv = conversion_index(f).ok_or(CalcError::InvalidFormat)?;
 
     let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
         .ok_or(CalcError::InvalidFormat)?;
@@ -1125,8 +1289,7 @@ fn bin_write(fmt: &str, val: &StackValue) -> Result<String, CalcError> {
 /// Unlike BIN_WRITE this uses `findConversionIndicator`, which skips
 /// assignment-suppressed conversions (`%*...`); the suppressed ones are then
 /// re-read as a byte count to skip over before the value is taken.
-fn bin_read(subject: &str, fmt: &str) -> Result<f64, CalcError> {
-    let f = fmt.as_bytes();
+fn bin_read(subject: &[u8], f: &[u8]) -> Result<f64, CalcError> {
     let conv = find_conversion_indicator(f).ok_or(CalcError::InvalidFormat)?;
     let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
         .ok_or(CalcError::InvalidFormat)?;
@@ -1209,8 +1372,26 @@ fn find_byte(h: &[u8], n: u8) -> Option<usize> {
     h.iter().position(|b| *b == n)
 }
 
+/// C `strstr`: the empty needle matches at the start of the haystack.
 fn find_sub(h: &[u8], n: &[u8]) -> Option<usize> {
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > h.len() {
+        return None;
+    }
     h.windows(n.len()).position(|w| w == n)
+}
+
+/// The LAST occurrence — C's `SUBLAST` scan (`sCalcPerform.c:996-1003`).
+fn rfind_sub(h: &[u8], n: &[u8]) -> Option<usize> {
+    if n.is_empty() {
+        return Some(h.len());
+    }
+    if n.len() > h.len() {
+        return None;
+    }
+    h.windows(n.len()).rposition(|w| w == n)
 }
 
 /// C `epicsStrnEscapedFromRaw` (epicsString.c:120), which is what
@@ -1240,61 +1421,76 @@ fn escaped_from_raw(src: &[u8]) -> String {
     out
 }
 
-/// C `dbTranslateEscape` -> `epicsStrnRawFromEscaped` (epicsString.c:49).
-/// Escaped string in, raw bytes out. An unknown escape yields the character
-/// itself, and a `\x` with no hex digit behind it yields a literal `x`.
-fn raw_from_escaped(src: &str) -> Vec<u8> {
-    let s = src.as_bytes();
+/// C `dbTranslateEscape` -> `epicsStrnRawFromEscaped` (epicsString.c:49-118):
+/// escaped text in, raw bytes out. The owner of the escape table for TR_ESC and
+/// BIN_READ, since C gives both the same function.
+///
+/// The `\x` cases follow C's `goto input`, which re-enters the loop with the
+/// offending character rather than backing up over it — so the `x` is SWALLOWED
+/// and the character is processed as if the `\x` had not been there. Compiled C:
+/// `\xZ` is `Z` (not `xZ`), `\xA!` is `0x0a` then `!`, and a trailing `\x` is
+/// nothing at all. Re-entering also means the character can itself start an
+/// escape.
+///
+/// (C's `!c` breaks are its string terminator; a [`ScalcString`] cannot contain a
+/// NUL, so `s.len()` is C's `strlen` and those breaks have nothing to do here.)
+fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
+    fn nibble(c: u8) -> u8 {
+        (c as char).to_digit(16).expect("checked is_ascii_hexdigit") as u8
+    }
+
     let mut out = Vec::new();
     let mut i = 0;
-    while i < s.len() {
-        if s[i] != b'\\' {
-            out.push(s[i]);
-            i += 1;
-            continue;
-        }
+    'next: while i < s.len() {
+        let mut c = s[i];
         i += 1;
-        let Some(&c) = s.get(i) else { break };
-        i += 1;
-        match c {
-            b'a' => out.push(0x07),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b't' => out.push(b'\t'),
-            b'v' => out.push(0x0b),
-            b'\\' => out.push(b'\\'),
-            b'\'' => out.push(b'\''),
-            b'"' => out.push(b'"'),
-            b'0' => out.push(0),
-            b'x' => {
-                let digits = s[i..]
-                    .iter()
-                    .take_while(|b| b.is_ascii_hexdigit())
-                    .count()
-                    .min(2);
-                if digits == 0 {
-                    // C falls back through `goto input`: the `x` is literal.
-                    out.push(b'x');
-                } else {
-                    let hex = std::str::from_utf8(&s[i..i + digits]).unwrap();
-                    out.push(u8::from_str_radix(hex, 16).unwrap());
-                    i += digits;
-                }
+        // C's `input:` label — `goto input` comes back here with a new `c`.
+        loop {
+            if c != b'\\' {
+                out.push(c);
+                continue 'next;
             }
-            other => out.push(other),
+            let Some(&e) = s.get(i) else { break 'next };
+            i += 1;
+            match e {
+                b'a' => out.push(0x07),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0c),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'v' => out.push(0x0b),
+                b'\\' => out.push(b'\\'),
+                b'\'' => out.push(b'\''),
+                b'"' => out.push(b'"'),
+                b'0' => out.push(0),
+                b'x' => {
+                    // `if (!srclen--) goto done;` — a trailing `\x` ends it.
+                    let Some(&c1) = s.get(i) else { return out };
+                    i += 1;
+                    if !c1.is_ascii_hexdigit() {
+                        c = c1; // goto input
+                        continue;
+                    }
+                    let u = nibble(c1);
+                    let Some(&c2) = s.get(i) else {
+                        out.push(u);
+                        return out;
+                    };
+                    i += 1;
+                    if !c2.is_ascii_hexdigit() {
+                        out.push(u);
+                        c = c2; // goto input
+                        continue;
+                    }
+                    out.push((u << 4) | nibble(c2));
+                }
+                other => out.push(other),
+            }
+            continue 'next;
         }
     }
     out
-}
-
-fn format_double(d: f64) -> String {
-    if d == d.trunc() && d.is_finite() {
-        format!("{}", d as i64)
-    } else {
-        format!("{}", d)
-    }
 }
 
 /// Whether `sCalcPostfix` would have stamped this program `USES_STRING`
@@ -1360,7 +1556,7 @@ fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
 /// mixed-type outcome — there is no `_` arm left to reject.
 enum Pair {
     Numeric(f64, f64),
-    Strings(String, String),
+    Strings(ScalcString, ScalcString),
 }
 
 impl Pair {
@@ -1372,18 +1568,50 @@ impl Pair {
     }
 }
 
-/// A `SUBRANGE` bound. This is NOT one of the numeric positions C coerces: C
-/// branches on the bound's TYPE (sCalcPerform.c:1876-1888) — a double is the
-/// index itself, while a STRING is searched for with `strstr` and positions the
-/// range at the match. The port implements only the numeric branch, so a string
-/// bound is still rejected here; running it through `to_double` instead would
-/// silently answer 0 for "abc" rather than looking for it. The missing branch is
-/// an open gap, reported, not papered over.
-fn subrange_index(v: &StackValue) -> Result<i64, CalcError> {
-    match v {
-        StackValue::Double(d) => Ok(*d as i64),
-        StackValue::Str(_) => Err(CalcError::TypeMismatch),
-    }
+/// `SUBRANGE`'s bounds (`sCalcPerform.c:1875-1895`). A bound is NOT one of the
+/// numeric positions C coerces — C branches on its TYPE:
+///
+/// ```c
+/// if (isDouble(ps1)) { i = (int)ps1->d;  if (i < 0) i += k; }
+/// else { s = strstr(ps->s, ps1->s);  i = s ? (s - ps->s) + strlen(ps1->s) : 0; }
+///
+/// if (isDouble(ps2)) { j = (int)ps2->d;  if (j < 0) j += k; }
+/// else if (*(ps2->s)) { s = strstr(ps->s, ps2->s);  j = s ? (s - ps->s) - 1 : k; }
+/// else { j = k; }
+///
+/// i = myMAX(myMIN(i,k),0);   /* i is clamped BOTH ways */
+/// j = myMIN(j,k);            /* j only from above — a negative j selects nothing */
+/// ```
+///
+/// So a string START bound puts the range just AFTER its match and a string END
+/// bound just BEFORE its match, each falling back to the whole string when the
+/// search fails (`i = 0`, `j = k`), and an empty END bound means "to the end"
+/// — without that special case `strstr` would match at 0 and give `j = -1`.
+///
+/// Only the DOUBLE branch wraps a negative bound around the end; a search never
+/// produces one except the `j = -1` of a match at position 0, which C leaves
+/// negative on purpose (`"hello world"["h","h"]` is empty). That is why the wrap
+/// lives in the branch and not in the clamp.
+fn subrange_bounds(subject: &[u8], start: &StackValue, end: &StackValue) -> (i64, i64) {
+    let k = subject.len() as i64;
+    let i = match start {
+        StackValue::Double(d) => {
+            let i = *d as i64;
+            if i < 0 { i + k } else { i }
+        }
+        StackValue::Str(needle) => {
+            find_sub(subject, needle.as_bytes()).map_or(0, |p| (p + needle.len()) as i64)
+        }
+    };
+    let j = match end {
+        StackValue::Double(d) => {
+            let j = *d as i64;
+            if j < 0 { j + k } else { j }
+        }
+        StackValue::Str(needle) if needle.is_empty() => k,
+        StackValue::Str(needle) => find_sub(subject, needle.as_bytes()).map_or(k, |p| p as i64 - 1),
+    };
+    (i.clamp(0, k), j.min(k))
 }
 
 /// Pop a NUMERIC operand. C reaches every one of these through `toDouble`

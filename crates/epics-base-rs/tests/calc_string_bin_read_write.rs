@@ -16,18 +16,18 @@ use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc};
 
 fn write(fmt: &str, val: f64) -> Result<String, CalcError> {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = fmt.to_string();
+    inputs.str_vars[0] = fmt.into();
     inputs.num_vars[0] = val;
     match scalc("WRITE(AA,A)", &mut inputs)? {
-        StackValue::Str(s) => Ok(s),
+        StackValue::Str(s) => Ok(s.as_str_lossy().into_owned()),
         StackValue::Double(d) => panic!("WRITE must produce a string, got {d}"),
     }
 }
 
 fn read(subject: &str, fmt: &str) -> Result<f64, CalcError> {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = subject.to_string();
-    inputs.str_vars[1] = fmt.to_string();
+    inputs.str_vars[0] = subject.into();
+    inputs.str_vars[1] = fmt.into();
     match scalc("READ(AA,BB)", &mut inputs)? {
         StackValue::Double(d) => Ok(d),
         StackValue::Str(s) => panic!("READ must produce a double, got {s:?}"),
@@ -120,7 +120,7 @@ fn only_the_narrow_conversions_sign_extend() {
 #[test]
 fn write_then_read_round_trips_in_one_expression() {
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = "%hd".to_string();
+    inputs.str_vars[0] = "%hd".into();
     inputs.num_vars[0] = 7.0;
     assert_eq!(
         scalc("READ(WRITE(AA,A),AA)", &mut inputs).unwrap(),

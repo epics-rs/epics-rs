@@ -49,14 +49,14 @@ fn num(expr: &str) -> f64 {
 /// The C driver's sCalc inputs: AA = "abcabc", BB = "bc".
 fn s(expr: &str) -> StackValue {
     let mut inp = StringInputs::new();
-    inp.str_vars[0] = "abcabc".to_string();
-    inp.str_vars[1] = "bc".to_string();
+    inp.str_vars[0] = "abcabc".into();
+    inp.str_vars[1] = "bc".into();
     scalc(expr, &mut inp).expect("sCalcPerform returns st=0 here")
 }
 
 fn s_str(expr: &str) -> String {
     match s(expr) {
-        StackValue::Str(v) => v,
+        StackValue::Str(v) => v.as_str_lossy().into_owned(),
         StackValue::Double(d) => panic!("{expr}: expected a string result, got {d}"),
     }
 }

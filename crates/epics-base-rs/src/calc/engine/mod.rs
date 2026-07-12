@@ -1,4 +1,5 @@
 pub mod cast;
+pub mod cvt;
 pub mod error;
 pub mod numeric;
 pub mod opcodes;
@@ -15,6 +16,7 @@ pub mod array_value;
 
 use error::CalcError;
 use opcodes::Opcode;
+use value::ScalcString;
 
 pub type CalcResult<T> = Result<T, CalcError>;
 
@@ -103,10 +105,28 @@ impl CompiledExpr {
     }
 }
 
-/// C's subrange bound rule, spelled once. Both synApps engines normalise `[i,j]`
-/// the same way over a container of length `k` — sCalc over `strlen(ps->s)`
-/// (`sCalcPerform.c:1875-1895`), aCalc over `arraySize`
-/// (`aCalcPerform.c:1527-1534`):
+/// C `isinf` — the value the ISINF operator pushes in all three engines
+/// (`calcPerform.c:277`, `sCalcPerform.c:1407`, `aCalcPerform.c:826,1084`,
+/// each of which assigns the macro's result straight into a `double`).
+///
+/// It is a SIGN, not a predicate: glibc expands `isinf` to
+/// `__builtin_isinf_sign`, so `-inf` is `-1`, `+inf` is `+1`, everything else
+/// (finite, NaN) is `0`. Verified on this host by compiling the macro.
+///
+/// The three engines share this one definition so the sign cannot drift back to
+/// a boolean in one of them.
+pub(crate) fn c_isinf(v: f64) -> f64 {
+    if v.is_infinite() {
+        if v.is_sign_negative() { -1.0 } else { 1.0 }
+    } else {
+        0.0
+    }
+}
+
+/// C's subrange bound rule for a pair of NUMERIC bounds over a container of
+/// length `k` — aCalc's `[` over `arraySize` (`aCalcPerform.c:1527-1534`), and
+/// sCalc's `isDouble` branch over `strlen(ps->s)` (`sCalcPerform.c:1876-1886`),
+/// which is the same arithmetic:
 ///
 /// ```c
 /// i = (int)ps1->d;  if (i < 0) i += k;
@@ -117,6 +137,10 @@ impl CompiledExpr {
 /// So: a negative bound counts back from the end, `j` is INCLUSIVE, and only `i`
 /// is clamped from below — C leaves a `j` that is still negative alone, which is
 /// what makes an inverted range select nothing.
+///
+/// sCalc alone can also take a STRING bound, which is searched for rather than
+/// counted; that branch (and the wrap it must NOT do) lives with the operator, in
+/// [`string::subrange_bounds`].
 pub(crate) fn subrange_bounds(i: i64, j: i64, k: i64) -> (i64, i64) {
     let wrap = |v: i64| if v < 0 { v + k } else { v };
     (wrap(i).clamp(0, k), wrap(j).min(k))
@@ -160,24 +184,28 @@ impl Default for NumericInputs {
 
 #[derive(Debug, Clone)]
 pub struct StringInputs {
-    pub num_vars: [f64; CALC_NARGS],    // A..U
-    pub str_vars: [String; CALC_NARGS], // AA..UU
+    pub num_vars: [f64; CALC_NARGS], // A..U
+    /// AA..UU. C's are `char *psarg[]`, pointing at the record's `char[40]`
+    /// string fields (`sCalcoutRecord.c:357`), and `FETCH_AA` copies one into
+    /// the 40-byte stack element — so an input, like every other string in the
+    /// engine, is a [`ScalcString`].
+    pub str_vars: [ScalcString; CALC_NARGS],
     /// Previous calculation result, read by the `VAL` token (C `FETCH_VAL`).
     pub prev_val: f64,
     /// Previous *string* calculation result, read by the `SVAL` token
     /// (C `FETCH_SVAL`, sCalcPerform.c:927-932, which pushes `psresult`).
     /// Empty for a fresh evaluation, and for callers whose C counterpart
     /// passes no `psresult` (numeric `calcPerform`).
-    pub prev_sval: String,
+    pub prev_sval: ScalcString,
 }
 
 impl StringInputs {
     pub fn new() -> Self {
         StringInputs {
             num_vars: [0.0; CALC_NARGS],
-            str_vars: std::array::from_fn(|_| String::new()),
+            str_vars: std::array::from_fn(|_| ScalcString::new()),
             prev_val: 0.0,
-            prev_sval: String::new(),
+            prev_sval: ScalcString::new(),
         }
     }
 }

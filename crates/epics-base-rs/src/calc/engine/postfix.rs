@@ -564,11 +564,17 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                         // Patch the Until opcode with the end_pc
                         output[until_pc] =
                             Opcode::Control(super::opcodes::ControlOp::Until(end_pc));
-                        // Runtime effect: the `Until` marker is a no-op (0),
-                        // but `UntilEnd` pops the loop condition (see
-                        // string.rs evaluator: `pop1_f64`) and pushes
-                        // nothing — a net runtime depth delta of -1.
-                        runtime_depth -= 1;
+                        // Runtime effect ZERO, both for `Until` and for
+                        // `UntilEnd` — C pushes the UNTIL_END element with an
+                        // explicit `runtime_effect = 0` (`sCalcPostfix.c:782`)
+                        // because UNTIL_END only PEEKS the condition
+                        // (`sCalcPerform.c:1999`, `ps->d == 0`). On the way out
+                        // of the loop the condition value stays on the stack —
+                        // it is what the expression evaluates to.
+                        //
+                        // The port subtracted 1 here, on the theory that the
+                        // condition is consumed. It is not, and the -1 is what
+                        // made C's own `UNTIL A; A:=A+1` look store-terminated.
                     }
                     // C postfix.c:452-455 — at a `;` terminator the net runtime
                     // depth must not exceed 1.
@@ -581,40 +587,26 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     operand_needed = true;
                 }
 
+                // C `STORE_OPERATOR` (`sCalcPostfix.c:539-565`): retract the fetch
+                // that was already emitted, turn it into a store, and park the store
+                // on the operator stack — ONE code path, whether the fetch was a
+                // number (FETCH_A..FETCH_P) or a string (FETCH_AA..FETCH_LL). It
+                // flushes nothing: a store left on the stack by an earlier `:=` in a
+                // chain stays there, which is how `A:=B:=5` reaches the end at depth
+                // -1 and is rejected as CALC_ERR_INCOMPLETE rather than underflowing
+                // mid-parse.
                 Token::Assign => {
-                    match output.last() {
-                        Some(Opcode::Core(CoreOp::PushVar(idx))) => {
-                            let idx = *idx;
-                            output.pop();
-                            runtime_depth -= 1;
-                            while let Some(entry) = stack.last() {
-                                if matches!(entry, StackEntry::LParen) {
-                                    break;
-                                }
-                                if entry.in_stack_pri() >= 1 {
-                                    let entry = stack.pop().unwrap();
-                                    runtime_depth += stack_effect(&entry);
-                                    flush_stack_entry(&entry, &mut output);
-                                } else {
-                                    break;
-                                }
-                            }
-                            stack.push(StackEntry::Store {
-                                var_idx: idx,
-                                is_double: false,
-                            });
-                        }
-                        Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => {
-                            let idx = *idx;
-                            output.pop();
-                            runtime_depth -= 1;
-                            stack.push(StackEntry::Store {
-                                var_idx: idx,
-                                is_double: true,
-                            });
-                        }
+                    let (idx, is_double) = match output.last() {
+                        Some(Opcode::Core(CoreOp::PushVar(idx))) => (*idx, false),
+                        Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => (*idx, true),
                         _ => return Err(CalcError::BadAssignment),
-                    }
+                    };
+                    output.pop();
+                    runtime_depth -= 1;
+                    stack.push(StackEntry::Store {
+                        var_idx: idx,
+                        is_double,
+                    });
                     operand_needed = true;
                 }
 
@@ -735,37 +727,25 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
         return Err(CalcError::Conditional);
     }
 
-    // End-of-expression well-formedness.
+    // End-of-expression well-formedness. ONE rule, the same in all three C
+    // compilers (`postfix.c:499-502`, `sCalcPostfix.c:862-870`,
+    // `aCalcPostfix.c:790-799`): the program must leave exactly one value on the
+    // runtime stack.
     //
-    // epics-base `postfix.c:499-502` requires a net runtime depth of exactly
-    // 1 (one value left to fetch). This Rust engine is a synApps superset:
-    // sCalc/aCalc store-assignment (`A:=5`, `BB:=AA`, `AA:="x"`) is a valid
-    // side-effect-only construct that legitimately terminates with the
-    // runtime stack at depth 0. The strict `== 1` rule therefore cannot be
-    // applied globally. (`UNTIL <cond>; <body>` value-producing forms still
-    // end at depth 1 — the `UntilEnd` opcode consumes the loop condition.)
+    // An assignment has runtime_effect -1 (`sCalcPostfix.c:226`) and pushes
+    // nothing, so a store-TERMINATED source ends at depth 0 and is rejected:
+    // compiled sCalcPostfix answers CALC_ERR_INCOMPLETE for `A:=5`, `AA:="x"`,
+    // `A:=5;B:=6` and `A:=B:=5`, and 0 for `A:=5;A`. An expression that assigns
+    // must still say what its value is.
     //
-    // The rule:
-    //   - depth 1                       -> value-producing expression, OK.
-    //   - depth 0 AND the final emitted
-    //     opcode is a store             -> store-terminated expression, OK.
-    //   - depth 0 otherwise             -> an operand was consumed without a
-    //                                      result (e.g. `CAT(AA)` with too
-    //                                      few args) -> Incomplete.
-    //   - depth > 1                     -> residual values (`1 2`, `A;B`)
-    //                                      -> Incomplete (TooMany already
-    //                                      fired at any `;`).
+    // The port exempted depth 0 when the last emitted opcode was a store, which
+    // accepted every one of those. There is no exemption: depth 1 or Incomplete.
     //
-    // A source that produced no opcodes at all is NOT exempt: `operand_needed`
-    // is still set, so it lands on Incomplete — which is what C answers for a
+    // A source that produced no opcodes at all lands here too — `operand_needed`
+    // is still set, so it is Incomplete, which is what C answers for a
     // whitespace-only expression, the only way to get here (the empty string
     // never reaches the compiler; see `calc::compile`).
-    let ends_with_store = matches!(
-        output.last(),
-        Some(Opcode::Core(CoreOp::StoreVar(_))) | Some(Opcode::Core(CoreOp::StoreDoubleVar(_)))
-    );
-    let depth_ok = runtime_depth == 1 || (runtime_depth == 0 && ends_with_store);
-    if operand_needed || !depth_ok {
+    if operand_needed || runtime_depth != 1 {
         return Err(CalcError::Incomplete);
     }
 

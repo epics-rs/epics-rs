@@ -56,7 +56,9 @@ fn test_string_var_push() {
 #[test]
 fn test_string_var_store() {
     let mut inputs = StringInputs::new();
-    let compiled = scalc_compile(r#"AA:="test""#).unwrap();
+    // R10-9: bare `AA:="test"` is CALC_ERR_INCOMPLETE in sCalcPostfix — a store
+    // leaves nothing on the stack, and the program must end with exactly one value.
+    let compiled = scalc_compile(r#"AA:="test";AA"#).unwrap();
     scalc_eval(&compiled, &mut inputs).unwrap();
     assert_eq!(inputs.str_vars[0], "test");
 }
@@ -182,14 +184,18 @@ fn a_mixed_comparison_compares_numerically() {
 
 // --- STR/DBL conversion ---
 
+// C `to_string` is `cvtDoubleToString(d, s, 8)` — a FIXED-POINT rendering with 8
+// fractional digits, not a shortest-round-trip one (R11-1). See
+// `tests/scalc_double_to_string.rs` for the compiled-C table.
+
 #[test]
 fn test_str_function() {
-    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14".into()));
+    assert_eq!(eval_str("STR(3.14)"), StackValue::Str("3.14000000".into()));
 }
 
 #[test]
 fn test_str_integer() {
-    assert_eq!(eval_str("STR(42)"), StackValue::Str("42".into()));
+    assert_eq!(eval_str("STR(42)"), StackValue::Str("42.00000000".into()));
 }
 
 #[test]

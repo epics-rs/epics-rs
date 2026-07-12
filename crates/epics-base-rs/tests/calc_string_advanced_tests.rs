@@ -128,7 +128,7 @@ fn test_modbus_append() {
     match result {
         StackValue::Str(s) => {
             // First two chars are "AB"
-            assert!(s.starts_with("AB"));
+            assert!(s.as_bytes().starts_with(b"AB"));
             // Followed by two CRC chars (may be multi-byte in UTF-8)
             assert!(s.len() > 2);
         }
@@ -158,7 +158,7 @@ fn test_amodbus_append() {
 fn test_xor8() {
     // XOR of 0x01, 0x02, 0x03 = 0x00
     let mut inputs = StringInputs::new();
-    inputs.str_vars[0] = String::from_utf8(vec![0x01, 0x02, 0x03]).unwrap();
+    inputs.str_vars[0] = vec![0x01u8, 0x02, 0x03].into();
     let result = scalc("XOR8(AA)", &mut inputs).unwrap();
     assert_eq!(result, StackValue::Double(0.0));
 }
@@ -263,45 +263,45 @@ fn test_sublast_no_match() {
 
 // --- UNTIL loop ---
 
+/// R10-9: C's UNTIL_END has runtime_effect 0 (`sCalcPostfix.c:782`) — it PEEKS
+/// the condition (`sCalcPerform.c:1999`) and leaves it on the stack on the way
+/// out. So the condition value is still there when the loop exits, and a source
+/// that then pushes another value ends at depth 2 and does not compile.
+///
+/// Compiled sCalcPostfix: `UNTIL 1; 42`, `UNTIL A; A` and `UNTIL 0; 0` are all
+/// CALC_ERR_INCOMPLETE. These three cases used to pin the port's -1 accounting,
+/// which accepted them.
 #[test]
-fn test_until_immediate_exit() {
-    // UNTIL with true condition should exit immediately
-    let mut inputs = StringInputs::new();
-    let compiled = epics_base_rs::calc::scalc_compile("UNTIL 1; 42").unwrap();
-    // Debug: print opcodes
-    for (i, op) in compiled.code.iter().enumerate() {
-        eprintln!("  [{}] {:?}", i, op);
+fn test_until_with_a_value_body_is_incomplete() {
+    for expr in ["UNTIL 1; 42", "UNTIL A; A", "UNTIL B; B", "UNTIL 0; 0"] {
+        assert!(
+            matches!(
+                epics_base_rs::calc::scalc_compile(expr),
+                Err(CalcError::Incomplete)
+            ),
+            "{expr}"
+        );
     }
-    let result = epics_base_rs::calc::scalc_eval(&compiled, &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(42.0));
 }
 
+/// The form C accepts: the body is an ASSIGNMENT, whose -1 brings the program
+/// back to depth 1 — the condition value, which is what it evaluates to.
+/// Compiled sCalcPerform: `A:=0; UNTIL A>3; A:=A+1` gives VAL=0 (the condition)
+/// with A=1.
 #[test]
-fn test_until_counter() {
-    // Test UNTIL with a simple counter using external state mutation.
-    // Increment A each iteration via num_vars externally isn't possible in expression.
-    // Test that UNTIL exits when condition is true and loops when false:
-    // A starts at 3. UNTIL A; tests A. A=3 (non-zero) -> exit immediately.
+fn test_until_with_an_assignment_body() {
     let mut inputs = StringInputs::new();
-    inputs.num_vars[0] = 3.0;
-    let result = scalc("UNTIL A; A", &mut inputs).unwrap();
-    assert_eq!(result, StackValue::Double(3.0));
-
-    // A starts at 0. UNTIL A; loops forever -> but we already test that via loop_limit.
-    // Test multi-iteration: A starts at 0, B starts at 1.
-    // Loop body: B (pushes B). Condition = B (non-zero -> exit).
-    // First iteration: B=1 -> exit. Works.
-    let mut inputs2 = StringInputs::new();
-    inputs2.num_vars[1] = 1.0; // B
-    let result2 = scalc("UNTIL B; B", &mut inputs2).unwrap();
-    assert_eq!(result2, StackValue::Double(1.0));
+    inputs.num_vars[0] = 3.0; // A: the condition is true at once
+    let result = scalc("UNTIL A; A:=A+1", &mut inputs).unwrap();
+    assert_eq!(result, StackValue::Double(3.0), "the condition value");
+    assert_eq!(inputs.num_vars[0], 4.0, "the body ran");
 }
 
 #[test]
 fn test_until_loop_limit() {
-    // Condition always false (0), never exits -> LoopLimitExceeded
+    // Condition always false, body is a legal store -> the loop never exits.
     let mut inputs = StringInputs::new();
-    let result = scalc("UNTIL 0; 0", &mut inputs);
+    let result = scalc("UNTIL 0; A:=1", &mut inputs);
     assert!(matches!(result, Err(CalcError::LoopLimitExceeded)));
 }
 
@@ -331,6 +331,10 @@ fn test_printf_no_spec() {
 
 #[test]
 fn test_printf_percent_escape() {
+    // R11-5: C's scan finds no conversion after the last `%%`, so PRINTF
+    // `strcpy`s the RAW format — the `%%` is NOT collapsed. Compiled C:
+    // PRINTF("100%%", 0) is `100%%`. (`%%` collapses only when a live
+    // conversion sends the format through snprintf — see tests/scalc_printf.rs.)
     let result = eval_str(r#"PRINTF("100%%", 0)"#);
-    assert_eq!(result, StackValue::Str("100%".into()));
+    assert_eq!(result, StackValue::Str("100%%".into()));
 }

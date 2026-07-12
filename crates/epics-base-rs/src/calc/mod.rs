@@ -1,13 +1,14 @@
 pub mod engine;
 pub mod math;
 
+pub use engine::cvt;
 pub use engine::error::{CalcError, calc_error_str};
 pub use engine::opcodes::{CoreOp, Opcode};
 pub use engine::{CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs};
 
 pub use engine::StringInputs;
 pub use engine::opcodes::StringOp;
-pub use engine::value::StackValue;
+pub use engine::value::{SCALC_STRING_MAX, SCALC_STRING_SIZE, ScalcString, StackValue};
 
 pub use engine::ArrayInputs;
 pub use engine::array_value::{ArrayCell, ArrayStackValue};
@@ -67,6 +68,29 @@ pub fn scalc_eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> CalcResult<
 pub fn scalc(expr: &str, inputs: &mut StringInputs) -> CalcResult<StackValue> {
     let compiled = scalc_compile(expr)?;
     scalc_eval(&compiled, inputs)
+}
+
+/// C `sCalcPerform`'s epilogue (`sCalcPerform.c:2034-2055`) — the ONE rule that
+/// turns the last stack element into the `(presult, psresult)` pair a record
+/// keeps as `(VAL, SVAL)` or `(OVAL, OSV)`:
+///
+/// ```c
+/// if (isDouble(ps)) {
+///     if (presult) *presult = ps->d;
+///     if (psresult) { to_string(ps); ...copy ps->s... }   /* cvtDoubleToString(d,s,8) */
+/// } else {
+///     if (psresult) { ...copy ps->s... }
+///     if (presult) { to_double(ps); *presult = ps->d; }   /* atof(s) */
+/// }
+/// ```
+///
+/// C fills BOTH cells on every evaluation, each by a coercion that already has
+/// an owner here — [`StackValue::to_double`] and [`StackValue::into_string_value`]
+/// — so a record must never re-derive either one with a formatter or a parser of
+/// its own. (The `isnan||isinf` failure that follows in C is already
+/// [`scalc_eval`]'s, so a result that reaches here is finite.)
+pub fn scalc_result(v: &StackValue) -> (f64, ScalcString) {
+    (v.to_double(), v.clone().into_string_value())
 }
 
 /// Compile an infix expression for the **array** engine — synApps

@@ -259,19 +259,20 @@ impl PortActor {
         }
     }
 
-    /// The asynManager methods that run **directly** under `asynManagerLock`
-    /// rather than through `queueRequest` — connect/disconnect, enable/disable,
-    /// auto-connect, the enable/auto-connect queries, block/unblock, and port
-    /// shutdown (asynManager.c: `enable` 2222-2249, `autoConnectAsyn` 2310-2324,
-    /// `isConnected`/`isEnabled` 2326-2354, `blockProcessCallback` 1692-1723).
+    /// The ops the block holder (`pblockProcessHolder`) cannot stall.
     ///
-    /// Because C never queues these, the block holder (`pblockProcessHolder`,
-    /// which only gates the portThread's I/O `processUser` dispatch) cannot
-    /// stall them, and the enabled/connected checks do not apply. This single
-    /// predicate is the one owner of that classification: it governs the
-    /// enabled/connected bypass in [`Self::process_one`] AND the block-divert
-    /// exemption in [`Self::enqueue_message`] / the [`RequestOp::BlockProcess`]
-    /// heap sweep, so both gates stay consistent.
+    /// C's block holder gates exactly one thing: the `processUser` dispatch in
+    /// the port thread's *lower-priority* loop (asynManager.c:874-880). The
+    /// manager calls that run directly under `asynManagerLock` — enable/disable,
+    /// auto-connect, the enable/auto-connect/connected queries, block/unblock,
+    /// port shutdown (`enable` 2222-2249, `autoConnectAsyn` 2310-2324,
+    /// `isConnected`/`isEnabled` 2326-2354, `blockProcessCallback` 1692-1723) —
+    /// never enter a queue at all, and the Connect queue is drained ahead of the
+    /// loop with no block check (:812-857). So none of them can be diverted.
+    ///
+    /// This predicate answers *that* question only. Whether the enabled/connected
+    /// refusals apply is a different question with a different answer — see
+    /// [`Self::queue_gate`], which is where C's `queueRequest` gate lives.
     fn is_lifecycle_op(op: &RequestOp) -> bool {
         matches!(
             op,
@@ -292,6 +293,56 @@ impl PortActor {
                 | RequestOp::UnblockProcess
                 | RequestOp::ShutdownPort
         )
+    }
+
+    /// Which refusals C's `queueRequest` gate (asynManager.c:1539-1552) applies
+    /// to this request — the single owner of that classification.
+    ///
+    /// `None` — C never queues it. `enable`, `autoConnect`, `isEnabled` /
+    /// `isAutoConnect` / `isConnected`, `blockProcessCallback`, `shutdownPort`
+    /// and `interposeInterface` are direct `pasynManager` calls that take
+    /// `asynManagerLock`, act, and return; no gate runs. It must stay that way:
+    /// a port disabled with `asynEnable(port,0)` could never be re-enabled if the
+    /// enable itself had to pass the enabled check.
+    ///
+    /// `Some(_)` — C queues it, so C's gate runs, and its two refusals are
+    /// **independent**. `!pport->dpc.enabled → asynDisabled` (:1541-1546) is
+    /// unconditional; only `checkPortConnect` is conditioned on the priority
+    /// (:1536-1538). [`PortDriverBase::check_queue`] enforces that split, so
+    /// nothing here can waive the enabled half.
+    ///
+    /// The connect/disconnect ops are in the queued class — C reaches
+    /// `asynCommon->connect` only from a queued callback (asynRecord's CNCT put,
+    /// asynRecord.c:503-505,562-571) or from the port thread itself — and their
+    /// waiver covers *connected* alone. That is what R12-48 fixes: a `CNCT=1` put
+    /// used to skip the whole gate, so a port disabled precisely to keep the IOC
+    /// off the hardware would open the device connection anyway. C's port thread
+    /// will not even drain the Connect queue on a disabled port (:802-805).
+    fn queue_gate(op: &RequestOp, user: &AsynUser) -> Option<ConnectCheck> {
+        match op {
+            RequestOp::EnableAddr
+            | RequestOp::DisableAddr
+            | RequestOp::SetEnable { .. }
+            | RequestOp::SetAutoConnect { .. }
+            | RequestOp::GetEnable
+            | RequestOp::GetAutoConnect
+            | RequestOp::GetConnected
+            | RequestOp::PushEchoInterpose
+            | RequestOp::PushDelayInterpose { .. }
+            | RequestOp::BlockProcess
+            | RequestOp::UnblockProcess
+            | RequestOp::ShutdownPort => None,
+            // The connect owner runs on a down line by definition: C's port thread
+            // drains the Connect queue *before* it consults any connected flag
+            // (asynManager.c:812-857). `enabled` still binds.
+            RequestOp::Connect
+            | RequestOp::Disconnect
+            | RequestOp::ConnectAddr
+            | RequestOp::DisconnectAddr => Some(ConnectCheck::Waived),
+            // Everything C queues: its gate, verbatim, keyed on the request's own
+            // user (`AsynUser::connect_check`).
+            _ => Some(user.connect_check()),
+        }
     }
 
     fn enqueue_message(&mut self, msg: ActorMessage) {
@@ -367,8 +418,6 @@ impl PortActor {
         // re-claim the token for its next phase.
         let _finish = FinishGuard(cancel);
 
-        let is_connect_op = Self::is_lifecycle_op(&op);
-
         // From here on `user.timeout` is the *I/O* timeout handed to the driver's
         // read/write, and nothing else: a request that begins running is never
         // aborted by a queue deadline (the gate above is the only place one is
@@ -377,23 +426,23 @@ impl PortActor {
         // the two clocks are separate in C too (`pasynUser->timeout` vs
         // `queueRequest`'s `timeout` argument, `AsynUser::queue_timeout` here).
 
-        // The queue gate. Which refusals apply is a property of the *request*,
-        // not of its op: `AsynUser::connect_check` reproduces C's
-        // `checkPortConnect` (asynManager.c:1536-1538), which waives the
-        // *connected* refusal for a Connect-priority request that either carries
-        // no device or carries `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`.
+        // The queue gate — C `queueRequest` (asynManager.c:1539-1552).
+        // [`Self::queue_gate`] says whether it runs at all (C queues this op or
+        // performs it as a direct manager call) and, when it does, which of its
+        // two independent refusals the request may waive. The *connected* waiver
+        // follows the request's own user (`AsynUser::connect_check`, C's
+        // `checkPortConnect` at :1536-1538); the *enabled* refusal is waivable by
+        // nobody, and `check_queue` is where that holds.
         //
-        // That waiver is the only route C gives an operator to reconfigure a line
+        // The waiver is the only route C gives an operator to reconfigure a line
         // that is down — repoint a dead IP port through HOSTINFO
         // (asynRecord.c:566-569), read a down serial port's options back into the
         // record (:1277-1280), run `asynSetOption`/`asynSetEos` from `st.cmd`
-        // before the crate is powered on (asynShellCommands.c:121,169,240,291) —
-        // and the port refused all of it. Bare Connect *priority* is not enough:
-        // C keeps the EOS readback at Low priority with no waiver (:1296), so
-        // IEOS/OEOS still stay blank on a disconnected port, and keying the
-        // waiver on the reason is what preserves that asymmetry.
-        if !is_connect_op {
-            let connect = user.connect_check();
+        // before the crate is powered on (asynShellCommands.c:121,169,240,291).
+        // Bare Connect *priority* is not enough: C keeps the EOS readback at Low
+        // priority with no waiver (:1296), so IEOS/OEOS still stay blank on a
+        // disconnected port, and keying the waiver on the reason preserves that.
+        if let Some(connect) = Self::queue_gate(&op, &user) {
             // C drains the Connect queue *before* `autoConnectDevice`
             // (asynManager.c:812-857): a waived request never triggers a connect
             // attempt, it just runs on the dead line.
@@ -2014,6 +2063,91 @@ mod tests {
         )
         .expect("the connect-time option readback is queued with the same waiver");
         assert_eq!(r.option_value.as_deref(), Some("newhost:5000"));
+    }
+
+    /// R12-48: C conditions **only** `checkPortConnect` on the priority
+    /// (asynManager.c:1536-1538). `if(!pport->dpc.enabled) return asynDisabled`
+    /// (:1541-1546) sits above it and every queued request takes it — and the
+    /// port thread will not drain even the Connect queue on a disabled port
+    /// (:802-805). So a `CNCT=1` put on a port disabled with `asynEnable(port,0)`
+    /// must not open the device connection: the port was disabled precisely to
+    /// keep the IOC off the hardware.
+    ///
+    /// The enable/query ops are the other half: C runs them as direct
+    /// `pasynManager` calls that never reach the gate, so they must keep working
+    /// on a disabled port — otherwise a disabled port could never be re-enabled.
+    #[test]
+    fn a_disabled_port_refuses_a_connect_request_but_still_takes_the_enable() {
+        struct ConnectSpy {
+            base: PortDriverBase,
+            connects: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl PortDriver for ConnectSpy {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connects
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.base.set_connected(true);
+                Ok(())
+            }
+        }
+
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("disabled_port", 1, PortFlags::default());
+        base.auto_connect = false;
+        base.set_connected(false);
+        base.enabled = false; // C `asynEnable(port, 0)`
+        let tx = spawn_actor(ConnectSpy {
+            base,
+            connects: connects.clone(),
+        });
+
+        // CNCT=1 on a disabled port: asynDisabled, and the driver's connect() is
+        // never called — the hardware is not touched.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disabled),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+        assert_eq!(
+            connects.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a disabled port must not open the device connection"
+        );
+
+        // Not even the option waiver buys the enabled refusal off (C's :1541-1546
+        // is above `checkPortConnect`, not beside it).
+        let user = AsynUser::new(0)
+            .with_timeout(Duration::from_secs(1))
+            .queue_even_if_not_connected();
+        let err = send_and_wait(
+            &tx,
+            RequestOp::SetOption {
+                key: "hostinfo".into(),
+                value: "h:1".into(),
+            },
+            user,
+        )
+        .unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disabled),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+
+        // The enable itself is a direct manager call in C and takes no gate…
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user).unwrap();
+
+        // …and once enabled, the same CNCT=1 put connects.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Connect, user).unwrap();
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

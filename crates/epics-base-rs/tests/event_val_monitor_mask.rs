@@ -136,9 +136,10 @@ async fn r9_77_dbe_log_only_subscriber_receives_nothing() {
 #[tokio::test]
 async fn r9_77_calc_val_still_logs_on_adel_crossing() {
     let db = PvDatabase::new();
-    let mut c = CalcRecord::default();
-    c.put_field("CALC", EpicsValue::String("VAL+1".into()))
-        .unwrap();
+    // `CalcRecord::new` compiles RPCL at construction; a bare `put_field`
+    // stores only the string (C's dbPut/special split — `special("CALC")`
+    // owns the compile, and no init pass runs on this direct-add path).
+    let mut c = CalcRecord::new("VAL+1");
     c.put_field("ADEL", EpicsValue::Double(0.0)).unwrap();
     c.put_field("MDEL", EpicsValue::Double(0.0)).unwrap();
     db.add_record("C", Box::new(c)).await.unwrap();

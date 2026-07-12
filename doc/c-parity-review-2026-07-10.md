@@ -2382,6 +2382,209 @@ Impact: on an alarm-transition cycle a DBE_ALARM-only subscriber to .P/.I/.D/.OV
   timeout=1 until the first asynCallbackProcess stamps TMOT; the port
   applies TMOT from the start.
 
+## Fix wave 9 — dispositions (2026-07-12)
+
+48 of 49 wave-9 items FIXED, 1 NOT-REAL (R11-32), one commit per finding,
+across 6 worktree fixers (a9a/a9b/b9/c9/d9/e9 — category A split in two)
+plus the dedicated g9 asynGpib task. All 7 branches merged into
+review/parity-r6 and verified by main.
+
+Two of this round's own finding texts were overturned by the fixers'
+compiled-C evidence; the corrections are recorded here, not silently:
+- **R11-1's premise was partly wrong.** The doc said sCalc goes to
+  exponential form "only for |v| >= 1e8". Compiled `cvtFast.c` switches
+  to `%.3f` at 1e7 and to `%*.*e` at 1e16. The fix follows compiled C.
+- **R10-13's "correct" reference implementation was wrong.** The port's
+  existing `raw_from_escaped` mishandled a `\x` with no hex digit; C's
+  `goto input` swallows the `x`. Fixed to C's behaviour.
+
+Category A part 1 — aCalc array engine + input links (a9a), 11/11 FIXED:
+- R11-61 FIXED 6862f179 — **HIGH.** Array-valued input links are offered
+  to the field whole (element-0 fallback), so INAA..INLL actually reach
+  AA..LL. The `to_f64()` collapse in processing.rs had made the entire
+  aCalcout array-input feature dead for waveform sources.
+- R10-6 FIXED d7f88108 — STRUCTURAL: `ArrayCell` = buffer + active window,
+  exposed only through `buf()`/`window()`; C's firstEl/numEl by
+  construction, so no reduction can see the zero fill again.
+- R10-8 FIXED 49c44a4d — FIT family takes C's operands, returns the fitted
+  curve, stores coefficients. Public API: `CalcError::FitFailed`,
+  `fitting::fitpoly`, `ArrayOp::FitQ/FitMQ`.
+- R11-8 FIXED 84156200 — DERIV/NDERIV are C's sliding quadratic fit.
+- R11-9 FIXED 29de3fbb — aCalc variable stores land in the record; AMASK
+  computed.
+- R11-10 FIXED 91d2173d — SMOOTH/NSMOOTH preserve border elements.
+- R11-11 FIXED a6f7d0d3 — FWHM gets C's strict crossing test and window
+  fallbacks (`fwhm(buf, last_el)`).
+- R10-10 FIXED 80680a46 — NDERIV promotes a scalar operand (toArray).
+- R10-11 FIXED b80ef9b3 — FIT/DERIV family propagates C's status; the
+  status cell is an assigning `set(Option)` mutator, one owner.
+- R11-6 FIXED ab16f745 — ARR() is C's in-place toArray promotion.
+- R11-7 FIXED d1474f87 — CAT of two scalars is C's no-op.
+
+Category A part 2 — sCalc string/number engine (a9b), 10/10 FIXED:
+- R11-1 FIXED 39592bb4 — STRUCTURAL: new `engine/cvt.rs`, a verbatim port
+  of `cvtFast.c`, is the sole owner of double→text. The four ad-hoc
+  `format!`/`parse::<f64>()` sites in scalcout.rs are gone.
+- R11-2 FIXED eff86a58 — `ScalcString` makes C's 39-byte bound hold by
+  construction; no producer can exceed it.
+- R11-3 FIXED d432724a — DBL hunts an embedded number (C's strpbrk scan);
+  a numeric operand coerces with atof.
+- R11-4 FIXED c769b6cf — BYTE reads a signed char; a double operand passes
+  through.
+- R11-5 FIXED 5f521dea — PRINTF is C's snprintf behind C's conversion scan.
+- R10-7 FIXED b6234a2d — ISINF is a SIGN, not a predicate: glibc expands it
+  to `__builtin_isinf_sign`, so -inf is -1. One `c_isinf` shared by all
+  three engines so it cannot drift back.
+- R10-9 FIXED 51caf870 — the depth-1 store exemption is gone. Enforcing the
+  uniform rule required **three compiled-C-verified semantic changes**:
+  UNTIL_END's compile effect is 0 (not -1), so an UNTIL evaluates to its
+  condition and its body must be an assignment; STORE_OPERATOR flushes
+  nothing; `;` does not reset depth.
+- R10-12 FIXED 17973c0a — an out-of-range literal is CALC_ERR_BAD_LITERAL.
+  Subtler than filed: ERANGE fires for a subnormal too, so compiled base
+  rejects 2.2e-308 and accepts 2.3e-308.
+- R10-13 FIXED 067f1852 — TR_ESC/ESC use epicsString.c's table.
+- R10-14 FIXED 6050b91c — SUBRANGE with a string bound is a strstr search;
+  the subject is toString'd. The search's `j = -1` must not wrap like a
+  negative numeric bound — true by construction now.
+
+Category B — CA tools (b9), 5/5 FIXED (merged da16471b):
+- R11-16/17/18, R10-17/18 — STRUCTURAL: `ValueFormat` splits into
+  `int_style`/`float_style` (one flag had meant two things); `cli::format_c_g`
+  is the single %g owner; `CountPrefix::leads` owns the count-prefix rule.
+  Behaviour change matching C: `caget -lx` on a LONG now prints decimal.
+
+Category C — PVA/qsrv (c9), 6 FIXED + 1 NOT-REAL:
+- R11-32 **NOT-REAL** — compiled both sides: libstdc++'s
+  `std::max(0.0, std::min(NaN, 100.0))` is 0.0, not 100.0, so pvxs lands on
+  `ackAt = limit/2` exactly where the port's NaN-propagating clamp lands.
+  The port already matches.
+- R11-31 FIXED 9e93e735 — STRUCTURAL: one negotiated per-op monitor limit.
+  `MonitorOptions::queue_size` is a resolved `u32` seeded from a server
+  default of 4 (pvxs's `limit=4u`), not the invented squash-depth 64.
+  Public API change.
+- R10-33 FIXED 7c257ce8 — qsrv reports the server's negotiated limit; the
+  duplicate queueSize parser deleted.
+- R10-34 FIXED 6bcad5e9 — the invented server-side `record._options.autoExec`
+  reader dropped.
+- R10-35 FIXED a5928544 — `record._options` converts like pvxs `Value::as<T>`.
+- R10-36 FIXED 32518461 — one `SB()<<Value` renderer for option diagnostics.
+- R10-37 FIXED 68ee7ec9 — the DBE empty-mask logRemote fires at MONITOR INIT.
+
+Category D — asyn (d9), 7/7 FIXED:
+- R11-46 FIXED 5602d457 — **the whole `SCAN="I/O Intr"` mode**, absent
+  until now. STRUCTURAL: `IoIntrScan` owns an `Option<IoIntrSample>`, so
+  C's "gotValue set without a value" is unrepresentable, and taking the
+  sample IS C's `gotValue = 0`.
+- R10-49 FIXED 047cc686 — the C queue timer: the deadline rides on
+  `ActorMessage.queue_deadline` with a `CancelToken` CAS. (C passes
+  QUEUE_TIMEOUT=10.0, per the Round 11 strengthening.)
+- R11-47 FIXED c211ec20 — an IP read teardown reports asynError, not the
+  timeout; `classify_read_failure` returns a structured delta.
+- R11-48 FIXED 65862949 — a port with no asynDrvUser forces reason 0.
+- R11-49 FIXED 30a46090 — STRUCTURAL: `drivers/option_parse.rs` is the
+  single owner of C's sscanf grammar and its diagnostic texts.
+- R10-52 FIXED b06007f8 — the option readback follows C's buffer rule.
+- R10-50 FIXED c608af35 — the dead `AsynOption` trait deleted (the
+  dead-code reclassification from Round 11).
+- BREAKING: five `PortHandle` helpers now take `&AsynUser`;
+  `interfaces::option`/`AsynOption` and `serial_config::parse_bool_option`
+  removed; `epics-base-rs` gains `Record::set_io_intr_scan` and
+  `AsyncDbHandle::put_pv`.
+
+Category E — synApps/AD records (e9), 8/8 FIXED:
+- R10-67 FIXED bfbfff95 — STRUCTURAL, framework-level: CALC_ALARM moves off
+  a framework rtype list into each record's own `check_alarms`, consumed
+  per cycle (calc/calcout/scalcout/swait). swait also gains its CLCV field.
+- R11-62 FIXED f8263a63 — swait simulation mode (SIML/SIMM/SIOL/SIMS/SVAL);
+  new `SimOutcome::SimulatedInputStage` shape, shared with busy's sim group.
+- R11-63 FIXED 6effe62f — CircularBuff flushes on soft trigger only when
+  `FlushOnSoftTrig != 0` (C), not `> 0`.
+- R11-64 FIXED 7b11c8b4 — epid posts secondary fields without the cycle's
+  alarm bits; new `Record::fields_posted_without_alarm_bits()` hook (also
+  used by transform).
+- R10-63 FIXED bdd5b39b — scaler posts only the fields C's process cycle posts.
+- R10-64 FIXED d0ae6120 — the scaler `special()` COUTP put fires inside the
+  put, not at the next process. New `Record::take_special_actions()` hook.
+- R10-65 FIXED 93d7e187 — scalcout fetches its string input links INAA..INLL.
+- R10-66 FIXED b9b1d3b0 — scalcout exposes PVAL/PSVL with C's update points.
+- STRUCTURAL: `AuxPostMask` becomes the single owner of the aux-post mask —
+  there had been two drifted assemblers.
+
+Dedicated task — asynGpib (g9), R10-55 FIXED (merged 080bfd8c):
+- GPIB as a first-class port capability: `PortDriver` +4 hooks; vxi11 and
+  prologix register asynGpib + asynInt32, so GPIBIV=1/I32IV=1 match C;
+  asynRecord UCMD/ACMD dispatch with C's frames and its 3-step serial poll.
+- The SRQ half is deliberately unported — devGpib is not in this tree.
+- Uniform-rule behaviour change: `process()` refuses `stateNoDevice` before
+  the TMOD gate, as C does.
+
+Merge integrations resolved by main (not by any fixer, so they are
+Round 12's first verification targets):
+- d9 x g9 in `asyn_record/mod.rs` — `perform_io` keeps g9's phase dispatch
+  and takes d9's `PhaseFlow::Aborted` break; `process()` keeps g9's
+  port-check-first order with d9's I/O Intr gate above it (C tests gotValue
+  at :340-341, before the stateNoDevice refusal at :356).
+- a9b x a9a in `calc/engine/array.rs` — `CoreOp::IsInf` keeps a9a's
+  `unary_op` form and a9b's `c_isinf` sign.
+- e9 x d9 in `record_trait.rs` — both added a Record hook at the same point;
+  `set_io_intr_scan` and `take_special_actions` are independent, both kept.
+
+Verified by main on a quiet host after all 7 merges: `cargo fmt --all
+--check` clean, `cargo clippy --workspace --all-targets -- -D warnings`
+clean, `cargo nextest run --workspace` **8276 passed / 0 failed / 2
+skipped**, `cargo test --doc --workspace` clean.
+
+## Open Findings — surfaced during fix wave 9 (reported by fixers, pending independent verify)
+
+Category A (calc engines):
+### R11-C1: `>?`/`<?` and vararg MAX/MIN collapse array operands to a scalar — C answers an element-wise ARRAY when either operand is an array (aCalcPerform.c:1155-1171, :1351-1352, :1376-1377); the port's pop2_f64/pop_f64 answers a scalar built from a[0] (array.rs:331,345,359,363)
+Severity: Medium. A record's AVAL gets a broadcast scalar instead of the element-wise max.
+### R11-C2: no end-of-expression stack-depth check in the array engine — C's `if (ps != top) return(-1)` (aCalcPerform.c:1608) makes a leaked operand a hard CALC_ALARM; the port's `eval` returns `stack.last()` unconditionally (array.rs:47)
+Severity: Medium.
+### R11-C3: an unset array variable fetches as the scalar 0, not an arraySize zero buffer (array.rs:89-96) — C's aa..ll always point at real arraySize record fields
+Severity: Low. Not reachable through aCalcout (always passes NELM-long arrays); reachable through the public `acalc()` API.
+### R11-C4: NEWM never computed on an INAA..INLL array change (acalcout.rs) — aCalcoutRecord.c:1105
+Severity: Low.
+### R11-C5: AMASK-flagged arrays are posted on change, not on write (acalcout.rs) — aCalcoutRecord.c:293-297 afterCalc posts exactly the flagged fields whether or not the value changed
+Severity: Low.
+### R11-C6: scalcout SVAL ignores PREC on a numeric program — `scalc_result` (calc/mod.rs:92) always renders at precision 8; C passes `pcalc->prec` into sCalcPerform (sCalcoutRecord.c:358,769 → sCalcPerform.c:831). The *string* evaluator's epilogue does hardcode 8 (:89-96), so the two paths differ by design
+Severity: Medium. SVAL/OSV of a numeric-only scalcout is wrong for every PREC != 8.
+### R11-C7: UNTIL loop-max is an error in the port, a silent break in C — the port returns CalcError::LoopLimitExceeded (string.rs:765); C just stops looping and continues with no error (sCalcPerform.c:1997), with sCalcLoopMax a settable global defaulting to 1000
+Severity: Low.
+
+Category D (asyn):
+### R11-C8: the `special()` REASON put does not blank DRVINFO or run monitorStatus — asynRecord.c:486-492 does both (the cancelIOInterruptScan half landed with R11-46)
+Severity: Low. After a REASON put, DRVINFO keeps stale text; a later reconnect re-resolves REASON *from the stale DRVINFO*, silently undoing the put.
+### R11-C9: the IP server child port does not close the client slot on a fatal read errno — drvAsynIPPort.c:797-812 closeConnection on any fatal errno or EOF; ip_server_port.rs `read_octet` ~:1266 does not
+Severity: Medium. Same defect family as R11-47 in shape, but a different driver and teardown owner. A client whose socket dies mid-read keeps its slot forever; reconnects are refused once the table fills.
+
+Category E (framework/records):
+### R11-C10: put-time posts never advance `last_posted` (record_instance.rs `notify_field`) — in C, dbPutField → db_post_events is the record's only post for that put, and monitor() then compares against the record's own *_lst fields
+Severity: Medium. Framework-wide: any subscribed non-pp field written by a put is change-posted a second time by the next process cycle.
+### R11-C11: scaler `special()` drops C's `scanOnce` (scaler.rs `take_special_actions`) — scalerRecord.c:655,667 calls scanOnce after the CNT/COUTP puts
+Severity: Medium. A non-Passive scaler publishes the state change a full scan period late.
+### R11-C12: `SIMM == 2` (RAW) is applied to menuYesNo records (processing.rs `check_simulation_mode`) — for menuYesNo SIMM there is no RAW choice; C's switch default is recGblSetSevr(SOFT_ALARM, INVALID) with NO device substitution (longinRecord.c:434-436, busyRecord.c:410-413)
+Severity: Medium. SIMM=2 on longin/int64in/busy/swait silently performs a raw simulated read where C alarms.
+### R11-C13: swait UDF discipline — C clears udf only on a successful calcPerform/SIOL read and never raises UDF_ALARM (swaitRecord.c:411,419); the port recomputes `udf = value_is_undefined()` every cycle
+Severity: Low.
+### R11-C14: transform evaluates with the numeric engine, not sCalc (transform.rs:8,564) — C calls sCalcPerform (transformRecord.c:593), which returns -1 on divide-by-zero → CALC_ALARM/INVALID
+Severity: Medium. `CLCx = "1/0"` yields inf with NO_ALARM in the port. (Also: transform's VAL is posted by the framework's deadband path on an alarm cycle, where C's monitor() posts no VAL at all.)
+### R11-C15: acalcout retains the R10-67 defect shape — a now-unread `get_field("CALC_ALARM")` pseudo-field arm and a sticky (non-consumed) `calc_alarm` in its check_alarms
+Severity: Medium. Same family as R10-67; the file was assigned to another panel that round, so e9 did not touch it.
+
+Notes on this set:
+- **A candidate list was lost.** a9b had recorded candidates (a)-(h) from the
+  R11-1..R10-13 areas before its context was compacted; the list existed only
+  in context and is in no file or commit. a9b declined to reconstruct it from
+  memory. Round 12 owes a fresh derive pass over those six areas.
+- b9's 5 and g9's 1 candidates were folded into the Round 11 adjudication
+  set already and are not repeated here.
+- **`git stash` is repo-global across caucus worktrees** — g9 and a9b collided
+  on `refs/stash` this wave (g9 restored a sibling's WIP onto commit 26275614).
+  Fixers must not use stash; use `git diff > patch; git apply -R; …; git apply`
+  for fail-before verification.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -2604,3 +2807,30 @@ Impact: on an alarm-transition cycle a DBE_ALARM-only subscriber to .P/.I/.D/.OV
   next: 49 items (24 confirmed carryovers + R10-50 cleanup + 24 new);
   R10-55 (asynGpib surface) assigned as a dedicated structural task;
   ARANDOM seeding awaiting disposition as accepted deviation.
+- Fix wave 9 (2026-07-12): 6 worktree fixers (opus; category A split a9a/a9b
+  because the sCalc string engine and the aCalc array engine are disjoint
+  surfaces of comparable size) plus the dedicated g9 asynGpib task. 48 of 49
+  items FIXED, 1 NOT-REAL (R11-32 — compiled both sides; libstdc++'s NaN
+  clamp is 0.0, so pvxs already lands where the port lands). All 7 branches
+  merged into review/parity-r6 by main, with 3 merge integrations resolved by
+  hand (d9xg9 in asyn_record, a9bxa9a in the array engine, e9xd9 in
+  record_trait) — those are Round 12's first verification targets. Verified on
+  a quiet host: workspace clippy -D warnings clean, nextest 8276 passed /
+  0 failed / 2 skipped, doctests clean. The two under-load flakes seen during
+  the fix wave (epics-pva-rs stability, epics-ca-rs protocol_tests) did not
+  reproduce. Structural work this wave: ArrayCell (buffer+window) closes the
+  aCalc window family; engine/cvt.rs is the sole double→text owner; ScalcString
+  bounds C's 39 bytes by construction; IoIntrScan makes "gotValue without a
+  value" unrepresentable; drivers/option_parse.rs owns C's sscanf grammar;
+  AuxPostMask replaces two drifted assemblers; CALC_ALARM moves from a
+  framework rtype list to record-owned, per-cycle-consumed state; GPIB becomes
+  a port capability rather than a hardcoded GPIBIV=0. Four compiled-C findings
+  overturned text this project had believed: cvtFast switches at 1e7/1e16 (not
+  1e8), glibc isinf is a sign, UNTIL_END's compile effect is 0, and ERANGE
+  fires for subnormals. Breaking API changes landed in epics-ca-rs
+  (ValueFormat), epics-pva-rs (MonitorOptions::queue_size), asyn-rs (PortHandle
+  helpers take &AsynUser; AsynOption removed) and epics-base-rs (two new Record
+  hooks, CalcError::FitFailed, ArrayCell). 15 new findings recorded OPEN
+  (R11-C1..C15); a9b lost a candidate list (a)-(h) to context compaction, so
+  Round 12 owes a fresh derive pass over the sCalc string-engine areas.
+  Nothing pushed.

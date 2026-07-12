@@ -17,6 +17,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     let code = &expr.code;
     let mut pc = 0;
 
+    // C's `status` (`aCalcPerform.c:422`) — a deferred failure flag, NOT an early
+    // return. An operator that trips it (the array SQRT/LOG domain guard) sets it
+    // and execution CONTINUES to the end of the expression; only then does
+    // aCalcPerform bail (`:1602-1605`) without writing p_dresult/p_aresult.
+    //
+    // The deferral is observable: aCalc's store opcodes write straight into the
+    // record's A..P / AA..LL fields, so a store sequenced AFTER the failing
+    // operator still lands in C. Returning early from the operator's arm would
+    // silently skip it.
+    let mut status: Option<CalcError> = None;
+
     while pc < code.len() {
         let op = &code[pc];
         pc += 1;
@@ -264,7 +275,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 CoreOp::Sqrt => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.sqrt()));
+                    stack.push(domain_guarded(a, f64::sqrt, &mut status));
                 }
                 CoreOp::Exp => {
                     let a = pop1(&mut stack)?;
@@ -272,11 +283,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 CoreOp::Log10 => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.log10()));
+                    stack.push(domain_guarded(a, f64::log10, &mut status));
                 }
                 CoreOp::LogE => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| x.ln()));
+                    stack.push(domain_guarded(a, f64::ln, &mut status));
                 }
                 CoreOp::Sin => {
                     let a = pop1(&mut stack)?;
@@ -680,10 +691,59 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         }
     }
 
+    // C `:1602-1605`: the deferred failure is consumed HERE, after the whole
+    // expression has run (and after its stores have landed), and it suppresses the
+    // result write entirely.
+    if let Some(err) = status {
+        return Err(err);
+    }
+
     Ok(stack
         .last()
         .cloned()
         .unwrap_or(ArrayStackValue::Double(0.0)))
+}
+
+/// aCalc's three domain-guarded unary operators — `SQRT`/`SQR`, `LOG`, `LN`.
+/// Their two branches do NOT agree, and the asymmetry is the contract:
+///
+/// - **scalar** (`aCalcPerform.c:1044-1072`): a negative operand becomes 0 and
+///   the evaluation continues with **no error at all** — C only prints a line.
+///   `SQRT(-4)` is 0 with a healthy record.
+/// - **array** (`:775-812`): every negative ELEMENT becomes 0 **and** `status` is
+///   set to -1, so aCalcPerform ultimately returns -1 without writing
+///   p_dresult/p_aresult — the record keeps its previous VAL/AVAL and raises
+///   CALC_ALARM/INVALID.
+///
+/// Neither branch ever yields NaN, which is what a bare `sqrt`/`log` gives and
+/// what the port used to produce. Note the guard is `< 0`, so `LOG(0)` is not
+/// caught here: it yields -inf, and the record's own non-finite check owns that.
+///
+/// This is aCalc's rule only. base `calcPerform` takes the bare sqrt/log (NaN,
+/// no error) and sCalc returns -1 immediately (`sCalcPerform.c:521-541`); both
+/// are already faithful in `numeric.rs` and `string.rs`.
+fn domain_guarded(
+    v: ArrayStackValue,
+    f: fn(f64) -> f64,
+    status: &mut Option<CalcError>,
+) -> ArrayStackValue {
+    match v {
+        ArrayStackValue::Double(d) => Double(if d < 0.0 { 0.0 } else { f(d) }),
+        ArrayStackValue::Array(a) => {
+            let out = a
+                .into_iter()
+                .map(|x| {
+                    if x < 0.0 {
+                        *status = Some(CalcError::DomainError);
+                        0.0
+                    } else {
+                        f(x)
+                    }
+                })
+                .collect();
+            ArrayStackValue::Array(out)
+        }
+    }
 }
 
 /// C's unary array-operator dispatch (`aCalcPerform.c:769-1101`) is ONE operator

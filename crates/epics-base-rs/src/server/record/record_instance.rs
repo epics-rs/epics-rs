@@ -1239,7 +1239,6 @@ impl RecordInstance {
         }
     }
 
-    /// Set a common field value. Returns what scan index changes are needed.
     /// `true` when the record type declares `name` in its own `field_list`,
     /// i.e. the record stores the field itself and owns whatever behaviour
     /// hangs off it.
@@ -1259,6 +1258,7 @@ impl RecordInstance {
         self.record.field_list().iter().any(|f| f.name == name)
     }
 
+    /// Set a common field value. Returns what scan index changes are needed.
     pub fn put_common_field(
         &mut self,
         name: &str,

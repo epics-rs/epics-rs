@@ -19,3 +19,6 @@ kodex-out/
 .claude/
 .DS_Store
 *.bak
+
+# caucus session infra (worktrees, logs) — never repo content
+.caucus/

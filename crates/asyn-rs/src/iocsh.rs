@@ -704,7 +704,15 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
                 };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
             keep_port_runtime(handle);
             ctx.println(&format!(
                 "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
@@ -780,7 +788,15 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
                 };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
             keep_port_runtime(handle);
             ctx.println(&format!(
                 "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
@@ -850,7 +866,15 @@ pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> Com
             };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("prologixGPIBConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
             keep_port_runtime(handle);
             ctx.println(&format!(
                 "prologixGPIBConfigure: GPIB port '{port}' -> {host}"

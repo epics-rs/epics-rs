@@ -46,7 +46,8 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
 
                 let port_handle = runtime.port_handle().clone();
 
-                asyn_rs::asyn_record::register_port(&port_name, port_handle, trace.clone());
+                asyn_rs::asyn_record::register_port(&port_name, port_handle, trace.clone())
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     runtime.pool().clone(),

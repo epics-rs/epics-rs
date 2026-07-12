@@ -9,9 +9,7 @@ mod include;
 mod substitution;
 #[cfg(test)]
 pub(crate) use include::parse_include_directive;
-pub use include::{
-    DbLoadConfig, expand_includes, override_dtyp, parse_db_file, parse_db_file_with_breaktables,
-};
+pub use include::{DbLoadConfig, expand_includes, parse_db_file, parse_db_file_with_breaktables};
 pub use substitution::{TemplateLoad, load_substitution_file, parse_substitutions};
 
 /// Factory function that creates a record instance.
@@ -1989,38 +1987,55 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         assert!(result.contains(r#"record(ai, "VIA_PATH")"#));
     }
 
+    /// A `DTYP=` macro is pure text substitution, exactly like every other
+    /// macro: it reaches a record only where the `.db` wrote
+    /// `field(DTYP,"$(DTYP)")`. It must NOT rewrite a record that spells its
+    /// DTYP literally.
+    ///
+    /// This replaces `test_dtyp_override_existing_only`, which pinned the
+    /// opposite (force-override) behaviour. C `dbLoadRecords` runs its macros
+    /// through macLib during lexing (`dbLexRoutines.c`); there is no DTYP
+    /// special case, and a force-override corrupts any multi-record file whose
+    /// helper records carry a literal DTYP — e.g. the vendored
+    /// `scaler-rs/db/scaler.db`, where two `bo` helpers are
+    /// `field(DTYP,"Soft Channel")` and only the `scaler` record references
+    /// `$(DTYP)`.
     #[test]
-    fn test_dtyp_override_existing_only() {
-        let mut records = vec![
-            DbRecordDef {
-                record_type: "ai".to_string(),
-                name: "REC_WITH_DTYP".to_string(),
-                fields: vec![
-                    ("DTYP".to_string(), "oldDtyp".to_string()),
-                    ("VAL".to_string(), "0".to_string()),
-                ],
-                aliases: Vec::new(),
-                info_tags: Vec::new(),
-            },
-            DbRecordDef {
-                record_type: "ao".to_string(),
-                name: "REC_WITHOUT_DTYP".to_string(),
-                fields: vec![("VAL".to_string(), "1".to_string())],
-                aliases: Vec::new(),
-                info_tags: Vec::new(),
-            },
-        ];
+    fn dtyp_macro_substitutes_references_and_leaves_literals_alone() {
+        let input = r#"
+record(bo, "$(P)_calcEnable") {
+    field(DTYP, "Soft Channel")
+    field(ZNAM, "ENABLE")
+}
+record(scaler, "$(P)") {
+    field(DTYP, "$(DTYP)")
+    field(FREQ, "10000000")
+}
+record(ao, "$(P)_noDtyp") {
+    field(VAL, "1")
+}
+"#;
+        let mut macros = HashMap::new();
+        macros.insert("P".to_string(), "SCALER1".to_string());
+        macros.insert("DTYP".to_string(), "Scaler-rs".to_string());
 
-        override_dtyp(&mut records, "newDtyp");
+        let records = parse_db(input, &macros).unwrap();
+        assert_eq!(records.len(), 3);
 
-        // Record with DTYP: value replaced
-        assert_eq!(
-            records[0].fields[0],
-            ("DTYP".to_string(), "newDtyp".to_string())
-        );
-        // Record without DTYP: unchanged (no DTYP added)
-        assert_eq!(records[1].fields.len(), 1);
-        assert!(!records[1].fields.iter().any(|(n, _)| n == "DTYP"));
+        let dtyp_of = |rec: &DbRecordDef| -> Option<String> {
+            rec.fields
+                .iter()
+                .find(|(n, _)| n == "DTYP")
+                .map(|(_, v)| v.clone())
+        };
+
+        // Literal DTYP: untouched by the macro. Force-override used to corrupt
+        // this into "Scaler-rs", breaking the soft helper records.
+        assert_eq!(dtyp_of(&records[0]).as_deref(), Some("Soft Channel"));
+        // $(DTYP) reference: substituted.
+        assert_eq!(dtyp_of(&records[1]).as_deref(), Some("Scaler-rs"));
+        // No DTYP field: none added.
+        assert_eq!(dtyp_of(&records[2]), None);
     }
 
     #[test]

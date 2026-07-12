@@ -819,7 +819,7 @@ fn hunt_double(s: &[u8]) -> f64 {
     if i > 0 && s[i - 1] == b'-' {
         i -= 1;
     }
-    super::strtod::strtod(&s[i..]).0
+    super::strtod::strtod(&s[i..]).value
 }
 
 /// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
@@ -1177,7 +1177,7 @@ fn simple_sscanf(input: &[u8], fmt: &[u8]) -> StackValue {
                 // C's `%e`/`%f`/`%g` conversion is strtod on the input, so it
                 // takes the longest numeric PREFIX and leaves the rest —
                 // `SSCANF("1.5V", "%f")` is 1.5, not a failed conversion.
-                b'f' | b'e' | b'g' => StackValue::Double(super::strtod::strtod(trimmed).0),
+                b'f' | b'e' | b'g' => StackValue::Double(super::strtod::strtod(trimmed).value),
                 b's' => {
                     // Read until whitespace
                     let word: Vec<u8> = trimmed

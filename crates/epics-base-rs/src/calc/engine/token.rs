@@ -226,25 +226,38 @@ struct ElementTable {
     /// eats all eight characters; `INFO` is CALC_ERR_SYNTAX because strtod eats
     /// `INF` and the `O` left behind matches no element.
     literal_words: &'static [&'static str],
-    /// How a numeric literal is parsed once its first character has matched.
-    hex: HexLiteral,
+    /// Which C compiler's literal reader this table belongs to.
+    literals: LiteralReader,
 }
 
 /// The `LITERAL_OPERAND` words shared by base and sCalc. aCalc's table has no
 /// such element, so it gets `&[]`.
 static INF_NAN: &[&str] = &["INF", "NAN"];
 
-/// C's two literal-parsing paths, one per table shape.
+/// C's two literal readers. The two compilers differ on BOTH halves of reading a
+/// literal, and they differ together — so this is one choice, not two knobs that
+/// could be set inconsistently.
 #[derive(Clone, Copy, PartialEq)]
-enum HexLiteral {
-    /// base `postfix.c:79` has a `{"0X", ..., LITERAL_INT}` element of its own,
-    /// parsed with `epicsParseUInt32` (`postfix.c:283`) — a 32-bit unsigned
-    /// value, and `CALC_ERR_BAD_LITERAL` for anything wider.
-    Uint32Element,
-    /// sCalc/aCalc have no `0X` element. `0x1F` matches the `{"0"}` element,
-    /// and `LITERAL_OPERAND` then re-scans from the symbol start with
-    /// `epicsStrtod` (sCalcPostfix.c:491, aCalcPostfix.c:493), i.e. C99
-    /// `strtod` — which parses hex itself, at full double width.
+enum LiteralReader {
+    /// base `postfix.c:261-288`.
+    ///
+    /// A double goes through `epicsParseDouble`, which FAILS on `errno ==
+    /// ERANGE` (`epicsStdlib.c:164`) — so a literal naming a number the format
+    /// cannot hold is `CALC_ERR_BAD_LITERAL`, not an infinity or a zero.
+    ///
+    /// Hex has an element of its own (`{"0X", ..., LITERAL_INT}`, `postfix.c:79`)
+    /// parsed with `epicsParseUInt32` (`:283`) — a 32-bit unsigned value, and a
+    /// bad literal for anything wider.
+    ParseDouble,
+    /// sCalc `sCalcPostfix.c:492` / aCalc `aCalcPostfix.c:462`.
+    ///
+    /// A bare `epicsStrtod`, whose only failure is "converted nothing"
+    /// (`pnext == psrc`): `errno` is never read, so `1e400` compiles to an
+    /// infinity and `1e-400` to a zero.
+    ///
+    /// Neither table has a `0X` element. `0x1F` matches the `{"0"}` element, and
+    /// `LITERAL_OPERAND` re-scans from the symbol start with the same strtod —
+    /// which parses hex itself, at full double width.
     Strtod,
 }
 
@@ -323,7 +336,7 @@ static BASE_TABLE: ElementTable = ElementTable {
     last_double_var: None,
     string_literals: false,
     literal_words: INF_NAN,
-    hex: HexLiteral::Uint32Element,
+    literals: LiteralReader::ParseDouble,
 };
 
 /// synApps `sCalcPostfix.c:97-215`.
@@ -445,7 +458,7 @@ static SCALC_TABLE: ElementTable = ElementTable {
     last_double_var: Some(b'L' - b'A'),
     string_literals: true,
     literal_words: INF_NAN,
-    hex: HexLiteral::Strtod,
+    literals: LiteralReader::Strtod,
 };
 
 /// synApps `aCalcPostfix.c:99-224`.
@@ -570,7 +583,7 @@ static ACALC_TABLE: ElementTable = ElementTable {
     // aCalcPostfix.c:98-108 — the table's only LITERAL_OPERANDs are `.` and the
     // digits. It has no `INF` and no `NAN` element.
     literal_words: &[],
-    hex: HexLiteral::Strtod,
+    literals: LiteralReader::Strtod,
 };
 
 fn table_for(kind: &ExprKind) -> &'static ElementTable {
@@ -706,28 +719,24 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// C's `LITERAL_OPERAND` case: rewind to the element's first character and
-    /// hand the text to strtod (`epicsParseDouble`, postfix.c:261; `epicsStrtod`,
-    /// sCalcPostfix.c:492 and aCalcPostfix.c:462). The literal covers exactly the
-    /// text strtod consumes, and strtod consuming NOTHING is
+    /// hand the text to the table's reader ([`LiteralReader`]). The literal
+    /// covers exactly the text strtod consumes, and strtod consuming NOTHING is
     /// `CALC_ERR_BAD_LITERAL` (C tests `pnext == psrc`) — which is why a lone `.`
     /// is a bad literal rather than a syntax error.
     ///
     /// The scan itself is `strtod::strtod`, shared with sCalc's `atof` coercion.
     /// A sign or leading whitespace never reaches it here: `at_literal` only
-    /// fires on a digit, a `.`, or one of the table's literal words.
+    /// fires on a digit, a `.`, or one of the table's literal words — which is
+    /// also why an out-of-range literal is only ever the MAGNITUDE: `-1e400` is
+    /// the unary minus applied to the bad literal `1e400`.
     fn read_literal(&mut self) -> Result<f64, CalcError> {
         let start = self.pos;
         let rem = &self.input[start..];
 
-        // base alone has a `{"0X", ..., LITERAL_INT}` element (postfix.c:79),
-        // and it is NOT strtod: postfix.c:283 parses it with `epicsParseUInt32`,
-        // so the value is 32-bit unsigned and anything wider is a bad literal.
-        // sCalc/aCalc have no such element — their `0x1F` matches `{"0"}` and
-        // goes to strtod, which reads hex at full double width.
         let is_hex = rem.first() == Some(&b'0')
             && matches!(rem.get(1), Some(b'x' | b'X'))
             && rem.get(2).is_some_and(u8::is_ascii_hexdigit);
-        if is_hex && self.table.hex == HexLiteral::Uint32Element {
+        if is_hex && self.table.literals == LiteralReader::ParseDouble {
             let end = 2 + rem[2..]
                 .iter()
                 .take_while(|b| b.is_ascii_hexdigit())
@@ -739,12 +748,21 @@ impl<'a> Tokenizer<'a> {
                 .map_err(|_| CalcError::BadLiteral);
         }
 
-        let (value, len) = strtod::strtod(rem);
-        if len == 0 {
+        let n = strtod::strtod(rem);
+        if n.len == 0 {
             return Err(CalcError::BadLiteral);
         }
-        self.pos += len;
-        Ok(value)
+        // `epicsParseDouble` returns ERANGE as a failure and base's compiler
+        // turns any failure into CALC_ERR_BAD_LITERAL (`postfix.c:263-265`);
+        // `epicsStrtod` never looks at errno, so sCalc/aCalc take the infinity
+        // or the zero. Compiled: base rejects `1e400`, `1e-400` and `2.2e-308`
+        // and accepts `2.3e-308`, `1e308` and `0e999`; sCalcPostfix accepts all
+        // six.
+        if n.erange && self.table.literals == LiteralReader::ParseDouble {
+            return Err(CalcError::BadLiteral);
+        }
+        self.pos += n.len;
+        Ok(n.value)
     }
 }
 

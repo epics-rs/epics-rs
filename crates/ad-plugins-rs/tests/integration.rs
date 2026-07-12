@@ -593,6 +593,9 @@ fn test_circular_buff_trigger_flow() {
         TriggerCondition::External,
         100, // max_buffers (C maxBuffers_)
     );
+    // C NDCircBuffControl = 1: the plugin records nothing until acquisition is
+    // turned on (NDPluginCircularBuff.cpp:121, the `if (scopeControl)` gate).
+    proc.start();
 
     // Fill pre-buffer
     let arr1 = make_2d_u8(4, 4);

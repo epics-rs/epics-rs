@@ -297,12 +297,100 @@ fn test_until_with_an_assignment_body() {
     assert_eq!(inputs.num_vars[0], 4.0, "the body ran");
 }
 
+/// `UNTIL(body; ... ; condition)` — the form the record documentation uses
+/// (`aCalcoutRecord.md:405`, `:578`) and the only one that loops. C compiles
+/// `UNTIL_END` from the OPERATOR stack, so the `;` INSIDE the parentheses cannot
+/// close the loop: everything up to the `)` is the body and the last value is the
+/// condition.
+///
+/// Compiled sCalcPerform, verbatim:
+///   `UNTIL(1)`                    -> st=0, VAL=1
+///   `B:=10;UNTIL(B:=B-1;B<1)`     -> st=0, VAL=1
+///   `A:=0;UNTIL(A:=A+1;A>3)`      -> st=0, VAL=1, A=4
+///   `UNTIL(1)+UNTIL(1)`           -> st=0, VAL=2
 #[test]
-fn test_until_loop_limit() {
-    // Condition always false, body is a legal store -> the loop never exits.
+fn test_until_parenthesised_loop() {
     let mut inputs = StringInputs::new();
-    let result = scalc("UNTIL 0; A:=1", &mut inputs);
-    assert!(matches!(result, Err(CalcError::LoopLimitExceeded)));
+    assert_eq!(
+        scalc("UNTIL(1)", &mut inputs).unwrap(),
+        StackValue::Double(1.0)
+    );
+
+    let mut inputs = StringInputs::new();
+    let r = scalc("B:=10;UNTIL(B:=B-1;B<1)", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(1.0), "the condition value");
+    assert_eq!(inputs.num_vars[1], 0.0, "B counted down to 0");
+
+    let mut inputs = StringInputs::new();
+    let r = scalc("A:=0;UNTIL(A:=A+1;A>3)", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(1.0));
+    assert_eq!(inputs.num_vars[0], 4.0, "the body ran until A>3");
+
+    let mut inputs = StringInputs::new();
+    assert_eq!(
+        scalc("UNTIL(1)+UNTIL(1)", &mut inputs).unwrap(),
+        StackValue::Double(2.0)
+    );
+}
+
+/// Running out of iterations is NOT an error in sCalc. C `sCalcPerform.c:1997`:
+///
+/// ```c
+/// if (++loopsDone > sCalcLoopMax) break;   /* out of the switch, not the perform */
+/// ```
+///
+/// so the loop simply stops, the perform returns 0, and the value is the last
+/// condition it evaluated (which is false, or it would have exited on its own).
+/// Compiled sCalcPerform, with the shipped `sCalcLoopMax` = 1000:
+///   `A:=0;UNTIL(A:=A+1;0)`        -> st=0, VAL=0, A=1001
+///   `A:=0;UNTIL(A:=A+1;A>2000)`   -> st=0, VAL=0, A=1001
+///   `UNTIL 0; A:=1`               -> st=0, VAL=0, A=1
+///
+/// A=1001, not 1000: `loopsDone` is incremented on ARRIVAL at UNTIL_END, so the
+/// body has already run one more time than the loop-back count.
+#[test]
+fn test_until_loop_max_stops_without_an_error() {
+    let mut inputs = StringInputs::new();
+    let r = scalc("A:=0;UNTIL(A:=A+1;0)", &mut inputs).unwrap();
+    assert_eq!(
+        r,
+        StackValue::Double(0.0),
+        "the last condition, not an error"
+    );
+    assert_eq!(inputs.num_vars[0], 1001.0);
+
+    let mut inputs = StringInputs::new();
+    let r = scalc("A:=0;UNTIL(A:=A+1;A>2000)", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(0.0));
+    assert_eq!(inputs.num_vars[0], 1001.0);
+
+    // The un-parenthesised form: the loop body is the bare `0`, and `A:=1` sits
+    // AFTER the UNTIL_END, so it runs exactly once, after the loop gives up.
+    let mut inputs = StringInputs::new();
+    let r = scalc("UNTIL 0; A:=1", &mut inputs).unwrap();
+    assert_eq!(r, StackValue::Double(0.0));
+    assert_eq!(inputs.num_vars[0], 1.0);
+}
+
+/// C `until_scratch[10]` with `if (i>9) {printf("too many UNTILs"); return(-1);}`
+/// (`sCalcPerform.c:356-360`). Compiled sCalc: nine `UNTIL(1)` terms perform
+/// (VAL=9); the tenth fails the perform.
+#[test]
+fn test_until_count_ceiling_is_nine() {
+    let nine = ["UNTIL(1)"; 9].join("+");
+    let mut inputs = StringInputs::new();
+    assert_eq!(
+        scalc(&nine, &mut inputs).unwrap(),
+        StackValue::Double(9.0),
+        "nine UNTILs perform"
+    );
+
+    let ten = ["UNTIL(1)"; 10].join("+");
+    let mut inputs = StringInputs::new();
+    assert!(
+        scalc(&ten, &mut inputs).is_err(),
+        "the tenth fails the perform"
+    );
 }
 
 // --- READ / WRITE (C `BIN_READ` / `BIN_WRITE` opcodes) ---

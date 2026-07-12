@@ -18,7 +18,6 @@ pub enum CalcError {
     BadAssignment,
     TypeMismatch,
     InvalidFormat,
-    LoopLimitExceeded,
     EmptyArray,
     InvalidSubrange,
     BracketNotOpen,
@@ -52,7 +51,6 @@ impl fmt::Display for CalcError {
             CalcError::BadAssignment => write!(f, "Bad assignment target"),
             CalcError::TypeMismatch => write!(f, "Type mismatch: mixed numeric/string operation"),
             CalcError::InvalidFormat => write!(f, "Invalid format string"),
-            CalcError::LoopLimitExceeded => write!(f, "Loop iteration limit exceeded"),
             CalcError::EmptyArray => write!(f, "Operation on empty array"),
             CalcError::InvalidSubrange => write!(f, "Invalid subrange specification"),
             CalcError::BracketNotOpen => write!(f, "Close bracket found without open"),
@@ -93,7 +91,7 @@ impl CalcError {
             // CALC_ERR_UNDERFLOW      = 9
             CalcError::Underflow => 9,
             // CALC_ERR_OVERFLOW       = 10
-            CalcError::Overflow | CalcError::LoopLimitExceeded => 10,
+            CalcError::Overflow => 10,
             // CALC_ERR_SYNTAX         = 11
             CalcError::Syntax
             | CalcError::DivisionByZero

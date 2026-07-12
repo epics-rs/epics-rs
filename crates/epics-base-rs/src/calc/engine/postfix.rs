@@ -1,5 +1,5 @@
 use super::error::CalcError;
-use super::opcodes::{CoreOp, Opcode};
+use super::opcodes::{ControlOp, CoreOp, Opcode};
 use super::token::{ConstName, FuncName, Token};
 use super::{CompiledExpr, ExprKind};
 
@@ -37,6 +37,24 @@ enum StackEntry {
         var_idx: u8,
         is_double: bool,
     },
+    /// C's `UNTIL_END` element (`sCalcPostfix.c:779-783`): reading `UNTIL` PUSHES
+    /// one of these onto the OPERATOR stack, carrying the in-stack priority of
+    /// the `UNTIL` element itself (0) and an explicit `runtime_effect = 0`. It is
+    /// therefore emitted by the ordinary flush rules and by nothing else — a `)`
+    /// or an inner `;` stops at the `(` above it, and only the end of the
+    /// enclosing statement (or of the expression) reaches it.
+    ///
+    /// That is the whole loop-closing rule, and it is why `UNTIL(a:=a+1;a>3)`
+    /// puts `UNTIL_END` AFTER the condition: the `;` inside the parentheses
+    /// cannot see this entry. The port used to keep a private `until_stack` and
+    /// close the loop at the first `;` it met, which is the `;` between the body
+    /// and the condition — so the condition was compiled outside the loop and
+    /// `UNTIL_END` peeked an empty stack.
+    UntilEnd {
+        /// Where the paired `Until` placeholder sits in `output`; it is patched
+        /// with this entry's own position when the entry is flushed.
+        until_pc: usize,
+    },
 }
 
 impl StackEntry {
@@ -47,6 +65,9 @@ impl StackEntry {
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::CondEnd => 0,
             StackEntry::Store { .. } => 1,
+            // C: `{"UNTIL", 0, 10, 0, UNTIL_OPERATOR, UNTIL}` — in_stack_pri 0,
+            // so no incoming operator ever pops it off the stack.
+            StackEntry::UntilEnd { .. } => 0,
         }
     }
 }
@@ -295,6 +316,13 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>) {
         StackEntry::CondEnd => {
             output.push(Opcode::Core(CoreOp::CondEnd));
         }
+        StackEntry::UntilEnd { until_pc } => {
+            // The two halves of the loop learn each other's position here, the
+            // one moment both are known.
+            let end_pc = output.len();
+            output.push(Opcode::Control(ControlOp::UntilEnd(*until_pc)));
+            output[*until_pc] = Opcode::Control(ControlOp::Until(end_pc));
+        }
         StackEntry::Store { var_idx, is_double } => {
             if *is_double {
                 output.push(Opcode::Core(CoreOp::StoreDoubleVar(*var_idx)));
@@ -328,7 +356,6 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     let mut pos = 0;
     let mut bracket_depth: i32 = 0;
     let mut brace_depth: i32 = 0;
-    let mut until_stack: Vec<usize> = Vec::new();
 
     while pos < tokens.len() {
         let token = &tokens[pos];
@@ -425,16 +452,19 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     stack.push(StackEntry::LParen);
                 }
 
+                // C `UNTIL_OPERATOR` (`sCalcPostfix.c:759-784`): flush the
+                // operators of >= priority (in_coming_pri 10), emit `UNTIL` to
+                // the output, then push the `UNTIL_END` half onto the OPERATOR
+                // stack, where the ordinary flush rules will place it. Both
+                // halves have runtime_effect 0, and `operand_needed` is
+                // untouched — the loop body still owes an operand.
                 Token::UntilKeyword => {
-                    // UNTIL marks the start of a loop.
-                    // Record the current output position as the loop start.
-                    // Emit placeholder Until opcode (will be patched).
+                    pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth);
                     let until_pc = output.len();
-                    output.push(Opcode::Control(
-                        super::opcodes::ControlOp::Until(0), // placeholder
-                    ));
-                    until_stack.push(until_pc);
-                    // operand_needed remains true (body follows)
+                    // Patched by `flush_stack_entry` when the paired `UntilEnd`
+                    // entry comes off the stack.
+                    output.push(Opcode::Control(ControlOp::Until(0)));
+                    stack.push(StackEntry::UntilEnd { until_pc });
                 }
 
                 Token::Func(func) => {
@@ -555,27 +585,12 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                         runtime_depth += stack_effect(&entry);
                         flush_stack_entry(&entry, &mut output);
                     }
-                    // If there's a pending UNTIL, close it.
-                    if let Some(until_pc) = until_stack.pop() {
-                        let end_pc = output.len();
-                        output.push(Opcode::Control(super::opcodes::ControlOp::UntilEnd(
-                            until_pc,
-                        )));
-                        // Patch the Until opcode with the end_pc
-                        output[until_pc] =
-                            Opcode::Control(super::opcodes::ControlOp::Until(end_pc));
-                        // Runtime effect ZERO, both for `Until` and for
-                        // `UntilEnd` — C pushes the UNTIL_END element with an
-                        // explicit `runtime_effect = 0` (`sCalcPostfix.c:782`)
-                        // because UNTIL_END only PEEKS the condition
-                        // (`sCalcPerform.c:1999`, `ps->d == 0`). On the way out
-                        // of the loop the condition value stays on the stack —
-                        // it is what the expression evaluates to.
-                        //
-                        // The port subtracted 1 here, on the theory that the
-                        // condition is consumed. It is not, and the -1 is what
-                        // made C's own `UNTIL A; A:=A+1` look store-terminated.
-                    }
+                    // A pending `UNTIL_END` is NOT closed here by a rule of its
+                    // own: it is an ordinary operator-stack entry, so the loop
+                    // above already flushed it if and only if it was above the
+                    // innermost `(`. Inside `UNTIL(...)` it is not, which is why
+                    // the condition ends up INSIDE the loop.
+                    //
                     // C postfix.c:452-455 — at a `;` terminator the net runtime
                     // depth must not exceed 1.
                     if cond_count != 0 {
@@ -791,6 +806,11 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         StackEntry::CondEnd => 0,
         StackEntry::Store { .. } => -1,
         StackEntry::LParen => 0,
+        // C `sCalcPostfix.c:783` sets `runtime_effect = 0` on the UNTIL_END
+        // element explicitly: the opcode only PEEKS the condition
+        // (`sCalcPerform.c:1999`, `if (ps->d == 0)`), so the condition survives
+        // as the value of the whole `UNTIL(...)`.
+        StackEntry::UntilEnd { .. } => 0,
     }
 }
 

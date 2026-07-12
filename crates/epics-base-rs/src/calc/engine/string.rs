@@ -17,7 +17,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
-    let mut loop_count: usize = 0;
+    // C's `until_scratch[]` (`sCalcPerform.c:329`) and `loopsDone` (`:330`) —
+    // one entry per UNTIL in the program, and ONE iteration budget for all of
+    // them together.
+    let mut until_marks: Vec<(usize, usize)> = Vec::new();
+    let mut loops_done: i32 = 0;
     // C compiles the USES_STRING marker into the postfix and `sCalcPerform`
     // switches on it ONCE (`sCalcPerform.c:399`) to pick a whole evaluator.
     let string_path = uses_string(code);
@@ -743,34 +747,65 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
             },
 
             Opcode::Control(ctrl) => match ctrl {
+                // C `UNTIL` (`sCalcPerform.c:1978-1993`) does one thing: it
+                // remembers the stack pointer, so that a later `UNTIL_END` can
+                // wind the stack back to exactly this point before re-running the
+                // body (`ps = until_scratch[i].ps`, `:2003`). `until_loc` is the
+                // key C matches on, and `pc - 1` is that key here.
                 super::opcodes::ControlOp::Until(_end_pc) => {
-                    // UNTIL is just a loop start marker - no-op during execution.
-                    // The actual loop jump happens at UntilEnd.
+                    let until_pc = pc - 1;
+                    match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
+                        Some((_, depth)) => *depth = stack.len(),
+                        None => {
+                            // C's `until_scratch[10]` with `if (i>9) return(-1)`
+                            // (`:356-360`) — compiled C fails the perform on the
+                            // TENTH distinct UNTIL, so nine is the ceiling.
+                            if until_marks.len() >= MAX_UNTILS {
+                                return Err(CalcError::Overflow);
+                            }
+                            until_marks.push((until_pc, stack.len()));
+                        }
+                    }
                 }
                 super::opcodes::ControlOp::UntilEnd(start_pc) => {
-                    // C PEEKS the condition (`sCalcPerform.c:1999`: `if (ps->d == 0)`).
-                    // It pops nothing.
+                    // C `sCalcPerform.c:1995-2018`, in this order:
+                    //
+                    // ```c
+                    // if (++loopsDone > sCalcLoopMax) break;   /* give up, no error */
+                    // if (ps->d == 0) { ...wind back and re-run the body... }
+                    // ```
+                    //
+                    // `loopsDone` counts EVERY arrival at an UNTIL_END, is shared
+                    // by all the UNTILs in one program, and when it runs out C
+                    // simply STOPS LOOPING: the perform continues, returns 0, and
+                    // the value is whatever the last condition evaluated to. There
+                    // is no loop-limit error in sCalc, and the record does not
+                    // alarm. (`sCalcLoopMax` is an ioc-shell variable, so the
+                    // ceiling is settable — see `scalc_loop_max`.)
+                    loops_done += 1;
+                    if loops_done > scalc_loop_max() {
+                        continue;
+                    }
+                    // C PEEKS the condition (`:1999`: `if (ps->d == 0)`); it pops
+                    // nothing, which is why UNTIL_END has a runtime effect of 0.
                     let cond = match stack.last() {
                         Some(v) => v.to_double(),
                         None => return Err(CalcError::Underflow),
                     };
                     if cond == 0.0 {
-                        // Loop back. C restores `ps` to the stack pointer it saved
-                        // when it ran UNTIL (`:2004`) — i.e. to before the
-                        // condition — so the condition value is discarded on the
-                        // way round, and the next iteration pushes a fresh one.
-                        stack.pop();
-                        pc = *start_pc + 1; // jump to instruction after UNTIL marker
-                        loop_count += 1;
-                        if loop_count > MAX_LOOP_ITERATIONS {
-                            return Err(CalcError::LoopLimitExceeded);
-                        }
+                        // Wind the stack back to where the paired UNTIL saw it —
+                        // C restores the saved `ps` wholesale, so everything the
+                        // body pushed (the condition included) is discarded.
+                        let Some((_, depth)) = until_marks.iter().find(|(k, _)| k == start_pc)
+                        else {
+                            // C's `printf("sCalcPerform: UNTIL not found"); return(-1)`.
+                            return Err(CalcError::Internal);
+                        };
+                        stack.truncate(*depth);
+                        pc = *start_pc + 1;
                     }
                     // Condition true: fall out of the loop with the condition value
-                    // still on the stack. C leaves `ps` alone, which is why the
-                    // compile-time ledger gives UNTIL_END a runtime effect of 0
-                    // and why the body of an UNTIL has to be an assignment for the
-                    // program to end at depth 1.
+                    // still on the stack. It is the value of the `UNTIL(...)`.
                 }
             },
 
@@ -826,7 +861,27 @@ fn hunt_double(s: &[u8]) -> f64 {
 /// are written around. It is sCalc's alone: base and aCalc compare exactly.
 const SMALL: f64 = 1e-11;
 
-const MAX_LOOP_ITERATIONS: usize = 1000;
+/// C `until_scratch[10]` guarded by `if (i>9) return(-1)` (`sCalcPerform.c:329`,
+/// `:356-360`). Compiled sCalc fails the perform on the tenth distinct UNTIL, so
+/// the usable ceiling is nine.
+const MAX_UNTILS: usize = 9;
+
+/// C `volatile int sCalcLoopMax = 1000` (`sCalcPerform.c:52`), exported to the
+/// ioc shell with `epicsExportAddress(int, sCalcLoopMax)` — a settable global,
+/// not a constant. It bounds the TOTAL number of `UNTIL_END` arrivals in one
+/// perform, across every UNTIL in the program, and running out is not an error:
+/// C stops looping and carries on (`:1997`).
+static SCALC_LOOP_MAX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
+
+/// Read `sCalcLoopMax`.
+pub fn scalc_loop_max() -> i32 {
+    SCALC_LOOP_MAX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Write `sCalcLoopMax` — the ioc-shell `var sCalcLoopMax, <n>`.
+pub fn set_scalc_loop_max(n: i32) {
+    SCALC_LOOP_MAX.store(n, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// C PRINTF (`sCalcPerform.c:1535-1567`).
 ///

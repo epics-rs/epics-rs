@@ -39,6 +39,13 @@ pub enum InterfaceType {
     Motor,
     Gpib,
     Option,
+    /// The `asynDrvUser` interface — the driver's `drvInfo` → `reason` resolver.
+    /// A parameter-library driver registers it (C `asynPortDriver`,
+    /// drvAsynUSBTMC.c:1319); a byte transport does not (drvAsynIPPort.c /
+    /// drvAsynSerialPort.c register no such interface), and a client asks the
+    /// port for it before ever calling `create` — asynRecord.c:1243,
+    /// devAsynInt32.c:264, asynOctetSyncIO.c:143.
+    DrvUser,
     Common,
 }
 
@@ -63,6 +70,7 @@ impl InterfaceType {
             "asynMotor" => Some(Self::Motor),
             "asynGpib" => Some(Self::Gpib),
             "asynOption" => Some(Self::Option),
+            "asynDrvUser" => Some(Self::DrvUser),
             "asynCommon" => Some(Self::Common),
             _ => None,
         }
@@ -88,6 +96,7 @@ impl InterfaceType {
             Self::Motor => "asynMotor",
             Self::Gpib => "asynGpib",
             Self::Option => "asynOption",
+            Self::DrvUser => "asynDrvUser",
             Self::Common => "asynCommon",
         }
     }
@@ -136,6 +145,13 @@ pub enum Capability {
     /// drvAsynFTDIPort.cpp:582) and asynRecord's `optioniv` is the result of
     /// `findInterface(asynOptionType)` (asynRecord.c:1177-1187).
     Option,
+    /// The `asynDrvUser` interface — see [`InterfaceType::DrvUser`]. A driver
+    /// that declares it can resolve a `drvInfo` string to a parameter reason
+    /// ([`crate::port::PortDriver::drv_user_create`]); a driver that does not
+    /// leaves every client at reason 0, and asynRecord reports
+    /// `"asynDrvUser not supported but drvInfo not blank"` for a non-empty
+    /// DRVINFO (asynRecord.c:1258-1266).
+    DrvUser,
     Flush,
     Connect,
 }
@@ -160,6 +176,7 @@ impl Capability {
             Self::Motor => InterfaceType::Motor,
             Self::Gpib => InterfaceType::Gpib,
             Self::Option => InterfaceType::Option,
+            Self::DrvUser => InterfaceType::DrvUser,
             Self::Flush | Self::Connect => InterfaceType::Common,
         }
     }
@@ -232,6 +249,10 @@ pub fn default_capabilities() -> Vec<Capability> {
         Capability::GenericPointerRead,
         Capability::GenericPointerWrite,
         Capability::Option,
+        // A parameter-library port resolves drvInfo → reason, so it registers
+        // asynDrvUser, exactly as C `asynPortDriver` does
+        // (asynPortDriver.cpp:4070 `asynDrvUserType`).
+        Capability::DrvUser,
         Capability::Flush,
         Capability::Connect,
     ]
@@ -241,7 +262,9 @@ pub fn default_capabilities() -> Vec<Capability> {
 /// `asynOption`, exactly what drvAsynIPPort / drvAsynSerialPort /
 /// drvAsynFTDIPort register (drvAsynIPPort.c:1037-1053). No register interface,
 /// so a record pointed at one with IFACE=Int32 gets C's "No asynInt32 interface"
-/// rather than a silent cache read.
+/// rather than a silent cache read. No `asynDrvUser` either — a byte transport
+/// has no parameters to name, so every client stays at reason 0 and asynRecord
+/// refuses a non-blank DRVINFO (asynRecord.c:1258-1266).
 pub fn octet_transport_capabilities() -> Vec<Capability> {
     vec![
         Capability::OctetRead,
@@ -327,6 +350,18 @@ mod interface_type_tests {
         assert!(!caps.contains(&Capability::Int32ArrayRead));
     }
 
+    /// R11-48: only a port that can resolve a drvInfo string declares
+    /// `asynDrvUser`. C's byte transports register no such interface, which is
+    /// what makes asynRecord force REASON=0 there (asynRecord.c:1258-1266).
+    #[test]
+    fn only_a_parameter_library_port_declares_drv_user() {
+        assert!(default_capabilities().contains(&Capability::DrvUser));
+        assert!(!octet_transport_capabilities().contains(&Capability::DrvUser));
+        assert_eq!(Capability::DrvUser.interface_type(), InterfaceType::DrvUser);
+        assert!(!Capability::DrvUser.is_read());
+        assert!(!Capability::DrvUser.is_write());
+    }
+
     #[test]
     fn all_variants_have_asyn_name() {
         let all = [
@@ -346,6 +381,7 @@ mod interface_type_tests {
             InterfaceType::Motor,
             InterfaceType::Gpib,
             InterfaceType::Option,
+            InterfaceType::DrvUser,
             InterfaceType::Common,
         ];
         for iface in &all {

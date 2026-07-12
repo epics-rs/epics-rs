@@ -243,7 +243,11 @@ impl PortDriver for DrvAsynUsbtmcPort {
     /// remote-local parameters. It registers no asynOption.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
         use crate::interfaces::Capability::*;
-        vec![OctetRead, OctetWrite, Int32Read, Int32Write, Flush, Connect]
+        // C drvAsynUSBTMC registers asynDrvUser (drvAsynUSBTMC.c:1319-1324) —
+        // its drvInfo strings (SRQ, STATUS_BYTE, …) resolve to reasons.
+        vec![
+            OctetRead, OctetWrite, Int32Read, Int32Write, DrvUser, Flush, Connect,
+        ]
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {

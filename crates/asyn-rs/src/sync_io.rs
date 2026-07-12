@@ -188,6 +188,17 @@ impl SyncIOHandle {
     }
 
     pub fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
+        // C `asynOctetSyncIO::connect` resolves a drvInfo only on a port that
+        // registered asynDrvUser (`findInterface(asynDrvUserType)`,
+        // asynOctetSyncIO.c:143-156); on a port without it the pasynUser keeps
+        // reason 0 and the connect succeeds. The interface registry answers that,
+        // not a failed `create`.
+        if !self
+            .handle
+            .has_interface(crate::interfaces::InterfaceType::DrvUser)
+        {
+            return Ok(0);
+        }
         // Synchronous I/O binds at the port level (no per-record asyn addr); use
         // addr 0 (C `getAddr` default) and surface only the shared reason.
         self.handle
@@ -273,6 +284,44 @@ mod tests {
         let (sio, _rt) = make_sync_io();
         sio.write_int64(6, i64::MIN).unwrap();
         assert_eq!(sio.read_int64(6).unwrap(), i64::MIN);
+    }
+
+    /// R11-48: C `asynOctetSyncIO::connect` resolves a drvInfo only on a port
+    /// that registered asynDrvUser (asynOctetSyncIO.c:141-156); on a byte
+    /// transport the connect succeeds with the pasynUser still at reason 0. The
+    /// port reported the transport's `ParamNotFound` instead.
+    #[test]
+    fn drv_user_create_on_a_port_without_asyn_drv_user_yields_reason_zero() {
+        struct Transport(PortDriverBase);
+        impl PortDriver for Transport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let (rt, _jh) = create_port_runtime(
+            Transport(PortDriverBase::new(
+                "syncnodrvuser",
+                1,
+                PortFlags::default(),
+            )),
+            RuntimeConfig::default(),
+        );
+        let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+
+        assert_eq!(sio.drv_user_create("ANYTHING").unwrap(), 0);
+
+        // Negative control: a port that registers asynDrvUser still resolves the
+        // name — and still rejects one it does not know.
+        let (sio2, _rt2) = make_sync_io();
+        assert_eq!(sio2.drv_user_create("FLOAT_VAL").unwrap(), 1);
+        assert!(sio2.drv_user_create("NO_SUCH_PARAM").is_err());
     }
 
     #[test]

@@ -1614,29 +1614,40 @@ impl AsynDeviceSupport {
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if !self.reason_set {
-            // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
-            // rejects an out-of-range offset here at bind time (C `drvUserCreate`
-            // `checkOffset`) instead of alarming on every I/O.
-            match self
-                .handle
-                .drv_user_create_blocking(&self.drv_info, self.addr)
-            {
-                Ok(info) => {
-                    self.reason = info.reason;
-                    // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
-                    // `octet_max_size` below, after SIZV finalizes the buffer.
-                    self.octet_len_cap = info.max_octet_len;
-                }
-                Err(e) => {
-                    // Param not found, or the driver rejected the bind (e.g. an
-                    // out-of-range offset) — this record cannot bind to a param.
-                    eprintln!(
-                        "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
-                        self.handle.port_name(),
-                        self.drv_info
-                    );
-                    self.reason_set = false;
-                    return Ok(());
+            // C calls drvUser->create only when the port registered asynDrvUser
+            // **and** the record named a userParam (`if (pasynInterface &&
+            // pPvt->userParam)`, devAsynInt32.c:264-265; the same pair of
+            // conditions in devAsynFloat64.c, devAsynOctet.c, asynOctetSyncIO.c:141).
+            // A byte transport registers no asynDrvUser and has no parameter to
+            // name: the record binds at reason 0 — the port's own reason space —
+            // and that is not a bind failure. Ask the interface registry
+            // (`has_interface`), never a failed `create`.
+            if self.handle.has_interface(InterfaceType::DrvUser) && !self.drv_info.is_empty() {
+                // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
+                // rejects an out-of-range offset here at bind time (C `drvUserCreate`
+                // `checkOffset`) instead of alarming on every I/O.
+                match self
+                    .handle
+                    .drv_user_create_blocking(&self.drv_info, self.addr)
+                {
+                    Ok(info) => {
+                        self.reason = info.reason;
+                        // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
+                        // `octet_max_size` below, after SIZV finalizes the buffer.
+                        self.octet_len_cap = info.max_octet_len;
+                    }
+                    Err(e) => {
+                        // Param not found, or the driver rejected the bind (e.g. an
+                        // out-of-range offset) — this record cannot bind to a param.
+                        // C prints and `goto bad` (devAsynInt32.c:272-276).
+                        eprintln!(
+                            "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
+                            self.handle.port_name(),
+                            self.drv_info
+                        );
+                        self.reason_set = false;
+                        return Ok(());
+                    }
                 }
             }
             self.reason_set = true;
@@ -5509,6 +5520,93 @@ mod tests {
         let mut rec = LsiRecord::new("");
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.octet_max_size, 256);
+    }
+
+    /// R11-48. C device support calls `drvUser->create` only when the port
+    /// registered asynDrvUser **and** the record named a userParam
+    /// (`if (pasynInterface && pPvt->userParam)`, devAsynInt32.c:264-265). A byte
+    /// transport registers no asynDrvUser: an `@asyn(L0,0,1)` link with no
+    /// drvInfo binds at reason 0 and the record works. The port called
+    /// `drv_user_create` unconditionally, took the transport's `ParamNotFound` as
+    /// a bind failure, and returned from `init` before the buffer setup — leaving
+    /// the record permanently dead (`reason_set == false` short-circuits read,
+    /// write and the I/O Intr receiver).
+    #[test]
+    fn a_device_support_on_a_port_without_asyn_drv_user_binds_at_reason_zero() {
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        struct Transport(PortDriverBase);
+        impl PortDriver for Transport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+            fn read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<usize> {
+                let bytes = b"HELLO";
+                buf[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        let (rt, _jh) = create_port_runtime(
+            Transport(PortDriverBase::new("r11_48_dev", 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        let link = AsynLink {
+            port_name: "r11_48_dev".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            // `@asyn(L0,0,1)` with no drvInfo — the ordinary serial/IP link.
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynOctet");
+        ads.set_record_info("TEST:R11_48", ScanType::Passive);
+
+        let mut rec = LsiRecord::new("");
+        rec.sizv = 1024;
+        ads.init(&mut rec).unwrap();
+
+        assert_eq!(ads.reason(), 0, "the transport's only reason");
+        assert_eq!(
+            ads.octet_max_size, 1024,
+            "init ran to completion — the buffer setup below the drvUser branch is reached"
+        );
+
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"HELLO".to_vec())),
+            "the record is bound and reads from the transport"
+        );
+    }
+
+    /// R11-48 negative control: on a port that DOES register asynDrvUser, an
+    /// unresolvable drvInfo is still a bind failure — C prints and `goto bad`
+    /// (devAsynInt32.c:272-276), leaving the record unbound.
+    #[test]
+    fn a_device_support_with_an_unknown_drv_info_still_fails_to_bind() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+
+        let mut ads = make_adapter(ScanType::Passive);
+        ads.drv_info = "NO_SUCH_PARAM".to_string();
+
+        let mut rec = LonginRecord::default();
+        ads.init(&mut rec).unwrap();
+
+        assert!(
+            !ads.reason_set,
+            "a param-library port that cannot resolve the drvInfo leaves the record unbound"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

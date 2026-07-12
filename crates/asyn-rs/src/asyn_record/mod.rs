@@ -2768,26 +2768,50 @@ impl AsynRecord {
 
         match registry::get_port(&self.port) {
             Some(entry) => {
-                // Resolve drvinfo → reason if specified
-                if !self.drvinfo.is_empty() {
-                    match entry
-                        .handle
-                        .drv_user_create_blocking(&self.drvinfo, self.addr)
-                    {
-                        Ok(info) => {
-                            self.resolved_reason = info.reason;
-                            self.reason = info.reason as i32;
+                // C `connectDevice` asks the port for asynDrvUser *before* it
+                // resolves anything (`findInterface(asynDrvUserType)`,
+                // asynRecord.c:1243). Whether a port can turn a drvInfo string
+                // into a reason is a property of the port's interface registry —
+                // `PortHandle::has_interface` — not something to infer from a
+                // failed `create`.
+                if entry
+                    .handle
+                    .has_interface(crate::interfaces::InterfaceType::DrvUser)
+                {
+                    // Resolve drvinfo → reason if specified (asynRecord.c:1248-1257).
+                    if !self.drvinfo.is_empty() {
+                        match entry
+                            .handle
+                            .drv_user_create_blocking(&self.drvinfo, self.addr)
+                        {
+                            Ok(info) => {
+                                self.resolved_reason = info.reason;
+                                self.reason = info.reason as i32;
+                            }
+                            Err(_) => {
+                                // C reports the bare literal — the driver's own text
+                                // reaches the operator through the trace file, not
+                                // ERRS (asynRecord.c:1255).
+                                self.errs = "Error in asynDrvUser->create()".to_string();
+                                self.resolved_reason = 0;
+                            }
                         }
-                        Err(_) => {
-                            // C reports the bare literal — the driver's own text
-                            // reaches the operator through the trace file, not
-                            // ERRS (asynRecord.c:1255).
-                            self.errs = "Error in asynDrvUser->create()".to_string();
-                            self.resolved_reason = 0;
-                        }
+                    } else {
+                        self.resolved_reason = self.reason as usize;
                     }
                 } else {
-                    self.resolved_reason = self.reason as usize;
+                    // No asynDrvUser — every byte transport (IP, serial, FTDI,
+                    // VXI-11). C zeroes REASON unconditionally here
+                    // (asynRecord.c:1261): there is no parameter space to point
+                    // at, so a REASON the operator restored from a save file must
+                    // not survive the connect. A non-blank DRVINFO is a
+                    // configuration error, reported and otherwise ignored
+                    // (:1263-1265).
+                    self.reason = 0;
+                    self.resolved_reason = 0;
+                    if !self.drvinfo.is_empty() {
+                        self.errs = "asynDrvUser not supported but drvInfo not blank".to_string();
+                    }
                 }
 
                 // C `connectDevice` asks the manager for each interface in turn —
@@ -7850,6 +7874,161 @@ mod tests {
             AlarmSeverity::NoAlarm,
             "C raises no recGblSetSevr in queueTimeoutCallbackSpecial"
         );
+    }
+
+    // ===== R11-48: a port with no asynDrvUser interface =====
+
+    /// Register an octet transport (asynOctet + asynOption + asynCommon — no
+    /// asynDrvUser, exactly what drvAsynIPPort / drvAsynSerialPort register).
+    fn register_octet_transport(port_name: &'static str) {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct OctetTransport(PortDriverBase);
+        impl PortDriver for OctetTransport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let (rt, jh) = create_port_runtime(
+            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        std::mem::forget(jh);
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        std::mem::forget(rt);
+    }
+
+    /// Register a parameter-library port (C `asynPortDriver`: it registers
+    /// asynDrvUser and can resolve a drvInfo string).
+    fn register_param_port(port_name: &'static str, param: &str) {
+        use crate::param::ParamType;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct ParamDriver(PortDriverBase);
+        impl PortDriver for ParamDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        // Reason 0 is taken by a filler param so the resolved reason is non-zero
+        // and cannot be confused with the forced-zero case.
+        base.params
+            .create_param("FILLER", ParamType::Int32)
+            .unwrap();
+        base.params.create_param(param, ParamType::Int32).unwrap();
+        let (rt, jh) = create_port_runtime(ParamDriver(base), RuntimeConfig::default());
+        std::mem::forget(jh);
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        std::mem::forget(rt);
+    }
+
+    /// R11-48. C `connectDevice` asks for asynDrvUser (asynRecord.c:1243); a byte
+    /// transport registers none, so C forces `pasynRec->reason = 0`
+    /// (asynRecord.c:1261) whatever the operator (or a save/restore file) left in
+    /// the field, and reports a non-blank DRVINFO as a configuration error
+    /// (:1263-1265). The port used to call `drvUser->create` on every port and
+    /// read the resulting `ParamNotFound` as C's *create failed* case, so REASON
+    /// survived the connect and ERRS carried the wrong text.
+    #[test]
+    fn a_port_without_asyn_drv_user_forces_reason_zero_and_reports_drvinfo() {
+        let port_name = "r11_48_no_drvuser";
+        register_octet_transport(port_name);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        // What a save/restore file restores into a record pointed at a transport.
+        rec.reason = 7;
+        rec.drvinfo = "SOME_PARAM".to_string();
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(
+            rec.reason, 0,
+            "C zeroes REASON on a port with no asynDrvUser"
+        );
+        assert_eq!(
+            rec.resolved_reason, 0,
+            "and no I/O may carry the stale reason"
+        );
+        assert_eq!(
+            rec.errs, "asynDrvUser not supported but drvInfo not blank",
+            "C reportError text (asynRecord.c:1264-1265)"
+        );
+    }
+
+    /// R11-48: the zeroing is unconditional — C runs `pasynRec->reason = 0` above
+    /// the DRVINFO test, so an empty DRVINFO zeroes REASON too and leaves ERRS
+    /// clean.
+    #[test]
+    fn a_port_without_asyn_drv_user_zeroes_reason_even_with_blank_drvinfo() {
+        let port_name = "r11_48_no_drvuser_blank";
+        register_octet_transport(port_name);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.reason = 7;
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(rec.reason, 0);
+        assert_eq!(rec.resolved_reason, 0);
+        assert_eq!(rec.errs, "", "a blank DRVINFO is not an error");
+    }
+
+    /// R11-48 negative control: a port that DOES register asynDrvUser still
+    /// resolves DRVINFO through `drvUser->create` and still reports C's create
+    /// failure text for a name the driver rejects — the new branch must not
+    /// swallow either case.
+    #[test]
+    fn a_port_with_asyn_drv_user_still_resolves_and_still_reports_create_failure() {
+        let port_name = "r11_48_drvuser";
+        register_param_port(port_name, "GAIN");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "GAIN".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.reason, 1, "DRVINFO resolved through the driver");
+        assert_eq!(rec.resolved_reason, 1);
+        assert_eq!(rec.errs, "");
+
+        // A name the driver does not know: C's create failure, not the
+        // no-interface report.
+        rec.drvinfo = "NO_SUCH_PARAM".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.errs, "Error in asynDrvUser->create()");
+        assert_eq!(rec.resolved_reason, 0);
+
+        // A blank DRVINFO on such a port keeps the operator's REASON — C never
+        // zeroes it on the asynDrvUser branch (asynRecord.c:1244-1257).
+        rec.drvinfo.clear();
+        rec.reason = 5;
+        rec.connect_device().unwrap();
+        assert_eq!(rec.reason, 5);
+        assert_eq!(rec.resolved_reason, 5);
+        assert_eq!(rec.errs, "");
     }
 
     // ===== R11-46: SCAN="I/O Intr" =====

@@ -400,11 +400,27 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     push(&mut stack, ArrayStackValue::array(arr));
                 }
                 ArrayOp::ToArray => {
-                    let v = pop_f64(&mut stack)?;
-                    push(
-                        &mut stack,
-                        ArrayStackValue::array(vec![v; inputs.array_size]),
-                    );
+                    // C `:1516-1518` — `ARR(x)` is exactly `toArray(ps,1)`, the same
+                    // promotion every other operator uses, applied in place:
+                    //
+                    //   * an ARRAY operand is left alone. `toArray` tests `isDouble`
+                    //     first (`:145`), so the buffer, the window and the provenance
+                    //     all survive. Compiled C, AA=[1,2,3,4]: `ARR(AA)` is
+                    //     [1,2,3,4] and `AVG(ARR(AA[1,2]))` is 2.5, the window's own
+                    //     average. The port popped the operand as an f64, which
+                    //     collapsed the array to its a[0] and rebroadcast THAT — so
+                    //     `ARR(AA)` came out [1,1,1,1] and the window was lost.
+                    //   * a SCALAR operand is broadcast with the NaN->0 fill
+                    //     (`to_array` `:135-137`). Compiled C, arraySize 4, A=NaN:
+                    //     `ARR(A)` is [0,0,0,0]. The port copied the NaN verbatim, and
+                    //     a record then published an all-NaN AVAL.
+                    //
+                    // `into_cell` IS that promotion, so both properties come from the
+                    // one rule rather than from this arm re-deriving them.
+                    let array_size = inputs.array_size;
+                    unary_op(&mut stack, |v| {
+                        ArrayStackValue::Array(v.into_cell(array_size))
+                    })?
                 }
                 ArrayOp::ToDouble => {
                     let v = pop(&mut stack)?.v;

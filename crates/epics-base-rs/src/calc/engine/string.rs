@@ -622,7 +622,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // Pop format string, then input string
                     let fmt = pop1(&mut stack)?;
                     let input = pop1(&mut stack)?;
-                    let result = simple_sscanf(input.as_bytes()?, fmt.as_bytes()?);
+                    // C `if (i != 1) return(-1)` (sCalcPerform.c:1687): a failed
+                    // conversion is an ERROR, not a zero.
+                    let result = super::scanf::sscanf(input.as_bytes()?, fmt.as_bytes()?)?;
                     stack.push(result);
                 }
                 StringOp::BinRead => {
@@ -1275,66 +1277,6 @@ fn pad(body: Vec<u8>, width: usize, minus: bool, zero: bool) -> Vec<u8> {
     out
 }
 
-fn simple_sscanf(input: &[u8], fmt: &[u8]) -> StackValue {
-    let bytes = fmt;
-    let mut i = 0;
-    // Find format specifier
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] != b'%' {
-            i += 1;
-            // Skip width
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                return StackValue::Double(0.0);
-            }
-            let spec = bytes[i];
-            let trimmed = trim_ascii(input);
-            return match spec {
-                b'd' | b'i' => {
-                    let digits = trimmed
-                        .iter()
-                        .take_while(|b| b.is_ascii_digit() || **b == b'-')
-                        .count();
-                    let text = std::str::from_utf8(&trimmed[..digits]).unwrap_or("");
-                    StackValue::Double(text.parse::<i64>().unwrap_or(0) as f64)
-                }
-                // C's `%e`/`%f`/`%g` conversion is strtod on the input, so it
-                // takes the longest numeric PREFIX and leaves the rest —
-                // `SSCANF("1.5V", "%f")` is 1.5, not a failed conversion.
-                b'f' | b'e' | b'g' => StackValue::Double(super::strtod::strtod(trimmed).value),
-                b's' => {
-                    // Read until whitespace
-                    let word: Vec<u8> = trimmed
-                        .iter()
-                        .copied()
-                        .take_while(|b| !b.is_ascii_whitespace())
-                        .collect();
-                    StackValue::str(word)
-                }
-                _ => StackValue::Double(0.0),
-            };
-        }
-        i += 1;
-    }
-    StackValue::Double(0.0)
-}
-
-/// C `isspace`-trimmed both ends, the way `sscanf`'s numeric conversions skip
-/// leading whitespace.
-fn trim_ascii(s: &[u8]) -> &[u8] {
-    let start = s
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(s.len());
-    let end = s
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map_or(start, |p| p + 1);
-    &s[start..end]
-}
-
 /// C `myNINT` (sCalcPerform.c:40) — round half away from zero.
 fn my_nint(d: f64) -> f64 {
     if d >= 0.0 { d + 0.5 } else { d - 0.5 }.trunc()
@@ -1416,7 +1358,7 @@ fn bin_write(f: &[u8], val: &StackValue) -> Result<String, CalcError> {
 /// assignment-suppressed conversions (`%*...`); the suppressed ones are then
 /// re-read as a byte count to skip over before the value is taken.
 fn bin_read(subject: &[u8], f: &[u8]) -> Result<f64, CalcError> {
-    let conv = find_conversion_indicator(f).ok_or(CalcError::InvalidFormat)?;
+    let conv = super::scanf::find_conversion_indicator(f).ok_or(CalcError::InvalidFormat)?;
     let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
         .ok_or(CalcError::InvalidFormat)?;
 
@@ -1468,30 +1410,6 @@ fn suppressed_skip_bytes(tail: &[u8]) -> usize {
         Some(b'e' | b'E' | b'f' | b'g' | b'G') => count * 4,
         _ => count,
     }
-}
-
-/// C `findConversionIndicator` (sCalcPerform.c:105): the byte offset of the
-/// first conversion character whose assignment is NOT suppressed, skipping
-/// `%%` pairs. Returns `None` when there is none.
-fn find_conversion_indicator(f: &[u8]) -> Option<usize> {
-    const CONV: &[u8] = b"pwn$c[deEfgGiousxX";
-    let mut i = 0;
-    while i < f.len() {
-        if let Some(p) = find_sub(&f[i..], b"%%") {
-            if find_byte(&f[i..], b'%') == Some(p) {
-                i += p + 2;
-                continue;
-            }
-        }
-        let pct = find_byte(&f[i..], b'%')? + i;
-        let cc = f[pct..].iter().position(|b| CONV.contains(b))? + pct;
-        match find_byte(&f[pct..], b'*') {
-            // Suppressed: skip past this conversion and keep looking.
-            Some(star) if star + pct < cc => i = cc + 1,
-            _ => return Some(cc),
-        }
-    }
-    None
 }
 
 fn find_byte(h: &[u8], n: u8) -> Option<usize> {

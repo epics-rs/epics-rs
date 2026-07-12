@@ -93,6 +93,11 @@ fn test_printf_hex_upper() {
 }
 
 // --- SSCANF ---
+//
+// Every value below is what compiled sCalc answers (`sCalcPerform.c:1635`,
+// `drv "SSCANF('<in>','<fmt>')"`). C hands the user's format to the C library's
+// `sscanf` with ONE output object, so the whole of scanf is in scope, and
+// `if (i != 1) return(-1)` makes a failed conversion an ERROR — never a 0.
 
 #[test]
 fn test_sscanf_int() {
@@ -100,16 +105,150 @@ fn test_sscanf_int() {
     assert_eq!(result, StackValue::Double(42.0));
 }
 
+/// C's object for a bare `%f` is a `float`, not a double: 3.15 comes back as
+/// the f32 rounding of itself. Only `%lf` gets a double.
 #[test]
-fn test_sscanf_float() {
-    let result = eval_str(r#"SSCANF("3.15", "%f")"#);
-    assert_eq!(result, StackValue::Double(3.15));
+fn test_sscanf_bare_percent_f_is_a_float() {
+    assert_eq!(
+        eval_str(r#"SSCANF("3.15", "%f")"#),
+        StackValue::Double(3.1500000953674316)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("3.15", "%lf")"#),
+        StackValue::Double(3.15)
+    );
 }
 
 #[test]
 fn test_sscanf_string() {
     let result = eval_str(r#"SSCANF("hello world", "%s")"#);
     assert_eq!(result, StackValue::Str("hello".into()));
+}
+
+/// The port used to answer `Double(0.0)` with a healthy record for every
+/// conversion its hand-rolled subset did not know, and for every failed one.
+#[test]
+fn test_sscanf_failed_conversion_is_an_error() {
+    let mut inputs = StringInputs::new();
+    for expr in [
+        r#"SSCANF("abc", "%d")"#,    // no digits
+        r#"SSCANF("", "%d")"#,       // empty input
+        r#"SSCANF("", "%s")"#,       // empty input
+        r#"SSCANF("zab", "%[^z]")"#, // scanset matches nothing
+        r#"SSCANF("y=42", "x=%d")"#, // literal mismatch
+        r#"SSCANF("abc", "%*d%s")"#, // the SUPPRESSED conversion fails
+        r#"SSCANF("abc", "xyz")"#,   // no conversion at all
+        r#"SSCANF("abc", "%p")"#,    // C refuses p/w/n/$ outright
+    ] {
+        assert!(scalc(expr, &mut inputs).is_err(), "{expr} must alarm");
+    }
+}
+
+/// `%x`/`%o`/`%u`/`%i`/`%c`/`%[` were simply unimplemented — all six answered 0.
+#[test]
+fn test_sscanf_integer_bases() {
+    assert_eq!(eval_str(r#"SSCANF("ff", "%x")"#), StackValue::Double(255.0));
+    assert_eq!(
+        eval_str(r#"SSCANF("0x1f", "%x")"#),
+        StackValue::Double(31.0)
+    );
+    assert_eq!(eval_str(r#"SSCANF("017", "%o")"#), StackValue::Double(15.0));
+    assert_eq!(eval_str(r#"SSCANF("017", "%i")"#), StackValue::Double(15.0));
+    assert_eq!(
+        eval_str(r#"SSCANF("-0x10", "%i")"#),
+        StackValue::Double(-16.0)
+    );
+}
+
+/// The output object's type is picked from the conversion char and `s[-1]`, so
+/// the value is narrowed before it is widened to a double: `unsigned short` for
+/// `%h[oux]`, `unsigned int` for a bare one, `unsigned long` for `%l[oux]`.
+#[test]
+fn test_sscanf_narrows_through_the_output_object() {
+    assert_eq!(
+        eval_str(r#"SSCANF("-5", "%u")"#),
+        StackValue::Double(4294967291.0)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("70000", "%hd")"#),
+        StackValue::Double(4464.0)
+    );
+    // `%lx` still parses HEX digits: 0x4294967295.
+    assert_eq!(
+        eval_str(r#"SSCANF("4294967295", "%lx")"#),
+        StackValue::Double(285960729237.0)
+    );
+}
+
+#[test]
+fn test_sscanf_char_and_scanset() {
+    // `%c` takes the character as-is — no leading-whitespace skip.
+    assert_eq!(
+        eval_str(r#"SSCANF("  abc", "%c")"#),
+        StackValue::Str(" ".into())
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("ff12 xy", "%5c")"#),
+        StackValue::Str("ff12 ".into())
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("hello", "%[a-l]")"#),
+        StackValue::Str("hell".into())
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("hello", "%[^l]")"#),
+        StackValue::Str("he".into())
+    );
+    // `[]a-z]`: a leading `]` is a plain member of the set.
+    assert_eq!(
+        eval_str(r#"SSCANF("ab1", "%*[]a-z]%d")"#),
+        StackValue::Double(1.0)
+    );
+}
+
+/// `findConversionIndicator` (`sCalcPerform.c:105`) decides the format, and it
+/// is stricter than scanf: its `%%` skip is GREEDY (it jumps past a `%%` found
+/// anywhere ahead, losing any conversion in front of it) and it refuses a
+/// second conversion that would be assigned.
+#[test]
+fn test_sscanf_rejects_a_second_live_conversion() {
+    let mut inputs = StringInputs::new();
+    assert!(scalc(r#"SSCANF("1 2", "%d%d")"#, &mut inputs).is_err());
+    assert!(scalc(r#"SSCANF("abc def", "%s %s")"#, &mut inputs).is_err());
+    // A trailing `%%` swallows the `%d` in front of it.
+    assert!(scalc(r#"SSCANF("100%", "%d%%")"#, &mut inputs).is_err());
+
+    // Suppressed conversions are fine — there is still only one assignment.
+    assert_eq!(
+        eval_str(r#"SSCANF("1 2", "%d %*d")"#),
+        StackValue::Double(1.0)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("1 2", "%*d%d")"#),
+        StackValue::Double(2.0)
+    );
+    // A `%%` AHEAD of the conversion is just a literal `%`.
+    assert_eq!(
+        eval_str(r#"SSCANF("%42", "%%%d")"#),
+        StackValue::Double(42.0)
+    );
+}
+
+/// BIN_READ shares `findConversionIndicator`, so it inherits both rules — it
+/// used to accept `%d%%` and answer 42.
+#[test]
+fn test_bin_read_shares_the_conversion_scanner() {
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = r"*\0\0\0".into(); // escaped text for the four bytes of 42
+    inputs.str_vars[1] = "%d".into();
+    assert_eq!(
+        scalc("READ(AA,BB)", &mut inputs).unwrap(),
+        StackValue::Double(42.0)
+    );
+    inputs.str_vars[1] = "%d%%".into();
+    assert!(scalc("READ(AA,BB)", &mut inputs).is_err());
+    inputs.str_vars[1] = "%d %d".into();
+    assert!(scalc("READ(AA,BB)", &mut inputs).is_err());
 }
 
 // --- CRC16 / MODBUS / XOR8 / ADD_XOR8 ---

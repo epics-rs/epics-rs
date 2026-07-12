@@ -161,6 +161,36 @@ impl FrameReader {
         }
     }
 
+    /// Read one frame, or `None` if the server CLOSED the circuit first.
+    ///
+    /// `read` above loops on EOF until it times out, which cannot tell a
+    /// reset apart from a slow reply. This is the pvxs `bev.reset()` probe:
+    /// the server drops the connection rather than answering.
+    fn read_or_closed(&mut self) -> Option<Frame> {
+        use epics_pva_rs::client_native::decode::try_parse_frame;
+        use std::io::Read;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(Some((frame, n))) = try_parse_frame(&self.buf) {
+                self.buf.drain(..n);
+                return Some(frame);
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("neither a frame nor a close within deadline");
+            }
+            let mut chunk = [0u8; 1024];
+            match self.sock.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return None,
+                Err(e) => panic!("frame read failed: {e}"),
+            }
+        }
+    }
+
     fn send(&mut self, bytes: &[u8]) {
         self.sock.write_all(bytes).expect("send");
     }
@@ -627,6 +657,80 @@ async fn monitor_dbe_recognized_token_emits_no_message() {
             .iter()
             .any(|f| f.header.command == Command::Message.code()),
         "an honored DBE selection must draw no CMD_MESSAGE"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R9-35 — array-typed record._options.DBE resets the circuit
+// ---------------------------------------------------------------------------
+
+/// pvxs `SingleSource::onSubscribe` dispatches DBE on the field's KIND and
+/// then CONVERTS (`ioc/singlesource.cpp:117-140`). Kind is the type-code class
+/// (`code & 0xe0`), so `Int32A` is `Kind::Integer` and reaches
+/// `fld.as<uint8_t>()` — but it STORES as an array, and `Value::copyOut` has no
+/// scalar arm for array storage (`data.cpp:466-499`). The `NoConvert` it raises
+/// escapes `onSubscribe`, escapes `servermon.cpp:590-594`, and lands in
+/// `conn.cpp:277-282`, which calls `bev.reset()`.
+///
+/// So the wire contract is: NO CMD_MESSAGE, NO INIT reply, NO monitor — the
+/// server hangs the circuit up. The port used to serve the subscription with
+/// the VALUE|ALARM fallback mask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_array_typed_resets_the_circuit() {
+    use epics_pva_rs::pvdata::TypedScalarArray;
+
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 61;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:a");
+
+    let req = pv_request_with_options(&[(
+        "DBE",
+        PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1].into())),
+    )]);
+    c.send(&codec.build_monitor_init(sid, ioid, &req, None));
+
+    assert!(
+        c.read_or_closed().is_none(),
+        "an unconvertible DBE must reset the circuit: no CMD_MESSAGE, no INIT reply"
+    );
+}
+
+/// The scope boundary. pvxs's `GroupSource::onSubscribe` (`ioc/groupsource.cpp`)
+/// reads `record._options.atomic` and never `DBE`, so the SAME array-typed DBE
+/// on a GROUP channel is never converted, never throws, and the monitor is
+/// served normally. Resetting here would be a new divergence, not a fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_dbe_array_typed_on_a_group_still_serves() {
+    use epics_pva_rs::pvdata::TypedScalarArray;
+
+    let db = db_with_two_records().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_MIXED_PUTORDER)
+        .expect("group config loads");
+    let (_server, addr) = spawn_qsrv(provider);
+
+    let codec = PvaCodec { big_endian: false };
+    let ioid: u32 = 62;
+    let mut c = FrameReader::connect(addr);
+    let sid = c.create_channel("RLOG:grp");
+
+    let req = pv_request_with_options(&[(
+        "DBE",
+        PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1].into())),
+    )]);
+    let frames = monitor_until_data(&mut c, &codec, sid, ioid, &req);
+
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.header.command == Command::Monitor.code()),
+        "a group monitor never reads DBE, so it must be served, not reset"
     );
 }
 

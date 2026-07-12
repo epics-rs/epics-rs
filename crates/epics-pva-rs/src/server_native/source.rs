@@ -402,6 +402,56 @@ impl ChannelInvalidator {
 /// channel whose source installed no `onRPC` handler.
 pub const RPC_NOT_IMPLEMENTED: &str = "RPC Not Implemented";
 
+/// A MONITOR INIT that pvxs answers by DROPPING THE CIRCUIT — not by
+/// replying with an error.
+///
+/// pvxs sources read their `record._options` inside `onSubscribe`, through the
+/// THROWING `Value::as<T>()`. `SingleSource` dispatches on the field's KIND and
+/// then converts (`ioc/singlesource.cpp:117-140`): `Kind::String` runs
+/// `fld.as<std::string>()`, `Kind::Integer`/`Kind::Real` run
+/// `fld.as<uint8_t>()`. Kind is the type-code class, so an ARRAY of those kinds
+/// (`Int32A` is `Kind::Integer`) reaches the conversion — and `Value::copyOut`
+/// has no scalar arm for array storage, so it raises `NoConvert`
+/// (`data.cpp:466-499`).
+///
+/// Nothing catches that: not `onSubscribe`, not `servermon.cpp:590-594`'s
+/// `chan->onSubscribe(std::move(ctrl))`. It reaches the command-dispatch
+/// `catch` in `conn.cpp:277-282`, which logs and calls `bev.reset()`. The
+/// client gets no INIT reply, no `CMD_MESSAGE`, and no monitor: the connection
+/// is gone.
+///
+/// This is deliberately NOT an [`OpError`] — an `OpError` is a *reply*, and
+/// pvxs sends none. A source returns this from
+/// [`ChannelSource::check_monitor_request`] and the wire layer tears the
+/// connection down.
+#[derive(Debug, Clone)]
+pub struct MonitorRequestFatal(String);
+
+impl MonitorRequestFatal {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// The reason text, for the server's `log_exc_printf` equivalent.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MonitorRequestFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MonitorRequestFatal {}
+
+impl From<crate::pvdata::NoConvert> for MonitorRequestFatal {
+    fn from(e: crate::pvdata::NoConvert) -> Self {
+        Self(e.message().to_string())
+    }
+}
+
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
     /// the wire layer to mint [`AccessChecked`] tokens for the typed
@@ -925,6 +975,31 @@ pub trait ChannelSource: Send + Sync + 'static {
 
     /// True iff PUT is allowed against this PV (for ACL gating).
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
+
+    /// pvxs's `onSubscribe` pvRequest read, run at MONITOR INIT — the part of
+    /// it that can THROW.
+    ///
+    /// A pvxs source parses its `record._options` at the top of `onSubscribe`,
+    /// before `connect()` sends the INIT reply, using the throwing
+    /// `Value::as<T>()`. An option whose storage no `copyOut` arm converts
+    /// raises `NoConvert`, which resets the circuit — see
+    /// [`MonitorRequestFatal`] for the full path. The port splits the two
+    /// halves of `onSubscribe`: this check runs at INIT (where pvxs can still
+    /// reset), while the subscription itself is opened at START.
+    ///
+    /// The default is `Ok(())`: a source that reads no `record._options` — the
+    /// pvxs server API's `SharedPV`, and `GroupSource`, neither of which looks
+    /// at `DBE` — has nothing to throw on. Only a source that reads an option
+    /// through the throwing conversion overrides this, and it must return `Ok`
+    /// for the names it does NOT read that option for.
+    fn check_monitor_request(
+        &self,
+        checked: &AccessChecked,
+        ctx: &ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), MonitorRequestFatal>> + Send {
+        let _ = (checked, ctx);
+        async { Ok(()) }
+    }
 
     /// Subscribe to value-change notifications. Returns `None` if unknown.
     fn subscribe(
@@ -1723,6 +1798,15 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Dyn forwarder for the MONITOR INIT pvRequest check that can reset the
+    /// circuit ([`ChannelSource::check_monitor_request`]).
+    fn check_monitor_request<'a>(
+        &'a self,
+        checked: &'a AccessChecked,
+        ctx: &'a ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), MonitorRequestFatal>> + Send + 'a>,
+    >;
     fn subscribe<'a>(
         &'a self,
         name: &'a str,
@@ -2036,6 +2120,17 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::is_writable(self, name))
+    }
+    fn check_monitor_request<'a>(
+        &'a self,
+        checked: &'a AccessChecked,
+        ctx: &'a ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), MonitorRequestFatal>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::check_monitor_request(
+            self, checked, ctx,
+        ))
     }
     fn subscribe<'a>(
         &'a self,

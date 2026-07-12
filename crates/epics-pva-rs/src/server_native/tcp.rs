@@ -6459,6 +6459,47 @@ async fn handle_op(
             None
         };
 
+        // pvxs runs the SOURCE's `record._options` read at the top of
+        // `onSubscribe` — before `connect()` emits the INIT reply — through the
+        // THROWING `Value::as<T>()` (`ioc/singlesource.cpp:117-140`). An option
+        // whose storage no `copyOut` arm converts raises `NoConvert`, nothing
+        // catches it on the way out of `handle_MONITOR`, and
+        // `conn.cpp:277-282` calls `bev.reset()`. The port opens the
+        // subscription at START, not INIT, so the throwing half of `onSubscribe`
+        // is its own INIT-time hook: `check_monitor_request`. Its `Err` is a
+        // fatal `PvaError` out of this read loop — the connection teardown that
+        // IS `bev.reset()`. Sources that read no such option (the default impl)
+        // return `Ok`, so nothing else changes. (R9-35.)
+        if kind == OpKind::Monitor {
+            let init_ctx = crate::server_native::source::ChannelContext {
+                peer,
+                account: cred.account.clone(),
+                method: cred.method.clone(),
+                host: cred.host.clone(),
+                authority: cred.authority.clone(),
+                roles: cred.roles.clone(),
+                pv_request: req_value.clone(),
+                log: Default::default(),
+            };
+            let checked = source
+                .access_gate()
+                .check_with_roles(
+                    &ch.name,
+                    &init_ctx.host,
+                    &init_ctx.account,
+                    &init_ctx.roles,
+                    &init_ctx.method,
+                    &init_ctx.authority,
+                )
+                .await;
+            if let Err(e) = source.check_monitor_request(&checked, &init_ctx).await {
+                return Err(PvaError::Decode(format!(
+                    "MONITOR INIT for \"{}\": unconvertible record._options: {e}",
+                    ch.name
+                )));
+            }
+        }
+
         ch.ops.insert(
             ioid,
             OpState {

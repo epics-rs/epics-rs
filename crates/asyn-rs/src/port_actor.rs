@@ -338,7 +338,15 @@ impl PortActor {
             // table and cannot fail for connectivity reasons; gating it made a
             // record bound to a down driver resolve its DRVINFO to reason 0
             // (R13-48).
-            | RequestOp::DrvUserCreate { .. } => CDispatch::Direct,
+            | RequestOp::DrvUserCreate { .. }
+            // `report` (asynManager.c:1136-1171) spawns a `reportPort` thread and
+            // calls `pasynCommon->report(drvPvt, fp, details)` directly (:1120-1122).
+            // No queue, no gate: a disabled port reports `enabled:No`, a
+            // disconnected one `connected:No` (:1112-1115). The diagnostic you
+            // reach for *because* the port is down must not be the one the down
+            // port refuses (W10-D6). The one state C will not report on is a
+            // destroyed port, handled in the dispatch arm (:1038-1042).
+            | RequestOp::Report { .. } => CDispatch::Direct,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT/PCNCT put,
@@ -385,7 +393,6 @@ impl PortActor {
             | RequestOp::Float32ArrayWrite { .. }
             | RequestOp::GetOption { .. }
             | RequestOp::SetOption { .. }
-            | RequestOp::Report { .. }
             | RequestOp::SetInputEos { .. }
             | RequestOp::SetOutputEos { .. }
             | RequestOp::GetInputEos
@@ -1058,14 +1065,24 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Report { level } => {
-                // C parity: `asynManager::report` (asynManager.c) walks
+                // C parity: `asynManager::report` (asynManager.c:1136-1171) walks
                 // every registered port and calls each driver's
                 // `pasynCommon->report` callback. The iocsh wrapper
                 // (`asynReport`) does the per-port loop; here we
                 // dispatch the per-port `report(level)` from the
                 // actor thread so the driver observes its own state
                 // under the actor's serial ownership.
-                self.driver.report(*level);
+                //
+                // The one port state C refuses to report on is a destroyed one:
+                // `reportPrintPort` prints "<name> destroyed" and returns without
+                // touching the driver (asynManager.c:1038-1042) — its interfaces
+                // are gone. Disabled and disconnected are *not* such states; they
+                // are reported, as `enabled:No` / `connected:No` (:1112-1115).
+                if self.driver.base().defunct {
+                    eprintln!("{} destroyed", self.driver.base().port_name);
+                } else {
+                    self.driver.report(*level);
+                }
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetInputEos { eos } => {
@@ -2228,6 +2245,78 @@ mod tests {
                  driver's real reason, not fall back to 0"
             );
         }
+    }
+
+    /// W10-D6: C's `report` (asynManager.c:1136-1171) spawns a `reportPort` thread
+    /// and calls `pasynCommon->report(drvPvt, fp, details)` directly (:1120-1122).
+    /// It never queues, so no gate runs: a disabled port reports `enabled:No` and
+    /// a disconnected one `connected:No` (:1112-1115). Queue-gating it made
+    /// `asynReport` on a down port print a refusal instead of the diagnostic the
+    /// operator opened it for.
+    ///
+    /// The one port C refuses to report on is a destroyed one: `reportPrintPort`
+    /// prints "<name> destroyed" and returns without touching the driver
+    /// (:1038-1042).
+    #[test]
+    fn report_runs_on_a_disabled_or_disconnected_port_but_not_on_a_destroyed_one() {
+        struct ReportSpy {
+            base: PortDriverBase,
+            reports: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl PortDriver for ReportSpy {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn report(&self, _level: i32) {
+                self.reports
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        for (connected, enabled) in [(false, true), (true, false), (false, false)] {
+            let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut base = PortDriverBase::new("rep", 1, PortFlags::default());
+            base.auto_connect = false;
+            base.set_connected(connected);
+            base.enabled = enabled;
+            let tx = spawn_actor(ReportSpy {
+                base,
+                reports: reports.clone(),
+            });
+
+            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            send_and_wait(&tx, RequestOp::Report { level: 1 }, user).unwrap_or_else(|e| {
+                panic!(
+                    "connected={connected} enabled={enabled}: C's report is a direct call \
+                     and cannot be refused, got {e:?}"
+                )
+            });
+            assert_eq!(
+                reports.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "connected={connected} enabled={enabled}: the driver's report must run"
+            );
+        }
+
+        // A destroyed port: C prints "<name> destroyed" and never reaches the
+        // driver's interfaces (asynManager.c:1038-1042).
+        let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("gone", 1, PortFlags::default());
+        base.defunct = true;
+        let tx = spawn_actor(ReportSpy {
+            base,
+            reports: reports.clone(),
+        });
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Report { level: 1 }, user).unwrap();
+        assert_eq!(
+            reports.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a destroyed port prints \"<name> destroyed\"; its driver is not called"
+        );
     }
 
     /// R12-48: C conditions **only** `checkPortConnect` on the priority

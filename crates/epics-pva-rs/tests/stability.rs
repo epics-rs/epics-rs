@@ -2500,3 +2500,190 @@ async fn array_concurrent_subop_replies_error_not_silent() {
     gate.add_permits(1);
     h.abort();
 }
+
+/// R12-33 — an exhausted pipeline window must stop the REPLY, not the DRAIN.
+///
+/// pvxs `MonitorOp::maybeReply` simply does not fire while `op->window == 0`
+/// (`servermon.cpp:79-83`, and `doReply` bails at `:143`), but
+/// `ServerMonitorControl::doPost` keeps running on every post and keeps
+/// SQUASHING into the negotiated queue (`:270-283`). So a client that stops
+/// ACKing sees, on resume, at most `queueSize` frames whose tail carries the
+/// LATEST value — everything past the limit coalesced into the queue tail.
+///
+/// The port used to `await` the credit INSIDE the event loop's `select!`, so
+/// while the window was empty `rx.recv()` was never polled: the source backed
+/// up in the mpsc (capacity 64) instead of squashing, and on resume the client
+/// was handed ~`64 + limit` distinct historical updates.
+///
+/// Drives it raw: pipeline with `queueSize=4`, initial nack 1 (so exactly one
+/// DATA frame is emitted and the window then sits at 0), push 40 updates with
+/// NO ACK, then grant credit and count what comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r12_33_stalled_pipeline_squashes_at_the_negotiated_limit() {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::{CMD_CREATE_CHANNEL, CMD_MONITOR, PvaCodec};
+    use epics_pva_rs::proto::encode_string_into;
+    use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, ReadExt, Status, WriteExt};
+    use epics_pva_rs::pv_request::PvRequestBuilder;
+
+    const QUEUE_SIZE: usize = 4;
+    const BURST: i32 = 200;
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("MON:PIPE:STALL", 0.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let mut sock = read_handshake_prelude(server_addr);
+    let order = ByteOrder::Little;
+
+    // CONNECTION_VALIDATION (anonymous).
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let hv = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    hv.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    // CREATE_CHANNEL → sid.
+    let mut body = Vec::new();
+    body.put_u16(1, order);
+    body.put_u32(909, order);
+    encode_string_into("MON:PIPE:STALL", order, &mut body);
+    let hc = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
+    let mut frame_bytes = Vec::new();
+    hc.write_into(&mut frame_bytes);
+    frame_bytes.extend_from_slice(&body);
+    sock.write_all(&frame_bytes).unwrap();
+    let resp = reader.read(&mut sock);
+    let mut cur = resp.cursor();
+    let _cid = cur.get_u32(order).unwrap();
+    let sid = cur.get_u32(order).unwrap();
+    assert_ne!(sid, u32::MAX, "channel for a hosted PV must resolve");
+
+    // MONITOR INIT: pipeline, queueSize=4, initial nack = 1 credit.
+    let codec = PvaCodec { big_endian: false };
+    let pv_req = PvRequestBuilder::new()
+        .record("pipeline", "true")
+        .record("queueSize", QUEUE_SIZE.to_string())
+        .build()
+        .encode(false);
+    let ioid = 91u32;
+    sock.write_all(&codec.build_monitor_init(sid, ioid, &pv_req, Some(1)))
+        .unwrap();
+    let f = reader.read(&mut sock);
+    assert_eq!(f.header.command, CMD_MONITOR);
+    let mut c = f.cursor();
+    assert_eq!(c.get_u32(order).unwrap(), ioid);
+    assert!(c.get_u8().unwrap() & 0x08 != 0, "INIT reply");
+    assert!(
+        Status::decode(&mut c, order).unwrap().is_success(),
+        "pipeline MONITOR INIT must succeed"
+    );
+
+    // START → the seed DATA frame spends the single initial credit. The
+    // window is now 0 and stays there: we send no ACK.
+    sock.write_all(&codec.build_monitor_start(sid, ioid))
+        .unwrap();
+    let seed = reader.read(&mut sock);
+    assert_eq!(seed.header.command, CMD_MONITOR, "START yields the seed");
+
+    // Burst well past both the queue limit and the source channel capacity
+    // (64) while the client owes credit.
+    for i in 1..=BURST {
+        source.push("MON:PIPE:STALL", i as f64).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Grant far more credit than the queue can hold, then read until the
+    // server goes quiet.
+    sock.write_all(&codec.build_monitor_ack(sid, ioid, 1000))
+        .unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+
+    let mut values: Vec<f64> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut idle_since = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        use epics_pva_rs::client_native::decode::try_parse_frame;
+        use std::io::Read;
+        if let Ok(Some((frame, n))) = try_parse_frame(&buf) {
+            buf.drain(..n);
+            idle_since = std::time::Instant::now();
+            if frame.header.command == CMD_MONITOR {
+                let mut c = frame.cursor();
+                let _ioid = c.get_u32(order).unwrap();
+                let subcmd = c.get_u8().unwrap();
+                if subcmd == 0x00 {
+                    // changed bitset + value + overrun
+                    let changed =
+                        epics_pva_rs::proto::BitSet::decode(&mut c, order).expect("changed bitset");
+                    let v = epics_pva_rs::pvdata::encode::decode_pv_field_with_bitset(
+                        &nt_scalar_desc(),
+                        &changed,
+                        0,
+                        &mut c,
+                        order,
+                    )
+                    .expect("decode monitor value");
+                    if let PvField::Structure(s) = v
+                        && let Some(ScalarValue::Double(d)) = s.get_value()
+                    {
+                        values.push(*d);
+                    }
+                }
+            }
+            continue;
+        }
+        let mut chunk = [0u8; 1024];
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Server quiet for a while → the backlog is drained.
+                if idle_since.elapsed() > Duration::from_millis(600) {
+                    break;
+                }
+            }
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+
+    assert!(
+        !values.is_empty(),
+        "the resumed pipeline must deliver the backlog"
+    );
+    assert_eq!(
+        values.last().copied(),
+        Some(BURST as f64),
+        "the queue tail must carry the LATEST value ({BURST}), got {values:?}"
+    );
+    assert!(
+        values.len() <= QUEUE_SIZE,
+        "one negotiated limit governs the squash: a stalled pipeline must \
+         coalesce everything past queueSize={QUEUE_SIZE} into the queue tail, \
+         but {} distinct updates were delivered: {values:?}",
+        values.len()
+    );
+
+    h.abort();
+}

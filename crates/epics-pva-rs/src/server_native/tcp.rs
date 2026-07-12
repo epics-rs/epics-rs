@@ -1314,42 +1314,60 @@ struct MonitorPipelineCredit<'a> {
 }
 
 impl MonitorPipelineCredit<'_> {
-    /// Block until the pipeline window has a free slot, then consume one
-    /// credit for the DATA frame about to be sent and fire the LOW
+    /// True iff a DATA frame may be sent right now — the window holds a
+    /// credit, or this is a non-pipeline monitor (no window at all).
+    ///
+    /// This is pvxs `maybeReply`'s `(!op->pipeline || op->window)`
+    /// (`servermon.cpp:79-83`, echoed in `doReply` at `:143`): an exhausted
+    /// window suppresses the REPLY, and nothing else. It must NOT be awaited
+    /// inside the event loop's select — pvxs keeps calling `doPost`, so a
+    /// stalled pipelined client goes on squashing into the negotiated queue.
+    /// Awaiting here instead stopped polling the source, buffering
+    /// `channel_capacity + limit` distinct updates and delivering them all on
+    /// resume.
+    fn available(&self) -> bool {
+        let Some(w) = self.window else {
+            return true;
+        };
+        w.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Register for the next ACK refill, BEFORE the caller reads the window.
+    ///
+    /// Ordering is load-bearing: the ACK path increments the window and then
+    /// calls `Notify::notify_waiters()`, which stores NO permit. A waiter
+    /// registered after the window read would miss a refill that landed in
+    /// between and park forever with credit in hand. `enable()` registers
+    /// eagerly (`Notified` does not register until first polled), so arming
+    /// first and reading the window second cannot lose the wake-up in either
+    /// interleaving.
+    ///
+    /// `None` for a non-pipeline monitor — it is never credit-blocked, so it
+    /// never waits on this.
+    fn arm_refill(&self) -> Option<std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>> {
+        let n = self.window_notify?;
+        let mut notified = Box::pin(n.notified());
+        notified.as_mut().enable();
+        Some(notified)
+    }
+
+    /// Consume one credit for the DATA frame about to be sent and fire the LOW
     /// watermark on the above→below crossing. A no-op for a non-pipeline
     /// monitor (`window` is `None`).
     ///
-    /// Must be called exactly once per monitor DATA frame, AFTER the
-    /// pause / filter gates (a held or filtered event produces no wire
-    /// frame, so it must not consume a slot).
-    async fn acquire(&self) {
+    /// Must be called exactly once per monitor DATA frame, AFTER the pause /
+    /// filter gates (a held or filtered event produces no wire frame, so it
+    /// must not consume a slot) and only under [`Self::available`] — this is
+    /// the ONLY site that decrements the window (the ACK path only adds), so
+    /// the credit checked in the emit gate is still there.
+    fn take(&self) {
         use std::sync::atomic::Ordering;
-        let (Some(w), Some(n)) = (self.window, self.window_notify) else {
+        let Some(w) = self.window else {
             return;
         };
-        loop {
-            let cur = w.load(Ordering::Relaxed);
-            if cur > 0 {
-                if w.compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-                continue;
-            }
-            // Window exhausted — wait for an ACK to refill. `enable()`
-            // registers the waiter eagerly so an ACK firing between the
-            // recheck and the await is captured (`Notify::notified()`
-            // does not register until first polled). Same pattern as
-            // `channel.rs::wait_until_inactive`.
-            let notified = n.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if w.load(Ordering::Relaxed) > 0 {
-                continue;
-            }
-            notified.await;
-        }
+        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(1))
+        });
         // LOW fires when consuming this credit drained the
         // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND
@@ -1372,6 +1390,20 @@ impl MonitorPipelineCredit<'_> {
                 );
             }
         }
+    }
+}
+
+/// Await a pipeline-credit refill. Only ever polled from the emit loop's
+/// credit arm, which runs solely when the window is exhausted — and an
+/// exhausted window implies a pipeline monitor, so `refill` is `Some` there.
+/// A non-pipeline monitor is never credit-blocked; `pending()` makes that arm
+/// inert for it rather than spinning the loop.
+async fn wait_credit_refill(
+    refill: Option<std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>>,
+) {
+    match refill {
+        Some(n) => n.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2117,6 +2149,19 @@ fn spawn_monitor_subscriber(
             if !source_open && executing && pending.is_empty() {
                 break;
             }
+            // Arm the credit-refill waiter BEFORE reading the window (see
+            // `arm_refill`: the ACK's `notify_waiters()` leaves no permit, so
+            // registering after the read could lose the wake-up).
+            let refill = credit.arm_refill();
+            // pvxs `maybeReply`/`doReply`: an exhausted pipeline window
+            // suppresses the REPLY only (`servermon.cpp:79-83,143`). It must
+            // not suppress the DRAIN — `doPost` keeps squashing into the
+            // negotiated queue while the client owes ACKs. So this is an emit
+            // GATE, not an await inside the arm: `rx.recv()` stays polled and
+            // a stalled pipelined client coalesces at `limit` instead of
+            // making the port buffer `channel_capacity + limit` distinct
+            // updates and deliver them all on resume.
+            let has_credit = credit.available();
             tokio::select! {
                 biased;
                 r = rx.recv(), if source_open => {
@@ -2131,7 +2176,9 @@ fn spawn_monitor_subscriber(
                     }
                 }
                 _ = exec_rx.changed() => {}
-                _ = std::future::ready(()), if executing && !pending.is_empty() => {
+                // Re-evaluate the gate when an ACK refills the window.
+                _ = wait_credit_refill(refill), if !has_credit => {}
+                _ = std::future::ready(()), if executing && has_credit && !pending.is_empty() => {
                     let mut value = pending.pop().expect("guarded non-empty");
                     // Subscription boundary (upstream descriptor change): emit
                     // MONITOR FINISH and end — the decoded counterpart of the raw
@@ -2189,12 +2236,12 @@ fn spawn_monitor_subscriber(
                         }
                     };
                     // Pipeline window: consume one credit AFTER the pause/filter
-                    // gates (pvxs `servermon.cpp:192`). No-op for a non-pipeline
-                    // monitor. For a pipeline monitor with no credit this awaits;
-                    // the source then backpressures at the `updates` channel
-                    // (sized >= queue_limit) instead of squashing — a documented
-                    // pipeline-starvation residual orthogonal to the accrual FIFO.
-                    credit.acquire().await;
+                    // gates (pvxs `servermon.cpp:192`) — a held or filtered event
+                    // produces no wire frame, so it must not consume a slot. The
+                    // credit was checked by the arm's `has_credit` gate and this
+                    // is the only decrementer, so it is still there. No-op for a
+                    // non-pipeline monitor.
+                    credit.take();
                     let payload = if let Some(paths) = marked.as_ref() {
                         build_monitor_payload_marked(
                             ioid, &intro_clone, &value, paths, &mask_clone, order_now(),
@@ -10860,10 +10907,10 @@ mod tests {
         }
     }
 
-    /// Owner path: `MonitorPipelineCredit::acquire` consumes exactly one
-    /// window slot per call.
+    /// Owner path: `MonitorPipelineCredit::take` consumes exactly one window
+    /// slot per call, and `available()` reports the gate the emit arm reads.
     #[tokio::test]
-    async fn monitor_pipeline_credit_acquire_decrements_window() {
+    async fn monitor_pipeline_credit_take_decrements_window() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(2));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -10880,16 +10927,31 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        credit.acquire().await;
+        assert!(credit.available());
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 1);
-        credit.acquire().await;
+        assert!(credit.available());
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 0);
+        assert!(
+            !credit.available(),
+            "an exhausted window closes the emit gate"
+        );
     }
 
-    /// Owner path: at zero credit `acquire` blocks, and proceeds once the
-    /// window is refilled (the ACK dispatch does `fetch_add` + notify).
+    /// R12-33 — an exhausted window must SUPPRESS THE REPLY, not the drain.
+    /// pvxs `maybeReply` simply does not fire while `window == 0`
+    /// (`servermon.cpp:79-83`) and `doPost` goes on squashing into the
+    /// negotiated queue. So the credit primitive must be a non-blocking gate
+    /// (`available`) plus a wake-up (`arm_refill`) that the event loop can
+    /// select over alongside `rx.recv()` — never an await that parks the loop
+    /// and stops draining the source.
+    ///
+    /// Also pins the arm-before-read ordering: the ACK path adds credit and
+    /// calls `notify_waiters()`, which stores no permit, so a waiter armed
+    /// AFTER the window read would miss the refill and park forever.
     #[tokio::test]
-    async fn monitor_pipeline_credit_acquire_blocks_until_refill() {
+    async fn monitor_pipeline_credit_refill_wakes_the_armed_waiter() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(0));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -10906,27 +10968,36 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        // Exhausted window: acquire must not complete.
+
+        // Exhausted: the gate is shut and the refill waiter parks.
+        let refill = credit.arm_refill();
+        assert!(!credit.available(), "no credit → the emit gate is shut");
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), credit.acquire())
+            tokio::time::timeout(Duration::from_millis(50), wait_credit_refill(refill))
                 .await
                 .is_err(),
-            "acquire must block while the window is empty"
+            "with no ACK the refill waiter must park"
         );
-        // Refill (as the ACK dispatch does) and re-acquire.
+
+        // Arm, THEN let the ACK land: `notify_waiters()` leaves no permit, so
+        // only an already-registered waiter is woken. This is the ordering the
+        // emit loop relies on.
+        let refill = credit.arm_refill();
         window.fetch_add(1, Ordering::Relaxed);
         notify.notify_waiters();
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), credit.acquire())
+            tokio::time::timeout(Duration::from_millis(500), wait_credit_refill(refill))
                 .await
                 .is_ok(),
-            "acquire must complete once the window is refilled"
+            "an ACK refill must wake the armed waiter"
         );
+        assert!(credit.available(), "the refilled window re-opens the gate");
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 0);
     }
 
-    /// Owner path: a non-pipeline monitor (no window) never blocks and
-    /// touches no counter.
+    /// Owner path: a non-pipeline monitor (no window) is always emit-eligible,
+    /// never waits, and touches no counter.
     #[tokio::test]
     async fn monitor_pipeline_credit_no_window_is_no_op() {
         use std::sync::atomic::AtomicU64;
@@ -10943,9 +11014,15 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        tokio::time::timeout(Duration::from_millis(50), credit.acquire())
-            .await
-            .expect("non-pipeline acquire must return immediately");
+        assert!(
+            credit.available(),
+            "a non-pipeline monitor is never credit-blocked"
+        );
+        credit.take();
+        assert!(
+            credit.arm_refill().is_none(),
+            "no window → nothing to wait on"
+        );
     }
 
     /// Bypass path (the formerly-uncounted send site): the pipeline

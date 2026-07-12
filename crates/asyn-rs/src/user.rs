@@ -46,6 +46,23 @@ pub struct AsynUser {
     /// framework-wide divergence: every blocking driver operation is bounded,
     /// so a stuck device cannot wedge the port actor thread indefinitely.
     pub timeout: Duration,
+    /// How long this request may wait **in the port queue** before it is removed
+    /// and reported as never having run — C `queueRequest`'s `timeout` argument
+    /// (asynManager.c:1514,1617-1623), which is a different clock from
+    /// [`Self::timeout`] above: that one bounds the driver's transfer once the
+    /// request is *running*, this one bounds the wait *before* it runs.
+    ///
+    /// `None` is C's `queueRequest(..., 0.0)`: no timer is armed and the request
+    /// waits as long as the queue makes it. That is what every device support
+    /// does (devAsynInt32.c:838) and it is the default here. `asynRecord` is the
+    /// caller that asks for a deadline — `QUEUE_TIMEOUT` = 10 s on both its
+    /// process and its special requests (asynRecord.c:71,343,572).
+    ///
+    /// The deadline is resolved through the request's [`crate::request::CancelToken`]:
+    /// only a still-**queued** request can time out, exactly as C's
+    /// `queueTimeoutCallback` returns immediately when `!isQueued`
+    /// (asynManager.c:655-661). A request that has begun running always completes.
+    pub queue_timeout: Option<Duration>,
     /// Queue priority.
     pub priority: QueuePriority,
     /// Timestamp set by the driver.
@@ -96,6 +113,7 @@ impl Default for AsynUser {
             reason: 0,
             addr: 0,
             timeout: Duration::from_secs(1),
+            queue_timeout: None,
             priority: QueuePriority::default(),
             timestamp: None,
             alarm_status: 0,
@@ -123,6 +141,13 @@ impl AsynUser {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Ask for C's `queueRequest(pasynUser, priority, timeout)` queue-wait
+    /// deadline on this request — see [`Self::queue_timeout`].
+    pub fn with_queue_timeout(mut self, queue_timeout: Duration) -> Self {
+        self.queue_timeout = Some(queue_timeout);
         self
     }
 

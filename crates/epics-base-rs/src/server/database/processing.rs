@@ -157,6 +157,23 @@ impl AsyncDbHandle {
         db.read_link_value_no_process(&parsed).await
     }
 
+    /// Out-of-band `dbPutField` on any record field, common fields included —
+    /// see [`PvDatabase::put_pv`]. `Ok(())` (no-op) if the database has been
+    /// dropped.
+    ///
+    /// Unlike [`Self::post_fields`] (which writes through `put_field_internal`
+    /// and only posts), this is the full put path: a `SCAN` write moves the
+    /// record between scan buckets and fires the `get_ioint_info` hook. C
+    /// records call `dbPutField` on their own fields exactly this way — asynRecord's
+    /// `cancelIOInterruptScan` does `dbPutField(&scanAddr, DBR_LONG,
+    /// &passiveScan, 1)` on its own `.SCAN` (asynRecord.c:794-806).
+    pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match self.db() {
+            Some(db) => db.put_pv(name, value).await,
+            None => Ok(()),
+        }
+    }
+
     /// Mint an async re-entry token — see [`PvDatabase::mint_async_token`].
     /// `None` if the record is absent or the database has been dropped.
     pub async fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {

@@ -1,8 +1,13 @@
+pub mod device;
+mod io_intr;
 pub mod registry;
+pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
 pub use registry::{
     PortEntry, PortRegistry, asyn_record_factory, get_port, register_asyn_record_type,
     register_port,
 };
+
+use io_intr::{IoIntrBinding, IoIntrSample, IoIntrScan};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +17,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record,
+    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -51,7 +56,7 @@ impl TransferMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-enum InterfaceType {
+pub(crate) enum InterfaceType {
     Octet = 0,
     Int32 = 1,
     UInt32Digital = 2,
@@ -442,6 +447,12 @@ pub struct AsynRecord {
     // refresh, which runs the same comparison — one cell, so the two paths
     // cannot disagree about which sink is "ours". `None` until the first sample.
     old_trace_file_id: Arc<Mutex<Option<usize>>>,
+
+    // C `asynRecPvt`'s I/O Intr half — `ioScanPvt`, `interruptPvt`,
+    // `interruptLock` and `gotValue` (asynRecord.c:228-232). Shared with the
+    // record's `asynRecordDevice` device support, which is the framework's
+    // `get_ioint_info` seam; see [`io_intr`].
+    io_intr: Arc<IoIntrScan>,
 }
 
 impl Default for AsynRecord {
@@ -531,6 +542,7 @@ impl Default for AsynRecord {
             except_cb: None,
             io_alarm: None,
             old_trace_file_id: Arc::new(Mutex::new(None)),
+            io_intr: Arc::new(IoIntrScan::new()),
         }
     }
 }
@@ -668,6 +680,22 @@ impl IoOutcome {
         self.report_error(CANCELED_MSG.to_string());
         raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Major);
     }
+
+    /// The queue-timeout outcome of a **process** request, C
+    /// `queueTimeoutCallbackProcess` (asynRecord.c:919-926): `reportError(…
+    /// "process queueRequest timeout")`, `recGblSetSevr(STATE_ALARM,
+    /// MAJOR_ALARM)`, then `callbackRequestProcessCallback` to complete the
+    /// record that is still sitting at `pact = TRUE`.
+    ///
+    /// The same shape as [`Self::report_canceled`], and for the same reason: both
+    /// are "the queued request left the queue without running", so the message
+    /// and the severity are one event with one owner, and the completion re-entry
+    /// that applies this outcome is C's forced callback. The remaining phases of
+    /// the plan do **not** run — C never entered `performIO` at all.
+    fn report_queue_timeout(&mut self) {
+        self.report_error(PROCESS_QUEUE_TIMEOUT_MSG.to_string());
+        raise_io_alarm(self, alarm_status::STATE_ALARM, AlarmSeverity::Major);
+    }
 }
 
 /// The status word C splices into the final octet read-error message
@@ -707,12 +735,15 @@ fn io_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason)
         .with_addr(plan.addr)
         .with_timeout(plan.timeout)
+        .with_queue_timeout(QUEUE_TIMEOUT)
 }
 
 /// Build the `asynUser` for a `Flush` phase. C `asynRecord.c` issues the flush
 /// with the same reason/addr but no transfer timeout.
 fn flush_user(plan: &IoPlan) -> AsynUser {
-    AsynUser::new(plan.reason).with_addr(plan.addr)
+    AsynUser::new(plan.reason)
+        .with_addr(plan.addr)
+        .with_queue_timeout(QUEUE_TIMEOUT)
 }
 
 /// One phase of a record I/O cycle — a `performIO` transfer phase, or one bus
@@ -1129,6 +1160,19 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
     }
 }
 
+/// Whether the `performIO` cycle continues after a phase.
+///
+/// A phase that *ran* and failed reports and the cycle carries on, exactly as C
+/// `performIO` does (a failed write is still followed by the read). A phase that
+/// never ran — its queued request was removed by the queue-wait deadline — ends
+/// the cycle: in C that request never entered `performIO` at all, and what runs
+/// instead is `queueTimeoutCallbackProcess`.
+#[must_use]
+enum PhaseFlow {
+    Continue,
+    Aborted,
+}
+
 /// Record one phase's result into the outcome — the phase→recorder mapping,
 /// shared by the synchronous and off-thread runners so a phase cannot be handled
 /// differently on the two paths. As in C `performIO`, a failed phase reports but
@@ -1138,7 +1182,19 @@ fn record_phase_result(
     out: &mut IoOutcome,
     phase: IoPhase,
     res: AsynResult<RequestResult>,
-) {
+) -> PhaseFlow {
+    // The queue-wait deadline, ahead of every per-phase recorder — including the
+    // flush's "discard the status" one, which would otherwise swallow it. This is
+    // not an I/O failure to report as one: the request never reached the driver,
+    // so there is no transfer to publish (no NAWT, no NORD, no EOMR) and no
+    // driver diagnostic to splice. C reports it from a different callback
+    // entirely (`queueTimeoutCallbackProcess`), which is what this is.
+    if let Err(e) = &res {
+        if e.is_queue_timeout() {
+            out.report_queue_timeout();
+            return PhaseFlow::Aborted;
+        }
+    }
     match phase {
         IoPhase::Flush => {
             // C `performOctetIO` calls the flush for its side effect only and
@@ -1216,6 +1272,7 @@ fn record_phase_result(
             }
         }
     }
+    PhaseFlow::Continue
 }
 
 /// Run `performIO`'s flush/write/read phases off the scan thread against the
@@ -1247,7 +1304,9 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
             out.report_canceled();
             return out;
         }
-        record_phase_result(&plan, &mut out, phase, res);
+        if let PhaseFlow::Aborted = record_phase_result(&plan, &mut out, phase, res) {
+            return out;
+        }
     }
 
     out
@@ -1256,6 +1315,27 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
 /// C `reportError(pasynRec, status, "I/O request canceled")` for a dequeued
 /// `AQR` request (asynRecord.c:398).
 const CANCELED_MSG: &str = "I/O request canceled";
+
+/// C `QUEUE_TIMEOUT` (asynRecord.c:71): how long a record request may wait in
+/// the port queue before it is removed and reported as never having run.
+///
+/// The record passes it to **every** `queueRequest` it makes — the process I/O
+/// (:343), the special option/EOS callback (:572), and the getOption/getEos
+/// requests `connectDevice` queues (:1281,:1297) — and it is the only caller in
+/// asyn that asks for one at all (device support passes 0.0, devAsynInt32.c:838).
+/// So it belongs to the record, not to the port: it rides on
+/// [`AsynUser::queue_timeout`] of the users the record builds below.
+const QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// C `queueTimeoutCallbackProcess` (asynRecord.c:919-926) — the process request
+/// waited out `QUEUE_TIMEOUT` and was removed from the queue.
+const PROCESS_QUEUE_TIMEOUT_MSG: &str = "process queueRequest timeout";
+
+/// C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) — the special
+/// (option / EOS / connect readback) request waited out `QUEUE_TIMEOUT`.
+/// Unlike the process one, C raises **no** record severity here: it reports,
+/// returns the record to `stateIdle`, and frees the request.
+const SPECIAL_QUEUE_TIMEOUT_MSG: &str = "special queueRequest timeout";
 
 /// The fields asynRecord.dbd marks `special(SPC_MOD)` — the complete set of puts
 /// that reach C `special()` (dbAccess only calls `special` for an SPC_MOD field).
@@ -1279,6 +1359,24 @@ const SPC_MOD_FIELDS: &[&str] = &[
 const OPTION_READBACK_FIELDS: &[&str] = &[
     "BAUD", "LBAUD", "PRTY", "DBIT", "SBIT", "MCTL", "FCTL", "IXON", "IXOFF", "IXANY", "HOSTINFO",
     "DRTO",
+];
+
+/// The driver option keys C `getOptions` reads (asynRecord.c:1864-1937), in C's
+/// order. The record reads them in one pass so a queue-wait timeout — which in C
+/// means the single request carrying *all* of them never ran — can abort the
+/// whole readback rather than half of it.
+const OPTION_READBACK_KEYS: &[&str] = &[
+    "baud",
+    "parity",
+    "bits",
+    "stop",
+    "crtscts",
+    "clocal",
+    "ixon",
+    "ixoff",
+    "ixany",
+    "hostinfo",
+    "disconnectOnReadTimeout",
 ];
 
 /// The fields C `getEos` re-reads and posts (asynRecord.c:2016-2024) — both
@@ -2269,96 +2367,127 @@ impl AsynRecord {
         if !handle.has_interface(crate::interfaces::InterfaceType::Option) {
             return;
         }
-        // Baud rate. C reads the driver's text once and derives both fields from
-        // it: `sscanf(optbuff, "%d", &lbaud)` and the `baud_choices` walk
-        // (asynRecord.c:1866-1871). BAUD is matched against the choice *text*,
-        // not against the parsed number, so a driver reporting something no menu
-        // choice carries leaves BAUD at "Unknown" while LBAUD still shows the
-        // rate.
-        if let Ok(val) = handle.get_option_blocking("baud") {
-            self.lbaud = val.parse::<i32>().unwrap_or(0);
-            self.baud = baud_choice_index(&val);
+        // Every `getOption` C's `getOptions` runs happens *inside* one queued
+        // request (`callbackGetOption`), so they stand or fall together: if that
+        // request never ran, no option was read.
+        let Some(opts) = self.get_options(handle, OPTION_READBACK_KEYS) else {
+            return;
+        };
+        // C hands `getOption` a buffer the driver clears at entry
+        // (`val[0] = '\0'`, drvAsynSerialPort.c:142, drvAsynIPPort.c:894) and
+        // then ignores the returned status (asynRecord.c:1863-1928). So a key the
+        // port does not implement is an *empty readback*, not a skipped field: an
+        // IP port answers "" for `parity`, and PRTY lands on its Unknown choice
+        // instead of keeping a stale value from the serial port the record used
+        // to point at. One rule for every key.
+        let opt = |key: &str| opts.get(key).map(String::as_str).unwrap_or("");
+
+        // Baud rate. C derives both fields from one text:
+        // `sscanf(optbuff, "%d", &pasynRec->lbaud)` and the `baud_choices` walk
+        // (asynRecord.c:1866-1871). BAUD is matched against the choice *text*, so
+        // a driver reporting a rate no menu choice carries leaves BAUD at
+        // "Unknown" while LBAUD still shows the number.
+        //
+        // LBAUD is the one field C does *not* pre-zero: `sscanf` writes nothing
+        // when the text carries no number, so LBAUD keeps its previous value —
+        // where the port's `parse().unwrap_or(0)` reported the line as 0 baud.
+        // The parse is C's `%d`, a prefix parse (`option_parse::sscanf_int`).
+        let baud_text = opt("baud");
+        if let Some(rate) = crate::drivers::option_parse::sscanf_int(baud_text) {
+            self.lbaud = rate;
         }
+        self.baud = baud_choice_index(baud_text);
         // Parity
-        if let Ok(val) = handle.get_option_blocking("parity") {
-            self.prty = match val.as_str() {
-                "none" => 1,
-                "even" => 2,
-                "odd" => 3,
-                _ => 0, // unknown
-            };
-        }
+        self.prty = match opt("parity") {
+            "none" => 1,
+            "even" => 2,
+            "odd" => 3,
+            _ => 0, // unknown
+        };
         // Data bits. The serial driver's get_option exposes data bits
         // under the key `"bits"` (C asynRecord.c:1884 likewise reads
         // "bits"); `"csize"` is consumed by no driver, so the readback
         // must use "bits" to match the DBIT write path (write_option
         // "bits" below).
-        if let Ok(val) = handle.get_option_blocking("bits") {
-            self.dbit = match val.as_str() {
-                "5" => 1,
-                "6" => 2,
-                "7" => 3,
-                "8" => 4,
-                _ => 0,
-            };
-        }
+        self.dbit = match opt("bits") {
+            "5" => 1,
+            "6" => 2,
+            "7" => 3,
+            "8" => 4,
+            _ => 0,
+        };
         // Stop bits
-        if let Ok(val) = handle.get_option_blocking("stop") {
-            self.sbit = match val.as_str() {
-                "1" => 1,
-                "2" => 2,
-                _ => 0,
-            };
-        }
+        self.sbit = match opt("stop") {
+            "1" => 1,
+            "2" => 2,
+            _ => 0,
+        };
         // Flow control
-        if let Ok(val) = handle.get_option_blocking("crtscts") {
-            self.fctl = match val.as_str() {
-                "Y" | "Yes" => 2,         // Hardware
-                "N" | "No" | "none" => 1, // None
-                _ => 0,
-            };
-        }
+        self.fctl = match opt("crtscts") {
+            "Y" | "Yes" => 2,         // Hardware
+            "N" | "No" | "none" => 1, // None
+            _ => 0,
+        };
         // Modem control
-        if let Ok(val) = handle.get_option_blocking("clocal") {
-            self.mctl = match val.as_str() {
-                "Y" | "Yes" => 1, // CLOCAL
-                "N" | "No" => 2,  // YES (hardware modem control)
-                _ => 0,
-            };
-        }
+        self.mctl = match opt("clocal") {
+            "Y" | "Yes" => 1, // CLOCAL
+            "N" | "No" => 2,  // YES (hardware modem control)
+            _ => 0,
+        };
         // XON/XOFF
-        if let Ok(val) = handle.get_option_blocking("ixon") {
-            self.ixon = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
+        self.ixon = match opt("ixon") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+        self.ixoff = match opt("ixoff") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+        self.ixany = match opt("ixany") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+        // IP options. C `strncpy(pasynRec->hostinfo, hostbuff, …)`
+        // (asynRecord.c:1928) copies the buffer whatever the get returned, so a
+        // port carrying no `hostinfo` key clears the field.
+        self.hostinfo = opt("hostinfo").to_string();
+        self.drto = match opt("disconnectOnReadTimeout") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+    }
+
+    /// Read the driver's options under the record's queued `AsynUser`.
+    ///
+    /// A key the driver does not know leaves its field alone — C's `getOption`
+    /// failure branch reports nothing and the record keeps what it had. A
+    /// **queue-wait timeout** is different in kind: the request never reached the
+    /// driver, so nothing was read and the whole readback is off. C reports that
+    /// through `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) and the
+    /// `getOptions` inside that request simply never happen — `None` here.
+    fn get_options(
+        &mut self,
+        handle: &PortHandle,
+        keys: &[&str],
+    ) -> Option<HashMap<String, String>> {
+        let mut opts = HashMap::new();
+        for key in keys {
+            match handle.get_option_blocking(self.option_user(), key) {
+                Ok(val) => {
+                    opts.insert((*key).to_string(), val);
+                }
+                Err(e) if e.is_queue_timeout() => {
+                    self.report_special_queue_timeout();
+                    return None;
+                }
+                Err(_) => {}
+            }
         }
-        if let Ok(val) = handle.get_option_blocking("ixoff") {
-            self.ixoff = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
-        if let Ok(val) = handle.get_option_blocking("ixany") {
-            self.ixany = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
-        // IP options
-        if let Ok(val) = handle.get_option_blocking("hostinfo") {
-            self.hostinfo = val;
-        }
-        if let Ok(val) = handle.get_option_blocking("disconnectOnReadTimeout") {
-            self.drto = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
+        Some(opts)
     }
 
     /// Read both EOS strings back from the driver into IEOS/OEOS — C `getEos`
@@ -2377,17 +2506,32 @@ impl AsynRecord {
         let mut ieos = String::new();
         let mut oeos = String::new();
         if self.octetiv != 0 {
-            match handle.get_input_eos_blocking() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    ieos = crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE);
+            // As in `get_options`: a queue-wait timeout means the request never
+            // ran, so neither EOS was read and the fields must not be rewritten
+            // from a readback that did not happen.
+            let read = |res: AsynResult<Vec<u8>>| -> Result<String, bool> {
+                match res {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        Ok(crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE))
+                    }
+                    Ok(_) => Ok(String::new()),
+                    Err(e) if e.is_queue_timeout() => Err(true),
+                    Err(_) => Ok(String::new()),
                 }
-                _ => {}
+            };
+            match read(handle.get_input_eos_blocking(self.option_user())) {
+                Ok(v) => ieos = v,
+                Err(_) => {
+                    self.report_special_queue_timeout();
+                    return;
+                }
             }
-            match handle.get_output_eos_blocking() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    oeos = crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE);
+            match read(handle.get_output_eos_blocking(self.option_user())) {
+                Ok(v) => oeos = v,
+                Err(_) => {
+                    self.report_special_queue_timeout();
+                    return;
                 }
-                _ => {}
             }
         }
         self.ieos = ieos;
@@ -2467,6 +2611,16 @@ impl AsynRecord {
             .handle
             .set_option_blocking(self.option_user(), key, value)
         {
+            // The queued special request never ran (C `queueTimeoutCallbackSpecial`,
+            // asynRecord.c:929-938): no option was written, and the
+            // `setOption -> getOptions` fall-through lives *inside* that request
+            // (:845-849), so the readback does not happen either. Reporting the
+            // set failure and then re-reading would claim a driver round-trip the
+            // port never made.
+            if e.is_queue_timeout() {
+                self.report_special_queue_timeout();
+                return;
+            }
             self.errs = format!("Error setting option, {}", e.message());
         }
         let before = self.field_snapshot(OPTION_READBACK_FIELDS);
@@ -2519,6 +2673,95 @@ impl AsynRecord {
         self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
     }
 
+    /// C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938): the option / EOS /
+    /// connect-readback request waited out `QUEUE_TIMEOUT` and was removed from
+    /// the queue. C reports the text, returns the record to `stateIdle` and frees
+    /// the request — and, unlike the process timeout, raises **no** severity, so
+    /// this must not go through `report_no_interface`'s alarm-raising shape.
+    ///
+    /// The single owner of that outcome for every request the record's
+    /// [`Self::option_user`] builds.
+    fn report_special_queue_timeout(&mut self) {
+        self.errs = SPECIAL_QUEUE_TIMEOUT_MSG.to_string();
+    }
+
+    /// The record's I/O Intr machinery, shared with its `asynRecordDevice`
+    /// device support (C reaches the same `asynRecPvt` through `pasynRec->dpvt`).
+    pub(crate) fn io_intr_scan(&self) -> Arc<IoIntrScan> {
+        self.io_intr.clone()
+    }
+
+    /// Publish the record's current interrupt binding — C `registerInterrupts`
+    /// reads PORT / IFACE / ADDR / REASON / UI32MASK straight off `pasynRec`
+    /// every time it registers (asynRecord.c:599-656), so every put that moves
+    /// one of them must reach the registration.
+    ///
+    /// The single owner of that hand-off: `connect_device` (a new port /
+    /// address / drvInfo) and the REASON / IFACE / UI32MASK puts all write
+    /// through it, so a live subscription can never describe a binding the
+    /// record no longer has. A registration refused by the port ("No asynInt32
+    /// interface") lands in ERRS exactly as C's `registerInterrupts` reports it.
+    fn publish_io_intr_binding(&mut self) {
+        let binding = self.port_entry.as_ref().map(|entry| IoIntrBinding {
+            handle: entry.handle.clone(),
+            iface: InterfaceType::from_u16(self.iface as u16),
+            addr: self.addr,
+            reason: self.resolved_reason,
+            ui32mask: self.ui32mask,
+        });
+        if let Err(msg) = self.io_intr.rebind(binding) {
+            self.errs = msg;
+        }
+    }
+
+    /// C `cancelIOInterruptScan` (asynRecord.c:794-806): a put that invalidates
+    /// what the record subscribed to — REASON, IFACE, UI32MASK (:490,:494,:497)
+    /// or a PCNCT=0 detach (:525) — takes the record **off** the I/O Intr scan
+    /// list rather than silently re-registering behind the operator's back:
+    /// `dbPutField(&scanAddr, DBR_LONG, &passiveScan, 1)`. The put is what
+    /// cancels the driver registration (`scanDelete` → `get_ioint_info(1)`).
+    ///
+    /// Both halves run here: the local `set_active(false)` is the registration
+    /// (so the driver stops pushing values the instant the field changes, with
+    /// no window where a stale subscription can fill the sample cell), and the
+    /// SCAN put makes the field itself read back "Passive" as C's does. The put
+    /// re-enters `set_io_intr_scan(false)`, which is idempotent.
+    ///
+    /// C is a no-op when SCAN is not I/O Intr, and so is this.
+    fn cancel_io_interrupt_scan(&mut self) {
+        if !self.io_intr.is_active() {
+            return;
+        }
+        let _ = self.io_intr.set_active(false);
+        let Some((name, db)) = self.async_ctx.clone() else {
+            // No database (a record built outside an IOC): the registration is
+            // cancelled above; there is no SCAN field to put.
+            return;
+        };
+        // C calls `dbPutField` inline; this record is currently locked by the
+        // put that reached `special()`, so the write is handed to the database
+        // rather than re-entered here. It lands as soon as this put returns —
+        // C's `dbScanLock` is recursive, this one is not.
+        let passive = EpicsValue::Enum(ScanType::Passive as u16);
+        tokio::spawn(async move {
+            let _ = db.put_pv(&format!("{name}.SCAN"), passive).await;
+        });
+    }
+
+    /// C's four `callbackInterrupt*` routines (asynRecord.c:709-792) write the
+    /// pushed value into the IFACE's input field. In C that happens on the
+    /// driver's thread, under `interruptLock`, before `scanIoRequest`; here the
+    /// value rides the sample cell and lands on the process cycle it triggered —
+    /// the record is only mutable there. The field written is the same.
+    fn apply_io_intr_sample(&mut self, sample: IoIntrSample) {
+        match sample {
+            IoIntrSample::Octet(s) => self.tinp = s,
+            IoIntrSample::Int32(v) => self.i32inp = v,
+            IoIntrSample::UInt32(v) => self.ui32inp = v,
+            IoIntrSample::Float64(v) => self.f64inp = v,
+        }
+    }
+
     /// Does the connected port implement the interface?
     ///
     /// Asked of the port's own registry (`PortHandle::has_interface`, the
@@ -2560,11 +2803,21 @@ impl AsynRecord {
         let field = if output { &self.oeos } else { &self.ieos };
         let bytes = translate_escape(field);
         let res = if output {
-            entry.handle.set_output_eos_blocking(&bytes)
+            entry
+                .handle
+                .set_output_eos_blocking(self.option_user(), &bytes)
         } else {
-            entry.handle.set_input_eos_blocking(&bytes)
+            entry
+                .handle
+                .set_input_eos_blocking(self.option_user(), &bytes)
         };
         if let Err(e) = res {
+            // Same rule as `write_option`: a queued special request that timed out
+            // wrote nothing and runs no `getEos` fall-through (asynRecord.c:851-854).
+            if e.is_queue_timeout() {
+                self.report_special_queue_timeout();
+                return;
+            }
             let which = if output { "output" } else { "input" };
             self.errs = format!("Error setting {which} eos, {}", e.message());
         }
@@ -2643,6 +2896,7 @@ impl AsynRecord {
             self.port_entry = None;
             self.refresh_connected_state();
             self.clear_exception_callback();
+            self.publish_io_intr_binding();
             return Err(self.report_connect_error(
                 "asynManager:connectDevice no port name provided".to_string(),
             ));
@@ -2650,26 +2904,50 @@ impl AsynRecord {
 
         match registry::get_port(&self.port) {
             Some(entry) => {
-                // Resolve drvinfo → reason if specified
-                if !self.drvinfo.is_empty() {
-                    match entry
-                        .handle
-                        .drv_user_create_blocking(&self.drvinfo, self.addr)
-                    {
-                        Ok(info) => {
-                            self.resolved_reason = info.reason;
-                            self.reason = info.reason as i32;
+                // C `connectDevice` asks the port for asynDrvUser *before* it
+                // resolves anything (`findInterface(asynDrvUserType)`,
+                // asynRecord.c:1243). Whether a port can turn a drvInfo string
+                // into a reason is a property of the port's interface registry —
+                // `PortHandle::has_interface` — not something to infer from a
+                // failed `create`.
+                if entry
+                    .handle
+                    .has_interface(crate::interfaces::InterfaceType::DrvUser)
+                {
+                    // Resolve drvinfo → reason if specified (asynRecord.c:1248-1257).
+                    if !self.drvinfo.is_empty() {
+                        match entry
+                            .handle
+                            .drv_user_create_blocking(&self.drvinfo, self.addr)
+                        {
+                            Ok(info) => {
+                                self.resolved_reason = info.reason;
+                                self.reason = info.reason as i32;
+                            }
+                            Err(_) => {
+                                // C reports the bare literal — the driver's own text
+                                // reaches the operator through the trace file, not
+                                // ERRS (asynRecord.c:1255).
+                                self.errs = "Error in asynDrvUser->create()".to_string();
+                                self.resolved_reason = 0;
+                            }
                         }
-                        Err(_) => {
-                            // C reports the bare literal — the driver's own text
-                            // reaches the operator through the trace file, not
-                            // ERRS (asynRecord.c:1255).
-                            self.errs = "Error in asynDrvUser->create()".to_string();
-                            self.resolved_reason = 0;
-                        }
+                    } else {
+                        self.resolved_reason = self.reason as usize;
                     }
                 } else {
-                    self.resolved_reason = self.reason as usize;
+                    // No asynDrvUser — every byte transport (IP, serial, FTDI,
+                    // VXI-11). C zeroes REASON unconditionally here
+                    // (asynRecord.c:1261): there is no parameter space to point
+                    // at, so a REASON the operator restored from a save file must
+                    // not survive the connect. A non-blank DRVINFO is a
+                    // configuration error, reported and otherwise ignored
+                    // (:1263-1265).
+                    self.reason = 0;
+                    self.resolved_reason = 0;
+                    if !self.drvinfo.is_empty() {
+                        self.errs = "asynDrvUser not supported but drvInfo not blank".to_string();
+                    }
                 }
 
                 // C `connectDevice` asks the manager for each interface in turn —
@@ -2712,6 +2990,14 @@ impl AsynRecord {
                 // POST_IF_NEW cache is seeded with the values C's `old` holds at
                 // the same point.
                 self.register_exception_callback();
+                // The record now points at a different port / address / reason.
+                // C leaves an I/O Intr registration made against the *previous*
+                // device in place (`connectDevice` calls no `cancelInterrupts`,
+                // asynRecord.c:1142-1321), which keeps firing the old port's
+                // values into the record. Re-point it instead: the registration
+                // follows the binding, which is the invariant `IoIntrScan` holds.
+                // A record not on I/O Intr registers nothing either way.
+                self.publish_io_intr_binding();
                 Ok(())
             }
             None => {
@@ -2719,6 +3005,7 @@ impl AsynRecord {
                 self.port_entry = None;
                 self.refresh_connected_state();
                 self.clear_exception_callback();
+                self.publish_io_intr_binding();
                 Err(self.report_connect_error(format!(
                     "asynManager:connectDevice port {} not found",
                     self.port
@@ -2798,6 +3085,11 @@ impl AsynRecord {
         AsynUser::new(self.resolved_reason)
             .with_addr(self.addr)
             .with_timeout(self.io_timeout())
+            // C `special()` queues the option callback with `QUEUE_TIMEOUT`
+            // (asynRecord.c:571-572), and `connectDevice` queues its
+            // getOption/getEos readbacks with the same (:1281,:1297) — every
+            // request built from this user is one of those.
+            .with_queue_timeout(QUEUE_TIMEOUT)
     }
 
     /// Clamp the operator's requested transfer sizes into the record fields —
@@ -3035,7 +3327,9 @@ impl AsynRecord {
             let res = entry
                 .handle
                 .submit_blocking(io_phase_op(&plan, phase), io_phase_user(&plan, phase));
-            record_phase_result(&plan, &mut out, phase, res);
+            if let PhaseFlow::Aborted = record_phase_result(&plan, &mut out, phase, res) {
+                break;
+            }
         }
 
         self.apply_io_outcome(out);
@@ -3711,25 +4005,38 @@ impl Record for AsynRecord {
                     // "Connect error…" text; it adds no wrapper of its own.
                     let _ = self.connect_device();
                 } else {
+                    // C asynRecord.c:522-526, in this order:
+                    // exceptionCallbackRemove, disconnect, cancelIOInterruptScan.
                     self.port_entry = None;
                     self.clear_exception_callback();
                     // Detached: `isConnected` has no device to report on, which
                     // is C's CNCT=0 (monitorStatus, :1091-1093).
                     self.refresh_connected_state();
+                    self.cancel_io_interrupt_scan();
+                    self.publish_io_intr_binding();
                 }
             }
 
-            // Interface change → update validity flags
+            // Interface change. C `special()` case asynRecordIFACE
+            // (asynRecord.c:493-495) does exactly one thing:
+            // `cancelIOInterruptScan`. The transfer path needs no notice — the
+            // field is read by `performIO` on the next process, where the port's
+            // interface registry decides whether the transfer runs at all
+            // (:1328-1360, `has_interface`) — but an I/O Intr registration was
+            // made against the *old* interface and must not survive the change.
             "IFACE" => {
-                // C has no `special` case for IFACE: the field is read by
-                // `performIO` on the next process, where the port's interface
-                // registry decides whether the transfer runs at all
-                // (asynRecord.c:1328-1360, `has_interface`).
+                self.cancel_io_interrupt_scan();
+                self.publish_io_intr_binding();
             }
 
-            // REASON change
+            // REASON change. C `special()` case asynRecordREASON
+            // (asynRecord.c:487-492) assigns `pasynUser->reason` and then calls
+            // `cancelIOInterruptScan` — the registration was made for the old
+            // reason.
             "REASON" => {
                 self.resolved_reason = self.reason as usize;
+                self.cancel_io_interrupt_scan();
+                self.publish_io_intr_binding();
             }
 
             // --- Serial options ---
@@ -3865,8 +4172,15 @@ impl Record for AsynRecord {
             "IEOS" => self.write_eos(false),
 
             // --- UI32MASK change ---
+            //
+            // C `special()` case asynRecordUI32MASK (asynRecord.c:496-498):
+            // `cancelIOInterruptScan`. The mask is a *registration* parameter for
+            // asynUInt32Digital (`registerInterruptUser(..., ui32mask, ...)`,
+            // :635) as well as a per-transfer one, so an existing registration
+            // still carries the old mask and must go.
             "UI32MASK" => {
-                // Just record the value, used during I/O
+                self.cancel_io_interrupt_scan();
+                self.publish_io_intr_binding();
             }
 
             _ => {}
@@ -3909,6 +4223,27 @@ impl Record for AsynRecord {
         // raised it. This port merges C's process and its callback, so one reset
         // here is both of C's.
         self.reset_error();
+
+        // C `process()`: "If we got value from interrupt no need to read"
+        // (asynRecord.c:340-341) — `if (pasynRecPvt->gotValue) goto done`. The
+        // cycle a driver interrupt drove queues nothing: no UCMD/ACMD, no
+        // performIO, no queueRequest. It stores the pushed value, posts its
+        // monitors (the framework's field diffing, C's `monitor()`) and fires
+        // FLNK.
+        //
+        // Taking the sample IS C's `gotValue = 0` at the end of process (:370):
+        // one cell, one operation — there is no window where the value has been
+        // consumed but the gate is still armed, or the other way round.
+        //
+        // The gate sits below `reset_error` (C's :339 precedes the check) and
+        // above every dispatch — including the `stateNoDevice` refusal below,
+        // which C tests at :356, *after* this — because C's `goto done` jumps
+        // past the `queueRequest` that would have run `asynCallbackProcess` at
+        // all.
+        if let Some(sample) = self.io_intr.take_sample() {
+            self.apply_io_intr_sample(sample);
+            return Ok(ProcessOutcome::complete());
+        }
 
         // C refuses on `state` before it queues anything, and the order is
         // load-bearing: `process()` tests `state == stateNoDevice`
@@ -3974,6 +4309,26 @@ impl Record for AsynRecord {
 
         self.perform_io(plan)?;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `getIoIntInfo` (asynRecord.c:582-597), reached from `dbScan`'s
+    /// `scanAdd` / `scanDelete`: register the driver interrupt callbacks when
+    /// the record joins the I/O Intr scan list, cancel them when it leaves.
+    ///
+    /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
+    /// report the error and leave the record Passive (dbScan.c:278-293). The
+    /// port's `setup_io_intr` runs the same demotion off
+    /// [`device::AsynRecordDevice::io_intr_receiver`]; for a *runtime* SCAN put
+    /// the failure text is what reaches the operator, in ERRS, exactly as C's
+    /// `reportError` puts it there (:617,:627,:637,:647).
+    fn set_io_intr_scan(&mut self, active: bool) {
+        if let Err(msg) = self.io_intr.set_active(active) {
+            self.errs = msg;
+        }
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn clears_udf(&self) -> bool {
@@ -7847,5 +8202,809 @@ mod tests {
         rec.ieos = "\\n".to_string();
         rec.special("IEOS", true).unwrap();
         assert_ne!(rec.errs, "No asynOctet interface");
+    }
+
+    // ===== R10-49: the record's QUEUE_TIMEOUT =====
+
+    /// R10-49. C `asynRecord` is the one caller in asyn that asks `queueRequest`
+    /// for a queue-wait deadline, and it asks for the same one everywhere:
+    /// `QUEUE_TIMEOUT` = 10.0 s (asynRecord.c:71) on the process I/O (:343), on
+    /// the special option/EOS callback (:572) and on the getOption/getEos
+    /// readbacks `connectDevice` queues (:1281,:1297). The port armed no queue
+    /// deadline at all.
+    #[test]
+    fn every_record_request_carries_c_queue_timeout() {
+        use std::time::Duration;
+
+        assert_eq!(
+            QUEUE_TIMEOUT,
+            Duration::from_secs(10),
+            "C `#define QUEUE_TIMEOUT 10.0`"
+        );
+
+        let mut rec = AsynRecord::default();
+        let plan = rec.build_io_plan();
+        assert_eq!(io_user(&plan).queue_timeout, Some(QUEUE_TIMEOUT));
+        assert_eq!(flush_user(&plan).queue_timeout, Some(QUEUE_TIMEOUT));
+        assert_eq!(rec.option_user().queue_timeout, Some(QUEUE_TIMEOUT));
+
+        // Negative control: a user built anywhere else (device support, iocsh,
+        // a driver's own request) arms no timer — C's `queueRequest(..., 0.0)`.
+        assert_eq!(AsynUser::default().queue_timeout, None);
+        assert_eq!(AsynUser::new(3).with_addr(1).queue_timeout, None);
+    }
+
+    /// R10-49. C `queueTimeoutCallbackProcess` (asynRecord.c:919-926): the
+    /// process request that never ran reports "process queueRequest timeout",
+    /// raises STATE_ALARM/MAJOR_ALARM and forces the record's completion. It is
+    /// **not** an I/O result: no transfer happened, so no NAWT/NORD/EOMR is
+    /// published and the rest of the cycle's phases do not run.
+    #[test]
+    fn a_process_queue_timeout_reports_the_c_text_and_state_major() {
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::WriteRead as i32;
+        let plan = rec.build_io_plan();
+
+        let mut out = IoOutcome::default();
+        let flow = record_phase_result(
+            &plan,
+            &mut out,
+            IoPhase::Write,
+            Err(crate::error::AsynError::QueueTimeout { port: "p".into() }),
+        );
+        assert!(
+            matches!(flow, PhaseFlow::Aborted),
+            "the request never ran: C never entered performIO, so no read follows"
+        );
+        assert_eq!(out.errs.as_deref(), Some("process queueRequest timeout"));
+        assert_eq!(
+            out.alarm,
+            Some((alarm_status::STATE_ALARM, AlarmSeverity::Major))
+        );
+        assert_eq!(out.nawt, None, "nothing was written — nothing to publish");
+
+        // The same on a read phase, and through the flush phase too — whose
+        // recorder discards every *I/O* status (C :1521) but must not swallow a
+        // request that never ran.
+        for phase in [IoPhase::Read, IoPhase::Flush] {
+            let mut out = IoOutcome::default();
+            let flow = record_phase_result(
+                &plan,
+                &mut out,
+                phase,
+                Err(crate::error::AsynError::QueueTimeout { port: "p".into() }),
+            );
+            assert!(matches!(flow, PhaseFlow::Aborted), "{phase:?}");
+            assert_eq!(out.errs.as_deref(), Some("process queueRequest timeout"));
+            assert_eq!(
+                out.alarm,
+                Some((alarm_status::STATE_ALARM, AlarmSeverity::Major)),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// Negative control for the gate above: an ordinary I/O failure is a *result*
+    /// — the request ran, the device did not answer. It reports the driver's text
+    /// with the read-error severity, and the cycle carries on (C `performIO` runs
+    /// the read after a failed write).
+    #[test]
+    fn an_io_timeout_is_not_a_queue_timeout() {
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::WriteRead as i32;
+        let plan = rec.build_io_plan();
+
+        let mut out = IoOutcome::default();
+        let flow = record_phase_result(
+            &plan,
+            &mut out,
+            IoPhase::Read,
+            Err(crate::error::AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "no response".into(),
+            }),
+        );
+        assert!(
+            matches!(flow, PhaseFlow::Continue),
+            "a phase that ran and failed does not abort the cycle"
+        );
+        let errs = out.errs.clone().unwrap();
+        assert!(
+            errs.contains("timeout") && !errs.contains("queueRequest"),
+            "the driver's read-error text, not the queue timeout's: {errs}"
+        );
+    }
+
+    /// R10-49. C `queueTimeoutCallbackSpecial` (asynRecord.c:929-938) reports
+    /// "special queueRequest timeout", returns the record to `stateIdle` and
+    /// frees the request — and raises **no** severity, unlike its process twin.
+    #[test]
+    fn a_special_queue_timeout_reports_the_c_text_and_no_severity() {
+        let mut rec = AsynRecord::default();
+        rec.report_special_queue_timeout();
+        assert_eq!(rec.errs, "special queueRequest timeout");
+
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(
+            c.nsev,
+            AlarmSeverity::NoAlarm,
+            "C raises no recGblSetSevr in queueTimeoutCallbackSpecial"
+        );
+    }
+
+    // ===== R10-52: the option readback follows C's buffer rule =====
+
+    /// Register a port whose `getOption("baud")` answers `baud_text` and which
+    /// refuses every other key — a driver that reports its rate as free text, and
+    /// the ordinary case of a port that does not implement a key at all.
+    fn register_baud_text_port(port_name: &'static str, baud_text: &'static str) {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct BaudTextPort(PortDriverBase, &'static str);
+        impl PortDriver for BaudTextPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                if key == "baud" {
+                    Ok(self.1.to_string())
+                } else {
+                    Err(crate::error::AsynError::OptionNotFound(key.to_string()))
+                }
+            }
+        }
+
+        let (rt, jh) = create_port_runtime(
+            BaudTextPort(
+                PortDriverBase::new(port_name, 1, PortFlags::default()),
+                baud_text,
+            ),
+            RuntimeConfig::default(),
+        );
+        std::mem::forget(jh);
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        std::mem::forget(rt);
+    }
+
+    /// R10-52. C reads LBAUD with `sscanf(optbuff, "%d", &pasynRec->lbaud)`
+    /// (asynRecord.c:1867) — and `sscanf` writes *nothing* when the text carries
+    /// no number, so LBAUD is the one readback field that keeps its previous
+    /// value. The port's `parse::<i32>().unwrap_or(0)` wrote 0 instead, reporting
+    /// a live line as 0 baud.
+    #[test]
+    fn a_baud_readback_with_no_number_leaves_lbaud_alone() {
+        let port_name = "r10_52_no_number";
+        register_baud_text_port(port_name, "unknown");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.lbaud = 115200;
+        // A field C *does* pre-zero, seeded with a stale value from a previous
+        // port: it must not survive a readback the driver cannot answer.
+        rec.dbit = 4;
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(
+            rec.lbaud, 115200,
+            "C's sscanf leaves LBAUD untouched when the text carries no number"
+        );
+        assert_eq!(rec.baud, 0, "BAUD still lands on its Unknown choice");
+        assert_eq!(
+            rec.dbit, 0,
+            "a key the port refuses is an empty readback, and C zeroes the enum before the choice walk"
+        );
+    }
+
+    /// R10-52 negative control: a text that *does* carry a number still reaches
+    /// LBAUD — through C's `%d`, which is a prefix parse, so a driver answering
+    /// "9600 baud" reads 9600 where `str::parse` refused the whole string.
+    #[test]
+    fn a_baud_readback_with_a_number_reaches_lbaud() {
+        let port_name = "r10_52_number";
+        register_baud_text_port(port_name, "9600 baud");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.lbaud = 115200;
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(rec.lbaud, 9600);
+        assert_eq!(
+            rec.baud, 0,
+            "BAUD matches the choice *text*, which \"9600 baud\" is not"
+        );
+    }
+
+    // ===== R11-48: a port with no asynDrvUser interface =====
+
+    /// Register an octet transport (asynOctet + asynOption + asynCommon — no
+    /// asynDrvUser, exactly what drvAsynIPPort / drvAsynSerialPort register).
+    fn register_octet_transport(port_name: &'static str) {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct OctetTransport(PortDriverBase);
+        impl PortDriver for OctetTransport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let (rt, jh) = create_port_runtime(
+            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        std::mem::forget(jh);
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        std::mem::forget(rt);
+    }
+
+    /// Register a parameter-library port (C `asynPortDriver`: it registers
+    /// asynDrvUser and can resolve a drvInfo string).
+    fn register_param_port(port_name: &'static str, param: &str) {
+        use crate::param::ParamType;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct ParamDriver(PortDriverBase);
+        impl PortDriver for ParamDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        // Reason 0 is taken by a filler param so the resolved reason is non-zero
+        // and cannot be confused with the forced-zero case.
+        base.params
+            .create_param("FILLER", ParamType::Int32)
+            .unwrap();
+        base.params.create_param(param, ParamType::Int32).unwrap();
+        let (rt, jh) = create_port_runtime(ParamDriver(base), RuntimeConfig::default());
+        std::mem::forget(jh);
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        std::mem::forget(rt);
+    }
+
+    /// R11-48. C `connectDevice` asks for asynDrvUser (asynRecord.c:1243); a byte
+    /// transport registers none, so C forces `pasynRec->reason = 0`
+    /// (asynRecord.c:1261) whatever the operator (or a save/restore file) left in
+    /// the field, and reports a non-blank DRVINFO as a configuration error
+    /// (:1263-1265). The port used to call `drvUser->create` on every port and
+    /// read the resulting `ParamNotFound` as C's *create failed* case, so REASON
+    /// survived the connect and ERRS carried the wrong text.
+    #[test]
+    fn a_port_without_asyn_drv_user_forces_reason_zero_and_reports_drvinfo() {
+        let port_name = "r11_48_no_drvuser";
+        register_octet_transport(port_name);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        // What a save/restore file restores into a record pointed at a transport.
+        rec.reason = 7;
+        rec.drvinfo = "SOME_PARAM".to_string();
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(
+            rec.reason, 0,
+            "C zeroes REASON on a port with no asynDrvUser"
+        );
+        assert_eq!(
+            rec.resolved_reason, 0,
+            "and no I/O may carry the stale reason"
+        );
+        assert_eq!(
+            rec.errs, "asynDrvUser not supported but drvInfo not blank",
+            "C reportError text (asynRecord.c:1264-1265)"
+        );
+    }
+
+    /// R11-48: the zeroing is unconditional — C runs `pasynRec->reason = 0` above
+    /// the DRVINFO test, so an empty DRVINFO zeroes REASON too and leaves ERRS
+    /// clean.
+    #[test]
+    fn a_port_without_asyn_drv_user_zeroes_reason_even_with_blank_drvinfo() {
+        let port_name = "r11_48_no_drvuser_blank";
+        register_octet_transport(port_name);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.reason = 7;
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(rec.reason, 0);
+        assert_eq!(rec.resolved_reason, 0);
+        assert_eq!(rec.errs, "", "a blank DRVINFO is not an error");
+    }
+
+    /// R11-48 negative control: a port that DOES register asynDrvUser still
+    /// resolves DRVINFO through `drvUser->create` and still reports C's create
+    /// failure text for a name the driver rejects — the new branch must not
+    /// swallow either case.
+    #[test]
+    fn a_port_with_asyn_drv_user_still_resolves_and_still_reports_create_failure() {
+        let port_name = "r11_48_drvuser";
+        register_param_port(port_name, "GAIN");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "GAIN".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.reason, 1, "DRVINFO resolved through the driver");
+        assert_eq!(rec.resolved_reason, 1);
+        assert_eq!(rec.errs, "");
+
+        // A name the driver does not know: C's create failure, not the
+        // no-interface report.
+        rec.drvinfo = "NO_SUCH_PARAM".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.errs, "Error in asynDrvUser->create()");
+        assert_eq!(rec.resolved_reason, 0);
+
+        // A blank DRVINFO on such a port keeps the operator's REASON — C never
+        // zeroes it on the asynDrvUser branch (asynRecord.c:1244-1257).
+        rec.drvinfo.clear();
+        rec.reason = 5;
+        rec.connect_device().unwrap();
+        assert_eq!(rec.reason, 5);
+        assert_eq!(rec.resolved_reason, 5);
+        assert_eq!(rec.errs, "");
+    }
+
+    // ===== R11-46: SCAN="I/O Intr" =====
+
+    /// A port whose reads are countable, so a process cycle that performed I/O is
+    /// distinguishable from one a driver interrupt drove.
+    struct IoIntrDriver {
+        base: PortDriverBase,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PortDriver for IoIntrDriver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(42)
+        }
+    }
+
+    /// Register a port that counts its Int32 reads. Returns its runtime handle
+    /// (kept alive by the caller) and the read counter.
+    fn io_intr_port(
+        name: &str,
+    ) -> (
+        crate::runtime::PortRuntimeHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::port::PortFlags;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (rt, _jh) = create_port_runtime(
+            IoIntrDriver {
+                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                reads: reads.clone(),
+            },
+            RuntimeConfig::default(),
+        );
+        register_port(
+            name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        (rt, reads)
+    }
+
+    /// A driver interrupt, as `notify_interface_value` fires it: addr 0, typed
+    /// for the interface the record selected.
+    fn fire_interrupt(
+        rt: &crate::runtime::PortRuntimeHandle,
+        reason: usize,
+        value: crate::param::ParamValue,
+        iface: crate::interfaces::InterfaceType,
+        changed_mask: u32,
+    ) {
+        rt.port_handle()
+            .interrupts()
+            .notify(crate::interrupt::InterruptValue {
+                reason,
+                addr: 0,
+                value,
+                uint32_changed_mask: changed_mask,
+                iface: Some(iface),
+                ..Default::default()
+            });
+    }
+
+    /// R11-46. C's I/O Intr mode: `getIoIntInfo` registers the driver callbacks
+    /// (asynRecord.c:582-597), `callbackInterruptInt32` stores the pushed value in
+    /// I32INP and sets `gotValue` (:747-751), and `process` skips **all** I/O for
+    /// the cycle that value drove (`if (gotValue) goto done`, :341). The port had
+    /// no I/O Intr mechanism at all: a record on `SCAN="I/O Intr"` was demoted to
+    /// Passive at iocInit and never saw a driver value.
+    ///
+    /// Also the DSET seam: the framework reaches the record's scan list through
+    /// `AsynRecordDevice` — C's `asynRecordDevice` (`{5,0,0,0,getIoIntInfo,0}`).
+    #[test]
+    fn an_int32_interrupt_lands_in_i32inp_and_that_cycle_does_no_io() {
+        use crate::param::ParamValue;
+        use epics_base_rs::server::device_support::DeviceSupport;
+
+        let (rt, reads) = io_intr_port("r11_46_int32");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_int32".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+
+        // iocInit: the DSET hands the framework the record's scan list, which is
+        // also C's `interruptAccept` moment.
+        let mut dev = AsynRecordDevice::new();
+        dev.init(&mut rec).unwrap();
+        let mut wakeups = dev.io_intr_receiver().expect("the DSET owns a scan list");
+
+        // SCAN = "I/O Intr" → dbScan `scanAdd` → getIoIntInfo(0) → registerInterrupts.
+        rec.set_io_intr_scan(true);
+        assert_eq!(rec.errs, "", "the port implements asynInt32");
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        wakeups
+            .try_recv()
+            .expect("C `scanIoRequest` — the callback asks for a process");
+
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 7, "the pushed value, not a read");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "C `goto done`: the interrupt-driven cycle queues no I/O"
+        );
+
+        // The gate is consumed: the next scan is an ordinary read again.
+        rec.process().unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "gotValue was cleared");
+        assert_eq!(rec.i32inp, 42, "…and the driver's read landed");
+    }
+
+    /// Negative control for the gate: with the record NOT on the I/O Intr scan
+    /// list there is no registration, so a driver value reaches nothing and the
+    /// cycle performs its ordinary read. C: `registerInterrupts` runs only from
+    /// `getIoIntInfo` (asynRecord.c:591).
+    #[test]
+    fn a_driver_value_is_ignored_while_the_record_is_not_on_the_io_intr_list() {
+        use crate::param::ParamValue;
+
+        let (rt, reads) = io_intr_port("r11_46_not_armed");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_not_armed".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        rec.process().unwrap();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "SCAN is Passive: a real read"
+        );
+        assert_eq!(rec.i32inp, 42, "the driver's read, not the interrupt value");
+    }
+
+    /// R11-46. C's callback drops its value when the record has not processed the
+    /// previous one: "If gotValue is 1 then the record has not yet processed the
+    /// previous interrupt" — `if (pasynRecPvt->gotValue) return` (asynRecord.c:
+    /// 717-719,738-740,759-761,780-782). The FIRST unprocessed value is kept, not
+    /// the latest.
+    #[test]
+    fn a_second_interrupt_before_the_record_processes_is_dropped() {
+        use crate::param::ParamValue;
+
+        let (rt, _reads) = io_intr_port("r11_46_drop");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_drop".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(9),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 7, "C keeps the first unprocessed value");
+
+        // The cell reopens once the record consumed it.
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(11),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 11);
+    }
+
+    /// R11-46. Each IFACE has its own callback writing its own input field:
+    /// TINP (escaped, :725), I32INP (:747), UI32INP (:768), F64INP (:789). The
+    /// UInt32 registration carries the record's UI32MASK (:635), so only an
+    /// overlapping change fires it.
+    #[test]
+    fn each_iface_interrupt_writes_its_own_input_field() {
+        use crate::interfaces::InterfaceType as RegIface;
+        use crate::param::ParamValue;
+
+        // Octet → TINP, escaped.
+        let (rt, _reads) = io_intr_port("r11_46_octet");
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_octet".to_string();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+        fire_interrupt(&rt, 0, ParamValue::Octet("ab\n".into()), RegIface::Octet, 0);
+        rec.process().unwrap();
+        assert_eq!(rec.tinp, "ab\\n", "C `epicsStrSnPrintEscaped` into TINP");
+
+        // Float64 → F64INP.
+        let (rt, _reads) = io_intr_port("r11_46_f64");
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_f64".to_string();
+        rec.iface = InterfaceType::Float64 as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+        fire_interrupt(&rt, 0, ParamValue::Float64(2.5), RegIface::Float64, 0);
+        rec.process().unwrap();
+        assert_eq!(rec.f64inp, 2.5);
+
+        // UInt32Digital → UI32INP, and the registration carries UI32MASK.
+        let (rt, _reads) = io_intr_port("r11_46_ui32");
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_ui32".to_string();
+        rec.iface = InterfaceType::UInt32Digital as i32;
+        rec.ui32mask = 0x0F;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        // A change outside UI32MASK never reaches the record (C hands the mask to
+        // registerInterruptUser and the driver filters on it).
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::UInt32Digital(0xF0),
+            RegIface::UInt32Digital,
+            0xF0,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.ui32inp, 0, "no bit of the change is in UI32MASK");
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::UInt32Digital(0x03),
+            RegIface::UInt32Digital,
+            0x03,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.ui32inp, 0x03);
+    }
+
+    /// R11-46. C `registerInterrupts` refuses the interface the port does not
+    /// implement — `reportError(... "No asynInt32 interface")` and `return -1`,
+    /// which leaves the record off the scan list (asynRecord.c:625-628).
+    #[test]
+    fn arming_io_intr_against_a_port_without_the_iface_reports_the_c_text() {
+        use crate::interfaces::octet_transport_capabilities;
+        use crate::param::ParamValue;
+        use crate::port::PortFlags;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct OctetOnly(PortDriverBase);
+        impl PortDriver for OctetOnly {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                octet_transport_capabilities()
+            }
+        }
+
+        let port_name = "r11_46_no_int32";
+        let (rt, _jh) = create_port_runtime(
+            OctetOnly(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+
+        rec.set_io_intr_scan(true);
+        assert_eq!(rec.errs, "No asynInt32 interface");
+
+        // …and no registration exists, so a driver value reaches nothing.
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 0, "the refused registration pushed nothing");
+    }
+
+    /// R11-46. C `cancelIOInterruptScan` (asynRecord.c:794-806): a put that
+    /// invalidates what the record subscribed to — REASON (:490), IFACE (:494),
+    /// UI32MASK (:497) or a PCNCT=0 detach (:525) — takes the record off the I/O
+    /// Intr scan list, which is what cancels the driver registration.
+    #[test]
+    fn reason_iface_ui32mask_and_pcnct_puts_cancel_the_io_intr_scan() {
+        use crate::param::ParamValue;
+
+        let (rt, reads) = io_intr_port("r11_46_cancel");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_cancel".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+
+        // The reason the record's registration is bound to; the REASON put moves
+        // it, and an interrupt is only delivered for the reason it subscribed to.
+        let mut reason = 0usize;
+
+        for field in ["REASON", "IFACE", "UI32MASK", "PCNCT"] {
+            rec.set_io_intr_scan(true);
+            assert!(scan.is_active(), "{field}: armed");
+            // Armed, the registration really does gate a cycle — the control the
+            // cancel assertion below is measured against.
+            let before = reads.load(Ordering::SeqCst);
+            fire_interrupt(
+                &rt,
+                reason,
+                ParamValue::Int32(7),
+                crate::interfaces::InterfaceType::Int32,
+                0,
+            );
+            rec.process().unwrap();
+            assert_eq!(
+                rec.i32inp, 7,
+                "{field}: armed, the interrupt drove the cycle"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                before,
+                "{field}: and did no I/O"
+            );
+
+            match field {
+                "REASON" => {
+                    rec.reason = 3;
+                    reason = 3;
+                }
+                "IFACE" => rec.iface = InterfaceType::Int32 as i32,
+                "UI32MASK" => rec.ui32mask = 0x0F,
+                "PCNCT" => rec.pcnct = 0,
+                _ => unreachable!(),
+            }
+            rec.special(field, true).unwrap();
+            assert!(
+                !scan.is_active(),
+                "{field}: C forces SCAN back to Passive, cancelling the registration"
+            );
+
+            // PCNCT=0 detached the port (C :522-526); reconnect so the read below
+            // has a device. The reconnect must not re-arm the scan by itself.
+            if field == "PCNCT" {
+                rec.pcnct = 1;
+                rec.special("PCNCT", true).unwrap();
+                assert!(!scan.is_active(), "a reconnect does not re-arm I/O Intr");
+            }
+
+            // The cancelled registration pushes nothing: the record reads instead.
+            let before = reads.load(Ordering::SeqCst);
+            fire_interrupt(
+                &rt,
+                reason,
+                ParamValue::Int32(7),
+                crate::interfaces::InterfaceType::Int32,
+                0,
+            );
+            rec.i32inp = 0;
+            rec.process().unwrap();
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                before + 1,
+                "{field}: no interrupt value gated the cycle"
+            );
+            assert_eq!(rec.i32inp, 42, "{field}: the value came from the read");
+        }
     }
 }

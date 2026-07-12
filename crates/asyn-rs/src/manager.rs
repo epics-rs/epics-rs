@@ -359,9 +359,12 @@ mod tests {
         // erred, so a clean Ok here is the proof.
         handle
             .port_handle()
-            .set_input_eos_blocking(b"\r\n")
+            .set_input_eos_blocking(crate::user::AsynUser::default(), b"\r\n")
             .unwrap();
-        handle.port_handle().set_output_eos_blocking(b"\n").unwrap();
+        handle
+            .port_handle()
+            .set_output_eos_blocking(crate::user::AsynUser::default(), b"\n")
+            .unwrap();
     }
 
     #[test]

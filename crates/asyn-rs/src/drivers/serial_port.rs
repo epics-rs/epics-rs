@@ -13,9 +13,8 @@ use crate::trace::TraceMask;
 use crate::user::AsynUser;
 use crate::{asyn_trace, asyn_trace_io};
 
-use super::serial_config::{
-    DataBits, FlowControl, Parity, SerialConfig, StopBits, parse_bool_option,
-};
+use super::option_parse::{bad_number, parse_yn_option, sscanf_int, sscanf_uint};
+use super::serial_config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 
 impl SerialConfig {
     /// Apply this configuration to a raw termios struct.
@@ -910,25 +909,31 @@ impl PortDriver for DrvAsynSerialPort {
 
         match key.as_str() {
             "baud" => {
-                let baud: u32 = value.parse().map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid baud rate: '{value}'"),
-                })?;
-                // C parity (drvAsynSerialPort.c:340-343): reject an unsupported
-                // rate with asynError. baud_to_speed is the single source of
-                // truth for what is settable on this platform, so the
-                // validation and the speed lookup cannot disagree.
-                let speed = baud_to_speed(baud).ok_or_else(|| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("unsupported baud rate: {baud}"),
-                })?;
+                // C `sscanf(val, "%d", &baud) != 1` -> "Bad number"
+                // (drvAsynSerialPort.c:262-266). A prefix parse: "9600x" is 9600
+                // to C, where `str::parse` refused it.
+                let baud = sscanf_int(value).ok_or_else(bad_number)?;
+                // C parity (drvAsynSerialPort.c:340-343): an unsupported rate is
+                // asynError "Unsupported data rate (%d baud)". baud_to_speed is
+                // the single source of truth for what is settable on this
+                // platform, so the validation and the speed lookup cannot
+                // disagree.
+                let speed = u32::try_from(baud)
+                    .ok()
+                    .and_then(baud_to_speed)
+                    .ok_or_else(|| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("Unsupported data rate ({baud} baud)"),
+                    })?;
                 unsafe {
                     libc::cfsetispeed(&mut self.termios, speed);
                     libc::cfsetospeed(&mut self.termios, speed);
                 }
-                self.baud = baud;
+                self.baud = baud as u32;
             }
             "bits" => {
+                // C compares the value string (drvAsynSerialPort.c:359-377), so
+                // 5/6/7/8 and nothing else; the miss is "Invalid number of bits."
                 let bits = match value {
                     "5" => DataBits::Five,
                     "6" => DataBits::Six,
@@ -937,7 +942,7 @@ impl PortDriver for DrvAsynSerialPort {
                     _ => {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
-                            message: format!("invalid data bits: '{value}' (expected 5/6/7/8)"),
+                            message: "Invalid number of bits.".into(),
                         });
                     }
                 };
@@ -966,11 +971,11 @@ impl PortDriver for DrvAsynSerialPort {
                         self.termios.c_cflag |= libc::PARODD;
                     }
                     _ => {
+                        // C's text for this key is not of the "Invalid <key>
+                        // value." shape (drvAsynSerialPort.c:394-395).
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
-                            message: format!(
-                                "invalid parity: '{value}' (expected none/odd/even; mark/space not supported)"
-                            ),
+                            message: "Invalid parity.".into(),
                         });
                     }
                 }
@@ -981,40 +986,40 @@ impl PortDriver for DrvAsynSerialPort {
                 _ => {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
-                        message: format!("invalid stop bits: '{value}' (expected 1/2)"),
+                        message: "Invalid number of stop bits.".into(),
                     });
                 }
             },
             "clocal" => {
-                if parse_bool_option(value)? {
+                if parse_yn_option(&key, value)? {
                     self.termios.c_cflag |= libc::CLOCAL;
                 } else {
                     self.termios.c_cflag &= !libc::CLOCAL;
                 }
             }
             "crtscts" => {
-                if parse_bool_option(value)? {
+                if parse_yn_option(&key, value)? {
                     self.termios.c_cflag |= libc::CRTSCTS;
                 } else {
                     self.termios.c_cflag &= !libc::CRTSCTS;
                 }
             }
             "ixon" => {
-                if parse_bool_option(value)? {
+                if parse_yn_option(&key, value)? {
                     self.termios.c_iflag |= libc::IXON;
                 } else {
                     self.termios.c_iflag &= !libc::IXON;
                 }
             }
             "ixoff" => {
-                if parse_bool_option(value)? {
+                if parse_yn_option(&key, value)? {
                     self.termios.c_iflag |= libc::IXOFF;
                 } else {
                     self.termios.c_iflag &= !libc::IXOFF;
                 }
             }
             "ixany" => {
-                if parse_bool_option(value)? {
+                if parse_yn_option(&key, value)? {
                     self.termios.c_iflag |= libc::IXANY;
                 } else {
                     self.termios.c_iflag &= !libc::IXANY;
@@ -1032,10 +1037,9 @@ impl PortDriver for DrvAsynSerialPort {
                     let duration = if value.is_empty() || value == "on" {
                         0 // standard break duration
                     } else {
-                        value.parse::<i32>().map_err(|_| AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("invalid break duration: '{value}'"),
-                        })?
+                        // C `sscanf(val, "%u", &break_len) != 1` -> "Bad number"
+                        // (drvAsynSerialPort.c:511-515).
+                        sscanf_uint(value).ok_or_else(bad_number)? as i32
                     };
                     // Disconnected -> error (not a silent no-op); C reaches
                     // tcdrain/tcsendbreak on the dead fd and returns asynError.
@@ -1240,47 +1244,39 @@ impl DrvAsynSerialPort {
             // C `drvAsynSerialPort.c:531-543`: "Y" sets ENABLED; "N"
             // clears the whole flags word (not just the bit) — match
             // that semantic exactly.
-            "rs485_enable" => match value.to_ascii_uppercase().as_str() {
-                "Y" => r.flags |= SER_RS485_ENABLED,
-                "N" => r.flags = 0,
-                _ => {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: "Invalid rs485_enable value.".into(),
-                    });
+            "rs485_enable" => {
+                if parse_yn_option(key, value)? {
+                    r.flags |= SER_RS485_ENABLED;
+                } else {
+                    r.flags = 0;
                 }
-            },
-            "rs485_rts_on_send" => match value.to_ascii_uppercase().as_str() {
-                "Y" => r.flags |= SER_RS485_RTS_ON_SEND,
-                "N" => r.flags &= !SER_RS485_RTS_ON_SEND,
-                _ => {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: "Invalid rs485_rts_on_send value.".into(),
-                    });
+            }
+            "rs485_rts_on_send" => {
+                if parse_yn_option(key, value)? {
+                    r.flags |= SER_RS485_RTS_ON_SEND;
+                } else {
+                    r.flags &= !SER_RS485_RTS_ON_SEND;
                 }
-            },
-            "rs485_rts_after_send" => match value.to_ascii_uppercase().as_str() {
-                "Y" => r.flags |= SER_RS485_RTS_AFTER_SEND,
-                "N" => r.flags &= !SER_RS485_RTS_AFTER_SEND,
-                _ => {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: "Invalid rs485_rts_after_send value.".into(),
-                    });
+            }
+            // C reports *this* key's bad value as "Invalid rs485_rts_on_send
+            // value." (drvAsynSerialPort.c:566) — a copy-paste of the previous
+            // arm's text. Deliberate deviation: the key names itself here, since
+            // an operator told "rs485_rts_on_send" while writing
+            // rs485_rts_after_send is being misdirected by a C typo.
+            "rs485_rts_after_send" => {
+                if parse_yn_option(key, value)? {
+                    r.flags |= SER_RS485_RTS_AFTER_SEND;
+                } else {
+                    r.flags &= !SER_RS485_RTS_AFTER_SEND;
                 }
-            },
+            }
+            // C `sscanf(val, "%u", &delay) != 1` -> "Bad number"
+            // (drvAsynSerialPort.c:574-578, :584-588).
             "rs485_delay_rts_before_send" => {
-                r.delay_rts_before_send = value.parse::<u32>().map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "Bad number".into(),
-                })?;
+                r.delay_rts_before_send = sscanf_uint(value).ok_or_else(bad_number)?;
             }
             "rs485_delay_rts_after_send" => {
-                r.delay_rts_after_send = value.parse::<u32>().map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "Bad number".into(),
-                })?;
+                r.delay_rts_after_send = sscanf_uint(value).ok_or_else(bad_number)?;
             }
             _ => {}
         }
@@ -1471,10 +1467,8 @@ mod tests {
             let err = drv
                 .set_option(&mut AsynUser::default(), "baud", "12345")
                 .unwrap_err();
-            match err {
-                AsynError::Status { message, .. } => assert!(message.contains("unsupported")),
-                _ => panic!("expected unsupported baud error"),
-            }
+            // R11-49: C's text, verbatim (drvAsynSerialPort.c:341-343).
+            assert_eq!(err.message(), "Unsupported data rate (12345 baud)");
         }
         #[cfg(any(
             target_os = "macos",
@@ -1612,25 +1606,26 @@ mod tests {
         let err = drv
             .set_option(&mut AsynUser::default(), "parity", "mark")
             .unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => {
-                assert!(message.contains("mark/space not supported"))
-            }
-            _ => panic!("expected mark/space unsupported error"),
-        }
+        // R11-49: C has one text for every unrecognised parity value —
+        // "Invalid parity." (drvAsynSerialPort.c:394-395). Mark/space are not a
+        // separate case in C, and were never a separate case here either.
+        assert_eq!(err.message(), "Invalid parity.");
     }
 
     #[test]
     fn test_parse_bool_option() {
         // C drvAsynSerialPort.c validates these options strictly Y/N
         // (case-insensitive); the looser y/yes/1/true coercion is gone.
-        assert!(parse_bool_option("Y").unwrap());
-        assert!(parse_bool_option("y").unwrap());
-        assert!(!parse_bool_option("N").unwrap());
-        assert!(!parse_bool_option("n").unwrap());
+        assert!(parse_yn_option("clocal", "Y").unwrap());
+        assert!(parse_yn_option("clocal", "y").unwrap());
+        assert!(!parse_yn_option("clocal", "N").unwrap());
+        assert!(!parse_yn_option("clocal", "n").unwrap());
         // Tokens C rejects now error instead of silently coercing.
         for v in &["yes", "1", "true", "no", "0", "false", "maybe", ""] {
-            assert!(parse_bool_option(v).is_err(), "expected err for '{v}'");
+            assert!(
+                parse_yn_option("clocal", v).is_err(),
+                "expected err for '{v}'"
+            );
         }
     }
 
@@ -1674,12 +1669,56 @@ mod tests {
         let err = drv
             .set_option(&mut AsynUser::default(), "break", "notanumber")
             .unwrap_err();
-        match err {
-            AsynError::Status { message, .. } => {
-                assert!(message.contains("invalid break duration"))
-            }
-            other => panic!("expected invalid break duration error, got {other:?}"),
-        }
+        // R11-49: C's sscanf("%u") miss is "Bad number" (drvAsynSerialPort.c:512-514).
+        assert_eq!(err.message(), "Bad number");
+    }
+
+    /// R11-49. Every invalid-value diagnostic C `setOption` can emit, at the key
+    /// that emits it (drvAsynSerialPort.c:261-616). These strings are the
+    /// operator's: they reach ERRS through `pasynUser->errorMessage`, so an OPI
+    /// or a script that keys off them must see C's words, not the port's own.
+    #[test]
+    fn every_serial_option_reports_cs_text() {
+        let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
+        let mut err = |key: &str, val: &str| {
+            drv.set_option(&mut AsynUser::default(), key, val)
+                .unwrap_err()
+                .message()
+        };
+
+        assert_eq!(err("baud", "fast"), "Bad number", "C :264");
+        assert_eq!(err("bits", "9"), "Invalid number of bits.", "C :374");
+        assert_eq!(err("parity", "mark"), "Invalid parity.", "C :395");
+        assert_eq!(err("stop", "3"), "Invalid number of stop bits.", "C :406");
+        assert_eq!(err("clocal", "maybe"), "Invalid clocal value.", "C :419");
+        assert_eq!(err("crtscts", "maybe"), "Invalid crtscts value.", "C :440");
+        assert_eq!(err("ixon", "maybe"), "Invalid ixon value.", "C :464");
+        assert_eq!(err("ixany", "maybe"), "Invalid ixany value.", "C :481");
+        assert_eq!(err("ixoff", "maybe"), "Invalid ixoff value.", "C :502");
+        assert_eq!(err("break", "soon"), "Bad number", "C :513");
+        assert_eq!(err("nosuch", "x"), "Unsupported key \"nosuch\"", "C :595");
+    }
+
+    /// R11-49. C parses the numeric option values with `sscanf("%d")` /
+    /// `sscanf("%u")` — a *prefix* parse, so trailing text is ignored, not
+    /// rejected. `str::parse` rejected it, so `baud 9600x` (and a value with a
+    /// stray unit suffix, which is how these reach an IOC from a substituted
+    /// template) errored where C sets the rate.
+    #[test]
+    fn a_numeric_option_prefix_parses_like_c_sscanf() {
+        let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
+
+        drv.set_option(&mut AsynUser::default(), "baud", "9600x")
+            .unwrap();
+        assert_eq!(drv.baud, 9600, "C's sscanf %d stops at the first non-digit");
+
+        // Negative control: a value with no leading number at all is C's
+        // `sscanf(...) != 1` — "Bad number", not a silent 0.
+        let err = drv
+            .set_option(&mut AsynUser::default(), "baud", "x9600")
+            .unwrap_err();
+        assert_eq!(err.message(), "Bad number");
+        assert_eq!(drv.baud, 9600, "the rejected write left the cache alone");
     }
 
     #[test]
@@ -1693,6 +1732,8 @@ mod tests {
             .set_option(&mut AsynUser::default(), "custom", "value")
             .unwrap_err();
         assert!(matches!(err, AsynError::OptionNotFound(_)));
+        // R11-49: and it says so in C's words (drvAsynSerialPort.c:595-596).
+        assert_eq!(err.message(), "Unsupported key \"custom\"");
         assert!(drv.get_option("custom").is_err());
 
         // The empty key is not an error. With no open fd there is nothing to

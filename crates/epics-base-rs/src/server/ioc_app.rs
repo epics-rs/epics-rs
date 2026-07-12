@@ -1180,6 +1180,11 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
             return;
         }
         inst.common.scan = record::ScanType::Passive;
+        // This assignment bypasses `put_common_field`, so the C
+        // `scanDelete` → `get_ioint_info(1)` hook has to be driven here too —
+        // otherwise a record demoted at `iocInit` would keep whatever interrupt
+        // registration it made while it believed it was on the I/O Intr list.
+        inst.record.set_io_intr_scan(false);
         inst.common.phas
     };
     db.update_scan_index(

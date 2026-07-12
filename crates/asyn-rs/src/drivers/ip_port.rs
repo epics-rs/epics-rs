@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
+use super::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::com::{ComInterpose, ComPortOptions};
@@ -635,35 +636,81 @@ pub(crate) fn maxchars_zero_error() -> AsynError {
     }
 }
 
-/// Whether a failed read must tear the socket down — C `readRaw`'s
-/// `should_disconnect` (drvAsynIPPort.c:798-806), verbatim:
+/// What C `readRaw` does with a failed read (drvAsynIPPort.c:797-812) — the
+/// teardown and the status it reports, as one value.
 ///
 /// ```c
-/// (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
-///  ((SOCKERRNO != SOCK_EWOULDBLOCK) && (SOCKERRNO != SOCK_EINTR)))
+/// int should_disconnect = (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
+///                          ((SOCKERRNO != SOCK_EWOULDBLOCK) && (SOCKERRNO != SOCK_EINTR)));
+/// if (should_disconnect) {
+///     epicsSnprintf(... "%s read error: %s" ...);
+///     closeConnection(pasynUser,tty,"Read error");
+///     status = asynError;                       /* :805 */
+/// } else {
+///     epicsSnprintf(... "%s timeout: %s" ...);
+///     status = asynTimeout;                     /* :811 */
+/// }
 /// ```
 ///
-/// So: a timeout tears down only when the option is on *and* the request carried
-/// a positive timeout (a `timeout == 0` poll — floored to a 1 ms socket poll by
-/// [`socket_poll_timeout`] — expires as `asynTimeout` with the socket intact),
-/// and any non-would-block, non-EINTR error tears down unconditionally.
-///
-/// Single owner of the rule. C applies it *inside* `readRaw`, which is below the
-/// interpose chain — so it governs both the data path
-/// ([`DrvAsynIPPort::read_octet_core`]) and the RFC 2217 negotiation
+/// C decides both in one statement: the branch that closes the socket is the
+/// branch that reports `asynError`. Returning them separately is what let the
+/// port drop the connection and still hand the caller the lower layer's
+/// `asynTimeout` — so ERRS read `"Read error, nread=0, timeout"` where C says
+/// `"error"`, and a SyncIO caller branching on the status saw a retryable
+/// timeout on a link that no longer exists.
+struct ReadFailure {
+    /// C's `should_disconnect`: a timeout tears down only when the option is on
+    /// *and* the request carried a positive timeout (a `timeout == 0` poll —
+    /// floored to a 1 ms socket poll by [`socket_poll_timeout`] — expires with
+    /// the socket intact), and any non-would-block, non-EINTR error tears down
+    /// unconditionally.
+    disconnect: bool,
+    /// The error the caller reports: C's `asynError` + `"read error"` text on
+    /// the teardown branch, the lower layer's failure verbatim otherwise.
+    error: AsynError,
+}
+
+/// Single owner of C `readRaw`'s failed-read rule. C applies it *inside*
+/// `readRaw`, which is below the interpose chain — so it governs both the data
+/// path ([`DrvAsynIPPort::read_octet_core`]) and the RFC 2217 negotiation
 /// ([`NegotiationLink`]), which C likewise drives through `readIt`/`readRaw`
 /// (`asynInterposeCom.c:103` calls `pasynOctetDrv->read`, the driver below).
-/// Both callers reach the teardown through it, so neither can drift.
-fn should_disconnect_after_read_error(
-    e: &AsynError,
+/// Both callers take the teardown *and* the reported status from here, so
+/// neither can drift.
+fn classify_read_failure(
+    e: AsynError,
     disconnect_on_read_timeout: bool,
     timeout: Duration,
-) -> bool {
+    device_name: &str,
+) -> ReadFailure {
     // Classify by the carried status, not the variant: an interpose below may
     // wrap the lower-layer timeout in `PartialRead`, and a variant match would
     // miss it.
     let is_timeout = e.status() == AsynStatus::Timeout;
-    (disconnect_on_read_timeout && is_timeout && timeout > Duration::ZERO) || e.is_fatal_transport()
+    let disconnect = (disconnect_on_read_timeout && is_timeout && timeout > Duration::ZERO)
+        || e.is_fatal_transport();
+    if !disconnect {
+        return ReadFailure {
+            disconnect: false,
+            error: e,
+        };
+    }
+    // C overwrites `pasynUser->errorMessage` and the status together (:801-805)
+    // — while the partial transfer already in the caller's buffer stands, because
+    // `*nbytesTransfered = thisRead` (:824) runs on both branches. So restamp the
+    // failure and re-attach whatever the read did deliver.
+    let partial = e.partial_read().cloned();
+    let restamped = AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("{device_name} read error: {}", e.message()),
+    };
+    ReadFailure {
+        disconnect: true,
+        error: match partial {
+            Some(p) => restamped.with_partial_read(p),
+            None => restamped,
+        },
+    }
 }
 
 /// The raw link the RFC 2217 negotiation drives, and the teardown decision it
@@ -685,6 +732,9 @@ fn should_disconnect_after_read_error(
 struct NegotiationLink<'a> {
     io: &'a mut IpIoState,
     disconnect_on_read_timeout: bool,
+    /// C `tty->IPDeviceName`, for the `"%s read error: %s"` text `readRaw`
+    /// reports on the teardown branch (drvAsynIPPort.c:801-803).
+    device_name: &'a str,
     /// Set when a read failed in a way C's `readRaw` would have closed the
     /// socket for. Read back by [`DrvAsynIPPort::with_negotiation`].
     teardown: bool,
@@ -692,14 +742,21 @@ struct NegotiationLink<'a> {
 
 impl OctetNext for NegotiationLink<'_> {
     fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
-        let r = self.io.read(user, buf);
-        if let Err(ref e) = r {
-            if should_disconnect_after_read_error(e, self.disconnect_on_read_timeout, user.timeout)
-            {
-                self.teardown = true;
+        match self.io.read(user, buf) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                let failure = classify_read_failure(
+                    e,
+                    self.disconnect_on_read_timeout,
+                    user.timeout,
+                    self.device_name,
+                );
+                if failure.disconnect {
+                    self.teardown = true;
+                }
+                Err(failure.error)
             }
         }
-        r
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -851,21 +908,23 @@ impl DrvAsynIPPort {
                 // IP port and `disconnectOnReadTimeout` could not fire; C runs
                 // its test inside readRaw, below the interpose, where the raw
                 // recv timeout is visible (drvAsynIPPort.c:798-806).
-                let should_disconnect = should_disconnect_after_read_error(
-                    &e,
+                let failure = classify_read_failure(
+                    e,
                     self.disconnect_on_read_timeout,
                     user.timeout,
+                    &self.host_info,
                 );
-                if should_disconnect && self.base.connected {
+                if failure.disconnect && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "read error, disconnecting: {e}"
+                        "read error, disconnecting: {}",
+                        failure.error
                     );
                     self.drop_connection();
                 }
-                Err(e)
+                Err(failure.error)
             }
         }
     }
@@ -947,6 +1006,7 @@ impl DrvAsynIPPort {
         let mut link = NegotiationLink {
             io: &mut self.io,
             disconnect_on_read_timeout: self.disconnect_on_read_timeout,
+            device_name: &self.host_info,
             teardown: false,
         };
         let out = f(&mut com.options, &mut link);
@@ -1387,17 +1447,9 @@ impl PortDriver for DrvAsynIPPort {
             // (default on via IpPortConfig::parse, matching C; settable off
             // here). Its value is validated strictly Y/N (case-insensitive)
             // like every other option value, so a typo errors instead of
-            // silently coercing to "off".
-            let enabled = if value.eq_ignore_ascii_case("Y") {
-                true
-            } else if value.eq_ignore_ascii_case("N") {
-                false
-            } else {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("Invalid noDelay value: '{value}'"),
-                });
-            };
+            // silently coercing to "off" — and it reports in C's words
+            // ("Invalid <key> value."), like every other option.
+            let enabled = parse_yn_option("noDelay", value)?;
             self.config.no_delay = enabled;
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
@@ -1407,16 +1459,7 @@ impl PortDriver for DrvAsynIPPort {
             // (case-insensitive) are valid; any other value returns
             // asynError "Invalid disconnectOnReadTimeout value." rather
             // than silently coercing the unknown text to "off".
-            if value.eq_ignore_ascii_case("Y") {
-                self.disconnect_on_read_timeout = true;
-            } else if value.eq_ignore_ascii_case("N") {
-                self.disconnect_on_read_timeout = false;
-            } else {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("Invalid disconnectOnReadTimeout value: '{value}'"),
-                });
-            }
+            self.disconnect_on_read_timeout = parse_yn_option("disconnectOnReadTimeout", value)?;
         } else if key.eq_ignore_ascii_case("hostInfo") {
             // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
             //
@@ -2143,10 +2186,18 @@ mod tests {
         let err = drv
             .read_octet(&user, &mut buf)
             .expect_err("a silent peer must time the read out");
+        // R11-47: the branch that closes the socket is the branch that reports
+        // asynError (drvAsynIPPort.c:805) — the lower layer's asynTimeout does
+        // not survive the teardown.
         assert_eq!(
             err.status(),
-            AsynStatus::Timeout,
-            "the interpose keeps C's asynTimeout status, it only wraps it"
+            AsynStatus::Error,
+            "C readRaw overwrites the status on the disconnect branch"
+        );
+        assert!(
+            err.message().contains("read error"),
+            "C's teardown text (drvAsynIPPort.c:801-803), got {:?}",
+            err.message()
         );
         assert!(
             !drv.base().connected,
@@ -2179,13 +2230,86 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_millis(50));
         let mut buf = [0u8; 32];
-        assert!(drv.read_octet(&user, &mut buf).is_err());
+        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        // R11-47 negative control: the non-teardown branch keeps C's asynTimeout
+        // (drvAsynIPPort.c:811) — the restamp is the teardown branch's, not every
+        // failed read's.
+        assert_eq!(err.status(), AsynStatus::Timeout);
         assert!(
             drv.base().connected,
             "a plain read timeout leaves the socket intact (C returns asynTimeout, no close)"
         );
 
         handle.join().unwrap();
+    }
+
+    /// R11-47: the restamp keeps the bytes the device did send. C assigns
+    /// `*nbytesTransfered = thisRead` (drvAsynIPPort.c:824) *below* both branches,
+    /// so a device that emits half a line and goes quiet reaches the record as
+    /// asynError **plus** its partial line — asynRecord commits NORD/EOMR
+    /// regardless of status (asynRecord.c:1591,1627).
+    #[test]
+    fn a_torn_down_read_reports_asyn_error_and_still_carries_the_partial_bytes() {
+        use crate::interpose::PartialOctetRead;
+
+        let timeout = Duration::from_millis(50);
+        let partial = PartialOctetRead {
+            data: b"OK\n".to_vec(),
+            eom_reason: EomReason::empty(),
+        };
+        let timed_out = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(partial);
+
+        let f = classify_read_failure(timed_out, true, timeout, "127.0.0.1:5001");
+        assert!(f.disconnect, "disconnectOnReadTimeout + timeout > 0");
+        assert_eq!(f.error.status(), AsynStatus::Error, "C :805");
+        assert_eq!(
+            f.error.message(),
+            "127.0.0.1:5001 read error: read timeout",
+            "C :801-803"
+        );
+        assert_eq!(
+            f.error.partial_read().map(|p| p.nbytes_transferred()),
+            Some(3),
+            "the transfer C writes out at :824 survives the restamp"
+        );
+    }
+
+    /// R11-47 boundary: the three inputs of C's `should_disconnect` disjunct, each
+    /// at its own boundary, and the status each produces.
+    #[test]
+    fn the_read_failure_rule_matches_c_should_disconnect_at_every_boundary() {
+        let timeout = || AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        };
+        let fatal = || AsynError::Io(std::io::Error::other("cable yanked"));
+        let dev = "host:1";
+
+        // option off → no teardown, status unchanged, whatever the timeout.
+        let f = classify_read_failure(timeout(), false, Duration::from_secs(1), dev);
+        assert!(!f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Timeout);
+
+        // option on but timeout == 0 (a poll) → C's `pasynUser->timeout > 0`
+        // fails: no teardown, asynTimeout stands.
+        let f = classify_read_failure(timeout(), true, Duration::ZERO, dev);
+        assert!(!f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Timeout);
+
+        // option on, timeout > 0 → teardown + asynError.
+        let f = classify_read_failure(timeout(), true, Duration::from_millis(1), dev);
+        assert!(f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Error);
+
+        // a real errno tears down with the option off — C's second disjunct.
+        let f = classify_read_failure(fatal(), false, Duration::ZERO, dev);
+        assert!(f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Error);
+        assert_eq!(f.error.message(), "host:1 read error: IO: cable yanked");
     }
 
     #[test]
@@ -2710,11 +2834,38 @@ mod tests {
             .set_option(&mut AsynUser::default(), "bogusKey", "value")
             .unwrap_err();
         assert!(matches!(err, AsynError::OptionNotFound(_)));
+        // R11-49: reported in C's words (drvAsynIPPort.c:903-904).
+        assert_eq!(err.message(), "Unsupported key \"bogusKey\"");
         assert!(drv.get_option("bogusKey").is_err());
 
         // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
         drv.set_option(&mut AsynUser::default(), "", "ignored")
             .unwrap();
+    }
+
+    /// R11-49: the IP driver's own invalid-value texts are C's
+    /// (drvAsynIPPort.c:932-933), and the Rust-only `noDelay` key follows the
+    /// same shape rather than inventing a third format.
+    #[test]
+    fn every_ip_option_reports_cs_text() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        assert_eq!(
+            drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "maybe")
+                .unwrap_err()
+                .message(),
+            "Invalid disconnectOnReadTimeout value."
+        );
+        assert_eq!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "1")
+                .unwrap_err()
+                .message(),
+            "Invalid noDelay value."
+        );
+        // Negative control: the valid values still take.
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "y")
+            .unwrap();
+        assert!(drv.disconnect_on_read_timeout);
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---

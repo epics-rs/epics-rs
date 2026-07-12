@@ -1452,6 +1452,16 @@ impl RecordInstance {
                 self.common.scan = new_scan;
                 if old_scan != new_scan {
                     let phas = self.common.phas;
+                    // C `dbPutField` on SCAN runs `scanDelete` then `scanAdd`
+                    // (dbScan.c:236-248), which call the record's device support
+                    // `get_ioint_info(1)` / `get_ioint_info(0)`. Only a change of
+                    // I/O Intr *membership* reaches those; a Passive→"1 second"
+                    // move calls neither.
+                    let was_io_intr = old_scan == ScanType::IoIntr;
+                    let is_io_intr = new_scan == ScanType::IoIntr;
+                    if was_io_intr != is_io_intr {
+                        self.record.set_io_intr_scan(is_io_intr);
+                    }
                     self.record.on_put(&name);
                     self.record.special(&name, true)?;
                     return Ok(CommonFieldPutResult::ScanChanged {

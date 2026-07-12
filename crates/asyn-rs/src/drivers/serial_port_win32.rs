@@ -33,9 +33,8 @@ use crate::trace::TraceMask;
 use crate::user::AsynUser;
 use crate::{asyn_trace, asyn_trace_io};
 
-use super::serial_config::{
-    DataBits, FlowControl, Parity, SerialConfig, StopBits, parse_bool_option,
-};
+use super::option_parse::{bad_number, parse_yn_option, sscanf_int, sscanf_uint};
+use super::serial_config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 
 // --- DCB bitfield helpers ---
 //
@@ -691,25 +690,30 @@ impl PortDriver for DrvAsynSerialPort {
 
         match key.as_str() {
             "baud" => {
-                let baud: u32 = value.parse().map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid baud rate: '{value}'"),
-                })?;
+                // C-Win32 `sscanf(val, "%d", &baud) != 1` -> "Bad number"
+                // (drvAsynSerialPortWin32.c:192-198).
+                let baud = sscanf_int(value).ok_or_else(bad_number)?;
+                let baud = u32::try_from(baud).map_err(|_| bad_number())?;
                 // Windows accepts an arbitrary BaudRate (no termios speed
                 // table), matching C-Win32's direct dcb.BaudRate assignment.
                 self.modify_dcb(|dcb| dcb.BaudRate = baud)?;
                 self.config.baud = baud;
             }
             "bits" => {
-                let bits = match value {
-                    "5" => DataBits::Five,
-                    "6" => DataBits::Six,
-                    "7" => DataBits::Seven,
-                    "8" => DataBits::Eight,
+                // C-Win32 parses this key with `sscanf("%d")` too
+                // (drvAsynSerialPortWin32.c:201-208) — "Bad number" for a value
+                // with no number in it. A number the DCB cannot carry (anything
+                // but 5..8 here) is refused by SetCommConfig in C; refuse it up
+                // front with the same text the POSIX backend uses.
+                let bits = match sscanf_int(value).ok_or_else(bad_number)? {
+                    5 => DataBits::Five,
+                    6 => DataBits::Six,
+                    7 => DataBits::Seven,
+                    8 => DataBits::Eight,
                     _ => {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
-                            message: format!("invalid data bits: '{value}' (expected 5/6/7/8)"),
+                            message: "Invalid number of bits.".into(),
                         });
                     }
                 };
@@ -732,9 +736,7 @@ impl PortDriver for DrvAsynSerialPort {
                     _ => {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
-                            message: format!(
-                                "invalid parity: '{value}' (expected none/odd/even; mark/space not supported)"
-                            ),
+                            message: "Invalid parity.".into(),
                         });
                     }
                 };
@@ -753,7 +755,7 @@ impl PortDriver for DrvAsynSerialPort {
                     _ => {
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
-                            message: format!("invalid stop bits: '{value}' (expected 1/2)"),
+                            message: "Invalid number of stop bits.".into(),
                         });
                     }
                 };
@@ -767,7 +769,7 @@ impl PortDriver for DrvAsynSerialPort {
             "clocal" => {
                 // C-Win32 setOption clocal: Y = ignore modem status (no DSR
                 // flow, DTR asserted); N = honor it (DSR flow, DTR handshake).
-                let enabled = parse_bool_option(value)?;
+                let enabled = parse_yn_option(&key, value)?;
                 self.modify_dcb(|dcb| {
                     let bf = &mut dcb._bitfield;
                     if enabled {
@@ -792,7 +794,7 @@ impl PortDriver for DrvAsynSerialPort {
                 })?;
             }
             "crtscts" => {
-                let enabled = parse_bool_option(value)?;
+                let enabled = parse_yn_option(&key, value)?;
                 self.modify_dcb(|dcb| {
                     let bf = &mut dcb._bitfield;
                     set_flag(bf, F_OUTX_CTS_FLOW, enabled);
@@ -814,11 +816,11 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             "ixon" => {
-                let enabled = parse_bool_option(value)?;
+                let enabled = parse_yn_option(&key, value)?;
                 self.modify_dcb(|dcb| set_flag(&mut dcb._bitfield, F_OUT_X, enabled))?;
             }
             "ixoff" => {
-                let enabled = parse_bool_option(value)?;
+                let enabled = parse_yn_option(&key, value)?;
                 self.modify_dcb(|dcb| set_flag(&mut dcb._bitfield, F_IN_X, enabled))?;
             }
             "ixany" => {
@@ -836,10 +838,9 @@ impl PortDriver for DrvAsynSerialPort {
                     let break_ms = if value.is_empty() || value == "on" {
                         250
                     } else {
-                        value.parse::<u64>().map_err(|_| AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: format!("invalid break duration: '{value}'"),
-                        })?
+                        // C-Win32 `sscanf(val, "%u", &break_len) != 1` ->
+                        // "Bad number" (drvAsynSerialPortWin32.c:311-316).
+                        u64::from(sscanf_uint(value).ok_or_else(bad_number)?)
                     };
                     let handle = self.io.handle_or_err()?;
                     // C: FlushFileBuffers before asserting the break so queued

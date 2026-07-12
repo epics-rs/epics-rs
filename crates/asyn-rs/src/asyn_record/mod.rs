@@ -110,50 +110,67 @@ impl InterfaceType {
     }
 }
 
-// ===== Baud rate menu mapping =====
+// ===== Option menu choice tables =====
+//
+// C `setOption` indexes these arrays with the record's menu field and hands the
+// text straight to `pasynOption->setOption` — `baud_choices[pasynRec->baud]`,
+// `parity_choices[pasynRec->prty]`, … (asynRecord.c:49-66, :1777-1826). Index 0
+// of every menu is the literal "Unknown", and C sends it like any other choice:
+// a put of `Unknown` is a real `setOption("baud", "Unknown")` the driver
+// rejects, reported as "Error setting option, …", after which the `/* no break */`
+// fall-through into `getOptions` (asynRecord.c:845-849) refreshes *every* option
+// readback and snaps the field back to the driver's actual value. It is not a
+// silent no-op, and a record must not treat it as one — that is what leaves an
+// operator's mis-set field showing a value the port never took.
 
-/// Map a baud rate integer to the serialBAUD menu index.
-fn baud_rate_to_menu_index(baud: i32) -> i32 {
-    match baud {
-        300 => 1,
-        600 => 2,
-        1200 => 3,
-        2400 => 4,
-        4800 => 5,
-        9600 => 6,
-        19200 => 7,
-        38400 => 8,
-        57600 => 9,
-        115200 => 10,
-        230400 => 11,
-        460800 => 12,
-        576000 => 13,
-        921600 => 14,
-        1152000 => 15,
-        _ => 0, // Unknown
-    }
+/// C `baud_choices` (asynRecord.c:49-53).
+const BAUD_CHOICES: &[&str] = &[
+    "Unknown", "300", "600", "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200",
+    "230400", "460800", "576000", "921600", "1152000",
+];
+/// C `parity_choices` (asynRecord.c:54).
+const PARITY_CHOICES: &[&str] = &["Unknown", "none", "even", "odd"];
+/// C `data_bit_choices` (asynRecord.c:56).
+const DBIT_CHOICES: &[&str] = &["Unknown", "5", "6", "7", "8"];
+/// C `stop_bit_choices` (asynRecord.c:58).
+const SBIT_CHOICES: &[&str] = &["Unknown", "1", "2"];
+/// C `modem_control_choices` (asynRecord.c:60).
+const MCTL_CHOICES: &[&str] = &["Unknown", "Y", "N"];
+/// C `flow_control_choices` (asynRecord.c:62).
+const FCTL_CHOICES: &[&str] = &["Unknown", "N", "Y"];
+/// C `ix_control_choices` (asynRecord.c:64) — IXON, IXOFF and IXANY share it.
+const IX_CHOICES: &[&str] = &["Unknown", "N", "Y"];
+/// C `drto_choices` (asynRecord.c:66).
+const DRTO_CHOICES: &[&str] = &["Unknown", "N", "Y"];
+
+/// C `<menu>_choices[index]` — the record's menu index into the choice text it
+/// sends to the driver.
+///
+/// C indexes the array unchecked because a dbd menu field cannot hold an index
+/// outside its menu (dbPut validates the choice against the menu). This port's
+/// fields are plain `i32`, so an index C could never produce takes the menu's
+/// index-0 "Unknown" — the choice that configures nothing and that the driver
+/// rejects, which is the closest defined behavior to C's.
+fn menu_choice(choices: &'static [&'static str], index: i32) -> &'static str {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| choices.get(i).copied())
+        .unwrap_or(choices[0])
 }
 
-/// Map a serialBAUD menu index to a baud rate integer.
-fn menu_index_to_baud_rate(idx: i32) -> i32 {
-    match idx {
-        1 => 300,
-        2 => 600,
-        3 => 1200,
-        4 => 2400,
-        5 => 4800,
-        6 => 9600,
-        7 => 19200,
-        8 => 38400,
-        9 => 57600,
-        10 => 115200,
-        11 => 230400,
-        12 => 460800,
-        13 => 576000,
-        14 => 921600,
-        15 => 1152000,
-        _ => 0,
-    }
+/// The `asynBAUD` menu index for the text the driver reported — C `getOptions`'
+/// `for (i…) if (strcmp(optbuff, baud_choices[i]) == 0) pasynRec->baud = i;`
+/// (asynRecord.c:1868-1871), which walks the very array `setOption` writes from.
+/// Text that matches no choice reads back as index 0, "Unknown", exactly as C's
+/// `pasynRec->baud = 0` before the loop leaves it.
+///
+/// Derived from [`BAUD_CHOICES`] so the record cannot send one text and read back
+/// against another.
+fn baud_choice_index(text: &str) -> i32 {
+    BAUD_CHOICES
+        .iter()
+        .position(|choice| *choice == text)
+        .unwrap_or(0) as i32
 }
 
 /// `asynFMT` menu value for ASCII I/O format (`asynFMT_ASCII` in EPICS
@@ -2112,10 +2129,15 @@ impl AsynRecord {
         if !handle.has_interface(crate::interfaces::InterfaceType::Option) {
             return;
         }
-        // Baud rate
+        // Baud rate. C reads the driver's text once and derives both fields from
+        // it: `sscanf(optbuff, "%d", &lbaud)` and the `baud_choices` walk
+        // (asynRecord.c:1866-1871). BAUD is matched against the choice *text*,
+        // not against the parsed number, so a driver reporting something no menu
+        // choice carries leaves BAUD at "Unknown" while LBAUD still shows the
+        // rate.
         if let Ok(val) = handle.get_option_blocking("baud") {
             self.lbaud = val.parse::<i32>().unwrap_or(0);
-            self.baud = baud_rate_to_menu_index(self.lbaud);
+            self.baud = baud_choice_index(&val);
         }
         // Parity
         if let Ok(val) = handle.get_option_blocking("parity") {
@@ -3536,105 +3558,69 @@ impl Record for AsynRecord {
             }
 
             // --- Serial options ---
+            //
+            // Every arm dispatches: C `setOption` has a `case` per field and no
+            // value gate anywhere (asynRecord.c:1777-1826), so *whatever* the
+            // operator put — including the index-0 "Unknown" of each menu, an
+            // LBAUD of 0, an empty HOSTINFO — reaches the driver, and the
+            // `/* no break */` fall-through (:845-849) then refreshes every
+            // option readback from the driver. An arm that returns early instead
+            // skips both halves: the driver never sees the write, and the field
+            // is left showing a value the port never took.
+            //
+            // The menu → choice text mapping is C's own choice arrays; see
+            // [`menu_choice`].
             "BAUD" => {
-                let rate = menu_index_to_baud_rate(self.baud);
-                if rate > 0 {
-                    self.lbaud = rate;
-                    self.write_option("baud", &rate.to_string());
-                }
+                let val = menu_choice(BAUD_CHOICES, self.baud);
+                self.write_option("baud", val);
             }
             "LBAUD" => {
-                if self.lbaud > 0 {
-                    self.baud = baud_rate_to_menu_index(self.lbaud);
-                    self.write_option("baud", &self.lbaud.to_string());
-                }
+                // C `sprintf(optionString, "%d", pasynRec->lbaud)` (:1783-1785):
+                // the long baud is sent verbatim, not through a menu.
+                self.write_option("baud", &self.lbaud.to_string());
             }
             "PRTY" => {
-                let val = match self.prty {
-                    1 => "none",
-                    2 => "even",
-                    3 => "odd",
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(PARITY_CHOICES, self.prty);
                 self.write_option("parity", val);
             }
             "DBIT" => {
-                let val = match self.dbit {
-                    1 => "5",
-                    2 => "6",
-                    3 => "7",
-                    4 => "8",
-                    _ => return Ok(()),
-                };
-                // C parity: `drvAsynSerialPort.c:146/360` recognises
-                // the key `"bits"` (not `"csize"`). Rust's serial
-                // driver follows the same C key (`serial_port.rs:649`)
-                // so the asynRecord DBIT write must use `"bits"` to
-                // actually reach the driver — previously routed to
-                // `"csize"` which no driver consumes.
+                // C parity: `drvAsynSerialPort.c:146/360` recognises the key
+                // `"bits"` (not `"csize"`), and so does this port's serial driver
+                // (`serial_port.rs:649`).
+                let val = menu_choice(DBIT_CHOICES, self.dbit);
                 self.write_option("bits", val);
             }
             "SBIT" => {
-                let val = match self.sbit {
-                    1 => "1",
-                    2 => "2",
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(SBIT_CHOICES, self.sbit);
                 self.write_option("stop", val);
             }
             "MCTL" => {
-                let val = match self.mctl {
-                    1 => "Y", // CLOCAL
-                    2 => "N", // Hardware modem control
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(MCTL_CHOICES, self.mctl);
                 self.write_option("clocal", val);
             }
             "FCTL" => {
-                let val = match self.fctl {
-                    1 => "N", // None
-                    2 => "Y", // Hardware
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(FCTL_CHOICES, self.fctl);
                 self.write_option("crtscts", val);
             }
             "IXON" => {
-                let val = match self.ixon {
-                    1 => "N",
-                    2 => "Y",
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(IX_CHOICES, self.ixon);
                 self.write_option("ixon", val);
             }
             "IXOFF" => {
-                let val = match self.ixoff {
-                    1 => "N",
-                    2 => "Y",
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(IX_CHOICES, self.ixoff);
                 self.write_option("ixoff", val);
             }
             "IXANY" => {
-                let val = match self.ixany {
-                    1 => "N",
-                    2 => "Y",
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(IX_CHOICES, self.ixany);
                 self.write_option("ixany", val);
             }
 
             // --- IP options ---
             "HOSTINFO" => {
-                if !self.hostinfo.is_empty() {
-                    self.write_option("hostinfo", &self.hostinfo.clone());
-                }
+                self.write_option("hostinfo", &self.hostinfo.clone());
             }
             "DRTO" => {
-                let val = match self.drto {
-                    1 => "N",
-                    2 => "Y",
-                    _ => return Ok(()),
-                };
+                let val = menu_choice(DRTO_CHOICES, self.drto);
                 self.write_option("disconnectOnReadTimeout", val);
             }
 
@@ -4250,6 +4236,125 @@ mod tests {
         assert_eq!(
             rec.errs, "",
             "a successful connect leaves no diagnostic behind, whatever the reason resolves to"
+        );
+    }
+
+    /// R10-48: an option put is dispatched whatever its value — C `setOption`
+    /// has a `case` per field and no value gate (asynRecord.c:1777-1826), so the
+    /// index-0 "Unknown" of each menu goes to the driver like any other choice
+    /// (`baud_choices[0]` is the literal "Unknown", :49), the driver's rejection
+    /// is reported, and the `/* no break */` fall-through into `getOptions`
+    /// (:845-849) snaps every option readback back to the port's real values.
+    ///
+    /// The port used to `return` on those values: the driver never saw the write
+    /// and the record kept showing a setting the port had never taken.
+    #[test]
+    fn an_unknown_option_put_reaches_the_driver_and_refreshes_the_readbacks() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        /// Logs every `setOption` it is given and refuses the ones it cannot
+        /// parse — a real serial driver's answer to "Unknown"
+        /// (drvAsynSerialPort.c:355-372 reports "Bad baud rate").
+        struct LoggingDriver {
+            base: PortDriverBase,
+            sets: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        impl PortDriver for LoggingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                key: &str,
+                value: &str,
+            ) -> crate::error::AsynResult<()> {
+                self.sets
+                    .lock()
+                    .unwrap()
+                    .push((key.to_string(), value.to_string()));
+                if value == "Unknown" {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("Bad {key}"),
+                    });
+                }
+                Ok(())
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                match key {
+                    "baud" => Ok("9600".to_string()),
+                    "parity" => Ok("even".to_string()),
+                    _ => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("unsupported option {key}"),
+                    }),
+                }
+            }
+        }
+
+        let port_name = "r10_48_unknown_option";
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel(64);
+        let actor = PortActor::new(
+            Box::new(LoggingDriver {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                sets: sets.clone(),
+            }),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(16)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+        sets.lock().unwrap().clear();
+
+        // The operator puts BAUD = Unknown (menu index 0) on a port running at
+        // 9600, with PRTY already read back as "even".
+        assert_eq!(rec.baud, baud_choice_index("9600"));
+        assert_eq!(rec.prty, 2);
+        rec.baud = 0;
+        rec.special("BAUD", true).unwrap();
+
+        assert_eq!(
+            *sets.lock().unwrap(),
+            vec![("baud".to_string(), "Unknown".to_string())],
+            "C sends baud_choices[0] = \"Unknown\" to the driver (asynRecord.c:1780)"
+        );
+        assert_eq!(
+            rec.errs, "Error setting option, Bad baud",
+            "the driver's rejection is C's \"Error setting option, %s\" (asynRecord.c:1828-1830)"
+        );
+        assert_eq!(
+            rec.baud,
+            baud_choice_index("9600"),
+            "the getOptions fall-through snaps BAUD back to the port's real rate"
+        );
+        assert_eq!(rec.lbaud, 9600, "…and LBAUD with it");
+        assert_eq!(
+            rec.prty, 2,
+            "every option readback refreshes, not just BAUD"
+        );
+
+        // Same for a string option C sends unconditionally: an empty HOSTINFO is
+        // a real setOption("hostInfo", "") (asynRecord.c:1824-1826).
+        sets.lock().unwrap().clear();
+        rec.hostinfo = String::new();
+        rec.special("HOSTINFO", true).unwrap();
+        assert_eq!(
+            *sets.lock().unwrap(),
+            vec![("hostinfo".to_string(), String::new())],
+            "C gates the HOSTINFO set on nothing — the driver decides"
         );
     }
 
@@ -5124,7 +5229,7 @@ mod tests {
         rec.lbaud = 115_200;
         rec.special("LBAUD", true).unwrap();
         assert_eq!(rec.lbaud, 9600, "LBAUD is a driver readback, not a latch");
-        assert_eq!(rec.baud, baud_rate_to_menu_index(9600));
+        assert_eq!(rec.baud, baud_choice_index("9600"));
         assert_eq!(rec.errs, "", "the set succeeded — no ERRS");
         // A field the driver refuses to report is left alone (C only overwrites
         // what `getOption` filled in).

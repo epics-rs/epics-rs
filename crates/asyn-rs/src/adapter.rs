@@ -2885,6 +2885,14 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
 pub fn universal_asyn_factory(
     ctx: &epics_base_rs::server::ioc_app::DeviceSupportContext,
 ) -> Option<Box<dyn DeviceSupport>> {
+    // The asyn record's own DSET (C `devAsynRecord.dbd`:
+    // `device(asyn, INST_IO, asynRecordDevice, "asynRecordDevice")`). It binds
+    // no link — the record carries PORT/ADDR/DRVINFO as fields — so it must be
+    // recognised before the `@asyn(...)` parse below, which would reject it.
+    if ctx.dtyp == crate::asyn_record::ASYN_RECORD_DTYP {
+        return Some(Box::new(crate::asyn_record::AsynRecordDevice::new()));
+    }
+
     // Try @asyn() link in INP or OUT
     let (link_str, is_output) = if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
         (ctx.out, true)

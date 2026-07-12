@@ -1157,6 +1157,29 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The record joined (`true`) or left (`false`) the `SCAN="I/O Intr"` list.
+    ///
+    /// C parity: `dbScan.c::scanAdd` calls the record's device support
+    /// `get_ioint_info(0, precord, &iopvt)` when SCAN becomes `I/O Intr`, and
+    /// `scanDelete` calls `get_ioint_info(1, ...)` when it leaves. Device
+    /// support that registers driver interrupt callbacks does so there —
+    /// `asynRecord.c:582-597` registers/cancels its per-interface interrupt
+    /// users in exactly those two calls, and clears its `gotValue` cell on the
+    /// register.
+    ///
+    /// The port's device supports own their subscription through
+    /// [`crate::server::device_support::DeviceSupport::io_intr_receiver`],
+    /// which the framework asks for once at `iocInit`. This hook is the
+    /// *runtime* half: a record whose own state decides what to subscribe to
+    /// (asynRecord's PORT/IFACE/UI32MASK/REASON) must (re)register when the
+    /// operator moves SCAN in or out of `I/O Intr` after `iocInit`.
+    ///
+    /// Called from the single owner of the SCAN transition
+    /// (`RecordInstance::put_common_field*`, and the `scanAdd`-failure demotion
+    /// in `ioc_app`) only when I/O Intr membership actually changes, so it is
+    /// never invoked twice for the same state. Default: ignore.
+    fn set_io_intr_scan(&mut self, _active: bool) {}
+
     /// Other fields whose monitors must be posted because a put to
     /// `put_field` changed them as a side effect, without driving a full
     /// process cycle.

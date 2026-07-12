@@ -1,8 +1,13 @@
+pub mod device;
+mod io_intr;
 pub mod registry;
+pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
 pub use registry::{
     PortEntry, PortRegistry, asyn_record_factory, get_port, register_asyn_record_type,
     register_port,
 };
+
+use io_intr::{IoIntrBinding, IoIntrSample, IoIntrScan};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +17,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record,
+    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -51,7 +56,7 @@ impl TransferMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-enum InterfaceType {
+pub(crate) enum InterfaceType {
     Octet = 0,
     Int32 = 1,
     UInt32Digital = 2,
@@ -442,6 +447,12 @@ pub struct AsynRecord {
     // refresh, which runs the same comparison — one cell, so the two paths
     // cannot disagree about which sink is "ours". `None` until the first sample.
     old_trace_file_id: Arc<Mutex<Option<usize>>>,
+
+    // C `asynRecPvt`'s I/O Intr half — `ioScanPvt`, `interruptPvt`,
+    // `interruptLock` and `gotValue` (asynRecord.c:228-232). Shared with the
+    // record's `asynRecordDevice` device support, which is the framework's
+    // `get_ioint_info` seam; see [`io_intr`].
+    io_intr: Arc<IoIntrScan>,
 }
 
 impl Default for AsynRecord {
@@ -531,6 +542,7 @@ impl Default for AsynRecord {
             except_cb: None,
             io_alarm: None,
             old_trace_file_id: Arc::new(Mutex::new(None)),
+            io_intr: Arc::new(IoIntrScan::new()),
         }
     }
 }
@@ -2379,6 +2391,83 @@ impl AsynRecord {
         self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
     }
 
+    /// The record's I/O Intr machinery, shared with its `asynRecordDevice`
+    /// device support (C reaches the same `asynRecPvt` through `pasynRec->dpvt`).
+    pub(crate) fn io_intr_scan(&self) -> Arc<IoIntrScan> {
+        self.io_intr.clone()
+    }
+
+    /// Publish the record's current interrupt binding — C `registerInterrupts`
+    /// reads PORT / IFACE / ADDR / REASON / UI32MASK straight off `pasynRec`
+    /// every time it registers (asynRecord.c:599-656), so every put that moves
+    /// one of them must reach the registration.
+    ///
+    /// The single owner of that hand-off: `connect_device` (a new port /
+    /// address / drvInfo) and the REASON / IFACE / UI32MASK puts all write
+    /// through it, so a live subscription can never describe a binding the
+    /// record no longer has. A registration refused by the port ("No asynInt32
+    /// interface") lands in ERRS exactly as C's `registerInterrupts` reports it.
+    fn publish_io_intr_binding(&mut self) {
+        let binding = self.port_entry.as_ref().map(|entry| IoIntrBinding {
+            handle: entry.handle.clone(),
+            iface: InterfaceType::from_u16(self.iface as u16),
+            addr: self.addr,
+            reason: self.resolved_reason,
+            ui32mask: self.ui32mask,
+        });
+        if let Err(msg) = self.io_intr.rebind(binding) {
+            self.errs = msg;
+        }
+    }
+
+    /// C `cancelIOInterruptScan` (asynRecord.c:794-806): a put that invalidates
+    /// what the record subscribed to — REASON, IFACE, UI32MASK (:490,:494,:497)
+    /// or a PCNCT=0 detach (:525) — takes the record **off** the I/O Intr scan
+    /// list rather than silently re-registering behind the operator's back:
+    /// `dbPutField(&scanAddr, DBR_LONG, &passiveScan, 1)`. The put is what
+    /// cancels the driver registration (`scanDelete` → `get_ioint_info(1)`).
+    ///
+    /// Both halves run here: the local `set_active(false)` is the registration
+    /// (so the driver stops pushing values the instant the field changes, with
+    /// no window where a stale subscription can fill the sample cell), and the
+    /// SCAN put makes the field itself read back "Passive" as C's does. The put
+    /// re-enters `set_io_intr_scan(false)`, which is idempotent.
+    ///
+    /// C is a no-op when SCAN is not I/O Intr, and so is this.
+    fn cancel_io_interrupt_scan(&mut self) {
+        if !self.io_intr.is_active() {
+            return;
+        }
+        let _ = self.io_intr.set_active(false);
+        let Some((name, db)) = self.async_ctx.clone() else {
+            // No database (a record built outside an IOC): the registration is
+            // cancelled above; there is no SCAN field to put.
+            return;
+        };
+        // C calls `dbPutField` inline; this record is currently locked by the
+        // put that reached `special()`, so the write is handed to the database
+        // rather than re-entered here. It lands as soon as this put returns —
+        // C's `dbScanLock` is recursive, this one is not.
+        let passive = EpicsValue::Enum(ScanType::Passive as u16);
+        tokio::spawn(async move {
+            let _ = db.put_pv(&format!("{name}.SCAN"), passive).await;
+        });
+    }
+
+    /// C's four `callbackInterrupt*` routines (asynRecord.c:709-792) write the
+    /// pushed value into the IFACE's input field. In C that happens on the
+    /// driver's thread, under `interruptLock`, before `scanIoRequest`; here the
+    /// value rides the sample cell and lands on the process cycle it triggered —
+    /// the record is only mutable there. The field written is the same.
+    fn apply_io_intr_sample(&mut self, sample: IoIntrSample) {
+        match sample {
+            IoIntrSample::Octet(s) => self.tinp = s,
+            IoIntrSample::Int32(v) => self.i32inp = v,
+            IoIntrSample::UInt32(v) => self.ui32inp = v,
+            IoIntrSample::Float64(v) => self.f64inp = v,
+        }
+    }
+
     /// Does the connected port implement the interface?
     ///
     /// Asked of the port's own registry (`PortHandle::has_interface`, the
@@ -2503,6 +2592,7 @@ impl AsynRecord {
             self.port_entry = None;
             self.refresh_connected_state();
             self.clear_exception_callback();
+            self.publish_io_intr_binding();
             return Err(self.report_connect_error(
                 "asynManager:connectDevice no port name provided".to_string(),
             ));
@@ -2572,6 +2662,14 @@ impl AsynRecord {
                 // POST_IF_NEW cache is seeded with the values C's `old` holds at
                 // the same point.
                 self.register_exception_callback();
+                // The record now points at a different port / address / reason.
+                // C leaves an I/O Intr registration made against the *previous*
+                // device in place (`connectDevice` calls no `cancelInterrupts`,
+                // asynRecord.c:1142-1321), which keeps firing the old port's
+                // values into the record. Re-point it instead: the registration
+                // follows the binding, which is the invariant `IoIntrScan` holds.
+                // A record not on I/O Intr registers nothing either way.
+                self.publish_io_intr_binding();
                 Ok(())
             }
             None => {
@@ -2579,6 +2677,7 @@ impl AsynRecord {
                 self.port_entry = None;
                 self.refresh_connected_state();
                 self.clear_exception_callback();
+                self.publish_io_intr_binding();
                 Err(self.report_connect_error(format!(
                     "asynManager:connectDevice port {} not found",
                     self.port
@@ -3536,25 +3635,38 @@ impl Record for AsynRecord {
                     // "Connect error…" text; it adds no wrapper of its own.
                     let _ = self.connect_device();
                 } else {
+                    // C asynRecord.c:522-526, in this order:
+                    // exceptionCallbackRemove, disconnect, cancelIOInterruptScan.
                     self.port_entry = None;
                     self.clear_exception_callback();
                     // Detached: `isConnected` has no device to report on, which
                     // is C's CNCT=0 (monitorStatus, :1091-1093).
                     self.refresh_connected_state();
+                    self.cancel_io_interrupt_scan();
+                    self.publish_io_intr_binding();
                 }
             }
 
-            // Interface change → update validity flags
+            // Interface change. C `special()` case asynRecordIFACE
+            // (asynRecord.c:493-495) does exactly one thing:
+            // `cancelIOInterruptScan`. The transfer path needs no notice — the
+            // field is read by `performIO` on the next process, where the port's
+            // interface registry decides whether the transfer runs at all
+            // (:1328-1360, `has_interface`) — but an I/O Intr registration was
+            // made against the *old* interface and must not survive the change.
             "IFACE" => {
-                // C has no `special` case for IFACE: the field is read by
-                // `performIO` on the next process, where the port's interface
-                // registry decides whether the transfer runs at all
-                // (asynRecord.c:1328-1360, `has_interface`).
+                self.cancel_io_interrupt_scan();
+                self.publish_io_intr_binding();
             }
 
-            // REASON change
+            // REASON change. C `special()` case asynRecordREASON
+            // (asynRecord.c:487-492) assigns `pasynUser->reason` and then calls
+            // `cancelIOInterruptScan` — the registration was made for the old
+            // reason.
             "REASON" => {
                 self.resolved_reason = self.reason as usize;
+                self.cancel_io_interrupt_scan();
+                self.publish_io_intr_binding();
             }
 
             // --- Serial options ---
@@ -3690,8 +3802,15 @@ impl Record for AsynRecord {
             "IEOS" => self.write_eos(false),
 
             // --- UI32MASK change ---
+            //
+            // C `special()` case asynRecordUI32MASK (asynRecord.c:496-498):
+            // `cancelIOInterruptScan`. The mask is a *registration* parameter for
+            // asynUInt32Digital (`registerInterruptUser(..., ui32mask, ...)`,
+            // :635) as well as a per-transfer one, so an existing registration
+            // still carries the old mask and must go.
             "UI32MASK" => {
-                // Just record the value, used during I/O
+                self.cancel_io_interrupt_scan();
+                self.publish_io_intr_binding();
             }
 
             _ => {}
@@ -3734,6 +3853,25 @@ impl Record for AsynRecord {
         // raised it. This port merges C's process and its callback, so one reset
         // here is both of C's.
         self.reset_error();
+
+        // C `process()`: "If we got value from interrupt no need to read"
+        // (asynRecord.c:340-341) — `if (pasynRecPvt->gotValue) goto done`. The
+        // cycle a driver interrupt drove queues nothing: no UCMD/ACMD, no
+        // performIO, no queueRequest. It stores the pushed value, posts its
+        // monitors (the framework's field diffing, C's `monitor()`) and fires
+        // FLNK.
+        //
+        // Taking the sample IS C's `gotValue = 0` at the end of process (:370):
+        // one cell, one operation — there is no window where the value has been
+        // consumed but the gate is still armed, or the other way round.
+        //
+        // The gate sits below `reset_error` (C's :339 precedes the check) and
+        // above the dispatch, because C's `goto done` jumps past the
+        // `queueRequest` that would have run `asynCallbackProcess` at all.
+        if let Some(sample) = self.io_intr.take_sample() {
+            self.apply_io_intr_sample(sample);
+            return Ok(ProcessOutcome::complete());
+        }
 
         // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
         // priority: a pending UCMD universal GPIB command first, else a
@@ -3807,6 +3945,26 @@ impl Record for AsynRecord {
 
         self.perform_io()?;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `getIoIntInfo` (asynRecord.c:582-597), reached from `dbScan`'s
+    /// `scanAdd` / `scanDelete`: register the driver interrupt callbacks when
+    /// the record joins the I/O Intr scan list, cancel them when it leaves.
+    ///
+    /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
+    /// report the error and leave the record Passive (dbScan.c:278-293). The
+    /// port's `setup_io_intr` runs the same demotion off
+    /// [`device::AsynRecordDevice::io_intr_receiver`]; for a *runtime* SCAN put
+    /// the failure text is what reaches the operator, in ERRS, exactly as C's
+    /// `reportError` puts it there (:617,:627,:637,:647).
+    fn set_io_intr_scan(&mut self, active: bool) {
+        if let Err(msg) = self.io_intr.set_active(active) {
+            self.errs = msg;
+        }
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn clears_udf(&self) -> bool {
@@ -7388,5 +7546,434 @@ mod tests {
         rec.ieos = "\\n".to_string();
         rec.special("IEOS", true).unwrap();
         assert_ne!(rec.errs, "No asynOctet interface");
+    }
+
+    // ===== R11-46: SCAN="I/O Intr" =====
+
+    use crate::port::{PortDriver, PortDriverBase};
+
+    /// A port whose reads are countable, so a process cycle that performed I/O is
+    /// distinguishable from one a driver interrupt drove.
+    struct IoIntrDriver {
+        base: PortDriverBase,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PortDriver for IoIntrDriver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(42)
+        }
+    }
+
+    /// Register a port that counts its Int32 reads. Returns its runtime handle
+    /// (kept alive by the caller) and the read counter.
+    fn io_intr_port(
+        name: &str,
+    ) -> (
+        crate::runtime::PortRuntimeHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::port::PortFlags;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (rt, _jh) = create_port_runtime(
+            IoIntrDriver {
+                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                reads: reads.clone(),
+            },
+            RuntimeConfig::default(),
+        );
+        register_port(
+            name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        (rt, reads)
+    }
+
+    /// A driver interrupt, as `notify_interface_value` fires it: addr 0, typed
+    /// for the interface the record selected.
+    fn fire_interrupt(
+        rt: &crate::runtime::PortRuntimeHandle,
+        reason: usize,
+        value: crate::param::ParamValue,
+        iface: crate::interfaces::InterfaceType,
+        changed_mask: u32,
+    ) {
+        rt.port_handle()
+            .interrupts()
+            .notify(crate::interrupt::InterruptValue {
+                reason,
+                addr: 0,
+                value,
+                uint32_changed_mask: changed_mask,
+                iface: Some(iface),
+                ..Default::default()
+            });
+    }
+
+    /// R11-46. C's I/O Intr mode: `getIoIntInfo` registers the driver callbacks
+    /// (asynRecord.c:582-597), `callbackInterruptInt32` stores the pushed value in
+    /// I32INP and sets `gotValue` (:747-751), and `process` skips **all** I/O for
+    /// the cycle that value drove (`if (gotValue) goto done`, :341). The port had
+    /// no I/O Intr mechanism at all: a record on `SCAN="I/O Intr"` was demoted to
+    /// Passive at iocInit and never saw a driver value.
+    ///
+    /// Also the DSET seam: the framework reaches the record's scan list through
+    /// `AsynRecordDevice` — C's `asynRecordDevice` (`{5,0,0,0,getIoIntInfo,0}`).
+    #[test]
+    fn an_int32_interrupt_lands_in_i32inp_and_that_cycle_does_no_io() {
+        use crate::param::ParamValue;
+        use epics_base_rs::server::device_support::DeviceSupport;
+
+        let (rt, reads) = io_intr_port("r11_46_int32");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_int32".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+
+        // iocInit: the DSET hands the framework the record's scan list, which is
+        // also C's `interruptAccept` moment.
+        let mut dev = AsynRecordDevice::new();
+        dev.init(&mut rec).unwrap();
+        let mut wakeups = dev.io_intr_receiver().expect("the DSET owns a scan list");
+
+        // SCAN = "I/O Intr" → dbScan `scanAdd` → getIoIntInfo(0) → registerInterrupts.
+        rec.set_io_intr_scan(true);
+        assert_eq!(rec.errs, "", "the port implements asynInt32");
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        wakeups
+            .try_recv()
+            .expect("C `scanIoRequest` — the callback asks for a process");
+
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 7, "the pushed value, not a read");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "C `goto done`: the interrupt-driven cycle queues no I/O"
+        );
+
+        // The gate is consumed: the next scan is an ordinary read again.
+        rec.process().unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "gotValue was cleared");
+        assert_eq!(rec.i32inp, 42, "…and the driver's read landed");
+    }
+
+    /// Negative control for the gate: with the record NOT on the I/O Intr scan
+    /// list there is no registration, so a driver value reaches nothing and the
+    /// cycle performs its ordinary read. C: `registerInterrupts` runs only from
+    /// `getIoIntInfo` (asynRecord.c:591).
+    #[test]
+    fn a_driver_value_is_ignored_while_the_record_is_not_on_the_io_intr_list() {
+        use crate::param::ParamValue;
+
+        let (rt, reads) = io_intr_port("r11_46_not_armed");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_not_armed".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        rec.process().unwrap();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "SCAN is Passive: a real read"
+        );
+        assert_eq!(rec.i32inp, 42, "the driver's read, not the interrupt value");
+    }
+
+    /// R11-46. C's callback drops its value when the record has not processed the
+    /// previous one: "If gotValue is 1 then the record has not yet processed the
+    /// previous interrupt" — `if (pasynRecPvt->gotValue) return` (asynRecord.c:
+    /// 717-719,738-740,759-761,780-782). The FIRST unprocessed value is kept, not
+    /// the latest.
+    #[test]
+    fn a_second_interrupt_before_the_record_processes_is_dropped() {
+        use crate::param::ParamValue;
+
+        let (rt, _reads) = io_intr_port("r11_46_drop");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_drop".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(9),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 7, "C keeps the first unprocessed value");
+
+        // The cell reopens once the record consumed it.
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(11),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 11);
+    }
+
+    /// R11-46. Each IFACE has its own callback writing its own input field:
+    /// TINP (escaped, :725), I32INP (:747), UI32INP (:768), F64INP (:789). The
+    /// UInt32 registration carries the record's UI32MASK (:635), so only an
+    /// overlapping change fires it.
+    #[test]
+    fn each_iface_interrupt_writes_its_own_input_field() {
+        use crate::interfaces::InterfaceType as RegIface;
+        use crate::param::ParamValue;
+
+        // Octet → TINP, escaped.
+        let (rt, _reads) = io_intr_port("r11_46_octet");
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_octet".to_string();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+        fire_interrupt(&rt, 0, ParamValue::Octet("ab\n".into()), RegIface::Octet, 0);
+        rec.process().unwrap();
+        assert_eq!(rec.tinp, "ab\\n", "C `epicsStrSnPrintEscaped` into TINP");
+
+        // Float64 → F64INP.
+        let (rt, _reads) = io_intr_port("r11_46_f64");
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_f64".to_string();
+        rec.iface = InterfaceType::Float64 as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+        fire_interrupt(&rt, 0, ParamValue::Float64(2.5), RegIface::Float64, 0);
+        rec.process().unwrap();
+        assert_eq!(rec.f64inp, 2.5);
+
+        // UInt32Digital → UI32INP, and the registration carries UI32MASK.
+        let (rt, _reads) = io_intr_port("r11_46_ui32");
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_ui32".to_string();
+        rec.iface = InterfaceType::UInt32Digital as i32;
+        rec.ui32mask = 0x0F;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+
+        // A change outside UI32MASK never reaches the record (C hands the mask to
+        // registerInterruptUser and the driver filters on it).
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::UInt32Digital(0xF0),
+            RegIface::UInt32Digital,
+            0xF0,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.ui32inp, 0, "no bit of the change is in UI32MASK");
+
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::UInt32Digital(0x03),
+            RegIface::UInt32Digital,
+            0x03,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.ui32inp, 0x03);
+    }
+
+    /// R11-46. C `registerInterrupts` refuses the interface the port does not
+    /// implement — `reportError(... "No asynInt32 interface")` and `return -1`,
+    /// which leaves the record off the scan list (asynRecord.c:625-628).
+    #[test]
+    fn arming_io_intr_against_a_port_without_the_iface_reports_the_c_text() {
+        use crate::interfaces::octet_transport_capabilities;
+        use crate::param::ParamValue;
+        use crate::port::PortFlags;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct OctetOnly(PortDriverBase);
+        impl PortDriver for OctetOnly {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                octet_transport_capabilities()
+            }
+        }
+
+        let port_name = "r11_46_no_int32";
+        let (rt, _jh) = create_port_runtime(
+            OctetOnly(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+
+        rec.set_io_intr_scan(true);
+        assert_eq!(rec.errs, "No asynInt32 interface");
+
+        // …and no registration exists, so a driver value reaches nothing.
+        fire_interrupt(
+            &rt,
+            0,
+            ParamValue::Int32(7),
+            crate::interfaces::InterfaceType::Int32,
+            0,
+        );
+        rec.process().unwrap();
+        assert_eq!(rec.i32inp, 0, "the refused registration pushed nothing");
+    }
+
+    /// R11-46. C `cancelIOInterruptScan` (asynRecord.c:794-806): a put that
+    /// invalidates what the record subscribed to — REASON (:490), IFACE (:494),
+    /// UI32MASK (:497) or a PCNCT=0 detach (:525) — takes the record off the I/O
+    /// Intr scan list, which is what cancels the driver registration.
+    #[test]
+    fn reason_iface_ui32mask_and_pcnct_puts_cancel_the_io_intr_scan() {
+        use crate::param::ParamValue;
+
+        let (rt, reads) = io_intr_port("r11_46_cancel");
+
+        let mut rec = AsynRecord::default();
+        rec.port = "r11_46_cancel".to_string();
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.connect_device().unwrap();
+        let scan = rec.io_intr_scan();
+        let _wakeups = scan.take_receiver().unwrap();
+
+        // The reason the record's registration is bound to; the REASON put moves
+        // it, and an interrupt is only delivered for the reason it subscribed to.
+        let mut reason = 0usize;
+
+        for field in ["REASON", "IFACE", "UI32MASK", "PCNCT"] {
+            rec.set_io_intr_scan(true);
+            assert!(scan.is_active(), "{field}: armed");
+            // Armed, the registration really does gate a cycle — the control the
+            // cancel assertion below is measured against.
+            let before = reads.load(Ordering::SeqCst);
+            fire_interrupt(
+                &rt,
+                reason,
+                ParamValue::Int32(7),
+                crate::interfaces::InterfaceType::Int32,
+                0,
+            );
+            rec.process().unwrap();
+            assert_eq!(
+                rec.i32inp, 7,
+                "{field}: armed, the interrupt drove the cycle"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                before,
+                "{field}: and did no I/O"
+            );
+
+            match field {
+                "REASON" => {
+                    rec.reason = 3;
+                    reason = 3;
+                }
+                "IFACE" => rec.iface = InterfaceType::Int32 as i32,
+                "UI32MASK" => rec.ui32mask = 0x0F,
+                "PCNCT" => rec.pcnct = 0,
+                _ => unreachable!(),
+            }
+            rec.special(field, true).unwrap();
+            assert!(
+                !scan.is_active(),
+                "{field}: C forces SCAN back to Passive, cancelling the registration"
+            );
+
+            // PCNCT=0 detached the port (C :522-526); reconnect so the read below
+            // has a device. The reconnect must not re-arm the scan by itself.
+            if field == "PCNCT" {
+                rec.pcnct = 1;
+                rec.special("PCNCT", true).unwrap();
+                assert!(!scan.is_active(), "a reconnect does not re-arm I/O Intr");
+            }
+
+            // The cancelled registration pushes nothing: the record reads instead.
+            let before = reads.load(Ordering::SeqCst);
+            fire_interrupt(
+                &rt,
+                reason,
+                ParamValue::Int32(7),
+                crate::interfaces::InterfaceType::Int32,
+                0,
+            );
+            rec.i32inp = 0;
+            rec.process().unwrap();
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                before + 1,
+                "{field}: no interrupt value gated the cycle"
+            );
+            assert_eq!(rec.i32inp, 42, "{field}: the value came from the read");
+        }
     }
 }

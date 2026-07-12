@@ -529,10 +529,12 @@ impl PortActor {
         // no-op for them.
         self.driver.base_mut().sync_connection_edge();
 
-        if let Some(connect) = Self::queue_gate(&op, &user) {
+        let gate = Self::queue_gate(&op, &user);
+        if let Some(connect) = gate {
             // C drains the Connect queue *before* `autoConnectDevice`
-            // (asynManager.c:812-857): a waived request never triggers a connect
-            // attempt, it just runs on the dead line.
+            // (asynManager.c:812-857): a waived request runs on the dead line
+            // with no connect attempt in front of it. The attempt C makes
+            // *after* that drain (:856-861) is at the tail of this function.
             if connect == ConnectCheck::Required {
                 self.auto_connect_device(user.addr, user.reason);
             }
@@ -553,6 +555,22 @@ impl PortActor {
         // Dispatch
         let result = self.dispatch_io(&mut user, &op);
         let _ = reply.send(result);
+
+        // C `portThread`, immediately after the Connect-priority queue is
+        // drained: `if(!pport->dpc.connected) autoConnectDevice(pport,0)`
+        // (asynManager.c:856-861). The waived requests are exactly what rides
+        // that queue — `asynSetOption`/`asynSetEos` from `st.cmd`, the record's
+        // HOSTINFO repoint (asynRecord.c:566-569) — and C's whole point is that
+        // the thread tries to bring the line *up* on the new configuration the
+        // moment the request that changed it has run, rather than waiting for
+        // some later I/O to force a connect. The attempt is port-level only
+        // (C passes `pdevice = 0`) and throttled to one per 2 s window, so an
+        // explicit Disconnect — which stamps `last_connect_disconnect` as it
+        // runs — is not undone by the very pass that performed it, exactly as
+        // in C (:712-713).
+        if gate == Some(ConnectCheck::Waived) {
+            self.auto_connect_port();
+        }
     }
 
     /// The port context [`AsynUser::trace`] carries — the driver's trace manager
@@ -564,6 +582,36 @@ impl PortActor {
             manager: manager.clone(),
             port: base.port_name.as_str().into(),
         })
+    }
+
+    /// The **port** half of C `autoConnectDevice` (asynManager.c:705-721) —
+    /// the single owner of every port-level auto-connect attempt, so the two
+    /// callers cannot drift apart.
+    ///
+    /// C reaches it two ways, and both are here: through `autoConnectDevice`
+    /// when a queued request needs the line up, and straight from `portThread`
+    /// with `pdevice = 0` once the Connect-priority queue has drained
+    /// (:856-861). One attempt per 2 s window either way
+    /// (`auto_connect_throttle_ok`, C :712-713), every attempt restarting the
+    /// window whether it succeeded or failed (`stamp_auto_connect_attempt`,
+    /// C :718).
+    ///
+    /// Returns whether the port is connected afterwards (C's `:721` bail-out).
+    fn auto_connect_port(&mut self) -> bool {
+        if !self.driver.base().is_connected() && self.driver.base().auto_connect {
+            if !self
+                .driver
+                .base()
+                .auto_connect_throttle_ok(-1, Instant::now())
+            {
+                return false;
+            }
+            let _ = self.driver.connect(&AsynUser::default());
+            self.driver
+                .base_mut()
+                .stamp_auto_connect_attempt(-1, Instant::now());
+        }
+        self.driver.base().is_connected()
     }
 
     /// C `autoConnectDevice` (asynManager.c:704-739) — the single owner of
@@ -593,20 +641,7 @@ impl PortActor {
         // --- Port level (C :705-721). Runs for single- and multi-device
         // ports alike: in C the port `dpCommon` is reconnected before any
         // device `dpCommon` is even looked at.
-        if !self.driver.base().is_connected() && self.driver.base().auto_connect {
-            if !self
-                .driver
-                .base()
-                .auto_connect_throttle_ok(-1, Instant::now())
-            {
-                return false;
-            }
-            let _ = self.driver.connect(&AsynUser::default());
-            self.driver
-                .base_mut()
-                .stamp_auto_connect_attempt(-1, Instant::now());
-        }
-        if !self.driver.base().is_connected() {
+        if !self.auto_connect_port() {
             // C :721 — the port is still down, so the device cannot come up.
             return false;
         }
@@ -1834,6 +1869,163 @@ mod tests {
         // inside the 2s throttle window and were refused without a connect
         // call (C autoConnectDevice 2.0s gate, asynManager.c:712-713).
         assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A connection-waived request is followed by the port auto-connect C's
+    /// `portThread` performs.
+    ///
+    /// C queues the waived requests — `asynSetOption`/`asynSetEos` from
+    /// `st.cmd`, the record's HOSTINFO repoint (asynRecord.c:566-569) — at
+    /// `asynQueuePriorityConnect`. `portThread` drains that queue and then, at
+    /// asynManager.c:856-861, runs `autoConnectDevice(pport,0)` whenever the
+    /// port is still disconnected. That is what brings a dead line up on its
+    /// *new* configuration immediately, instead of leaving it down until some
+    /// later I/O request happens to force a connect.
+    ///
+    /// Boundary 1 (here): the waived request runs on the dead line AND the port
+    /// connect attempt follows it.
+    /// Boundary 2 (below): an explicit Disconnect is not undone by the same
+    /// pass — C's 2 s throttle (:712-713) anchors on the transition it just
+    /// stamped.
+    #[test]
+    fn a_waived_request_is_followed_by_the_port_auto_connect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct WaivedDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+            options: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+        }
+        impl PortDriver for WaivedDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                // The line comes up on the configuration the waived request
+                // just wrote — a real driver reopens its transport here.
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                key: &str,
+                value: &str,
+            ) -> AsynResult<()> {
+                self.options
+                    .lock()
+                    .push((key.to_string(), value.to_string()));
+                Ok(())
+            }
+        }
+
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let options = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut base = PortDriverBase::new("waived_test", 1, PortFlags::default());
+        base.init_connected(false);
+        base.auto_connect = true;
+        let tx = spawn_actor(WaivedDriver {
+            base,
+            connect_calls: connect_calls.clone(),
+            options: options.clone(),
+        });
+
+        // The `asynSetOption` user: Connect priority + the reason that waives
+        // the connected refusal (asynShellCommands.c:121,126).
+        let user = AsynUser::default().queue_even_if_not_connected();
+        send_and_wait(
+            &tx,
+            RequestOp::SetOption {
+                key: "baud".to_string(),
+                value: "9600".to_string(),
+            },
+            user,
+        )
+        .expect("a waived request runs on a disconnected port");
+        assert_eq!(
+            options.lock().as_slice(),
+            &[("baud".to_string(), "9600".to_string())],
+            "the waived request reaches the driver on the dead line"
+        );
+
+        // ...and C's portThread then tries to bring the port up on it.
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "C portThread runs autoConnectDevice(pport,0) once the Connect \
+             queue has drained (asynManager.c:856-861)"
+        );
+
+        // The follow-up read now finds a live port, which is the observable the
+        // operator cares about: the line is back without further traffic.
+        let probe = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = send_and_wait(&tx, RequestOp::Int32Read, probe);
+        assert!(
+            !matches!(
+                err,
+                Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    ..
+                })
+            ),
+            "the port is connected after the waived request, so nothing is \
+             refused Disconnected: {err:?}"
+        );
+    }
+
+    /// Boundary 2 of the above: the auto-connect that follows a waived request
+    /// must not undo an explicit Disconnect. C's throttle (asynManager.c:712-713)
+    /// refuses an attempt within 2 s of the last transition, and the Disconnect
+    /// callback stamps that transition as it runs — so C's very next
+    /// `autoConnectDevice(pport,0)` on the same pass returns FALSE.
+    #[test]
+    fn the_port_auto_connect_does_not_undo_an_explicit_disconnect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DisconnectDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+        }
+        impl PortDriver for DisconnectDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.base.set_connected(false);
+                Ok(())
+            }
+        }
+
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("disconnect_test", 1, PortFlags::default());
+        base.init_connected(true);
+        base.auto_connect = true;
+        let tx = spawn_actor(DisconnectDriver {
+            base,
+            connect_calls: connect_calls.clone(),
+        });
+
+        send_and_wait(&tx, RequestOp::Disconnect, AsynUser::default())
+            .expect("an explicit disconnect succeeds");
+
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            0,
+            "the transition the Disconnect just stamped keeps the auto-connect \
+             inside its 2 s window (asynManager.c:712-713)"
+        );
     }
 
     /// R6-49: C `autoConnectDevice` reconnects the PORT first

@@ -54,6 +54,64 @@ pub(crate) fn value_gate(
         .map(|(_, gate)| *gate)
 }
 
+/// The event mask a change-detected AUXILIARY field posts with — the single
+/// owner of that decision, built once per cycle from the record's declarations
+/// and shared by every monitor loop (both `process_record_*` paths, the
+/// deferred-completion path, and `RecordInstance::process_local`), so they
+/// cannot drift apart on what mask a field carries.
+///
+/// C's usual shape for the "post every input/aux field that changed" loop is
+/// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400,
+/// motor `DBE_VAL_LOG`) — that is the default. Three record-declared exceptions
+/// narrow it, and no two are the same narrowing:
+///
+/// * [`Record::value_only_change_fields`] — a literal `DBE_VALUE`
+///   (tableRecord.c:659, scaler `Sn`): alarm bits + `DBE_VALUE`, never `LOG`.
+/// * [`Record::fields_posted_with_monitor_mask`] — `monitor_mask | DBE_VALUE`
+///   (swaitRecord.c:650): VAL's own monitor mask, so `DBE_LOG` rides along
+///   exactly when VAL's ADEL deadband crossed.
+/// * [`Record::fields_posted_without_alarm_bits`] — a literal
+///   `DBE_VALUE | DBE_LOG` (epidRecord.c:376): both value classes, alarm bits
+///   discarded.
+#[derive(Clone, Copy)]
+pub(crate) struct AuxPostMask {
+    value_only: &'static [&'static str],
+    monitor_masked: &'static [&'static str],
+    no_alarm_bits: &'static [&'static str],
+}
+
+impl AuxPostMask {
+    /// Read the record's three declarations once, outside the per-field loop.
+    pub(crate) fn of(record: &dyn Record) -> Self {
+        Self {
+            value_only: record.value_only_change_fields(),
+            monitor_masked: record.fields_posted_with_monitor_mask(),
+            no_alarm_bits: record.fields_posted_without_alarm_bits(),
+        }
+    }
+
+    /// `alarm_bits` is this cycle's `recGblResetAlarms` result; `deadband_mask`
+    /// is VAL's own monitor mask (those alarm bits, plus `DBE_VALUE` when MDEL
+    /// crossed and `DBE_LOG` when ADEL crossed).
+    pub(crate) fn mask_for(
+        &self,
+        field: &str,
+        alarm_bits: crate::server::recgbl::EventMask,
+        deadband_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::recgbl::EventMask {
+        use crate::server::recgbl::EventMask;
+        if self.value_only.contains(&field) {
+            alarm_bits | EventMask::VALUE
+        } else if self.monitor_masked.contains(&field) {
+            deadband_mask | EventMask::VALUE
+        } else if self.no_alarm_bits.contains(&field) {
+            EventMask::VALUE | EventMask::LOG
+        } else {
+            alarm_bits | EventMask::VALUE | EventMask::LOG
+        }
+    }
+}
+
 /// Outcome of a record's array-style monitor decision, returned by
 /// [`Record::array_monitor_post`] (C waveform/aai/aao `monitor()`,
 /// waveformRecord.c:291-326).
@@ -1012,6 +1070,39 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Fields whose change post carries a LITERAL `DBE_VALUE | DBE_LOG` — this
+    /// cycle's alarm bits DISCARDED.
+    ///
+    /// C's fourth mask shape, and the only one that *drops* information the
+    /// record already computed. `epidRecord.c::monitor` builds VAL's mask from
+    /// `recGblResetAlarms` (`:350`) and posts VAL with it, then REASSIGNS
+    /// (not `|=`) before the secondaries:
+    ///
+    /// ```c
+    /// monitor_mask = DBE_LOG|DBE_VALUE;          /* :376 */
+    /// if (pepid->ovlp != pepid->oval) db_post_events(pepid, &pepid->oval, monitor_mask);
+    /// ...                                        /* P, I, D, CT, DT, ERR, CVAL */
+    /// ```
+    ///
+    /// so on an alarm-transition cycle a `DBE_ALARM`-only subscriber to one of
+    /// those fields is sent NOTHING, while the generic aux mask
+    /// (`alarm_bits | DBE_VALUE | DBE_LOG`) would send it an event.
+    ///
+    /// Distinct from the three narrower shapes: [`Self::value_only_change_fields`]
+    /// (literal `DBE_VALUE`), [`Self::fields_posted_with_monitor_mask`]
+    /// (`monitor_mask | DBE_VALUE` — keeps the alarm bits AND VAL's ADEL LOG bit)
+    /// and [`Self::fields_posted_with_value_mask`] (VAL's mask, posted from inside
+    /// C's `if (monitor_mask)` guard). A field named here posts on every change,
+    /// with both value classes and no alarm class, whatever the cycle's alarms did.
+    ///
+    /// Resolved for every change-detected field by [`aux_change_mask`], the single
+    /// owner of the aux-post mask.
+    ///
+    /// Default: empty.
+    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The array-style monitor decision (C waveform/aai/aao `monitor()`,
     /// waveformRecord.c:291-326). `None` (the default) means the record has
     /// no MPST/APST/HASH mechanism and the generic MDEL/ADEL deadband
@@ -1022,6 +1113,45 @@ pub trait Record: Send + Sync + 'static {
     /// changed (so the owner posts `HASH` with `DBE_VALUE`). Called by
     /// `check_deadband_ext` (the single owner of the VAL-mask decision).
     fn array_monitor_post(&mut self) -> Option<ArrayMonitorPost> {
+        None
+    }
+
+    /// Fields the record posts itself via an event-driven, individually
+    /// masked path rather than the generic change-detection loop. The
+    /// framework excludes these from that loop so they are neither
+    /// double-posted nor spuriously posted on a cycle the event did not
+    /// fire. C waveform/aai/aao `monitor()` posts `HASH` this way —
+    /// `db_post_events(prec, &prec->hash, DBE_VALUE)` only when the content
+    /// hash changed (waveformRecord.c:317-319), never via VAL's change.
+    ///
+    /// The CLOSED set of fields a process cycle of this record may post —
+    /// the record's C `process()` + `monitor()` `db_post_events` calls,
+    /// enumerated.
+    ///
+    /// `None` (the default) leaves the framework's generic rule in force:
+    /// every subscribed field that changed since its last post is posted.
+    /// That rule is right for a record whose C `monitor()` walks its fields
+    /// and posts whatever moved (calc, sub, ai …). It is WRONG for a record
+    /// whose C `monitor()` posts a fixed list and leaves every other field it
+    /// wrote silent — the framework then invents events C never sends:
+    ///
+    /// * a field the record WRITES during `process()` but C never posts
+    ///   (scaler's gate→direction copy, `scalerRecord.c:413-414`: `pdir[i] =
+    ///   pgate[i]` with no `db_post_events` — C posts `Dn` only from
+    ///   `special()`), and
+    /// * a field a PUT already posted, whose `last_posted` the put path does
+    ///   not advance, so the next process cycle change-detects it a second
+    ///   time (`Gn`, `PRn`).
+    ///
+    /// `Some(list)` closes both by construction: a field outside the list is
+    /// never posted by a process cycle — its only monitors come from its own
+    /// put and from [`Self::monitor_side_effect_fields`]. The list is a
+    /// whitelist, not a blacklist, so a field added to the record later stays
+    /// silent unless C posts it.
+    ///
+    /// Fields inside the list keep their normal treatment (change detection,
+    /// [`Self::value_only_change_fields`] mask, deadband, `log_swept_fields`).
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
         None
     }
 
@@ -1180,6 +1310,36 @@ pub trait Record: Send + Sync + 'static {
     /// never invoked twice for the same state. Default: ignore.
     fn set_io_intr_scan(&mut self, _active: bool) {}
 
+    /// The link writes a C `special()` performs *itself*, inside `dbPut`.
+    ///
+    /// `special()` takes the record alone — it has no database handle — so a
+    /// record whose C `special()` calls `dbPutLink` cannot make that write from
+    /// `special()`. It queues the write here instead, and the put owner
+    /// (`field_io`'s `dbPut` paths) drains the queue immediately after
+    /// `special(field, true)` returns and executes the actions BEFORE the put's
+    /// `pp(TRUE)` process cycle. That is C's order: `dbPutField` → `dbPut` →
+    /// `dbPutSpecial(paddr, 1)` — which runs the `dbPutLink` to completion,
+    /// target processing included — → `dbProcess`.
+    ///
+    /// The scaler is the case this exists for: `scalerRecord.c:623-624` puts
+    /// `CNT` to `COUTP` inside `special()`, so a record wired to `.COUTP` is
+    /// processed while the scaler is still IDLE, before the count is armed. The
+    /// port deferred that write to the head of the CNT-triggered process cycle,
+    /// where the target saw an already-COUNTING scaler.
+    ///
+    /// This is neither the record's "should the link fire" state nor part of the
+    /// process cycle's action list: a `special()` put and a `process()` put to
+    /// the same link (scaler `COUTP` again, `:463`) are independent writes.
+    ///
+    /// The drain is unconditional — it runs even when `special()` returned an
+    /// error — so a queued action can never survive the put that queued it and
+    /// fire against a later, unrelated put.
+    ///
+    /// Default: none (a `special()` that writes no link).
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        Vec::new()
+    }
+
     /// Other fields whose monitors must be posted because a put to
     /// `put_field` changed them as a side effect, without driving a full
     /// process cycle.
@@ -1272,11 +1432,90 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// A `SIMM != NO` cycle substitutes only this record's INPUT STAGE — the
+    /// rest of its `process()` still runs.
+    ///
+    /// C's SIML/SIMM/SIOL group has three shapes, and this hook names the third:
+    ///
+    /// * `readValue` (ai, bi, longin, …): the simulated read replaces the device
+    ///   read, which is the whole of the record's input; the framework performs
+    ///   the SIOL read and completes the cycle itself.
+    /// * `writeValue` (ao, bo, …): the simulated write replaces the device write
+    ///   at the END of the body, so the body runs and only the output is
+    ///   redirected to SIOL.
+    /// * swait (`swaitRecord.c:401-421`): the simulated read replaces
+    ///   `fetch_values()` **and** `calcPerform()` and nothing else — VAL comes
+    ///   from SIOL through SVAL, and the OOPT switch, `execOutput`, the monitors
+    ///   and the forward link all still run from the record's own `process()`.
+    ///
+    /// A record that returns `true` gets, on a simulated cycle: SIMM resolved
+    /// from SIML, SIOL read into SVAL, `VAL = SVAL` and `UDF = FALSE` when that
+    /// read succeeded (C `:417-420` — a failed read changes neither), SIMM_ALARM
+    /// raised at SIMS *before* the body so it maximizes against whatever the
+    /// body raises (C `:421`), no input-link fetch, and
+    /// [`Self::set_simulation_active`] pushed before `process()`.
+    fn simulation_substitutes_input_stage(&self) -> bool {
+        false
+    }
+
+    /// This cycle's simulation state, pushed by the framework before
+    /// `process()` — the twin of [`Self::set_fetch_gate_failed`], and only for a
+    /// record that declares [`Self::simulation_substitutes_input_stage`].
+    ///
+    /// It is pushed on EVERY cycle of such a record (`false` included), so the
+    /// flag cannot survive the cycle it belongs to. The record uses it to skip
+    /// exactly what C's simulation branch skips — for swait, `fetch_values()`
+    /// (through [`Self::select_input_links`]) and `calcPerform()`.
+    fn set_simulation_active(&mut self, _active: bool) {}
+
     /// How C's `fetch_values()` for this record type reacts to a link read
     /// that fails. Drives the framework's [`Self::multi_input_links`] fetch
     /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].
+    ///
+    /// It governs the [`Self::multi_input_links`] loop ONLY.
+    /// [`Self::string_input_links`] is C's *second*, separately-gated fetch
+    /// loop and never participates in this policy.
     fn input_fetch_policy(&self) -> InputFetchPolicy {
         InputFetchPolicy::ReadAll
+    }
+
+    /// String-valued input links: `(link_field, value_field)` pairs read as
+    /// DBR_STRING, C `sCalcoutRecord.c::fetch_values` (890-941) — the SECOND
+    /// loop of that function, over `INAA`..`INLL` → `AA`..`LL`:
+    ///
+    /// ```c
+    /// for (i=0, plink=&pcalc->inaa, psvalue=pcalc->strs; i<STRING_MAX_FIELDS; ...) {
+    ///     ...
+    ///     if (((field_type==DBR_CHAR) || (field_type==DBR_UCHAR)) && nelm>1) {
+    ///         status = dbGetLink(plink, field_type, tmpstr, 0, &nelm);
+    ///         epicsStrSnPrintEscaped(*psvalue, STRING_SIZE-1, tmpstr, strlen(tmpstr));
+    ///     } else {
+    ///         status = dbGetLink(plink, DBR_STRING, *psvalue, 0, 0);
+    ///     }
+    ///     if (!RTN_SUCCESS(status))
+    ///         epicsSnprintf(*psvalue, STRING_SIZE-1, "%s:fetch(%s) failed", pcalc->name, sFldnames[i]);
+    /// }
+    /// return(0);
+    /// ```
+    ///
+    /// Three properties this loop does NOT share with [`Self::multi_input_links`],
+    /// which is why it is a separate list rather than more entries in that one:
+    ///
+    /// 1. **Ungated.** It ends in `return(0)` — a failing string link never
+    ///    makes `fetch_values` non-zero, so it cannot suppress the record body.
+    ///    The record's single [`Self::input_fetch_policy`] describes the numeric
+    ///    loop (`AbortOnFirstFailure` for scalcout) and cannot also describe this
+    ///    one.
+    /// 2. **A failed read still writes the field** — with the diagnostic text
+    ///    `"<record>:fetch(<FIELD>) failed"`, not with the previous value.
+    /// 3. **A `DBF_CHAR`/`DBF_UCHAR` array source is read as text**, C-escaped
+    ///    (`epicsStrSnPrintEscaped`), which is how a >40-char string reaches a
+    ///    string calc; every other source type converts as DBR_STRING.
+    ///
+    /// The value is delivered through [`Self::put_field_internal`], so the
+    /// target field's declared `DbFieldType` performs the final coercion.
+    fn string_input_links(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     /// Input links this record reads at OUTPUT time instead of during the

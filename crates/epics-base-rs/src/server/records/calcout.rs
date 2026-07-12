@@ -130,8 +130,11 @@ pub struct CalcoutRecord {
     // cycle decided on, not re-evaluate should_output() against the
     // (by then stale) pval/val.
     pending_output: bool,
-    // CALC_ALARM flag
-    pub calc_alarm: bool,
+    // This cycle's `calcPerform` outcome (C `calcoutRecord.c:238-241` for CALC,
+    // `:622` for OCAL). A per-cycle fact, not record state: `check_alarms` — the
+    // owner of this record's alarm transitions — consumes it, so it cannot
+    // outlive the cycle that set it.
+    calc_alarm: bool,
     // This cycle's `fetch_values()` outcome, pushed by the framework through
     // `set_fetch_gate_failed`. C `calcoutRecord.c::process` (237) runs
     // `calcPerform` only `if (fetch_values(prec) == 0)`: a failed input link
@@ -1081,13 +1084,8 @@ impl Record for CalcoutRecord {
             // *previous* VAL. Seed before `self.val` is overwritten below.
             inputs.prev_val = self.val;
             match crate::calc::eval(&self.rpcl, &mut inputs) {
-                Ok(v) => {
-                    self.val = v;
-                    self.calc_alarm = false;
-                }
-                Err(_) => {
-                    self.calc_alarm = true;
-                }
+                Ok(v) => self.val = v,
+                Err(_) => self.calc_alarm = true,
             }
         }
 
@@ -1210,7 +1208,6 @@ impl Record for CalcoutRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
@@ -1818,6 +1815,21 @@ impl Record for CalcoutRecord {
         if self.out != common.out {
             self.out = common.out.clone();
             self.refresh_link_status();
+        }
+
+        // C `calcoutRecord.c:238-241` (CALC) and `:622` (OCAL, inside
+        // `execOutput`) — a failed `calcPerform` is `recGblSetSevr(prec,
+        // CALC_ALARM, INVALID_ALARM)`, raised in `process()` before
+        // `checkAlarms(prec)`. Consuming the flag keeps it a per-cycle fact: a
+        // cycle whose input fetch failed runs no `calcPerform` (`:237`) and
+        // raises nothing.
+        if std::mem::take(&mut self.calc_alarm) {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::CALC_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                "CALC expression evaluation failed",
+            );
         }
     }
 }

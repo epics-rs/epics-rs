@@ -785,6 +785,17 @@ impl Record for TransformRecord {
         }
     }
 
+    /// C `transformRecord.c:793-794` throws away `recGblResetAlarms`'s mask —
+    /// it assigns `monitor_mask = DBE_VALUE|DBE_LOG` over it — and the A..P
+    /// change loop (:796-806) posts every one of the sixteen value fields with
+    /// that literal. No transform field ever carries an alarm bit, so a
+    /// `DBE_ALARM`-only subscriber on `.A` is notified on no cycle at all.
+    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
+        &[
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+        ]
+    }
+
     /// Transform's UDF is C's `ptran->udf`: cleared at the top of every
     /// `process()` and set only by a failing channel calc. It is NOT derived
     /// from VAL — VAL is an inert dummy (R9-62).

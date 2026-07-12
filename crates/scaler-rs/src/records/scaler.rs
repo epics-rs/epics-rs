@@ -139,15 +139,16 @@ pub struct ScalerRecord {
     /// Carries C's `special()` COUTP put — and only that one.
     ///
     /// C `scalerRecord.c:623-624` calls `dbPutLink(&pscal->coutp, ...)` inside
-    /// `special()` itself, before the CNT-triggered `scanOnce()`. `special()`
-    /// here cannot emit `ProcessAction`s, so it raises this flag and the
-    /// CNT-triggered `process()` emits that put at the head of the cycle and
-    /// clears it.
+    /// `special()` itself, so the link is written — and its target processed —
+    /// while the scaler is still IDLE, before `:637` sets REQSTART and before
+    /// the CNT-triggered process cycle arms the count. The framework drains this
+    /// through [`Record::take_special_actions`] at the end of the put and
+    /// executes it there, which is that point.
     ///
     /// It is NOT the record's "should COUTP fire" state: C's other COUTP put
-    /// (`:463`, on the finish edge) is independent and is emitted on its own, so
-    /// a user stop writes the link twice. Never merge the two.
-    coutp_pending: bool,
+    /// (`:463`, on the finish edge) is independent, is emitted by `process()` on
+    /// its own, and both fire on a user stop. Never merge the two.
+    special_actions: Vec<ProcessAction>,
 
     /// The `db_post_events` calls C's `special()` made on the put now in flight,
     /// handed to the framework by
@@ -235,7 +236,7 @@ impl Default for ScalerRecord {
             autocount_delay: 0.0,
             done_flag: false,
             reqstart_old_pr1: 0,
-            coutp_pending: false,
+            special_actions: Vec::new(),
             side_effect_posts: &[],
             fire_fwd_link: false,
         }
@@ -718,6 +719,27 @@ static VALUE_ONLY_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Every `db_post_events` C's scaler makes from a PROCESS cycle, enumerated —
+/// [`ScalerRecord::process_posted_fields`]. `process()`: `CNT` (:372), `PR1`
+/// (:425, only when the count-start recompute moved it), `TP` (:427), `FREQ`
+/// (:430, :530), `VAL` (:478), `S1..Snch` (:582), `T` (:588); `monitor()`:
+/// `S1..Snch` (:771). That is the whole list — C writes `D1..Dnch` in process
+/// (:413-414, :525-526) and posts none of them, and it posts `Gn`/`PRn`(n>1)
+/// only from `special()`.
+///
+/// Indexed by `nch`: the fixed head plus the `Sn` of the active channels, so
+/// the `Sn` of a channel the record does not have stays out of the set (C's
+/// post loops are bounded by `nch` too).
+static PROCESS_POSTED_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
+    (0..=MAX_SCALER_CHANNELS)
+        .map(|nch| {
+            let mut v: Vec<&'static str> = vec!["VAL", "T", "CNT", "PR1", "TP", "FREQ"];
+            v.extend(SN_FIELD_NAMES.iter().take(nch).copied());
+            v
+        })
+        .collect()
+});
+
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
         "scaler"
@@ -732,21 +754,6 @@ impl Record for ScalerRecord {
         let mut just_finished_user_count = false;
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
-
-        // C scalerRecord.c:623-624 — `special("CNT")` puts to COUTP itself, and
-        // it runs to completion on the CA put BEFORE the CNT-triggered process()
-        // starts. `special()` has no action channel here, so the put is deferred
-        // to the front of this cycle — the earliest point it can land, and ahead
-        // of every put process() makes below. It is C's FIRST COUTP put; the one
-        // at :463 (below, on the finish edge) is a second, independent put, not
-        // this one arriving late.
-        if self.coutp_pending {
-            self.coutp_pending = false;
-            actions.push(ProcessAction::WriteDbLink {
-                link_field: "COUTP",
-                value: EpicsValue::Short(self.cnt),
-            });
-        }
 
         // C scalerRecord.c:346 — dbPutNotify completions also force the
         // long autocount hold time. The port has no putNotify plumbing
@@ -933,6 +940,15 @@ impl Record for ScalerRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
+    /// C's `special()` COUTP put (`scalerRecord.c:623-624`), handed to the
+    /// framework to execute where C executes it: inside the put, before the
+    /// CNT-triggered process cycle. The queue is filled by `special()` and
+    /// emptied here — the framework drains it on every put, so a put that queues
+    /// nothing hands back nothing.
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        std::mem::take(&mut self.special_actions)
+    }
+
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {
             // The framework runs this pre-pass on every put (field_io.rs:937),
@@ -952,10 +968,15 @@ impl Record for ScalerRecord {
                     return Ok(());
                 }
                 // C:623-624 — fire the COUTP link on every CNT write that
-                // passes the redundant-command guard. `special()` cannot
-                // emit actions; raise a flag the CNT-triggered `process()`
-                // turns into a `WriteDbLink`.
-                self.coutp_pending = true;
+                // passes the redundant-command guard. C makes this put from
+                // `special()` itself, i.e. inside `dbPut`: the target is written
+                // and processed with `us` still IDLE and the count not yet
+                // armed. The framework drains `take_special_actions()` at the
+                // end of the put and executes it there.
+                self.special_actions.push(ProcessAction::WriteDbLink {
+                    link_field: "COUTP",
+                    value: EpicsValue::Short(self.cnt),
+                });
                 // C:633-634 — `dly = pscal->dly; if (dly<0.0) dly = 0.0;`
                 let dly = self.dly.max(0.0);
                 // C:635 — `if (dly == 0.0 || pscal->cnt == 0)`: handle now.
@@ -1301,6 +1322,26 @@ impl Record for ScalerRecord {
     /// sees `PRn`/`Gn`/`Dn`, matching C.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         &VALUE_ONLY_BY_NCH[self.active_channels()]
+    }
+
+    /// C's scaler posts a FIXED list from a process cycle (see
+    /// [`PROCESS_POSTED_BY_NCH`]) and leaves every other field it wrote silent.
+    /// Declaring that list closes two spurious-event families the framework's
+    /// generic "post whatever changed" rule opened:
+    ///
+    /// * `D1..Dnch` — `process()` copies the gates into them on every count
+    ///   start (`scalerRecord.c:413-414`, `:525-526`) and posts NOTHING; C's
+    ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:704`). The port
+    ///   change-detected the copy and fired a `Dn` monitor C never sends.
+    /// * `G1..Gnch`, `PR2..PRnch` — a put posts them (C `dbPut`), but the put
+    ///   path does not advance `last_posted`, so the next process cycle
+    ///   change-detected them a SECOND time. C's `process()` posts no `Gn` at
+    ///   all, and `PRn` only for n = 1.
+    ///
+    /// `PR1` stays in the set: C's `process()` does post it (`:425`), when the
+    /// count-start preset recompute moved it.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&PROCESS_POSTED_BY_NCH[self.active_channels()])
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that

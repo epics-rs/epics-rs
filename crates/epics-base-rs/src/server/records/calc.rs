@@ -86,8 +86,10 @@ pub struct CalcRecord {
     pub ls: f64,
     pub lt: f64,
     pub lu: f64,
-    // CALC_ALARM flag: set when calcPerform fails
-    pub calc_alarm: bool,
+    // This cycle's `calcPerform` outcome (C `calcRecord.c:121-123`). A per-cycle
+    // fact, not record state: `check_alarms` — the owner of this record's alarm
+    // transitions — consumes it, so it cannot outlive the cycle that set it.
+    calc_alarm: bool,
     // This cycle's `fetch_values()` outcome, pushed by the framework through
     // `set_fetch_gate_failed`. C `calcRecord.c::process` (120) runs
     // `calcPerform` only `if (fetch_values(prec) == 0)`, so a failed input link
@@ -784,13 +786,8 @@ impl Record for CalcRecord {
         // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
         inputs.prev_val = self.val;
         match crate::calc::eval(&self.rpcl, &mut inputs) {
-            Ok(v) => {
-                self.val = v;
-                self.calc_alarm = false;
-            }
-            Err(_) => {
-                self.calc_alarm = true;
-            }
+            Ok(v) => self.val = v,
+            Err(_) => self.calc_alarm = true,
         }
         self.advance_prev_inputs();
 
@@ -823,7 +820,6 @@ impl Record for CalcRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
-            "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
             "INPB" => Some(EpicsValue::String(self.inpb.clone().into())),
             "INPC" => Some(EpicsValue::String(self.inpc.clone().into())),
@@ -1472,6 +1468,26 @@ impl Record for CalcRecord {
 
     fn set_fetch_gate_failed(&mut self, failed: bool) {
         self.fetch_gate_failed = failed;
+    }
+
+    /// C `calcRecord.c:121-123` — a failed `calcPerform` is
+    /// `recGblSetSevr(prec, CALC_ALARM, INVALID_ALARM)`, raised in `process()`
+    /// BEFORE `checkAlarms(prec)` runs its UDF guard (`:300-303`). So when a
+    /// broken CALC leaves VAL undefined, C reports CALC_ALARM, not UDF_ALARM:
+    /// `recGblSetSevr` is MAXIMIZE (strict `>`), and both are INVALID.
+    ///
+    /// Consuming the flag makes it a per-cycle fact: a cycle whose input fetch
+    /// failed runs no `calcPerform` (`:120`) and therefore raises nothing — the
+    /// stale flag used to re-raise CALC_ALARM on every gated cycle.
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        if std::mem::take(&mut self.calc_alarm) {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::CALC_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                "CALC expression evaluation failed",
+            );
+        }
     }
 }
 

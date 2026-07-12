@@ -18,7 +18,7 @@ use super::link::{
 use super::menu_choices::MenuBound;
 use super::pini::PiniMode;
 use super::record_trait::{
-    CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    AuxPostMask, CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -1844,26 +1844,22 @@ impl RecordInstance {
 
     /// Evaluate alarms based on record type and current value.
     /// Uses rec_gbl_set_sevr to accumulate into nsta/nsev.
+    ///
+    /// CALC_ALARM is NOT raised here. C raises it inside the record's own
+    /// `process()` (`calcRecord.c:121-123`, `calcoutRecord.c:238-241`,
+    /// `sCalcoutRecord.c:357-363`, `aCalcoutRecord.c:304-305`,
+    /// `swaitRecord.c:409-410`), and in the port [`Record::check_alarms`] — which
+    /// runs immediately before this — is that owner. It used to be raised here
+    /// instead, keyed on a hardcoded `rtype` list plus a `CALC_ALARM` pseudo-field
+    /// no DBD declares; swait is what that construction cost: it carried the flag
+    /// but was not on the list, so a failed `calcPerform` alarmed nowhere.
     pub fn evaluate_alarms(&mut self) {
-        use crate::server::recgbl::{self, alarm_status};
+        use crate::server::recgbl;
 
         // Check UDF first
         recgbl::rec_gbl_check_udf(&mut self.common);
 
-        // Check CALC_ALARM for calc/calcout records
         let rtype = self.record.record_type();
-        if rtype == "calc" || rtype == "calcout" || rtype == "scalcout" {
-            // calc_alarm is exposed as a boolean field - check it
-            if let Some(EpicsValue::Char(1)) = self.record.get_field("CALC_ALARM") {
-                recgbl::rec_gbl_set_sevr_msg(
-                    &mut self.common,
-                    alarm_status::CALC_ALARM,
-                    crate::server::record::AlarmSeverity::Invalid,
-                    "CALC expression evaluation failed",
-                );
-            }
-        }
-
         match rtype {
             "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
             | "sub" => {
@@ -2406,11 +2402,10 @@ impl RecordInstance {
         // RBV — C motor `monitor()`, motorRecord.cc:3468-3507) leaves
         // VAL to the generic change-detection loop below.
         let deadband_field = self.record.monitor_deadband_field();
-        // Fields whose change post carries DBE_VALUE only (LOG stripped) —
-        // C `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
-        // scalerRecord.c:478). The deadband field's own post is assembled by
-        // `deadband_post`; this local serves the generic change loop below.
-        let value_only = self.record.value_only_change_fields();
+        // The mask every change-detected aux field posts with — owned by
+        // `AuxPostMask`, the same resolver the `processing.rs` paths use, so
+        // this builder cannot drift from them on what mask a field carries.
+        let aux_post = AuxPostMask::of(self.record.as_ref());
         // The deadband field's post — mask owned by `deadband_post`, the single
         // assembler C's `db_post_events(&prec->val, monitor_mask)` maps to.
         let deadband = self.deadband_post(alarm_bits, include_val, include_archive);
@@ -2504,6 +2499,10 @@ impl RecordInstance {
         // generic change-detection so they are neither double-posted nor
         // spuriously posted. See `Record::event_posted_fields`.
         let event_posted = self.record.event_posted_fields();
+        // The closed set of fields this record's C process()/monitor() posts,
+        // when it declares one — see `Record::process_posted_fields`. A field
+        // outside it is never posted by a process cycle.
+        let process_posted = self.record.process_posted_fields();
         let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2513,6 +2512,7 @@ impl RecordInstance {
                 && field != "AMSG"
                 && field != "UDF"
                 && !event_posted.contains(&field.as_str())
+                && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
             {
                 if let Some(val) = self.resolve_field(field) {
                     let changed = match self.last_posted.get(field) {
@@ -2535,15 +2535,7 @@ impl RecordInstance {
                             sub_updates.push((field.clone(), val, deadband_mask));
                         }
                     } else if changed {
-                        // A value-only field posts DBE_VALUE (+ this
-                        // cycle's alarm bits) without the LOG bit —
-                        // `aux_mask` minus LOG is exactly
-                        // `alarm_bits | DBE_VALUE`.
-                        let mask = if value_only.contains(&field.as_str()) {
-                            alarm_bits | EventMask::VALUE
-                        } else {
-                            aux_mask
-                        };
+                        let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                         sub_updates.push((field.clone(), val, mask));
                     } else if force_fields.contains(&field.as_str()) {
                         // C `monitor()` posts a re-marked field with

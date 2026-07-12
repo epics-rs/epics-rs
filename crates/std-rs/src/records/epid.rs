@@ -966,6 +966,19 @@ impl Record for EpidRecord {
         }
     }
 
+    /// C `epidRecord.c:376` REASSIGNS `monitor_mask = DBE_LOG|DBE_VALUE` after
+    /// VAL's own post, so every secondary the rest of `monitor()` posts
+    /// (:377-406) carries a LITERAL `DBE_VALUE | DBE_LOG` — this cycle's alarm
+    /// bits are discarded, unlike VAL's post (:371), which keeps them. A
+    /// `DBE_ALARM`-only subscriber on `.OVAL`/`.P`/`.I`/... is therefore
+    /// notified on no cycle at all.
+    ///
+    /// C's list is OVAL, P, I, D, CT, DT, ERR, CVAL; `CT` is `DBF_NOACCESS`
+    /// (`epidRecord.dbd:226`) and has no CA-visible field, leaving these seven.
+    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
+        &["OVAL", "P", "I", "D", "DT", "ERR", "CVAL"]
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),

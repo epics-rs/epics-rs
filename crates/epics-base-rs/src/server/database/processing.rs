@@ -5,11 +5,73 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
 use crate::server::record::{
-    InputFetchPolicy, NotifyWaitSet, RecordInstance, ValuePostGate, value_gate,
+    AuxPostMask, InputFetchPolicy, NotifyWaitSet, RecordInstance, ValuePostGate, value_gate,
 };
-use crate::types::EpicsValue;
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::{PvDatabase, apply_timestamp};
+
+/// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
+/// string field a string-input link writes into. The text therefore carries at
+/// most 39 bytes plus the NUL, which is what `epicsSnprintf(..., STRING_SIZE-1,
+/// ...)` and `epicsStrSnPrintEscaped(..., STRING_SIZE-1, ...)` enforce in C.
+const STRING_FIELD_MAX_LEN: usize = 39;
+
+/// Cut a string-link value to the C field width (see [`STRING_FIELD_MAX_LEN`]).
+fn truncate_string_field(s: PvString) -> PvString {
+    let bytes = s.as_bytes();
+    if bytes.len() <= STRING_FIELD_MAX_LEN {
+        return s;
+    }
+    PvString::from_bytes(&bytes[..STRING_FIELD_MAX_LEN])
+}
+
+/// The DBR_STRING view of a [`Record::string_input_links`] source, C
+/// `sCalcoutRecord.c::fetch_values` (895-937).
+///
+/// A `DBF_CHAR`/`DBF_UCHAR` source of more than one element is the one type C
+/// does NOT read as DBR_STRING (which would render element 0 as a number):
+/// it reads the array as text and escapes it with `epicsStrSnPrintEscaped`
+/// (`epicsString.c:230-261`), which is how a string longer than a DBR_STRING —
+/// or one carrying control characters — reaches a string calc. C caps the
+/// request at `STRING_SIZE-1` elements before the get and treats the result as
+/// a C string (`strlen(tmpstr)`), so the source is cut at 39 bytes and at the
+/// first NUL. Every other source type takes the plain `dbGetLink(DBR_STRING)`
+/// branch, i.e. the framework's own `DbFieldType::String` coercion.
+fn string_link_text(value: &EpicsValue) -> PvString {
+    let char_array_bytes = match value {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) if b.len() > 1 => Some(b),
+        _ => None,
+    };
+    if let Some(bytes) = char_array_bytes {
+        let src = &bytes[..bytes.len().min(STRING_FIELD_MAX_LEN)];
+        let src = &src[..src.iter().position(|&b| b == 0).unwrap_or(src.len())];
+        let mut out = String::with_capacity(src.len());
+        for &b in src {
+            match b {
+                0x07 => out.push_str("\\a"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x0b => out.push_str("\\v"),
+                b'\\' => out.push_str("\\\\"),
+                b'\'' => out.push_str("\\'"),
+                b'"' => out.push_str("\\\""),
+                // C `isprint` in the "C" locale: ASCII 0x20..0x7e. Everything
+                // else — including the high half — is escaped `\xHH`.
+                _ if b.is_ascii_graphic() || b == b' ' => out.push(b as char),
+                _ => out.push_str(&format!("\\x{b:02x}")),
+            }
+        }
+        return truncate_string_field(PvString::from(out));
+    }
+    match value.convert_to(DbFieldType::String) {
+        EpicsValue::String(s) => truncate_string_field(s),
+        _ => PvString::new(),
+    }
+}
 
 /// A cancellable, generation-gated handle that re-enters an async record's
 /// `process()` exactly once.
@@ -298,40 +360,6 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
     instance.suppress_subroutine_run = ds.skip_run;
 }
 
-/// The event mask a change-detected AUXILIARY field posts with — the single
-/// owner of that decision, shared by the three snapshot builders (the main
-/// process path, the async-write completion, and `process_local`).
-///
-/// C's usual shape for the "post every input/aux field that changed" loop is
-/// `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400,
-/// motor `DBE_VAL_LOG`) — that is the default. Two record-declared exceptions
-/// narrow it, and they are NOT the same narrowing:
-///
-/// * [`Record::value_only_change_fields`] — C posts a literal `DBE_VALUE`
-///   (tableRecord.c:659, scaler `Sn`): alarm bits + `DBE_VALUE`, never `LOG`.
-/// * [`Record::fields_posted_with_monitor_mask`] — C posts
-///   `monitor_mask | DBE_VALUE` (swaitRecord.c:650): VAL's own monitor mask,
-///   so `DBE_LOG` rides along exactly when VAL's ADEL deadband crossed.
-///
-/// `deadband_mask` is that VAL monitor mask for this cycle (alarm bits, plus
-/// `DBE_VALUE` when MDEL crossed and `DBE_LOG` when ADEL crossed).
-fn aux_change_mask(
-    field: &str,
-    value_only: &[&'static str],
-    monitor_masked: &[&'static str],
-    alarm_bits: crate::server::recgbl::EventMask,
-    deadband_mask: crate::server::recgbl::EventMask,
-) -> crate::server::recgbl::EventMask {
-    use crate::server::recgbl::EventMask;
-    if value_only.contains(&field) {
-        alarm_bits | EventMask::VALUE
-    } else if monitor_masked.contains(&field) {
-        deadband_mask | EventMask::VALUE
-    } else {
-        alarm_bits | EventMask::VALUE | EventMask::LOG
-    }
-}
-
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
 /// the record name with the `.TIME` suffix stripped; otherwise `None`.
 ///
@@ -439,6 +467,14 @@ enum SimOutcome {
     /// forward-link / CP / RPRO tail exactly as `recGblFwdLink` does for a
     /// real process cycle, but skips the (already-substituted) body.
     Simulated,
+    /// Simulated record whose simulation replaces only the INPUT STAGE of its
+    /// body ([`Record::simulation_substitutes_input_stage`]) — swait. The SIOL
+    /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
+    /// have already happened here (C `swaitRecord.c:415-421`, which precedes the
+    /// OOPT switch); the caller runs the record body with its input-link fetch
+    /// suppressed, then the ordinary alarm/monitor/forward-link tail — none of
+    /// which C's simulation branch skips.
+    SimulatedInputStage,
     /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
     /// `writeValue` substitutes the device write with
     /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
@@ -1438,11 +1474,20 @@ impl PvDatabase {
         // `sim_output` carries the OUTPUT redirect (SIOL link, SIMS, RAW
         // flag) from this point to the OUT stage / alarm epilogue below;
         // `None` for a non-simulated record or a simulated INPUT.
+        // The cycle's simulation state, pushed to the record before the body —
+        // the twin of `set_fetch_gate_failed`. Written on EVERY cycle of a record
+        // that declares the input-stage shape (`false` included), so the flag
+        // cannot outlive the cycle it belongs to.
+        let mut sim_input_stage = false;
         let sim_output = match self.check_simulation_mode(&rec).await {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
                 return Ok(());
+            }
+            SimOutcome::SimulatedInputStage => {
+                sim_input_stage = true;
+                None
             }
             SimOutcome::DeferRead(delay) => {
                 // C `readValue`/`writeValue` async path: hold PACT and
@@ -1470,6 +1515,12 @@ impl PvDatabase {
                 raw_mode,
             } => Some((siol, sims, raw_mode)),
         };
+        {
+            let mut instance = rec.write().await;
+            if instance.record.simulation_substitutes_input_stage() {
+                instance.record.set_simulation_active(sim_input_stage);
+            }
+        }
 
         // 1. Read INP link value and DOL link (outside lock)
         let (inp_parsed, is_soft, dol_info) = {
@@ -1863,6 +1914,84 @@ impl PvDatabase {
                     || (link_info.iter().any(|(s, _, _)| !s.is_empty())
                         && resolved_link_fields.is_empty()));
         }
+        // 1.6. String-input link fetch — C `sCalcoutRecord.c::fetch_values`'s
+        // SECOND loop (890-941), over INAA..INLL → AA..LL. It is a separate
+        // loop here for the same reason it is one in C: it does not feed the
+        // fetch gate (`return(0)` at :941, so a failing string link never
+        // suppresses sCalcPerform), a failed read writes a diagnostic INTO the
+        // value field instead of leaving it alone, and a multi-element
+        // DBF_CHAR/DBF_UCHAR source is read as escaped text. See
+        // `Record::string_input_links`.
+        let string_input_values: Vec<(String, EpicsValue)>;
+        {
+            let link_info: Vec<(String, &'static str)> = {
+                let instance = rec.read().await;
+                instance
+                    .record
+                    .string_input_links()
+                    .iter()
+                    .map(|(lf, vf)| {
+                        let link_str = instance
+                            .record
+                            .get_field(lf)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        (link_str.as_str_lossy().into_owned(), *vf)
+                    })
+                    .collect()
+            }; // read lock dropped
+            let mut results = Vec::with_capacity(link_info.len());
+            for (link_str, val_field) in &link_info {
+                // C (:895-911): an unset link is neither CA_LINK nor DB_LINK, so
+                // neither `dbGetLink` branch runs, `status` stays 0, and the
+                // string field keeps whatever was last put to it.
+                if link_str.is_empty() {
+                    continue;
+                }
+                let parsed = crate::server::record::parse_link_v2(link_str);
+                if let crate::server::record::ParsedLink::Db(ref db) = parsed {
+                    self.process_passive_db_source(db, visited, depth).await;
+                }
+                let (value, alarm) = self.read_link_with_alarm(&parsed).await;
+                if let Some(alarm) = alarm {
+                    match &parsed {
+                        crate::server::record::ParsedLink::Db(db) => {
+                            link_alarms.push((db.monitor_switch, alarm));
+                        }
+                        crate::server::record::ParsedLink::Ca(ca) => {
+                            link_alarms.push((ca.monitor_switch, alarm));
+                        }
+                        crate::server::record::ParsedLink::Pva(_)
+                        | crate::server::record::ParsedLink::PvaJson(_) => {
+                            link_alarms.push((
+                                crate::server::record::MonitorSwitch::MaximizeStatus,
+                                alarm,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let text = match value {
+                    Some(value) => string_link_text(&value),
+                    // C (:939-940): `epicsSnprintf(*psvalue, STRING_SIZE-1,
+                    // "%s:fetch(%s) failed", pcalc->name, sFldnames[i])` — the
+                    // failed fetch REPLACES the value with the diagnostic; the
+                    // previous string is not kept, and the record still computes.
+                    None => truncate_string_field(PvString::from(format!(
+                        "{name}:fetch({val_field}) failed"
+                    ))),
+                };
+                results.push((val_field.to_string(), EpicsValue::String(text)));
+            }
+            string_input_values = results;
+        }
+
         // PR #d0cf47c continued: feed the INP alarm (if any) into the
         // same `link_alarms` list the lock-section iterates over. Order
         // doesn't matter — `rec_gbl_set_sevr_msg` takes the maximum
@@ -2027,6 +2156,14 @@ impl PvDatabase {
                         .record
                         .put_field("SELN", EpicsValue::UShort(f as u16));
                 }
+            }
+
+            // Apply the string-input values (scalcout INAA..INLL -> AA..LL),
+            // fetched in step 1.6 above. `put_field_internal` is the coercion
+            // owner: it converts to the target field's declared `DbFieldType`,
+            // which is `String` for every one of these.
+            for (val_field, value) in string_input_values {
+                let _ = instance.record.put_field_internal(&val_field, value);
             }
 
             // Device support read (input records only, not output records)
@@ -2873,15 +3010,10 @@ impl PvDatabase {
             // change-detection loop below — an unchanged setpoint is
             // not re-posted on every readback poll.
             let deadband_field = instance.record.monitor_deadband_field();
-            // Fields whose change post carries DBE_VALUE only (LOG
-            // stripped) — C `db_post_events(field, DBE_VALUE)` literal
-            // (e.g. scaler VAL, scalerRecord.c:478). The deadband field's own
-            // post is assembled by `deadband_post`; this serves the generic
-            // change loop below.
-            let value_only = instance.record.value_only_change_fields();
-            // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
-            // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
-            let monitor_masked = instance.record.fields_posted_with_monitor_mask();
+            // The mask every change-detected aux field posts with — owned by
+            // `AuxPostMask`, the single resolver of the record's declared
+            // narrowings of C's default `monitor_mask | DBE_VALUE | DBE_LOG`.
+            let aux_post = AuxPostMask::of(instance.record.as_ref());
             // The deadband field's post — mask owned by `deadband_post`, the
             // single assembler for C's `db_post_events(&prec->val, monitor_mask)`.
             let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
@@ -2927,6 +3059,10 @@ impl PvDatabase {
             // Event-driven posts (HASH on a content-hash change) — excluded
             // from generic change-detection (see `event_posted_fields`).
             let event_posted = instance.record.event_posted_fields();
+            // The closed set of fields this record's C process()/monitor()
+            // posts, when it declares one — see `Record::process_posted_fields`.
+            // A field outside it is never posted by a process cycle.
+            let process_posted = instance.record.process_posted_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -2936,6 +3072,7 @@ impl PvDatabase {
                     && field != "AMSG"
                     && field != "UDF"
                     && !event_posted.contains(&field.as_str())
+                    && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
                 {
                     if let Some(val) = instance.resolve_field(field) {
                         let changed = match instance.last_posted.get(field) {
@@ -2959,13 +3096,7 @@ impl PvDatabase {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
-                            let mask = aux_change_mask(
-                                field,
-                                value_only,
-                                monitor_masked,
-                                alarm_bits,
-                                deadband_mask,
-                            );
+                            let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                             sub_updates.push((field.clone(), val, mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
@@ -3632,7 +3763,7 @@ impl PvDatabase {
     ///   (bypasses read-only checks via put_field_internal)
     /// - WriteDbLink: writes a value to a linked PV
     /// - ReprocessAfter: schedules a delayed re-process via tokio::spawn
-    async fn execute_process_actions(
+    pub(super) async fn execute_process_actions(
         &self,
         record_name: &str,
         rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
@@ -3997,15 +4128,10 @@ impl PvDatabase {
             // (motor RBV) leaves VAL to the generic change-detection
             // loop below.
             let deadband_field = instance.record.monitor_deadband_field();
-            // Fields whose change post carries DBE_VALUE only (LOG
-            // stripped) — C `db_post_events(field, DBE_VALUE)` literal
-            // (e.g. scaler VAL, scalerRecord.c:478). The deadband field's own
-            // post is assembled by `deadband_post`; this serves the generic
-            // change loop below.
-            let value_only = instance.record.value_only_change_fields();
-            // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
-            // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
-            let monitor_masked = instance.record.fields_posted_with_monitor_mask();
+            // The mask every change-detected aux field posts with — owned by
+            // `AuxPostMask`, the single resolver of the record's declared
+            // narrowings of C's default `monitor_mask | DBE_VALUE | DBE_LOG`.
+            let aux_post = AuxPostMask::of(instance.record.as_ref());
             // The deadband field's post — mask owned by `deadband_post`, the
             // single assembler for C's `db_post_events(&prec->val, monitor_mask)`.
             let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
@@ -4087,6 +4213,10 @@ impl PvDatabase {
             // Event-driven posts (HASH on a content-hash change) — excluded
             // from generic change-detection (see `event_posted_fields`).
             let event_posted = instance.record.event_posted_fields();
+            // The closed set of fields this record's C process()/monitor()
+            // posts, when it declares one — see `Record::process_posted_fields`.
+            // A field outside it is never posted by a process cycle.
+            let process_posted = instance.record.process_posted_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -4096,6 +4226,7 @@ impl PvDatabase {
                     && field != "AMSG"
                     && field != "UDF"
                     && !event_posted.contains(&field.as_str())
+                    && process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))
                 {
                     if let Some(val) = instance.resolve_field(field) {
                         let changed = match instance.last_posted.get(field) {
@@ -4119,13 +4250,7 @@ impl PvDatabase {
                                 sub_updates.push((field.clone(), val, deadband_mask));
                             }
                         } else if changed {
-                            let mask = aux_change_mask(
-                                field,
-                                value_only,
-                                monitor_masked,
-                                alarm_bits,
-                                deadband_mask,
-                            );
+                            let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                             sub_updates.push((field.clone(), val, mask));
                         } else if force_fields.contains(&field.as_str()) {
                             // C `monitor()` posts a re-marked field with
@@ -4718,9 +4843,13 @@ impl PvDatabase {
     /// processing should proceed.
     async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
         // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
-        let (siml_link, siol_link, sims, sdly, _rtype, is_input, pact_held) = {
+        let (siml_link, siol_link, sims, sdly, _rtype, is_input, input_stage, pact_held) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
+            // swait: the simulation replaces the record's input STAGE, not its
+            // whole cycle. Declared by the record, not by a type-name list —
+            // the classification is a property of where C put the SIOL read.
+            let input_stage = instance.record.simulation_substitutes_input_stage();
             // C `prec->pact` at process entry — the value every readValue/
             // writeValue simulation guard keys on. The framework holds the
             // `processing` flag across an async wait owned by PACT (the SDLY
@@ -4772,20 +4901,21 @@ impl PvDatabase {
             // writes VAL out to SIOL, which the OUTPUT redirect (`!is_input` ->
             // `RedirectOutputToSiol` -> `write_simulated_output_siol`, VAL array
             // -> SIOL) already reproduces.
-            let is_input = matches!(
-                rtype.as_str(),
-                "ai" | "bi"
-                    | "mbbi"
-                    | "mbbiDirect"
-                    | "longin"
-                    | "int64in"
-                    | "stringin"
-                    | "lsi"
-                    | "event"
-                    | "waveform"
-                    | "histogram"
-                    | "aai"
-            );
+            let is_input = input_stage
+                || matches!(
+                    rtype.as_str(),
+                    "ai" | "bi"
+                        | "mbbi"
+                        | "mbbiDirect"
+                        | "longin"
+                        | "int64in"
+                        | "stringin"
+                        | "lsi"
+                        | "event"
+                        | "waveform"
+                        | "histogram"
+                        | "aai"
+                );
 
             let siml = instance
                 .record
@@ -4856,6 +4986,7 @@ impl PvDatabase {
                 sdly,
                 rtype,
                 is_input,
+                input_stage,
                 pact_held,
             )
         };
@@ -4926,6 +5057,45 @@ impl PvDatabase {
         // the synchronous branch below.
         if !pact_held && sdly >= 0.0 {
             return SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly));
+        }
+
+        // INPUT-STAGE record (swait). C `swaitRecord.c:415-421`:
+        //
+        // ```c
+        // } else {      /* SIMULATION MODE */
+        //     status = dbGetLink(&(pwait->siol),DBR_DOUBLE,&(pwait->sval),0,0);
+        //     if (status==0) {
+        //         pwait->val=pwait->sval;
+        //         pwait->udf=FALSE;
+        //     }
+        //     recGblSetSevr(pwait,SIMM_ALARM,pwait->sims);
+        // }
+        // ```
+        //
+        // The read substitutes `fetch_values()` + `calcPerform()` and nothing
+        // else, so this performs exactly those four lines and hands the cycle
+        // back: the OOPT switch, `execOutput`, the monitors and the forward link
+        // all still come from the record's own `process()`. SIMM_ALARM goes into
+        // the PENDING alarm (`rec_gbl_set_sevr` is C's MAXIMIZE) before the body
+        // runs, so a body-raised alarm maximizes against it exactly as in C.
+        if input_stage {
+            let siol_val = self.read_link_value_no_process(&siol_link).await;
+            let mut instance = rec.write().await;
+            // C `:417-420` — a FAILED read changes neither VAL nor UDF; only the
+            // SIMM_ALARM below is unconditional.
+            if let Some(siol_val) = siol_val {
+                let sval = EpicsValue::Double(siol_val.to_f64().unwrap_or(0.0));
+                let _ = instance.record.put_field_internal("SVAL", sval.clone());
+                let _ = instance.record.set_val(sval);
+                instance.common.udf = false;
+            }
+            let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
+            crate::server::recgbl::rec_gbl_set_sevr(
+                &mut instance.common,
+                crate::server::recgbl::alarm_status::SIMM_ALARM,
+                sev,
+            );
+            return SimOutcome::SimulatedInputStage;
         }
 
         // OUTPUT record: C `writeValue` substitutes the device write with the
@@ -5132,14 +5302,10 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
         }
     };
     let deadband_field = instance.record.monitor_deadband_field();
-    // Fields whose change post carries DBE_VALUE only (LOG stripped) — C
-    // `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
-    // scalerRecord.c:478). The deadband field's own post is assembled by
-    // `deadband_post`; this serves the generic change loop below.
-    let value_only = instance.record.value_only_change_fields();
-    // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
-    // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
-    let monitor_masked = instance.record.fields_posted_with_monitor_mask();
+    // The mask every change-detected aux field posts with — owned by
+    // `AuxPostMask`, the single resolver of the record's declared narrowings of
+    // C's default `monitor_mask | DBE_VALUE | DBE_LOG`.
+    let aux_post = AuxPostMask::of(instance.record.as_ref());
     // The deadband field's post — mask owned by `deadband_post`, the single
     // assembler for C's `db_post_events(&prec->val, monitor_mask)`.
     let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
@@ -5210,13 +5376,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                         sub_updates.push((field.clone(), val, deadband_mask));
                     }
                 } else if changed {
-                    let mask = aux_change_mask(
-                        field,
-                        value_only,
-                        monitor_masked,
-                        alarm_bits,
-                        deadband_mask,
-                    );
+                    let mask = aux_post.mask_for(field, alarm_bits, deadband_mask);
                     sub_updates.push((field.clone(), val, mask));
                 } else if force_fields.contains(&field.as_str()) {
                     // C `monitor()` posts a re-marked field with

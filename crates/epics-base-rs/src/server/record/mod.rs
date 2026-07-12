@@ -25,10 +25,10 @@ pub use menu_choices::{
 };
 pub use pini::PiniMode;
 pub use record_instance::{NotifyWaitSet, RecordInstance};
-pub(crate) use record_trait::value_gate;
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,
     FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessContext, ProcessOutcome,
     ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
 };
+pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanType, SimModeScan};

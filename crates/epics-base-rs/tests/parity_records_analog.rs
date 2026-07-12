@@ -378,6 +378,17 @@ fn l3_ai_linear_linr_no_bpt_alarm() {
 
 // ─── S1 / S2: scalcout raises CALC_ALARM on broken CALC / OCAL ───────
 
+/// The alarm the record RAISES, read out of the pending `nsta`/`nsev` its
+/// `check_alarms` writes — C's `checkAlarms()`, which the framework calls every
+/// cycle. (This used to be a `CALC_ALARM` pseudo-field no DBD declares; see
+/// R10-67.)
+fn calc_alarm_raised(r: &mut dyn Record) -> bool {
+    let mut common = CommonFields::default();
+    r.check_alarms(&mut common);
+    common.nsta == epics_base_rs::server::recgbl::alarm_status::CALC_ALARM
+        && common.nsev == AlarmSeverity::Invalid
+}
+
 #[test]
 fn s1_scalcout_invalid_calc_raises_calc_alarm() {
     let mut r = ScalcoutRecord::new();
@@ -385,20 +396,15 @@ fn s1_scalcout_invalid_calc_raises_calc_alarm() {
     r.special("CALC", true).unwrap();
     r.put_field("A", EpicsValue::Double(5.0)).unwrap();
     r.process().unwrap();
-    assert_eq!(
-        r.get_field("CALC_ALARM"),
-        Some(EpicsValue::Char(0)),
-        "valid CALC: no alarm"
-    );
+    assert!(!calc_alarm_raised(&mut r), "valid CALC: no alarm");
     // A failed sCalcPerform must raise CALC_ALARM. Force the calc into a
     // value-stack-underflow state: a bare binary operator with no
     // operands fails at eval time.
     r.put_field("CALC", EpicsValue::String("+".into())).unwrap();
     r.special("CALC", true).unwrap();
     r.process().unwrap();
-    assert_eq!(
-        r.get_field("CALC_ALARM"),
-        Some(EpicsValue::Char(1)),
+    assert!(
+        calc_alarm_raised(&mut r),
         "broken CALC expression raises CALC_ALARM"
     );
 }
@@ -413,9 +419,8 @@ fn s2_scalcout_invalid_ocal_raises_calc_alarm() {
     r.put_field("OCAL", EpicsValue::String("+".into())).unwrap();
     r.special("OCAL", true).unwrap();
     r.process().unwrap();
-    assert_eq!(
-        r.get_field("CALC_ALARM"),
-        Some(EpicsValue::Char(1)),
+    assert!(
+        calc_alarm_raised(&mut r),
         "broken OCAL expression raises CALC_ALARM"
     );
 }

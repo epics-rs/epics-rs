@@ -733,6 +733,40 @@ fn format_int_wide(decimal: String, bits: u64, style: IntStyle) -> String {
     }
 }
 
+/// C `sscanf(optarg, "%d", &n)` semantics, shared by every CA tool that
+/// scans a numeric option argument: skip leading whitespace, accept an
+/// optional sign, then take the leading run of decimal digits — trailing junk
+/// is ignored (`"16x"` → `16`, `"0x10"` → `0`). `None` is C's `sscanf`
+/// returning 0, i.e. no digit leads.
+///
+/// The tools branch on exactly that return: `caget -d` falls through to the
+/// textual `dbr_text_to_type` lookup (`caget.c:416-421`), while `-#` prints
+/// "not a valid array element count" and keeps going (`caget.c:445-450`,
+/// `caput.c:336-343`).
+pub fn scan_leading_i64(s: &str) -> Option<i64> {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut neg = false;
+    if let Some(&c) = bytes.first()
+        && (c == b'+' || c == b'-')
+    {
+        neg = c == b'-';
+        i = 1;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    s[start..i]
+        .parse::<i64>()
+        .ok()
+        .map(|n| if neg { -n } else { n })
+}
+
 /// `printf`'s default precision for `%e` / `%f` / `%g` when the conversion
 /// carries none — 6 (C99 7.19.6.1). C's `dblFormatStr` starts as `"%g"`
 /// (`tool_lib.c:53`) and the `FMT_GR` / `FMT_CTRL` limit macros hardcode a

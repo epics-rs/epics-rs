@@ -4,8 +4,8 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
     CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, base_style,
-    ca_error_marker, dbr_value_field_type, format_c_g, format_value, sevr_to_str, stat_to_str,
-    zero_dbr_snapshot, zero_dbr_value,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_value, scan_leading_i64, sevr_to_str,
+    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -1009,35 +1009,6 @@ async fn main() {
     if n_conn == 0 {
         std::process::exit(1);
     }
-}
-
-/// C `sscanf(optarg, "%d", &type)` semantics: skip leading whitespace,
-/// accept an optional sign, then take the leading run of decimal digits
-/// — trailing junk is ignored (`"16x"` → `16`, `"0x10"` → `0`). Returns
-/// `None` when no digit leads (C's `sscanf` returns 0, so `caget` falls
-/// through to the textual `dbr_text_to_type` lookup).
-fn scan_leading_i64(s: &str) -> Option<i64> {
-    let s = s.trim_start();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut neg = false;
-    if let Some(&c) = bytes.first()
-        && (c == b'+' || c == b'-')
-    {
-        neg = c == b'-';
-        i = 1;
-    }
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    s[start..i]
-        .parse::<i64>()
-        .ok()
-        .map(|n| if neg { -n } else { n })
 }
 
 /// resolve a `caget -d <type>` token to an EXACT DBR type code,

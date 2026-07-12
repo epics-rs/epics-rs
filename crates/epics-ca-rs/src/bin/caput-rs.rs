@@ -3,8 +3,8 @@ use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str,
-    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, scan_leading_i64,
+    sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
@@ -202,6 +202,21 @@ struct Args {
     #[arg(short = 'a', long = "array", overrides_with = "long_string")]
     array_mode: bool,
 
+    /// Vestigial array element count. C's getopt string accepts `-# <n>`
+    /// (`caput.c:290`, `":cnlhatsVS#:w:p:F:"`) and scans it into `count`
+    /// (`:336-343`), but `count` is OVERWRITTEN unconditionally before the
+    /// put — with `argc - optind` in `-a` array mode (`:418`) and with `1` in
+    /// scalar mode (`:441`) — so the value never reaches the wire, the
+    /// readback element count, or the output. Accepted here for the same
+    /// reason C accepts it: `caput -# 3 PV 1` must not fail, and clap
+    /// otherwise exits 2 on the unknown flag.
+    ///
+    /// Held as a raw `String` so a non-numeric argument reproduces C's
+    /// `sscanf`-failure warning ([`Args::warn_bad_element_count`]) instead of
+    /// clap's own parse error.
+    #[arg(short = '#', long = "max-elements", value_name = "COUNT")]
+    max_elements: Option<String>,
+
     /// Alternate output field separator.
     #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
     field_separator: Option<char>,
@@ -217,9 +232,30 @@ struct Args {
     values: Vec<String>,
 }
 
+impl Args {
+    /// C `caput.c:336-343`: `-#` scans its argument with `sscanf("%d")` and,
+    /// on failure, warns and falls back to `count = 0`. The count is dead
+    /// either way (see [`Args::max_elements`]), so this warning is the flag's
+    /// ONLY observable effect — reproduce it rather than swallow the argument
+    /// silently. `None` when `-#` was absent or its argument scanned.
+    fn warn_bad_element_count_text(&self) -> Option<String> {
+        let raw = self.max_elements.as_deref()?;
+        if scan_leading_i64(raw).is_some() {
+            return None;
+        }
+        Some(format!(
+            "'{raw}' is not a valid array element count - ignored. ('caput -h' for help.)"
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    // C warns inside its getopt loop, before any of the work below.
+    if let Some(warning) = args.warn_bad_element_count_text() {
+        eprintln!("{warning}");
+    }
 
     if args.version {
         println!("{VERSION_INFO}");
@@ -934,6 +970,45 @@ mod tests {
 
     fn menu_vals(s: &[&str]) -> Vec<epics_ca_rs::PvString> {
         s.iter().map(|x| (*x).into()).collect()
+    }
+
+    /// C's getopt string accepts `-# <n>` (`caput.c:290`) and scans it into
+    /// `count` (`:336-343`), but `count` is then overwritten unconditionally —
+    /// `argc - optind` in `-a` mode (`:418`), `1` in scalar mode (`:441`) — so
+    /// the flag is vestigial: it must PARSE, and it must change nothing.
+    ///
+    /// Pre-fix caput-rs had no `-#` at all, so clap exited 2 on the unknown
+    /// flag where C runs the put.
+    #[test]
+    fn hash_flag_is_accepted_and_ignored() {
+        // Scalar: `-# 3` parses, and the value list is untouched.
+        let a = Args::try_parse_from(["caput", "-#", "3", "PV", "42"])
+            .expect("C's getopt accepts -# (caput.c:290); clap must too");
+        assert_eq!(a.max_elements.as_deref(), Some("3"));
+        assert_eq!(a.pv_name.as_deref(), Some("PV"));
+        assert_eq!(a.values, vals(&["42"]));
+        // The count that reaches the wire comes from the values, never from
+        // `-#` — C overwrites it at caput.c:441.
+        assert!(a.warn_bad_element_count_text().is_none());
+
+        // Array mode: `-# 1` must not truncate the 3-element write.
+        let a = Args::try_parse_from(["caput", "-a", "-#", "1", "WF", "3", "1", "2", "3"])
+            .expect("-# parses alongside -a");
+        assert!(a.array_mode);
+        assert_eq!(a.values, vals(&["3", "1", "2", "3"]));
+
+        // A non-numeric argument: C's `sscanf` fails, warns, and keeps going
+        // (caput.c:337-342). It must NOT be a hard error.
+        let a = Args::try_parse_from(["caput", "-#", "abc", "PV", "42"])
+            .expect("C warns on a bad -# argument, it does not exit");
+        assert_eq!(
+            a.warn_bad_element_count_text().as_deref(),
+            Some("'abc' is not a valid array element count - ignored. ('caput -h' for help.)")
+        );
+        // C's `sscanf("%d")` takes a LEADING integer and ignores the tail, so
+        // `3x` scans fine and warns nothing.
+        let a = Args::try_parse_from(["caput", "-#", "3x", "PV", "42"]).expect("leading digits");
+        assert!(a.warn_bad_element_count_text().is_none());
     }
 
     /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two

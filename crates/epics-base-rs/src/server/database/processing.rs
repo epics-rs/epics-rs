@@ -2824,33 +2824,19 @@ impl PvDatabase {
             let deadband_field = instance.record.monitor_deadband_field();
             // Fields whose change post carries DBE_VALUE only (LOG
             // stripped) — C `db_post_events(field, DBE_VALUE)` literal
-            // (e.g. scaler VAL, scalerRecord.c:478). Consulted here and in
-            // the generic change loop below.
+            // (e.g. scaler VAL, scalerRecord.c:478). The deadband field's own
+            // post is assembled by `deadband_post`; this serves the generic
+            // change loop below.
             let value_only = instance.record.value_only_change_fields();
             // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
             // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
             let monitor_masked = instance.record.fields_posted_with_monitor_mask();
-            let deadband_mask = {
-                let mut m = alarm_bits;
-                if include_val {
-                    m |= EventMask::VALUE;
-                }
-                // A value-only field's archive (ADEL) LOG bit is dropped —
-                // C posts it with a literal DBE_VALUE on a value change.
-                if include_archive && !value_only.contains(&deadband_field) {
-                    m |= EventMask::LOG;
-                }
-                m
-            };
-            if !deadband_mask.is_empty() {
-                let dval = if deadband_field == "VAL" {
-                    instance.record.val()
-                } else {
-                    instance.resolve_field(deadband_field)
-                };
-                if let Some(val) = dval {
-                    changed_fields.push((deadband_field.to_string(), val, deadband_mask));
-                }
+            // The deadband field's post — mask owned by `deadband_post`, the
+            // single assembler for C's `db_post_events(&prec->val, monitor_mask)`.
+            let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
+            let deadband_mask = deadband.mask;
+            if let Some((field, value)) = deadband.field {
+                changed_fields.push((field, value, deadband_mask));
             }
             // Add subscribed fields that actually changed since last
             // notification. The deadband-gated field is excluded — it is
@@ -3962,33 +3948,19 @@ impl PvDatabase {
             let deadband_field = instance.record.monitor_deadband_field();
             // Fields whose change post carries DBE_VALUE only (LOG
             // stripped) — C `db_post_events(field, DBE_VALUE)` literal
-            // (e.g. scaler VAL, scalerRecord.c:478). Consulted here and in
-            // the generic change loop below.
+            // (e.g. scaler VAL, scalerRecord.c:478). The deadband field's own
+            // post is assembled by `deadband_post`; this serves the generic
+            // change loop below.
             let value_only = instance.record.value_only_change_fields();
             // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
             // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
             let monitor_masked = instance.record.fields_posted_with_monitor_mask();
-            let deadband_mask = {
-                let mut m = alarm_bits;
-                if include_val {
-                    m |= EventMask::VALUE;
-                }
-                // A value-only field's archive (ADEL) LOG bit is dropped —
-                // C posts it with a literal DBE_VALUE on a value change.
-                if include_archive && !value_only.contains(&deadband_field) {
-                    m |= EventMask::LOG;
-                }
-                m
-            };
-            if !deadband_mask.is_empty() {
-                let dval = if deadband_field == "VAL" {
-                    instance.record.val()
-                } else {
-                    instance.resolve_field(deadband_field)
-                };
-                if let Some(val) = dval {
-                    changed_fields.push((deadband_field.to_string(), val, deadband_mask));
-                }
+            // The deadband field's post — mask owned by `deadband_post`, the
+            // single assembler for C's `db_post_events(&prec->val, monitor_mask)`.
+            let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
+            let deadband_mask = deadband.mask;
+            if let Some((field, value)) = deadband.field {
+                changed_fields.push((field, value, deadband_mask));
             }
             // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
             // field with its OWN per-field mask. Mirror the synchronous
@@ -5111,34 +5083,19 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     let deadband_field = instance.record.monitor_deadband_field();
     // Fields whose change post carries DBE_VALUE only (LOG stripped) — C
     // `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
-    // scalerRecord.c:478). Consulted here and in the generic change loop
-    // below.
+    // scalerRecord.c:478). The deadband field's own post is assembled by
+    // `deadband_post`; this serves the generic change loop below.
     let value_only = instance.record.value_only_change_fields();
     // Aux fields C posts with `monitor_mask | DBE_VALUE` (swait A..L,
     // swaitRecord.c:650) instead of the forced `| DBE_VALUE | DBE_LOG`.
     let monitor_masked = instance.record.fields_posted_with_monitor_mask();
-    let deadband_mask = {
-        let mut m = alarm_bits;
-        if include_val {
-            m |= EventMask::VALUE;
-        }
-        // A value-only field's archive (ADEL) LOG bit is dropped — C
-        // posts it with a literal DBE_VALUE on a value change.
-        if include_archive && !value_only.contains(&deadband_field) {
-            m |= EventMask::LOG;
-        }
-        m
-    };
+    // The deadband field's post — mask owned by `deadband_post`, the single
+    // assembler for C's `db_post_events(&prec->val, monitor_mask)`.
+    let deadband = instance.deadband_post(alarm_bits, include_val, include_archive);
+    let deadband_mask = deadband.mask;
     let mut changed_fields = Vec::new();
-    if !deadband_mask.is_empty() {
-        let dval = if deadband_field == "VAL" {
-            instance.record.val()
-        } else {
-            instance.resolve_field(deadband_field)
-        };
-        if let Some(val) = dval {
-            changed_fields.push((deadband_field.to_string(), val, deadband_mask));
-        }
+    if let Some((field, value)) = deadband.field {
+        changed_fields.push((field, value, deadband_mask));
     }
 
     let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;

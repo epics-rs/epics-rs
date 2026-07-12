@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+use epics_pva_rs::pvdata::{FieldDesc, NoConvert, PvField, PvStructure, ScalarValue, convert};
 use epics_pva_rs::server_native::source::RemoteLog;
 
 use super::monitor::BridgeMonitor;
@@ -74,79 +74,50 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
     }
 }
 
-/// Which arm of pvxs's `record._options.DBE` switch a field lands in.
-///
-/// pvxs dispatches DBE on the field's *kind* — `fld.type().kind()`
-/// (singlesource.cpp:118), the class nibble of the type code, `code & 0xe0`
-/// (data.h:141-147, 197) — not on its concrete scalar type. Exactly two arms
-/// of that switch read a value:
-///
-/// * `Kind::String` → the sloppy substring scan (`:119-133`);
-/// * `Kind::Integer` / `Kind::Real` → `dbe = fld.as<uint8_t>()` (`:134-137`).
-///
-/// EVERY other kind — `Kind::Bool` included — hits `default: break` (`:138-139`)
-/// with `dbe` still 0, so the value-class mask leaves nothing and the
-/// `DBE_VALUE | DBE_ALARM` fallback applies (`:141-144`). `Value::as<uint8_t>()`
-/// *could* convert bool storage (data.cpp:428-435) — pvxs simply never calls it
-/// for a bool.
-///
-/// Modelling that switch as one exhaustive match is what stops a kind from
-/// leaking into the numeric arm. Two already have: the string kind (fixed in
-/// R7-34) and then `Boolean` (R9-31) — `DBE=true` mapped to `true as u8` = 1 =
-/// DBE_VALUE, so the client negotiated a VALUE-only subscription and never saw
-/// the alarm-only transitions pvxs delivers. A new `ScalarValue` variant now
-/// forces a decision here instead of silently taking the numeric path.
-enum DbeKind<'a> {
-    /// `Kind::String`.
-    Text(std::borrow::Cow<'a, str>),
-    /// `Kind::Integer` / `Kind::Real`. The narrowing `as u8` reproduces C's
-    /// `(uint8_t)` truncation in `copyOutScalar` (data.cpp:402-416); DBE bits
-    /// live in the low nibble, so the high bits pvxs discards are irrelevant.
-    Numeric(u8),
-    /// pvxs's `default: break` — this kind selects no DBE bit at all.
-    Unselected,
-}
-
-fn dbe_kind(sv: &ScalarValue) -> DbeKind<'_> {
-    match sv {
-        // Kind::String
-        ScalarValue::String(s) => DbeKind::Text(s.as_str_lossy()),
-        // Kind::Integer
-        ScalarValue::Byte(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::Short(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::Int(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::Long(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::UByte(n) => DbeKind::Numeric(*n),
-        ScalarValue::UShort(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::UInt(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::ULong(n) => DbeKind::Numeric(*n as u8),
-        // Kind::Real
-        ScalarValue::Float(n) => DbeKind::Numeric(*n as u8),
-        ScalarValue::Double(n) => DbeKind::Numeric(*n as u8),
-        // Kind::Bool — pvxs's `default: break`, NOT the numeric arm.
-        ScalarValue::Boolean(_) => DbeKind::Unselected,
-    }
-}
-
 /// parse `record._options.DBE` from a MONITOR INIT pvRequest into the
-/// value-subscription mask. Returns `None` only when the option is
+/// value-subscription mask. `Ok(None)` only when the option is
 /// absent; a present option always resolves to a non-empty value-class
 /// mask (pvxs's `VALUE|ALARM` fallback applies when nothing in the
 /// value class is selected).
+///
+/// pvxs dispatches DBE on the field's KIND — `fld.type().kind()`
+/// (singlesource.cpp:118), the class nibble of the type code (`code & 0xe0`,
+/// data.h:140-147) — and then CONVERTS. Exactly two arms read a value:
+///
+/// * `Kind::String` → `fld.as<std::string>()`, then the sloppy substring scan
+///   (`:119-133`);
+/// * `Kind::Integer` / `Kind::Real` → `dbe = fld.as<uint8_t>()` (`:134-137`).
+///
+/// Every other kind — `Kind::Bool` and `Kind::Compound` (struct / union / any)
+/// included — hits `default: break` (`:138-139`) with `dbe` still 0, so the
+/// value class selects nothing and the `DBE_VALUE | DBE_ALARM` fallback applies
+/// (`:141-144`). `as<uint8_t>()` *could* convert bool storage
+/// (data.cpp:428-435); pvxs simply never calls it for a bool.
+///
+/// Both value-reading arms use the THROWING `as<T>()`, and KIND IS NOT STORAGE:
+/// `Int32A` is `Kind::Integer` but stores as an array, and `Value::copyOut` has
+/// no scalar arm for array storage (`data.cpp:466-499`). So an ARRAY-typed
+/// `DBE` of integer, real, or string element kind reaches the conversion and
+/// raises `NoConvert` — `Err` here, which the caller turns into the circuit
+/// reset pvxs performs (see
+/// [`epics_pva_rs::server_native::source::MonitorRequestFatal`]). A BOOLEAN
+/// array does not: `Kind::Bool` never reaches a conversion. (R9-35 — the port
+/// used to serve VALUE|ALARM for every array.)
 ///
 /// String form mirrors pvxs's "sloppy" substring parse
 /// (singlesource.cpp:122-127): only `VALUE`, `ARCHIVE`, and `ALARM` are
 /// recognized for the value mask. `LOG` is not a recognized spelling,
 /// and `PROPERTY` is deliberately excluded — the property subscription
-/// is separate and unconditional (singlesource.cpp:161-167). Numeric
-/// form (`"5"` or an integer scalar) is masked to the value class the
-/// same way.
+/// is separate and unconditional (singlesource.cpp:161-167).
 ///
 /// `log` is the operation's [`RemoteLog`]: a string DBE that selects
 /// NOTHING in the value class still falls back to `VALUE|ALARM`, but pvxs
 /// tells the client so first (singlesource.cpp:128-130) rather than
 /// letting the fallback pass for an honored request.
-pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Option<u16> {
+pub fn dbe_mask_from_pv_request(
+    request: &PvStructure,
+    log: &RemoteLog,
+) -> Result<Option<u16>, NoConvert> {
     use epics_base_rs::server::recgbl::EventMask;
 
     let options = request
@@ -158,26 +129,35 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
         .and_then(|f| match f {
             PvField::Structure(s) => Some(s),
             _ => None,
-        })?;
-
-    let dbe = options.get_field("DBE")?;
-    // Dispatch on the field's KIND, exactly as pvxs does
-    // (singlesource.cpp:118-140) — see [`DbeKind`]. Every arm converges on the
+        });
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let Some(dbe) = options.get_field("DBE") else {
+        return Ok(None);
+    };
+    // pvxs `switch(fld.type().kind())`, through the shared kind owner
+    // (`convert::kind` IS `Value::type().kind()`). Every arm converges on the
     // single value-class mask + `VALUE|ALARM` fallback below
     // (singlesource.cpp:141-144), so PROPERTY / out-of-class bits are stripped
     // in one place and cannot leak into the value subscription.
-    let raw = match dbe {
-        PvField::Scalar(sv) => match dbe_kind(sv) {
-            DbeKind::Text(s) => s.into_owned(),
-            DbeKind::Numeric(n) => return Some(dbe_value_class_mask(n as u16)),
-            // Kind::Bool: pvxs leaves `dbe` at 0 and takes the fallback. This
-            // is NOT `None` (which the caller reads as "the option is absent")
-            // — the option is present, it just selects nothing.
-            DbeKind::Unselected => return Some(dbe_value_class_mask(0)),
-        },
-        // A non-scalar DBE (structure / union) is `Kind::Compound` in pvxs and
-        // hits the same `default: break` → 0 → VALUE|ALARM fallback.
-        _ => return Some(dbe_value_class_mask(0)),
+    let raw = match convert::kind(dbe) {
+        // `fld.as<std::string>()` — throws on a string ARRAY.
+        convert::Kind::String => convert::as_string(dbe)?,
+        // `dbe = fld.as<uint8_t>()` — throws on an integer / real ARRAY. The
+        // narrowing to `u8` is C's `(uint8_t)` truncation in `copyOutScalar`
+        // (data.cpp:402-416); DBE bits live in the low nibble, so the high bits
+        // pvxs discards are irrelevant.
+        convert::Kind::Integer | convert::Kind::Real => {
+            return Ok(Some(dbe_value_class_mask(u16::from(convert::as_u8(dbe)?))));
+        }
+        // pvxs's `default: break` — Bool and Compound select no DBE bit and
+        // never reach a conversion, so they cannot throw. This is NOT `None`
+        // (which the caller reads as "the option is absent"): the option is
+        // present, it just selects nothing.
+        convert::Kind::Bool | convert::Kind::Compound | convert::Kind::Null => {
+            return Ok(Some(dbe_value_class_mask(0)));
+        }
     };
 
     // A String-typed DBE is NEVER parsed numerically. pvxs switches on the
@@ -233,7 +213,7 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
     if raw_mask == 0 && !raw.is_empty() {
         log.warn(format!("record._options.DBE=\"{raw}\" selects empty mask"));
     }
-    Some(dbe_value_class_mask(raw_mask))
+    Ok(Some(dbe_value_class_mask(raw_mask)))
 }
 
 /// parse `record._options.atomic` from a group operation
@@ -243,12 +223,14 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure, log: &RemoteLog) -> Optio
 ///
 /// pvxs resolves group atomicity with `pvRequest["record._options.atomic"]
 /// .as(atomic)` on both PUT and GET (`groupsource.cpp:203,480`), i.e.
-/// `Value::as<bool>`. Route through the shared [`scalar_as_bool`] owner so
-/// the coercion is identical to `record._options.block`: a bool, any
-/// signed/unsigned integer or real scalar maps by nonzero truthiness, and
-/// a string is accepted only as the exact tokens `"true"` / `"false"`.
-/// Numeric `0` / `1` / `UInt(1)` / `Double(1.0)` therefore override the
-/// group default instead of being silently ignored.
+/// `Value::as(bool&)`. Route through the shared
+/// [`epics_pva_rs::pvdata::convert::as_bool`] owner so the coercion is
+/// identical to `record._options.block` / `process` — and to the native
+/// server's `record._options.pipeline`: a bool, any signed/unsigned integer
+/// or real scalar maps by nonzero truthiness, and a string is accepted only
+/// as the exact tokens `"true"` / `"false"`. Numeric `0` / `1` / `UInt(1)` /
+/// `Double(1.0)` therefore override the group default instead of being
+/// silently ignored.
 pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
     let options = request
         .get_field("record")
@@ -261,10 +243,7 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
             _ => None,
         })?;
 
-    match options.get_field("atomic")? {
-        PvField::Scalar(sv) => scalar_as_bool(sv),
-        _ => None,
-    }
+    convert::as_bool(options.get_field("atomic")?).ok()
 }
 
 /// Map a present `record._options.process` field to a [`ProcessMode`],
@@ -279,11 +258,11 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 ///
 /// `True`/`False`/`Unset` map to Force/Inhibit/Passive here. The `as<bool>`
 /// coercion is the *same* one `record._options.atomic`/`block` use, so it
-/// routes through the shared [`scalar_as_bool`] owner rather than being
-/// re-derived: a bool, any signed/unsigned integer or real scalar maps by
-/// nonzero truthiness (`copyOutScalar` `bool(src)`, src/data.cpp:402-408),
-/// and a string is accepted only as the exact tokens `"true"`/`"false"` —
-/// no trim, case sensitive (src/data.cpp:459-461).
+/// routes through the shared [`epics_pva_rs::pvdata::convert::as_bool`] owner
+/// rather than being re-derived: a bool, any signed/unsigned integer or real
+/// scalar maps by nonzero truthiness (`copyOutScalar` `bool(src)`,
+/// src/data.cpp:402-408), and a string is accepted only as the exact tokens
+/// `"true"`/`"false"` — no trim, case sensitive (src/data.cpp:459-461).
 ///
 /// The third arm is what this function exists for: `"passive"` is a
 /// SUPPORTED spelling of the default and is silent, while a
@@ -293,15 +272,14 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 /// distinction, which is the only thing the client can act on: the PUT it
 /// asked to force will silently not process.
 fn process_mode_from_field(field: &PvField, log: &RemoteLog) -> ProcessMode {
-    if let PvField::Scalar(sv) = field {
-        match scalar_as_bool(sv) {
-            Some(true) => return ProcessMode::Force,
-            Some(false) => return ProcessMode::Inhibit,
-            // NoConvert — pvxs falls through to its `proc.as(s)` check.
-            None => {
-                if matches!(sv, ScalarValue::String(s) if s.as_str_lossy() == "passive") {
-                    return ProcessMode::Passive;
-                }
+    match convert::as_bool(field) {
+        Ok(true) => return ProcessMode::Force,
+        Ok(false) => return ProcessMode::Inhibit,
+        // NoConvert — pvxs falls through to its `proc.as(s)` check.
+        Err(_) => {
+            if matches!(field, PvField::Scalar(ScalarValue::String(s)) if s.as_str_lossy() == "passive")
+            {
+                return ProcessMode::Passive;
             }
         }
     }
@@ -353,41 +331,6 @@ fn render_option_value(field: &PvField) -> String {
     }
 }
 
-/// Coerce a pvRequest scalar to a bool exactly as pvxs `Value::as<bool>`
-/// does. `copyOutScalar` (`src/data.cpp:399-409`) converts a bool, any
-/// signed/unsigned integer (nonzero ⇒ true), or a real to bool; the
-/// string store (`src/data.cpp:459-462`) accepts only the exact tokens
-/// `"true"` / `"false"` (no trim, case-sensitive) and otherwise raises
-/// `NoConvert`. `None` mirrors that `NoConvert` outcome — the caller
-/// keeps its default, matching pvxs `as<bool>(fallback)` returning the
-/// fallback for an absent or unconvertible field.
-///
-/// [`process_mode_from_scalar`] shares this exact `as<bool>` coercion:
-/// pvxs `setForceProcessingFlag` (iocsource.cpp:436) calls the same
-/// `proc.as<bool>`, so the only difference is that it is a tri-state — a
-/// NoConvert outcome (this returning `None`) becomes the passive default
-/// there instead of the caller's bool fallback here.
-fn scalar_as_bool(sv: &ScalarValue) -> Option<bool> {
-    match sv {
-        ScalarValue::Boolean(b) => Some(*b),
-        ScalarValue::Byte(n) => Some(*n != 0),
-        ScalarValue::Short(n) => Some(*n != 0),
-        ScalarValue::Int(n) => Some(*n != 0),
-        ScalarValue::Long(n) => Some(*n != 0),
-        ScalarValue::UByte(n) => Some(*n != 0),
-        ScalarValue::UShort(n) => Some(*n != 0),
-        ScalarValue::UInt(n) => Some(*n != 0),
-        ScalarValue::ULong(n) => Some(*n != 0),
-        ScalarValue::Float(v) => Some(*v != 0.0),
-        ScalarValue::Double(v) => Some(*v != 0.0),
-        ScalarValue::String(s) => match s.as_str_lossy().as_ref() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
-    }
-}
-
 impl PutOptions {
     /// Extract process/block options from a PvStructure.
     ///
@@ -435,10 +378,10 @@ impl PutOptions {
             // only `Boolean`, silently dropping the integer and string
             // forms a PVA client can legally send — so a `block=1` or
             // `block="true"` lost the put-notify completion barrier.
-            if let Some(PvField::Scalar(sv)) = opt_struct.get_field("block") {
-                if let Some(b) = scalar_as_bool(sv) {
-                    opts.block = b;
-                }
+            if let Some(field) = opt_struct.get_field("block")
+                && let Ok(b) = convert::as_bool(field)
+            {
+                opts.block = b;
             }
             // No point blocking if processing is inhibited
             // (singlesource.cpp:350-352: `doWait` is cleared whenever the
@@ -1255,6 +1198,14 @@ mod tests {
         assert!(!opts.block, "block=1 must be cleared when process=false");
     }
 
+    /// Unwrap the DBE mask, asserting the option CONVERTED. An `Err` here is
+    /// pvxs throwing out of `onSubscribe` and resetting the circuit — see
+    /// [`dbe_array_typed_throws_and_resets_the_circuit`].
+    fn dbe_mask(req: &PvStructure, log: &RemoteLog) -> Option<u16> {
+        dbe_mask_from_pv_request(req, log)
+            .expect("DBE must convert; an Err would reset the circuit in pvxs")
+    }
+
     fn req_with_dbe(value: PvField) -> PvStructure {
         let mut options = PvStructure::new("");
         options.fields.push(("DBE".into(), value));
@@ -1274,7 +1225,7 @@ mod tests {
     fn dbe_mask_parses_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("VALUE | ALARM".into())));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1289,7 +1240,7 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
             "DBE_VALUE,DBE_ARCHIVE,PROPERTY".into(),
         )));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(
             mask,
             (EventMask::VALUE | EventMask::LOG).bits(),
@@ -1306,7 +1257,7 @@ mod tests {
     fn dbe_string_property_only_falls_back_to_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("PROPERTY".into())));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1318,7 +1269,7 @@ mod tests {
     fn dbe_string_log_spelling_not_recognized() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("LOG".into())));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1334,8 +1285,7 @@ mod tests {
         let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
         for token in ["alarm", "value", "archive", "value | alarm", "dbe_value"] {
             let req = req_with_dbe(PvField::Scalar(ScalarValue::String(token.into())));
-            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
-                .expect("present option must parse");
+            let mask = dbe_mask(&req, &RemoteLog::default()).expect("present option must parse");
             assert_eq!(
                 mask, fallback,
                 "lowercase DBE token {token:?} matches no uppercase substring, so pvxs falls back to VALUE|ALARM"
@@ -1352,8 +1302,7 @@ mod tests {
     fn dbe_string_uppercase_substring_in_mixed_case_still_selects() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("alarmALARM".into())));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
-            .expect("present option must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("present option must parse");
         assert_eq!(mask, EventMask::ALARM.bits());
     }
 
@@ -1362,7 +1311,7 @@ mod tests {
     #[test]
     fn dbe_mask_accepts_integer_form() {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, 5);
     }
 
@@ -1376,7 +1325,7 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(
             EventMask::PROPERTY.bits() as i32,
         )));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1386,7 +1335,7 @@ mod tests {
     fn dbe_numeric_zero_falls_back_to_value_alarm() {
         use epics_base_rs::server::recgbl::EventMask;
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(0)));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
@@ -1397,7 +1346,7 @@ mod tests {
         use epics_base_rs::server::recgbl::EventMask;
         let raw = (EventMask::VALUE | EventMask::PROPERTY).bits();
         let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(raw as i32)));
-        let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default()).expect("must parse");
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
         assert_eq!(mask, EventMask::VALUE.bits());
     }
 
@@ -1417,7 +1366,7 @@ mod tests {
         for raw in ["0", "1", "2", "7", "8", " 5 "] {
             let log = RemoteLog::default();
             let req = req_with_dbe(PvField::Scalar(ScalarValue::String(raw.into())));
-            let mask = dbe_mask_from_pv_request(&req, &log).expect("must parse");
+            let mask = dbe_mask(&req, &log).expect("must parse");
             assert_eq!(
                 mask, fallback,
                 "a numeric string selects no event class, so DBE={raw:?} falls back to VALUE|ALARM"
@@ -1440,7 +1389,7 @@ mod tests {
     #[test]
     fn dbe_mask_absent_returns_none() {
         let req = PvStructure::new("request");
-        assert!(dbe_mask_from_pv_request(&req, &RemoteLog::default()).is_none());
+        assert!(dbe_mask(&req, &RemoteLog::default()).is_none());
     }
 
     /// A numeric `record._options.DBE`
@@ -1478,7 +1427,7 @@ mod tests {
         for (field, expected) in cases {
             let label = format!("{field:?}");
             let req = req_with_dbe(field);
-            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+            let mask = dbe_mask(&req, &RemoteLog::default())
                 .unwrap_or_else(|| panic!("DBE {label} must coerce to a value-class mask"));
             assert_eq!(
                 mask, expected,
@@ -1508,12 +1457,79 @@ mod tests {
         let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
         for b in [true, false] {
             let req = req_with_dbe(PvField::Scalar(ScalarValue::Boolean(b)));
-            let mask = dbe_mask_from_pv_request(&req, &RemoteLog::default())
+            let mask = dbe_mask(&req, &RemoteLog::default())
                 .expect("a present DBE option always resolves to a mask");
             assert_eq!(
                 mask, fallback,
                 "DBE={b} (Kind::Bool) must hit pvxs's `default: break` and fall back to \
                  VALUE|ALARM, not select DBE_VALUE"
+            );
+        }
+    }
+
+    /// R9-35. pvxs dispatches DBE on KIND but converts through STORAGE, and the
+    /// two disagree for arrays: `Int32A` is `Kind::Integer` (`code & 0xe0`), so
+    /// it reaches `fld.as<uint8_t>()` (singlesource.cpp:134-137) — and
+    /// `Value::copyOut` has no scalar arm for array storage, so it raises
+    /// `NoConvert` (data.cpp:466-499). Same for a real array, and for a STRING
+    /// array (`StringA` is `Kind::String` → `fld.as<std::string>()`).
+    ///
+    /// Nothing catches that inside `onSubscribe`; `conn.cpp:277-282` does
+    /// `bev.reset()`. The port used to fall into its non-scalar `_ =>` arm and
+    /// serve VALUE|ALARM — handing the client a working monitor where pvxs hangs
+    /// the circuit up.
+    #[test]
+    fn dbe_array_typed_throws_and_resets_the_circuit() {
+        use epics_pva_rs::pvdata::TypedScalarArray;
+        let throwing = [
+            // Kind::Integer, array storage.
+            PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::UByte(vec![4].into())),
+            // Kind::Real, array storage.
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![2.0].into())),
+            // Kind::String, array storage.
+            PvField::ScalarArrayTyped(TypedScalarArray::String(vec!["VALUE".into()].into())),
+            // An empty array is still array storage — the throw is about the
+            // storage class, not the element count.
+            PvField::ScalarArrayTyped(TypedScalarArray::Int(Vec::new().into())),
+        ];
+        for field in throwing {
+            let label = format!("{field:?}");
+            let req = req_with_dbe(field);
+            assert!(
+                dbe_mask_from_pv_request(&req, &RemoteLog::default()).is_err(),
+                "DBE {label} must throw NoConvert (circuit reset), not serve a mask"
+            );
+        }
+    }
+
+    /// R9-35, the kind boundary. `BoolA` is `Kind::Bool` and a struct / union is
+    /// `Kind::Compound`; BOTH hit pvxs's `default: break` and never reach a
+    /// conversion, so they cannot throw — they select nothing and take the
+    /// `VALUE|ALARM` fallback. Only the Integer / Real / String kinds convert,
+    /// and only those can therefore reset the circuit.
+    #[test]
+    fn dbe_bool_array_and_compound_do_not_throw() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_pva_rs::pvdata::TypedScalarArray;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        let non_throwing = [
+            PvField::ScalarArrayTyped(TypedScalarArray::Boolean(vec![true].into())),
+            PvField::Structure(PvStructure::new("")),
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        ];
+        for field in non_throwing {
+            let label = format!("{field:?}");
+            let req = req_with_dbe(field);
+            let mask = dbe_mask(&req, &RemoteLog::default())
+                .expect("a present DBE option always resolves to a mask");
+            assert_eq!(
+                mask, fallback,
+                "DBE {label} is a `default: break` kind: no conversion, no throw, VALUE|ALARM"
             );
         }
     }

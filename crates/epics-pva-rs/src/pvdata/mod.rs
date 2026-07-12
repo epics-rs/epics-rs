@@ -10,8 +10,10 @@ mod typed_array;
 mod value;
 mod value_check;
 
+pub mod convert;
 pub mod encode;
 
+pub use convert::{Kind, NoConvert};
 pub use field::{FieldDesc, Member, TypeDef};
 pub use rpc_reply::RpcReply;
 pub use scalar::{ScalarType, ScalarValue};

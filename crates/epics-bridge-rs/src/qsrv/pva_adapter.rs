@@ -272,9 +272,14 @@ async fn open_monitor(
     // `BridgeChannel::create_monitor_with_value_mask`; group
     // and pva_pv-registered channels fall through to the
     // default mask (their DBE selection is not yet wired).
+    // An unconvertible (array-typed) DBE never reaches here: pvxs throws out of
+    // `onSubscribe` at INIT and resets the circuit, which the port enforces in
+    // `QsrvPvStore::check_monitor_request` before this op is even registered. If
+    // one somehow arrives, take pvxs's `dbe = 0` fallback rather than inventing
+    // a third behaviour.
     let dbe_mask = match ctx.pv_request {
         Some(PvField::Structure(ref req)) => {
-            crate::qsrv::channel::dbe_mask_from_pv_request(req, &ctx.log)
+            crate::qsrv::channel::dbe_mask_from_pv_request(req, &ctx.log).unwrap_or(None)
         }
         _ => None,
     };
@@ -354,6 +359,51 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     // thread identity through the type-state
     // `_checked` overrides so every wire op runs against the
     // ACF policy with the correct user/host.
+
+    /// pvxs `SingleSource::onSubscribe` (`ioc/singlesource.cpp:114-140`) reads
+    /// `record._options.DBE` with the THROWING `as<T>()`, before `connect()`
+    /// emits the INIT reply. An array-typed DBE of integer, real or string
+    /// element kind raises `NoConvert` there and resets the circuit
+    /// ([`MonitorRequestFatal`]). This is the INIT-time half of that read; the
+    /// mask itself is resolved at START by `open_monitor`, which is where the
+    /// port opens the subscription.
+    ///
+    /// Scoped to SINGLE-RECORD channels, because that is the only pvxs source
+    /// that reads DBE:
+    /// * a `pva_pvs`-registered name is served through the PVA `SharedPV` path,
+    ///   whose `onSubscribe` reads no `record._options` at all;
+    /// * a group name is served by `GroupSource`, whose `onSubscribe`
+    ///   (`ioc/groupsource.cpp`) reads `atomic` but never `DBE`.
+    ///
+    /// Throwing for either of those would be a NEW divergence — pvxs serves
+    /// them.
+    fn check_monitor_request(
+        &self,
+        checked: &epics_pva_rs::server_native::source::AccessChecked,
+        ctx: &epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<
+        Output = Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal>,
+    > + Send {
+        let pva_pvs = self.pva_pvs.clone();
+        let provider = self.provider.clone();
+        let name = checked.pv_name().to_string();
+        let pv_request = ctx.pv_request.clone();
+        async move {
+            let Some(PvField::Structure(req)) = pv_request else {
+                return Ok(());
+            };
+            if pva_pvs.read().await.contains_key(&name) || provider.is_servable_group(&name).await {
+                return Ok(());
+            }
+            // The empty-mask `logRemote` this parse can raise is emitted by the
+            // START-time reader in `open_monitor`, against the operation's own
+            // `RemoteLog`; this INIT-time call exists solely for the throw, so
+            // it parses against a log nobody flushes rather than double-report.
+            let discard = epics_pva_rs::server_native::source::RemoteLog::default();
+            crate::qsrv::channel::dbe_mask_from_pv_request(&req, &discard)?;
+            Ok(())
+        }
+    }
 
     fn get_value_checked(
         &self,

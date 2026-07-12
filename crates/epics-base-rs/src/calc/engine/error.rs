@@ -31,6 +31,19 @@ pub enum CalcError {
     /// which DERIV/NDERIV/FITPOLY/FITMPOLY/FITQ/FITMQ assign to `status`
     /// (`aCalcPerform.c:613`, `:985`, `:1008`, `:1029`, `:1221`, `:1270`).
     FitFailed,
+    /// The expression did not end with EXACTLY one value on the value stack.
+    ///
+    /// C's `if (ps != top) { freeStack(...); return(-1); }` (`aCalcPerform.c:1607-1618`).
+    /// `ps` starts one BELOW `top` (`:418-419`, `top = ps = &stack[1]; ps--;`), so
+    /// `ps == top` means depth exactly 1 — an expression that leaked an operand and
+    /// one that consumed too many are both a hard -1, and C writes neither
+    /// `p_dresult` nor `p_aresult`.
+    ///
+    /// This is an INVARIANT, not a reachable divergence: a program that
+    /// `aCalcPostfix` accepts always balances, and no expression has been found that
+    /// trips it while the port returns a value. It exists so that a future opcode
+    /// which forgets to pop cannot silently publish the wrong stack cell as VAL/AVAL.
+    StackLeak,
 }
 
 impl fmt::Display for CalcError {
@@ -61,6 +74,7 @@ impl fmt::Display for CalcError {
             CalcError::NonFiniteResult => write!(f, "Result is not a finite number"),
             CalcError::EmptyProgram => write!(f, "Empty postfix program"),
             CalcError::FitFailed => write!(f, "Polynomial fit failed"),
+            CalcError::StackLeak => write!(f, "Too many results returned"),
         }
     }
 }
@@ -74,8 +88,10 @@ impl CalcError {
     /// record-level `perror` reporting stays within the documented range.
     pub fn code(&self) -> i16 {
         match self {
-            // CALC_ERR_TOOMANY        = 1
-            CalcError::TooMany => 1,
+            // CALC_ERR_TOOMANY        = 1. `StackLeak` is the RUNTIME form of the
+            // same thing — an expression that ended with an operand left over — so
+            // it reports the same code and the same string.
+            CalcError::TooMany | CalcError::StackLeak => 1,
             // CALC_ERR_BAD_LITERAL    = 2
             CalcError::BadLiteral => 2,
             // CALC_ERR_BAD_ASSIGNMENT = 3

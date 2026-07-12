@@ -900,7 +900,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     // result write entirely.
     status.into_result()?;
 
-    Ok(stack.last().map_or(Double(0.0), |c| c.v.clone()))
+    // C `:1607-1618`, and it runs AFTER the deferred status above, in this order:
+    //
+    // ```c
+    // if (status) { freeStack(flp, stack); return(status); }
+    // /* if everything is peachy, the stack should end at its first position */
+    // if (ps != top) { freeStack(flp, stack); return(-1); }
+    // ```
+    //
+    // `ps` starts one BELOW `top` (`:418-419` — `top = ps = &stack[1]; ps--;`, with
+    // the comment "Expression handler assumes ps is pointing to a filled element"),
+    // and every push is an `INC` first. So `ps == top` means the stack holds
+    // EXACTLY ONE value, and C's check is a hard depth-1 assertion: an expression
+    // that leaked an operand AND one that consumed everything are both -1, with
+    // neither `p_dresult` nor `p_aresult` written.
+    //
+    // This is an INVARIANT GUARD, not a fix for a live bug. `aCalcPostfix`'s
+    // compile-time `runtime_depth` ledger (`aCalcPostfix.c:420-585`) rejects any
+    // program that would not end at depth 1, so a program it accepts always
+    // balances; no expression has been found where C returns -1 here while the port
+    // returns a value. (C's check DOES fire — compiled C, `FITMPOLY(AA,1)` is status
+    // -1 with AVAL never written, because a scalar mask takes the unary dispatch's
+    // scalar branch and never DECs the y operand below it — but the port already
+    // refuses that one earlier, in FITMPOLY's own arm.)
+    //
+    // It is here so that a future opcode which forgets to pop cannot silently
+    // publish the wrong stack cell as VAL/AVAL: `stack.last()` would have handed
+    // back the leaked operand, and an empty stack would have invented a 0 that C
+    // never produces.
+    match <[Cell; 1]>::try_from(stack) {
+        Ok([result]) => Ok(result.v),
+        Err(_) => Err(CalcError::StackLeak),
+    }
 }
 
 /// C's single `status` cell (`aCalcPerform.c:422`), read exactly ONCE, at the end of
@@ -1532,4 +1563,68 @@ fn simple_random() -> f64 {
     SEED.store(s, Ordering::Relaxed);
     // C calcRandom() returns (double)rand()/RAND_MAX — a closed [0,1] range.
     (s >> 11) as f64 / ((1u64 << 53) - 1) as f64
+}
+
+/// The end-of-expression depth invariant — C's `if (ps != top) return(-1)`
+/// (`aCalcPerform.c:1607-1618`).
+///
+/// These programs are hand-built because `aCalcPostfix` CANNOT emit them: its
+/// compile-time `runtime_depth` ledger (`aCalcPostfix.c:420-585`) rejects anything
+/// that would not end at depth 1, which is why C's runtime check has no reachable
+/// divergence today. Compiled C agrees, and so does the port's compiler — both
+/// answer "Incomplete expression, operand missing" for `A:=1`, `AA:=1`, `BB:=AA`
+/// and `AA:=AA+1`, and both compile and run `A:=1;2` to 2.
+///
+/// So the guard is tested where it actually applies: at the engine's own boundary,
+/// against a program that violates the invariant.
+#[cfg(test)]
+mod stack_depth_invariant {
+    use super::*;
+    use crate::calc::engine::ExprKind;
+
+    fn run(code: Vec<Opcode>) -> Result<ArrayStackValue, CalcError> {
+        let expr = CompiledExpr {
+            code,
+            kind: ExprKind::Array,
+            loop_pairs: Vec::new(),
+        };
+        eval(&expr, &mut ArrayInputs::new(4))
+    }
+
+    #[test]
+    fn a_leaked_operand_is_an_error_not_the_top_of_stack() {
+        // Two pushes, no operator to consume them: C ends with ps one ABOVE top and
+        // returns -1, writing neither p_dresult nor p_aresult. The port used to
+        // return `stack.last()` — the 2.0 — and publish it as VAL/AVAL.
+        let leaked = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn an_empty_stack_is_an_error_not_a_zero() {
+        // A store consumes the only value, so the program ends at depth 0: C's `ps`
+        // is left one BELOW `top` and the check fails just as hard. The port used to
+        // invent a 0.0 that C never produces.
+        let consumed = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::StoreVar(0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(consumed), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn exactly_one_value_is_the_result() {
+        let balanced = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::Add),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(balanced), Ok(Double(3.0)));
+    }
 }

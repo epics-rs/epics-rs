@@ -29,6 +29,7 @@ pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc,
     FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessContext, ProcessOutcome,
     ProcessSnapshot, Record, RecordProcessResult, SubroutineFn, ValuePostGate,
+    put_field_internal_default,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanType, SimModeScan};

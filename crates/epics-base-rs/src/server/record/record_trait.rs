@@ -1635,55 +1635,7 @@ pub trait Record: Send + Sync + 'static {
     /// single-INP→VAL apply path reaches the same `convert_to` via
     /// `set_val`'s `TypeMismatch` auto-coerce.
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        // Input-link / internal delivery coerces the source to the target
-        // field's stored type before `put_field`, mirroring C
-        // `dbGetLink(DBF_<target>)`: the link layer converts any numeric
-        // source to the requested type, so a record's typed `put_field`
-        // arm never sees a mismatched type. This is the single owner of
-        // that coercion, covering every `ReadDbLink` target by construction
-        // (e.g. a `compress` INP from a `DBF_LONG` record delivers a
-        // `Long`/`LongArray` that must become `Double`/`DoubleArray` for the
-        // Double-only VAL arm, which otherwise drops it and never advances
-        // the buffer). An `EnumWithChoices` carrier is always collapsed to a
-        // bare index by `convert_to`, even when the target is already `Enum`.
-        let target_type = self
-            .field_list()
-            .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(name))
-            .map(|f| f.dbf_type)
-            .or_else(|| self.get_field(name).map(|v| v.db_field_type()));
-        // An array source into a SCALAR destination delivers element 0. C's
-        // link layer asks for exactly one element (`dbGetLink(..., nRequest =
-        // NULL)`), so `dbGet` converts the field at offset 0 and the record
-        // sees a scalar — a waveform INP into an `ai.VAL` lands `wf[0]`, it is
-        // not dropped. Without the reduction the array reached the record's
-        // typed `put_field` arm, which rejected it and left the field at its
-        // stale value. Same clamp as `field_io::dbput_request` (C `dbPut`
-        // `nRequest -> no_elements`), through the same primitive; a `CharArray`
-        // into a `DBF_STRING` field is likewise exempt — that shape is the
-        // dbChannel `$` char view of a string field, decoded by `convert_to`.
-        let dest_is_array = self.get_field(name).is_some_and(|v| v.is_array());
-        let is_char_string_view =
-            matches!(value, EpicsValue::CharArray(_)) && target_type == Some(DbFieldType::String);
-        let value = if !dest_is_array && value.is_array() && !is_char_string_view {
-            value.first_element().unwrap_or(value)
-        } else {
-            value
-        };
-        let is_enum_carrier = matches!(value, EpicsValue::EnumWithChoices { .. });
-        let value = match target_type {
-            Some(target)
-                if is_enum_carrier
-                    || (value.db_field_type() != target && !value.is_empty_array()) =>
-            {
-                value.convert_to(target)
-            }
-            // Carrier with no known target field: collapse to a bare index
-            // (the prior fallback) rather than letting it reach storage.
-            None if is_enum_carrier => value.convert_to(DbFieldType::Long),
-            _ => value,
-        };
-        self.put_field(name, value)
+        put_field_internal_default(self, name, value)
     }
 
     /// Return pre-process actions (ReadDbLink) that the framework should
@@ -1809,6 +1761,67 @@ pub trait Record: Send + Sync + 'static {
     fn soft_channel_skips_convert(&self) -> bool {
         false
     }
+}
+
+/// The body of [`Record::put_field_internal`] — the framework's internal write
+/// path — as a free function, so a record that needs to observe an internal
+/// write can WRAP it instead of re-implementing it.
+///
+/// A record overriding `put_field_internal` and ending in `self.put_field(..)`
+/// silently drops the coercion below for every field it does not special-case.
+/// Calling this instead keeps the one owner of that coercion.
+///
+/// Input-link / internal delivery coerces the source to the target field's
+/// stored type before `put_field`, mirroring C `dbGetLink(DBF_<target>)`: the
+/// link layer converts any numeric source to the requested type, so a record's
+/// typed `put_field` arm never sees a mismatched type. This covers every
+/// `ReadDbLink` target by construction (e.g. a `compress` INP from a `DBF_LONG`
+/// record delivers a `Long`/`LongArray` that must become `Double`/`DoubleArray`
+/// for the Double-only VAL arm, which otherwise drops it and never advances the
+/// buffer). An `EnumWithChoices` carrier is always collapsed to a bare index by
+/// `convert_to`, even when the target is already `Enum`.
+pub fn put_field_internal_default<R: Record + ?Sized>(
+    record: &mut R,
+    name: &str,
+    value: EpicsValue,
+) -> CaResult<()> {
+    let target_type = record
+        .field_list()
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|f| f.dbf_type)
+        .or_else(|| record.get_field(name).map(|v| v.db_field_type()));
+    // An array source into a SCALAR destination delivers element 0. C's link
+    // layer asks for exactly one element (`dbGetLink(..., nRequest = NULL)`), so
+    // `dbGet` converts the field at offset 0 and the record sees a scalar — a
+    // waveform INP into an `ai.VAL` lands `wf[0]`, it is not dropped. Without the
+    // reduction the array reached the record's typed `put_field` arm, which
+    // rejected it and left the field at its stale value. Same clamp as
+    // `field_io::dbput_request` (C `dbPut` `nRequest -> no_elements`), through the
+    // same primitive; a `CharArray` into a `DBF_STRING` field is likewise exempt —
+    // that shape is the dbChannel `$` char view of a string field, decoded by
+    // `convert_to`.
+    let dest_is_array = record.get_field(name).is_some_and(|v| v.is_array());
+    let is_char_string_view =
+        matches!(value, EpicsValue::CharArray(_)) && target_type == Some(DbFieldType::String);
+    let value = if !dest_is_array && value.is_array() && !is_char_string_view {
+        value.first_element().unwrap_or(value)
+    } else {
+        value
+    };
+    let is_enum_carrier = matches!(value, EpicsValue::EnumWithChoices { .. });
+    let value = match target_type {
+        Some(target)
+            if is_enum_carrier || (value.db_field_type() != target && !value.is_empty_array()) =>
+        {
+            value.convert_to(target)
+        }
+        // Carrier with no known target field: collapse to a bare index (the prior
+        // fallback) rather than letting it reach storage.
+        None if is_enum_carrier => value.convert_to(DbFieldType::Long),
+        _ => value,
+    };
+    record.put_field(name, value)
 }
 
 /// Subroutine function type for `sub`/`aSub` records.

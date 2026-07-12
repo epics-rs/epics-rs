@@ -260,6 +260,21 @@ impl PortDriver for DrvVxi11Port {
         &mut self.base
     }
 
+    /// C drvVxi11 registers asynOption itself (drvVxi11.c:1777) and gets
+    /// asynCommon + asynOctet + asynGpib from `pasynGpib->registerPort`
+    /// (:1761). No register interface.
+    ///
+    /// `Gpib` is deliberately absent: this crate has no port operation that
+    /// carries a GPIB universal / addressed command to a driver, so asynRecord
+    /// cannot dispatch UCMD/ACMD (it reports "No asynGpib interface", as C does
+    /// for a port without the interface). Declaring it here would make the
+    /// record's GPIBIV read 1 with nothing behind it. The driver's `AsynGpib`
+    /// impl is reachable directly, just not through the record.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        use crate::interfaces::Capability::*;
+        vec![OctetRead, OctetWrite, Option, Flush, Connect]
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         if !Self::has_hw_support() {
             return Err(AsynError::Status {

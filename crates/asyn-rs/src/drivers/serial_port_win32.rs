@@ -412,14 +412,14 @@ impl DrvAsynSerialPort {
             driver.base.auto_connect = false;
         }
         if !no_process_eos {
-            driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+            driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         }
         Ok(driver)
     }
 
     /// Push an interpose layer onto the octet I/O stack.
-    pub fn push_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
-        self.base.push_octet_interpose(layer);
+    pub fn install_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
+        self.base.install_octet_interpose(layer);
     }
 
     /// Send a serial line BREAK condition. Win32 has no timed-break primitive,
@@ -495,6 +495,12 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C drvAsynSerialPortWin32 registers the same set as the POSIX serial
+    /// driver: asynCommon, asynOption, asynOctet.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -670,7 +676,7 @@ impl PortDriver for DrvAsynSerialPort {
         self.base.interpose_octet.dispatch_flush(user, &mut self.io)
     }
 
-    fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         use dcb_bits::*;
 
         // C-Win32 setOption's opening guard (drvAsynSerialPortWin32.c:180-185):
@@ -1083,7 +1089,7 @@ mod tests {
             ("ixoff", "Y"),
             ("break", "on"),
         ] {
-            match drv.set_option(key, value) {
+            match drv.set_option(&mut AsynUser::default(), key, value) {
                 Err(AsynError::Status { status, message }) => {
                     assert_eq!(status, AsynStatus::Error, "set_option({key}) status");
                     assert!(

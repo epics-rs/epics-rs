@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interfaces::{Capability, InterfaceType};
 use crate::interrupt::InterruptManager;
 use crate::port::DrvUserInfo;
 use crate::port_actor::ActorMessage;
@@ -65,6 +66,15 @@ pub struct PortHandle {
     can_block: bool,
     multi_device: bool,
     max_addr: i32,
+    /// The port's interface registry — the driver's own
+    /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
+    /// port is registered. C's asynManager keeps the same thing as the list of
+    /// `registerInterface` calls the driver made, and clients ask for it with
+    /// `findInterface` (asynManager.c:1352-1372); asynRecord uses it to fill
+    /// OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV
+    /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
+    /// driver cannot gain or lose an interface after `registerInterface`.
+    interfaces: Arc<[Capability]>,
 }
 
 impl PortHandle {
@@ -80,7 +90,23 @@ impl PortHandle {
             can_block: false,
             multi_device: false,
             max_addr: 1,
+            interfaces: crate::interfaces::default_capabilities().into(),
         }
+    }
+
+    /// Record the driver's declared interface set — see [`Self::interfaces`].
+    /// Called by the runtime layer at handle construction, from the driver's own
+    /// [`crate::port::PortDriver::capabilities`].
+    pub fn set_interfaces(&mut self, interfaces: Vec<Capability>) {
+        self.interfaces = interfaces.into();
+    }
+
+    /// Does the port implement this interface? The port's `findInterface`
+    /// (asynManager.c:1352-1372).
+    pub fn has_interface(&self, iface: InterfaceType) -> bool {
+        self.interfaces
+            .iter()
+            .any(|cap| cap.interface_type() == iface)
     }
 
     /// Set whether this port can perform blocking I/O.
@@ -627,24 +653,14 @@ impl PortHandle {
         })
     }
 
-    pub fn set_option_blocking(&self, key: &str, value: &str) -> AsynResult<()> {
-        let user = AsynUser::default();
-        self.submit_blocking(
-            RequestOp::SetOption {
-                key: key.to_string(),
-                value: value.to_string(),
-            },
-            user,
-        )?;
-        Ok(())
-    }
-
-    /// Address-aware setOption — iocsh `asynSetOption portName addr key value`.
-    /// The C surface (`asynShellCommands.c:604-606`) carries `addr`
-    /// via `connectDevice`; here we attach it to the AsynUser so the
-    /// driver can disambiguate device-scoped options.
-    pub fn set_option_addr_blocking(&self, addr: i32, key: &str, value: &str) -> AsynResult<()> {
-        let user = AsynUser::default().with_addr(addr);
+    /// C `asynOption::setOption` — the caller supplies the `AsynUser`, because in
+    /// C the caller's `pasynUser` is what the option write runs under: its `addr`
+    /// selects the device and its `timeout` bounds any wire traffic the write
+    /// causes (an RFC 2217 negotiation on a COM port, `asynInterposeCom.c:475`).
+    /// asynRecord passes the record's user (TMOT); iocsh `asynSetOption` passes
+    /// its own, at 2 s (`asynShellCommands.c:119`). There is no default here to
+    /// paper over the difference.
+    pub fn set_option_blocking(&self, user: AsynUser, key: &str, value: &str) -> AsynResult<()> {
         self.submit_blocking(
             RequestOp::SetOption {
                 key: key.to_string(),
@@ -717,8 +733,9 @@ impl PortHandle {
         })
     }
 
-    pub async fn set_option(&self, key: &str, value: &str) -> AsynResult<()> {
-        let user = AsynUser::default();
+    /// Async [`Self::set_option_blocking`] — same rule: the caller owns the
+    /// `AsynUser` that bounds the write.
+    pub async fn set_option(&self, user: AsynUser, key: &str, value: &str) -> AsynResult<()> {
         self.submit_async(
             RequestOp::SetOption {
                 key: key.to_string(),

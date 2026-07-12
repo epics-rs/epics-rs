@@ -12,6 +12,7 @@
 //! Available only with the `epics` feature.
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::{
@@ -27,6 +28,7 @@ use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
+use crate::user::AsynUser;
 
 /// Register the standard asyn iocsh commands on the supplied
 /// [`IocApplication`]. The shared [`PortManager`] is captured in each
@@ -300,8 +302,15 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 let key = arg_str(args, 2).ok_or_else(|| "key required".to_string())?;
                 let value = arg_str(args, 3).unwrap_or_default();
+                // C `asynSetOption` builds its own asynUser and gives it
+                // `timeout = 2` (asynShellCommands.c:119) before queueing the
+                // setOption callback; `addr` rides on the same user, as C's
+                // `findInterface(portName, addr, ...)` connects it to the device.
+                let user = AsynUser::default()
+                    .with_addr(addr)
+                    .with_timeout(Duration::from_secs(2));
                 match mgr_r.find_port_handle(&port) {
-                    Ok(handle) => match handle.set_option_addr_blocking(addr, &key, &value) {
+                    Ok(handle) => match handle.set_option_blocking(user, &key, &value) {
                         Ok(()) => Ok(CommandOutcome::Continue),
                         Err(e) => {
                             ctx.println(&format!("asynSetOption: {e}"));
@@ -456,18 +465,12 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let _addr = arg_int(args, 1).unwrap_or(0);
-                // C takes the delay as a `double` seconds and stores it
-                // verbatim (`pvt->delay = delay`, asynInterposeDelay.c:214).
-                // `Duration::from_secs_f64` panics on a negative or NaN value,
-                // which iocsh can supply, so refuse those rather than abort the
-                // shell — C's `epicsThreadSleep` treats a non-positive delay as
-                // "no delay", which is the zero Duration here.
-                let secs = arg_f64(args, 2).unwrap_or(0.0);
-                let delay = if secs.is_finite() && secs > 0.0 {
-                    std::time::Duration::from_secs_f64(secs)
-                } else {
-                    std::time::Duration::ZERO
-                };
+                // C takes the delay as a `double` seconds and stores it verbatim
+                // (`pvt->delay = delay`, asynInterposeDelay.c:214). iocsh can
+                // supply a negative or NaN one; `delay_from_secs` owns the
+                // conversion and collapses those to C's "no delay".
+                let delay =
+                    crate::interpose::delay::delay_from_secs(arg_f64(args, 2).unwrap_or(0.0));
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => {
                         if let Err(e) = handle.push_delay_interpose_blocking(delay) {
@@ -756,7 +759,7 @@ pub(crate) fn build_configured_ip_port(
         driver.base_mut().auto_connect = false;
     }
     if !no_process_eos {
-        driver.push_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
     }
     Ok(driver)
 }

@@ -563,21 +563,19 @@ pub struct DrvAsynIPPort {
 struct ComState {
     /// The `asynOctet` half — IAC stuffing.
     ///
-    /// Deliberately **not** pushed onto [`PortDriverBase::interpose_octet`]. C
+    /// Deliberately **not** installed onto [`PortDriverBase::interpose_octet`]. C
     /// installs COM at :1061 and the EOS interpose at :1065, and its
     /// `interposeInterface` makes each *later* install the *outer* one — so C's
     /// chain is `EOS → COM → driver`, with COM directly above the IP driver's
-    /// octet interface and below every other interpose. This stack's `push`
-    /// appends, and dispatch runs index 0 first, so a later push lands *inner*:
-    /// pushing COM at construction would have put it *outside* the EOS layer that
-    /// `build_configured_ip_port` pushes afterwards, leaving EOS to scan
-    /// still-stuffed bytes and hunt terminators in a stream COM had not yet
-    /// unescaped.
+    /// octet interface and below every other interpose.
     ///
-    /// Making it the base link instead (see [`DrvAsynIPPort::with_base_link`])
-    /// puts it beneath every stack layer *by construction*, so no push order can
-    /// get it wrong — rather than pinning the ordering with a convention that the
-    /// next person to push a layer has to know about.
+    /// Making it the base link (see [`DrvAsynIPPort::with_base_link`]) puts it
+    /// beneath every stack layer *by construction*, so no install order can get it
+    /// wrong — rather than pinning the ordering with a convention the next person
+    /// to install a layer has to know about. (The stack now follows C's rule too —
+    /// [`crate::interpose::OctetInterposeStack::install`] — so COM installed first
+    /// would land innermost anyway; the base link keeps the invariant whatever
+    /// else is installed later.)
     octet: ComInterpose,
     /// The `asynOption` half — the negotiation and the serial settings it
     /// carries. Driven against the raw link, since C's `setOption`/`getOption`
@@ -986,8 +984,8 @@ impl DrvAsynIPPort {
     }
 
     /// Push an interpose layer onto the octet I/O stack.
-    pub fn push_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
-        self.base.push_octet_interpose(layer);
+    pub fn install_interpose(&mut self, layer: Box<dyn crate::interpose::OctetInterpose>) {
+        self.base.install_octet_interpose(layer);
     }
 
     fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
@@ -1162,6 +1160,14 @@ impl PortDriver for DrvAsynIPPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C drvAsynIPPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynIPPort.c:1037-1053) — no register interface. A record with
+    /// IFACE=Int32/UInt32/Float64 on this port gets C's "No asyn<X> interface"
+    /// (asynRecord.c:1336-1358), not a silent parameter-cache read.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -1350,7 +1356,7 @@ impl PortDriver for DrvAsynIPPort {
         self.with_base_link(|stack, link| stack.dispatch_flush(user, link))
     }
 
-    fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+    fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         // C interposes `asynInterposeCOM`'s asynOption interface *above* the IP
         // driver's (`asynInterposeCom.c:809-824`), so a COM port's option writes
         // hit the negotiation first and only an unclaimed key reaches the driver
@@ -1362,7 +1368,7 @@ impl PortDriver for DrvAsynIPPort {
             // Same teardown gate as the connect-time handshake: C's setOption
             // reads run through the same `readIt`/`readRaw` below the interpose.
             return self
-                .with_negotiation(|com, link| com.set_option(link, key, value))
+                .with_negotiation(|com, link| com.set_option(user, link, key, value))
                 .expect("com is Some");
         }
         // C `drvAsynIPPort.c::setOption`/`getOption` compare option keys
@@ -1999,7 +2005,8 @@ mod tests {
         drv.connect(&user).unwrap();
         assert!(drv.base.is_connected());
 
-        drv.set_option("baud", "115200").unwrap();
+        drv.set_option(&mut AsynUser::default(), "baud", "115200")
+            .unwrap();
         assert_eq!(drv.get_option("baud").unwrap(), "115200");
 
         server.join().unwrap();
@@ -2058,7 +2065,8 @@ mod tests {
         // applies readRaw's teardown to the negotiation's reads too.
         let (port, server) = silent_server();
         let mut drv = DrvAsynIPPort::new("comto2", &format!("127.0.0.1:{port} COM")).unwrap();
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         drv.connect(&AsynUser::default()).unwrap();
         assert!(
             !drv.base.is_connected(),
@@ -2085,7 +2093,7 @@ mod tests {
             input_eos: vec![b'\r', b'\n'],
             output_eos: vec![],
         });
-        drv.push_interpose(Box::new(eos));
+        drv.install_interpose(Box::new(eos));
 
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
@@ -2121,11 +2129,12 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         drv.connect(&AsynUser::default()).unwrap();
         assert!(drv.base().connected);
 
@@ -2162,7 +2171,7 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));
@@ -2192,14 +2201,22 @@ mod tests {
     #[test]
     fn test_set_option_nodelay() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
-        drv.set_option("noDelay", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "noDelay", "Y")
+            .unwrap();
         assert!(drv.config.no_delay);
-        drv.set_option("noDelay", "n").unwrap();
+        drv.set_option(&mut AsynUser::default(), "noDelay", "n")
+            .unwrap();
         assert!(!drv.config.no_delay);
         // Value is validated strictly Y/N (case-insensitive); the old loose
         // coercion silently treated any other token (incl. "0"/"1") as off.
-        assert!(drv.set_option("noDelay", "1").is_err());
-        assert!(drv.set_option("noDelay", "maybe").is_err());
+        assert!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "1")
+                .is_err()
+        );
+        assert!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "maybe")
+                .is_err()
+        );
     }
 
     // --- UDP tests ---
@@ -2355,7 +2372,8 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
         assert!(drv.base().connected);
@@ -2401,7 +2419,8 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         let user = AsynUser::default();
         drv.connect(&user).unwrap();
         assert!(drv.base().connected);
@@ -2526,15 +2545,18 @@ mod tests {
         // rather than silently coercing unknown text to "off".
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
 
-        drv.set_option("disconnectOnReadTimeout", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
+            .unwrap();
         assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "Y");
-        drv.set_option("disconnectOnReadTimeout", "n").unwrap();
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "n")
+            .unwrap();
         assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
 
         // Values C never accepts must now error instead of mapping to "off".
         for bad in ["1", "yes", "true", "", "maybe"] {
             assert!(
-                drv.set_option("disconnectOnReadTimeout", bad).is_err(),
+                drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", bad)
+                    .is_err(),
                 "value {bad:?} should be rejected"
             );
         }
@@ -2569,7 +2591,8 @@ mod tests {
     #[test]
     fn test_set_option_host_info() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025").unwrap();
-        drv.set_option("hostInfo", "192.168.1.1:8080").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "192.168.1.1:8080")
+            .unwrap();
         assert_eq!(drv.config.host, "192.168.1.1");
         assert_eq!(drv.config.port, 8080);
     }
@@ -2587,7 +2610,8 @@ mod tests {
         drv.connect(&user).unwrap();
         assert!(drv.base().connected);
 
-        drv.set_option("hostInfo", "127.0.0.1:9999").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:9999")
+            .unwrap();
         assert!(!drv.base().connected);
         assert_eq!(drv.config.port, 9999);
     }
@@ -2601,20 +2625,25 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::Tcp);
 
-        drv.set_option("hostInfo", "127.0.0.1:5026 udp").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5026 udp")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::Udp);
         assert_eq!(drv.config.port, 5026);
 
-        drv.set_option("hostInfo", "127.0.0.1:5027 udp*").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5027 udp*")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcast);
 
-        drv.set_option("hostInfo", "127.0.0.1:5028 udp&").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5028 udp&")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::UdpReusePort);
 
-        drv.set_option("hostInfo", "127.0.0.1:5029 udp*&").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5029 udp*&")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::UdpBroadcastReusePort);
 
-        drv.set_option("hostInfo", "127.0.0.1:5030 tcp&").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5030 tcp&")
+            .unwrap();
         assert_eq!(drv.config.protocol, IpProtocol::TcpReusePort);
     }
 
@@ -2627,7 +2656,8 @@ mod tests {
     fn host_info_reparse_clears_omitted_local_port() {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025:12345 tcp").unwrap();
         assert_eq!(drv.config.local_port, Some(12345));
-        drv.set_option("hostInfo", "127.0.0.1:5026 tcp").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "127.0.0.1:5026 tcp")
+            .unwrap();
         assert_eq!(
             drv.config.local_port, None,
             "local_port must reset on hostInfo reparse"
@@ -2649,7 +2679,8 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
 
         // asynRecord writes the lowercase key (asyn_record/mod.rs).
-        drv.set_option("hostinfo", "10.0.0.5:1234 udp").unwrap();
+        drv.set_option(&mut AsynUser::default(), "hostinfo", "10.0.0.5:1234 udp")
+            .unwrap();
         // The live driver config must reflect the reparse, not the map.
         assert_eq!(drv.config.host, "10.0.0.5");
         assert_eq!(drv.config.port, 1234);
@@ -2662,7 +2693,8 @@ mod tests {
 
         // disconnectOnReadTimeout shares the same case-insensitive key
         // contract for set and get (C getOption -> "Y"/"N").
-        drv.set_option("DISCONNECTONREADTIMEOUT", "Y").unwrap();
+        drv.set_option(&mut AsynUser::default(), "DISCONNECTONREADTIMEOUT", "Y")
+            .unwrap();
         assert_eq!(drv.get_option("disconnectonreadtimeout").unwrap(), "Y");
     }
 
@@ -2674,12 +2706,15 @@ mod tests {
         // empty key is a silent no-op.
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
 
-        let err = drv.set_option("bogusKey", "value").unwrap_err();
+        let err = drv
+            .set_option(&mut AsynUser::default(), "bogusKey", "value")
+            .unwrap_err();
         assert!(matches!(err, AsynError::OptionNotFound(_)));
         assert!(drv.get_option("bogusKey").is_err());
 
         // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
-        drv.set_option("", "ignored").unwrap();
+        drv.set_option(&mut AsynUser::default(), "", "ignored")
+            .unwrap();
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---
@@ -3074,7 +3109,7 @@ mod tests {
         });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
-        drv.push_interpose(Box::new(EosInterpose::new(EosConfig {
+        drv.install_interpose(Box::new(EosInterpose::new(EosConfig {
             input_eos: vec![b'\n'],
             output_eos: vec![],
         })));

@@ -780,8 +780,8 @@ impl PortDriverBase {
     /// **Concurrency**: requires `&mut self`, which means the caller must hold
     /// the port lock (`Arc<Mutex<dyn PortDriver>>`). This ensures
     /// interpose modifications are serialized with I/O dispatch.
-    pub fn push_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
-        self.interpose_octet.push(layer);
+    pub fn install_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
+        self.interpose_octet.install(layer);
     }
 
     /// Flush changed parameters as interrupt notifications.
@@ -1034,7 +1034,14 @@ pub trait PortDriver: Send + Sync + 'static {
             .ok_or_else(|| AsynError::OptionNotFound(key.to_string()))
     }
 
-    fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+    /// C `asynOption::setOption(void *drvPvt, asynUser *pasynUser, key, val)`.
+    ///
+    /// `user` is the caller's, and its `timeout` is the one that bounds any wire
+    /// traffic the option write causes — an RFC 2217 negotiation on a COM port
+    /// runs under it (`asynInterposeCom.c:475,495`). The option layer has no
+    /// timeout of its own: an asynRecord option put negotiates under TMOT, an
+    /// iocsh `asynSetOption` under its own 2 s (`asynShellCommands.c:119`).
+    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         self.base_mut()
             .options
             .insert(key.to_string(), value.to_string());
@@ -1764,9 +1771,11 @@ mod tests {
     #[test]
     fn test_option_set_get() {
         let mut drv = TestDriver::new();
-        drv.set_option("baud", "9600").unwrap();
+        drv.set_option(&mut AsynUser::default(), "baud", "9600")
+            .unwrap();
         assert_eq!(drv.get_option("baud").unwrap(), "9600");
-        drv.set_option("baud", "115200").unwrap();
+        drv.set_option(&mut AsynUser::default(), "baud", "115200")
+            .unwrap();
         assert_eq!(drv.get_option("baud").unwrap(), "115200");
     }
 
@@ -1780,7 +1789,8 @@ mod tests {
     #[test]
     fn test_report_no_panic() {
         let mut drv = TestDriver::new();
-        drv.set_option("testkey", "testval").unwrap();
+        drv.set_option(&mut AsynUser::default(), "testkey", "testval")
+            .unwrap();
         drv.base_mut().set_int32_param(0, 0, 42).unwrap();
         for level in 0..=3 {
             drv.report(level);
@@ -1978,7 +1988,7 @@ mod tests {
             let mut guard = port.lock();
             guard
                 .base_mut()
-                .push_octet_interpose(Box::new(NoopInterpose));
+                .install_octet_interpose(Box::new(NoopInterpose));
             assert_eq!(guard.base().interpose_octet.len(), 1);
         }
     }
@@ -2016,7 +2026,7 @@ mod tests {
 
         let mut drv = TestDriver::new();
         drv.base_mut()
-            .push_octet_interpose(Box::new(EosInterpose::default()));
+            .install_octet_interpose(Box::new(EosInterpose::default()));
 
         // Set IEOS through the driver trait: caches in base AND must reach
         // the interpose.
@@ -2099,7 +2109,7 @@ mod tests {
 
         let resets = Arc::new(AtomicUsize::new(0));
         let mut base = PortDriverBase::new("reset_test", 1, PortFlags::default());
-        base.push_octet_interpose(Box::new(CountingInterpose(resets.clone())));
+        base.install_octet_interpose(Box::new(CountingInterpose(resets.clone())));
 
         // Port starts connected. Disconnect edge → reset (C exceptionDisconnect).
         assert!(base.set_connected(false));

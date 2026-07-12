@@ -193,14 +193,10 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::GetConnected => Self::GetConnected,
             PortCommand::PushEchoInterpose => Self::PushEchoInterpose,
             // A negative / non-finite wire value would panic
-            // `Duration::from_secs_f64`; clamp to "no delay", which is what C's
-            // `epicsThreadSleep` does with a non-positive argument.
+            // `Duration::from_secs_f64`; `delay_from_secs` owns the conversion
+            // and collapses those to C's "no delay".
             PortCommand::PushDelayInterpose { delay_secs } => Self::PushDelayInterpose {
-                delay: if delay_secs.is_finite() && *delay_secs > 0.0 {
-                    std::time::Duration::from_secs_f64(*delay_secs)
-                } else {
-                    std::time::Duration::ZERO
-                },
+                delay: crate::interpose::delay::delay_from_secs(*delay_secs),
             },
             PortCommand::BlockProcess => Self::BlockProcess,
             PortCommand::UnblockProcess => Self::UnblockProcess,

@@ -152,7 +152,7 @@ impl DrvAsynFtdiPort {
         // (empty terminator until setInputEos/OEOS), suppressed by
         // noProcessEos.
         if !no_process_eos {
-            base.push_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         }
         Ok(Self {
             base,
@@ -190,6 +190,12 @@ impl PortDriver for DrvAsynFtdiPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C drvAsynFTDIPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynFTDIPort.cpp:579-613).
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {

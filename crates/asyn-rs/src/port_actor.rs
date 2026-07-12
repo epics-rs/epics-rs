@@ -358,9 +358,28 @@ impl PortActor {
             }
         }
 
+        // Connect the user to the port it is about to run on, so every layer the
+        // request passes through can trace through it — C's `pasynUser →
+        // pport/pdevice` linkage, which `asynPrint`/`asynPrintIO` resolve the
+        // trace config from (`findTracePvt`, asynManager.c:3040-3060). The actor
+        // is the single owner of the linkage: an interpose has no other handle on
+        // the port, and a user that never reached a port traces nothing.
+        user.trace = self.user_trace();
+
         // Dispatch
         let result = self.dispatch_io(&mut user, &op);
         let _ = reply.send(result);
+    }
+
+    /// The port context [`AsynUser::trace`] carries — the driver's trace manager
+    /// and the port's name, both `Arc`s, so stamping a request is two refcount
+    /// bumps.
+    fn user_trace(&self) -> Option<crate::user::UserTrace> {
+        let base = self.driver.base();
+        base.trace.as_ref().map(|manager| crate::user::UserTrace {
+            manager: manager.clone(),
+            port: base.port_name.as_str().into(),
+        })
     }
 
     /// C `autoConnectDevice` (asynManager.c:704-739) — the single owner of
@@ -623,9 +642,9 @@ impl PortActor {
                 // layer onto the port's octet interface at any time after
                 // configure. The actor owns the driver, so the install lands
                 // between transfers instead of racing one.
-                self.driver
-                    .base_mut()
-                    .push_octet_interpose(Box::new(crate::interpose::echo::EchoInterpose::new()));
+                self.driver.base_mut().install_octet_interpose(Box::new(
+                    crate::interpose::echo::EchoInterpose::new(),
+                ));
                 Ok(RequestResult::write_ok())
             }
             RequestOp::PushDelayInterpose { delay } => {
@@ -633,7 +652,7 @@ impl PortActor {
                 // the per-character write delay onto the port's octet interface
                 // from the iocsh command (:221-234), after configure. Same
                 // actor-owned install point as the echo layer above.
-                self.driver.base_mut().push_octet_interpose(Box::new(
+                self.driver.base_mut().install_octet_interpose(Box::new(
                     crate::interpose::delay::DelayInterpose::new(*delay),
                 ));
                 Ok(RequestResult::write_ok())
@@ -866,7 +885,11 @@ impl PortActor {
                 Ok(RequestResult::option_read(val))
             }
             RequestOp::SetOption { key, value } => {
-                self.driver.set_option(key, value)?;
+                // The request's own AsynUser, as C hands `setOption` the caller's
+                // pasynUser (asynRecord.c:1787-1826 passes the record's, whose
+                // timeout is TMOT; asynShellCommands.c:119 passes iocsh's 2 s).
+                // A COM port's negotiation is bounded by exactly that timeout.
+                self.driver.set_option(user, key, value)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Report { level } => {
@@ -2056,5 +2079,63 @@ mod tests {
         drop(tx); // Dropping all senders causes the actor to return
         std::thread::sleep(Duration::from_millis(10));
         // No hang, no panic
+    }
+
+    /// R9-57. Every layer a request passes through must be able to trace through
+    /// its `asynUser`, as in C, where `pasynUser` reaches the port's trace config
+    /// through its `pport`/`pdevice` linkage (`findTracePvt`,
+    /// asynManager.c:3040-3060) — an interpose has no other handle on the port
+    /// (`asynInterposeCom.c:237-239`). The actor is the single owner of that
+    /// linkage: it stamps the request's user with the port it is about to run on.
+    #[test]
+    fn the_actor_connects_every_request_s_user_to_the_port() {
+        use crate::manager::PortManager;
+        use crate::trace::TraceMask;
+        use std::sync::Mutex as StdMutex;
+
+        static SEEN: StdMutex<Option<(String, bool)>> = StdMutex::new(None);
+
+        struct TraceSpy(PortDriverBase);
+        impl PortDriver for TraceSpy {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                let t = user.trace.as_ref();
+                *SEEN.lock().unwrap() = Some((
+                    t.map(|t| t.port.to_string()).unwrap_or_default(),
+                    t.is_some(),
+                ));
+                // And the trace actually resolves through it.
+                user.print_io(TraceMask::IO_DRIVER, data, "write:");
+                Ok(data.len())
+            }
+        }
+
+        let mgr = PortManager::new();
+        mgr.register_port(TraceSpy(PortDriverBase::new(
+            "trace_link",
+            1,
+            PortFlags::default(),
+        )))
+        .unwrap();
+        let handle = mgr.find_port_handle("trace_link").unwrap();
+        handle
+            .submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"hi".to_vec(),
+                },
+                AsynUser::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            SEEN.lock().unwrap().take(),
+            Some(("trace_link".to_string(), true)),
+            "the driver's user carries the port it is running on"
+        );
     }
 }

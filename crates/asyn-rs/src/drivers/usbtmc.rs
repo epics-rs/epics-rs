@@ -238,6 +238,14 @@ impl PortDriver for DrvAsynUsbtmcPort {
         &mut self.base
     }
 
+    /// C drvAsynUSBTMC registers asynCommon, asynOctet and asynInt32
+    /// (drvAsynUSBTMC.c:1285-1322) — asynInt32 carries the status-byte /
+    /// remote-local parameters. It registers no asynOption.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        use crate::interfaces::Capability::*;
+        vec![OctetRead, OctetWrite, Int32Read, Int32Write, Flush, Connect]
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         if !Self::has_hw_support() {
             return Err(AsynError::Status {

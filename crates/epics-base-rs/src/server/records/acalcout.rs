@@ -2232,6 +2232,20 @@ impl Record for AcalcoutRecord {
             .map(|(_, name)| *name)
             .collect()
     }
+
+    /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a
+    /// previous copy of every SCALAR input (PA..PL, `aCalcoutRecord.c:1023-1029`)
+    /// and of OVAL (POVL, `:1039`) and compares them — but it keeps NO previous
+    /// copy of an array and compares no array anywhere. The only array
+    /// comparison in the record is inside `fetch_values` (`:1103-1105`), against
+    /// the link's own previous delivery, and its result IS the NEWM bit.
+    ///
+    /// (PAA exists, but it is `fetch_values`' scratch buffer for exactly that
+    /// comparison — one buffer reused for every link, not a per-field previous
+    /// value.)
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &ARR_NAMES
+    }
 }
 
 #[cfg(test)]

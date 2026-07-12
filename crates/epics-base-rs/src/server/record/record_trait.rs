@@ -1010,6 +1010,28 @@ pub trait Record: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Fields whose ONLY post path is the record's own per-cycle mark — C never
+    /// change-detects them, so a value change alone must post nothing.
+    ///
+    /// aCalcout's arrays AA..LL are the case. C's `monitor()` compares scalar
+    /// A..L against their PA..PL previous values (`aCalcoutRecord.c:1023-1029`)
+    /// and OVAL against POVL (`:1039`), but it keeps NO previous copy of an
+    /// array and runs no array comparison anywhere: an array posts if and only
+    /// if the expression stored into it (AMASK, `afterCalc` `:293-297`) or its
+    /// input link delivered a changed value (NEWM, `:1031-1036`) — both reported
+    /// by [`Self::take_cycle_posted_fields`].
+    ///
+    /// So the change-detection arm must not see these fields at all. It is not
+    /// merely redundant with the marks: a client `caput` to AA posts the put's
+    /// value without advancing the subscriber's `last_posted`, and the next
+    /// process — which stored nothing into AA and fetched nothing into it —
+    /// then found AA "changed" and emitted a post C has no counterpart for.
+    ///
+    /// Default: empty — every other record's auxiliary fields post on change.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Fields the record's C `monitor()` re-posts with `DBE_LOG` ONLY on
     /// every cycle it names them, regardless of change — the analogue of
     /// an unconditional `db_post_events(field, DBE_LOG)` sweep.

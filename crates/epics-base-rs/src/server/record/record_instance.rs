@@ -2292,7 +2292,10 @@ impl RecordInstance {
     ///   fields a process cycle may post at all.
     /// * A secondary value field ([`Record::fields_posted_with_value_mask`])
     ///   carries VAL's monitor mask, gated per its [`ValuePostGate`].
-    /// * A CHANGED field carries [`AuxPostMask::mask_for`].
+    /// * A CHANGED field carries [`AuxPostMask::mask_for`] — unless it is a
+    ///   [`Record::fields_posted_only_when_marked`] field, which C never
+    ///   change-detects (aCalcout AA..LL) and which therefore posts from its
+    ///   mark alone.
     /// * An UNCHANGED field posts only if the record marked it this cycle:
     ///   statically ([`Record::force_posted_fields`]), per-cycle
     ///   ([`Record::take_cycle_posted_fields`]), on the alarm transition
@@ -2322,6 +2325,10 @@ impl RecordInstance {
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
         let cycle_posted = self.record.take_cycle_posted_fields();
         let log_swept = self.record.log_swept_fields();
+        // C change-detects nothing about these fields; only the record's own
+        // per-cycle mark may post them (aCalcout AA..LL — no PAA..PLL previous
+        // copy exists to compare against).
+        let marked_only = self.record.fields_posted_only_when_marked();
         let value_masked = self.record.fields_posted_with_value_mask();
         let event_posted = self.record.event_posted_fields();
         let process_posted = self.record.process_posted_fields();
@@ -2365,7 +2372,7 @@ impl RecordInstance {
                 if post {
                     sub_updates.push((field.clone(), val.clone(), deadband_mask));
                 }
-            } else if changed {
+            } else if changed && !marked_only.contains(&field.as_str()) {
                 sub_updates.push((
                     field.clone(),
                     val.clone(),

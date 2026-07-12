@@ -6,6 +6,19 @@ use crate::error::AsynResult;
 use crate::interpose::{OctetInterpose, OctetNext, OctetReadResult};
 use crate::user::AsynUser;
 
+/// The single owner of every `f64 seconds` → per-character delay conversion.
+///
+/// C stores the operator's `double` verbatim (`pvt->delay = delay`,
+/// asynInterposeDelay.c:214) and hands it to `epicsThreadSleep`, which returns
+/// immediately for any non-positive argument. `Duration::from_secs_f64` instead
+/// *panics* on a negative or non-finite value, so every f64 the operator can
+/// reach — iocsh argument, protocol wire field, `set_delay` string — is
+/// converted here: non-positive and non-finite collapse to `Duration::ZERO`,
+/// C's "no delay".
+pub fn delay_from_secs(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO)
+}
+
 /// Interpose layer that introduces a per-character write delay.
 pub struct DelayInterpose {
     delay: Duration,
@@ -24,7 +37,7 @@ impl DelayInterpose {
                 status: crate::error::AsynStatus::Error,
                 message: format!("invalid delay value: '{secs_str}'"),
             })?;
-        self.delay = Duration::from_secs_f64(secs);
+        self.delay = delay_from_secs(secs);
         Ok(())
     }
 }
@@ -186,5 +199,19 @@ mod tests {
         d.set_delay("0.001").unwrap();
         assert_eq!(d.delay, Duration::from_millis(1));
         assert!(d.set_delay("invalid").is_err());
+    }
+
+    /// R9-54: the same `Duration::from_secs_f64`-on-parsed-input panic lived on
+    /// the delay path. C hands the double to `epicsThreadSleep`, which returns
+    /// immediately for a non-positive argument.
+    #[test]
+    fn test_set_delay_non_positive_is_zero_not_a_panic() {
+        let mut d = DelayInterpose::new(Duration::from_millis(5));
+        for s in ["-1", "-0.001", "NaN", "inf"] {
+            d.set_delay(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(d.delay, Duration::ZERO, "{s}");
+        }
+        assert_eq!(delay_from_secs(-1.0), Duration::ZERO);
+        assert_eq!(delay_from_secs(0.002), Duration::from_millis(2));
     }
 }

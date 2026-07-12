@@ -11,7 +11,7 @@ use crate::interfaces::InterfaceType;
 use crate::interrupt::{InterruptFilter, InterruptSubscription};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
 use crate::request::{RequestOp, RequestResult};
-use crate::user::AsynUser;
+use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
 
 /// Parsed `@asyn(portName, addr, timeout) drvInfoString` link specification.
 #[derive(Debug, Clone)]
@@ -115,12 +115,16 @@ pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
         0
     };
     let timeout = if parts.len() > 2 {
+        // C asynEpicsUtils.c:125 `strtod(pnext, &endp)` into `pasynUser->timeout`.
+        // A negative value ("wait forever" in C) is accepted there and bounded
+        // here; `timeout_from_secs` owns that substitution under DRV-42.
         let secs: f64 = parts[2]
             .parse()
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[2])))?;
-        Duration::from_secs_f64(secs)
+        timeout_from_secs(secs)
     } else {
-        Duration::from_secs(1)
+        // C asynEpicsUtils.c:109,121 — `pasynUser->timeout = 1.0`.
+        DEFAULT_TIMEOUT
     };
 
     Ok(AsynLink {
@@ -180,12 +184,13 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
         .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?;
 
     let timeout = if parts.len() > 3 {
+        // Same `strtod` timeout field as `@asyn` (asynEpicsUtils.c:200).
         let secs: f64 = parts[3]
             .parse()
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[3])))?;
-        Duration::from_secs_f64(secs)
+        timeout_from_secs(secs)
     } else {
-        Duration::from_secs(1)
+        DEFAULT_TIMEOUT
     };
 
     Ok(AsynMaskLink {
@@ -3199,6 +3204,39 @@ mod tests {
     #[test]
     fn test_parse_invalid_timeout() {
         assert!(parse_asyn_link("@asyn(port, 0, xyz) X").is_err());
+    }
+
+    /// R9-54: C `strtod` accepts the negative "wait forever" sentinel
+    /// (asynEpicsUtils.c:125) and every other double the operator can type.
+    /// `Duration::from_secs_f64` panicked on exactly those, aborting the thread
+    /// at record init. They now take the bounded DRV-42 substitution instead.
+    #[test]
+    fn test_parse_negative_and_non_finite_timeout_is_bounded_not_a_panic() {
+        for spec in [
+            "@asyn(PORT, 0, -1) DRV",
+            "@asyn(PORT, 0, -0.5) DRV",
+            "@asyn(PORT, 0, inf) DRV",
+            "@asyn(PORT, 0, NaN) DRV",
+            "@asyn(PORT, 0, 1e30) DRV",
+        ] {
+            let link = parse_asyn_link(spec).expect(spec);
+            assert_eq!(link.timeout, DEFAULT_TIMEOUT, "{spec}");
+            assert_eq!(link.drv_info, "DRV", "{spec}");
+        }
+        // A representable timeout still passes through verbatim.
+        assert_eq!(
+            parse_asyn_link("@asyn(PORT, 0, 0) DRV").unwrap().timeout,
+            Duration::ZERO
+        );
+    }
+
+    /// R9-54, same field on the `@asynMask` parser.
+    #[test]
+    fn test_parse_mask_negative_timeout_is_bounded_not_a_panic() {
+        let link = parse_asyn_mask_link("@asynMask(PORT, 0, 0x1F, -1) DRV").unwrap();
+        assert_eq!(link.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(link.mask, 0x1F);
+        assert_eq!(link.drv_info, "DRV");
     }
 
     #[test]

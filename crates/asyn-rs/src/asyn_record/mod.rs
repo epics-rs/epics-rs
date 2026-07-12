@@ -2332,13 +2332,16 @@ impl AsynRecord {
     /// thread indefinitely. That is the signed-off deviation **DRV-42**
     /// (`user.rs:15-22`, filed at
     /// `doc/c-parity-review-drivers-2026-06-29.md:98`), and this record is not
-    /// allowed to override it: a negative TMOT falls back to the bounded 1 s
-    /// default. A non-finite or out-of-range TMOT takes the same fallback —
-    /// `Duration::try_from_secs_f64` rejects it, and C's `(int)` cast of such a
-    /// value is undefined behaviour, so there is no C semantics to port.
+    /// allowed to override it: a negative TMOT falls back to the bounded
+    /// [`crate::user::DEFAULT_TIMEOUT`]. A non-finite or out-of-range TMOT takes
+    /// the same fallback — C's `(int)` cast of such a value is undefined
+    /// behaviour, so there is no C semantics to port.
+    ///
+    /// The substitution itself belongs to [`crate::user::timeout_from_secs`],
+    /// the crate-wide owner of `f64 seconds` → `AsynUser::timeout`; this method
+    /// only names TMOT as the source.
     fn io_timeout(&self) -> std::time::Duration {
-        const DRV42_BOUNDED_FALLBACK: std::time::Duration = std::time::Duration::from_secs(1);
-        std::time::Duration::try_from_secs_f64(self.tmot).unwrap_or(DRV42_BOUNDED_FALLBACK)
+        crate::user::timeout_from_secs(self.tmot)
     }
 
     /// Clamp the operator's requested transfer sizes into the record fields —

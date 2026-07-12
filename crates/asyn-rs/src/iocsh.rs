@@ -456,18 +456,12 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
                 let _addr = arg_int(args, 1).unwrap_or(0);
-                // C takes the delay as a `double` seconds and stores it
-                // verbatim (`pvt->delay = delay`, asynInterposeDelay.c:214).
-                // `Duration::from_secs_f64` panics on a negative or NaN value,
-                // which iocsh can supply, so refuse those rather than abort the
-                // shell — C's `epicsThreadSleep` treats a non-positive delay as
-                // "no delay", which is the zero Duration here.
-                let secs = arg_f64(args, 2).unwrap_or(0.0);
-                let delay = if secs.is_finite() && secs > 0.0 {
-                    std::time::Duration::from_secs_f64(secs)
-                } else {
-                    std::time::Duration::ZERO
-                };
+                // C takes the delay as a `double` seconds and stores it verbatim
+                // (`pvt->delay = delay`, asynInterposeDelay.c:214). iocsh can
+                // supply a negative or NaN one; `delay_from_secs` owns the
+                // conversion and collapses those to C's "no delay".
+                let delay =
+                    crate::interpose::delay::delay_from_secs(arg_f64(args, 2).unwrap_or(0.0));
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => {
                         if let Err(e) = handle.push_delay_interpose_blocking(delay) {

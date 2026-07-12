@@ -258,6 +258,22 @@ pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
 pub fn format_time(ts: WallTime) -> String {
     use chrono::{DateTime, Local, TimeZone};
 
+    // C treats an all-zero `epicsTimeStamp` as UNINITIALIZED and prints a
+    // sentinel instead of a date (`epicsTime.cpp:174-179`, W10-B3):
+    //
+    //     // presume that EPOCH date is an uninitialized time stamp
+    //     if ( pTS->secPastEpoch == 0 && pTS->nsec == 0u ) {
+    //         strncpy ( pBuff, "<undefined>", bufLength );
+    //
+    // The test is on the stamp AS IT ARRIVED — seconds past the EPICS epoch,
+    // before any timezone applies — which is why it lives here and not at a
+    // call site holding a local `DateTime`. A never-processed record
+    // (`caget -a TST:NEVER`) and every timed-out synchronous readback (see
+    // `zero_dbr_snapshot`) carry exactly this stamp.
+    if ts.unix_secs() == EPICS_EPOCH_UNIX_SECS && ts.subsec_nanos() == 0 {
+        return "<undefined>".to_string();
+    }
+
     // Round to microseconds the way C does, then clamp: `frac` can reach
     // 1e9 only by rounding up, and C refuses to let that touch the seconds.
     let frac = u64::from(ts.subsec_nanos()) + 500;

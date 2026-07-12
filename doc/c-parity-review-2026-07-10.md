@@ -1419,6 +1419,279 @@ Impact: a DBE_LOG subscriber to swait .A–.L gets an archive event on every inp
   material.
 - Extensive audited-clean inventories per panel are in the round report.
 
+### Fix wave 7 — dispositions (2026-07-12)
+
+8 worktree fixers (opus): a7 / b7-tools / b7-evq (structural) / c7 / d7 /
+d7-com (subsystem port) / e7-rec / e7-ad. All branches merged into
+review/parity-r6 and verified by main: workspace fmt --check clean, clippy
+--all-targets -D warnings clean, nextest 7866 passed / 0 failed / 2 skipped,
+doctests clean. 31 of 32 items FIXED; R9-17 NOT-REAL; R9-46 fixed as its
+TMOT>=0 half with the negative half a documented DRV-42 deviation. One
+merge-integration fix by main: e7-rec's swait_input_monitor_mask test
+adapted to b7-evq's EventReader API (commit on review/parity-r6).
+
+Category A (fixer a7; every expectation verified against COMPILED C drivers
+of sCalcPostfix/sCalcPerform/aCalcPostfix/aCalcPerform + base postfix/calcPerform):
+- R8-6 FIXED 55903088 — per-engine `ElementTable` IS the lexer (base/sCalc/
+  aCalc, own symbols, operand-letter ranges, hex rules); the post-hoc
+  token_in_base_table filter deleted — out-of-table symbols unrepresentable.
+  SUB-CLAIM NOT-REAL: 0x hex literals ARE accepted by C sCalc/aCalc
+  (epicsStrtod re-scan, 0x1F=31); the real defect was invented symbol names
+  (ATOD/BIN_READ/BIN_WRITE/NORMAL_RNDM vs C's DBL/READ/WRITE/NRNDM).
+- R8-7 FIXED 414a3f18, WIDENED — string::eval owns C's whole -1 contract
+  (zero divisor, negative SQRT/LOG10/LOGE, non-finite-result tail incl. the
+  atof of a string result); aCalc Div yields myMAXFLOAT in all three operand
+  shapes; base stays bare IEEE.
+- R8-8 FIXED 9f0b3fe0 — <</>> dispatch on the left operand's type; array
+  branch is shift_elements(): positional move by myNINT, zero fill, C's
+  in-place interpolation walk for fractional shifts.
+- R9-1 FIXED 480dc413 — FINDING CORRECTION: the premise was half wrong. The
+  1e-11 epsilon is C's SMALL (sCalcPerform.c:46), used by ALL SIX sCalc
+  numeric comparisons; the port had the two engines' rules SWAPPED (epsilon
+  in aCalc which is exact, exact in sCalc which uses SMALL). Compiled C:
+  0.1+0.2==0.3 is true in sCalc, false in aCalc. One commit — one rule in
+  the wrong place, not two bugs.
+- R9-2 FIXED 4cdf8ec7 — broadcast → ArrayStackValue::to_array (C's
+  to_array(setValues=1), NaN→0), single promotion owner; rename exposed a
+  second site (acalcout AVAL fill, aCalcPerform.c:1624).
+- R9-3 FIXED 1052c1c9 — calcout init compiles CALC/OCAL unconditionally.
+- Tests corrected (pinned invented behaviour → compiled-C values):
+  h7_div_by_zero (sCalc -1 not +Inf), h6 comparisons (SMALL not exact),
+  acalcout non-finite cases (1/0 → myMAXFLOAT/st=0 in C; moved to
+  1e300*1e300), ATOD→DBL, BIN_READ/BIN_WRITE→READ/WRITE, MM/UU now Err.
+
+Category B (fixers b7-tools, b7-evq):
+- R9-16 FIXED 4f2e3c76 — cli::connect_pvs single connect-gate owner
+  (create-all → wait-all → C's exact stderr text) shared by caget/cainfo/
+  caput; partial connect → zero stdout, exit 1. camonitor classified
+  distinct (C uses a connection handler, no barrier).
+- R9-17 NOT-REAL a273458c — the subscription coordinator already re-derives
+  the type across reconnect; pinned by evidence test
+  label_readback_re_derives_to_dbr_time_string_when_the_pv_returns_as_enum
+  passing with no production change.
+- R9-18 FIXED b54b0744 — FINDING CORRECTION (compiled/traced against C):
+  the "*** no data available (timeout)" branch is DEAD in caput (needs
+  value==NULL; caput callocs at :167 and never uses the callback path), so
+  C prints the ZEROED buffer (`New : <name>  0`) and exits 0 — implemented
+  as zero_readback shaped by the readback type; widened to the Old: read
+  (same fatal-timeout bug); ENUM-menu read distinct (C genuinely returns 1).
+- R8-22 FIXED c45e60a8 / R8-23 FIXED 5affc90c — STRUCTURAL REDESIGN (third
+  round on the primitive): new epics_base_rs::server::event_queue ports C's
+  triple EventUser (circuit, flowCtrlMode, queue chain with quota
+  selection) / EvQue (ring occupancy, nDuplicates, quota, one SubQ per
+  monitor) / SubQ (events VecDeque; npend=len, pLastLog=back).
+  Invariants: n_duplicates == Σ max(0, npend-1); total_pending == Σ npend;
+  newest pending is events.back() on every path; NO side slot exists; only
+  the queue moves its counters. coalesce_consume, Subscriber::
+  coalesce_overflow, pop_coalesced, per_channel_event_depth, MonitorFlow,
+  FlowControlGate all DELETED. post returns PostOutcome{Appended/Replaced/
+  Closed}. Boundary tests incl. sibling-duplicate release (R8-23 owner
+  path) and the intermediate one-ring-per-subscription tree failing it.
+  Documented deviations in the module header: per-subscription reader tasks
+  (frame interleave not C's strict ring order; all accounted quantities
+  shared), by-reference early-drop branch unreachable (owned Snapshots),
+  replace ORs the displaced mask into the survivor (pre-existing 446e0d4a).
+
+Category C (fixer c7):
+- R8-34 FIXED f1e2fca1 — MonitorTeardown single owner for both monitor
+  loops; MonitorEnd::Fatal constructed at exactly one site which calls
+  server.close() first, so Fatal ⟹ circuit-closed holds by construction.
+  RawMonitorFrameKind::Fatal split into Invalid (circuit-fatal) /
+  FinishError (op-local) — the type split forced all five driver sites.
+  IOID unregister + active clear centralized from 14 open-coded exits.
+- R9-31 FIXED 7d4f5af0 — dbe_scalar_as_u8 → dbe_kind, exhaustive match
+  mirroring pvxs switch(kind); Bool → default → VALUE|ALARM fallback. A
+  test pinning Boolean(true)→VALUE was invented and corrected.
+- R9-32 FIXED e226272a — ack_any_as_u32, one exhaustive tryAs<uint32_t>
+  for non-string storage; also closes the unwrap_or(1) arms (pvxs wraps
+  negatives then clamps). Stated deviation: uint64_t(double) is C++ UB for
+  negative/NaN/overflow; port takes Rust's defined saturating cast.
+
+Category D (fixers d7, d7-com):
+- R8-54 FIXED 606c9a48 — clamp_transfer_sizes single owner of NOWT/NRRD
+  effective values, written back into the fields.
+- R8-55 FIXED 3be9d184 — one monitor_status() owner (C monitorStatus),
+  driven by connect_device and the status_dirty drain; exception
+  subscription filters on port name alone. Also corrected invented
+  behaviour: connect_device kept AUCT/ENBL on port-query failure where C
+  assigns 0 (:1087,:1092,:1097). New async PortHandle::is_connected/
+  is_enabled/is_auto_connect (callback runs on the port-actor thread).
+- R8-56 FIXED 046183b7 / R9-48 FIXED ca97a50b / R9-49 FIXED 51c17877 /
+  R9-50 FIXED 1613ec3d — every I/O diagnostic through one
+  IoOutcome::report_error (C's reportError, last-writer-wins into ERRS):
+  C texts, C source ordering (status failure then overflow),
+  AsynError::message() tail, pre-write flush status discarded.
+- R8-58 FIXED 8f9507db — asynInterposeDelay iocsh registrar via
+  RequestOp::PushDelayInterpose through the port actor.
+- R9-46 FIXED 08b0f190 — io_timeout() single owner of TMOT→AsynUser::
+  timeout; tmot >= 0 verbatim (0 = C's non-blocking poll; transports
+  already implement it). DOCUMENTED DEVIATION: tmot < 0 ("wait forever")
+  keeps the bounded 1 s fallback under DRV-42 (AsynUser::timeout is an
+  unsigned Duration so every blocking driver op is bounded) — the invented
+  "1 s default" comment replaced by an explicit DRV-42 citation at the
+  site. Decision by main: option (1), reversing DRV-42 rejected.
+- R9-47 FIXED c8afa0c9 — write_option (set→getOptions) and write_eos
+  (set→getEos) single owners; option/EOS fields are driver readbacks, not
+  request latches, even on a failed set. New RequestOp::GetInputEos/
+  GetOutputEos round trips.
+- R8-57 FIXED d92eaacb + 189aa949 + b6e01a1b + 824df948 — asynInterposeCOM
+  ported in full (crates/asyn-rs/src/interpose/com.rs; C file is at
+  asyn/miscellaneous/asynInterposeCom.c, not interposes/ as filed). 45
+  protocol tests incl. a byte-exact 61-byte connect handshake and C-quirk
+  negative controls (parity echo unchecked, crtscts N resends current
+  mode, short write reports the stuffed count). IpProtocol::Com accepted;
+  the R8-50 refusal replaced; restore_com_settings on connect (C
+  exceptionHandler). STRUCTURAL: COM is the chain's BASE LINK, not a stack
+  layer — Rust's interpose push order inverts C's (later install =
+  innermost, C = outermost), and with COM above EOS each escaped 0xFF
+  costs the read one byte (byte-budget test proves it); with_base_link
+  makes "COM innermost" hold by construction. Negotiation reads share the
+  data path's socket-teardown gate (should_disconnect_after_read_error).
+  Deliberate deviation: C's ixon bad-value arm sends uninitialized memory
+  (UB); the port returns asynError("Bad option value"), documented at site.
+  No iocsh registrar BECAUSE C HAS NONE (brief assumption wrong —
+  installed only from drvAsynIPPort.c:1061).
+
+Category E (fixers e7-rec, e7-ad):
+- R9-61 FIXED 5c5412b8 / R9-62 FIXED 4947f9d8 / R9-63 FIXED 5a0c9a34 /
+  R9-64 FIXED 0ae29ab1 — one structural pass over transform process():
+  C's fetch → IVLA gate → per-channel calc → outputs order; VAL de-aliased
+  (constant-0 dummy; test_transform_val_is_a corrected); calc failure
+  raises CALC_ALARM/INVALID + UDF; failed INPx read zeroes the channel;
+  the invented per-channel value-restore removed.
+- R9-65 FIXED 34d23e7c — output_link_value() single owner of the OUT
+  value composed at output time; output_time_input_links() fetches DOL
+  after ODLY (C execOutput); swait OVAL de-dualed (now only C's Old
+  Value); DOLN field added.
+- R9-69 FIXED 0ef94baf, WIDENED to aSub — input_fetch_policy() Record
+  hook (ReadAll | AbortOnFirstFailure), enforced once in the framework
+  fetch loop; sub + aSub declare AbortOnFirstFailure (the exact C
+  fetch_values population).
+- R9-70 FIXED 0c1704b9 — FINDING CORRECTION: C's put path quantizes and
+  posts DLY1 regardless of WHICH DLYn was written (sseqRecord.c:1140-1156
+  computes lnkIndex but never adds it — long-standing upstream quirk);
+  reproduced and pinned as C-verified. Init quantizes all channels.
+  epicsThreadSleepQuantum/NINT ported into runtime::time.
+- R9-72 FIXED dbb9d550 — aux_change_mask() single owner of changed-aux
+  event masks across all three change-detection loops, driven by
+  fields_posted_with_monitor_mask() declarations; swait inherits
+  monitor_mask (and gained its missing MDEL/ADEL fields), calc keeps its
+  forced |LOG.
+- R8-71 FIXED 9fe0e508 / R8-72 FIXED 038fec51 — CircularBuff completion
+  test moved outside the triggered branches (postCount==0 completes per
+  running frame); SoftTrigger latches for any written value incl. 0 and
+  flushes the pre-buffer eagerly when FlushOnSoftTrig>0.
+- R8-73 FIXED b29103e2 — netCDF numArrays keyed on open mode through
+  define_data_set.
+- R8-74 FIXED f4af35e5 / R9-71 FIXED 784a0fa8 — compress_jpeg returns the
+  message-bearing error (C's three texts); BSLZ4 text is C's "Failed to
+  Blosc decompress" copy-paste.
+- R8-75 FIXED 1de6b646 — TIFF errors on 3-D without ColorMode as C does.
+- R9-66 FIXED b1685c5a — resolve_axis returns (offset, size, binning);
+  disabled dimension forces binning=1 by construction (both 2-D and 3-D
+  call sites' hand derivations deleted).
+- R9-67 FIXED dad7b0ba, WIDENED — NDArrayInfo::user_dims() single owner of
+  C's {xDim,yDim,colorDim}; same-defect site found and fixed in
+  bad_pixel.rs (physical dims[0]/dims[1] → bad pixels corrected at the
+  wrong element on RGB1).
+- R9-68 FIXED 8f9cade1 — the port gained pArrays[0] as real state with one
+  writer; SaveBackground/SaveFlatField copy the last OUTPUT synchronously
+  inside the write and set ValidXxx immediately. The two one-shot tests
+  pinning the deferred behaviour deleted, replaced by C-verified cases.
+
+## Open Findings — surfaced during fix wave 7 (reported by fixers, pending independent verify)
+
+Category A (calc engines; compiled-C evidence behind 1/2/6):
+### R9-4: sCalc coerces string operands to double via toDouble/atof; the port errors TypeMismatch
+Severity: Medium. With AA="6", C gives AA/2=3 and SQRT(AA)=2.449; affects every mixed-type op in string.rs.
+### R9-5: aCalc SQRT/LOG of a negative — C scalar: 0 with status 0; C array: elements 0 with status -1 (aCalcPerform.c:775-812 → :1602); port yields NaN in both
+Severity: Medium.
+### R9-6: C's READ/WRITE are 2-operand; the port's op is 1-operand (compiled C: COMPILE_ERR 8 for READ(AA))
+Severity: Low.
+### R9-7: calc/calcout never raise CALC_ALARM for an empty/broken expression — C postfix() always writes END_EXPRESSION into RPCL (even on failure) and calcPerform returns -1 → CALC_ALARM/INVALID every process; port models "no program" as Option::None and skips evaluation
+Severity: Medium. Structural cause behind R9-3's symptom; spans calc + calcout; its own change (empty/failed compile carries an empty program, not None).
+### R9-8: C symbols the port cannot lex/execute: @, @@, R2S, S2R, AVAL, ANEG, APOS, aCalc LEN, sCalc -|, $E/$P/$R/$S/$T/$W aliases; aCalc [/{ array subrange (C compiles, port answers Syntax)
+Severity: Medium.
+### R9-9: C's strtod re-scan swallows INFINITY-style literals where the port stops at INF
+Severity: Low.
+
+Category B (CA tools):
+### R9-19: caget-rs read-timeout prints "*** no data available (timeout)" in both modes; C's synchronous path prints the zeroed calloc'd buffer (caget.c:209), the string is reachable only under -c (caget.c:130)
+Severity: Low.
+### R9-20: caget-rs exits 1 for any single PV's post-gate read failure; C returns 0 unless EVERY PV is disconnected (caget.c:227 if (!nConn) return 1)
+Severity: Low.
+### R9-21: caput-rs Old:-read disconnect/error exits 1 before the put; C discards that caget()'s return (caput.c:535) and proceeds to the put
+Severity: Low.
+### R9-22: caput-rs -S is not applied to the readback rendering; C's caget uses the global charArrAsStr (caput.c:211-221)
+Severity: Low.
+### R9-23: caput-rs non-fatal readback errors echo the submitted value; C prints "*** no read access" / "*** CA error" markers
+Severity: Low.
+
+Category C (PVA):
+### R9-33: non-scalar ackAny should reset the circuit — pvxs servermon.cpp:556 runs as<std::string>() BEFORE the if/else; NoConvert escapes into the dispatch catch (conn.cpp:277-282) → bev.reset(); the :570-573 Crit logRemote is dead code (R9-32's filing text was wrong there). Port logs Crit and serves on with ackAt=1 (comment already corrected in e226272a)
+Severity: Medium.
+### R9-34: string ackAny parse is decimal-only; pvxs parseTo<uint64_t> = stoull(s,&idx,0): "0x10"→16, "010"→8, "-1" wraps to u64::MAX → 0xFFFFFFFF → clamped to queueSize
+Severity: Low.
+### R9-35: array-typed record._options.DBE — TypeCode kind() is code&0xe0 so Int32A is Kind::Integer and pvxs reaches as<uint8_t>() which THROWS on array storage, escaping onSubscribe; port treats non-scalar DBE as unselected → VALUE|ALARM. pvxs-side consequence UNVERIFIED — verify before fixing
+Severity: Low.
+
+Category D (asyn):
+### R9-51: record-lifecycle ERRS texts invented (outside IoOutcome::report_error): "port '{}' not found" (C "connectDevice failed: %s"), "not connected" (C "Not connect to a port"), "drvUserCreate failed: {e}" (C "Error in asynDrvUser->create()"), trace-file open text, and "read: ... returned no value" arms with no C analogue
+Severity: Low.
+### R9-52: monitorStatus does not refresh TSIZ (getTraceIOTruncateSize, asynRecord.c:1100) or TFIL ("Unknown" on foreign change, :1119-1124) on any path
+Severity: Low.
+### R9-53: interface-validity fields hardcoded — connect_device sets octetiv/i32iv/ui32iv/f64iv/optioniv=1 unconditionally; C queries each interface, e.g. setEos with no asynOctet → "No asynOctet interface" + COMM/MAJOR (asynRecord.c:1949-1953)
+Severity: Medium.
+### R9-54: @asyn(PORT,ADDR,TIMEOUT) DB-link parse panics on a negative timeout — adapter.rs:121,186 Duration::from_secs_f64 with no guard; C accepts -1 as "wait forever". A PANIC at record init, not a substitution
+Severity: High.
+### R9-55: PortDriver::set_option/get_option carry no asynUser, so asynRecord TMOT cannot reach the COM negotiation (uses C's own 2 s, faithful for the shell path, silently fixed for the record path). Needs an asynUser on the option trait — public API change
+Severity: Low.
+### R9-56: interpose STACK push-order inversion remains for stack layers — an echo pushed onto a port that already has EOS lands inner of EOS where C puts it outer (COM fixed structurally as base link; the general stack family is open)
+Severity: Medium.
+### R9-57: COM diagnostic gaps blocked on trait surface: asynPrintIO(ASYN_TRACEIO_FILTER) on unstuffing dropped (readIt :237-239); flow-control advisory message into pasynUser->errorMessage on success dropped (:600-640)
+Severity: Low.
+
+Category E (records + AD; block extended past 75 — numbering is per-round unique):
+### R9-73: calc/calcout/sCalcout/swait run calcPerform regardless of fetch failure; C gates on fetch_values()==0 (calcRecord.c:120); swait additionally raises READ_ALARM/INVALID on a failed input
+Severity: Medium. Same shape as R9-69, different mechanism (calc gate, not subroutine gate).
+### R9-74: swait OOPT="On Change" is fabs(oval-val) > mdel in C (swaitRecord.c:432); port compares with != (newly observable now MDEL exists)
+Severity: Low.
+### R9-75: swait LA..LL previous-input fields missing — C posts them alongside A..L (swaitRecord.c:652)
+Severity: Low.
+### R9-76: swait INAV..INLV / DOLV link-status fields missing (PV_OK/PV_NC/NO_PV); C's execOutput reads DOL only if (!dolv); port approximates with "DOLN resolves"
+Severity: Low.
+### R9-77: eventRecord.c:163 posts VAL with monitor_mask | DBE_VALUE (no forced LOG); the port's default forced VALUE|LOG still applies (R9-72 family; the new hook is the mechanism)
+Severity: Low.
+### R9-78: aSub OUTA..OUTU output links never driven; C pushes them when do_sub returns 0 (aSubRecord.c:210-230)
+Severity: Medium.
+### R9-79: CircularBuff push() is not gated on Control — C processCallbacks does nothing when scopeControl==0; port transitions Idle→BufferFilling on first push, so Control=0 does not stop recording
+Severity: Medium.
+### R9-80: color_convert.rs:802 detect_color_mode infers layout from dims when ColorMode is absent (same inference R8-75 removed from file writers); C NDPluginColorConvert.cpp:44 defaults Mono — consequence is wrong pixel conversion
+Severity: Medium.
+
+### Notes (fix wave 7)
+
+- Deliberate deviations recorded (not defects): JPEG oversized-dimension —
+  C's jpeg_std_error error_exit calls exit() and aborts the IOC, port
+  refuses with C's :235 text; bad_pixel .max(1) binning clamp — C divides
+  by a 0 binning verbatim (crash); COM ixon bad-value arm — C sends
+  uninitialized memory (UB); ack_any float — uint64_t(double) is C++ UB
+  for negative/NaN, port uses the defined saturating cast; TMOT<0 —
+  DRV-42.
+- Test-infra defect (not parity): epics-pva-rs tests/stability.rs uses
+  fixed host ports (NEXT_PORT=15075) and run_pva_server swallows the bind
+  error, so concurrent workspace runs on one host cross-connect —
+  root-caused by fixer-c7 as the source of the recurring
+  array_concurrent_subop_replies_error_not_silent flake (it failed once in
+  four separate fixers' full-workspace runs, incl. on the untouched base
+  tree, and passed all isolation reruns). Worth fixing in a future wave.
+- Other compile-load/UDP flakes, all passing isolation + rerun, recorded:
+  ca_fr_8_dotted_filter_suffix_resolves_at_search,
+  mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer,
+  claimed_host_name_matches_a_host_hag_and_grants_write.
+- Fixer-a7 was cut off once by an API server error mid-task and resumed by
+  main with no loss (worktree state intact).
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -1546,3 +1819,26 @@ Impact: a DBE_LOG subscriber to swait .A–.L gets an archive event on every inp
   zero-on-fail); kind-dispatch gaps in pvRequest option parsing. Fix wave 7
   next: 32 items (15 confirmed + 17 new), R8-23 event-queue redesign and
   R8-57 asynInterposeCOM port assigned as dedicated structural tasks.
+- Fix wave 7 (2026-07-12): 31 of 32 items FIXED, R9-17 NOT-REAL (coordinator
+  already rebuilds; evidence test), across 8 worktree fixers; all merged and
+  verified by main — workspace fmt/clippy -D warnings clean, nextest
+  7866/7866 (2 skipped), doctests clean. Landmark closures: the CA server
+  event queue REDESIGNED to C's EventUser/EvQue/SubQ triple (R8-22+R8-23,
+  MonitorFlow/coalesce slots deleted); asynInterposeCOM PORTED in full
+  (R8-57, 45 protocol tests, COM as structural base link); per-engine
+  ElementTable IS the calc lexer (R8-6); transform process() rebuilt to C's
+  order (R9-61..64); three new Record hooks (input_fetch_policy,
+  output_link_value/output_time_input_links,
+  fields_posted_with_monitor_mask); IoOutcome::report_error owns every
+  asynRecord I/O diagnostic. THREE finding-text corrections by fixers with
+  compiled-C/traced evidence: R9-1 (epsilon rules were SWAPPED between
+  engines — SMALL is real C, sCalc-side), R9-18 (C's timeout branch is dead
+  code; C prints the zeroed buffer), R9-70 (C's put path quantizes DLY1
+  regardless of which DLYn was written). One NOT-REAL sub-claim (R8-6 hex
+  literals — C accepts them). R9-46 decision: TMOT>=0 verbatim, TMOT<0
+  stays bounded under DRV-42 (documented at site). One merge-integration
+  test fix by main (EventReader API). 26 NEW fixer-surfaced findings
+  recorded OPEN (R9-4..9, 19..23, 33..35, 51..57, 73..80) — notable: R9-54
+  is a PANIC at record init (@asyn negative timeout), R9-7 is the
+  structural cause behind R9-3, R9-56 is the general interpose stack-order
+  family behind R8-57's COM-specific fix. Next: R10 re-audit.

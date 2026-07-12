@@ -2233,96 +2233,92 @@ impl AsynRecord {
         let Some(opts) = self.get_options(handle, OPTION_READBACK_KEYS) else {
             return;
         };
-        // Baud rate. C reads the driver's text once and derives both fields from
-        // it: `sscanf(optbuff, "%d", &lbaud)` and the `baud_choices` walk
-        // (asynRecord.c:1866-1871). BAUD is matched against the choice *text*,
-        // not against the parsed number, so a driver reporting something no menu
-        // choice carries leaves BAUD at "Unknown" while LBAUD still shows the
-        // rate.
-        if let Some(val) = opts.get("baud") {
-            self.lbaud = val.parse::<i32>().unwrap_or(0);
-            self.baud = baud_choice_index(val);
+        // C hands `getOption` a buffer the driver clears at entry
+        // (`val[0] = '\0'`, drvAsynSerialPort.c:142, drvAsynIPPort.c:894) and
+        // then ignores the returned status (asynRecord.c:1863-1928). So a key the
+        // port does not implement is an *empty readback*, not a skipped field: an
+        // IP port answers "" for `parity`, and PRTY lands on its Unknown choice
+        // instead of keeping a stale value from the serial port the record used
+        // to point at. One rule for every key.
+        let opt = |key: &str| opts.get(key).map(String::as_str).unwrap_or("");
+
+        // Baud rate. C derives both fields from one text:
+        // `sscanf(optbuff, "%d", &pasynRec->lbaud)` and the `baud_choices` walk
+        // (asynRecord.c:1866-1871). BAUD is matched against the choice *text*, so
+        // a driver reporting a rate no menu choice carries leaves BAUD at
+        // "Unknown" while LBAUD still shows the number.
+        //
+        // LBAUD is the one field C does *not* pre-zero: `sscanf` writes nothing
+        // when the text carries no number, so LBAUD keeps its previous value —
+        // where the port's `parse().unwrap_or(0)` reported the line as 0 baud.
+        // The parse is C's `%d`, a prefix parse (`option_parse::sscanf_int`).
+        let baud_text = opt("baud");
+        if let Some(rate) = crate::drivers::option_parse::sscanf_int(baud_text) {
+            self.lbaud = rate;
         }
+        self.baud = baud_choice_index(baud_text);
         // Parity
-        if let Some(val) = opts.get("parity") {
-            self.prty = match val.as_str() {
-                "none" => 1,
-                "even" => 2,
-                "odd" => 3,
-                _ => 0, // unknown
-            };
-        }
+        self.prty = match opt("parity") {
+            "none" => 1,
+            "even" => 2,
+            "odd" => 3,
+            _ => 0, // unknown
+        };
         // Data bits. The serial driver's get_option exposes data bits
         // under the key `"bits"` (C asynRecord.c:1884 likewise reads
         // "bits"); `"csize"` is consumed by no driver, so the readback
         // must use "bits" to match the DBIT write path (write_option
         // "bits" below).
-        if let Some(val) = opts.get("bits") {
-            self.dbit = match val.as_str() {
-                "5" => 1,
-                "6" => 2,
-                "7" => 3,
-                "8" => 4,
-                _ => 0,
-            };
-        }
+        self.dbit = match opt("bits") {
+            "5" => 1,
+            "6" => 2,
+            "7" => 3,
+            "8" => 4,
+            _ => 0,
+        };
         // Stop bits
-        if let Some(val) = opts.get("stop") {
-            self.sbit = match val.as_str() {
-                "1" => 1,
-                "2" => 2,
-                _ => 0,
-            };
-        }
+        self.sbit = match opt("stop") {
+            "1" => 1,
+            "2" => 2,
+            _ => 0,
+        };
         // Flow control
-        if let Some(val) = opts.get("crtscts") {
-            self.fctl = match val.as_str() {
-                "Y" | "Yes" => 2,         // Hardware
-                "N" | "No" | "none" => 1, // None
-                _ => 0,
-            };
-        }
+        self.fctl = match opt("crtscts") {
+            "Y" | "Yes" => 2,         // Hardware
+            "N" | "No" | "none" => 1, // None
+            _ => 0,
+        };
         // Modem control
-        if let Some(val) = opts.get("clocal") {
-            self.mctl = match val.as_str() {
-                "Y" | "Yes" => 1, // CLOCAL
-                "N" | "No" => 2,  // YES (hardware modem control)
-                _ => 0,
-            };
-        }
+        self.mctl = match opt("clocal") {
+            "Y" | "Yes" => 1, // CLOCAL
+            "N" | "No" => 2,  // YES (hardware modem control)
+            _ => 0,
+        };
         // XON/XOFF
-        if let Some(val) = opts.get("ixon") {
-            self.ixon = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
-        if let Some(val) = opts.get("ixoff") {
-            self.ixoff = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
-        if let Some(val) = opts.get("ixany") {
-            self.ixany = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
-        // IP options
-        if let Some(val) = opts.get("hostinfo") {
-            self.hostinfo = val.clone();
-        }
-        if let Some(val) = opts.get("disconnectOnReadTimeout") {
-            self.drto = match val.as_str() {
-                "Y" | "Yes" => 2,
-                "N" | "No" => 1,
-                _ => 0,
-            };
-        }
+        self.ixon = match opt("ixon") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+        self.ixoff = match opt("ixoff") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+        self.ixany = match opt("ixany") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
+        // IP options. C `strncpy(pasynRec->hostinfo, hostbuff, …)`
+        // (asynRecord.c:1928) copies the buffer whatever the get returned, so a
+        // port carrying no `hostinfo` key clears the field.
+        self.hostinfo = opt("hostinfo").to_string();
+        self.drto = match opt("disconnectOnReadTimeout") {
+            "Y" | "Yes" => 2,
+            "N" | "No" => 1,
+            _ => 0,
+        };
     }
 
     /// Read the driver's options under the record's queued `AsynUser`.
@@ -7873,6 +7869,99 @@ mod tests {
             c.nsev,
             AlarmSeverity::NoAlarm,
             "C raises no recGblSetSevr in queueTimeoutCallbackSpecial"
+        );
+    }
+
+    // ===== R10-52: the option readback follows C's buffer rule =====
+
+    /// Register a port whose `getOption("baud")` answers `baud_text` and which
+    /// refuses every other key — a driver that reports its rate as free text, and
+    /// the ordinary case of a port that does not implement a key at all.
+    fn register_baud_text_port(port_name: &'static str, baud_text: &'static str) {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct BaudTextPort(PortDriverBase, &'static str);
+        impl PortDriver for BaudTextPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                if key == "baud" {
+                    Ok(self.1.to_string())
+                } else {
+                    Err(crate::error::AsynError::OptionNotFound(key.to_string()))
+                }
+            }
+        }
+
+        let (rt, jh) = create_port_runtime(
+            BaudTextPort(
+                PortDriverBase::new(port_name, 1, PortFlags::default()),
+                baud_text,
+            ),
+            RuntimeConfig::default(),
+        );
+        std::mem::forget(jh);
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+        std::mem::forget(rt);
+    }
+
+    /// R10-52. C reads LBAUD with `sscanf(optbuff, "%d", &pasynRec->lbaud)`
+    /// (asynRecord.c:1867) — and `sscanf` writes *nothing* when the text carries
+    /// no number, so LBAUD is the one readback field that keeps its previous
+    /// value. The port's `parse::<i32>().unwrap_or(0)` wrote 0 instead, reporting
+    /// a live line as 0 baud.
+    #[test]
+    fn a_baud_readback_with_no_number_leaves_lbaud_alone() {
+        let port_name = "r10_52_no_number";
+        register_baud_text_port(port_name, "unknown");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.lbaud = 115200;
+        // A field C *does* pre-zero, seeded with a stale value from a previous
+        // port: it must not survive a readback the driver cannot answer.
+        rec.dbit = 4;
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(
+            rec.lbaud, 115200,
+            "C's sscanf leaves LBAUD untouched when the text carries no number"
+        );
+        assert_eq!(rec.baud, 0, "BAUD still lands on its Unknown choice");
+        assert_eq!(
+            rec.dbit, 0,
+            "a key the port refuses is an empty readback, and C zeroes the enum before the choice walk"
+        );
+    }
+
+    /// R10-52 negative control: a text that *does* carry a number still reaches
+    /// LBAUD — through C's `%d`, which is a prefix parse, so a driver answering
+    /// "9600 baud" reads 9600 where `str::parse` refused the whole string.
+    #[test]
+    fn a_baud_readback_with_a_number_reaches_lbaud() {
+        let port_name = "r10_52_number";
+        register_baud_text_port(port_name, "9600 baud");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.lbaud = 115200;
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(rec.lbaud, 9600);
+        assert_eq!(
+            rec.baud, 0,
+            "BAUD matches the choice *text*, which \"9600 baud\" is not"
         );
     }
 

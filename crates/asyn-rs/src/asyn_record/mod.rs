@@ -7192,6 +7192,60 @@ mod tests {
         assert_eq!(rec.auct, 1, "AUCT is re-read and unchanged");
     }
 
+    /// R10-55. A GPIB driver takes its interfaces from
+    /// `pasynGpib->registerPort` (asynGpib.c:562-631) — asynCommon, asynOctet,
+    /// asynGpib and asynInt32 — so on a vxi11 (drvVxi11.c:1761) or Prologix
+    /// (drvPrologixGPIB.c:592) port C's `connectDevice` reads back GPIBIV = 1
+    /// and I32IV = 1. vxi11 registers asynOption on top (drvVxi11.c:1777);
+    /// Prologix does not.
+    #[test]
+    fn a_gpib_port_reads_back_gpibiv_and_i32iv() {
+        use crate::drivers::prologix::DrvAsynPrologixPort;
+        use crate::drivers::vxi11::DrvVxi11Port;
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        let vxi_name = "r10_55_vxi11";
+        let (vxi_rt, _vxi_jh) = create_port_runtime(
+            DrvVxi11Port::configure(vxi_name, "192.0.2.1", 0, "", "gpib0", 0, true).unwrap(),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            vxi_name,
+            vxi_rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = vxi_name.to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1228-1234)");
+        assert_eq!(rec.i32iv, 1, "asynInt32, registered by asynGpib (C :140)");
+        assert_eq!(rec.octetiv, 1, "asynOctet");
+        assert_eq!(rec.optioniv, 1, "vxi11 registers asynOption (:1777)");
+
+        let prologix_name = "r10_55_prologix";
+        let (p_rt, _p_jh) = create_port_runtime(
+            DrvAsynPrologixPort::new(prologix_name, "192.0.2.1:1234", true).unwrap(),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            prologix_name,
+            p_rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = prologix_name.to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.gpibiv, 1, "asynGpib (C :1228-1234)");
+        assert_eq!(rec.i32iv, 1, "asynInt32, registered by asynGpib (C :140)");
+        assert_eq!(rec.octetiv, 1, "asynOctet");
+        assert_eq!(
+            rec.optioniv, 0,
+            "drvPrologixGPIB registers no asynOption (:592)"
+        );
+    }
+
     /// R9-53. C `connectDevice` asks the manager for each interface in turn
     /// (`findInterface(asynOctetType / asynInt32Type / ... )`,
     /// asynRecord.c:1177-1240) and records what it found; `performIO` then

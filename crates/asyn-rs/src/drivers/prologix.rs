@@ -333,17 +333,23 @@ impl PortDriver for DrvAsynPrologixPort {
         &mut self.base
     }
 
-    /// C drvPrologixGPIB registers through `pasynGpib->registerPort`
-    /// (drvPrologixGPIB.c:592): asynCommon + asynOctet + asynGpib, and no
-    /// asynOption.
-    ///
-    /// `Gpib` is deliberately absent — see the same note on `DrvVxi11Port`: no
-    /// port operation carries a GPIB command, so asynRecord cannot dispatch
-    /// UCMD/ACMD and GPIBIV must stay 0 rather than advertise a path that does
-    /// not exist.
+    /// C drvPrologixGPIB takes every interface it has from
+    /// `pasynGpib->registerPort` (drvPrologixGPIB.c:592) — asynCommon +
+    /// asynOctet + asynGpib + asynInt32 — and registers no asynOption.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        use crate::interfaces::Capability::*;
-        vec![OctetRead, OctetWrite, Flush, Connect]
+        crate::interfaces::gpib::gpib_port_capabilities()
+    }
+
+    /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
+    /// readable register: `read`/`write` are the asynInt32Base defaults and
+    /// fail. See [`crate::interfaces::gpib::int32_not_supported`].
+    fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+        Err(crate::interfaces::gpib::int32_not_supported())
+    }
+
+    /// See [`Self::read_int32`].
+    fn write_int32(&mut self, _user: &mut AsynUser, _value: i32) -> AsynResult<()> {
+        Err(crate::interfaces::gpib::int32_not_supported())
     }
 
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -893,6 +899,42 @@ mod tests {
 
         let err = drv.gpib_ren(&mut user, true).unwrap_err();
         assert_eq!(err.message(), "prologixRen unimplemented");
+    }
+
+    /// R10-55. Prologix takes every interface it has from
+    /// `pasynGpib->registerPort` (drvPrologixGPIB.c:592): asynCommon +
+    /// asynOctet + asynGpib + asynInt32, and no asynOption. The asynInt32 is
+    /// asynGpib's SRQ interrupt source with a NULL vtable (asynGpib.c:140), so
+    /// reading or writing it lands in the asynInt32Base defaults and fails.
+    #[test]
+    fn prologix_registers_the_gpib_port_interfaces() {
+        use crate::interfaces::Capability;
+
+        let mut drv = DrvAsynPrologixPort::new("p", "127.0.0.1:1234", false).unwrap();
+        let caps = drv.capabilities();
+        for cap in [
+            Capability::Gpib,
+            Capability::Int32Read,
+            Capability::Int32Write,
+            Capability::OctetRead,
+            Capability::OctetWrite,
+        ] {
+            assert!(caps.contains(&cap), "prologix must declare {cap:?}");
+        }
+        assert!(
+            !caps.contains(&Capability::Option),
+            "drvPrologixGPIB registers no asynOption"
+        );
+
+        let mut user = AsynUser::default();
+        assert_eq!(
+            drv.read_int32(&user).unwrap_err().message(),
+            "write is not supported"
+        );
+        assert_eq!(
+            drv.write_int32(&mut user, 1).unwrap_err().message(),
+            "write is not supported"
+        );
     }
 
     #[test]

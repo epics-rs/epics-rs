@@ -270,19 +270,25 @@ impl PortDriver for DrvVxi11Port {
         &mut self.base
     }
 
-    /// C drvVxi11 registers asynOption itself (drvVxi11.c:1777) and gets
-    /// asynCommon + asynOctet + asynGpib from `pasynGpib->registerPort`
-    /// (:1761). No register interface.
-    ///
-    /// `Gpib` is deliberately absent: this crate has no port operation that
-    /// carries a GPIB universal / addressed command to a driver, so asynRecord
-    /// cannot dispatch UCMD/ACMD (it reports "No asynGpib interface", as C does
-    /// for a port without the interface). Declaring it here would make the
-    /// record's GPIBIV read 1 with nothing behind it. The driver's `AsynGpib`
-    /// impl is reachable directly, just not through the record.
+    /// C drvVxi11 takes asynCommon + asynOctet + asynGpib + asynInt32 from
+    /// `pasynGpib->registerPort` (drvVxi11.c:1761) and registers asynOption
+    /// itself (:1777). No register interface.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        use crate::interfaces::Capability::*;
-        vec![OctetRead, OctetWrite, Option, Flush, Connect]
+        let mut caps = crate::interfaces::gpib::gpib_port_capabilities();
+        caps.push(crate::interfaces::Capability::Option);
+        caps
+    }
+
+    /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
+    /// readable register: `read`/`write` are the asynInt32Base defaults and
+    /// fail. See [`crate::interfaces::gpib::int32_not_supported`].
+    fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+        Err(crate::interfaces::gpib::int32_not_supported())
+    }
+
+    /// See [`Self::read_int32`].
+    fn write_int32(&mut self, _user: &mut AsynUser, _value: i32) -> AsynResult<()> {
+        Err(crate::interfaces::gpib::int32_not_supported())
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -342,6 +348,40 @@ impl PortDriver for DrvVxi11Port {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R10-55. `pasynGpib->registerPort` (drvVxi11.c:1761) gives the port
+    /// asynCommon + asynOctet + asynGpib + asynInt32; the driver registers
+    /// asynOption itself (:1777). The asynInt32 it gets is asynGpib's SRQ
+    /// interrupt source with a NULL vtable (asynGpib.c:140), so a read or a
+    /// write of it lands in the asynInt32Base defaults and fails.
+    #[test]
+    fn vxi11_registers_the_gpib_port_interfaces() {
+        use crate::interfaces::Capability;
+
+        let drv = DrvVxi11Port::configure("v", "192.0.2.1", 0, "", "gpib0", 0, true).unwrap();
+        let caps = drv.capabilities();
+        for cap in [
+            Capability::Gpib,
+            Capability::Int32Read,
+            Capability::Int32Write,
+            Capability::OctetRead,
+            Capability::OctetWrite,
+            Capability::Option,
+        ] {
+            assert!(caps.contains(&cap), "vxi11 must declare {cap:?}");
+        }
+
+        let mut drv = drv;
+        let mut user = AsynUser::default();
+        assert_eq!(
+            drv.read_int32(&user).unwrap_err().message(),
+            "write is not supported"
+        );
+        assert_eq!(
+            drv.write_int32(&mut user, 1).unwrap_err().message(),
+            "write is not supported"
+        );
+    }
 
     #[test]
     fn link_kind_recognises_gpib_hpib_inst_com() {

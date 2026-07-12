@@ -211,6 +211,39 @@ pub fn addressed_request(menu: i32, addr: i32) -> GpibAddressedRequest {
     }
 }
 
+/// The interface set `pasynGpib->registerPort` gives every GPIB driver
+/// (asynGpib.c:562-631): `asynCommon` + `asynOctet` + `asynGpib` + `asynInt32`.
+/// One owner for that C fact — drvVxi11 and drvPrologixGPIB both obtain their
+/// interfaces from this one call (drvVxi11.c:1761, drvPrologixGPIB.c:592), and
+/// a driver that registers more (vxi11 adds `asynOption`, drvVxi11.c:1777) says
+/// so at its own `capabilities`.
+///
+/// `asynInt32` is in the set even though no GPIB driver implements it: asynGpib
+/// registers an all-NULL vtable (`asynInt32 int32 = {0,0,0,0,0}`,
+/// asynGpib.c:140) through `pasynInt32Base->initialize`, which fills in the
+/// asynInt32Base defaults. It is registered for the SRQ interrupt source
+/// (asynGpib.c:620), so asynRecord's I32IV reads 1 on a GPIB port while an
+/// actual read or write reports [`int32_not_supported`].
+pub fn gpib_port_capabilities() -> Vec<super::Capability> {
+    use super::Capability::*;
+    vec![
+        OctetRead, OctetWrite, Gpib, Int32Read, Int32Write, Flush, Connect,
+    ]
+}
+
+/// C's asynInt32Base default read/write for a port that registered `asynInt32`
+/// with a NULL vtable — `writeDefault` (asynInt32Base.c:52-68) and
+/// `readDefault` (:70-86) both set `errorMessage` to "write is not supported"
+/// (the read path's text is a C copy-paste, reproduced here) and return
+/// `asynError`. `getBounds` is the one default that succeeds (low = high = 0),
+/// which is already [`crate::port::PortDriver::get_bounds_int32`]'s default.
+pub fn int32_not_supported() -> crate::error::AsynError {
+    crate::error::AsynError::Status {
+        status: crate::error::AsynStatus::Error,
+        message: "write is not supported".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

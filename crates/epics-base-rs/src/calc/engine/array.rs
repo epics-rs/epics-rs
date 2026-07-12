@@ -551,12 +551,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 ArrayOp::Deriv => {
                     // C `:976-989`: the derivative is taken over the window and written
                     // back into it, and everything OUTSIDE the window is zeroed
-                    // (`:985-987`).
+                    // (`:985-987`). A failed fit leaves C's scratch cell unwritten and
+                    // sets status; here the window comes out zeroed (the status is
+                    // R10-11's subject).
                     unary_op(&mut stack, |v| {
                         unary(
                             v,
                             |mut c| {
-                                let d = derivative::deriv(c.window());
+                                let d = derivative::deriv(c.window())
+                                    .unwrap_or_else(|| vec![0.0; c.window().len()]);
                                 c.window_mut().copy_from_slice(&d);
                                 c.clear_outside_window();
                                 ArrayStackValue::Array(c)
@@ -566,7 +569,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 ArrayOp::NDeriv => {
-                    let n = pop_f64(&mut stack)? as usize;
+                    // C `:596` — `j = ps->d`, a truncating int cast, and the value is
+                    // the number of points on EACH SIDE of the fit.
+                    let npts = i64::from(c_int(pop_f64(&mut stack)?));
                     // NDERIV is NOT in C's unary switch either (`:594-617`), and its
                     // own case PROMOTES a scalar with `toArray(ps,1)` rather than
                     // answering 0. Refusing here is a divergence from that promotion,
@@ -576,7 +581,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // runs after `DEC(ps)`, on the array itself (`:600`).
                     try_unary_op(&mut stack, |v| {
                         let mut cell = v.as_cell()?.clone();
-                        let d = derivative::nderiv(cell.window(), n);
+                        let d = derivative::nderiv(cell.window(), npts)
+                            .unwrap_or_else(|| vec![0.0; cell.window().len()]);
                         cell.window_mut().copy_from_slice(&d);
                         cell.clear_outside_window();
                         Ok(ArrayStackValue::Array(cell))

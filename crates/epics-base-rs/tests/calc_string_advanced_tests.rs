@@ -707,3 +707,27 @@ fn test_replace_coerces_every_operand() {
         StackValue::Str("heLLlo".into())
     );
 }
+
+/// The USES_STRING marker (`sCalcPostfix.c:447-475`) picks the whole evaluator,
+/// and C's list opens with FETCH_AA..FETCH_LL — so merely reading `AA` marks the
+/// program. The port's marker named an opcode its own compiler never emits
+/// (`StringOp::PushStringVar`; `AA` compiles to `CoreOp::PushDoubleVar`), so no
+/// `AA`-reading program was marked.
+///
+/// The two evaluators differ arithmetically in exactly one place, MODULO's cast
+/// width — `(int)` in the string evaluator, `(long)` in the numeric one — which
+/// is how the marker is observable without a string in sight. Compiled sCalc,
+/// with 2147483648 (2^31):
+///
+///     2147483648 % 7    -2      (numeric evaluator: the int cast overflows)
+///     AA % 7             2      (string evaluator, AA = "2147483648")
+#[test]
+fn test_fetch_aa_marks_the_program_uses_string() {
+    let mut inputs = StringInputs::new();
+    inputs.str_vars[0] = "2147483648".into();
+    assert_eq!(scalc("AA%7", &mut inputs).unwrap(), StackValue::Double(2.0));
+    assert_eq!(
+        scalc("2147483648 % 7", &mut inputs).unwrap(),
+        StackValue::Double(-2.0)
+    );
+}

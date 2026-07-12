@@ -1530,6 +1530,65 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// C `sCalcPerform`'s output: the `(*presult, *psresult)` pair, which a record
+/// keeps as `(VAL, SVAL)` or `(OVAL, OSV)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalcResult {
+    pub val: f64,
+    pub sval: ScalcString,
+}
+
+/// C `sCalcPerform`'s epilogue — and there are TWO of them, one per evaluator,
+/// which is why this cannot be a function of the final stack value alone.
+///
+/// ```c
+/// /* NO_STRING (:826-831) */
+/// *presult = *pd;
+/// if (psresult && (lenSresult > 15)) {
+///     if (isnan(*pd)) strcpy(psresult, "NaN");
+///     else            cvtDoubleToString(*pd, psresult, precision);
+/// }
+///
+/// /* USES_STRING (:2034-2048) */
+/// if (isDouble(ps)) { *presult = ps->d;  to_string(ps); ...copy ps->s... }
+/// else              { ...copy ps->s...;  to_double(ps); *presult = ps->d; }
+/// ```
+///
+/// The numeric evaluator renders SVAL at the record's **PREC** — the `precision`
+/// argument sCalcoutRecord passes as `pcalc->prec` (`sCalcoutRecord.c:359`,
+/// `:770`). The string evaluator never sees `precision`: its `to_string` is
+/// `cvtDoubleToString(d, s, 8)` (`:90-96`), hardcoded. Compiled sCalc, `PI`:
+///
+///     program    PREC=0   PREC=2   PREC=8        PREC=12
+///     numeric    "3"      "3.14"   "3.14159265"  " 3.141592653590e+00"
+///     string     "3.14159265" whatever the PREC
+///
+/// so at the shipped default PREC=0 a numeric scalcout's SVAL is "3", and the
+/// port's uniform precision-8 rendering was wrong for every record that had not
+/// set PREC to 8.
+///
+/// (`lenSresult > 15` always holds: scalcout's buffer is `STRING_SIZE` = 40.)
+pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcResult {
+    let val = top.to_double();
+    if uses_string(&expr.code) {
+        ScalcResult {
+            val,
+            sval: top.clone().into_string_value(),
+        }
+    } else {
+        let sval = if val.is_nan() {
+            ScalcString::from_c("NaN")
+        } else {
+            // `cvtDoubleToString`'s parameter is `epicsUInt16` (`cvtFast.c:114`)
+            // while the record's PREC is a `short`, so C reinterprets a negative
+            // PREC as a huge unsigned one — which the function then clamps to 17
+            // and renders in %e. Not clamped to 0; this cast is that conversion.
+            ScalcString::from_c(super::cvt::cvt_double_to_string(val, precision as u16))
+        };
+        ScalcResult { val, sval }
+    }
+}
+
 /// Whether `sCalcPostfix` would have stamped this program `USES_STRING`
 /// (`sCalcPostfix.c:447-475`), which is what makes `sCalcPerform` run its
 /// string evaluator (`:2057`) instead of the plain double one (`:399`).
@@ -1544,7 +1603,12 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
 /// this list mirrors it case for case.
 fn uses_string(code: &[Opcode]) -> bool {
     code.iter().any(|op| match op {
-        // FETCH_SVAL — the only Core opcode in C's list.
+        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest
+        // trigger by far. The port's compiler emits them as `PushDoubleVar`
+        // (`postfix.rs:377`), not as the `StringOp::PushStringVar` this list
+        // used to name, so every `AA`-reading program was missing the marker.
+        Opcode::Core(CoreOp::PushDoubleVar(_)) => true,
+        // FETCH_SVAL.
         Opcode::Core(CoreOp::FetchSval) => true,
         Opcode::String(s) => match s {
             StringOp::PushStringVar(_)   // FETCH_AA..FETCH_LL

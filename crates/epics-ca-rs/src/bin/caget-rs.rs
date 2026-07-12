@@ -4,7 +4,7 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, base_style,
-    ca_error_marker, dbr_value_field_type, format_value, sevr_to_str, stat_to_str,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_value, sevr_to_str, stat_to_str,
     zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
@@ -312,9 +312,9 @@ fn dbr_text(code: u16) -> &'static str {
 /// values. Each line is indented with four spaces and the block carries
 /// no trailing newline.
 ///
-/// Numeric limit formatting follows the C macros' spirit (`%8d` for
-/// integer classes, `%g` for float/double) but exact `sprint_long`/`%g`
-/// byte-parity is a separate concern.
+/// Numeric limits take the conversion the C macro embeds: `%8d` for the
+/// integer classes and a hardcoded `%g` for FLOAT/DOUBLE, rendered by
+/// [`epics_ca_rs::cli::format_c_g`] — NOT the `-e`/`-f`/`-g` value format.
 fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
     if req_type <= 6 {
         return String::new();
@@ -368,11 +368,17 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
             let is_float = matches!(req_type, 23 | 27 | 30 | 34); // GR/CTRL FLOAT/DOUBLE
             let is_int = matches!(req_type, 22 | 25 | 26 | 29 | 32 | 33); // SHORT/CHAR/LONG
             let d = snap.display.clone().unwrap_or_default();
+            // C renders each limit straight from the `FMT_GR` / `FMT_CTRL`
+            // macro's embedded conversion — `%8d` for the integer classes,
+            // a hardcoded `%g` for FLOAT/DOUBLE (`tool_lib.c:248-254`). The
+            // `-e`/`-f`/`-g` flags only rewrite `dblFormatStr`, which is
+            // read by `val2str` (the Value line) and never by `dbr2str`, so
+            // `fmt` deliberately does not participate here.
             let lim = |v: f64| -> String {
                 if is_int {
                     format!("{:8}", v as i64)
                 } else {
-                    format!("{v}")
+                    format_c_g(v)
                 }
             };
             let mut out = sts;
@@ -1051,7 +1057,10 @@ mod tests {
         DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_STRING,
         DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
-    use epics_ca_rs::cli::{EPICS_EPOCH_UNIX_SECS, ValueFormat, zero_dbr_snapshot, zero_dbr_value};
+    use epics_ca_rs::cli::{
+        EPICS_EPOCH_UNIX_SECS, FloatFormat, FloatStyle, ValueFormat, zero_dbr_snapshot,
+        zero_dbr_value,
+    };
     use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
     use std::time::SystemTime;
@@ -1335,8 +1344,94 @@ mod tests {
         assert!(out.contains("    Hi ctrl limit:    9\n"), "{out}");
     }
 
-    // C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
-    // (no element count / value / extended block).
+    /// C's `FMT_GR` / `FMT_CTRL` macros embed a hardcoded `%g` for the
+    /// FLOAT/DOUBLE limit classes (`tool_lib.c:248-254,375-386`), so every
+    /// graphic/control limit prints at printf's default 6 significant digits.
+    /// The `-e`/`-f`/`-g` flags rewrite `dblFormatStr`, which only `val2str`
+    /// reads — they must NOT reach a limit line.
+    ///
+    /// Pre-fix the `lim` closure used Rust's `Display`, printing the full f64
+    /// (`3.14159265`, `1000000`) where C prints `3.14159` / `1e+06`.
+    #[test]
+    fn gr_ctrl_float_limits_use_c_hardcoded_g() {
+        let mut snap = ctrl_double_snap();
+        let d = snap
+            .display
+            .as_mut()
+            .expect("ctrl_double_snap sets display");
+        // Verified against `printf("%g", ...)`: 8.76543 / 1e+06 / -0.00123457.
+        d.lower_disp_limit = 8.765_432_19;
+        d.upper_disp_limit = 1e6;
+        d.lower_alarm_limit = -0.001234567;
+        let c = snap
+            .control
+            .as_mut()
+            .expect("ctrl_double_snap sets control");
+        c.upper_ctrl_limit = 123456789.0;
+
+        // The limit block must be identical under EVERY float style, because
+        // C's limits never consult `dblFormatStr`.
+        for float in [
+            FloatFormat::default(),
+            FloatFormat {
+                style: FloatStyle::F,
+                precision: 9,
+            },
+            FloatFormat {
+                style: FloatStyle::E,
+                precision: 2,
+            },
+            FloatFormat {
+                style: FloatStyle::G,
+                precision: 12,
+            },
+        ] {
+            let fmt = ValueFormat {
+                float,
+                ..ValueFormat::default()
+            };
+            let out = specified_dbr_report(
+                "ai:temp",
+                Some(DbFieldType::Double),
+                DBR_CTRL_DOUBLE,
+                &snap,
+                &fmt,
+            );
+            assert!(
+                out.contains("    Lo disp limit:    8.76543\n"),
+                "%g truncates to 6 significant digits: {out}"
+            );
+            assert!(
+                out.contains("    Hi disp limit:    1e+06\n"),
+                "%g switches to scientific at exp >= precision: {out}"
+            );
+            assert!(out.contains("    Lo alarm limit:   -0.00123457\n"), "{out}");
+            assert!(out.contains("    Hi ctrl limit:    1.23457e+08\n"), "{out}");
+        }
+        // Negative control: the VALUE line DOES follow `-f 9` (C `val2str`
+        // reads `dblFormatStr`), so the two renderings are genuinely distinct.
+        let f9 = ValueFormat {
+            float: FloatFormat {
+                style: FloatStyle::F,
+                precision: 9,
+            },
+            ..ValueFormat::default()
+        };
+        let out = specified_dbr_report(
+            "ai:temp",
+            Some(DbFieldType::Double),
+            DBR_CTRL_DOUBLE,
+            &snap,
+            &f9,
+        );
+        assert!(
+            out.contains("    Value:            1.500000000\n"),
+            "-f 9 must still reach the Value line: {out}"
+        );
+    }
+
+    /// C `caget.c:312-316`: DBR_CLASS_NAME prints only the Class Name line
+    /// (no element count / value / extended block).
     #[test]
     fn specified_report_class_name_prints_class_line_only() {
         let mut snap = Snapshot::new(

@@ -702,6 +702,31 @@ fn format_int_wide(decimal: String, bits: u64, style: IntStyle) -> String {
     }
 }
 
+/// `printf`'s default precision for `%e` / `%f` / `%g` when the conversion
+/// carries none — 6 (C99 7.19.6.1). C's `dblFormatStr` starts as `"%g"`
+/// (`tool_lib.c:53`) and the `FMT_GR` / `FMT_CTRL` limit macros hardcode a
+/// bare `%g`, so both land on this precision.
+const C_DEFAULT_PRECISION: usize = 6;
+
+/// The single owner of C's HARDCODED `%g` for a `dbr_gr_*` / `dbr_ctrl_*`
+/// FLOAT/DOUBLE limit.
+///
+/// `dbr2str` builds the graphic/control limit block from the `FMT_GR(%g)` /
+/// `FMT_CTRL(%g)` macros (`tool_lib.c:248-254,266-270`), which embed the
+/// literal `%g` — printf's default 6 significant digits. The `-e` / `-f` /
+/// `-g` flags rewrite `dblFormatStr`, which ONLY `val2str` reads
+/// (`tool_lib.c:138,150`), so they never reach a limit: `caget -d
+/// DBR_CTRL_DOUBLE -f 9` still prints every limit at 6 significant digits.
+///
+/// Non-finite limits fall through to C `printf`'s `inf` / `nan` spelling, the
+/// same escape [`format_float`] takes.
+pub fn format_c_g(x: f64) -> String {
+    if !x.is_finite() {
+        return format!("{x}");
+    }
+    format_g(x, C_DEFAULT_PRECISION)
+}
+
 fn format_float(x: f64, fmt: &ValueFormat) -> String {
     if fmt.float_style != IntStyle::Dec {
         // C `val2str` (`tool_lib.c:138-158`): a non-`dec` `outTypeF` rounds

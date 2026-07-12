@@ -1600,22 +1600,57 @@ impl Drop for MonitorStartControl {
     }
 }
 
+/// A monitor post that may be pvxs's **terminal** — its null `Value`.
+///
+/// pvxs's `doPost` (`servermon.cpp:270-283`) gates the append on
+/// `(mon->queue.size() < mon->limit) || force || !val`, so a terminal is
+/// ALWAYS `push_back`'d and grows the queue past `limit`; only a
+/// non-terminal post can reach the squash branch. Both FIFOs the port
+/// runs — the decoded [`crate::server_native::MonitorUpdate`] queue and
+/// the raw-forward [`crate::server_native::RawMonitorEvent`] queue —
+/// carry that boundary as `type_changed`, so the rule lives in
+/// [`push_squash_monitor`] behind this trait rather than at each call
+/// site: a caller cannot forget it.
+trait MonitorPost {
+    /// pvxs's `!val`.
+    fn is_terminal(&self) -> bool;
+}
+
+impl MonitorPost for crate::server_native::MonitorUpdate {
+    fn is_terminal(&self) -> bool {
+        self.type_changed
+    }
+}
+
+impl MonitorPost for crate::server_native::RawMonitorEvent {
+    fn is_terminal(&self) -> bool {
+        self.type_changed
+    }
+}
+
 /// Push one monitor event into the bounded FIFO, squashing the newest into the
 /// tail once the queue is full — the single producer rule covering both the
 /// INIT->START and STOP->START "Idle, accruing" windows AND the Executing
-/// burst. Models pvxs `servermon.cpp:271-287`: a post is appended as a DISTINCT
-/// queue entry while the queue holds fewer than `limit` entries; once full, the
-/// newest update is coalesced into the queue tail (unioning marked-leaf sets via
-/// [`coalesce_monitor_update`] on the decoded path). `limit` must be >= 1 so a
-/// tail always exists to squash into. Returns whether an overflow squash
-/// happened (diagnostic only).
-fn push_squash_monitor<T>(
+/// burst. Models pvxs `servermon.cpp:270-287`:
+///
+/// * a **terminal** post ([`MonitorPost::is_terminal`], pvxs's `!val`) is
+///   always appended, even past `limit` — pvxs delivers every queued update
+///   and *then* the FINISH, so the terminal must never destroy a real one;
+/// * otherwise a post is appended as a DISTINCT queue entry while the queue
+///   holds fewer than `limit` entries;
+/// * once full, a non-terminal post is coalesced into the queue tail
+///   (unioning marked-leaf sets via [`coalesce_monitor_update`] on the
+///   decoded path).
+///
+/// `limit` must be >= 1 so a tail always exists to squash into. Returns
+/// whether an overflow squash happened (diagnostic only).
+fn push_squash_monitor<T: MonitorPost>(
     pending: &mut std::collections::VecDeque<T>,
     ev: T,
     limit: usize,
     coalesce: impl Fn(T, T) -> T,
 ) -> bool {
-    if pending.len() < limit {
+    if ev.is_terminal() || pending.len() < limit {
         pending.push_back(ev);
         false
     } else {
@@ -9007,6 +9042,40 @@ mod tests {
             "a descriptor boundary always queues"
         );
 
+        // R13-34: the terminal on a FULL FIFO. pvxs's append gate is
+        // `(mon->queue.size() < mon->limit) || force || !val`
+        // (servermon.cpp:270-283) — a terminal is ALWAYS push_back'd and
+        // grows the queue PAST `limit`. It must never reach the squash
+        // branch, which would pop the newest real update and coalesce the
+        // terminal over it (`coalesce_monitor_update` returns a bare
+        // `type_change()` whenever either side is `type_changed`).
+        //
+        // pvxs delivers all `limit` queued updates and THEN the FINISH;
+        // pre-fix the port delivered `limit - 1` and the FINISH.
+        let mut q = MonitorQueue::new(2, &intro, &mask);
+        q.seed(tag(0));
+        assert!(q.push(upd(1, &["value"])), "fills the FIFO to limit=2");
+        assert_eq!(tags(&q), vec![tag(0), tag(1)], "FIFO is full");
+        assert!(
+            q.push(crate::server_native::MonitorUpdate::type_change()),
+            "a terminal always queues, even on a full FIFO"
+        );
+        assert_eq!(
+            q.pending.len(),
+            3,
+            "the terminal grows the queue past limit=2 (pvxs push_back)"
+        );
+        assert_eq!(
+            tags(&q),
+            vec![tag(0), tag(1), PvField::Null],
+            "both real updates survive and the terminal trails them — it must \
+             not squash the newest one out of the tail"
+        );
+        assert!(
+            q.pending[2].type_changed,
+            "the terminal is the last entry, delivered after every real update"
+        );
+
         // Squash CONTENTS: with limit 2 and the FIFO already full, a
         // masked-out post must not coalesce the real tail. Pre-fix it took a
         // slot and overwrote `value=3` with `value=4`.
@@ -9084,23 +9153,58 @@ mod tests {
             "limit 1 collapses the burst to the single newest value"
         );
 
-        // A descriptor-change boundary is sticky through the squash: pushed
-        // into a full limit-1 FIFO it coalesces into the tail and stays
-        // type_changed, so the consumer detects it (MONITOR FINISH) rather
-        // than encoding a stale value.
+        // R13-34: a descriptor-change boundary (pvxs's terminal, `!val`)
+        // never squashes. pvxs's append gate is
+        // `(mon->queue.size() < mon->limit) || force || !val`
+        // (servermon.cpp:270-283), so the terminal is push_back'd PAST the
+        // limit. Pushed into a FULL limit-1 FIFO it must NOT pop the real
+        // update and coalesce over it — the real value survives and the
+        // terminal trails it, exactly as pvxs delivers every queued update
+        // and then the FINISH.
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
         push_squash_monitor(&mut pending, upd(2), 1, coalesce_monitor_update);
-        push_squash_monitor(
+        let squashed = push_squash_monitor(
             &mut pending,
             crate::server_native::MonitorUpdate::type_change(),
             1,
             coalesce_monitor_update,
         );
-        assert_eq!(pending.len(), 1, "limit 1 keeps a single entry");
-        assert!(
-            pending[0].type_changed,
-            "a boundary post survives the limit-1 squash into the tail"
+        assert!(!squashed, "a terminal never reaches the squash branch");
+        assert_eq!(
+            pending.len(),
+            2,
+            "the terminal grows the queue past limit=1 (pvxs push_back)"
         );
+        assert_eq!(
+            pending[0].value,
+            val(2),
+            "the newest real update survives the terminal"
+        );
+        assert!(pending[1].type_changed, "the terminal trails it");
+
+        // Same rule on the RAW-forward FIFO: `RawMonitorEvent` carries the
+        // same `type_changed` boundary and coalesces with `|_old, new| new`,
+        // so pre-fix a terminal on a full raw queue replaced the newest raw
+        // frame outright.
+        let raw = |body: &[u8], terminal: bool| crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::copy_from_slice(body),
+            byte_order: ByteOrder::Little,
+            type_changed: terminal,
+        };
+        let mut raw_pending: VecDeque<crate::server_native::RawMonitorEvent> = VecDeque::new();
+        push_squash_monitor(&mut raw_pending, raw(b"a", false), 1, |_old, new| new);
+        push_squash_monitor(&mut raw_pending, raw(b"", true), 1, |_old, new| new);
+        assert_eq!(
+            raw_pending.len(),
+            2,
+            "the raw terminal is push_back'd past limit=1 too"
+        );
+        assert_eq!(
+            raw_pending[0].body_bytes.as_ref(),
+            b"a",
+            "the newest raw frame is not destroyed by the terminal"
+        );
+        assert!(raw_pending[1].type_changed, "the raw terminal trails it");
     }
 
     /// server pipeline parser accepts the typed-bool /

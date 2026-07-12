@@ -2275,7 +2275,10 @@ impl AsynRecord {
             self.report_no_interface("asynOption");
             return;
         }
-        if let Err(e) = entry.handle.set_option_blocking(key, value) {
+        if let Err(e) = entry
+            .handle
+            .set_option_blocking(self.option_user(), key, value)
+        {
             self.errs = format!("Error setting option, {}", e.message());
         }
         let before = self.field_snapshot(OPTION_READBACK_FIELDS);
@@ -2562,6 +2565,26 @@ impl AsynRecord {
     /// only names TMOT as the source.
     fn io_timeout(&self) -> std::time::Duration {
         crate::user::timeout_from_secs(self.tmot)
+    }
+
+    /// The `asynUser` an option put runs under.
+    ///
+    /// C queues the option callback on a `duplicateAsynUser` of the record's own
+    /// `pasynUser` (asynRecord.c:531-533), and `duplicateAsynUser` copies
+    /// `timeout` (asynManager.c:1225). The record's `pasynUser->timeout` is TMOT
+    /// (asynRecord.c:818), so an RFC 2217 negotiation triggered by a BAUD/PRTY/…
+    /// put is bounded by TMOT — the record's own timeout, not a constant private
+    /// to the COM layer. ADDR rides along because C's option callback runs on the
+    /// device the record is connected to.
+    ///
+    /// (C assigns `pasynUser->timeout = tmot` inside `asynCallbackProcess`, so an
+    /// option put made before the record has ever processed inherits the 1 s
+    /// `createAsynUser` default instead. That lazy assignment is not modelled:
+    /// TMOT is the record's timeout from the first put onwards.)
+    fn option_user(&self) -> AsynUser {
+        AsynUser::new(self.resolved_reason)
+            .with_addr(self.addr)
+            .with_timeout(self.io_timeout())
     }
 
     /// Clamp the operator's requested transfer sizes into the record fields —
@@ -4663,7 +4686,12 @@ mod tests {
             fn read_float64(&mut self, _u: &AsynUser) -> crate::error::AsynResult<f64> {
                 Err(boom("f64r"))
             }
-            fn set_option(&mut self, _k: &str, _v: &str) -> crate::error::AsynResult<()> {
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                _k: &str,
+                _v: &str,
+            ) -> crate::error::AsynResult<()> {
                 Err(boom("opt"))
             }
             fn set_input_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
@@ -4777,7 +4805,12 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn set_option(&mut self, _k: &str, _v: &str) -> crate::error::AsynResult<()> {
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                _k: &str,
+                _v: &str,
+            ) -> crate::error::AsynResult<()> {
                 Ok(())
             }
             fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
@@ -6870,6 +6903,71 @@ mod tests {
         assert_ne!(
             rec.errs, "No asynOctet interface",
             "asynOctet is implemented and must not be refused"
+        );
+    }
+
+    /// R9-55. C queues the option callback on a `duplicateAsynUser` of the
+    /// record's own `pasynUser` (asynRecord.c:531-533), and `duplicateAsynUser`
+    /// copies `timeout` (asynManager.c:1225), which the record set to TMOT
+    /// (asynRecord.c:818). `setOption` then gets that user (:1787-1826) and an RFC
+    /// 2217 negotiation runs under it (asynInterposeCom.c:475,495). The port's
+    /// option path carried no asynUser at all, so the record's TMOT never reached
+    /// the driver and the negotiation used a private 2 s.
+    #[test]
+    fn an_option_put_reaches_the_driver_with_the_records_tmot() {
+        use crate::interfaces::{Capability, octet_transport_capabilities};
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        static SEEN: StdMutex<Option<Duration>> = StdMutex::new(None);
+
+        struct OptionSpy(PortDriverBase);
+        impl PortDriver for OptionSpy {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<Capability> {
+                octet_transport_capabilities()
+            }
+            fn set_option(
+                &mut self,
+                user: &mut AsynUser,
+                _key: &str,
+                _value: &str,
+            ) -> crate::error::AsynResult<()> {
+                *SEEN.lock().unwrap() = Some(user.timeout);
+                Ok(())
+            }
+        }
+
+        let port_name = "r9_55_option_user";
+        let (rt, _jh) = create_port_runtime(
+            OptionSpy(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device().unwrap();
+
+        rec.tmot = 3.5;
+        rec.lbaud = 19200;
+        rec.special("LBAUD", true).unwrap();
+
+        assert_eq!(
+            SEEN.lock().unwrap().take(),
+            Some(Duration::from_millis(3500)),
+            "the driver's setOption runs under the record's TMOT"
         );
     }
 

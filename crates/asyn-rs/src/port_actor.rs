@@ -866,7 +866,11 @@ impl PortActor {
                 Ok(RequestResult::option_read(val))
             }
             RequestOp::SetOption { key, value } => {
-                self.driver.set_option(key, value)?;
+                // The request's own AsynUser, as C hands `setOption` the caller's
+                // pasynUser (asynRecord.c:1787-1826 passes the record's, whose
+                // timeout is TMOT; asynShellCommands.c:119 passes iocsh's 2 s).
+                // A COM port's negotiation is bounded by exactly that timeout.
+                self.driver.set_option(user, key, value)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Report { level } => {

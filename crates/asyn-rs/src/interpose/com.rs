@@ -83,13 +83,20 @@ const CPO_REPLY_OFFSET: i32 = 100;
 /// from the byte 0xFF, which is why this type is `i32` and not `u8`.
 const EOF: i32 = -1;
 
-/// The timeout C gives the negotiation.
+/// The timeout on the interpose's *own* `asynUser` (`asynInterposeCom.c:836`).
 ///
-/// Both C paths that drive the negotiation set exactly this: the interpose's
-/// own `pasynUser` (`asynInterposeCom.c:836`, used by `restoreSettings` at
-/// configure time and from the reconnect `exceptionHandler`) and the iocsh
-/// `asynSetOption` command (`asynShellCommands.c:119`).
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// It bounds the two negotiations the interpose runs for itself — `restoreSettings`
+/// at configure time and from the reconnect `exceptionHandler` — and nothing else.
+/// A negotiation driven by a *caller* (an asynRecord option put, an iocsh
+/// `asynSetOption`) runs under that caller's `asynUser`, whose timeout C threads
+/// all the way down through `setOption` → `sbComPortOption` → `nextChar` (:475,
+/// :417-431, :95-106).
+const INTERPOSE_USER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The interpose's own `asynUser` — C `asynInterposeCom.c:833-836`.
+fn interpose_user() -> AsynUser {
+    AsynUser::new(0).with_timeout(INTERPOSE_USER_TIMEOUT)
+}
 
 /// The option keys C's COM interpose claims — `setOption` (:481-643) and
 /// `getOption` (:664-708) test the same seven with `epicsStrCaseCmp`. Anything
@@ -382,23 +389,27 @@ impl OctetInterpose for ComInterpose {
 /// `asynError` status, exactly as C does.
 struct TelnetLink<'a> {
     next: &'a mut dyn OctetNext,
-    user: AsynUser,
+    /// The `asynUser` C threads through the whole negotiation — the *caller's*
+    /// on `setOption` (an asynRecord option put carries TMOT; an iocsh
+    /// `asynSetOption` carries its own 2 s, `asynShellCommands.c:119`), the
+    /// interpose's own on `restoreSettings` ([`interpose_user`]). Its `timeout`
+    /// bounds every wire read the handshake performs, so the negotiation has no
+    /// timeout of its own to disagree with the caller's.
+    user: &'a mut AsynUser,
     err_msg: String,
 }
 
 impl<'a> TelnetLink<'a> {
-    fn new(next: &'a mut dyn OctetNext) -> Self {
+    fn new(next: &'a mut dyn OctetNext, user: &'a mut AsynUser) -> Self {
         Self {
             next,
-            // C :836 — the interpose's own asynUser runs the negotiation at
-            // `timeout = 2`.
-            user: AsynUser::new(0).with_timeout(NEGOTIATION_TIMEOUT),
+            user,
             err_msg: String::new(),
         }
     }
 
     fn next_char(&mut self) -> i32 {
-        next_char(self.next, &self.user, &mut self.err_msg)
+        next_char(self.next, self.user, &mut self.err_msg)
     }
 
     /// C `expectChar` (:112-125) — fetch and compare. Returns false on EOF
@@ -427,7 +438,7 @@ impl<'a> TelnetLink<'a> {
     }
 
     fn write(&mut self, bytes: &[u8]) -> AsynResult<usize> {
-        self.next.write(&mut self.user, bytes)
+        self.next.write(self.user, bytes)
     }
 
     /// C `willdo` (:327-411). Two shapes depending on `command`:
@@ -715,11 +726,24 @@ impl ComPortOptions {
     }
 
     /// C `setOption` (:474-655) — negotiate `key`/`val` with the server over
-    /// `next`, the octet driver *below* the interpose.
+    /// `next`, the octet driver *below* the interpose, bounded by `user`'s
+    /// timeout.
+    ///
+    /// `user` is the caller's `asynUser`, as in C: `setOption(drvPvt, pasynUser,
+    /// key, val)` hands it to `sbComPortOption` (:495), which writes and reads the
+    /// wire with it (:431, :435-457). An asynRecord option put therefore
+    /// negotiates under TMOT and an iocsh `asynSetOption` under its own 2 s
+    /// (`asynShellCommands.c:119`) — the layer has no timeout of its own.
     ///
     /// Caller must have checked [`Self::owns_key`].
-    pub fn set_option(&mut self, next: &mut dyn OctetNext, key: &str, val: &str) -> AsynResult<()> {
-        let mut link = TelnetLink::new(next);
+    pub fn set_option(
+        &mut self,
+        user: &mut AsynUser,
+        next: &mut dyn OctetNext,
+        key: &str,
+        val: &str,
+    ) -> AsynResult<()> {
+        let mut link = TelnetLink::new(next, user);
         self.set_option_on(&mut link, key, val)
     }
 
@@ -732,8 +756,13 @@ impl ComPortOptions {
     /// pushed to the server — which is how the line comes up configured after a
     /// terminal server reboots. `break` is deliberately not in C's key list: a
     /// break is a momentary line condition, not a setting to restore.
+    /// Runs on the interpose's own `asynUser` (C creates it at :833-836 and hands
+    /// it to `restoreSettings` from both the configure path (:851) and the
+    /// reconnect `exceptionHandler` (:770)), so this is the one negotiation with a
+    /// timeout of its own — 2 s — and no caller to inherit one from.
     pub fn restore_settings(&mut self, next: &mut dyn OctetNext) -> AsynResult<()> {
-        let mut link = TelnetLink::new(next);
+        let mut user = interpose_user();
+        let mut link = TelnetLink::new(next, &mut user);
         self.restore_settings_on(&mut link)
     }
 
@@ -1238,7 +1267,8 @@ mod tests {
     fn set_baud_emits_a_big_endian_four_byte_subnegotiation() {
         let mut server = FakeServer::new(&ack(CPO_SET_BAUDRATE, &[0x00, 0x01, 0xC2, 0x00]));
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "baud", "115200").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "baud", "115200")
+            .unwrap();
 
         // 115200 == 0x0001C200.
         assert_eq!(
@@ -1266,7 +1296,9 @@ mod tests {
         // Asked 115200, server says 9600.
         let mut server = FakeServer::new(&ack(CPO_SET_BAUDRATE, &[0x00, 0x00, 0x25, 0x80]));
         let mut com = ComPortOptions::new();
-        let err = com.set_option(&mut server, "baud", "115200").unwrap_err();
+        let err = com
+            .set_option(&mut AsynUser::default(), &mut server, "baud", "115200")
+            .unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(
             err.message(),
@@ -1280,12 +1312,16 @@ mod tests {
     fn set_bits_and_stop_check_the_echo() {
         let mut server = FakeServer::new(&ack(CPO_SET_DATASIZE, &[7]));
         let mut com = ComPortOptions::new();
-        let err = com.set_option(&mut server, "bits", "8").unwrap_err();
+        let err = com
+            .set_option(&mut AsynUser::default(), &mut server, "bits", "8")
+            .unwrap_err();
         assert_eq!(err.message(), "Tried to set 8 bits, actually set 7 bits.");
 
         let mut server = FakeServer::new(&ack(CPO_SET_STOPSIZE, &[2]));
         let mut com = ComPortOptions::new();
-        let err = com.set_option(&mut server, "stop", "1").unwrap_err();
+        let err = com
+            .set_option(&mut AsynUser::default(), &mut server, "stop", "1")
+            .unwrap_err();
         assert_eq!(
             err.message(),
             "Tried to set 1 stop bits, actually set 2 stop bits."
@@ -1300,7 +1336,8 @@ mod tests {
     fn set_parity_does_not_check_the_echo() {
         let mut server = FakeServer::new(&ack(CPO_SET_PARITY, &[CPO_PARITY_ODD]));
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "parity", "even").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "parity", "even")
+            .unwrap();
         assert_eq!(
             server.written,
             vec![
@@ -1327,7 +1364,8 @@ mod tests {
         ] {
             let mut server = FakeServer::new(&ack(CPO_SET_PARITY, &[code]));
             let mut com = ComPortOptions::new();
-            com.set_option(&mut server, "parity", name).unwrap();
+            com.set_option(&mut AsynUser::default(), &mut server, "parity", name)
+                .unwrap();
             assert_eq!(server.written[4], code, "parity {name}");
             assert_eq!(com.get_option("parity").unwrap(), name);
         }
@@ -1342,13 +1380,15 @@ mod tests {
     fn crtscts_n_resends_the_current_flow_mode_rather_than_noflow() {
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_IXON]));
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "ixon", "y").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "ixon", "y")
+            .unwrap();
         assert_eq!(com.get_option("ixon").unwrap(), "Y");
         assert_eq!(com.get_option("crtscts").unwrap(), "N");
 
         // Now ask for crtscts off. C sends the cached mode — IXON — not NOFLOW.
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_IXON]));
-        com.set_option(&mut server, "crtscts", "n").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "crtscts", "n")
+            .unwrap();
         assert_eq!(
             server.written,
             vec![
@@ -1368,7 +1408,8 @@ mod tests {
     fn crtscts_y_sets_hardware_flow_control() {
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_HWFLOW]));
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "crtscts", "y").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "crtscts", "y")
+            .unwrap();
         assert_eq!(
             server.written,
             vec![
@@ -1391,7 +1432,8 @@ mod tests {
     fn break_on_and_off_emit_set_control_break() {
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_BREAK_ON]));
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "break", "on").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "break", "on")
+            .unwrap();
         assert_eq!(
             server.written,
             vec![
@@ -1407,7 +1449,8 @@ mod tests {
         assert_eq!(com.get_option("break").unwrap(), "on");
 
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_BREAK_OFF]));
-        com.set_option(&mut server, "break", "off").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "break", "off")
+            .unwrap();
         assert_eq!(
             server.written,
             vec![
@@ -1431,7 +1474,8 @@ mod tests {
         let mut com = ComPortOptions::new();
         // Already off; "off" is a no-op that touches neither the wire nor the
         // (empty) reply queue.
-        com.set_option(&mut server, "break", "off").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "break", "off")
+            .unwrap();
         assert!(server.written.is_empty());
     }
 
@@ -1442,7 +1486,8 @@ mod tests {
         reply.extend_from_slice(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_BREAK_OFF]));
         let mut server = FakeServer::new(&reply);
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "break", "1").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "break", "1")
+            .unwrap();
 
         #[rustfmt::skip]
         let expected: Vec<u8> = vec![
@@ -1472,7 +1517,8 @@ mod tests {
         reply.extend_from_slice(&ack(CPO_SET_DATASIZE, &[8]));
         let mut server = FakeServer::new(&reply);
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "bits", "8").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "bits", "8")
+            .unwrap();
         assert_eq!(com.get_option("bits").unwrap(), "8");
     }
 
@@ -1490,7 +1536,8 @@ mod tests {
         reply.extend_from_slice(&ack(CPO_SET_DATASIZE, &[8]));
         let mut server = FakeServer::new(&reply);
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "bits", "8").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "bits", "8")
+            .unwrap();
         assert_eq!(com.get_option("bits").unwrap(), "8");
     }
 
@@ -1500,7 +1547,9 @@ mod tests {
         // Asked SET-DATASIZE (2, reply 102); server answers for SET-PARITY (103).
         let mut server = FakeServer::new(&ack(CPO_SET_PARITY, &[CPO_PARITY_NONE]));
         let mut com = ComPortOptions::new();
-        let err = com.set_option(&mut server, "bits", "8").unwrap_err();
+        let err = com
+            .set_option(&mut AsynUser::default(), &mut server, "bits", "8")
+            .unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(err.message(), "Sent COM-PORT-OPTION 2 but got reply 103");
     }
@@ -1511,7 +1560,9 @@ mod tests {
         // IAC then a data byte where SB (0xFA) must be.
         let mut server = FakeServer::new(&[IAC, b'A']);
         let mut com = ComPortOptions::new();
-        let err = com.set_option(&mut server, "bits", "8").unwrap_err();
+        let err = com
+            .set_option(&mut AsynUser::default(), &mut server, "bits", "8")
+            .unwrap_err();
         assert_eq!(err.message(), "Expected 0XFA, got 0X41");
     }
 
@@ -1610,6 +1661,86 @@ mod tests {
         }
     }
 
+    /// R9-55. C threads the *caller's* `pasynUser` through the whole
+    /// negotiation: `setOption(drvPvt, pasynUser, key, val)` (:475) hands it to
+    /// `sbComPortOption` (:495), which writes (:431) and reads (:435-457) the wire
+    /// with it — so an asynRecord option put negotiates under TMOT and an iocsh
+    /// `asynSetOption` under its own 2 s (`asynShellCommands.c:119`). The port
+    /// pinned every negotiation to a private 2 s instead, so a record with
+    /// TMOT=10 gave up on a slow terminal server after 2 s, and one with
+    /// TMOT=0.05 sat waiting for 2 s.
+    ///
+    /// The 2 s is C's only where C's own asynUser drives — `restoreSettings`,
+    /// from the configure path and the reconnect exceptionHandler (:836).
+    #[test]
+    fn the_negotiation_runs_under_the_callers_timeout() {
+        /// Records the timeout on the asynUser every wire operation is given.
+        struct TimeoutSpy {
+            inner: FakeServer,
+            seen: Vec<Duration>,
+        }
+        impl OctetNext for TimeoutSpy {
+            fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+                self.seen.push(user.timeout);
+                self.inner.read(user, buf)
+            }
+            fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.seen.push(user.timeout);
+                self.inner.write(user, data)
+            }
+            fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+                self.inner.flush(user)
+            }
+        }
+
+        // One setOption("bits", "8"): write the subcommand, read the echo.
+        let mut spy = TimeoutSpy {
+            inner: FakeServer::new(&ack(CPO_SET_DATASIZE, &[8])),
+            seen: Vec::new(),
+        };
+        let mut com = ComPortOptions::new();
+        let caller = Duration::from_millis(250);
+        com.set_option(
+            &mut AsynUser::default().with_timeout(caller),
+            &mut spy,
+            "bits",
+            "8",
+        )
+        .unwrap();
+        assert!(!spy.seen.is_empty(), "the negotiation reached the wire");
+        assert!(
+            spy.seen.iter().all(|t| *t == caller),
+            "every wire operation runs under the caller's timeout, got {:?}",
+            spy.seen
+        );
+
+        // restoreSettings is the interpose's own negotiation, and only that one
+        // carries C's 2 s (:836).
+        let mut replies = Vec::new();
+        replies.extend(vec![IAC, WILL, WD_TRANSMIT_BINARY]);
+        replies.extend(vec![IAC, DO, WD_TRANSMIT_BINARY]);
+        replies.extend(vec![IAC, DO, SB_COM_PORT_OPTION]);
+        replies.extend(ack(CPO_SET_MODEMSTATE_MASK, &[0]));
+        replies.extend(ack(CPO_SET_BAUDRATE, &9600i32.to_be_bytes()));
+        replies.extend(ack(CPO_SET_DATASIZE, &[8]));
+        replies.extend(ack(CPO_SET_PARITY, &[CPO_PARITY_NONE]));
+        replies.extend(ack(CPO_SET_STOPSIZE, &[1]));
+        replies.extend(ack(CPO_SET_CONTROL, &[CPO_CONTROL_NOFLOW]));
+        replies.extend(ack(CPO_SET_CONTROL, &[CPO_CONTROL_NOFLOW]));
+        let mut spy = TimeoutSpy {
+            inner: FakeServer::new(&replies),
+            seen: Vec::new(),
+        };
+        let mut com = ComPortOptions::new();
+        com.restore_settings(&mut spy).unwrap();
+        assert!(!spy.seen.is_empty());
+        assert!(
+            spy.seen.iter().all(|t| *t == INTERPOSE_USER_TIMEOUT),
+            "restoreSettings runs on the interpose's own 2 s asynUser, got {:?}",
+            spy.seen
+        );
+    }
+
     #[test]
     fn get_option_reports_the_defaults_asyn_interpose_com_installs() {
         let com = ComPortOptions::new();
@@ -1627,26 +1758,26 @@ mod tests {
         let mut server = FakeServer::new(&[]);
         let mut com = ComPortOptions::new();
         assert_eq!(
-            com.set_option(&mut server, "baud", "fast")
+            com.set_option(&mut AsynUser::default(), &mut server, "baud", "fast")
                 .unwrap_err()
                 .message(),
             "Bad number"
         );
         assert_eq!(
-            com.set_option(&mut server, "parity", "sideways")
+            com.set_option(&mut AsynUser::default(), &mut server, "parity", "sideways")
                 .unwrap_err()
                 .message(),
             "Invalid parity selection"
         );
         // C's message really does have two spaces (:553).
         assert_eq!(
-            com.set_option(&mut server, "stop", "1.5")
+            com.set_option(&mut AsynUser::default(), &mut server, "stop", "1.5")
                 .unwrap_err()
                 .message(),
             "Bad  stop bit count"
         );
         assert_eq!(
-            com.set_option(&mut server, "crtscts", "maybe")
+            com.set_option(&mut AsynUser::default(), &mut server, "crtscts", "maybe")
                 .unwrap_err()
                 .message(),
             "Bad  value"
@@ -1661,7 +1792,8 @@ mod tests {
     fn baud_accepts_a_trailing_tail_the_way_sscanf_does() {
         let mut server = FakeServer::new(&ack(CPO_SET_BAUDRATE, &[0x00, 0x00, 0x25, 0x80]));
         let mut com = ComPortOptions::new();
-        com.set_option(&mut server, "baud", "9600 bps").unwrap();
+        com.set_option(&mut AsynUser::default(), &mut server, "baud", "9600 bps")
+            .unwrap();
         assert_eq!(com.get_option("baud").unwrap(), "9600");
     }
 

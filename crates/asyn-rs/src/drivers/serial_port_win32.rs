@@ -676,7 +676,7 @@ impl PortDriver for DrvAsynSerialPort {
         self.base.interpose_octet.dispatch_flush(user, &mut self.io)
     }
 
-    fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
+    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         use dcb_bits::*;
 
         // C-Win32 setOption's opening guard (drvAsynSerialPortWin32.c:180-185):
@@ -1089,7 +1089,7 @@ mod tests {
             ("ixoff", "Y"),
             ("break", "on"),
         ] {
-            match drv.set_option(key, value) {
+            match drv.set_option(&mut AsynUser::default(), key, value) {
                 Err(AsynError::Status { status, message }) => {
                     assert_eq!(status, AsynStatus::Error, "set_option({key}) status");
                     assert!(

@@ -12,6 +12,7 @@
 //! Available only with the `epics` feature.
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::iocsh::registry::{
@@ -27,6 +28,7 @@ use crate::port::PortDriver;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
+use crate::user::AsynUser;
 
 /// Register the standard asyn iocsh commands on the supplied
 /// [`IocApplication`]. The shared [`PortManager`] is captured in each
@@ -300,8 +302,15 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 let key = arg_str(args, 2).ok_or_else(|| "key required".to_string())?;
                 let value = arg_str(args, 3).unwrap_or_default();
+                // C `asynSetOption` builds its own asynUser and gives it
+                // `timeout = 2` (asynShellCommands.c:119) before queueing the
+                // setOption callback; `addr` rides on the same user, as C's
+                // `findInterface(portName, addr, ...)` connects it to the device.
+                let user = AsynUser::default()
+                    .with_addr(addr)
+                    .with_timeout(Duration::from_secs(2));
                 match mgr_r.find_port_handle(&port) {
-                    Ok(handle) => match handle.set_option_addr_blocking(addr, &key, &value) {
+                    Ok(handle) => match handle.set_option_blocking(user, &key, &value) {
                         Ok(()) => Ok(CommandOutcome::Continue),
                         Err(e) => {
                             ctx.println(&format!("asynSetOption: {e}"));

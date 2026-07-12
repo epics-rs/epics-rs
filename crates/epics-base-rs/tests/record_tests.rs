@@ -1278,6 +1278,66 @@ fn test_per_field_masks_narrow_deadband_and_aux_posts() {
 }
 
 #[test]
+fn test_acks_posts_once_with_dbe_value_only() {
+    // W10-E1. C `recGblResetAlarms` posts ACKS EXACTLY ONCE, with a literal
+    // `DBE_VALUE`, from inside `if (stat_mask)` (recGbl.c:214-217):
+    //
+    //     if (!pdbc->ackt || new_sevr >= pdbc->acks) {
+    //         pdbc->acks = new_sevr;
+    //         db_post_events(pdbc, &pdbc->acks, DBE_VALUE);
+    //     }
+    //
+    // There is no second ACKS post anywhere in C. The port's generic
+    // change-detection loop (`collect_subscriber_posts`) did not exclude ACKS,
+    // so a changed ACKS was ALSO emitted in the record-wide snapshot carrying
+    // `alarm_bits | DBE_VALUE | DBE_LOG` — a `.ACKS` monitor saw two events, one
+    // of them with a mask C never uses for that field.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0;
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let _acks_rx = instance
+        .add_subscriber("ACKS", 1, DbFieldType::Enum, EventMask::VALUE.bits())
+        .expect("ACKS subscriber");
+    // HIGH=0.5/Major so VAL=1.0 raises a NoAlarm -> Major transition, which
+    // makes `recGblResetAlarms` fire the ack rule and move ACKS 0 -> 2.
+    instance.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 1000.0,
+        high: 0.5,
+        low: -1000.0,
+        lolo: -2000.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Major,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, alarm_posts) = instance.process_local().unwrap();
+
+    assert_eq!(
+        instance.common.acks,
+        AlarmSeverity::Major,
+        "the ack rule fired and raised ACKS"
+    );
+    // The ONLY ACKS post is the alarm-field one, with DBE_VALUE.
+    let acks_posts: Vec<_> = alarm_posts.iter().filter(|(f, _)| *f == "ACKS").collect();
+    assert_eq!(acks_posts.len(), 1, "exactly one ACKS post");
+    assert_eq!(
+        *acks_posts[0],
+        ("ACKS", EventMask::VALUE),
+        "C posts ACKS with a literal DBE_VALUE (recGbl.c:216)"
+    );
+    // ...and NOT a second time from the record-wide change-detection snapshot.
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "ACKS"),
+        "ACKS must not also ride the generic snapshot — C posts it once"
+    );
+}
+
+#[test]
 fn test_no_alarm_change_does_not_post_sevr_stat() {
     // C `recGbl.c:202-207`: when `prev_sevr == new_sevr` and
     // `prev_stat == new_stat`, `recGblResetAlarms` posts neither

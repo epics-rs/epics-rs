@@ -119,6 +119,25 @@ impl std::ops::BitAnd for EventMask {
     }
 }
 
+/// The record fields C `recGblResetAlarms` posts ITSELF (recGbl.c:201-217):
+/// `db_post_events(&sevr, …)`, `db_post_events(&stat, …)`,
+/// `db_post_events(&amsg, …)` and `db_post_events(&acks, DBE_VALUE)`.
+///
+/// Each carries its own C mask, assembled by the alarm-post owner
+/// (`processing::alarm_field_posts` and its siblings) from
+/// [`AlarmResetResult`]. The generic per-cycle change-detection loop
+/// (`RecordInstance::collect_subscriber_posts`) must therefore SKIP every field
+/// named here: emitting one from the record-wide snapshot as well would send a
+/// subscriber two events for one C `db_post_events`, the second carrying the
+/// framework's default `alarm_bits | DBE_VALUE | DBE_LOG` — a mask C never uses
+/// for these fields.
+///
+/// The two sides are kept in step by construction: a field the alarm-post owner
+/// emits belongs in this list, and the change-detection loop excludes exactly
+/// this list. (`UDF` is NOT here — it is not a `recGblResetAlarms` post; the
+/// framework posts it from its own undefined-value rule.)
+pub const RECGBL_POSTED_ALARM_FIELDS: [&str; 4] = ["SEVR", "STAT", "AMSG", "ACKS"];
+
 /// Result of rec_gbl_reset_alarms: whether alarm state changed.
 pub struct AlarmResetResult {
     pub alarm_changed: bool,

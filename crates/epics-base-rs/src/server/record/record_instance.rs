@@ -2282,8 +2282,10 @@ impl RecordInstance {
     ///
     /// The rules, in order:
     ///
-    /// * The deadband field (default VAL) and SEVR/STAT/AMSG/UDF are emitted by
-    ///   the caller with their own C masks and are skipped here.
+    /// * The deadband field (default VAL), the
+    ///   [`recgbl::RECGBL_POSTED_ALARM_FIELDS`](crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS)
+    ///   (SEVR/STAT/AMSG/ACKS) and UDF are emitted by the caller with their own
+    ///   C masks and are skipped here.
     /// * [`Record::event_posted_fields`] post from their own event path
     ///   (waveform HASH) — never from change detection.
     /// * [`Record::process_posted_fields`], when declared, is the closed set of
@@ -2328,9 +2330,14 @@ impl RecordInstance {
         for (field, subs) in &self.subscribers {
             if subs.is_empty()
                 || field == deadband_field
-                || field == "SEVR"
-                || field == "STAT"
-                || field == "AMSG"
+                // SEVR/STAT/AMSG/ACKS are posted by `recGblResetAlarms` itself,
+                // each with its own C mask (recGbl.c:201-217) — the caller emits
+                // them from `alarm_field_posts`. A second, change-detected copy
+                // here would double-post with a mask C never uses for them
+                // (`alarm_bits | DBE_VALUE | DBE_LOG` instead of C's DBE_VALUE
+                // on ACKS). UDF is separate: the framework posts it from its own
+                // undefined-value rule, not from recGblResetAlarms.
+                || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field.as_str())
                 || field == "UDF"
                 || event_posted.contains(&field.as_str())
                 || !process_posted.is_none_or(|allowed| allowed.contains(&field.as_str()))

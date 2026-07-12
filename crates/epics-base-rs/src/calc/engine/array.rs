@@ -517,9 +517,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 ArrayOp::IndexNonZero => {
                     let v = pop1(&mut stack)?;
                     let arr = v.as_array()?;
+                    // C `aCalcPerform.c:893-898` thresholds at SMALL — `fabs(a[i])
+                    // > SMALL` — it is not an exact `!= 0.0`. Below 1e-9 an element
+                    // counts as zero and is skipped. (aCalc's other zero tests —
+                    // logical AND/OR/NOT, the conditional, the DIV/MOD zero divisor
+                    // — really are C's exact truthiness, so SMALL stays here.)
                     let idx = arr
                         .iter()
-                        .position(|&x| x != 0.0)
+                        .position(|&x| x.abs() > SMALL)
                         .map(|i| i as f64)
                         .unwrap_or(-1.0);
                     stack.push(ArrayStackValue::Double(idx));

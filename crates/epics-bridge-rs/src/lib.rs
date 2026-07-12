@@ -82,6 +82,11 @@ pub mod pvalink;
 #[cfg(feature = "pva-gateway")]
 pub mod pva_gateway;
 
+// `AccessControl` is an `#[async_trait]` trait: re-exported so an out-of-tree
+// impl can annotate itself (`#[epics_bridge_rs::async_trait]`) without taking
+// its own `async-trait` dependency and risking a version mismatch.
+pub use async_trait::async_trait;
+
 // Convenience re-exports for the QSRV bridge (default feature).
 // External users can write `epics_bridge_rs::BridgeProvider` directly.
 #[cfg(feature = "qsrv")]

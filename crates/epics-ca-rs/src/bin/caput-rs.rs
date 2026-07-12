@@ -2,9 +2,12 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
-use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
+use epics_ca_rs::cli::{
+    PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str, stat_to_str,
+    zero_dbr_snapshot, zero_dbr_value,
+};
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
-use epics_ca_rs::{CaError, DbFieldType, EpicsValue, PvString};
+use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
 fn format_server_timestamp(ts: WallTime) -> String {
@@ -14,49 +17,11 @@ fn format_server_timestamp(ts: WallTime) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
-fn sevr_to_str(sevr: u16) -> &'static str {
-    match sevr {
-        0 => "NO_ALARM",
-        1 => "MINOR",
-        2 => "MAJOR",
-        3 => "INVALID",
-        _ => "Illegal value",
-    }
-}
-
-fn stat_to_str(stat: u16) -> &'static str {
-    match stat {
-        0 => "NO_ALARM",
-        1 => "READ",
-        2 => "WRITE",
-        3 => "HIHI",
-        4 => "HIGH",
-        5 => "LOLO",
-        6 => "LOW",
-        7 => "STATE",
-        8 => "COS",
-        9 => "COMM",
-        10 => "TIMEOUT",
-        11 => "HW_LIMIT",
-        12 => "CALC",
-        13 => "SCAN",
-        14 => "LINK",
-        15 => "SOFT",
-        16 => "BAD_SUB",
-        17 => "UDF",
-        18 => "DISABLE",
-        19 => "SIMM",
-        20 => "READ_ACCESS",
-        21 => "WRITE_ACCESS",
-        _ => "Illegal value",
-    }
-}
-
-/// Print one `Old : ...` / `New : ...` line in long-mode shape:
-///   `<prefix>{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
+/// One `Old : ...` / `New : ...` line in long-mode shape:
+///   `{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
 /// Mirrors `tool_lib.c::print_time_val_sts` — when alarm is
 /// (NO_ALARM, NO_ALARM) the trailing two fields are emitted empty.
-fn print_long_line(prefix: &str, name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) {
+fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> String {
     let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
     // caput has no `-#` element-count flag, so req_elems is always false:
     // an array count prefix is emitted only when the array length itself
@@ -66,13 +31,70 @@ fn print_long_line(prefix: &str, name_col: &str, sep: char, snap: &Snapshot, fmt
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
     if stat == 0 && sevr == 0 {
-        println!("{prefix}{name_col}{sep}{ts}{sep}{val}{sep}{sep}");
+        format!("{name_col}{sep}{ts}{sep}{val}{sep}{sep}")
     } else {
-        println!(
-            "{prefix}{name_col}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+        format!(
+            "{name_col}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
             stat_str = stat_to_str(stat),
             sevr_str = sevr_to_str(sevr),
-        );
+        )
+    }
+}
+
+/// C `print_time_val_sts` stamps its error lines with the CLIENT's current
+/// time (`epicsTimeGetCurrent`, `tool_lib.c:514-515`), not a server timestamp
+/// — a failed read carries no server response to take one from.
+fn format_client_timestamp() -> String {
+    format_server_timestamp(SystemTime::now().into())
+}
+
+/// What C's `caget()` (`caput.c:130-240`) prints for one readback, WITHOUT
+/// the `Old : ` / `New : ` prefix its caller already emitted.
+///
+/// `None` means C returned from `if (!nConn) return 1` (`caput.c:181`) BEFORE
+/// reaching its print loop — it printed nothing at all, not even a newline,
+/// leaving the bare prefix on stdout.
+///
+/// Whether that non-zero return MATTERS is the caller's business, and the two
+/// call sites differ: the `Old :` read's return is DISCARDED (`caput.c:535`)
+/// so the put runs regardless, while the `New :` read's return IS caput's
+/// exit status (`caput.c:583,589`).
+fn readback_line(
+    rb: &Readback,
+    name_col: &str,
+    sep: char,
+    fmt: &ValueFormat,
+    terse: bool,
+    long_mode: bool,
+) -> Option<String> {
+    match rb {
+        // C treats a timed-out read exactly like a successful one here: the
+        // zeroed buffer is still a buffer (see `zero_readback`).
+        Readback::Value(v, snap) | Readback::TimedOut(v, snap) => {
+            let rendered = format_value(v, fmt, None, false);
+            if terse {
+                return Some(rendered);
+            }
+            Some(match (long_mode, snap) {
+                (true, Some(s)) => long_line(name_col, sep, s, fmt),
+                (true, None) => format!("{name_col}{sep}*{sep}{rendered}{sep}{sep}"),
+                (false, _) => format!("{name_col}{sep}{rendered}"),
+            })
+        }
+        Readback::Disconnected(_) => None,
+        Readback::Other(e) => {
+            let marker = ca_error_marker(e.to_eca_status());
+            Some(if terse {
+                marker
+            } else if long_mode {
+                format!(
+                    "{name_col}{sep}{ts} {marker}",
+                    ts = format_client_timestamp()
+                )
+            } else {
+                format!("{name_col}{sep}{marker}")
+            })
+        }
     }
 }
 
@@ -276,37 +298,67 @@ async fn main() {
     // zeroed buffer is an empty string, not a 0 index.
     let read_as_string = enum_dbr.is_some();
 
-    // C caput.c:532-535 gates the pre-put "Old :" read+print on
+    // The readback display format. C's `charArrAsStr` (`-S`) is read by BOTH
+    // the write-value builder (`caput.c:514`, DBR_CHAR) and the readback print
+    // loop (`caput.c:211-222`), which escapes a CHAR-array readback back into
+    // its long-string form — so `-S` must reach the `Old :`/`New :` rendering,
+    // not just the wire value. `format_value` owns C's gate
+    // (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`).
+    let mut fmt = ValueFormat {
+        char_array_as_string: args.long_string,
+        ..ValueFormat::default()
+    };
+    if let Some(c) = args.field_separator {
+        fmt.field_separator = c;
+    }
+    let sep = fmt.field_separator;
+    // C pads the PV-name column on the READ element count (`pvs[n].reqElems <=
+    // 1 && fieldSeparator == ' '`, caput.c:196-198), which caput knows before
+    // the put — it never depends on the value that comes back.
+    let name_col = if read_elems <= 1 && sep == ' ' {
+        format!("{pv_name:<width$}", width = PV_NAME_WIDTH)
+    } else {
+        pv_name.clone()
+    };
+
+    // C caput.c:531-535 gates the pre-put "Old :" read+print on
     // `if (format != terse)`. Terse mode prints only the new value, so the
     // pre-put GET must NOT be issued: C never issues it, and a PV that is slow
     // to read, read-denied before a write-side access transition, or backed by
     // an expensive/side-effecting read path must still proceed to the write.
     // The post-put read below is kept in every mode (C still calls caget()
     // after the put, caput.c:583; terse only suppresses the `New :` label).
-    let (old_value, old_snap) = if args.terse {
-        (None, None)
-    } else {
-        match classify_readback(
+    //
+    // The read's RETURN VALUE IS DISCARDED (`result` is overwritten by the put
+    // at caput.c:539-548), so NOTHING about this read can abort caput: a
+    // read-denied but writable PV prints `*** no read access` here and still
+    // gets its put, and a PV that dropped since the connect barrier prints
+    // nothing at all (C returns from `!nConn` before its print loop) and lets
+    // the PUT report the disconnect.
+    if !args.terse {
+        print!("Old : ");
+        let rb = classify_readback(
             read_display(ch.clone()).await,
             native_type,
             read_as_string,
             read_elems,
             long_mode,
-        ) {
-            Readback::Value(v, s) => (Some(v), s),
-            Readback::TimedOut(v, s) => {
-                // C caput.c:186-188 warns and keeps going; the `Old :` read's
-                // return value is DISCARDED at caput.c:535, so the PUT still
-                // runs and the zeroed buffer is what the `Old :` line shows.
-                eprintln!("Read operation timed out: PV data was not read.");
-                (Some(v), s)
-            }
-            Readback::Disconnected(e) | Readback::Other(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+        );
+        if matches!(rb, Readback::TimedOut(..)) {
+            // C caput.c:186-188 warns and keeps going, printing the zeroed
+            // buffer on the `Old :` line.
+            eprintln!("Read operation timed out: PV data was not read.");
+        }
+        match readback_line(&rb, &name_col, sep, &fmt, false, long_mode) {
+            Some(line) => println!("{line}"),
+            // C printed the `Old : ` prefix and nothing else — not even a
+            // newline. Flush it so the put's stderr diagnostic does not race a
+            // buffered partial line.
+            None => {
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
         }
-    };
+    }
 
     // build the value to write in C's precedence order — `-S`
     // (long string) resolved before any native-type parse. See
@@ -373,81 +425,35 @@ async fn main() {
     // Re-read for echoing to stdout (matches C caput which always reads the PV
     // back after the put, caput.c:583). Same readback type selection as the
     // `Old :` read above, so an ENUM `New :` value also echoes as the state
-    // label. C returns this readback's status as caput's exit status
-    // (caput.c:589), and inside `caget()` only `!nConn` yields a non-zero
+    // label. C returns THIS readback's status as caput's exit status
+    // (caput.c:583,589), and inside `caget()` only `!nConn` yields a non-zero
     // return (`caput.c:181`) — see [`Readback`]. A read TIMEOUT does NOT:
     // C prints `New : <name> <zeroed value>` and exits 0.
-    let echo_fallback = parsed_value.echo_fallback();
-    let (new_value, new_snap) = match classify_readback(
+    if !args.terse {
+        // C `caput -t` suppresses the label, not the read (caput.c:580-583).
+        print!("New : ");
+    }
+    let rb = classify_readback(
         read_display(ch.clone()).await,
         native_type,
         read_as_string,
         read_elems,
         long_mode,
-    ) {
-        Readback::Value(v, s) => (v, s),
-        Readback::TimedOut(v, s) => {
-            eprintln!("Read operation timed out: PV data was not read.");
-            (v, s)
-        }
-        Readback::Disconnected(e) => {
-            eprintln!("error: {e}");
+    );
+    if matches!(rb, Readback::TimedOut(..)) {
+        eprintln!("Read operation timed out: PV data was not read.");
+    }
+    match readback_line(&rb, &name_col, sep, &fmt, args.terse, long_mode) {
+        Some(line) => println!("{line}"),
+        // `!nConn`: C's caget() printed nothing and returned 1, which IS
+        // caput's exit status here (caput.c:589).
+        None => {
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if let Readback::Disconnected(e) = &rb {
+                eprintln!("error: {e}");
+            }
             std::process::exit(1);
         }
-        // C prints a `*** ...` marker here and exits 0; the port echoes the
-        // submitted value instead, keeping C's exit code.
-        Readback::Other(_) => (echo_fallback.clone(), None),
-    };
-
-    let mut fmt = ValueFormat::default();
-    if let Some(c) = args.field_separator {
-        fmt.field_separator = c;
-    }
-    let sep = fmt.field_separator;
-    // In terse mode `old_value` is `None` (no pre-put read was issued) and the
-    // rendered old value is unused; non-terse modes always carry `Some`.
-    let old_rendered = old_value
-        .as_ref()
-        .map(|v| format_value(v, &fmt, None, false))
-        .unwrap_or_default();
-    let new_rendered = format_value(&new_value, &fmt, None, false);
-    let is_scalar = new_value.count() == 1;
-    let pad = |name: &str| -> String {
-        if is_scalar && sep == ' ' {
-            format!("{name:<width$}", width = PV_NAME_WIDTH)
-        } else {
-            name.to_string()
-        }
-    };
-
-    if args.terse {
-        // C `caput -t`: only the new value (no name, no Old/New).
-        println!("{new_rendered}");
-    } else if args.long_mode {
-        // C `caput -l`: same shape as `caget -a` for both lines, using
-        // the DBR_TIME snapshots captured around the put.
-        let name_col = pad(&pv_name);
-        match &old_snap {
-            Some(s) => print_long_line("Old : ", &name_col, sep, s, &fmt),
-            None => println!("Old : {name_col}{sep}*{sep}{old_rendered}{sep}{sep}"),
-        }
-        match &new_snap {
-            Some(s) => print_long_line("New : ", &name_col, sep, s, &fmt),
-            None => println!("New : {name_col}{sep}*{sep}{new_rendered}{sep}{sep}"),
-        }
-    } else {
-        // Default: `Old : <name-padded><sep><value>` and likewise for
-        // New. Mirrors C `caput.c::main` post-put echo.
-        println!(
-            "Old : {name}{sep}{val}",
-            name = pad(&pv_name),
-            val = old_rendered
-        );
-        println!(
-            "New : {name}{sep}{val}",
-            name = pad(&pv_name),
-            val = new_rendered
-        );
     }
 }
 
@@ -477,23 +483,6 @@ enum WriteValue {
     EnumStringArray(Vec<epics_ca_rs::PvString>),
 }
 
-impl WriteValue {
-    /// Value used to echo `New :` if the post-put read-back fails
-    /// non-fatally (see [`postput_read_fatal`]).
-    fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
-        match self {
-            WriteValue::Wire { value, .. } => value.clone(),
-            WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
-            WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
-        }
-    }
-}
-
-/// Unix seconds at the EPICS epoch (1990-01-01T00:00:00Z) — the instant a
-/// zeroed `epicsTimeStamp` denotes, which is what C prints for a timed-out
-/// readback under `-l` (see [`zero_readback`]).
-const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
-
 /// One `caput` readback — the `Old :` read (`caput.c:535`) and the `New :`
 /// read (`caput.c:583`) are the SAME C function, `caget()`
 /// (`caput.c:130-240`) — classified by C's contract.
@@ -516,67 +505,26 @@ enum Readback {
     Other(CaError),
 }
 
-/// The value C `caput` prints for a readback whose `ca_pend_io` timed out.
+/// The value C `caput` prints for a readback whose `ca_pend_io` timed out:
+/// the zeroed `calloc` buffer, sized from the DBR type it REQUESTED. Owned
+/// by [`epics_ca_rs::cli::zero_dbr_value`] — `caget` renders the same buffer
+/// on its own synchronous timeout, and the contract is C's, not caput's.
 ///
-/// C `calloc`s the readback buffer BEFORE issuing the get (`caput.c:167`)
-/// and, on `ECA_TIMEOUT`, only warns on stderr (`caput.c:186-188`) — it
-/// neither frees the buffer nor marks the PV's status. The print loop
-/// therefore sees `status == ECA_NORMAL` and `value != 0` (`caput.c:201-209`)
-/// and renders the still-ZEROED buffer: a numeric field prints `0`, a string
-/// (or ENUM-as-label) field prints an empty value, an array prints its
-/// element count then that many zeros, and `-l` prints a zeroed
-/// `epicsTimeStamp` (the EPICS epoch) with NO_ALARM/NO_ALARM
-/// (`tool_lib.c::print_time_val_sts`). `caget()` then returns 0
-/// (`caput.c:239`).
-///
-/// Note the `*** no data available (timeout)` branch (`caput.c:207-208`) is
-/// DEAD in caput: it needs `value == 0`, which only the callback get path
-/// allocates lazily (`caget.c:130`), and caput's readback is always the
-/// synchronous `ca_array_get`.
+/// `as_string` marks the ENUM-read-back-as-label case: that get requests a
+/// `DBR_STRING`, so its zeroed buffer is an empty string, not a `0` index.
 fn zero_readback(
     native: DbFieldType,
     as_string: bool,
     count: u32,
     long_mode: bool,
 ) -> (EpicsValue, Option<Snapshot>) {
-    let n = count.max(1) as usize;
-    let scalar = n == 1;
-    let zeros = |scalar_v: EpicsValue, array_v: EpicsValue| {
-        if scalar { scalar_v } else { array_v }
-    };
-    let value = if as_string || native == DbFieldType::String {
-        zeros(
-            EpicsValue::String(PvString::from("")),
-            EpicsValue::StringArray(vec![PvString::from(""); n]),
-        )
+    let base = if as_string {
+        DbFieldType::String
     } else {
-        match native {
-            DbFieldType::Short => zeros(EpicsValue::Short(0), EpicsValue::ShortArray(vec![0; n])),
-            DbFieldType::Float => {
-                zeros(EpicsValue::Float(0.0), EpicsValue::FloatArray(vec![0.0; n]))
-            }
-            DbFieldType::Enum => zeros(EpicsValue::Enum(0), EpicsValue::EnumArray(vec![0; n])),
-            DbFieldType::Char => zeros(EpicsValue::Char(0), EpicsValue::CharArray(vec![0; n])),
-            DbFieldType::Long => zeros(EpicsValue::Long(0), EpicsValue::LongArray(vec![0; n])),
-            // DbFieldType::Double, plus the internal-only widths (Int64,
-            // UInt64, UShort, ULong, UChar) that have no CA wire type: a CA
-            // server reports them promoted (DBR_DOUBLE / DBR_LONG / DBR_CHAR),
-            // so `native_field_type` never yields them here — and their zero
-            // renders as `0` in every one of those promotions anyway.
-            _ => zeros(
-                EpicsValue::Double(0.0),
-                EpicsValue::DoubleArray(vec![0.0; n]),
-            ),
-        }
+        native
     };
-    let snap = long_mode.then(|| {
-        Snapshot::new(
-            value.clone(),
-            0,
-            0,
-            WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
-        )
-    });
+    let value = zero_dbr_value(base, count);
+    let snap = long_mode.then(|| zero_dbr_snapshot(base, count));
     (value, snap)
 }
 
@@ -934,11 +882,12 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, EPICS_EPOCH_UNIX_SECS, Readback, WriteValue, build_write_value, classify_readback,
-        raw_from_escaped, raw_from_escaped_string, zero_readback,
+        Args, Readback, WriteValue, build_write_value, classify_readback, raw_from_escaped,
+        raw_from_escaped_string, zero_readback,
     };
     use clap::Parser;
     use epics_base_rs::types::WallTime;
+    use epics_ca_rs::cli::EPICS_EPOCH_UNIX_SECS;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {

@@ -554,14 +554,22 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(len));
                 }
                 StringOp::Byte => {
+                    // C BYTE (sCalcPerform.c:1528-1533):
+                    //
+                    //     if (isString(ps)) { ps->d = ps->s[0]; ps->s = NULL; }
+                    //
+                    // `ps->s[0]` is a `char`, which is SIGNED on the reference
+                    // platform, so a byte with the high bit set reads NEGATIVE:
+                    // compiled C gives BYTE("\xff") = -1 and BYTE("\x80") = -128,
+                    // not 255 and 128. (The same signed read is already in
+                    // BIN_READ's `%c`.) The empty string reads its NUL: 0. And a
+                    // DOUBLE operand falls through the `isString` guard
+                    // untouched — it is not an error and not zero.
                     let v = pop1(&mut stack)?;
-                    let byte_val = match &v {
-                        StackValue::Str(s) => {
-                            s.as_bytes().first().map(|b| *b as f64).unwrap_or(0.0)
-                        }
-                        StackValue::Double(_) => 0.0,
-                    };
-                    stack.push(StackValue::Double(byte_val));
+                    stack.push(StackValue::Double(match &v {
+                        StackValue::Double(d) => *d,
+                        StackValue::Str(s) => s.as_bytes().first().map_or(0.0, |b| *b as i8 as f64),
+                    }));
                 }
                 StringOp::TrEsc => {
                     let v = pop1(&mut stack)?;

@@ -4,7 +4,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue};
 
-use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_eval, scalc_result};
+use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_eval};
 
 const NUM_CHANNELS: usize = 16; // A-P
 
@@ -590,9 +590,13 @@ impl Record for TransformRecord {
                 match scalc_eval(compiled, &mut inputs) {
                     Ok(result) => {
                         // C's epilogue with `psresult == NULL`: `*presult` takes
-                        // the double, coercing a string result through `atof`.
-                        // `scalc_result` is the single owner of that coercion.
-                        self.vals[i] = scalc_result(&result).0;
+                        // the double, coercing a string result through `atof` —
+                        // `StackValue::to_double` is that coercion, the same one
+                        // `scalc_perform`'s epilogue uses for its `val` half.
+                        // transform never consumes the SVAL half, so PREC plays
+                        // no part here (C passes `ptran->prec` but a NULL
+                        // `psresult` makes it moot).
+                        self.vals[i] = result.to_double();
                     }
                     Err(_) => {
                         // C `transformRecord.c:593-596`:

@@ -1086,6 +1086,15 @@ pub fn resolve_linr_breaktable_names(
     }
 }
 
+/// The link fields whose value must reach [`RecordCommon`] — and therefore
+/// device-support init via `DeviceSupportContext` — for every record type,
+/// even one that stores the field itself.
+///
+/// [`RecordCommon`]: crate::server::record::RecordCommon
+fn is_common_link_field(upper_name: &str) -> bool {
+    matches!(upper_name, "INP" | "OUT")
+}
+
 pub fn apply_fields(
     record: &mut Box<dyn Record>,
     fields: &[(String, String)],
@@ -1125,6 +1134,29 @@ pub fn apply_fields(
                 })?
             };
             record.put_field(&upper_name, value)?;
+            // A record type may declare INP/OUT in its own `field_list`,
+            // mirroring its C `.dbd` (`scalerRecord`, `motorRecord`,
+            // `acalcout`, …). The value is then stored by the record — but in
+            // C the link is *also* what device support reads at init:
+            // `devXxx.c::init_record` dereferences `prec->out` / `prec->inp`
+            // directly (e.g. `devScalerAsyn.c::scaler_init_record` parses OUT
+            // to pick its board), and a record owning the field changes
+            // nothing about that. Routing the value to the record ALONE left
+            // `RecordCommon.inp`/`.out` — the single source of truth
+            // `DeviceSupportContext` is built from — empty, so a dynamic
+            // device-support factory saw `ctx.out == ""` and could not
+            // disambiguate. Mirror link fields into the common fields as well
+            // so the link text reaches device-support init for every record
+            // type. This is text only: `RecordInstance::put_common_field`
+            // arms the framework's own link dispatch (`parsed_inp` /
+            // `parsed_out`) only for a record that does NOT declare the field,
+            // so a record driving its own link is not driven twice.
+            if is_common_link_field(&upper_name) {
+                common_fields.push((
+                    upper_name.clone(),
+                    EpicsValue::String(value_str.clone().into()),
+                ));
+            }
         } else {
             // Store as common field for RecordInstance to handle
             common_fields.push((upper_name, EpicsValue::String(value_str.clone().into())));

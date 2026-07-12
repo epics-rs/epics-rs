@@ -64,9 +64,32 @@ pub struct ScalcoutRecord {
     pub num_vals: [f64; 12],
     // String input values AA-LL
     pub str_vals: [PvString; 12],
-    // Previous value for transition detection
-    prev_val: f64,
-    prev_sval: PvString,
+    /// PVAL — C `sCalcoutRecord.dbd:60` `field(PVAL,DBF_DOUBLE)`, writable.
+    ///
+    /// The value VAL had at the END of the previous process cycle: C assigns
+    /// `pcalc->pval = pcalc->val` at `sCalcoutRecord.c:397`, after the OOPT
+    /// switch has read it. It is the left operand of every OOPT comparison
+    /// (`:379` On Change, `:382/:385` the two transitions).
+    ///
+    /// It was a private `prev_val` captured at the TOP of `process()`, which is
+    /// the value VAL had at the *start of this cycle* — the same thing only when
+    /// nothing wrote VAL between cycles. A client `caput VAL` (or an OUT link
+    /// into VAL) moved the port's previous-value cell and C's does not, so the
+    /// On-Change/transition decision diverged; and PVAL, which C lets an
+    /// operator write to force or suppress the next output, did not exist.
+    pub pval: f64,
+    /// PSVL — C `sCalcoutRecord.dbd:63` `field(PSVL,DBF_STRING)`,
+    /// `special(SPC_NOMOD)`.
+    ///
+    /// The SVAL value C last posted: `monitor()` posts SVAL when it differs from
+    /// PSVL and then copies it (`sCalcoutRecord.c:842-846`). So it equals SVAL
+    /// after every cycle that reaches `monitor()`, and lags it across an
+    /// ODLY-delayed output, whose scheduling cycle returns before `monitor()`
+    /// (`:407`).
+    ///
+    /// The private `prev_sval` it replaces was a copy of SVAL taken at the top of
+    /// `process()` and read by nothing.
+    psvl: PvString,
     /// CALC_ALARM flag — set when the CALC or OCAL `sCalcPerform`
     /// evaluation fails. synApps `sCalcoutRecord` raises `CALC_ALARM`
     /// on a broken expression; the framework's `evaluate_alarms`
@@ -128,8 +151,8 @@ impl Default for ScalcoutRecord {
             str_inp_links: Default::default(),
             num_vals: [0.0; 12],
             str_vals: Default::default(),
-            prev_val: 0.0,
-            prev_sval: PvString::new(),
+            pval: 0.0,
+            psvl: PvString::new(),
             calc_alarm: false,
             fetch_gate_failed: false,
             cached_should_output: false,
@@ -187,13 +210,23 @@ impl ScalcoutRecord {
     fn should_output(&self) -> bool {
         match self.oopt {
             0 => true,
-            1 => (self.prev_val - self.val).abs() > self.mdel,
+            1 => (self.pval - self.val).abs() > self.mdel,
             2 => self.val == 0.0,
             3 => self.val != 0.0,
-            4 => self.prev_val != 0.0 && self.val == 0.0,
-            5 => self.prev_val == 0.0 && self.val != 0.0,
+            4 => self.pval != 0.0 && self.val == 0.0,
+            5 => self.pval == 0.0 && self.val != 0.0,
             _ => true,
         }
+    }
+
+    /// C `monitor()` (`sCalcoutRecord.c:842-846`): SVAL is posted when it
+    /// differs from PSVL, and PSVL then takes its value. The framework owns the
+    /// post (SVAL is change-detected against its last posted value, which is the
+    /// same test); this owns the copy, at the same point — the end of every cycle
+    /// that reaches `monitor()`. The ODLY-scheduling cycle is not one of them: C
+    /// `return(0)`s at `:407`, so PSVL lags SVAL for the length of the delay.
+    fn sync_psvl(&mut self) {
+        self.psvl = self.sval.clone();
     }
 
     /// C `sCalcoutRecord.c::special:463-471` (and the same two lines in
@@ -277,6 +310,19 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
         name: "SVAL",
         dbf_type: DbFieldType::String,
         read_only: false,
+    },
+    // sCalcoutRecord.dbd:60-67 — PVAL is a plain DBF_DOUBLE (an operator may
+    // write it to force or suppress the next OOPT decision); PSVL is
+    // `special(SPC_NOMOD)`, so a put to it is refused.
+    FieldDesc {
+        name: "PVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PSVL",
+        dbf_type: DbFieldType::String,
+        read_only: true,
     },
     FieldDesc {
         name: "CALC",
@@ -680,6 +726,23 @@ impl Record for ScalcoutRecord {
         &["CLCV", "OCLV"]
     }
 
+    /// Every `db_post_events` C's scalcout makes from a process cycle:
+    /// `VAL` (`sCalcoutRecord.c:840`), `SVAL` (`:843`), `OSV` (`:848`),
+    /// `A`..`L` (`:856`), `AA`..`LL` (`:862`), `OVAL` (`:867`) — all of
+    /// `monitor()` — and `DLYA` (`:402`, `:426`).
+    ///
+    /// PVAL and PSVL are the reason this list exists: C's `monitor()` posts
+    /// NEITHER (they are the cells it compares against), so exposing them as
+    /// fields must not hand a subscriber events C does not send. Declaring C's
+    /// set — rather than blacklisting the two — keeps that true for any field
+    /// added later.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "VAL", "SVAL", "OVAL", "OSV", "DLYA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+            "K", "L", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
+        ])
+    }
+
     // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
     // for string output side, but OUT writeback only reads OVAL).
     //
@@ -707,11 +770,9 @@ impl Record for ScalcoutRecord {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
+            self.sync_psvl();
             return Ok(ProcessOutcome::complete());
         }
-
-        self.prev_val = self.val;
-        self.prev_sval = self.sval.clone();
 
         // Evaluate CALC. A fresh cycle clears CALC_ALARM; a broken CALC
         // (compile failure OR an sCalcPerform eval failure) re-raises
@@ -738,8 +799,9 @@ impl Record for ScalcoutRecord {
             false
         } else {
             // C `sCalcoutRecord.c:357-359` — presult = &pcalc->val,
-            // psresult = pcalc->sval: VAL/SVAL both read this cycle's
-            // pre-evaluation values (captured in prev_val/prev_sval above).
+            // psresult = pcalc->sval: the VAL/SVAL tokens read this cycle's
+            // pre-evaluation VAL/SVAL, i.e. the cells the results are about to
+            // overwrite. (PVAL/PSVL are a different pair — see their docs.)
             let mut inputs = self.build_inputs(self.val, &self.sval);
             match scalc_eval(&self.compiled_calc, &mut inputs) {
                 Ok(result) => {
@@ -787,6 +849,12 @@ impl Record for ScalcoutRecord {
         // non-Don't_drive path, so OVAL/OUT behaviour is unchanged there.
         let oopt_fires = self.should_output();
         let write_out = oopt_fires && !ivoa_veto_out;
+        // C `sCalcoutRecord.c:397` — `pcalc->pval = pcalc->val`, immediately
+        // after the OOPT switch read it and before `execOutput`. The advance is
+        // unconditional: it happens on a cycle that drives no output, and it
+        // happens on the ODLY-scheduling cycle, which returns at `:407` before
+        // `monitor()`.
+        self.pval = self.val;
         // C `execOutput` (sCalcoutRecord.c:760-777) computes OVAL/OSV via the
         // DOPT switch on EVERY output cycle, *before* the IVOA decision (the
         // Don't_drive `break` is at :795). So OVAL is recomputed even when the
@@ -859,6 +927,7 @@ impl Record for ScalcoutRecord {
         }
 
         self.cached_should_output = write_out;
+        self.sync_psvl();
         Ok(ProcessOutcome::complete())
     }
 
@@ -866,6 +935,8 @@ impl Record for ScalcoutRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SVAL" => Some(EpicsValue::String(self.sval.clone())),
+            "PVAL" => Some(EpicsValue::Double(self.pval)),
+            "PSVL" => Some(EpicsValue::String(self.psvl.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
             "OCLV" => Some(EpicsValue::Long(self.oclv)),
@@ -918,6 +989,15 @@ impl Record for ScalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SVAL".into())),
             },
+            // PVAL is writable in C (no SPC_NOMOD): writing it aims the next
+            // OOPT comparison. PSVL is SPC_NOMOD — the framework refuses the put
+            // from `read_only` in the field list, so there is no arm for it.
+            "PVAL" => {
+                self.pval = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("PVAL".into()))?;
+                Ok(())
+            }
             // C `dbPut` stores the string; `special()` compiles it and records
             // the sCalcPostfix() status in CLCV (see `Self::special`).
             "CALC" => match value {
@@ -1173,18 +1253,21 @@ mod tests {
         rec.put_field("OOPT", EpicsValue::Short(1)).unwrap();
         rec.put_field("MDEL", EpicsValue::Double(2.0)).unwrap();
 
+        // The decision a cycle made is `multi_output_links()` — C advances
+        // `pval = val` inside the cycle (`:397`), so re-running the OOPT test
+        // afterwards would only ever compare VAL against itself.
         rec.put_field("A", EpicsValue::Double(1.0)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.val, 1.0);
         assert!(
-            !rec.should_output(),
+            rec.multi_output_links().is_empty(),
             "|pval - val| = 1.0 is inside MDEL=2.0 — C does not drive OUT"
         );
 
         rec.put_field("A", EpicsValue::Double(5.0)).unwrap();
         rec.process().unwrap();
         assert!(
-            rec.should_output(),
+            !rec.multi_output_links().is_empty(),
             "|1.0 - 5.0| = 4.0 exceeds MDEL=2.0 — C drives OUT"
         );
     }
@@ -1212,7 +1295,7 @@ mod tests {
         rec.process().unwrap();
         assert_eq!(rec.sval, "second");
         assert!(
-            !rec.should_output(),
+            rec.multi_output_links().is_empty(),
             "SVAL changed but VAL did not — C's On-Change test is numeric only"
         );
     }

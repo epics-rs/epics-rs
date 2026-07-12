@@ -454,8 +454,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         )
                     })?
                 }
+                // FWHM takes the BUFFER and `lastEl`, not a window slice: C seeds it
+                // from `a[firstEl]` even when the window is EMPTY (an in-bounds read),
+                // and its no-crossing fallback is `lastEl` itself — so an empty window
+                // answers -1, which a slice could not express.
                 ArrayOp::Fwhm => unary_op(&mut stack, |v| {
-                    unary(v, |c| Double(stats::fwhm(c.window())), ZERO)
+                    unary(v, |c| Double(stats::fwhm(c.buf(), c.last_el())), ZERO)
                 })?,
                 ArrayOp::ArraySum => {
                     // C `:991-997` seeds `d = 0.0`, unlike AVERAGE — so an empty

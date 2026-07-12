@@ -16,57 +16,74 @@ pub fn std_dev(data: &[f64]) -> f64 {
     variance.sqrt()
 }
 
-/// Compute the full width at half maximum (FWHM) of a data array.
-/// Assumes data represents a peak profile. Returns 0.0 if no valid FWHM found.
-pub fn fwhm(data: &[f64]) -> f64 {
-    if data.len() < 3 {
+/// C's FWHM (`aCalcPerform.c:928-967`) — the distance between the two half-maximum
+/// crossings, in fractional element indices.
+///
+/// `buf` is the whole `arraySize` buffer and `last_el` is C's `lastEl`, because the
+/// operator does not confine itself to the window: it seeds from `a[firstEl]` (an
+/// in-bounds read even when the window is EMPTY, and firstEl is always 0) and then
+/// answers `lastEl - 0` if it finds no crossing at all. An empty window therefore has
+/// `lastEl == -1` and C answers **-1**, which a window-slice signature could not
+/// express.
+///
+/// Three things the port had wrong, all of them at the boundaries the operator is
+/// made of:
+///
+/// * **the crossing test is STRICT**, `a[i] < half` (`:946`, `:956`). A sample sitting
+///   exactly AT half-max is not a crossing, so the walk steps over a half-max plateau
+///   instead of stopping on it. Compiled C, AA=[0,2,4,2,2,0] (half = 2): FWHM is 3,
+///   where a `<=` test answers 2. The strictness also makes the interpolation safe by
+///   construction: the loop breaks at the first element BELOW half-max, so its
+///   neighbour towards the peak is at or above half-max and the denominator cannot be
+///   zero — the `span == 0` guard the port needed was an artefact of `<=`.
+/// * **no forward crossing means `lastEl`, not "zero width"** (`:953`) — a monotonic
+///   ramp has its peak at the last element and no descent, so C measures from the
+///   backward crossing to the END of the window. Compiled C, AA=[0,1,2,3,4]: 2.
+/// * **no backward crossing means 0** (`:964`) — likewise a descending ramp measures
+///   from the START. Compiled C, AA=[4,3,2,1,0]: 2.
+///
+/// Both fallbacks together are what a FLAT array gets: nothing is strictly below
+/// half-max, so the answer is `lastEl - 0`. Compiled C, AA=[3,3,3,3,3]: 4 — where the
+/// port's `max == min` early return answered 0.
+pub fn fwhm(buf: &[f64], last_el: i64) -> f64 {
+    let Some(&seed) = buf.first() else {
         return 0.0;
-    }
+    };
+    let last = last_el.clamp(-1, buf.len() as i64 - 1);
 
-    // Find the maximum value and its index
-    let mut max_val = data[0];
-    let mut max_idx = 0;
-    for (i, &v) in data.iter().enumerate() {
-        if v > max_val {
-            max_val = v;
-            max_idx = i;
+    // C `:931-941`: max (d), min (e) and the index of the max (j), all seeded from
+    // a[firstEl] and advanced only on a STRICT comparison, so ties keep the FIRST
+    // maximum.
+    let (mut max, mut min, mut peak) = (seed, seed, 0i64);
+    for i in 1..=last {
+        let v = buf[i as usize];
+        if v > max {
+            max = v;
+            peak = i;
+        }
+        if v < min {
+            min = v;
         }
     }
+    // C `:943` — `min + (max-min)/2`, not `(max+min)/2`.
+    let half = min + (max - min) / 2.0;
 
-    let min_val = data.iter().cloned().fold(f64::INFINITY, f64::min);
-    if (max_val - min_val).abs() < f64::EPSILON {
-        return 0.0;
-    }
-    let half_max = (max_val + min_val) / 2.0;
-
-    // Find left half-max crossing
-    let mut left = max_idx as f64;
-    for i in (0..max_idx).rev() {
-        if data[i] <= half_max {
-            // Linear interpolation; guard against a flat segment
-            // (data[i+1] == data[i]) that would divide by zero.
-            let span = data[i + 1] - data[i];
-            let frac = if span == 0.0 {
-                0.0
-            } else {
-                (half_max - data[i]) / span
-            };
-            left = i as f64 + frac;
+    // Forward from the peak (`:945-953`).
+    let mut right = last as f64;
+    for i in peak + 1..=last {
+        let (i, prev) = (i as usize, (i - 1) as usize);
+        if buf[i] < half {
+            right = prev as f64 + (half - buf[prev]) / (buf[i] - buf[prev]);
             break;
         }
     }
 
-    // Find right half-max crossing
-    let mut right = max_idx as f64;
-    for i in (max_idx + 1)..data.len() {
-        if data[i] <= half_max {
-            let span = data[i - 1] - data[i];
-            let frac = if span == 0.0 {
-                0.0
-            } else {
-                (half_max - data[i]) / span
-            };
-            right = i as f64 - frac;
+    // Backward from the peak (`:955-964`).
+    let mut left = 0.0;
+    for i in (0..peak).rev() {
+        let (i, next) = (i as usize, (i + 1) as usize);
+        if buf[i] < half {
+            left = i as f64 + (half - buf[i]) / (buf[next] - buf[i]);
             break;
         }
     }
@@ -172,7 +189,7 @@ mod tests {
                 (-0.5 * ((x - center) / sigma).powi(2)).exp()
             })
             .collect();
-        let result = fwhm(&data);
+        let result = fwhm(&data, n as i64 - 1);
         // FWHM of Gaussian = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.3548 * sigma
         let expected = 2.3548 * sigma;
         assert!(
@@ -183,10 +200,18 @@ mod tests {
         );
     }
 
+    /// The short-buffer boundaries. C has no minimum length: it seeds from `a[0]` and
+    /// runs the two walks, so a two-element array is a legitimate half-crossing.
+    /// Compiled C: AA=[1] -> 0, AA=[1,2] -> 0.5, empty window -> -1.
     #[test]
-    fn test_fwhm_empty() {
-        assert_eq!(fwhm(&[]), 0.0);
-        assert_eq!(fwhm(&[1.0]), 0.0);
-        assert_eq!(fwhm(&[1.0, 2.0]), 0.0);
+    fn test_fwhm_short_buffers() {
+        assert_eq!(fwhm(&[], -1), 0.0);
+        assert_eq!(fwhm(&[1.0], 0), 0.0);
+        assert_eq!(fwhm(&[1.0, 2.0], 1), 0.5);
+        assert_eq!(
+            fwhm(&[0.0, 1.0, 4.0], -1),
+            -1.0,
+            "an empty window is lastEl"
+        );
     }
 }

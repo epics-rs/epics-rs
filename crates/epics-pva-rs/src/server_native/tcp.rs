@@ -1314,42 +1314,60 @@ struct MonitorPipelineCredit<'a> {
 }
 
 impl MonitorPipelineCredit<'_> {
-    /// Block until the pipeline window has a free slot, then consume one
-    /// credit for the DATA frame about to be sent and fire the LOW
+    /// True iff a DATA frame may be sent right now — the window holds a
+    /// credit, or this is a non-pipeline monitor (no window at all).
+    ///
+    /// This is pvxs `maybeReply`'s `(!op->pipeline || op->window)`
+    /// (`servermon.cpp:79-83`, echoed in `doReply` at `:143`): an exhausted
+    /// window suppresses the REPLY, and nothing else. It must NOT be awaited
+    /// inside the event loop's select — pvxs keeps calling `doPost`, so a
+    /// stalled pipelined client goes on squashing into the negotiated queue.
+    /// Awaiting here instead stopped polling the source, buffering
+    /// `channel_capacity + limit` distinct updates and delivering them all on
+    /// resume.
+    fn available(&self) -> bool {
+        let Some(w) = self.window else {
+            return true;
+        };
+        w.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Register for the next ACK refill, BEFORE the caller reads the window.
+    ///
+    /// Ordering is load-bearing: the ACK path increments the window and then
+    /// calls `Notify::notify_waiters()`, which stores NO permit. A waiter
+    /// registered after the window read would miss a refill that landed in
+    /// between and park forever with credit in hand. `enable()` registers
+    /// eagerly (`Notified` does not register until first polled), so arming
+    /// first and reading the window second cannot lose the wake-up in either
+    /// interleaving.
+    ///
+    /// `None` for a non-pipeline monitor — it is never credit-blocked, so it
+    /// never waits on this.
+    fn arm_refill(&self) -> Option<std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>> {
+        let n = self.window_notify?;
+        let mut notified = Box::pin(n.notified());
+        notified.as_mut().enable();
+        Some(notified)
+    }
+
+    /// Consume one credit for the DATA frame about to be sent and fire the LOW
     /// watermark on the above→below crossing. A no-op for a non-pipeline
     /// monitor (`window` is `None`).
     ///
-    /// Must be called exactly once per monitor DATA frame, AFTER the
-    /// pause / filter gates (a held or filtered event produces no wire
-    /// frame, so it must not consume a slot).
-    async fn acquire(&self) {
+    /// Must be called exactly once per monitor DATA frame, AFTER the pause /
+    /// filter gates (a held or filtered event produces no wire frame, so it
+    /// must not consume a slot) and only under [`Self::available`] — this is
+    /// the ONLY site that decrements the window (the ACK path only adds), so
+    /// the credit checked in the emit gate is still there.
+    fn take(&self) {
         use std::sync::atomic::Ordering;
-        let (Some(w), Some(n)) = (self.window, self.window_notify) else {
+        let Some(w) = self.window else {
             return;
         };
-        loop {
-            let cur = w.load(Ordering::Relaxed);
-            if cur > 0 {
-                if w.compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-                continue;
-            }
-            // Window exhausted — wait for an ACK to refill. `enable()`
-            // registers the waiter eagerly so an ACK firing between the
-            // recheck and the await is captured (`Notify::notified()`
-            // does not register until first polled). Same pattern as
-            // `channel.rs::wait_until_inactive`.
-            let notified = n.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if w.load(Ordering::Relaxed) > 0 {
-                continue;
-            }
-            notified.await;
-        }
+        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(1))
+        });
         // LOW fires when consuming this credit drained the
         // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND
@@ -1372,6 +1390,20 @@ impl MonitorPipelineCredit<'_> {
                 );
             }
         }
+    }
+}
+
+/// Await a pipeline-credit refill. Only ever polled from the emit loop's
+/// credit arm, which runs solely when the window is exhausted — and an
+/// exhausted window implies a pipeline monitor, so `refill` is `Some` there.
+/// A non-pipeline monitor is never credit-blocked; `pending()` makes that arm
+/// inert for it rather than spinning the loop.
+async fn wait_credit_refill(
+    refill: Option<std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>>>,
+) {
+    match refill {
+        Some(n) => n.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1592,6 +1624,107 @@ fn push_squash_monitor<T>(
             .expect("len >= limit >= 1 guarantees a tail to squash into");
         pending.push_back(coalesce(tail, ev));
         true
+    }
+}
+
+/// The decoded monitor's bounded FIFO and the SINGLE owner of the enqueue
+/// transition — pvxs `ServerMonitorControl::doPost` (`servermon.cpp:239-289`).
+///
+/// Invariant: **an update reaches the queue only if it would produce a
+/// non-empty wire changed-bitset** (or it is the first post, or a terminal).
+/// pvxs decides that BEFORE touching the queue:
+///
+/// ```text
+/// bool real = mon->first;                       // always post the first update
+/// if(real) mon->first = false;
+/// else     real = testmask(val, mon->pvMask);   // else consider the mask
+/// if(real || !val) { ...queue or squash...; maybeReply(); }
+/// ```
+///
+/// A masked-out update is DROPPED, never queued: it neither occupies a slot
+/// in the negotiated FIFO nor coalesces a real update out of the tail. The
+/// port used to push every arrival straight into the FIFO, so an update whose
+/// marked leaves lay entirely outside the client's pvRequest mask both framed
+/// an empty-bitset frame and evicted a real update under back-pressure — the
+/// squash CONTENTS differed, not just the frame count.
+///
+/// [`Self::seed`] carries pvxs's `first`: the connect-time seed IS the first
+/// post, so it is exempt from the mask test (and clears `first`). A source
+/// with no seed leaves `first` set, so ITS first stream event is the exempt
+/// one — exactly `MonitorOp::first` ("set until first update queued").
+struct MonitorQueue<'a> {
+    pending: std::collections::VecDeque<crate::server_native::MonitorUpdate>,
+    /// The ONE negotiated squash limit (`MonitorOp::limit`).
+    limit: usize,
+    /// pvxs `MonitorOp::first` — set until the first update is queued.
+    first: bool,
+    intro: &'a FieldDesc,
+    /// The op's pvRequest selection mask (`MonitorOp::pvMask`).
+    mask: &'a BitSet,
+}
+
+impl<'a> MonitorQueue<'a> {
+    fn new(limit: usize, intro: &'a FieldDesc, mask: &'a BitSet) -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            limit: limit.max(1),
+            first: true,
+            intro,
+            mask,
+        }
+    }
+
+    /// Queue the connect-time seed as pvxs's first post: exempt from the mask
+    /// test, and it clears `first` so every later arrival is tested.
+    fn seed(&mut self, initial: PvField) {
+        self.first = false;
+        self.pending.push_back(crate::server_native::MonitorUpdate {
+            value: initial,
+            marked: None,
+            type_changed: false,
+            overrun: Vec::new(),
+        });
+    }
+
+    /// pvxs `doPost`. Returns whether the update was queued (`false` = dropped
+    /// by the mask test, i.e. `real == false`).
+    fn push(&mut self, ev: crate::server_native::MonitorUpdate) -> bool {
+        if !self.real(&ev) {
+            return false;
+        }
+        self.first = false;
+        push_squash_monitor(&mut self.pending, ev, self.limit, coalesce_monitor_update);
+        true
+    }
+
+    /// pvxs's `real || !val`: the first post and a terminal (pvxs's null Value
+    /// — here the `type_changed` boundary, which MUST survive to become the
+    /// MONITOR FINISH) always queue; anything else must pass `testmask`
+    /// (`pvrequest.cpp:73-92`) — at least one marked bit inside `pvMask`.
+    ///
+    /// A source that marks nothing explicitly (`marked: None`) posts a value
+    /// the port treats as wholly changed, which is what pvxs's fully-marked
+    /// `Value` is: `testmask` finds a marked bit in any non-empty `pvMask`, so
+    /// it always passes. `request2mask` cannot produce an empty mask (it
+    /// throws instead), so there is no case where such a post is dropped.
+    fn real(&self, ev: &crate::server_native::MonitorUpdate) -> bool {
+        if self.first || ev.type_changed {
+            return true;
+        }
+        let Some(paths) = ev.marked.as_ref() else {
+            return true;
+        };
+        crate::pvdata::encode::marked_changed_bitset(self.intro, paths)
+            .iter()
+            .any(|bit| self.mask.get(bit))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn pop(&mut self) -> Option<crate::server_native::MonitorUpdate> {
+        self.pending.pop_front()
     }
 }
 
@@ -1986,24 +2119,19 @@ fn spawn_monitor_subscriber(
         let emits_partial = src.monitor_emits_partial(&pv_name).await;
         let mut prev_value: Option<PvField> = None;
 
-        // Bounded FIFO: the connect-time seed is `pending[0]` (the
-        // consumer emits it first at START, ahead of the accrued backlog) rather
-        // than an unconditional pre-loop send. The seed is pushed RAW — the
-        // consumer runs the `_filter` chain on every pending item (so the seed
-        // is filtered exactly once, like epics-base `dbChannelRunPreChain`; a
-        // gating filter that drops it suppresses the initial frame, a transform
-        // mismatch tears the monitor down with an error). `prev_value` is NOT
-        // set here — the seed must emit FULL (the consumer sets `prev_value`
-        // after emitting, so event #2 onward is partial).
-        let mut pending: std::collections::VecDeque<crate::server_native::MonitorUpdate> =
-            std::collections::VecDeque::new();
+        // Bounded FIFO, owned by [`MonitorQueue`] (pvxs `doPost`): the
+        // connect-time seed is `pending[0]` (the consumer emits it first at
+        // START, ahead of the accrued backlog) rather than an unconditional
+        // pre-loop send. The seed is pushed RAW — the consumer runs the
+        // `_filter` chain on every pending item (so the seed is filtered
+        // exactly once, like epics-base `dbChannelRunPreChain`; a gating filter
+        // that drops it suppresses the initial frame, a transform mismatch
+        // tears the monitor down with an error). `prev_value` is NOT set here —
+        // the seed must emit FULL (the consumer sets `prev_value` after
+        // emitting, so event #2 onward is partial).
+        let mut pending = MonitorQueue::new(queue_limit, &intro_clone, &mask_clone);
         if let Some(initial) = seed_initial {
-            pending.push_back(crate::server_native::MonitorUpdate {
-                value: initial,
-                marked: None,
-                type_changed: false,
-                overrun: Vec::new(),
-            });
+            pending.seed(initial);
         }
 
         let mut source_open = true;
@@ -2021,22 +2149,37 @@ fn spawn_monitor_subscriber(
             if !source_open && executing && pending.is_empty() {
                 break;
             }
+            // Arm the credit-refill waiter BEFORE reading the window (see
+            // `arm_refill`: the ACK's `notify_waiters()` leaves no permit, so
+            // registering after the read could lose the wake-up).
+            let refill = credit.arm_refill();
+            // pvxs `maybeReply`/`doReply`: an exhausted pipeline window
+            // suppresses the REPLY only (`servermon.cpp:79-83,143`). It must
+            // not suppress the DRAIN — `doPost` keeps squashing into the
+            // negotiated queue while the client owes ACKs. So this is an emit
+            // GATE, not an await inside the arm: `rx.recv()` stays polled and
+            // a stalled pipelined client coalesces at `limit` instead of
+            // making the port buffer `channel_capacity + limit` distinct
+            // updates and deliver them all on resume.
+            let has_credit = credit.available();
             tokio::select! {
                 biased;
                 r = rx.recv(), if source_open => {
                     match r {
                         Some(ev) => {
-                            push_squash_monitor(&mut pending, ev, queue_limit, coalesce_monitor_update);
+                            pending.push(ev);
                             while let Ok(e) = rx.try_recv() {
-                                push_squash_monitor(&mut pending, e, queue_limit, coalesce_monitor_update);
+                                pending.push(e);
                             }
                         }
                         None => source_open = false,
                     }
                 }
                 _ = exec_rx.changed() => {}
-                _ = std::future::ready(()), if executing && !pending.is_empty() => {
-                    let mut value = pending.pop_front().expect("guarded non-empty");
+                // Re-evaluate the gate when an ACK refills the window.
+                _ = wait_credit_refill(refill), if !has_credit => {}
+                _ = std::future::ready(()), if executing && has_credit && !pending.is_empty() => {
+                    let mut value = pending.pop().expect("guarded non-empty");
                     // Subscription boundary (upstream descriptor change): emit
                     // MONITOR FINISH and end — the decoded counterpart of the raw
                     // path's `type_changed` branch.
@@ -2093,12 +2236,12 @@ fn spawn_monitor_subscriber(
                         }
                     };
                     // Pipeline window: consume one credit AFTER the pause/filter
-                    // gates (pvxs `servermon.cpp:192`). No-op for a non-pipeline
-                    // monitor. For a pipeline monitor with no credit this awaits;
-                    // the source then backpressures at the `updates` channel
-                    // (sized >= queue_limit) instead of squashing — a documented
-                    // pipeline-starvation residual orthogonal to the accrual FIFO.
-                    credit.acquire().await;
+                    // gates (pvxs `servermon.cpp:192`) — a held or filtered event
+                    // produces no wire frame, so it must not consume a slot. The
+                    // credit was checked by the arm's `has_credit` gate and this
+                    // is the only decrementer, so it is still there. No-op for a
+                    // non-pipeline monitor.
+                    credit.take();
                     let payload = if let Some(paths) = marked.as_ref() {
                         build_monitor_payload_marked(
                             ioid, &intro_clone, &value, paths, &mask_clone, order_now(),
@@ -6117,10 +6260,7 @@ async fn handle_op(
         // connection-fatal `Decode` error (the read loop closes the
         // circuit) instead of a per-op Status that left a malformed-INIT
         // peer free to keep reusing the connection. The EMPTY-MASK case
-        // below is different — pvxs builds the mask inside the source's
-        // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
-        // signalled as a remote *op* error (`serverget.cpp:407-413`),
-        // so that stays an op-level Status reply.
+        // below is different — see the `request_to_mask` arm.
         //
         // The VALUE body is read per pvxs `from_wire_full`. The Rust client's
         // default selectors (and RPC INIT) send a descriptor whose
@@ -6159,11 +6299,42 @@ async fn handle_op(
                 Err(e) => {
                     // The only variant today is `EmptyMask`: pvRequest
                     // selected no field that exists in the value
-                    // descriptor (e.g. `field(noSuch)`). pvxs treats
-                    // this as an INIT-level error
-                    // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
-                    // fell back to all-fields, leaking fields the client
-                    // didn't request.
+                    // descriptor (e.g. `field(noSuch)`). pvxs raises it
+                    // as `throw std::runtime_error("pvRequest must select
+                    // at least one field")` (`pvrequest.cpp:61-62`), from
+                    // inside `request2mask()` — which runs in
+                    // `Server{GPR,Monitor}Setup::connect()`
+                    // (`serverget.cpp:200`, `servermon.cpp:402`), i.e.
+                    // inside the *source's* connect callback, never in the
+                    // protocol handler. Who catches it is therefore the
+                    // source's choice, and pvxs's own hosting API catches
+                    // it on both legs:
+                    //   GET/PUT — `serverget.cpp:406-412` wraps
+                    //     `chan->onOp(...)` in try/catch and signals a
+                    //     remote *op* error.
+                    //   MONITOR — `servermon.cpp:591-592` calls
+                    //     `chan->onSubscribe(...)` UNGUARDED, but the only
+                    //     library source, `SharedPV::Impl::connectSub`
+                    //     (`sharedpv.cpp:76,94-101`), catches around
+                    //     `conn->connect()` and calls `conn->error(msg)`
+                    //     ("not re-throwing for consistency") — an op-level
+                    //     Status reply with the circuit left up. pvxs's own
+                    //     regression for this throw (`test/testget.cpp:
+                    //     380-393`, SharedPV mailbox, `.field("invalid")`)
+                    //     asserts exactly that remote error.
+                    // So an op-level Status is the parity behaviour and this
+                    // is deliberately NOT a fatal `PvaError`. The circuit
+                    // reset one can observe against a C QSRV IOC comes from
+                    // QSRV's sources alone (`ioc/singlesource.cpp:147`,
+                    // `ioc/groupsource.cpp:399` call `connect()` bare, so the
+                    // throw unwinds through `servermon.cpp:592` into
+                    // `conn.cpp:277-282`'s `bev.reset()`): one client's typo'd
+                    // pvRequest drops the shared TCP circuit carrying every
+                    // other channel on it. That is an upstream C++ defect, not
+                    // a contract to port.
+                    //
+                    // Pre-fix Rust silently fell back to all-fields, leaking
+                    // fields the client didn't request.
                     send_chan_op_error(
                         &chan_tx,
                         kind,
@@ -7752,10 +7923,17 @@ fn build_monitor_payload(
 /// marked set is reconstructed by structurally diffing consecutive
 /// snapshots ([`crate::pvdata::encode::diff_changed_bitset`]).
 ///
-/// When the diff is empty (no leaf changed but the source still
-/// posted — e.g. an alarm-only re-post that decoded identically) the
-/// frame still carries an empty changed-bitset and no value bytes,
-/// matching pvxs posting an unmarked Value.
+/// When the diff is empty (no leaf changed but the source still posted —
+/// e.g. an alarm-only re-post that decoded identically) the frame carries
+/// an empty changed-bitset and no value bytes. That is NOT what pvxs does
+/// and must not be read as parity: pvxs marks the source's leaves
+/// *assigned-not-changed*, so `testmask` passes and the frame carries those
+/// leaves. Only a source that hands up an explicit marked set
+/// ([`build_monitor_payload_marked`]) reproduces pvxs here — such a set is
+/// mask-tested at enqueue by [`MonitorQueue::real`], so an all-masked-out
+/// update never reaches a frame builder at all. This diff path is the
+/// port's own narrowing for sources that mark nothing, and it stays
+/// deliberately narrower than pvxs.
 fn build_monitor_payload_partial(
     ioid: u32,
     intro: &FieldDesc,
@@ -8726,6 +8904,121 @@ mod tests {
         );
         assert!(m.type_changed, "boundary survives the squash");
         assert!(m.overrun.is_empty(), "boundary carries no overrun");
+    }
+
+    /// R12-32 — the `testmask` gate. pvxs `doPost` decides `real` BEFORE
+    /// touching the queue (`servermon.cpp:252-268`): the first post always
+    /// goes through, every later one must have a marked leaf inside `pvMask`
+    /// (`testmask`, `pvrequest.cpp:73-92`), and a masked-out post is dropped
+    /// — it does NOT occupy a FIFO slot and so cannot coalesce a real update
+    /// out of the tail.
+    ///
+    /// Tested by invariant boundary: first-post exemption, marked-inside-mask,
+    /// marked-outside-mask, the unmarked (`marked: None`) post that pvxs sees
+    /// as fully marked, the terminal boundary, and the squash-contents case
+    /// where the drop is what keeps a real update alive.
+    #[test]
+    fn monitor_queue_drops_updates_outside_the_request_mask() {
+        // { value, alarm { severity } } — bits: 0 root, 1 value, 2 alarm,
+        // 3 alarm.severity.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    },
+                ),
+            ],
+        };
+        // The client asked for `field(value)` only.
+        let mut mask = BitSet::new();
+        mask.set(1);
+
+        let upd = |tag: i32, marked: &[&str]| crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(tag)),
+            marked: Some(marked.iter().map(|s| s.to_string()).collect()),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let tags = |q: &MonitorQueue| {
+            q.pending
+                .iter()
+                .map(|u| u.value.clone())
+                .collect::<Vec<PvField>>()
+        };
+        let tag = |t: i32| PvField::Scalar(ScalarValue::Int(t));
+
+        // No seed: `first` is still set, so the FIRST post is exempt from the
+        // mask test even though `alarm.severity` lies outside `field(value)`.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        assert!(
+            q.push(upd(1, &["alarm.severity"])),
+            "the first post is always queued (MonitorOp::first)"
+        );
+        // ...and every later masked-out post is dropped.
+        assert!(
+            !q.push(upd(2, &["alarm.severity"])),
+            "a post whose marked leaves lie outside pvMask must be dropped"
+        );
+        assert!(
+            q.push(upd(3, &["value"])),
+            "a post marking a selected leaf is queued"
+        );
+        assert_eq!(
+            tags(&q),
+            vec![tag(1), tag(3)],
+            "the masked-out post never entered the FIFO"
+        );
+
+        // A seeded op consumes the `first` exemption, so its very first stream
+        // event is already mask-tested.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0));
+        assert!(
+            !q.push(upd(1, &["alarm.severity"])),
+            "the seed IS pvxs's first post; the next event is mask-tested"
+        );
+        assert_eq!(tags(&q), vec![tag(0)], "only the seed is queued");
+
+        // A source that marks nothing posts a wholly-changed value — pvxs's
+        // fully-marked Value, which `testmask` always passes.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0));
+        assert!(
+            q.push(crate::server_native::MonitorUpdate {
+                value: tag(1),
+                marked: None,
+                type_changed: false,
+                overrun: Vec::new(),
+            }),
+            "an unmarked post is fully marked to pvxs and always passes testmask"
+        );
+
+        // The terminal boundary is pvxs's null Value (`if(real || !val)`): it
+        // must queue regardless of the mask, or the MONITOR FINISH is lost.
+        let mut q = MonitorQueue::new(4, &intro, &mask);
+        q.seed(tag(0));
+        assert!(
+            q.push(crate::server_native::MonitorUpdate::type_change()),
+            "a descriptor boundary always queues"
+        );
+
+        // Squash CONTENTS: with limit 2 and the FIFO already full, a
+        // masked-out post must not coalesce the real tail. Pre-fix it took a
+        // slot and overwrote `value=3` with `value=4`.
+        let mut q = MonitorQueue::new(2, &intro, &mask);
+        q.seed(tag(0));
+        q.push(upd(3, &["value"]));
+        assert!(!q.push(upd(4, &["alarm.severity"])), "masked out → dropped");
+        assert_eq!(
+            tags(&q),
+            vec![tag(0), tag(3)],
+            "a masked-out post must not squash a real update out of the tail"
+        );
     }
 
     /// Boundary test for the bounded server-side monitor FIFO
@@ -10642,10 +10935,10 @@ mod tests {
         }
     }
 
-    /// Owner path: `MonitorPipelineCredit::acquire` consumes exactly one
-    /// window slot per call.
+    /// Owner path: `MonitorPipelineCredit::take` consumes exactly one window
+    /// slot per call, and `available()` reports the gate the emit arm reads.
     #[tokio::test]
-    async fn monitor_pipeline_credit_acquire_decrements_window() {
+    async fn monitor_pipeline_credit_take_decrements_window() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(2));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -10662,16 +10955,31 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        credit.acquire().await;
+        assert!(credit.available());
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 1);
-        credit.acquire().await;
+        assert!(credit.available());
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 0);
+        assert!(
+            !credit.available(),
+            "an exhausted window closes the emit gate"
+        );
     }
 
-    /// Owner path: at zero credit `acquire` blocks, and proceeds once the
-    /// window is refilled (the ACK dispatch does `fetch_add` + notify).
+    /// R12-33 — an exhausted window must SUPPRESS THE REPLY, not the drain.
+    /// pvxs `maybeReply` simply does not fire while `window == 0`
+    /// (`servermon.cpp:79-83`) and `doPost` goes on squashing into the
+    /// negotiated queue. So the credit primitive must be a non-blocking gate
+    /// (`available`) plus a wake-up (`arm_refill`) that the event loop can
+    /// select over alongside `rx.recv()` — never an await that parks the loop
+    /// and stops draining the source.
+    ///
+    /// Also pins the arm-before-read ordering: the ACK path adds credit and
+    /// calls `notify_waiters()`, which stores no permit, so a waiter armed
+    /// AFTER the window read would miss the refill and park forever.
     #[tokio::test]
-    async fn monitor_pipeline_credit_acquire_blocks_until_refill() {
+    async fn monitor_pipeline_credit_refill_wakes_the_armed_waiter() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(0));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -10688,27 +10996,36 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        // Exhausted window: acquire must not complete.
+
+        // Exhausted: the gate is shut and the refill waiter parks.
+        let refill = credit.arm_refill();
+        assert!(!credit.available(), "no credit → the emit gate is shut");
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), credit.acquire())
+            tokio::time::timeout(Duration::from_millis(50), wait_credit_refill(refill))
                 .await
                 .is_err(),
-            "acquire must block while the window is empty"
+            "with no ACK the refill waiter must park"
         );
-        // Refill (as the ACK dispatch does) and re-acquire.
+
+        // Arm, THEN let the ACK land: `notify_waiters()` leaves no permit, so
+        // only an already-registered waiter is woken. This is the ordering the
+        // emit loop relies on.
+        let refill = credit.arm_refill();
         window.fetch_add(1, Ordering::Relaxed);
         notify.notify_waiters();
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), credit.acquire())
+            tokio::time::timeout(Duration::from_millis(500), wait_credit_refill(refill))
                 .await
                 .is_ok(),
-            "acquire must complete once the window is refilled"
+            "an ACK refill must wake the armed waiter"
         );
+        assert!(credit.available(), "the refilled window re-opens the gate");
+        credit.take();
         assert_eq!(window.load(Ordering::Relaxed), 0);
     }
 
-    /// Owner path: a non-pipeline monitor (no window) never blocks and
-    /// touches no counter.
+    /// Owner path: a non-pipeline monitor (no window) is always emit-eligible,
+    /// never waits, and touches no counter.
     #[tokio::test]
     async fn monitor_pipeline_credit_no_window_is_no_op() {
         use std::sync::atomic::AtomicU64;
@@ -10725,9 +11042,15 @@ mod tests {
             pv_name: "dut",
             mon_ctx: &ctx,
         };
-        tokio::time::timeout(Duration::from_millis(50), credit.acquire())
-            .await
-            .expect("non-pipeline acquire must return immediately");
+        assert!(
+            credit.available(),
+            "a non-pipeline monitor is never credit-blocked"
+        );
+        credit.take();
+        assert!(
+            credit.arm_refill().is_none(),
+            "no window → nothing to wait on"
+        );
     }
 
     /// Bypass path (the formerly-uncounted send site): the pipeline

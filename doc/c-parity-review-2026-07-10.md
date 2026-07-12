@@ -2144,6 +2144,244 @@ Severity: Low.
 ### R10-67: swait has no CLCV field and no real alarm-severity plumbing — R9-7 added only the calc_alarm bool it needed
 Severity: Low.
 
+## Round 11 — re-audit (2026-07-12): wave-8 fix verification + adjudications + fresh findings
+
+### Fix verification (wave 8) — fourth consecutive clean wave
+
+- Category A — all 11 commits VERIFIED (R9-4/R9-9 consistency-checked
+  rather than re-derived; no counter-evidence). Main's merge-integration
+  (R9-7 x R9-73 fetch-gate nesting) verified CORRECT in all five
+  calc-family records against each record's C process(), including
+  calcout's OOPT-outside vs acalcout's afterCalc-inside gate scopes and
+  scalcout's VAL=-1/"***ERROR***" failure values. Completeness caveat:
+  R10-1/2/5 are correct formulas over the full buffer — the
+  [firstEl,lastEl] window divergence is exactly R10-6, still open.
+- Category B — all 6 commits VERIFIED, incl. the zeroed-calloc
+  per-type buffers + EPICS-epoch stamp, the !nConn exit rule with the
+  connect_pvs barrier abort, and the readback_line None-only-for-!nConn
+  invariant.
+- Category C — all 5 commits VERIFIED cell-by-cell: the pvdata::convert
+  storage matrix vs every copyOut/copyOutScalar arm, parse_to_u64 vs
+  stoull base-0 (incl. "08" octal reject), convert::kind boundary,
+  check_monitor_request fires before ops.insert and before the INIT
+  reply, QSRV source-scope gate, reject-before-ackAny ordering,
+  level2mtype framing. One completeness observation filed as R11-31
+  (default squash depth).
+- Category D — all 10 commits VERIFIED. R9-53 caveat subsumed by
+  R10-55: C's vxi11/prologix register asynGpib+asynInt32 via
+  pasynGpib->registerPort, so their *IV readbacks differ until the
+  GPIB surface exists. R9-55 edge noted, not filed: C's record user
+  carries timeout=1 until the first asynCallbackProcess; the port uses
+  TMOT immediately (manifests only on operator-set TMOT before first
+  scan). R10-47's fourth C reset site (:817) is folded into the merged
+  process/callback — acceptable.
+- Category E — all 10 commits VERIFIED, and the 8 wave-7 items round 10
+  had sampled-only are now line-verified CORRECT (R9-66/67, R8-71..74,
+  R9-71, R9-69). One residual on R8-72 filed as R11-63.
+
+### Adjudications — 24 CONFIRMED, 3 REFUTED, 1 cleanup, 1 unverifiable
+
+- R10-6..R10-14 CONFIRMED (R10-6 the array-window headline; R10-8
+  strengthened: C FITPOLY is 1-operand returning the fitted curve,
+  FITQ/FITMQ store coefficients back into named P-fields; R10-13
+  sharpened: the CORRECT escape ports raw_from_escaped/
+  escaped_from_raw sit unused beside the divergent tables).
+- R10-15 REFUTED — C's shared `long l` 4-byte-memcpy read is a
+  stale-high-bytes latent bug on LP64; the port's deterministic
+  zero-extend reproduces C's canonical fresh-`l` result. Do not port
+  the UB.
+- R10-17, R10-18 CONFIRMED.
+- R10-33..R10-37 CONFIRMED (R10-33 sharpened: pvxs
+  GroupSource::onSubscribe only WRITES queueSize back to the client;
+  the native _opts value is computed and discarded for singles at
+  pva_adapter.rs:295-296 / dropped at :746).
+- R10-49 CONFIRMED, STRENGTHENED — asynRecord passes QUEUE_TIMEOUT=10.0
+  (asynRecord.c:71), not 0.0, for BOTH process (:342) and special
+  (:571), and special has its own queueTimeoutCallbackSpecial
+  (:929-940). The port_actor.rs:340-341 comment claiming "standard
+  device support passes 0.0, arming no timer" is factually wrong for
+  asynRecord itself; the port has no queue-wait timer at all.
+- R10-50 CONFIRMED as dead code, NOT a parity defect — cleanup item.
+- R10-51 REFUTED as observable — both sides compare option keys
+  case-insensitively (epicsStrCaseCmp / eq_ignore_ascii_case);
+  internal key, never on the wire.
+- R10-52 CONFIRMED (sharpened: .parse() also rejects numeric-with-
+  suffix that C's %d prefix-parses).
+- R10-53 REFUTED as observable — the alias branches are unreachable
+  (C serial getOption emits only Y/N and none/even/odd).
+- R10-54 unverifiable on this host (cfg(windows)) — remains a
+  verification gap, not a known defect.
+- R10-55 CONFIRMED (structural) — no Gpib capability exists; GPIBIV
+  always 0, UCMD/ACMD only ever take the no-interface branch; also
+  pins vxi11/prologix I32IV=0 vs C's 1 (R9-53 caveat).
+- R10-63..R10-67 CONFIRMED (R10-63 precise: the Dn posts are
+  DBE_VALUE-masked but their existence is spurious — C's
+  gate→direction copy posts nothing).
+
+### New findings
+
+### R11-1: scalcout double→string uses Rust shortest round-trip, not cvtDoubleToString(d,s,8)
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/string.rs:1292-1298` (format_double via format!("{}")), also PRINTF %s :898-904 and value.rs:52 into_string_value.
+C reference: `sCalcPerform.c:89-96` to_string → cvtDoubleToString(d, s, 8); cvtFast.c renders 8 fractional digits fixed-point, exp form only for |v|>=1e8.
+Impact: TO_STRING(PI) → C "3.14159265", port "3.141592653589793" — every scalcout string result derived from a double diverges, plus downstream LEN/comparisons.
+
+### R11-2: sCalc engine never truncates intermediate string results to SCALC_STRING_SIZE-1 (39)
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/string.rs:85-89` (Add concat) and every string producer — StackValue::Str is an unbounded String.
+C reference: `sCalcPerform.c:975` strncat bounded by SCALC_STRING_SIZE(40)-1; all intermediates live in char[40].
+Impact: LEN("20 chars"+"30 chars") → C 39, port 50; SUBRANGE offsets, comparisons and REPLACE positions on over-length intermediates diverge. Distinct from the field-write layer (R6-74).
+
+### R11-3: TO_DOUBLE (DBL) strict-parses; C hunts an embedded number
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/string.rs:764-769` — file-local to_double = trim+parse::<f64>().unwrap_or(0.0).
+C reference: `sCalcPerform.c:1505-1514` — strpbrk digits, back over '.'/'-', atof from there.
+Impact: DBL("12abc") → C 12, port 0; internally inconsistent with the port's own StackValue::to_double (strtod), so ("12abc")+0 = 12 but DBL("12abc") = 0 in one engine.
+
+### R11-4: BYTE — unsigned byte and Double-operand handling both wrong
+Severity: Low
+Rust: `crates/epics-base-rs/src/calc/engine/string.rs:547-554` — u8 read; Double → 0.0.
+C reference: `sCalcPerform.c:1528-1533` — signed char (0xFF → -1); no else, a Double passes through unchanged.
+Impact: BYTE("\xff...") → C -1, port 255; BYTE(65) → C 65, port 0.
+
+### R11-5: PRINTF collapses %% when the format has no live conversion
+Severity: Low
+Rust: `crates/epics-base-rs/src/calc/engine/string.rs:855-860` — simple_printf always collapses %%.
+C reference: `sCalcPerform.c:1541-1545` — with no unsuppressed conversion, C strcpy's the RAW format verbatim.
+Impact: PRINTF("done 100%%", x) → C "done 100%%", port "done 100%".
+
+### R11-6: ARR/TO_ARRAY of a NaN scalar fills NaN, bypassing the to_array NaN→0 rule
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:464-467` — vec![v; n] direct, bypassing ArrayStackValue::to_array.
+C reference: `aCalcPerform.c:136-137` — to_array(setValues=1) fills 0 for NaN.
+Impact: ARR(ACOS(2)) → C all-zeros; port all-NaN + spurious CALC_ALARM via a[0].
+
+### R11-7: CAT of two scalars builds a 2-element array; C is a no-op
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:606-618`.
+C reference: `aCalcPerform.c:1411` — two-scalar branch `case CAT: break;` (left scalar unchanged).
+Impact: 4 CAT 5 → C scalar 4; port [4,5] — VAL and AVAL shape both wrong.
+
+### R11-8: DERIV/NDERIV wrong algorithm; NDERIV mis-reads its window argument
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/math/derivative.rs:2-14` — central difference; nderiv = linear LSQ slope with npts as total width.
+C reference: `aCalcPerform.c:985,613,596` + `calcUtil.c:32-55` — deriv = nderiv(...,2,...): sliding QUADRATIC fit (b+2ax); the argument is points PER SIDE (m = 2*npts+1).
+Impact: y=x²: C d[0]=0, port d[0]=1; NDERIV(y,3) → C 7-point window, port 3-point.
+
+### R11-9: acalc array store-backs are discarded and AMASK never recomputed during process
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/records/acalcout.rs:375-388` — eval consumes only the stack top; StoreDoubleVar/StoreVar mutations land in a local ArrayInputs and are dropped; amask never recomputed.
+C reference: `aCalcPerform.c:487,524` — A_ASTORE/STORE_* write the record fields in place and set *amask |= 1<<i; afterCalc posts exactly those.
+Impact: AA:=SUM(BB) leaves AA unchanged and AMASK=0 — array-variable store expressions silently no-op.
+
+### R11-10: SMOOTH/NSMOOTH zero the in-window border elements; C preserves them
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/math/stats.rs:81-100` — result seeded zeros, fills only 2..n-2; n<5 → all-zeros; nsmooth erodes 2k borders.
+C reference: `aCalcPerform.c:971-991/:583-591` — in-place loop firstEl+2..lastEl-2 leaves borders at original values; n<5 unchanged.
+Impact: SMOOTH([1..7]) → C keeps [1,2,...,6,7] borders; port zeroes four positions.
+
+### R11-11: FWHM no-crossing fallback and half-max test differ
+Severity: Low
+Rust: `crates/epics-base-rs/src/calc/math/stats.rs:43-72` — <= half-max test; both crossings init to max_idx → no-crossing side contributes 0.
+C reference: `aCalcPerform.c:945-966` — strict <; fallbacks e=lastEl (forward), d=0 (backward).
+Impact: monotonic ramp: C width ≈ lastEl, port ≈ 0; exact-half-max samples shift the result.
+
+### R11-16: DBF_CHAR values honor the -0x/-0o/-0b base flag; C's val2str renders CHAR as decimal unconditionally
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/cli.rs:430,432` — Char/UChar route through format_int_i64(fmt.int_style); shared by caget (plain, -a) and camonitor.
+C reference: `tool_lib.c:160-161` — case DBR_CHAR is sprintf("%d", ch) always; only DBR_INT/LONG route through sprint_long(outTypeI). caget's -0x forces DBR_LONG only on the terse/specified path; plain/-a/camonitor re-derive native CHAR.
+Impact: caget -0x on a CHAR PV holding 0xFF: C prints -1, port prints 0xFFFFFFFF; same for -0o/-0b, caget -a, camonitor.
+
+### R11-17: caget -d GR/CTRL float limits render with Rust Display instead of C's %g
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/bin/caget-rs.rs:374-380` — lim closure uses format!("{v}") for FLOAT/DOUBLE limits; cli::format_float bypassed.
+C reference: `tool_lib.c:248-254,375,377` — PRN_DBR_GR_PREC prints every graphic/control limit with hardcoded %g (6 sig digits), independent of -e/-f/-g.
+Impact: lower_disp_limit 3.14159265 → C "3.14159", port "3.14159265"; 1e6 → C "1e+06", port "1000000".
+
+### R11-18: caget -d specifiedDbr Value line emits an array element-count prefix C omits
+Severity: Medium
+Rust: `crates/epics-ca-rs/src/bin/caget-rs.rs:474` — format_value's array renderers prepend the count whenever total > 1 regardless of the false req_elems argument.
+C reference: `caget.c:317-335` — the specifiedDbr Value block prints "Element count:" then a bare value loop with NO count prefix (unlike the plain loop :284).
+Impact: caget -d DBR_LONG on a 3-element array: C "Value: v0 v1 v2", port "Value: 3 v0 v1 v2".
+
+### R11-31: native per-op monitor squash depth defaults to 64, not pvxs's op->limit default of 4
+Severity: Medium
+Rust: `crates/epics-pva-rs/src/server_native/runtime.rs:314` (monitor_queue_depth: 64) consumed at tcp.rs:6545-6550 as queue_size.unwrap_or(config.monitor_queue_depth).
+C reference: `servermon.cpp:66` — size_t window=0u, limit=4u per MonitorOp; squash gate queue.size() < mon->limit (:273-296). A per-op constant, not a server knob.
+Impact: a monitor with no queueSize buffers up to 64 distinct updates under burst where pvxs coalesces beyond 4 — different squashing shape on the wire. (The R10-32 fix's own text assumed default 4.)
+
+### R11-32: server ackAny="N%" with a non-finite percent resolves to queueSize/2; pvxs resolves to queueSize
+Severity: Low
+Rust: `crates/epics-pva-rs/src/server_native/tcp.rs:188-197,215-216` — f64::clamp propagates NaN → (NaN...) as u32 == 0 → ==0 branch → limit/2.
+C reference: `servermon.cpp:564` — std::max(0.0, std::min(NaN,100.0)) = 100.0 → ackAt = limit.
+Impact: crafted ackAny="nan%" yields a different MONITOR_ACK refill cadence. Low (no real client sends it).
+
+### R11-46: asynRecord has no SCAN="I/O Intr" path — driver interrupts never update the record
+Severity: Medium
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs:2973` + registry — no get_ioint_info/interrupt receiver, no gotValue gate, no cancelIOInterruptScan; process() always queues an explicit read.
+C reference: `asynRecord.c:582` getIoIntInfo registers per-interface interrupt callbacks; callbackInterruptInt32/UInt32/Float64/Octet (:709-793) store the pushed value into I32INP/UI32INP/F64INP/TINP, set gotValue=1, scanIoRequest; process() `if (gotValue) goto done`; special() reverts SCAN on REASON/IFACE/UI32MASK/PCNCT (:490-525).
+Impact: SCAN="I/O Intr" against a callback-posting driver never auto-updates — C's whole interrupt-driven readback mode for the diagnostic record is absent.
+
+### R11-47: IP read-timeout disconnect returns asynTimeout where C returns asynError
+Severity: Low
+Rust: `crates/asyn-rs/src/drivers/ip_port.rs:859-868` — should_disconnect_after_read_error drops the connection but returns the original Timeout status.
+C reference: `drvAsynIPPort.c:798-806` — the disconnect branch sets status = asynError (:805); only the non-disconnect branch keeps asynTimeout.
+Impact: ERRS reads "timeout  nread N ..." instead of C's "error  nread N ...", and SyncIO callers branching on the status code see Timeout.
+
+### R11-48: a port with no asynDrvUser interface does not force REASON=0
+Severity: Low
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs:2531-2532` — empty DRVINFO keeps resolved_reason = self.reason; no per-port drvUser modeling.
+C reference: `asynRecord.c:1258-1266` — findInterface(asynDrvUserType)==NULL (true for IP/serial) forces reason = 0, and reports "asynDrvUser not supported but drvInfo not blank" when DRVINFO set.
+Impact: octet-only port + restored REASON!=0 + empty DRVINFO reads back the set REASON where C zeroes it; the non-empty-DRVINFO error text also differs.
+
+### R11-49: serial/IP driver setOption value-validation error texts diverge from C
+Severity: Low
+Rust: `crates/asyn-rs/src/drivers/serial_port.rs:901+` — Rust-authored texts, strict parse::<u32> baud.
+C reference: `drvAsynSerialPort.c:261-266,340-...` — "Bad number", "Unsupported data rate (%d baud)", "Invalid number of bits.", ...; sscanf %d prefix-parse accepts "9600x".
+Impact: invalid-option ERRS strings differ across the whole serial validation surface; numeric-prefix values error in Rust, parse in C.
+
+### R11-61: aCalcout array inputs INAA..INLL are silently dropped for an array (waveform) source
+Severity: High
+Rust: `crates/epics-base-rs/src/server/database/processing.rs:1955-1961` — the multi-input apply loop is `if let Some(f) = value.to_f64() { put Double }`; to_f64 returns None for every array variant, so array-typed link values never reach put_field and AA..LL stay empty. acalcout.rs:1944-1946 assumes the opposite.
+C reference: `aCalcoutRecord.c:1076-1097` — fetch_values reads each INAA..INLL as a full array via dbGetLink(DBR_DOUBLE, *pavalue, &nRequest), zero-filling the tail.
+Impact: INAA → waveform with CALC="AA"/"SUM(AA)" computes on an empty array and outputs zeros with no alarm — the core array-input feature is non-functional for array sources.
+
+### R11-62: swait has no simulation mode — SIML/SIMM/SIOL/SIMS/SVAL absent
+Severity: Medium
+Rust: `crates/epics-base-rs/src/server/records/swait.rs` — none of the five fields; check_simulation_mode finds no SIMM.
+C reference: `swaitRecord.c:401-421` — simm != NO reads SIOL → SVAL, VAL = SVAL, udf = FALSE, SIMM_ALARM at SIMS severity, skips calcPerform. Fields in swaitRecord.dbd:497-517.
+Impact: a swait in simulation runs the real CALC instead of latching VAL to SVAL with SIMM_ALARM — the whole sim-mode observable is missing.
+
+### R11-63: NDPluginCircularBuff flushes on a negative FlushOnSoftTrig where C requires strictly > 0
+Severity: Low
+Rust: `crates/ad-plugins-rs/src/circular_buff.rs:787` — stored as != 0.
+C reference: `NDPluginCircularBuff.cpp:276-277` — if (flushOn > 0) flushPreBuffer().
+Impact: FlushOnSoftTrig=-1 + SoftTrigger flushes on the port, not on C. (R8-72 residual.)
+
+### R11-64: epid secondary-field monitors carry a spurious DBE_ALARM on an alarm-transition cycle
+Severity: Low
+Rust: `crates/std-rs/src/records/epid.rs` — no posting hooks, so changed OVAL/P/I/D/DT/ERR/CVAL take the generic alarm_bits|VALUE|LOG mask (record_instance.rs:2474,2527-2537).
+C reference: `epidRecord.c:376` — monitor_mask = DBE_LOG|DBE_VALUE (reassignment discarding the alarm bits) before posting the secondaries (:377-408).
+Impact: on an alarm-transition cycle a DBE_ALARM-only subscriber to .P/.I/.D/.OVAL/.ERR/.CVAL/.DT gets an event C never sends. No existing hook produces VALUE|LOG-without-alarm — needs a new mask hook or epid-specific declaration.
+
+### Notes (round 11)
+
+- Un-numbered Category-A observations recorded for the fixer:
+  FITMPOLY/FITMQ mask threshold uses != 0.0 where C uses
+  mask[i] > SMALL (1e-8, calcUtil.c:280) — fold into the R10-8 work;
+  ARANDOM is time-seeded splitmix vs C's fixed-seed thread-private LCG
+  (aCalcPerform.c:1667-1685) — divergent by construction, likely an
+  accepted deviation, awaiting disposition.
+- parse_to_u64 nit not filed: Rust is_ascii_whitespace excludes \x0b
+  which C isspace skips — no realistic option carries it.
+- swait forward-link exclusivity suspicion investigated and cleared
+  (C fires FLNK exactly once on every chain); scaler UDF_ALARM
+  confirmed effectively dead in C too; acalcout per-element deadband
+  replacement is a documented intentional deviation — none filed.
+- R9-55 timing edge recorded, not filed: C's record user carries
+  timeout=1 until the first asynCallbackProcess stamps TMOT; the port
+  applies TMOT from the start.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -2338,3 +2576,31 @@ Severity: Low.
   33..37, 49..55, 63..67) — notable: R10-6 aCalc array window
   (firstEl/numEl) is the highest-priority candidate; R10-49 asynRecord
   queue-timeout mechanism missing entirely. Next: R11 re-audit.
+- Round 11 (2026-07-12): same 5 auditor panels (opus, read-only), triple
+  mandate. Fix verification: all 42 wave-8 commits VERIFIED CORRECT AND
+  COMPLETE — fourth consecutive clean wave — including main's a8×e8
+  merge-integration (fetch-gate nesting checked against each C record's
+  process()), and the 8 previously-sampled wave-7 E items now
+  line-verified. Adjudications: 24 of 30 wave-8 candidates CONFIRMED,
+  3 REFUTED (R10-15 — C's shared `long l` read is LP64 UB, the port
+  matches C's canonical result, do not port the UB; R10-51 — casing
+  unobservable, both sides case-insensitive; R10-53 — alias branches
+  unreachable), R10-50 reclassified dead-code cleanup, R10-54 remains a
+  cfg(windows) verification gap. R10-49 STRENGTHENED: C's asynRecord
+  passes QUEUE_TIMEOUT=10.0 (not 0.0) and the port_actor.rs:340-341
+  comment is factually wrong. 24 NEW findings: High 1 / Medium 14 /
+  Low 9 — A: 11 (sCalc string-engine byte contract: cvtDoubleToString(8),
+  39-char intermediates, DBL embedded-number hunt; aCalc math kernels:
+  DERIV/NDERIV quadratic fit, SMOOTH borders, FWHM fallback, store-backs
+  +AMASK), B: 3 (caget/camonitor formatting: CHAR base-flag, %g limits,
+  specifiedDbr count prefix), C: 2 (squash-depth default 64 vs pvxs 4;
+  NaN-percent ackAny), D: 4 (R11-46 SCAN="I/O Intr" absent is the
+  headline; IP timeout status, drvUser REASON=0, setOption texts),
+  E: 4 (R11-61 HIGH — aCalcout array inputs dropped by the to_f64
+  collapse in processing.rs, the core array-input feature dead for
+  waveform sources; swait sim mode absent; FlushOnSoftTrig sign; epid
+  secondary-post alarm mask). Volume 13→24 reflects deeper kernel/
+  formatting scrutiny, severity re-entered High via R11-61. Fix wave 9
+  next: 49 items (24 confirmed carryovers + R10-50 cleanup + 24 new);
+  R10-55 (asynGpib surface) assigned as a dedicated structural task;
+  ARANDOM seeding awaiting disposition as accepted deviation.

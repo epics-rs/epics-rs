@@ -601,21 +601,6 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     out
 }
 
-/// Keeps the [`PortRuntimeHandle`]s created by the port-configure iocsh
-/// commands (`drvAsynIPPortConfigure`, `drvAsynSerialPortConfigure`)
-/// alive for the process lifetime. Dropping a handle shuts the port's
-/// actor thread down, so a startup-script-created port must be parked
-/// somewhere with a 'static lifetime.
-static PORT_RUNTIMES: OnceLock<Mutex<Vec<PortRuntimeHandle>>> = OnceLock::new();
-
-fn keep_port_runtime(handle: PortRuntimeHandle) {
-    PORT_RUNTIMES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(handle);
-}
-
 /// Build the `drvAsynIPPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynIPPort.c::drvAsynIPPortConfigure(portName,
@@ -705,7 +690,9 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
             crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_port_runtime(handle);
+            // The registry above holds a live `PortHandle` for this port, which is
+            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+            drop(handle);
             ctx.println(&format!(
                 "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
             ));
@@ -781,7 +768,9 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
             crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_port_runtime(handle);
+            // The registry above holds a live `PortHandle` for this port, which is
+            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+            drop(handle);
             ctx.println(&format!(
                 "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
             ));
@@ -851,7 +840,9 @@ pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> Com
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
             crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
-            keep_port_runtime(handle);
+            // The registry above holds a live `PortHandle` for this port, which is
+            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+            drop(handle);
             ctx.println(&format!(
                 "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
             ));

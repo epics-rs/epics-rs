@@ -9,6 +9,7 @@ use epics_ca_rs::cli::{
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
 };
+use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
@@ -513,8 +514,90 @@ fn caget_req_count(callback: bool, max_elements: Option<usize>, native: u32) -> 
 /// outcome.
 struct PvRead {
     name: String,
-    outcome: Result<GetResult, String>,
+    outcome: Result<GetResult, ReadError>,
     timed_out: bool,
+}
+
+/// C `pvs[n].status` after the read phase — the value the print loop
+/// switches on (`caget.c:262-268`, `tool_lib.c:520-529`).
+///
+/// Exactly ONE of these is fatal, and only collectively: C counts the PVs
+/// that were still connected when it issued the read (`nConn`) and returns 1
+/// only when that count is zero (`caget.c:227`). Past that gate the read
+/// function returns 0 unconditionally (`caget.c:348`), so a read-access
+/// denial, a CA error, or a read timeout on SOME PV prints its marker and
+/// leaves the exit status at 0.
+#[derive(Debug)]
+enum ReadError {
+    /// `ca_state != cs_conn` when the read was issued (`caget.c:220`): C
+    /// never sends the get and leaves the PV OUT of `nConn`.
+    Disconnected,
+    /// The `-c` callback never delivered, so `pvs[n].value` is still NULL
+    /// (`caget.c:130,268`). Unreachable on the synchronous path — see
+    /// [`read_timeout`].
+    CallbackTimeout,
+    /// A CA failure carrying an ECA status: `ECA_NORDACCESS` is C's
+    /// read-access denial, anything else is its generic `ca_message` error.
+    Ca(u32),
+}
+
+impl ReadError {
+    /// C's `*** ...` marker for this status (`caget.c:262-268` — the same
+    /// four strings the `terse`, `plain` and `specifiedDbr` formats share,
+    /// and that `print_time_val_sts` repeats for `-a`).
+    fn marker(&self) -> String {
+        match self {
+            ReadError::Disconnected => "*** not connected".to_string(),
+            ReadError::CallbackTimeout => "*** no data available (timeout)".to_string(),
+            ReadError::Ca(s) if *s == ECA_NORDACCESS => "*** no read access".to_string(),
+            ReadError::Ca(s) => format!("*** CA error {}", eca_message(*s)),
+        }
+    }
+}
+
+/// Map one failed get onto C's PV status. A `Timeout` is C's `ca_pend_io`
+/// expiring, which only the CALLBACK path can render as a marker; the caller
+/// resolves that through [`read_timeout`] before reaching here.
+fn read_error(e: &CaError) -> ReadError {
+    match e {
+        CaError::Disconnected | CaError::Shutdown => ReadError::Disconnected,
+        other => ReadError::Ca(other.to_eca_status()),
+    }
+}
+
+/// C `print_time_val_sts` stamps its error lines with the CLIENT's current
+/// time (`epicsTimeGetCurrent`, `tool_lib.c:514-515`), not with a server
+/// timestamp — there is no server response to take one from.
+fn format_client_timestamp() -> String {
+    format_server_timestamp(SystemTime::now().into())
+}
+
+/// Print one PV's error line in the shape its output format uses.
+///
+/// * `terse` (`caget.c:264-269`): the bare marker.
+/// * `plain` (`caget.c:260-269`): the padded name column, then the marker.
+/// * `specifiedDbr` (`caget.c:299-305`): the name line, then the marker
+///   indented four spaces.
+/// * `all` (`tool_lib.c:517-529`): the padded name column, then either the
+///   `!onceConnected` line — reached exactly when the channel was NOT
+///   connected at read time, so it carries no timestamp — or the client's
+///   current time, a literal space, and the marker.
+fn print_read_error(mode: OutputMode, name_col: &str, pv_name: &str, sep: char, e: &ReadError) {
+    let marker = e.marker();
+    match mode {
+        OutputMode::Terse => println!("{marker}"),
+        OutputMode::SpecifiedDbr => println!("{pv_name}\n    {marker}"),
+        OutputMode::Plain => println!("{name_col}{sep}{marker}"),
+        OutputMode::All => match e {
+            ReadError::Disconnected => {
+                println!("{name_col}{sep}*** Not connected (PV not found)")
+            }
+            _ => println!(
+                "{name_col}{sep}{ts} {marker}",
+                ts = format_client_timestamp()
+            ),
+        },
+    }
 }
 
 /// C's read-timeout contract for one PV — the single owner of what a
@@ -542,22 +625,15 @@ fn read_timeout(
     base: Option<DbFieldType>,
     elems: u32,
     zeroed: impl FnOnce(DbFieldType, u32) -> GetResult,
-) -> Result<GetResult, String> {
+) -> Result<GetResult, ReadError> {
     if callback {
-        return Err(TIMEOUT_ERR.to_string());
+        return Err(ReadError::CallbackTimeout);
     }
     match base {
         Some(b) => Ok(zeroed(b, elems)),
-        None => Err(NOT_CONNECTED_ERR.to_string()),
+        None => Err(ReadError::Disconnected),
     }
 }
-
-/// Marker the print loop matches to reach C's `*** no data available
-/// (timeout)` branch. Reachable only under `-c` — see [`read_timeout`].
-const TIMEOUT_ERR: &str = "timeout";
-/// Marker for a channel that dropped after the connect barrier (C
-/// `ECA_DISCONN`, `caget.c:219-221`).
-const NOT_CONNECTED_ERR: &str = "not connected";
 
 #[tokio::main]
 async fn main() {
@@ -704,7 +780,7 @@ async fn main() {
                         timed_out = true;
                         on_timeout()
                     }
-                    Ok(Err(e)) => Err(format!("{e}")),
+                    Ok(Err(e)) => Err(read_error(&e)),
                 }
             } else {
                 // C `caget.c:177-187` readback substitution, in C's
@@ -752,7 +828,7 @@ async fn main() {
                             timed_out = true;
                             on_timeout()
                         }
-                        Ok(Err(e)) => Err(format!("{e}")),
+                        Ok(Err(e)) => Err(read_error(&e)),
                     }
                 } else if want_time {
                     let on_timeout = || {
@@ -771,7 +847,7 @@ async fn main() {
                             timed_out = true;
                             on_timeout()
                         }
-                        Ok(Err(e)) => Err(format!("{e}")),
+                        Ok(Err(e)) => Err(read_error(&e)),
                     }
                 } else {
                     // plain / terse: cheap typed value, no metadata payload.
@@ -783,7 +859,7 @@ async fn main() {
                                 GetResult::Plain(zero_dbr_value(b, n))
                             })
                         }
-                        Err(e) => Err(format!("{e}")),
+                        Err(e) => Err(read_error(&e)),
                     }
                 }
             };
@@ -823,7 +899,6 @@ async fn main() {
             name.to_string()
         }
     };
-    let mut failed = false;
     for PvRead {
         name: pv_name,
         outcome: result,
@@ -881,64 +956,25 @@ async fn main() {
                     specified_dbr_report(pv_name, *native, *req_type, snap, &fmt)
                 );
             }
-            Err(e) if e.contains("not connected") || e.contains("isconnect") => {
-                // C prints different strings per format: plain/terse
-                // (caget.c:265) print lowercase `*** not connected`;
-                // `-a`/wide (print_time_val_sts, tool_lib.c:521) prints
-                // `*** Not connected (PV not found)`; specifiedDbr
-                // (caget.c:301) prints the name line then an indented
-                // `    *** not connected`.
-                match mode {
-                    OutputMode::All => println!(
-                        "{}{}*** Not connected (PV not found)",
-                        pad_name(true, pv_name),
-                        sep
-                    ),
-                    OutputMode::Terse => println!("*** not connected"),
-                    OutputMode::SpecifiedDbr => println!("{pv_name}\n    *** not connected"),
-                    OutputMode::Plain => {
-                        println!("{}{}*** not connected", pad_name(true, pv_name), sep)
-                    }
-                }
-                failed = true;
-            }
-            Err(e) if e.contains("timeout") => {
-                // Reachable only under `-c`: the callback get allocates its
-                // buffer inside the event handler (`caget.c:130`), so a
-                // callback that never arrives leaves `pvs[n].value == 0` and
-                // C prints this marker (`caget.c:268`). The SYNCHRONOUS get
-                // callocs up front and renders the zeroed buffer instead —
-                // see [`read_timeout`].
-                //
-                // C `caget`: `connect_pvs` returns 1 only on a
-                // `ca_pend_io` connect timeout; the data-read function
-                // (`caget.c:348`) always returns 0. A CONNECTED PV
-                // whose GET times out therefore does NOT change the
-                // exit code — print the timeout line but leave
-                // `failed` untouched.
-                match mode {
-                    OutputMode::Terse => println!("*** no data available (timeout)"),
-                    OutputMode::SpecifiedDbr => {
-                        println!("{pv_name}\n    *** no data available (timeout)")
-                    }
-                    _ => println!(
-                        "{}{}*** no data available (timeout)",
-                        pad_name(true, pv_name),
-                        sep
-                    ),
-                }
-            }
             Err(e) => {
-                println!(
-                    "{}{}*** no data available ({e})",
-                    pad_name(true, pv_name),
-                    sep
-                );
-                failed = true;
+                // A failed PV never carries a value, so C's name column takes
+                // the scalar padding (`nElems == 0 <= 1`).
+                print_read_error(mode, &pad_name(true, pv_name), pv_name, sep, e);
             }
         }
     }
-    if failed {
+    // C `caget.c:227`: `if (!nConn) return 1` — `nConn` counts the PVs that
+    // were still connected when the read was issued, and it is the ONLY thing
+    // that can make the read phase fail. Past that gate `caget()` returns 0
+    // unconditionally (`caget.c:348`), so a read-access denial, a CA error, or
+    // a read timeout on some PV prints its marker and leaves the exit status
+    // at 0 — as does a disconnect, as long as ANY other PV was still
+    // connected.
+    let n_conn = results
+        .iter()
+        .filter(|r| !matches!(r.outcome, Err(ReadError::Disconnected)))
+        .count();
+    if n_conn == 0 {
         std::process::exit(1);
     }
 }
@@ -1007,8 +1043,9 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, GetResult, OutputMode, ReqCount, caget_req_count, dbr_extended_str, dbr_text,
-        parse_dbr_type, read_timeout, resolve_output_mode, scan_leading_i64, specified_dbr_report,
+        Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, caget_req_count,
+        dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_output_mode,
+        scan_leading_i64, specified_dbr_report,
     };
     use clap::CommandFactory;
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
@@ -1018,7 +1055,8 @@ mod tests {
         DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
     use epics_ca_rs::cli::{EPICS_EPOCH_UNIX_SECS, ValueFormat, zero_dbr_snapshot, zero_dbr_value};
-    use epics_ca_rs::{DbFieldType, EpicsValue};
+    use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
+    use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
     use std::time::SystemTime;
 
     fn mode_of(argv: &[&str]) -> OutputMode {
@@ -1062,10 +1100,9 @@ mod tests {
         // Callback (`-c`) is the ONLY path with no buffer: it alone reaches
         // C's `*** no data available (timeout)` marker.
         match plain(true, Some(DbFieldType::Double), 1) {
-            Err(e) => assert!(
-                e.contains("timeout"),
-                "-c timeout must reach the marker branch, got {e}"
-            ),
+            Err(e @ ReadError::CallbackTimeout) => {
+                assert_eq!(e.marker(), "*** no data available (timeout)")
+            }
             other => panic!("-c has no calloc'd buffer to print, got {other:?}"),
         }
     }
@@ -1103,9 +1140,93 @@ mod tests {
             GetResult::Plain(zero_dbr_value(b, n))
         });
         match r {
-            Err(e) => assert!(e.contains("not connected"), "got {e}"),
+            Err(ReadError::Disconnected) => {}
             other => panic!("a dropped channel is not a timeout, got {other:?}"),
         }
+    }
+
+    /// C `caget.c:262-268`: a post-gate read failure prints a `*** ...`
+    /// marker whose text comes straight from the PV's ECA status —
+    /// `ECA_NORDACCESS` is spelled out, every other status goes through
+    /// `ca_message`. The port printed an invented
+    /// `*** no data available (<Rust error Display>)` for all of them.
+    #[test]
+    fn read_error_markers_match_c() {
+        assert_eq!(
+            read_error(&CaError::ServerError(ECA_NORDACCESS)).marker(),
+            "*** no read access"
+        );
+        assert_eq!(
+            read_error(&CaError::Disconnected).marker(),
+            "*** not connected"
+        );
+        assert_eq!(
+            read_error(&CaError::Shutdown).marker(),
+            "*** not connected",
+            "a client shutdown is C's ECA_DISCONN too"
+        );
+        // Any other ECA status renders C's `ca_message` text.
+        let e = CaError::Protocol("bad frame".into());
+        let status = e.to_eca_status();
+        assert_eq!(
+            read_error(&e).marker(),
+            format!("*** CA error {}", eca_message(status)),
+            "generic CA failures print ca_message"
+        );
+    }
+
+    /// C `caget.c:227,348`: `if (!nConn) return 1` is the ONLY non-zero
+    /// return of the read phase — `nConn` counts the PVs still connected when
+    /// the read was issued. A read-access denial, a CA error or a read timeout
+    /// on a CONNECTED PV therefore exits 0, and so does a disconnect as long
+    /// as ANY other PV was connected.
+    ///
+    /// Pre-fix caget-rs set `failed = true` on the `not connected` branch and
+    /// on every generic error, exiting 1 for all of them.
+    #[test]
+    fn exit_status_is_c_n_conn() {
+        let read = |outcome| PvRead {
+            name: "PV".into(),
+            outcome,
+            timed_out: false,
+        };
+        let n_conn = |reads: &[PvRead]| {
+            reads
+                .iter()
+                .filter(|r| !matches!(r.outcome, Err(ReadError::Disconnected)))
+                .count()
+        };
+
+        // Read-access denied on the only PV: it IS connected → nConn == 1 → 0.
+        assert_eq!(
+            n_conn(&[read(Err(ReadError::Ca(ECA_NORDACCESS)))]),
+            1,
+            "an ECA_NORDACCESS PV is still connected"
+        );
+        // A callback read timeout: connected → exit 0.
+        assert_eq!(
+            n_conn(&[read(Err(ReadError::CallbackTimeout))]),
+            1,
+            "a timed-out read is still connected"
+        );
+        // One disconnected PV among connected ones → nConn > 0 → exit 0.
+        assert_eq!(
+            n_conn(&[
+                read(Err(ReadError::Disconnected)),
+                read(Ok(GetResult::Plain(EpicsValue::Double(1.0)))),
+            ]),
+            1,
+            "one live PV keeps nConn non-zero"
+        );
+        // EVERY PV disconnected → nConn == 0 → the sole exit-1 case.
+        assert_eq!(
+            n_conn(&[
+                read(Err(ReadError::Disconnected)),
+                read(Err(ReadError::Disconnected)),
+            ]),
+            0,
+            "!nConn is C's only read-phase failure"
+        );
     }
 
     /// `caget -c` (callback,

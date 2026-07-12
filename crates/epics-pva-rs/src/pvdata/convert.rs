@@ -279,6 +279,32 @@ pub fn as_u8(f: &PvField) -> Result<u8, NoConvert> {
     as_u64(f).map(|v| v as u8)
 }
 
+/// pvxs `Value::as<std::string>()` / `Value::as(std::string&)` — `copyOut`
+/// into `StoreType::String`.
+///
+/// A string passes through; a bool renders as the exact tokens
+/// `"true"`/`"false"` (`data.cpp:438`); every integer and real renders through
+/// `SB()<<src` (`copyOutScalar`, `data.cpp:409`). Array, struct and unselected
+/// union storage have no arm → [`NoConvert`]; a selected union derefs.
+///
+/// DEVIATION, deliberate and recorded: `SB()<<double` is `std::ostream`'s
+/// default float format (6 significant digits, `1e+20`); the port renders a
+/// real with Rust's shortest round-trip form. No `record._options` reader
+/// observes that text — a numeric store always satisfies the integer/bool
+/// conversion the readers try first — so this only affects the reason text of
+/// a [`NoConvert`], never a decision.
+pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
+    match store_of(f) {
+        Store::Bool(b) => Ok(if b { "true".into() } else { "false".into() }),
+        Store::Integer(n) => Ok(n.to_string()),
+        Store::UInteger(n) => Ok(n.to_string()),
+        Store::Real(n) => Ok(n.to_string()),
+        Store::Str(s) => Ok(s.into_owned()),
+        Store::Compound(Some(inner)) => as_string(inner),
+        Store::Array | Store::Compound(None) | Store::Null => Err(no_scalar_arm(f, "string")),
+    }
+}
+
 /// pvxs `parseTo<uint64_t>` (`util.cpp:786-799`) — `std::stoull(s, &idx, 0)`
 /// followed by a trailing-whitespace skip and an "extraneous characters"
 /// check.

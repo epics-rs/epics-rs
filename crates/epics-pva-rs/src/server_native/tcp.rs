@@ -125,64 +125,12 @@ enum MonitorPipelineRequest {
     Reject(String),
 }
 
-/// pvxs `Value::as(uint32_t&)` — i.e. `tryAs<uint32_t>` — applied to a scalar
-/// `record._options.ackAny` (`servermon.cpp:557`). This is the whole of the
-/// "plain integer" branch, and it is a conversion, not a type test: pvxs
-/// routes bool, every signed/unsigned integer, and BOTH reals through one
-/// `copyOutScalar()` that C-casts the storage to `uint64_t` (data.cpp:402-435),
-/// then narrows to the `uint32_t` out-param (data.h:636-647). So `ackAny` =
-/// `Double(4.0)` or `Boolean(true)` reaches `op->ackAt` just like `Int(4)`
-/// does.
-///
-/// The port used to hand-roll one arm per `ScalarValue` variant, with a
-/// `_ => {}` catch-all that silently dropped `Float`/`Double`/`Boolean`
-/// (leaving `ackAt` = 1, i.e. ACK every event, and never letting the
-/// `ackAt == 0 → queueSize/2` fallback fire) and `u32::try_from(..)
-/// .unwrap_or(1)` fallbacks that turned an out-of-range or negative integer
-/// into 1 instead of pvxs's wrap-then-clamp. One exhaustive match replaces
-/// both: every scalar storage class must now be classified explicitly.
-///
-/// Returns `None` only for `String` storage — pvxs converts that through
-/// `parseTo<uint64_t>` (data.cpp:451-453), and the caller owns the string
-/// form (including the `"N%"` percentage) so the two stay in pvxs's
-/// integer-first / string-second precedence.
-///
-/// Sign and range follow the C casts: a negative or oversized integer wraps
-/// (`uint64_t(int64_t(-1))` = `u64::MAX` → `0xFFFF_FFFF`), which the caller's
-/// `[1, queueSize]` clamp (`servermon.cpp:581`) then pins to `queueSize`. For
-/// reals, `uint64_t(double)` truncates toward zero; C++ leaves the negative /
-/// NaN / overflow cases undefined, so the port takes Rust's defined saturating
-/// cast (`-1.0` and `NaN` → 0 → the `queueSize/2` fallback) rather than
-/// reproducing an undefined result.
-fn ack_any_as_u32(sv: &crate::pvdata::ScalarValue) -> Option<u32> {
-    use crate::pvdata::ScalarValue;
-    Some(match sv {
-        // StoreType::Bool → `uint64_t(src)` (data.cpp:428-434).
-        ScalarValue::Boolean(b) => u32::from(*b),
-        // StoreType::Integer → `uint64_t(int64_t(src))`, wrapping.
-        ScalarValue::Byte(n) => *n as i64 as u64 as u32,
-        ScalarValue::Short(n) => *n as i64 as u64 as u32,
-        ScalarValue::Int(n) => *n as i64 as u64 as u32,
-        ScalarValue::Long(n) => *n as u64 as u32,
-        // StoreType::UInteger → `uint64_t(src)`, wrapping on narrow.
-        ScalarValue::UByte(n) => u32::from(*n),
-        ScalarValue::UShort(n) => u32::from(*n),
-        ScalarValue::UInt(n) => *n,
-        ScalarValue::ULong(n) => *n as u32,
-        // StoreType::Real → `uint64_t(double(src))`, truncating toward zero.
-        ScalarValue::Float(n) => *n as u64 as u32,
-        ScalarValue::Double(n) => *n as u64 as u32,
-        // StoreType::String → pvxs `parseTo<uint64_t>`; owned by the caller.
-        ScalarValue::String(_) => return None,
-    })
-}
-
 /// pvxs `servermon.cpp:554-581` — derive the pipeline ACK-refill
 /// threshold `ackAt` from `record._options.ackAny` and the negotiated
-/// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (typed
-/// builder scalar — of ANY numeric or bool type, see [`ack_any_as_u32`] — or
-/// a numeric string) or a percentage string
-/// (`"N%"`). An absent or unparseable value keeps the pvxs default of
+/// `queueSize` (pvxs `limit`). `ackAny` may be a plain integer (any scalar
+/// [`crate::pvdata::convert::as_u32`] converts — bool, every signed/unsigned
+/// integer, both reals, and a BASE-0 numeric string) or a percentage string
+/// (`"N%"`). An absent or unconvertible value keeps the pvxs default of
 /// `1`; an explicit `0` becomes `queueSize / 2`; the result clamps to
 /// `[1, queueSize]`. `queue_size` MUST be `>= 1` (the caller only
 /// invokes this for an enabled pipeline, where `queueSize >= 2`).
@@ -209,22 +157,28 @@ fn ack_any_as_u32(sv: &crate::pvdata::ScalarValue) -> Option<u32> {
 /// filed as a finding candidate; this comment previously claimed pvxs takes
 /// the Crit path, which it does not.
 fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<MonitorOptionDiag>) {
-    use crate::pvdata::ScalarValue;
     // pvxs `MonitorOp::ackAt` struct default.
     let mut ack_at: u32 = 1;
     let mut diag: Option<MonitorOptionDiag> = None;
     match ack_any {
-        // pvxs tries the PLAIN-INTEGER conversion first — `ackAny.as(ival)`,
-        // i.e. `tryAs<uint32_t>` (`servermon.cpp:557`) — and only falls to the
-        // string / percentage form when that conversion fails (`:560`). Keep
-        // that precedence: `ack_any_as_u32` is the whole of `tryAs<uint32_t>`
-        // for non-string storage, so real and bool `ackAny` values land in the
-        // integer branch, exactly as they do in pvxs.
-        Some(PvField::Scalar(sv)) => {
-            if let Some(n) = ack_any_as_u32(sv) {
+        // pvxs tries the PLAIN-INTEGER conversion FIRST — `ackAny.as(ival)`,
+        // `uint32_t ival` (`servermon.cpp:557`) — and falls to the string /
+        // percentage form only when that conversion fails (`:560`). Crucially
+        // it runs that conversion even for STRING storage: `copyOut` String →
+        // UInteger is `parseTo<uint64_t>` = `stoull(s,&idx,0)`, BASE 0
+        // (data.cpp:451-453, util.cpp:786-799). So `ackAny = "0x10"` is 16,
+        // `"010"` is 8, and `"-1"` wraps to `0xFFFF_FFFF` (then clamps to
+        // queueSize) — all in the INTEGER branch, before the percentage form is
+        // ever considered. The port's decimal-only `str::parse` fallback sat in
+        // the wrong branch and refused every one of them (R9-34).
+        Some(f) => {
+            if let Ok(n) = crate::pvdata::convert::as_u32(f) {
                 ack_at = n;
-            } else if let ScalarValue::String(s) = sv {
-                let s = s.as_str_lossy();
+            } else if let Ok(s) = crate::pvdata::convert::as_string(f) {
+                // `as(ival)` refused it, so this store is not a base-0 integer
+                // — with the integer conversion covering bool/int/real, only a
+                // string store can land here. pvxs's `else if(ackAny.as(sval))`
+                // branch: a `"N%"` percentage is the only form it acts on.
                 if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
                     match pct.trim().parse::<f64>() {
                         Ok(percent) => {
@@ -249,24 +203,22 @@ fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<Monit
                             });
                         }
                     }
-                } else if let Ok(n) = s.trim().parse::<u32>() {
-                    ack_at = n;
                 }
-                // else: a plain non-`%` string that fails integer parse —
+                // else: a plain non-`%` string that is not a base-0 integer —
                 // pvxs leaves `ackAt` default with NO logRemote
                 // (`servermon.cpp:560-569` only logs the `%` branch).
+            } else {
+                // A non-scalar `ackAny` — no `copyOut` arm converts it. See the
+                // DIVERGENCE note above: pvxs throws out of the handler here and
+                // resets the circuit; the port logs and serves on.
+                diag = Some(MonitorOptionDiag {
+                    level: MessageType::Fatal,
+                    message: format!(
+                        "Unable to parse record._options.ackAny : {}",
+                        render_option_value(f)
+                    ),
+                });
             }
-        }
-        Some(other) => {
-            // See the DIVERGENCE note above: pvxs throws out of the handler
-            // here and resets the circuit; the port logs and serves on.
-            diag = Some(MonitorOptionDiag {
-                level: MessageType::Fatal,
-                message: format!(
-                    "Unable to parse record._options.ackAny : {}",
-                    render_option_value(other)
-                ),
-            });
         }
         None => {}
     }
@@ -9800,6 +9752,98 @@ mod tests {
             1,
             "unparseable ackAny → default 1"
         );
+    }
+
+    /// R9-34. pvxs runs `ackAny.as(ival)` (`uint32_t`) FIRST — even for STRING
+    /// storage. `copyOut` String→UInteger is `parseTo<uint64_t>`, i.e.
+    /// `std::stoull(s, &idx, 0)`: BASE 0 (data.cpp:451-453, util.cpp:786-799).
+    /// So a hex, octal, signed or whitespace-padded `ackAny` string resolves in
+    /// the INTEGER branch, before the `"N%"` percentage form is ever considered.
+    ///
+    /// The port's fallback was a decimal-only `str::trim().parse::<u32>()` sitting
+    /// INSIDE the string branch, so it rejected every one of these and left
+    /// `ackAt` at the default of 1 (ACK every event).
+    #[test]
+    fn pva_r9_34_ack_any_string_converts_base_zero() {
+        // queueSize 32 so none of these clamp on the way out (except -1, below).
+        let q = 32u32;
+        let cases: [(ScalarValue, u32); 6] = [
+            // `0x`/`0X` prefix → radix 16.
+            (ScalarValue::String("0x10".into()), 16),
+            (ScalarValue::String("0X10".into()), 16),
+            // Leading `0` → radix 8. "010" is EIGHT, not ten.
+            (ScalarValue::String("010".into()), 8),
+            // Plain decimal still decimal.
+            (ScalarValue::String("12".into()), 12),
+            // strtoull skips leading whitespace; parseTo skips trailing.
+            (ScalarValue::String("  12  ".into()), 12),
+            // A base-0 "0" converts to 0 and so takes the `ackAt == 0 →
+            // queueSize/2` fallback (servermon.cpp:577), NOT the default of 1.
+            (ScalarValue::String("0".into()), q / 2),
+        ];
+        for (ack_any, want) in cases {
+            let label = format!("{ack_any:?}");
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(q as i32)),
+                PvField::Scalar(ack_any),
+            );
+            assert_eq!(parsed_opts(&req).ack_at, want, "ackAny={label}");
+        }
+        // A leading `-` negates the unsigned parse (C, not an error): "-1" is
+        // u64::MAX, narrowed to 0xFFFF_FFFF, then clamped to the queue — the
+        // same result the typed `Int(-1)` already produced.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(q as i32)),
+            PvField::Scalar(ScalarValue::String("-1".into())),
+        );
+        assert_eq!(
+            parsed_opts(&req).ack_at,
+            q,
+            "ackAny=\"-1\" wraps to 0xFFFF_FFFF → clamps to queueSize"
+        );
+        // Octal radix has no digit 8: "08" is `invalid`/extraneous, so the
+        // integer conversion fails, the string branch finds no `%`, and pvxs
+        // leaves ackAt at the default with NO diagnostic.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(q as i32)),
+            PvField::Scalar(ScalarValue::String("08".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(opts.ack_at, 1, "ackAny=\"08\" is not a base-0 integer");
+        assert!(
+            opts.diagnostics.is_empty(),
+            "a non-`%` unconvertible string is silent in pvxs"
+        );
+    }
+
+    /// R9-34. The percentage branch is pvxs's `else if(ackAny.as(sval))` — a
+    /// CONVERSION into `std::string`, which "automagic derefs" a selected union
+    /// (data.cpp:478-492). Both branches therefore see through a union-wrapped
+    /// `ackAny`, which the port's `PvField::Scalar(..)` match could not.
+    #[test]
+    fn pva_r9_34_ack_any_derefs_a_selected_union() {
+        let wrap = |sv: ScalarValue| PvField::Union {
+            selector: 0,
+            variant_name: "s".into(),
+            value: Box::new(PvField::Scalar(sv)),
+        };
+        // Integer branch, through the deref.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            wrap(ScalarValue::String("0x4".into())),
+        );
+        assert_eq!(parsed_opts(&req).ack_at, 4);
+        // Percentage branch, through the deref.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            wrap(ScalarValue::String("25%".into())),
+        );
+        assert_eq!(parsed_opts(&req).ack_at, 4);
     }
 
     #[test]

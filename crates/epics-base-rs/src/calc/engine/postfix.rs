@@ -131,8 +131,13 @@ fn func_arity(func: &FuncName) -> u8 {
         // 2-arg core math (numeric.rs: Atan2/Fmod pop2).
         FuncName::Atan2 | FuncName::Fmod => 2,
 
-        // 2-arg string ops (string.rs: Printf/Sscanf pop2).
-        FuncName::Printf | FuncName::Sscanf => 2,
+        // 2-arg string ops (string.rs: Printf/Sscanf/BinRead/BinWrite pop2).
+        // C's element table settles this: `runtime_effect` is -1 for PRINTF
+        // ($P), SSCANF ($S), BIN_READ ($R, READ) and BIN_WRITE ($W, WRITE)
+        // alike (sCalcPostfix.c:173-195) — one net operand consumed, i.e. two
+        // popped and one pushed. Only elements with `runtime_effect` 0 are
+        // 1-in-1-out.
+        FuncName::Printf | FuncName::Sscanf | FuncName::BinRead | FuncName::BinWrite => 2,
 
         // 2-arg array ops.
         //   NSmoo  -> ArrayOp::NSmooth   (array.rs:527 — pop n, pop array)
@@ -153,8 +158,8 @@ fn func_arity(func: &FuncName) -> u8 {
         //   core math: Abs, Sqrt, Sqr, Exp, Log10, LogE, Ln, Sin,
         //     Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Ceil, Floor,
         //     Nint, Int, IsInf, Not
-        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, BinRead,
-        //     BinWrite, Crc16, ModBus, Lrc, AModBus, Xor8, AddXor8
+        //   string 1-arg: Dbl, Str, Len, Byte, TrEsc, Esc, Crc16, ModBus,
+        //     Lrc, AModBus, Xor8, AddXor8
         //   array 1-arg: Avg, Std, FwhmFunc, Sum, AMax, AMin, IxMax,
         //     IxMin, IxZ, IxNz, Arr, AToD, Smoo, Deriv, Cum
         // Vararg funcs (Min, Max, Finite, IsNan) are unreachable here.

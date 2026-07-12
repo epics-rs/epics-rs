@@ -44,6 +44,19 @@ impl ArrayStackValue {
         }
     }
 
+    /// Every element this operand contributes to an all-element reduction — the
+    /// whole array, or the single value of a scalar. This is the shape C's
+    /// VARARG predicates fold over (`aCalcPerform.c:1114-1146`: `if (isDouble(ps))
+    /// j = f(ps->d); else for (i=0; i<arraySize; i++) j = j OP f(ps->a[i]);`), and
+    /// it is deliberately NOT `as_f64`, which collapses an array to its a[0].
+    pub fn elements(&self) -> impl Iterator<Item = f64> + '_ {
+        let (scalar, arr) = match self {
+            ArrayStackValue::Double(v) => (Some(*v), [].as_slice()),
+            ArrayStackValue::Array(a) => (None, a.as_slice()),
+        };
+        scalar.into_iter().chain(arr.iter().copied())
+    }
+
     pub fn map<F: Fn(f64) -> f64>(self, f: F) -> ArrayStackValue {
         match self {
             ArrayStackValue::Double(v) => ArrayStackValue::Double(f(v)),

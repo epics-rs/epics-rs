@@ -332,37 +332,36 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     }));
                 }
 
+                // ISNAN and FINITE are aCalc's two VARARG predicates
+                // (`aCalcPerform.c:1114-1146`), and each folds over EVERY ELEMENT
+                // of EVERY argument — an array argument is not collapsed to its
+                // a[0]:
+                //   FINITE = AND of finite() over all elements of all args
+                //   ISNAN  = OR  of isnan()  over all elements of all args
+                // Both reduce to a plain double (`toDouble(ps); ps->d = j`).
                 CoreOp::IsNan(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = false;
-                    for _ in 0..n {
-                        let v = pop1_f64(&mut stack)?;
-                        result = result || v.is_nan();
-                    }
-                    stack.push(ArrayStackValue::Double(if result { 1.0 } else { 0.0 }));
-                }
-                CoreOp::IsInf => {
-                    let a = pop1_f64(&mut stack)?;
-                    stack.push(ArrayStackValue::Double(if a.is_infinite() {
-                        1.0
-                    } else {
-                        0.0
-                    }));
+                    let args = popn(&mut stack, *nargs as usize)?;
+                    let any_nan = args
+                        .iter()
+                        .flat_map(ArrayStackValue::elements)
+                        .any(f64::is_nan);
+                    stack.push(ArrayStackValue::Double(f64::from(u8::from(any_nan))));
                 }
                 CoreOp::Finite(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = true;
-                    for _ in 0..n {
-                        let v = pop1_f64(&mut stack)?;
-                        result = result && v.is_finite();
-                    }
-                    stack.push(ArrayStackValue::Double(if result { 1.0 } else { 0.0 }));
+                    let args = popn(&mut stack, *nargs as usize)?;
+                    let all_finite = args
+                        .iter()
+                        .flat_map(ArrayStackValue::elements)
+                        .all(f64::is_finite);
+                    stack.push(ArrayStackValue::Double(f64::from(u8::from(all_finite))));
+                }
+                // ISINF is NOT a reduction: it is one of aCalc's element-wise unary
+                // operators (`aCalcPerform.c:826` in the isArray branch, :1085 in
+                // the scalar one), so an array operand yields an ARRAY result with
+                // the predicate applied per element.
+                CoreOp::IsInf => {
+                    let a = pop1(&mut stack)?;
+                    stack.push(a.map(|x| f64::from(u8::from(x.is_infinite()))));
                 }
 
                 CoreOp::Atan2 => {
@@ -817,6 +816,14 @@ fn shift_elements(a: &mut [f64], e: f64) {
 
 fn pop1(stack: &mut Vec<ArrayStackValue>) -> Result<ArrayStackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
+}
+
+/// Pop the `n` arguments of a VARARG operator, keeping their shapes intact.
+fn popn(stack: &mut Vec<ArrayStackValue>, n: usize) -> Result<Vec<ArrayStackValue>, CalcError> {
+    if stack.len() < n {
+        return Err(CalcError::Underflow);
+    }
+    Ok(stack.split_off(stack.len() - n))
 }
 
 fn pop1_f64(stack: &mut Vec<ArrayStackValue>) -> Result<f64, CalcError> {

@@ -6435,6 +6435,19 @@ async fn handle_op(
                     ch.name
                 )));
             }
+            // R10-37: the source's `onSubscribe` diagnostics are INIT-time.
+            // pvxs records them INSIDE `onSubscribe` — `singlesource.cpp:129`'s
+            // `record._options.DBE=… selects empty mask` is written before
+            // `connect()` emits the INIT reply — so the client sees the
+            // CMD_MESSAGE ahead of that reply. The port opens the subscription
+            // at START, and used to let this hook parse against a discarded log
+            // and re-parse at START to log there, putting the message AFTER the
+            // INIT reply (and emitting it for group / native-PVA channels, whose
+            // pvxs sources never read DBE at all). Draining here, before the
+            // reply is built, is pvxs's order. Only on the Ok path: a DBE that
+            // THROWS resets the circuit without a reply, and pvxs's throw
+            // happens before its logRemote.
+            flush_remote_log(&init_ctx.log, ioid, order, &chan_tx).await;
         }
 
         ch.ops.insert(

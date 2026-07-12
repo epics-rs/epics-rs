@@ -277,9 +277,17 @@ async fn open_monitor(
     // `QsrvPvStore::check_monitor_request` before this op is even registered. If
     // one somehow arrives, take pvxs's `dbe = 0` fallback rather than inventing
     // a third behaviour.
+    //
+    // R10-37: this START-time parse resolves the MASK only. The
+    // `selects empty mask` warning it can raise belongs to INIT — pvxs writes it
+    // inside `onSubscribe`, before `connect()` sends the INIT reply — so
+    // `check_monitor_request` (the port's INIT half of `onSubscribe`) owns the
+    // reporting and this call parses against a log nobody flushes. Passing
+    // `ctx.log` here too would emit the message twice, and after the reply.
+    let discard = epics_pva_rs::server_native::source::RemoteLog::default();
     let dbe_mask = match ctx.pv_request {
         Some(PvField::Structure(ref req)) => {
-            crate::qsrv::channel::dbe_mask_from_pv_request(req, &ctx.log).unwrap_or(None)
+            crate::qsrv::channel::dbe_mask_from_pv_request(req, &discard).unwrap_or(None)
         }
         _ => None,
     };
@@ -388,6 +396,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let provider = self.provider.clone();
         let name = checked.pv_name().to_string();
         let pv_request = ctx.pv_request.clone();
+        // The op's `RemoteLogger` sink — the wire layer drains it after this
+        // hook returns Ok, before the INIT reply (R10-37).
+        let log = ctx.log.clone();
         async move {
             let Some(PvField::Structure(req)) = pv_request else {
                 return Ok(());
@@ -395,12 +406,20 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             if pva_pvs.read().await.contains_key(&name) || provider.is_servable_group(&name).await {
                 return Ok(());
             }
-            // The empty-mask `logRemote` this parse can raise is emitted by the
-            // START-time reader in `open_monitor`, against the operation's own
-            // `RemoteLog`; this INIT-time call exists solely for the throw, so
-            // it parses against a log nobody flushes rather than double-report.
-            let discard = epics_pva_rs::server_native::source::RemoteLog::default();
-            crate::qsrv::channel::dbe_mask_from_pv_request(&req, &discard)?;
+            // R10-37: this hook IS pvxs's `onSubscribe` DBE read, so it owns
+            // BOTH of that read's outcomes — the `NoConvert` throw that resets
+            // the circuit, and the `Level::Warn` "selects empty mask" logRemote
+            // (`singlesource.cpp:128-130`). pvxs writes that warning before
+            // `connect()` emits the INIT reply; the wire layer drains `ctx.log`
+            // on this hook's Ok path, before building the reply, so the client
+            // sees it in pvxs's order. The START-time re-parse in `open_monitor`
+            // discards its log so this is reported exactly once.
+            //
+            // Scoped to single-record channels by the early return above — the
+            // pvxs sources for group and native-PVA names never read DBE, so
+            // neither warns. Logging from START (as this used to) warned for
+            // them as well.
+            crate::qsrv::channel::dbe_mask_from_pv_request(&req, &log)?;
             Ok(())
         }
     }

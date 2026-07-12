@@ -28,34 +28,6 @@ use super::config::{LinkDirection, PvaLinkConfig};
 use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent, ScanOverrun};
 use super::registry::PvaLinkRegistry;
 
-/// Wrap `tokio::task::block_in_place(f)` with a runtime-flavour check.
-/// Tokio's block_in_place panics under the current_thread runtime; on
-/// that flavour we run `f` directly (the caller's outer block_on then
-/// has nothing to fall back to and may itself fail, but we surface
-/// that as a regular error rather than a panic). Used by every
-/// pvalink LinkSet/Resolver entry point — they're invoked from inside
-/// `PvDatabase::resolve_external_pv`'s async context.
-fn block_in_place_or_warn<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    if let Ok(handle) = Handle::try_current() {
-        match handle.runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
-            // CurrentThread (or any other future flavour) can't park
-            // a worker, so we just call directly. Inside the closure
-            // the caller will likely call Handle::block_on which
-            // panics on current_thread; catch_unwind would mask real
-            // bugs, so we let it propagate. Production IOC binaries
-            // use the multi-threaded runtime.
-            _ => f(),
-        }
-    } else {
-        f()
-    }
-}
-
 /// Resolver wrapping a [`PvaLinkRegistry`] and a tokio runtime handle.
 /// Cheap to clone — both fields are `Arc`-backed.
 #[derive(Clone)]
@@ -761,84 +733,81 @@ impl PvaLinkResolver {
     }
 
     /// Build the [`ExternalPvResolver`] closure that the database
-    /// expects. The closure is sync; it uses
-    /// `Handle::block_on(future)` for the rare uncached path.
-    /// Pre-warm INP links via [`Self::open`] to keep the steady-state
-    /// path lock-free. The returned closure has a sync fast path
-    /// (cache hit on a pre-warmed monitor) and only falls through
-    /// to `block_on` on the first call for a given PV.
+    /// expects. Pre-warm INP links via [`Self::open`] to keep the
+    /// steady-state path lock-free: the closure has a cache-hit fast path
+    /// (a pre-warmed monitor, no I/O) and only opens the link on the first
+    /// call for a given PV.
     pub fn build_resolver(self) -> ExternalPvResolver {
         let resolver = self;
-        Arc::new(move |name: &str| -> Option<EpicsValue> {
-            if !resolver.is_enabled() {
-                return None;
-            }
-            // Strip optional pva:// prefix — the resolver receives the
-            // bare PV name in some link forms but the prefixed form in
-            // others. `ca://` is handled by libca, not pvalink — reject.
-            let full = match name.strip_prefix("pva://") {
-                Some(stripped) => stripped,
-                None => {
-                    if name.starts_with("ca://") {
-                        return None;
-                    }
-                    name
+        Arc::new(move |name: &str| {
+            let resolver = resolver.clone();
+            let name = name.to_string();
+            Box::pin(async move {
+                let name = name.as_str();
+                if !resolver.is_enabled() {
+                    return None;
                 }
-            };
-            // strip query string; lazily register per-link
-            // options; get per-link config before the fast path so the
-            // field selector is available for `try_read_cached_with_field`.
-            let bare = link_pv_name(full);
-            if full != bare {
-                lazy_register_inp_opts(&resolver.link_options, full);
-            }
-            // cfg carries the per-link field (among other opts).
-            let cfg = resolver.inp_cfg_for(full);
+                // Strip optional pva:// prefix — the resolver receives the
+                // bare PV name in some link forms but the prefixed form in
+                // others. `ca://` is handled by libca, not pvalink — reject.
+                let full = match name.strip_prefix("pva://") {
+                    Some(stripped) => stripped,
+                    None => {
+                        if name.starts_with("ca://") {
+                            return None;
+                        }
+                        name
+                    }
+                };
+                // strip query string; lazily register per-link
+                // options; get per-link config before the fast path so the
+                // field selector is available for `try_read_cached_with_field`.
+                let bare = link_pv_name(full);
+                if full != bare {
+                    lazy_register_inp_opts(&resolver.link_options, full);
+                }
+                // cfg carries the per-link field (among other opts).
+                let cfg = resolver.inp_cfg_for(full);
 
-            // Fast path: a previously-opened link with a cached
-            // monitor value. No `block_on`, no async runtime touch.
-            // `try_get_inp` resolves THIS caller's monitor variant
-            // (`pipeline` / `Q`), so a `Q=1` record reads from its own
-            // monitor, not a `Q=64` sibling sharing the PV name.
-            // `try_read_cached_with_field`
-            // then applies the per-link field selector.
-            if let Some(link) = resolver
-                .registry
-                .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
-                && let Some(value) = link.try_read_cached_with_field(&cfg.field)
-            {
-                resolver
-                    .reads
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return pvfield_to_epics_value(&value);
-            }
+                // Fast path: a previously-opened link with a cached
+                // monitor value. No `block_on`, no async runtime touch.
+                // `try_get_inp` resolves THIS caller's monitor variant
+                // (`pipeline` / `Q`), so a `Q=1` record reads from its own
+                // monitor, not a `Q=64` sibling sharing the PV name.
+                // `try_read_cached_with_field`
+                // then applies the per-link field selector.
+                if let Some(link) =
+                    resolver
+                        .registry
+                        .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
+                    && let Some(value) = link.try_read_cached_with_field(&cfg.field)
+                {
+                    resolver
+                        .reads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return pvfield_to_epics_value(&value);
+                }
 
-            // Slow path: link not yet open or first-event not arrived.
-            // Open the link (idempotent) then issue an async read.
-            // B4: use `inp_cfg_for` so a link registered via
-            // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
-            // `monorder`); `default_inp_cfg` would discard them.
-            // The Lset external resolver is invoked from inside an
-            // async context (PvDatabase::resolve_external_pv runs on a
-            // tokio worker). Bare Handle::block_on panics under those
-            // conditions. block_in_place yields the worker thread for
-            // the duration of the inner block_on so the runtime stays
-            // healthy. Requires the multi-threaded runtime, which is
-            // the only flavour our IOC binaries use.
-            let field = cfg.field.clone();
-            let (link, value) = block_in_place_or_warn(|| {
-                resolver.handle.block_on(async {
+                // Slow path: link not yet open or first-event not arrived.
+                // Open the link (idempotent) then read it.
+                // B4: use `inp_cfg_for` so a link registered via
+                // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
+                // `monorder`); `default_inp_cfg` would discard them.
+                let field = cfg.field.clone();
+                let (link, value) = async {
                     let link = resolver.registry.get_or_open(cfg).await.ok()?;
                     // use per-link field selector.
                     let value = link.read_with_field(&field).await.ok()?;
                     Some((link, value))
-                })
-            })?;
-            let _ = link;
-            resolver
-                .reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            pvfield_to_epics_value(&value)
+                }
+                .await?;
+                let _ = link;
+                resolver
+                    .reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                pvfield_to_epics_value(&value)
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<EpicsValue>> + Send>>
         })
     }
 }
@@ -1142,13 +1111,11 @@ async fn scan_once(
     drop(atomic_epoch);
 }
 
+#[epics_base_rs::async_trait]
 impl LinkSet for PvaLinkResolver {
-    fn is_connected(&self, name: &str) -> bool {
-        // Sync-only check: trait can't await. If the link hasn't
-        // been pre-opened we report "not connected" — the resolver
-        // hot path or `pvxr` will open it lazily; any caller that
-        // wants a fresh open should call `Self::open(name).await`
-        // first.
+    async fn is_connected(&self, name: &str) -> bool {
+        // A link that has not been opened reports "not connected"; the
+        // resolver hot path or `pvxr` opens it lazily.
         let Some(full) = strip_scheme(name) else {
             return false;
         };
@@ -1170,7 +1137,7 @@ impl LinkSet for PvaLinkResolver {
         }
     }
 
-    fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
         if !self.is_enabled() {
             return None;
         }
@@ -1201,18 +1168,17 @@ impl LinkSet for PvaLinkResolver {
         // keeps its options (`sevr`, `Q`, `pipeline`, `monorder`);
         // `default_inp_cfg` would discard them.
         let field = cfg.field.clone();
-        let value = block_in_place_or_warn(|| {
-            self.handle.block_on(async {
-                let link = self.registry.get_or_open(cfg).await.ok()?;
-                link.read_with_field(&field).await.ok()
-            })
-        })?;
+        let value = async {
+            let link = self.registry.get_or_open(cfg).await.ok()?;
+            link.read_with_field(&field).await.ok()
+        }
+        .await?;
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pvfield_to_epics_value(&value)
     }
 
-    fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
         }
@@ -1247,42 +1213,41 @@ impl LinkSet for PvaLinkResolver {
         // through the string PUT path where the bracketed `Display`
         // text is unparseable.
         let array_path = is_array_value(&value);
-        block_in_place_or_warn(|| {
-            self.handle.block_on(async {
-                // `local`-admission gate on the lazy write path: a
-                // `local=true` OUT link must never open — or reuse a
-                // sibling's already-open — remote channel. Checked before
-                // `get_or_open` so even a cache hit is gated (pvxs
-                // `pvaOpenLink`, direction-agnostic).
-                self.check_local_admission(&cfg)
+        async {
+            // `local`-admission gate on the lazy write path: a
+            // `local=true` OUT link must never open — or reuse a
+            // sibling's already-open — remote channel. Checked before
+            // `get_or_open` so even a cache hit is gated (pvxs
+            // `pvaOpenLink`, direction-agnostic).
+            self.check_local_admission(&cfg)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Resolve the SHARED channel owner for this PV (the
+            // registry no longer keys on the per-link OUT options),
+            // then stage THIS link's write with its own
+            // `field`/`proc`/`defer`/`retry` so sibling fields
+            // coalesce into one upstream PUT.
+            let link = self
+                .registry
+                .get_or_open(cfg.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            if array_path {
+                let pv_field = crate::convert::epics_to_pv_field(&value);
+                link.put_out_field(&cfg, &pv_field, block)
                     .await
-                    .map_err(|e| e.to_string())?;
-                // Resolve the SHARED channel owner for this PV (the
-                // registry no longer keys on the per-link OUT options),
-                // then stage THIS link's write with its own
-                // `field`/`proc`/`defer`/`retry` so sibling fields
-                // coalesce into one upstream PUT.
-                let link = self
-                    .registry
-                    .get_or_open(cfg.clone())
+                    .map_err(|e| e.to_string())
+            } else {
+                let value_str = value.to_string();
+                link.put_out_str(&cfg, &value_str, block)
                     .await
-                    .map_err(|e| e.to_string())?;
-                if array_path {
-                    let pv_field = crate::convert::epics_to_pv_field(&value);
-                    link.put_out_field(&cfg, &pv_field, block)
-                        .await
-                        .map_err(|e| e.to_string())
-                } else {
-                    let value_str = value.to_string();
-                    link.put_out_str(&cfg, &value_str, block)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            })
-        })
+                    .map_err(|e| e.to_string())
+            }
+        }
+        .await
     }
 
-    fn scan_forward(&self, name: &str) -> Result<(), String> {
+    async fn scan_forward(&self, name: &str) -> Result<(), String> {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
         }
@@ -1298,22 +1263,21 @@ impl LinkSet for PvaLinkResolver {
             lazy_register_inp_opts(&self.link_options, full);
         }
         let cfg = self.inp_cfg_for(full);
-        block_in_place_or_warn(|| {
-            self.handle.block_on(async {
-                // Open / reuse the shared channel so the forward link
-                // tracks connection the way pvxs's shared channel does,
-                // then fire `pvaScanForward` (process-only, no value).
-                let link = self
-                    .registry
-                    .get_or_open(cfg)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                link.scan_forward().await.map_err(|e| e.to_string())
-            })
-        })
+        async {
+            // Open / reuse the shared channel so the forward link
+            // tracks connection the way pvxs's shared channel does,
+            // then fire `pvaScanForward` (process-only, no value).
+            let link = self
+                .registry
+                .get_or_open(cfg)
+                .await
+                .map_err(|e| e.to_string())?;
+            link.scan_forward().await.map_err(|e| e.to_string())
+        }
+        .await
     }
 
-    fn flush_puts(&self) {
+    async fn flush_puts(&self) {
         if !self.is_enabled() {
             return;
         }
@@ -1327,16 +1291,15 @@ impl LinkSet for PvaLinkResolver {
         if links.is_empty() {
             return;
         }
-        block_in_place_or_warn(|| {
-            self.handle.block_on(async {
-                for link in links {
-                    let _ = link.flush_retry_pending().await;
-                }
-            })
-        });
+        async {
+            for link in links {
+                let _ = link.flush_retry_pending().await;
+            }
+        }
+        .await;
     }
 
-    fn alarm_message(&self, name: &str) -> Option<String> {
+    async fn alarm_message(&self, name: &str) -> Option<String> {
         // parse the caller's full link config and apply the
         // caller's own `sevr` mode — `get_or_open` may return a
         // previously cached INP link whose `config.sevr` belongs to a
@@ -1351,14 +1314,11 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         let field = cfg.field.clone();
-        let link = block_in_place_or_warn(|| {
-            self.handle
-                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
-        })?;
+        let link = async { self.registry.get_or_open(cfg).await.ok() }.await?;
         link.alarm_message_with(&field, sevr)
     }
 
-    fn alarm_severity(&self, name: &str) -> Option<i32> {
+    async fn alarm_severity(&self, name: &str) -> Option<i32> {
         // B2: surface the gated link-alarm severity so the owning
         // record's `LINK_ALARM` actually reflects the remote PV's
         // alarm. The `MS`/`NMS`/`MSI` gate is applied here.
@@ -1374,14 +1334,14 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         let field = cfg.field.clone();
-        let link = block_in_place_or_warn(|| {
-            self.handle
-                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
-        })?;
+        let link = async { self.registry.get_or_open(cfg).await.ok() }.await?;
         link.link_alarm_severity_with(&field, sevr)
     }
 
-    fn remote_alarm(&self, name: &str) -> Option<epics_base_rs::server::database::RemoteAlarm> {
+    async fn remote_alarm(
+        &self,
+        name: &str,
+    ) -> Option<epics_base_rs::server::database::RemoteAlarm> {
         // Ungated remote alarm snapshot for DB-link inspection
         // (`dbGetAlarm`/`dbGetAlarmMsg`). Unlike `alarm_severity`, this
         // applies NO `sevr` gate — a default `NMS` link still reports
@@ -1396,14 +1356,11 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let field = cfg.field.clone();
-        let link = block_in_place_or_warn(|| {
-            self.handle
-                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
-        })?;
+        let link = async { self.registry.get_or_open(cfg).await.ok() }.await?;
         link.remote_alarm_snapshot(&field)
     }
 
-    fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+    async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let full = strip_scheme(name)?;
         let bare = link_pv_name(full);
         if full != bare {
@@ -1423,10 +1380,7 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let want_time = cfg.time;
         let field = cfg.field.clone();
-        let link = block_in_place_or_warn(|| {
-            self.handle
-                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
-        })?;
+        let link = async { self.registry.get_or_open(cfg).await.ok() }.await?;
         // only adopt the upstream timestamp when this caller's
         // link was configured with `time=true`. pvxs
         // `pvalink_lset.cpp:427` copies the latched remote NT
@@ -1439,7 +1393,10 @@ impl LinkSet for PvaLinkResolver {
         link.time_stamp(&field)
     }
 
-    fn link_metadata(&self, name: &str) -> Option<epics_base_rs::server::database::LinkMetadata> {
+    async fn link_metadata(
+        &self,
+        name: &str,
+    ) -> Option<epics_base_rs::server::database::LinkMetadata> {
         // surface the remote display/control/valueAlarm
         // metadata, DBF type and element count through the DB link
         // API, mirroring the pvxs pvalink lset metadata getter set
@@ -1462,14 +1419,11 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let field = cfg.field.clone();
-        let link = block_in_place_or_warn(|| {
-            self.handle
-                .block_on(async { self.registry.get_or_open(cfg).await.ok() })
-        })?;
+        let link = async { self.registry.get_or_open(cfg).await.ok() }.await?;
         link.link_metadata_with(&field)
     }
 
-    fn link_names(&self) -> Vec<String> {
+    async fn link_names(&self) -> Vec<String> {
         // The [`LinkSet::link_names`] enumeration contract: surface one
         // identity per opened INP monitor variant, for link introspection.
         // NOT consumed by the iocInit external-link wait — that wait is
@@ -2834,7 +2788,7 @@ mod tests {
         assert_eq!(resolver.inp_cfg_for("UNSEEN").sevr, SevrMode::Nms);
     }
 
-    /// `LinkSet::link_names()` must surface the opened INP upstream PV
+    /// `LinkSet::link_names().await` must surface the opened INP upstream PV
     /// names (the lset enumeration contract), each landing on the right
     /// link when fed back through its `is_connected` companion query; OUT
     /// links are excluded (no monitor connection signal). These names are
@@ -2866,7 +2820,7 @@ mod tests {
             .registry
             .insert_for_test(&out_cfg, Arc::new(PvaLink::for_test(out_cfg.clone(), None)));
 
-        let mut names = LinkSet::link_names(&resolver);
+        let mut names = LinkSet::link_names(&resolver).await;
         names.sort();
         assert_eq!(
             names,
@@ -2877,11 +2831,11 @@ mod tests {
         // Each returned name is queryable via is_connected — the
         // round-trip identity the enumeration contract guarantees.
         assert!(
-            LinkSet::is_connected(&resolver, "FR15:CONNECTED"),
+            LinkSet::is_connected(&resolver, "FR15:CONNECTED").await,
             "cached INP link reports connected"
         );
         assert!(
-            !LinkSet::is_connected(&resolver, "FR15:PENDING"),
+            !LinkSet::is_connected(&resolver, "FR15:PENDING").await,
             "INP link with no value yet reports not connected"
         );
     }
@@ -3182,10 +3136,6 @@ mod tests {
     /// opening/queuing, not send or stage a remote PUT. Asserts the error
     /// is the `local` gate (`NotLocal` Display) rather than an incidental
     /// disconnected-write failure, so removing the gate truly fails this.
-    ///
-    /// Multi-thread runtime: `put_value` drives the async open through
-    /// `block_in_place` + `block_on`, which a current-thread runtime
-    /// rejects (matching the typed-array OUT tests below).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn b4_local_out_put_value_rejects_non_local_pv() {
         let db = Arc::new(PvDatabase::new());
@@ -3195,7 +3145,8 @@ mod tests {
             "pva://NOT:A:LOCAL:RECORD?local=true",
             EpicsValue::Double(1.0),
             LinkPutOp::Plain,
-        );
+        )
+        .await;
         let err = r.expect_err("local=true OUT put to a non-local PV must fail");
         assert!(
             err.contains("has no matching local record"),
@@ -3776,42 +3727,43 @@ mod tests {
             .open_link_for_record("pva://VAR:PV?proc=CP&Q=64", "REC:Q64")
             .await;
 
-        let targets = resolver.scan_targets.read();
-        let key_q1 = MonitorKey {
-            pv_name: "VAR:PV".to_string(),
-            pipeline: false,
-            queue_size: 1,
-        };
-        let key_q64 = MonitorKey {
-            pv_name: "VAR:PV".to_string(),
-            pipeline: false,
-            queue_size: 64,
-        };
-        let fan_q1 = targets
-            .get(&key_q1)
-            .expect("Q=1 variant must have its own scan fan-out");
-        let fan_q64 = targets
-            .get(&key_q64)
-            .expect("Q=64 variant must have its own scan fan-out");
-        assert_eq!(
-            fan_q1.records.len(),
-            1,
-            "Q=1 fan-out must hold only its own record"
-        );
-        assert_eq!(fan_q1.records[0].record, "REC:Q1");
-        assert_eq!(
-            fan_q64.records.len(),
-            1,
-            "Q=64 fan-out must not inherit the Q=1 record"
-        );
-        assert_eq!(fan_q64.records[0].record, "REC:Q64");
-        drop(targets);
+        {
+            let targets = resolver.scan_targets.read();
+            let key_q1 = MonitorKey {
+                pv_name: "VAR:PV".to_string(),
+                pipeline: false,
+                queue_size: 1,
+            };
+            let key_q64 = MonitorKey {
+                pv_name: "VAR:PV".to_string(),
+                pipeline: false,
+                queue_size: 64,
+            };
+            let fan_q1 = targets
+                .get(&key_q1)
+                .expect("Q=1 variant must have its own scan fan-out");
+            let fan_q64 = targets
+                .get(&key_q64)
+                .expect("Q=64 variant must have its own scan fan-out");
+            assert_eq!(
+                fan_q1.records.len(),
+                1,
+                "Q=1 fan-out must hold only its own record"
+            );
+            assert_eq!(fan_q1.records[0].record, "REC:Q1");
+            assert_eq!(
+                fan_q64.records.len(),
+                1,
+                "Q=64 fan-out must not inherit the Q=1 record"
+            );
+            assert_eq!(fan_q64.records[0].record, "REC:Q64");
+        }
 
         // Both monitor variants must appear in the iocInit wait set,
         // each rendered as an identity that round-trips back to its own
         // variant; the default-Q form is bare, non-default carries the
         // query.
-        let mut names = resolver.link_names();
+        let mut names = resolver.link_names().await;
         names.sort();
         assert_eq!(
             names,
@@ -4108,18 +4060,18 @@ mod tests {
         // MAJOR severity propagate.
         let nms_name = "pva://MR_R15:PV";
         assert_eq!(
-            LinkSet::alarm_severity(&resolver, nms_name),
+            LinkSet::alarm_severity(&resolver, nms_name).await,
             None,
             "an NMS caller must not propagate the remote alarm"
         );
         let ms_name = "pva://MR_R15:PV?sevr=MS";
         assert_eq!(
-            LinkSet::alarm_severity(&resolver, ms_name),
+            LinkSet::alarm_severity(&resolver, ms_name).await,
             Some(2),
             "an MS caller must see MAJOR even though the cached link is NMS"
         );
         assert_eq!(
-            LinkSet::alarm_message(&resolver, ms_name),
+            LinkSet::alarm_message(&resolver, ms_name).await,
             Some("HIGH".to_string()),
             "an MS caller must get the remote alarm message"
         );
@@ -4139,6 +4091,7 @@ mod tests {
         // `alarm_severity` calls read the cached value live and do NOT
         // latch, so the snapshot is still INVALID here.
         let pre = LinkSet::remote_alarm(&resolver, nms_name)
+            .await
             .expect("connected link reports the initial INVALID snapshot");
         assert_eq!(pre.severity, 3, "pre-read snapshot is INVALID_ALARM");
         assert_eq!(pre.status, 14, "LINK_ALARM status");
@@ -4147,7 +4100,7 @@ mod tests {
         // A value read (the LinkSet `get_value` path = pvxs `dbGetLink` /
         // `pvaGetValue`) latches the snapshot.
         assert!(
-            LinkSet::get_value(&resolver, nms_name).is_some(),
+            LinkSet::get_value(&resolver, nms_name).await.is_some(),
             "the cached value read must succeed and latch the snapshot"
         );
 
@@ -4156,6 +4109,7 @@ mod tests {
         // LINK_ALARM(14) status, and message. The `sevr` mode does not
         // gate this path.
         let snap = LinkSet::remote_alarm(&resolver, nms_name)
+            .await
             .expect("NMS caller still gets the ungated remote alarm snapshot");
         assert_eq!(snap.severity, 2, "ungated snapshot reports remote MAJOR");
         assert_eq!(snap.status, 14, "LINK_ALARM status derived from severity");
@@ -4164,12 +4118,12 @@ mod tests {
         // The shared cached link is time=false → a bare caller adopts
         // no timestamp. A caller asking `?time=true` must adopt it.
         assert_eq!(
-            LinkSet::time_stamp(&resolver, nms_name),
+            LinkSet::time_stamp(&resolver, nms_name).await,
             None,
             "a time=false caller must not adopt the upstream timestamp"
         );
         assert_eq!(
-            LinkSet::time_stamp(&resolver, "pva://MR_R15:PV?time=true"),
+            LinkSet::time_stamp(&resolver, "pva://MR_R15:PV?time=true").await,
             Some((1_700_000_000, 42, 0x0000_0000_9000_0000)),
             "a time=true caller must adopt the upstream timestamp and the \
              zero-extended userTag"
@@ -4274,6 +4228,7 @@ mod tests {
         // Drive the OUT path through the resolver's LinkSet impl.
         let scheme_name = format!("pva://{pv_name}");
         LinkSet::put_value(&resolver, &scheme_name, value, LinkPutOp::Plain)
+            .await
             .expect("typed array OUT write must succeed");
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;

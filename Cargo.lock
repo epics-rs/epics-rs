@@ -985,6 +985,7 @@ dependencies = [
 name = "epics-base-rs"
 version = "0.23.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "clap",

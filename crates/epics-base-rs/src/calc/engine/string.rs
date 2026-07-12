@@ -444,13 +444,30 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(Extremum::Min.fold(Operands::of(args)));
                 }
 
-                CoreOp::MaxVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(if a > b { a } else { b }));
-                }
-                CoreOp::MinVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(if a < b { a } else { b }));
+                // C `MAX_VAL` / `MIN_VAL` — the `>?` / `<?` operators
+                // (`sCalcPerform.c:1296-1328`). They are NOT numeric-only: they
+                // are written in the same three-branch shape as ADD, SUB and the
+                // comparisons, which is exactly what [`Pair::of`] models. Both
+                // operands strings => strcmp, and the RESULT IS THE STRING.
+                //
+                // Compiled C: `"abc">?"abd"` = "abd", `"b"<?"a"` = "a". The port
+                // used `pop2_f64` and answered the double 0 for both.
+                //
+                // Distinct from `MAX` / `MIN` (a different opcode, W10-A1): those
+                // pre-scan n arguments; these classify a pair, and they carry no
+                // `isnan` clause — `NAN >? 5` keeps the NaN because `NAN < 5` is
+                // false, so C's `if (ps->d < ps1->d)` simply never fires.
+                CoreOp::MaxVal | CoreOp::MinVal => {
+                    let which = match core {
+                        CoreOp::MaxVal => Extremum::Max,
+                        _ => Extremum::Min,
+                    };
+                    let b = pop1(&mut stack)?;
+                    let a = pop1(&mut stack)?;
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(a, b) => StackValue::Double(which.pick(a, b)),
+                        Pair::Strings(a, b) => StackValue::Str(which.pick(a, b)),
+                    });
                 }
 
                 // Store
@@ -1682,6 +1699,21 @@ enum Extremum {
 }
 
 impl Extremum {
+    /// C's binary keep-rule, `if (ps->d < ps1->d) ps->d = ps1->d;` for `MAX_VAL`
+    /// (`sCalcPerform.c:1300`) — the LEFT operand survives unless it strictly
+    /// loses, so a tie keeps the left. `ScalcString` orders by its bytes, which is
+    /// `strcmp`: both compare unsigned bytes and a prefix sorts first.
+    ///
+    /// `MAX`/`MIN`'s n-ary [`Self::fold`] cannot use this: it carries an extra
+    /// `isnan(d)` clause that `MAX_VAL`/`MIN_VAL` do not have.
+    fn pick<T: PartialOrd>(self, a: T, b: T) -> T {
+        let right_wins = match self {
+            Extremum::Max => a < b,
+            Extremum::Min => a > b,
+        };
+        if right_wins { b } else { a }
+    }
+
     /// C's `MAX` / `MIN` fold (`sCalcPerform.c:1930-1962`), walking DOWN the stack
     /// from the top exactly as C does.
     ///

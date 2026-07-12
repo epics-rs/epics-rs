@@ -348,9 +348,8 @@ impl Default for FloatFormat {
     }
 }
 
-/// Integer formatting requested via `-0x` / `-0o` / `-0b` (base for
-/// integer types) and `-lx` / `-lo` / `-lb` (round-float-to-long
-/// then print in base). C tool default is decimal.
+/// A `sprint_long` output base — C `tool_lib.c`'s `IntFormatT`
+/// (`dec` / `bin` / `oct` / `hex`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntStyle {
     Dec,
@@ -359,14 +358,50 @@ pub enum IntStyle {
     Bin,
 }
 
+/// Resolve one C base flag group (`-0x`/`-0o`/`-0b`, or `-lx`/`-lo`/`-lb`)
+/// into its [`IntStyle`], mirroring C's `switch ((char) *optarg)`
+/// (`caget.c:486-495`, `camonitor.c:327-336`). No flag of the group given →
+/// `Dec`, C's default for both `outTypeI` and `outTypeF`. The three flags of
+/// a group are mutually exclusive at the clap layer, so at most one is set.
+pub fn base_style(hex: bool, oct: bool, bin: bool) -> IntStyle {
+    match (hex, oct, bin) {
+        (true, _, _) => IntStyle::Hex,
+        (_, true, _) => IntStyle::Oct,
+        (_, _, true) => IntStyle::Bin,
+        _ => IntStyle::Dec,
+    }
+}
+
 /// Per-tool CLI formatting state.
+///
+/// C keeps the integer base and the float base in TWO independent globals
+/// (`tool_lib.c:51-52`, `outTypeI` / `outTypeF`), and every tool's getopt
+/// writes exactly one of them: `-0x`/`-0o`/`-0b` sets `outTypeI`,
+/// `-lx`/`-lo`/`-lb` sets `outTypeF` (`caget.c:485-497`,
+/// `camonitor.c:325-340`). Neither flag touches the other's global, so
+/// `int_style` and `float_style` are mirrored as two separate fields — a
+/// single shared base field made `-lx` hex an integer PV (C prints it
+/// decimal) and `-0x` reach the DBR_CHAR / DBR_ENUM arms of `val2str`,
+/// which C prints with a bare `%d`.
 #[derive(Debug, Clone)]
 pub struct ValueFormat {
     pub float: FloatFormat,
+    /// C `outTypeI` — the `-0x` / `-0o` / `-0b` base. Applies to EXACTLY
+    /// the two `val2str` arms that call `sprint_long(.., outTypeI)`:
+    /// `DBR_INT` (SHORT) and `DBR_LONG` (`tool_lib.c:163-167`). `DBR_CHAR`
+    /// and the `DBR_ENUM` index are plain `sprintf("%d")`
+    /// (`tool_lib.c:160-161,187`) and never see this base; `DBR_FLOAT` /
+    /// `DBR_DOUBLE` use [`ValueFormat::float_style`].
     pub int_style: IntStyle,
-    /// Round-float-to-long-and-render in `int_style` (the `-lx` / `-lo`
-    /// / `-lb` C-tool flags). Only applies to floating-point values.
-    pub float_as_int: bool,
+    /// C `outTypeF` — the `-lx` / `-lo` / `-lb` base, applying ONLY to
+    /// `DBR_FLOAT` / `DBR_DOUBLE`. `Dec` (the default) means the value
+    /// renders through the `-e`/`-f`/`-g` `dblFormatStr`; any other base
+    /// means C rounds it half-away-from-zero into a `dbr_long_t` and
+    /// prints that with `sprint_long(.., outTypeF)` (`tool_lib.c:138-158`).
+    /// Folding this into a separate field makes the old
+    /// `float_as_int: bool` + shared-base pair — whose inconsistent
+    /// combinations were the defect — unrepresentable.
+    pub float_style: IntStyle,
     /// `-n` flag: print enum value as its integer index instead of
     /// the menu string.
     pub enum_as_number: bool,
@@ -387,7 +422,7 @@ impl Default for ValueFormat {
         Self {
             float: FloatFormat::default(),
             int_style: IntStyle::Dec,
-            float_as_int: false,
+            float_style: IntStyle::Dec,
             enum_as_number: false,
             char_array_as_string: false,
             max_elements: None,
@@ -427,24 +462,24 @@ pub fn format_value(
         // plain integer formatter is correct — no wide-unsigned path needed.
         EpicsValue::UShort(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::ULong(n) => format_int_i64(*n as i64, fmt.int_style),
-        EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
+        EpicsValue::Char(n) => format_char((*n as i8) as i64),
         // epicsUInt8 formats unsigned (0xFF -> 255), unlike the signed `Char`.
-        EpicsValue::UChar(n) => format_int_i64(*n as i64, fmt.int_style),
+        EpicsValue::UChar(n) => format_char(*n as i64),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         // Transient NTEnum carrier never reaches CA serialization (coerced in
         // base at the link-write boundary); format its index like a DBF_ENUM.
         EpicsValue::EnumWithChoices { index, .. } => format_enum(*index as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
         EpicsValue::Double(x) => format_float(*x, fmt),
-        EpicsValue::ShortArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::ShortArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
             sep,
             req_elems_present,
         ),
-        EpicsValue::LongArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::LongArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
             sep,
@@ -466,15 +501,15 @@ pub fn format_value(
             sep,
             req_elems_present,
         ),
-        EpicsValue::UShortArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::UShortArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
             sep,
             req_elems_present,
         ),
-        EpicsValue::ULongArray(arr) => render_array_int(
-            arr.iter().map(|&n| n as i64),
+        EpicsValue::ULongArray(arr) => render_array_iter(
+            arr.iter().map(|&n| format_int_i64(n as i64, fmt.int_style)),
             arr.len(),
             fmt,
             sep,
@@ -482,8 +517,8 @@ pub fn format_value(
         ),
         // DBF_UCHAR[] is numeric unsigned-byte image data: render each element
         // unsigned (0xFF -> 255), not the signed-i8 / long-string CharArray path.
-        EpicsValue::UCharArray(arr) => render_array_int(
-            arr.iter().map(|&b| b as i64),
+        EpicsValue::UCharArray(arr) => render_array_iter(
+            arr.iter().map(|&b| format_char(b as i64)),
             arr.len(),
             fmt,
             sep,
@@ -524,8 +559,8 @@ pub fn format_value(
                 let end = arr.iter().position(|&b| b == 0).unwrap_or(arr.len());
                 escape_from_raw(&arr[..end])
             } else {
-                render_array_int(
-                    arr.iter().map(|&b| (b as i8) as i64),
+                render_array_iter(
+                    arr.iter().map(|&b| format_char((b as i8) as i64)),
                     arr.len(),
                     fmt,
                     sep,
@@ -543,24 +578,6 @@ pub fn format_value(
             parts.join(&sep.to_string())
         }
     }
-}
-
-fn render_array_int<I: Iterator<Item = i64>>(
-    iter: I,
-    total: usize,
-    fmt: &ValueFormat,
-    sep: char,
-    req_elems_present: bool,
-) -> String {
-    let take = fmt.max_elements.unwrap_or(total).min(total);
-    let mut parts = Vec::with_capacity(take + 1);
-    if req_elems_present || total > 1 {
-        parts.push(total.to_string());
-    }
-    for n in iter.take(take) {
-        parts.push(format_int_i64(n, fmt.int_style));
-    }
-    parts.join(&sep.to_string())
 }
 
 fn render_array_iter<I: Iterator<Item = String>>(
@@ -590,7 +607,25 @@ fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -
         // byte-wise escaper renders them faithfully on the CLI.
         return escape_from_raw(strs[idx as usize].as_bytes());
     }
-    format_int_i64(idx, fmt.int_style)
+    // C `val2str`'s DBR_ENUM arm prints a bare index with `sprintf("%d")`
+    // (`tool_lib.c:187`) — the `-0x`/`-0o`/`-0b` base (`outTypeI`) is
+    // reserved for the DBR_INT / DBR_LONG arms and never reaches here.
+    // `caget -n` / `camonitor -n` on a native ENUM field re-request the
+    // value as DBR_TIME_INT (`caget.c:179`, `camonitor.c:159`), so those
+    // DO carry the base — but they arrive as a SHORT carrier, not as this
+    // one. Only a request that keeps the ENUM type (`caget -d DBR_ENUM`,
+    // `-d DBR_GR_ENUM -n`) lands here, and C prints those in decimal.
+    format_int_i64(idx, IntStyle::Dec)
+}
+
+/// C `val2str`'s `DBR_CHAR` arm: `sprintf(str, "%d", ch)` — a bare decimal,
+/// unconditionally (`tool_lib.c:160-161`). Unlike `DBR_INT` / `DBR_LONG`,
+/// a CHAR value NEVER goes through `sprint_long`, so `-0x` / `-0o` / `-0b`
+/// leave it alone: `caget -0x` on a CHAR PV holding `0xFF` prints `-1`, not
+/// `0xFFFFFFFF`. Both CA-CHAR carriers (signed `Char`, unsigned `UChar`)
+/// share the arm; the caller supplies the already-widened value.
+fn format_char(n: i64) -> String {
+    format_int_i64(n, IntStyle::Dec)
 }
 
 /// Port of EPICS `epicsStrnEscapedFromRaw` (`epicsString.c:120-159`):
@@ -668,10 +703,15 @@ fn format_int_wide(decimal: String, bits: u64, style: IntStyle) -> String {
 }
 
 fn format_float(x: f64, fmt: &ValueFormat) -> String {
-    if fmt.float_as_int {
-        // C tool: round-half-to-even via `lroundl`, then format as int.
+    if fmt.float_style != IntStyle::Dec {
+        // C `val2str` (`tool_lib.c:138-158`): a non-`dec` `outTypeF` rounds
+        // the value half-away-from-zero (`x > 0 ? x + 0.5 : x - 0.5`, then a
+        // truncating cast to `dbr_long_t`) and prints it with
+        // `sprint_long(.., outTypeF)`. `f64::round` is the same
+        // half-away-from-zero rule. The INTEGER base (`outTypeI`) plays no
+        // part here.
         let rounded = if x.is_nan() { 0i64 } else { x.round() as i64 };
-        return format_int_i64(rounded, fmt.int_style);
+        return format_int_i64(rounded, fmt.float_style);
     }
     if !x.is_finite() {
         // C printf prints "nan" / "inf" / "-inf"; Rust matches by
@@ -982,10 +1022,129 @@ mod tests {
     fn float_as_int_rounds_then_renders() {
         let v = EpicsValue::Double(1234.6);
         let mut fmt = fmt_default();
-        fmt.float_as_int = true;
-        fmt.int_style = IntStyle::Hex;
+        // C `-lx` sets outTypeF only (caget.c:493-496).
+        fmt.float_style = IntStyle::Hex;
         // 1235 = 0x4D3 (sprint_long uses uppercase %X)
         assert_eq!(format_value(&v, &fmt, None, false), "0x4D3");
+    }
+
+    /// C `val2str` routes DBR_CHAR through `sprintf("%d", ch)`
+    /// (`tool_lib.c:160-161`), NOT through `sprint_long(.., outTypeI)` —
+    /// only DBR_INT / DBR_LONG take the `-0x`/`-0o`/`-0b` base. Every CHAR
+    /// carrier (scalar and array, signed `Char` and unsigned `UChar`) is
+    /// therefore plain decimal whatever the base flag says.
+    ///
+    /// Pre-fix: `caget -0x` on a CHAR PV holding 0xFF printed `0xFFFFFFFF`;
+    /// C prints `-1`.
+    #[test]
+    fn char_ignores_the_int_base_flag() {
+        for style in [IntStyle::Hex, IntStyle::Oct, IntStyle::Bin, IntStyle::Dec] {
+            let mut fmt = fmt_default();
+            fmt.int_style = style;
+            // Signed CHAR carrier: 0xFF is -1 as a C `char`.
+            assert_eq!(
+                format_value(&EpicsValue::Char(0xFF), &fmt, None, false),
+                "-1",
+                "DBR_CHAR is %d, never sprint_long ({style:?})"
+            );
+            assert_eq!(
+                format_value(&EpicsValue::UChar(255), &fmt, None, false),
+                "255",
+                "the unsigned CHAR carrier is %d too ({style:?})"
+            );
+            assert_eq!(
+                format_value(&EpicsValue::CharArray(vec![255, 1]), &fmt, None, false),
+                "2 -1 1",
+                "a CHAR array renders every element via the same %d arm ({style:?})"
+            );
+            assert_eq!(
+                format_value(&EpicsValue::UCharArray(vec![255, 1]), &fmt, None, false),
+                "2 255 1",
+                "an unsigned CHAR array likewise ({style:?})"
+            );
+        }
+        // Negative control: DBR_INT / DBR_LONG DO carry the base — the
+        // integer arms are the ones C hands to `sprint_long(.., outTypeI)`.
+        let mut hex = fmt_default();
+        hex.int_style = IntStyle::Hex;
+        assert_eq!(
+            format_value(&EpicsValue::Short(-1), &hex, None, false),
+            "0xFFFFFFFF"
+        );
+        assert_eq!(
+            format_value(&EpicsValue::Long(-1), &hex, None, false),
+            "0xFFFFFFFF"
+        );
+        assert_eq!(
+            format_value(&EpicsValue::LongArray(vec![-1]), &hex, None, true),
+            "1 0xFFFFFFFF"
+        );
+    }
+
+    /// C `val2str`'s DBR_ENUM arm prints the index with a bare `sprintf("%d")`
+    /// (`tool_lib.c:187`), so an ENUM index never carries the `-0x` base
+    /// either. (`caget -n` on a native ENUM field re-requests DBR_TIME_INT,
+    /// which arrives as a SHORT carrier and DOES carry the base — that is the
+    /// negative control in [`char_ignores_the_int_base_flag`].)
+    #[test]
+    fn enum_index_ignores_the_int_base_flag() {
+        let mut fmt = fmt_default();
+        fmt.int_style = IntStyle::Hex;
+        // No labels available (`caget -d DBR_ENUM`): C prints the index.
+        assert_eq!(
+            format_value(&EpicsValue::Enum(255), &fmt, None, false),
+            "255"
+        );
+        // `-n` with labels present (`-d DBR_GR_ENUM -n`): still the index.
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
+        fmt.enum_as_number = true;
+        assert_eq!(
+            format_value(&EpicsValue::Enum(1), &fmt, Some(&strs), false),
+            "1"
+        );
+    }
+
+    /// The two C base globals are independent (`outTypeI` / `outTypeF`):
+    /// `-lx` must NOT hex an integer PV, and `-0x` must NOT hex a float PV.
+    /// Pre-fix both flags wrote one shared `int_style`, so `-lx` on a LONG PV
+    /// printed hex where C prints decimal.
+    #[test]
+    fn int_and_float_bases_do_not_cross() {
+        // `-lx`: outTypeF = hex, outTypeI stays dec.
+        let mut lx = fmt_default();
+        lx.float_style = IntStyle::Hex;
+        assert_eq!(
+            format_value(&EpicsValue::Long(1235), &lx, None, false),
+            "1235",
+            "-lx leaves DBR_LONG on outTypeI = dec"
+        );
+        assert_eq!(
+            format_value(&EpicsValue::Double(1234.6), &lx, None, false),
+            "0x4D3",
+            "-lx rounds the float and prints it in outTypeF"
+        );
+        // `-0x`: outTypeI = hex, outTypeF stays dec → the float keeps %g.
+        let mut ix = fmt_default();
+        ix.int_style = IntStyle::Hex;
+        assert_eq!(
+            format_value(&EpicsValue::Long(1235), &ix, None, false),
+            "0x4D3"
+        );
+        assert_eq!(
+            format_value(&EpicsValue::Double(1234.6), &ix, None, false),
+            "1234.6",
+            "-0x leaves DBR_DOUBLE on outTypeF = dec (the -e/-f/-g format)"
+        );
+    }
+
+    /// C's base resolution: the flag letter picks the base, no flag → `dec`
+    /// (`caget.c:486-495`).
+    #[test]
+    fn base_style_resolves_c_out_type() {
+        assert_eq!(base_style(true, false, false), IntStyle::Hex);
+        assert_eq!(base_style(false, true, false), IntStyle::Oct);
+        assert_eq!(base_style(false, false, true), IntStyle::Bin);
+        assert_eq!(base_style(false, false, false), IntStyle::Dec);
     }
 
     #[test]

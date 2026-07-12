@@ -1,22 +1,13 @@
-use chrono::{DateTime, Local};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_value, sevr_to_str,
-    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_time, format_value,
+    sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::copt::CTool;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
-
-fn format_server_timestamp(ts: WallTime) -> String {
-    // Display only, to microseconds (`%.6f`), so converting through
-    // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
-    let dt: DateTime<Local> = SystemTime::from(ts).into();
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
 
 /// One `Old : ...` / `New : ...` line in long-mode shape:
 ///   `{name-padded}<sep><ts>{sep}<value>{sep}{stat?}{sep}{sevr?}`
@@ -37,7 +28,7 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
         enum_strings,
         CountPrefix::IfRequestedOrArray,
     );
-    let ts = format_server_timestamp(snap.timestamp);
+    let ts = format_time(snap.timestamp);
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
     if stat == 0 && sevr == 0 {
@@ -55,7 +46,7 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
 /// time (`epicsTimeGetCurrent`, `tool_lib.c:514-515`), not a server timestamp
 /// — a failed read carries no server response to take one from.
 fn format_client_timestamp() -> String {
-    format_server_timestamp(SystemTime::now().into())
+    format_time(SystemTime::now().into())
 }
 
 /// The SINGLE owner of what a `caput` readback may write to STDERR.

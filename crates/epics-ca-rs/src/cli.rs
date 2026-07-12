@@ -235,6 +235,48 @@ pub const NO_DATA_MARKER: &str = "*** no data available (timeout)";
 /// [`zero_dbr_snapshot`]).
 pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
 
+/// C `tool_lib.c:52` `timeFormatStr` — the ONE format every CA tool passes to
+/// `epicsTimeToStrftime` for an absolute stamp (`caget -a`, `caget -d
+/// DBR_TIME_*`, `caput -l`, every `camonitor` line, and the `*** disconnected`
+/// / `*** CA error` lines at `tool_lib.c:515-529`).
+///
+/// This is the single owner of that rendering. The fractional field is NOT
+/// what `chrono`'s `%.6f` produces: C ROUNDS the nanoseconds into the
+/// requested width, and clamps so the rounding can never carry into the whole
+/// seconds (`epicsTime.cpp:233-238`, W10-B4):
+///
+/// ```c
+/// unsigned long frac = pTS->nsec + div[fracWid] / 2;   /* div[6] == 1000 */
+/// if (frac >= nSecPerSec)
+///     frac = nSecPerSec - 1;                           /* never carries */
+/// frac /= div[fracWid];
+/// ```
+///
+/// so `nsec = 1_500` prints `.000002` (chrono truncated it to `.000001`), and
+/// `nsec = 999_999_600` prints `.999999` on the SAME second rather than
+/// rolling the clock forward.
+pub fn format_time(ts: WallTime) -> String {
+    use chrono::{DateTime, Local, TimeZone};
+
+    // Round to microseconds the way C does, then clamp: `frac` can reach
+    // 1e9 only by rounding up, and C refuses to let that touch the seconds.
+    let frac = u64::from(ts.subsec_nanos()) + 500;
+    let usec = frac.min(999_999_999) / 1_000;
+
+    // The whole seconds are formatted from the stamp with a ZERO fraction:
+    // C runs `strftime` on the `tm` and prints the fraction itself, so the
+    // seconds field must never see the rounded-up value.
+    let secs = i64::try_from(ts.unix_secs()).unwrap_or(i64::MAX);
+    let dt: DateTime<Local> = match Local.timestamp_opt(secs, 0).single() {
+        Some(dt) => dt,
+        // Unrepresentable instant: C's `strftime` would print garbage rather
+        // than fail. Nothing on the CA wire can produce one (a u32
+        // `secPastEpoch` tops out in 2106), so fall back to the epoch.
+        None => Local.timestamp_opt(0, 0).unwrap(),
+    };
+    format!("{}.{usec:06}", dt.format("%Y-%m-%d %H:%M:%S"))
+}
+
 /// The value carrier of a CA request DBR code — the type C's
 /// `dbr_size_n(dbrType, nElems)` sizes its buffer from (`db_access.h`).
 /// Codes 0..=34 repeat the seven base types every 7 codes (`STRING SHORT
@@ -1449,6 +1491,66 @@ mod tests {
             format_value(&one, &fmt, None, CountPrefix::IfRequestedOrArray),
             "1 200",
             "C: `caget -# -3 TST:LO` → `1 200`"
+        );
+    }
+
+    /// W10-B4. C rounds the nanoseconds into the fractional field and CLAMPS
+    /// so the rounding can never carry into the whole seconds
+    /// (`epicsTime.cpp:233-238`); `chrono`'s `%.6f` truncates. Boundary cases
+    /// of `frac = nsec + 500`, one per boundary rather than one per scenario:
+    #[test]
+    fn microseconds_round_with_c_and_never_carry_into_the_seconds() {
+        // A fixed second whose local rendering we do not depend on: assert
+        // only the fractional field, which is timezone-independent.
+        let frac = |nsec: u32| {
+            let s = format_time(WallTime::from_unix(EPICS_EPOCH_UNIX_SECS + 1, nsec));
+            s.rsplit_once('.')
+                .expect("a fractional field")
+                .1
+                .to_string()
+        };
+        let secs = |nsec: u32| {
+            let s = format_time(WallTime::from_unix(EPICS_EPOCH_UNIX_SECS + 1, nsec));
+            s.rsplit_once('.')
+                .expect("a whole-seconds field")
+                .0
+                .to_string()
+        };
+
+        // Below / at / above the half-microsecond rounding boundary.
+        assert_eq!(frac(1_000), "000001");
+        assert_eq!(frac(1_499), "000001", "rounds down");
+        assert_eq!(frac(1_500), "000002", "rounds up; truncation gave 000001");
+        assert_eq!(frac(1_501), "000002");
+        // Zero and the exact microsecond.
+        assert_eq!(frac(0), "000000");
+        assert_eq!(frac(499), "000000");
+        assert_eq!(frac(500), "000001");
+        // The clamp: rounding up out of range must NOT advance the second.
+        assert_eq!(frac(999_999_499), "999999");
+        assert_eq!(
+            frac(999_999_500),
+            "999999",
+            "C clamps to nSecPerSec-1 rather than carrying"
+        );
+        assert_eq!(frac(999_999_999), "999999");
+        assert_eq!(
+            secs(999_999_999),
+            secs(0),
+            "the whole second is the same on both sides of the clamp"
+        );
+
+        // The rendering this replaced, pinned so the divergence stays visible:
+        // every tool formatted the stamp with `chrono`'s `%.6f`, which
+        // TRUNCATES. On the boundary above it printed one microsecond less
+        // than C.
+        let dt: chrono::DateTime<chrono::Local> =
+            std::time::SystemTime::from(WallTime::from_unix(EPICS_EPOCH_UNIX_SECS + 1, 1_500))
+                .into();
+        assert_eq!(
+            dt.format("%.6f").to_string(),
+            ".000001",
+            "chrono truncates; C rounds to .000002"
         );
     }
 }

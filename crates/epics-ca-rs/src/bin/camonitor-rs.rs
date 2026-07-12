@@ -2,12 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str,
-    stat_to_str,
+    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_time, format_value,
+    sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 use epics_ca_rs::copt::CTool;
@@ -304,9 +303,11 @@ async fn main() {
     }
 }
 
+/// camonitor's whole timestamp domain is `SystemTime` (it diffs client and
+/// server stamps for `-t r`/`-t i`), so this adapts into the shared
+/// `epicsTimeToStrftime` owner rather than re-implementing its rounding.
 fn format_server_timestamp(ts: SystemTime) -> String {
-    let dt: DateTime<Local> = ts.into();
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+    format_time(ts.into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -341,7 +342,9 @@ async fn monitor_pv(
                     flag.store(true, Ordering::Release);
                 }
                 ConnectionEvent::Disconnected => {
-                    let now = Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
+                    // C `tool_lib.c:515` stamps this line with
+                    // `epicsTimeGetCurrent` through the same formatter.
+                    let now = format_server_timestamp(SystemTime::now());
                     // C `tool_lib.c::print_time_val_sts` ECA_DISCONN
                     // branch: `name <sep> ts *** disconnected`. Pad the
                     // name to 30 only with the default space separator.

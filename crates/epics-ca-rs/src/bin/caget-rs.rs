@@ -1,11 +1,10 @@
-use chrono::{DateTime, Local};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG, WallTime};
+use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG};
 use epics_ca_rs::cli::{
     CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
-    ca_error_marker, dbr_value_field_type, format_c_g, format_value, sevr_to_str, stat_to_str,
-    zero_dbr_snapshot, zero_dbr_value,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_time, format_value, sevr_to_str,
+    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -361,13 +360,6 @@ enum GetResult {
     },
 }
 
-fn format_server_timestamp(ts: WallTime) -> String {
-    // Display only, to microseconds (`%.6f`), so converting through
-    // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
-    let dt: DateTime<Local> = SystemTime::from(ts).into();
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-}
-
 /// C `dbf_type_to_text`: native field type → `DBF_*` mnemonic.
 fn dbf_text(t: DbFieldType) -> &'static str {
     match t {
@@ -467,7 +459,7 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
         // TIME_* (14..=20): timestamp then status + severity.
         14..=20 => format!(
             "    Timestamp:        {}\n{sts}",
-            format_server_timestamp(snap.timestamp)
+            format_time(snap.timestamp)
         ),
         // GR_ENUM (24) / CTRL_ENUM (31): status/severity then the enum
         // state table (C `PRN_DBR_X_ENUM`).
@@ -707,7 +699,7 @@ fn read_error(e: &CaError) -> ReadError {
 /// time (`epicsTimeGetCurrent`, `tool_lib.c:514-515`), not with a server
 /// timestamp — there is no server response to take one from.
 fn format_client_timestamp() -> String {
-    format_server_timestamp(SystemTime::now().into())
+    format_time(SystemTime::now().into())
 }
 
 /// Print one PV's error line in the shape its output format uses.
@@ -1067,7 +1059,7 @@ async fn main() {
                     CountPrefix::IfRequestedOrArray,
                 );
                 let is_scalar = snap.value.count() == 1;
-                let ts = format_server_timestamp(snap.timestamp);
+                let ts = format_time(snap.timestamp);
                 let stat = snap.alarm.status;
                 let sevr = snap.alarm.severity;
                 if stat == 0 && sevr == 0 {

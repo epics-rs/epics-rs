@@ -46,7 +46,12 @@ use super::wiring::{WiringRegistry, upstream_key};
 enum PluginParamMsg {
     /// A param write to apply.
     Change(usize, i32, ParamChangeValue),
-    /// Sync barrier — acknowledged (best-effort send of `()`) when consumed.
+    /// Sync barrier — acknowledged (best-effort send of `()`) at full
+    /// quiescence: every `Change` enqueued before it has been applied (FIFO
+    /// channel) AND the array queue has drained. The second condition exists
+    /// because arrays travel a separate channel: without it, a param applied
+    /// while an older array still waits in the queue would retroactively
+    /// change how that array is processed.
     Barrier(std::sync::mpsc::SyncSender<()>),
 }
 
@@ -1595,9 +1600,13 @@ impl PluginRuntimeHandle {
     /// applies it (the EnableCallbacks flip, NDArrayPort/NDArrayAddr rewiring,
     /// processor param updates) asynchronously. This is the fence between the
     /// two planes: it enqueues a barrier behind every already-queued change
-    /// and waits for the data thread to consume it — the param channel is
-    /// FIFO, so consumption of the barrier implies every earlier change is
-    /// fully applied.
+    /// and waits for the data thread to acknowledge it — the param channel is
+    /// FIFO, so the ack implies every earlier change is fully applied.
+    ///
+    /// The ack additionally waits for the array queue to drain, so it also
+    /// implies every array published before this call has been fully handled
+    /// (processed or throttled). Under continuous array traffic the ack is
+    /// therefore delayed until the queue momentarily empties.
     ///
     /// Returns `false` if the data thread has exited or `timeout` elapsed.
     pub fn wait_params_applied(&self, timeout: std::time::Duration) -> bool {
@@ -1867,8 +1876,22 @@ fn plugin_data_loop<P: NDPluginProcess>(
         // reroutes past full consumers. One per plugin instance, for its
         // lifetime — matching `nextClient_(1)` set once at construction.
         let mut scatter_cursor: usize = 0;
+        // Barriers held until the array queue drains. A barrier acks only at
+        // full quiescence — params applied AND no queued arrays — because a
+        // param applied while an older array still waits in the queue would
+        // retroactively change that array's processing (e.g. a
+        // MinCallbackTime reset un-throttling it). See `PluginParamMsg`.
+        let mut held_barriers: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
 
         loop {
+            // Release held barriers once the array queue is empty. This runs
+            // after every arm, and the single-task loop guarantees any
+            // already-dequeued array has fully finished processing by now.
+            if !held_barriers.is_empty() && array_rx.pending() == 0 {
+                for ack in held_barriers.drain(..) {
+                    let _ = ack.try_send(());
+                }
+            }
             tokio::select! {
                 msg = array_rx.recv_msg() => {
                     match msg {
@@ -1931,10 +1954,12 @@ fn plugin_data_loop<P: NDPluginProcess>(
                 param = param_rx.recv() => {
                     match param {
                         // Barrier: every Change enqueued before it has been
-                        // applied by the arms below (FIFO channel). Ack and
-                        // move on; a gone waiter is not an error.
+                        // applied by the arms below (FIFO channel). Ack is
+                        // deferred to the top-of-loop release, which also
+                        // requires the array queue to be drained — a gone
+                        // waiter is not an error.
                         Some(PluginParamMsg::Barrier(ack)) => {
-                            let _ = ack.try_send(());
+                            held_barriers.push(ack);
                         }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
                             if reason == enable_callbacks_reason {
@@ -3014,6 +3039,10 @@ mod tests {
         send_array(handle.array_sender(), make_test_array(2));
 
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
+        // Fence the array queue: array 2 must have been consumed (throttled
+        // out) before the negative checks below, or they could false-pass on
+        // a not-yet-processed frame.
+        params_applied(&handle);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3215,6 +3244,10 @@ mod tests {
 
         // Array 1 was processed and emitted; array 2 was throttled out.
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 1);
+        // Fence the ARRAY queue: array 2 must be consumed (and throttled out)
+        // under the 10s gate before the reset below un-gates it. The barrier
+        // acks only once the array queue has drained.
+        params_applied(&handle);
 
         // ProcessPlugin re-injects the cached input. The cache must still hold
         // array 1, because array 2 never passed the throttle gate. The

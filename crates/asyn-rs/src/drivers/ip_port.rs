@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
+use super::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::com::{ComInterpose, ComPortOptions};
@@ -1446,17 +1447,9 @@ impl PortDriver for DrvAsynIPPort {
             // (default on via IpPortConfig::parse, matching C; settable off
             // here). Its value is validated strictly Y/N (case-insensitive)
             // like every other option value, so a typo errors instead of
-            // silently coercing to "off".
-            let enabled = if value.eq_ignore_ascii_case("Y") {
-                true
-            } else if value.eq_ignore_ascii_case("N") {
-                false
-            } else {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("Invalid noDelay value: '{value}'"),
-                });
-            };
+            // silently coercing to "off" — and it reports in C's words
+            // ("Invalid <key> value."), like every other option.
+            let enabled = parse_yn_option("noDelay", value)?;
             self.config.no_delay = enabled;
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
@@ -1466,16 +1459,7 @@ impl PortDriver for DrvAsynIPPort {
             // (case-insensitive) are valid; any other value returns
             // asynError "Invalid disconnectOnReadTimeout value." rather
             // than silently coercing the unknown text to "off".
-            if value.eq_ignore_ascii_case("Y") {
-                self.disconnect_on_read_timeout = true;
-            } else if value.eq_ignore_ascii_case("N") {
-                self.disconnect_on_read_timeout = false;
-            } else {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("Invalid disconnectOnReadTimeout value: '{value}'"),
-                });
-            }
+            self.disconnect_on_read_timeout = parse_yn_option("disconnectOnReadTimeout", value)?;
         } else if key.eq_ignore_ascii_case("hostInfo") {
             // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
             //
@@ -2850,11 +2834,38 @@ mod tests {
             .set_option(&mut AsynUser::default(), "bogusKey", "value")
             .unwrap_err();
         assert!(matches!(err, AsynError::OptionNotFound(_)));
+        // R11-49: reported in C's words (drvAsynIPPort.c:903-904).
+        assert_eq!(err.message(), "Unsupported key \"bogusKey\"");
         assert!(drv.get_option("bogusKey").is_err());
 
         // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
         drv.set_option(&mut AsynUser::default(), "", "ignored")
             .unwrap();
+    }
+
+    /// R11-49: the IP driver's own invalid-value texts are C's
+    /// (drvAsynIPPort.c:932-933), and the Rust-only `noDelay` key follows the
+    /// same shape rather than inventing a third format.
+    #[test]
+    fn every_ip_option_reports_cs_text() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        assert_eq!(
+            drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "maybe")
+                .unwrap_err()
+                .message(),
+            "Invalid disconnectOnReadTimeout value."
+        );
+        assert_eq!(
+            drv.set_option(&mut AsynUser::default(), "noDelay", "1")
+                .unwrap_err()
+                .message(),
+            "Invalid noDelay value."
+        );
+        // Negative control: the valid values still take.
+        drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "y")
+            .unwrap();
+        assert!(drv.disconnect_on_read_timeout);
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---

@@ -172,7 +172,13 @@ pub enum AsynError {
     #[error("already subscribed")]
     AlreadySubscribed,
 
-    #[error("option not found: {0}")]
+    /// An option key the port does not implement — C's trailing
+    /// `else if (epicsStrCaseCmp(key, "") != 0)` arm, in `setOption` and
+    /// `getOption` alike (drvAsynSerialPort.c:594-597, :1171;
+    /// drvAsynSerialPortWin32.c:341-344; drvAsynIPPort.c:902-905). The text is
+    /// C's, verbatim: it is what reaches the operator through
+    /// `pasynUser->errorMessage` and lands in the record's ERRS.
+    #[error("Unsupported key \"{0}\"")]
     OptionNotFound(String),
 
     #[error("invalid link syntax: {0}")]

@@ -40,22 +40,74 @@ pub enum SimMode {
     /// `menuSimmRAW` — as `Yes`, but the SIOL round-trip carries the RAW value
     /// (`prec->rval`), so the record's own conversion chain still runs
     /// (`aiRecord.c:494-497`, `aoRecord.c:575-577`).
+    ///
+    /// Only reachable on a record whose SIMM is `menu(menuSimm)`.
     Raw,
+    /// The `default:` arm of C's `switch (prec->simm)`: a SIMM value that is not
+    /// a choice of THIS record's SIMM menu.
+    ///
+    /// ```c
+    /// default:
+    ///     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
+    ///     status = -1;
+    /// ```
+    ///
+    /// No device I/O, no SIOL round-trip, no SIMM_ALARM, no value or UDF
+    /// change — the record's `process()` ignores the `-1` for control flow, so
+    /// `checkAlarms`/`monitor`/`recGblFwdLink` still run. Two ways in:
+    ///
+    /// * `SIMM = 2` (RAW) on one of the 13 records whose SIMM is
+    ///   `menu(menuYesNo)` — the menu has no RAW choice, so 2 hits `default:`.
+    /// * ANY out-of-menu index on ANY of them: `recGblGetSimm` reads SIML with
+    ///   `dbTryGetLink(psiml, DBR_USHORT, psimm, 0)`, which performs NO menu
+    ///   validation — a SIML pointing at a record holding 7 puts 7 in SIMM.
+    Illegal,
 }
 
 impl SimMode {
-    /// C's `switch (prec->simm)` selector.
-    pub fn from_index(simm: i16) -> Self {
-        match simm {
-            0 => SimMode::No,
-            2 => SimMode::Raw,
-            _ => SimMode::Yes,
-        }
-    }
-
     /// Whether the device I/O is substituted this cycle.
     pub fn is_simulated(self) -> bool {
         !matches!(self, SimMode::No)
+    }
+}
+
+/// Resolve a record's C `switch (prec->simm)` — **the single owner of that
+/// dispatch**, because the switch is not the same on every record and the
+/// difference is the whole of R11-C12.
+///
+/// The legal arms are the choices of THIS record's own SIMM menu:
+///
+/// * `menu(menuSimm)` (ai, ao, bi, bo, mbbi, mbbo, mbbiDirect, mbboDirect —
+///   3 choices): `case menuSimmNO / menuSimmYES / menuSimmRAW`.
+/// * `menu(menuYesNo)` (the other 13, plus busy — 2 choices):
+///   `case menuYesNoNO / menuYesNoYES`. **RAW is not a choice**, so `SIMM = 2`
+///   falls to `default:` — `recGblSetSevr(SOFT_ALARM, INVALID_ALARM)`, with no
+///   device substitution at all. The port previously ran these records' RAW
+///   branch, substituting a device read C refuses to perform.
+///
+/// swait is the one record with no `default:` arm at all
+/// (`swaitRecord.c:407-421` is a plain `if (simm == menuYesNoNO) … else …`):
+/// every non-NO value simulates. It says so via
+/// [`Record::rejects_illegal_sim_mode`](crate::server::record::Record::rejects_illegal_sim_mode).
+pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {
+    let simm = record
+        .get_field("SIMM")
+        .and_then(|v| v.to_f64())
+        .unwrap_or(0.0) as i16;
+    // The record's own SIMM menu decides which indices are legal. Every record
+    // that declares SIMM declares its menu; a record with no SIMM never reaches
+    // here (the caller's entry gate), so the fallback is inert.
+    let choices = record
+        .menu_field_choices("SIMM")
+        .map(|c| c.len())
+        .unwrap_or(0);
+    match simm {
+        0 => SimMode::No,
+        1 => SimMode::Yes,
+        2 if choices >= 3 => SimMode::Raw,
+        // swait's `else` arm: anything that is not NO simulates.
+        _ if !record.rejects_illegal_sim_mode() => SimMode::Yes,
+        _ => SimMode::Illegal,
     }
 }
 
@@ -170,13 +222,28 @@ mod tests {
     }
 
     #[test]
-    fn sim_mode_indices_match_menu_simm() {
-        assert_eq!(SimMode::from_index(0), SimMode::No);
-        assert_eq!(SimMode::from_index(1), SimMode::Yes);
-        assert_eq!(SimMode::from_index(2), SimMode::Raw);
+    fn simm_2_is_raw_on_a_menu_simm_record_and_illegal_on_a_menu_yesno_one() {
+        use crate::server::record::Record;
+        use crate::server::records::ai::AiRecord; // SIMM is menu(menuSimm)
+        use crate::server::records::longin::LonginRecord; // SIMM is menu(menuYesNo)
+
+        let mut ai = AiRecord::new(0.0);
+        let mut li = LonginRecord::new(0);
+        for (simm, ai_mode, li_mode) in [
+            (0i16, SimMode::No, SimMode::No),
+            (1, SimMode::Yes, SimMode::Yes),
+            (2, SimMode::Raw, SimMode::Illegal),
+            (7, SimMode::Illegal, SimMode::Illegal),
+        ] {
+            ai.put_field("SIMM", EpicsValue::Short(simm)).unwrap();
+            li.put_field("SIMM", EpicsValue::Short(simm)).unwrap();
+            assert_eq!(resolve_sim_mode(&ai), ai_mode, "ai SIMM={simm}");
+            assert_eq!(resolve_sim_mode(&li), li_mode, "longin SIMM={simm}");
+        }
         assert!(!SimMode::No.is_simulated());
         assert!(SimMode::Yes.is_simulated());
         assert!(SimMode::Raw.is_simulated());
+        assert!(SimMode::Illegal.is_simulated());
     }
 
     #[test]

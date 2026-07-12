@@ -898,6 +898,14 @@ impl Record for SwaitRecord {
     /// and `calcPerform()`, and nothing else: the OOPT switch (`:424`),
     /// `execOutput`, the monitors and the forward link all still run. So it is
     /// the input-STAGE shape, not the whole-cycle `readValue` of ai/bi.
+    /// `swaitRecord.c:407-421` has no `default:` arm — the simulation test is a
+    /// plain `if (pwait->simm == menuYesNoNO) { … } else { /* SIMULATION MODE */
+    /// … }`, so ANY non-NO SIMM (including the 2 that every other menuYesNo
+    /// record rejects with SOFT_ALARM/INVALID) simulates from SIOL.
+    fn rejects_illegal_sim_mode(&self) -> bool {
+        false
+    }
+
     fn simulation_substitutes_input_stage(&self) -> bool {
         true
     }

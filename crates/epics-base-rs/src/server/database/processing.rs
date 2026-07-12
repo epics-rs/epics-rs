@@ -475,6 +475,26 @@ enum SimOutcome {
     /// suppressed, then the ordinary alarm/monitor/forward-link tail — none of
     /// which C's simulation branch skips.
     SimulatedInputStage,
+    /// The `default:` arm of C's `switch (prec->simm)` — a SIMM value outside
+    /// the record's own menu (`SimMode::Illegal`):
+    ///
+    /// ```c
+    /// default:
+    ///     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
+    ///     status = -1;
+    /// ```
+    ///
+    /// SOFT_ALARM/INVALID is already raised into the record's PENDING alarm by
+    /// `check_simulation_mode`. What is left is what C's `readValue`/
+    /// `writeValue` does NOT do on this arm: no device read, no device write, no
+    /// SIOL round-trip, no SIMM_ALARM, no VAL/UDF change. The `-1` it returns is
+    /// not a control-flow abort — the record's `process()` ignores it and still
+    /// runs `checkAlarms`, `monitor` and `recGblFwdLink` — so the cycle's tail
+    /// runs either way. The two record shapes differ only in where the
+    /// suppressed I/O sat: an INPUT's `readValue` precedes the body (nothing of
+    /// the body is left to run), an OUTPUT's `writeValue` follows it (the body
+    /// runs, only the write is suppressed).
+    IllegalMode { is_output: bool },
     /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
     /// `writeValue` substitutes the device write with
     /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
@@ -1479,11 +1499,35 @@ impl PvDatabase {
         // that declares the input-stage shape (`false` included), so the flag
         // cannot outlive the cycle it belongs to.
         let mut sim_input_stage = false;
+        // C `switch (prec->simm)` `default:` on an OUTPUT record: the body runs
+        // (it is `writeValue`, at the END of `process()`, that refuses), but the
+        // device / OUT-link / SIOL write is suppressed. Set only by
+        // `SimOutcome::IllegalMode { is_output: true }`.
+        let mut sim_illegal_out = false;
         let sim_output = match self.check_simulation_mode(&rec).await {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
                 return Ok(());
+            }
+            SimOutcome::IllegalMode { is_output } => {
+                if is_output {
+                    // `writeValue` follows the body, so only the write is lost.
+                    sim_illegal_out = true;
+                    None
+                } else {
+                    // `readValue` precedes the body and IS the body's input, so
+                    // nothing of the body is left to run. SOFT_ALARM/INVALID is
+                    // already pending; commit it, post the monitors and fire the
+                    // forward link — C `process()` runs `checkAlarms`,
+                    // `monitor()` and `recGblFwdLink()` regardless of the -1.
+                    {
+                        let mut instance = rec.write().await;
+                        sim_process_tail(&mut instance, SimTailAlarm::None, false);
+                    }
+                    self.run_forward_link_tail(name, &rec, visited, depth).await;
+                    return Ok(());
+                }
             }
             SimOutcome::SimulatedInputStage => {
                 sim_input_stage = true;
@@ -2868,6 +2912,12 @@ impl PvDatabase {
                 // is applied from the OUT epilogue by `write_simulated_output_siol`
                 // (it reads the post-body OVAL/RVAL), so the normal device/OUT
                 // write is suppressed here.
+                None
+            } else if sim_illegal_out {
+                // C `writeValue` `default:` arm: `recGblSetSevr(SOFT_ALARM,
+                // INVALID_ALARM); status = -1;` — it returns BEFORE both the
+                // device write and the SIOL redirect, so this cycle performs no
+                // output at all.
                 None
             } else if skip_out {
                 None
@@ -5204,20 +5254,50 @@ impl PvDatabase {
             self.rec_gbl_get_simm(rec, &siml_link).await;
         }
 
-        // Check SIMM
+        // Check SIMM. The dispatch is the record's own C `switch (prec->simm)`,
+        // whose legal arms are the choices of ITS SIMM menu — `resolve_sim_mode`
+        // is the single owner of that fact.
         let mode = {
             let instance = rec.read().await;
-            crate::server::recgbl::simm::SimMode::from_index(
-                instance
-                    .record
-                    .get_field("SIMM")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0) as i16,
-            )
+            crate::server::recgbl::simm::resolve_sim_mode(&*instance.record)
         };
 
         if !mode.is_simulated() {
             return SimOutcome::NotSimulated; // menuSimmNO — proceed normally
+        }
+
+        // C `default:` arm — `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`
+        // and NOTHING else: the device is not substituted, SIOL is never read or
+        // written, SIMM_ALARM is not raised and VAL/UDF are untouched. Raise the
+        // alarm here (into the PENDING pair, so the body/tail maximizes against
+        // it exactly as C does) and tell the caller to suppress the record's I/O
+        // stage. This is the arm a `SIMM = 2` (RAW) reaches on the 13 records
+        // whose SIMM is `menu(menuYesNo)` — R11-C12 — and the arm ANY
+        // out-of-menu SIMM reaches on all of them, since `recGblGetSimm`'s
+        // `dbTryGetLink` writes SIMM with no menu validation at all.
+        if mode == crate::server::recgbl::simm::SimMode::Illegal {
+            let mut instance = rec.write().await;
+            crate::server::recgbl::rec_gbl_set_sevr(
+                &mut instance.common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+            // Reachable with PACT held only on an SDLY continuation whose SIMM
+            // was made illegal (by a `caput`) during the delay: C's `readValue`
+            // re-reads SIMM only when `!pact`, so the continuation's switch sees
+            // the new value and takes `default:` — which does NOT clear `pact`,
+            // but the record's `process()` ends with `prec->pact = FALSE` on the
+            // way out. Release it here for the same reason the YES/RAW branches
+            // do (below and at the `Simulated` tail): the cycle ends, so the
+            // record must be left idle.
+            if pact_held {
+                instance
+                    .processing
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            let is_output = !is_input;
+            drop(instance);
+            return SimOutcome::IllegalMode { is_output };
         }
 
         // epics-base 7.0.7 (SIMM menu):
@@ -5446,7 +5526,7 @@ impl PvDatabase {
             // having landed (R12-61). UDF is the one part C does gate on the
             // read's status (`if (status == 0) prec->udf = FALSE`), and a
             // constant SIOL is status 0.
-            sim_process_tail(&mut instance, sims, fetch.is_ok());
+            sim_process_tail(&mut instance, SimTailAlarm::Simm(sims), fetch.is_ok());
         }
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
@@ -5466,6 +5546,20 @@ impl PvDatabase {
 
         SimOutcome::Simulated
     }
+}
+
+/// Which alarm the simulated cycle's tail raises before it commits.
+///
+/// C raises SIMM_ALARM at SIMS on the YES/RAW arms only
+/// (`recGblSetSevr(prec, SIMM_ALARM, prec->sims)`). The `default:` arm raises
+/// SOFT_ALARM/INVALID *instead*, and does so where it is detected — before the
+/// tail — so the tail has nothing left to raise.
+#[derive(Debug, Clone, Copy)]
+enum SimTailAlarm {
+    /// The YES/RAW arms: `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`.
+    Simm(i16),
+    /// The `default:` arm: SOFT_ALARM/INVALID is already pending; raise nothing.
+    None,
 }
 
 /// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of
@@ -5501,7 +5595,7 @@ impl PvDatabase {
 /// result — every simulated cycle re-sent unchanged alarm fields,
 /// stamped `DBE_ALARM` on cycles whose alarm state never moved, and
 /// bypassed the MDEL/ADEL deadband entirely.
-fn sim_process_tail(instance: &mut RecordInstance, sims: i16, clear_udf: bool) {
+fn sim_process_tail(instance: &mut RecordInstance, alarm: SimTailAlarm, clear_udf: bool) {
     use crate::server::recgbl::EventMask;
 
     apply_timestamp(&mut instance.common, true);
@@ -5511,12 +5605,14 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16, clear_udf: bool) {
         instance.common.udf = false;
     }
 
-    let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-    crate::server::recgbl::rec_gbl_set_sevr(
-        &mut instance.common,
-        crate::server::recgbl::alarm_status::SIMM_ALARM,
-        sev,
-    );
+    if let SimTailAlarm::Simm(sims) = alarm {
+        let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
+        crate::server::recgbl::rec_gbl_set_sevr(
+            &mut instance.common,
+            crate::server::recgbl::alarm_status::SIMM_ALARM,
+            sev,
+        );
+    }
     {
         let inst = &mut *instance;
         inst.record.check_alarms(&mut inst.common);

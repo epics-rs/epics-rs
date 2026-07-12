@@ -338,3 +338,149 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
         "C `dbGetLink` -> `setLinkAlarm` -> recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R11-C12 — SIMM = 2 (RAW) on a `menu(menuYesNo)` record is the `default:` arm
+// ---------------------------------------------------------------------------
+//
+// The legal SIMM arms are the choices of the RECORD'S OWN menu. Eight records
+// (ai/ao/bi/bo/mbbi/mbbo/mbbiDirect/mbboDirect) have `menu(menuSimm)` —
+// NO/YES/RAW. The other thirteen (event, histogram, int64in, int64out, longin,
+// longout, lsi, lso, stringin, stringout, waveform, aai, aao) plus `busy` have
+// `menu(menuYesNo)` — NO/YES only. On those, `SIMM = 2` is not RAW, it is
+// out-of-menu, and C's switch sends it to:
+//
+// ```c
+// default:
+//     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
+//     status = -1;
+// ```
+//
+// No device substitution of any kind: no device read, no device write, no SIOL
+// round-trip, no SIMM_ALARM, no VAL/UDF change. The port instead ran its RAW
+// branch on these records. Nothing validates the index either — `recGblGetSimm`
+// writes SIMM straight from `dbTryGetLink`, and `dbPut` of a numeric DBR into a
+// DBF_MENU does no menu check — so ANY out-of-menu SIMM lands on this arm.
+//
+// `swait` is the one exception (`swaitRecord.c:407-421` has no `default:`).
+
+use epics_base_rs::server::records::longout::LongoutRecord;
+
+/// A menuYesNo INPUT record with SIMM=2: SOFT_ALARM/INVALID, and SVAL is NOT
+/// copied into VAL (C never reaches the SIOL read on this arm).
+#[tokio::test]
+async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
+    let db = PvDatabase::new();
+    let mut li = LonginRecord::new(7);
+    li.sims = 2; // MAJOR — would be the SIMM_ALARM severity if YES were taken
+    db.add_record("RAWIN", Box::new(li)).await.unwrap();
+    db.put_pv("RAWIN.SVAL", EpicsValue::Long(42)).await.unwrap();
+    db.put_pv("RAWIN.SIMM", EpicsValue::Short(2)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("RAWIN", &mut v, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.get_pv("RAWIN").await.unwrap(),
+        EpicsValue::Long(7),
+        "C's default arm performs NO device substitution — SVAL must not reach VAL"
+    );
+    let rec = db.get_record("RAWIN").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::SOFT_ALARM,
+        "C `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`"
+    );
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+}
+
+/// A menuYesNo OUTPUT record with SIMM=2: SOFT_ALARM/INVALID, and NOTHING is
+/// written — not the device/OUT link, not SIOL. C `writeValue` returns -1 from
+/// the default arm, before either write.
+#[tokio::test]
+async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
+    let db = PvDatabase::new();
+    db.add_record("SINK", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+    let mut lo = LongoutRecord::new(0);
+    lo.siol = "SINK".to_string();
+    db.add_record("RAWOUT", Box::new(lo)).await.unwrap();
+    db.put_pv("RAWOUT.SIMM", EpicsValue::Short(2))
+        .await
+        .unwrap();
+    db.put_pv("RAWOUT", EpicsValue::Long(99)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("RAWOUT", &mut v, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.get_pv("SINK").await.unwrap(),
+        EpicsValue::Long(0),
+        "the default arm returns before the SIOL redirect — SIOL must not be written"
+    );
+    let rec = db.get_record("RAWOUT").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+}
+
+/// `busy` is menuYesNo too (`busyRecord.c:409-413` is the `else` of its YES
+/// test): SIMM=2 raises SOFT_ALARM/INVALID and writes nothing.
+#[tokio::test]
+async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
+    let db = PvDatabase::new();
+    db.add_record("BSINK", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+    let mut b = BusyRecord::new();
+    b.siol = "BSINK".to_string();
+    db.add_record("BRAW", Box::new(b)).await.unwrap();
+    db.put_pv("BRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
+    db.put_pv("BRAW", EpicsValue::Short(1)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("BRAW", &mut v, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(db.get_pv("BSINK").await.unwrap(), EpicsValue::Long(0));
+    let rec = db.get_record("BRAW").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+}
+
+/// The guard on the other side: `ai` IS `menu(menuSimm)`, so SIMM=2 is the
+/// legal RAW arm — it must still simulate (SIOL -> SVAL -> RVAL -> conversion),
+/// with SIMM_ALARM and no SOFT_ALARM.
+#[tokio::test]
+async fn simm_raw_on_a_menu_simm_record_still_simulates() {
+    use epics_base_rs::server::records::ai::AiRecord;
+
+    let db = PvDatabase::new();
+    let mut ai = AiRecord::new(0.0);
+    ai.sims = 1; // MINOR
+    ai.sval = 5.0;
+    db.add_record("AIRAW", Box::new(ai)).await.unwrap();
+    db.put_pv("AIRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("AIRAW", &mut v, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("AIRAW").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::SIMM_ALARM,
+        "menuSimm's RAW arm is legal — SIMM_ALARM, never SOFT_ALARM"
+    );
+    assert_eq!(inst.common.sevr, AlarmSeverity::Minor);
+}

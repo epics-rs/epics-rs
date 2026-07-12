@@ -1487,6 +1487,31 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Whether the record's C `switch (prec->simm)` carries a `default:` arm
+    /// that REFUSES a SIMM value outside its own menu:
+    ///
+    /// ```c
+    /// default:
+    ///     recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM);
+    ///     status = -1;
+    /// ```
+    ///
+    /// Every record in the framework has it — all 21 base records
+    /// (`longinRecord.c:436-438` and its twins; `aaiRecord.c:381-384` writes the
+    /// same arm as an `else if (prec->simm != menuYesNoNO)`) and `busy`
+    /// (`busyRecord.c:409-413`, the `else` of its YES test).
+    ///
+    /// `swait` is the sole exception: `swaitRecord.c:407-421` is a plain
+    /// `if (pwait->simm == menuYesNoNO) { … } else { /* SIMULATION MODE */ … }`,
+    /// so every non-NO value — legal or not — simulates. It overrides to
+    /// `false`.
+    ///
+    /// Consumed by [`resolve_sim_mode`](crate::server::recgbl::simm::resolve_sim_mode),
+    /// the single owner of the SIMM dispatch.
+    fn rejects_illegal_sim_mode(&self) -> bool {
+        true
+    }
+
     /// This cycle's simulation state, pushed by the framework before
     /// `process()` — the twin of [`Self::set_fetch_gate_failed`], and only for a
     /// record that declares [`Self::simulation_substitutes_input_stage`].

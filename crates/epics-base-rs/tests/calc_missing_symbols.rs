@@ -34,7 +34,7 @@ fn a_inputs() -> ArrayInputs {
 
 fn arr(expr: &str) -> Vec<f64> {
     match acalc(expr, &mut a_inputs()).expect("aCalcPerform returns st=0 here") {
-        ArrayStackValue::Array(v) => v,
+        ArrayStackValue::Array(v) => v.into_buf(),
         ArrayStackValue::Double(d) => panic!("{expr}: expected an array result, got {d}"),
     }
 }

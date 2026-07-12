@@ -17,7 +17,6 @@ pub enum CalcError {
     BadSeparator,
     BadAssignment,
     TypeMismatch,
-    LengthMismatch,
     InvalidFormat,
     LoopLimitExceeded,
     EmptyArray,
@@ -47,7 +46,6 @@ impl fmt::Display for CalcError {
             CalcError::BadSeparator => write!(f, "Comma without enclosing parentheses"),
             CalcError::BadAssignment => write!(f, "Bad assignment target"),
             CalcError::TypeMismatch => write!(f, "Type mismatch: mixed numeric/string operation"),
-            CalcError::LengthMismatch => write!(f, "Array length mismatch in binary operation"),
             CalcError::InvalidFormat => write!(f, "Invalid format string"),
             CalcError::LoopLimitExceeded => write!(f, "Loop iteration limit exceeded"),
             CalcError::EmptyArray => write!(f, "Operation on empty array"),
@@ -94,7 +92,6 @@ impl CalcError {
             CalcError::Syntax
             | CalcError::DivisionByZero
             | CalcError::TypeMismatch
-            | CalcError::LengthMismatch
             | CalcError::InvalidFormat
             | CalcError::EmptyArray
             | CalcError::InvalidSubrange

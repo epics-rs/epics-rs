@@ -42,7 +42,7 @@ fn a_array(expr: &str, aa: &[f64], bb: &[f64]) -> Vec<f64> {
     inp.arrays[0] = aa.to_vec();
     inp.arrays[1] = bb.to_vec();
     match acalc(expr, &mut inp).expect("aCalcPerform returns st=0 here") {
-        ArrayStackValue::Array(v) => v,
+        ArrayStackValue::Array(v) => v.into_buf(),
         ArrayStackValue::Double(d) => panic!("expected an array result, got {d}"),
     }
 }

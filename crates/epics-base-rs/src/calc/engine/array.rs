@@ -1,5 +1,5 @@
 use super::array_value::ArrayStackValue::Double;
-use super::array_value::{ArrayStackValue, zip_map};
+use super::array_value::{ArrayCell, ArrayStackValue, zip_map};
 use super::cast::{c_int, c_long, d2ui};
 use super::error::CalcError;
 use super::opcodes::{ArrayOp, CoreOp, Opcode};
@@ -48,12 +48,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     stack.push(ArrayStackValue::Double(inputs.num_vars[*idx as usize]));
                 }
                 CoreOp::PushDoubleVar(idx) => {
-                    // In array evaluator, double vars are array vars
+                    // In array evaluator, double vars are array vars. C's fresh
+                    // push clears the window (`INC`: `ps->numEl = -1`,
+                    // `aCalcPerform.c:88`), which is what `ArrayCell::new` gives.
                     let arr = inputs.arrays[*idx as usize].clone();
                     if arr.is_empty() {
                         stack.push(ArrayStackValue::Double(0.0));
                     } else {
-                        stack.push(ArrayStackValue::Array(arr));
+                        stack.push(ArrayStackValue::Array(ArrayCell::new(
+                            arr,
+                            inputs.array_size,
+                        )));
                     }
                 }
 
@@ -92,17 +97,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Add => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| x + y)?);
+                    stack.push(zip_map(a, b, |x, y| x + y));
                 }
                 CoreOp::Sub => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| x - y)?);
+                    stack.push(zip_map(a, b, |x, y| x - y));
                 }
                 CoreOp::Mul => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| x * y)?);
+                    stack.push(zip_map(a, b, |x, y| x * y));
                 }
                 CoreOp::Div => {
                     let b = pop1(&mut stack)?;
@@ -118,7 +123,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         a,
                         b,
                         |x, y| if y == 0.0 { MY_MAXFLOAT } else { x / y },
-                    )?);
+                    ));
                 }
                 CoreOp::Mod => {
                     let b = pop1(&mut stack)?;
@@ -133,7 +138,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         } else {
                             c_int(x).wrapping_rem(den) as f64
                         }
-                    })?);
+                    }));
                 }
                 CoreOp::Neg => {
                     let a = pop1(&mut stack)?;
@@ -142,7 +147,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Power => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| x.powf(y))?);
+                    stack.push(zip_map(a, b, |x, y| x.powf(y)));
                 }
 
                 // Comparison (element-wise for arrays). aCalc compares EXACTLY —
@@ -155,32 +160,32 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Eq => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x == y)))?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x == y))));
                 }
                 CoreOp::Ne => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x != y)))?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x != y))));
                 }
                 CoreOp::Lt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x < y)))?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x < y))));
                 }
                 CoreOp::Le => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x <= y)))?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x <= y))));
                 }
                 CoreOp::Gt => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x > y)))?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x > y))));
                 }
                 CoreOp::Ge => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x >= y)))?);
+                    stack.push(zip_map(a, b, |x, y| f64::from(u8::from(x >= y))));
                 }
 
                 // Logical
@@ -191,7 +196,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         a,
                         b,
                         |x, y| if x != 0.0 && y != 0.0 { 1.0 } else { 0.0 },
-                    )?);
+                    ));
                 }
                 CoreOp::Or => {
                     let b = pop1(&mut stack)?;
@@ -200,7 +205,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         a,
                         b,
                         |x, y| if x != 0.0 || y != 0.0 { 1.0 } else { 0.0 },
-                    )?);
+                    ));
                 }
                 CoreOp::Not => {
                     let a = pop1(&mut stack)?;
@@ -215,17 +220,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::BitAnd => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (c_int(x) & c_int(y)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) & c_int(y)) as f64));
                 }
                 CoreOp::BitOr => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (c_int(x) | c_int(y)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) | c_int(y)) as f64));
                 }
                 CoreOp::BitXor => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (c_int(x) ^ c_int(y)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (c_int(x) ^ c_int(y)) as f64));
                 }
                 CoreOp::BitNot => {
                     let a = pop1(&mut stack)?;
@@ -253,11 +258,14 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                             };
                             stack.push(ArrayStackValue::Double(v as f64));
                         }
-                        ArrayStackValue::Array(mut arr) => {
+                        ArrayStackValue::Array(mut cell) => {
                             // C negates the count for `<<` (:1431) — a left
-                            // shift moves elements DOWN in index.
-                            shift_elements(&mut arr, if left_shift { -count } else { count });
-                            stack.push(ArrayStackValue::Array(arr));
+                            // shift moves elements DOWN in index. No
+                            // `calcFirstLast` in this case (`:1416-1459`): the
+                            // move runs over the whole buffer and leaves the
+                            // window alone.
+                            shift_elements(cell.buf_mut(), if left_shift { -count } else { count });
+                            stack.push(ArrayStackValue::Array(cell));
                         }
                     }
                 }
@@ -268,7 +276,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::ShrLogical => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| (d2ui(x) >> (d2ui(y) & 31)) as f64)?);
+                    stack.push(zip_map(a, b, |x, y| (d2ui(x) >> (d2ui(y) & 31)) as f64));
                 }
 
                 // Conditional
@@ -394,12 +402,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Atan2 => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| y.atan2(x))?);
+                    stack.push(zip_map(a, b, |x, y| y.atan2(x)));
                 }
                 CoreOp::Fmod => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    stack.push(zip_map(a, b, |x, y| x % y)?);
+                    stack.push(zip_map(a, b, |x, y| x % y));
                 }
 
                 CoreOp::Max(nargs) => {
@@ -446,8 +454,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::StoreDoubleVar(idx) => {
                     let v = pop1(&mut stack)?;
                     match v {
-                        ArrayStackValue::Array(arr) => {
-                            inputs.arrays[*idx as usize] = arr;
+                        ArrayStackValue::Array(cell) => {
+                            inputs.arrays[*idx as usize] = cell.into_buf();
                         }
                         ArrayStackValue::Double(d) => {
                             inputs.num_vars[*idx as usize] = d;
@@ -459,11 +467,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
             Opcode::Array(aop) => match aop {
                 ArrayOp::ConstIndex => {
                     let arr: Vec<f64> = (0..inputs.array_size).map(|i| i as f64).collect();
-                    stack.push(ArrayStackValue::Array(arr));
+                    stack.push(ArrayStackValue::array(arr));
                 }
                 ArrayOp::ToArray => {
                     let v = pop1_f64(&mut stack)?;
-                    stack.push(ArrayStackValue::Array(vec![v; inputs.array_size]));
+                    stack.push(ArrayStackValue::array(vec![v; inputs.array_size]));
                 }
                 ArrayOp::ToDouble => {
                     let v = pop1(&mut stack)?;
@@ -471,25 +479,52 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
                 ArrayOp::Average => {
                     let v = pop1(&mut stack)?;
-                    stack.push(unary(v, |a| Double(stats::average(a)), PASS_THROUGH));
+                    // C `:929-932`: `d = a[firstEl]; for (i=firstEl+1..lastEl) d +=
+                    // a[i]; ps->d = d/(1+lastEl-firstEl)`. The seed is read even when
+                    // the window is EMPTY (the read is still in bounds, the loop just
+                    // does not run), and the divisor is then 0 — so C answers a[0]/0.
+                    // That is why the divisor is `span()` and not `window().len()`.
+                    stack.push(unary(
+                        v,
+                        |c| Double(window_sum(&c) / c.span() as f64),
+                        PASS_THROUGH,
+                    ));
                 }
                 ArrayOp::StdDev => {
                     let v = pop1(&mut stack)?;
-                    stack.push(unary(v, |a| Double(stats::std_dev(a)), ZERO));
+                    // C `:934-946` — the same seeded sum, then `sqrt(sum(err^2)/(n-1))`
+                    // over the window, falling back to `sqrt(sum(err^2))` when the
+                    // window holds one element or none.
+                    stack.push(unary(
+                        v,
+                        |c| {
+                            let n = c.span();
+                            let mean = window_sum(&c) / n as f64;
+                            let e: f64 = c.window().iter().map(|x| (x - mean).powi(2)).sum();
+                            Double(if n > 1 {
+                                (e / (n - 1) as f64).sqrt()
+                            } else {
+                                e.sqrt()
+                            })
+                        },
+                        ZERO,
+                    ));
                 }
                 ArrayOp::Fwhm => {
                     let v = pop1(&mut stack)?;
-                    stack.push(unary(v, |a| Double(stats::fwhm(a)), ZERO));
+                    stack.push(unary(v, |c| Double(stats::fwhm(c.window())), ZERO));
                 }
                 ArrayOp::ArraySum => {
                     let v = pop1(&mut stack)?;
-                    stack.push(unary(v, |a| Double(a.iter().sum()), PASS_THROUGH));
+                    // C `:991-997` seeds `d = 0.0`, unlike AVERAGE — so an empty
+                    // window sums to 0 rather than to a[0].
+                    stack.push(unary(v, |c| Double(c.window().iter().sum()), PASS_THROUGH));
                 }
                 ArrayOp::ArrayMax => {
                     let v = pop1(&mut stack)?;
                     stack.push(unary(
                         v,
-                        |a| Double(extremum(a).map_or(0.0, |(v, _)| v)),
+                        |c| Double(extremum(&c, |x, best| x > best).0),
                         PASS_THROUGH,
                     ));
                 }
@@ -497,7 +532,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let v = pop1(&mut stack)?;
                     stack.push(unary(
                         v,
-                        |a| Double(extremum_by(a, |x, best| x < best).map_or(0.0, |(v, _)| v)),
+                        |c| Double(extremum(&c, |x, best| x < best).0),
                         PASS_THROUGH,
                     ));
                 }
@@ -505,7 +540,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let v = pop1(&mut stack)?;
                     stack.push(unary(
                         v,
-                        |a| Double(extremum(a).map_or(0.0, |(_, i)| i as f64)),
+                        |c| Double(extremum(&c, |x, best| x > best).1 as f64),
                         ZERO,
                     ));
                 }
@@ -513,11 +548,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let v = pop1(&mut stack)?;
                     stack.push(unary(
                         v,
-                        |a| {
-                            Double(
-                                extremum_by(a, |x, best| x < best).map_or(0.0, |(_, i)| i as f64),
-                            )
-                        },
+                        |c| Double(extremum(&c, |x, best| x < best).1 as f64),
                         ZERO,
                     ));
                 }
@@ -527,7 +558,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // zero" exactly when it is (near-)zero itself.
                     stack.push(unary(
                         v,
-                        |a| Double(index_zero_crossing(a)),
+                        |c| Double(index_zero_crossing(c.window())),
                         |d| if d.abs() < SMALL { 0.0 } else { -1.0 },
                     ));
                 }
@@ -541,9 +572,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // Scalar: C `:1091`, the mirror image of IXZ's.
                     stack.push(unary(
                         v,
-                        |a| {
+                        |c| {
                             Double(
-                                a.iter()
+                                c.window()
+                                    .iter()
                                     .position(|&x| x.abs() > SMALL)
                                     .map_or(-1.0, |i| i as f64),
                             )
@@ -554,9 +586,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
 
                 ArrayOp::Smooth => {
                     let v = pop1(&mut stack)?;
+                    // C `:968-975` smooths IN PLACE inside the window and touches
+                    // nothing outside it — not even to zero it, which is what NSMOOTH
+                    // and DERIV do.
                     stack.push(unary(
                         v,
-                        |a| ArrayStackValue::Array(stats::smooth(a)),
+                        |mut c| {
+                            let smoothed = stats::smooth(c.window());
+                            c.window_mut().copy_from_slice(&smoothed);
+                            ArrayStackValue::Array(c)
+                        },
                         PASS_THROUGH,
                     ));
                 }
@@ -564,41 +603,68 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let n = pop1_f64(&mut stack)? as usize;
                     let v = pop1(&mut stack)?;
                     // NSMOOTH is NOT in C's unary switch — it is its own case
-                    // (`aCalcPerform.c:579-591`) and it indexes `ps->a[]` with no
+                    // (`aCalcPerform.c:579-592`) and it indexes `ps->a[]` with no
                     // `toArray` first, so a scalar operand dereferences a NULL array
                     // in C. There is no C behaviour to match; refusing is the
                     // deliberate deviation.
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Array(stats::nsmooth(arr, n)));
+                    //
+                    // It also does NOT honour the operand's window, and that is not an
+                    // oversight to tidy away: C calls `calcFirstLast(ps,...)` BEFORE
+                    // `DEC(ps)` (`:580-582`) — i.e. on the npts SCALAR, whose numEl is
+                    // always the -1 sentinel — so first/last come out as
+                    // 0..arraySize-1 whatever window the array carries. Compiled C,
+                    // arraySize 7, AA=[1,2,3,40,5,6,7]:
+                    //   SMOO(AA[1,5])    -> [2,3,17.5,5,6,0,0]        (window only)
+                    //   NSMOO(AA[1,5],1) -> [2,3,17.5,13.5625,6,0,0]  (whole buffer)
+                    let mut cell = v.as_cell()?.clone();
+                    let smoothed = stats::nsmooth(cell.buf(), n);
+                    cell.buf_mut().copy_from_slice(&smoothed);
+                    stack.push(ArrayStackValue::Array(cell));
                 }
                 ArrayOp::Deriv => {
                     let v = pop1(&mut stack)?;
+                    // C `:976-989`: the derivative is taken over the window and written
+                    // back into it, and everything OUTSIDE the window is zeroed
+                    // (`:985-987`).
                     stack.push(unary(
                         v,
-                        |a| ArrayStackValue::Array(derivative::deriv(a)),
+                        |mut c| {
+                            let d = derivative::deriv(c.window());
+                            c.window_mut().copy_from_slice(&d);
+                            c.clear_outside_window();
+                            ArrayStackValue::Array(c)
+                        },
                         ZERO,
                     ));
                 }
                 ArrayOp::NDeriv => {
                     let n = pop1_f64(&mut stack)? as usize;
                     let v = pop1(&mut stack)?;
-                    // NDERIV is NOT in C's unary switch either (`:594-618`), and its
+                    // NDERIV is NOT in C's unary switch either (`:594-617`), and its
                     // own case PROMOTES a scalar with `toArray(ps,1)` rather than
                     // answering 0. Refusing here is a divergence from that promotion,
                     // reported separately — it is not R10-4's family.
-                    let arr = v.as_array()?;
-                    stack.push(ArrayStackValue::Array(derivative::nderiv(arr, n)));
+                    //
+                    // Unlike NSMOOTH it DOES honour the window: its `calcFirstLast`
+                    // runs after `DEC(ps)`, on the array itself (`:600`).
+                    let mut cell = v.as_cell()?.clone();
+                    let d = derivative::nderiv(cell.window(), n);
+                    cell.window_mut().copy_from_slice(&d);
+                    cell.clear_outside_window();
+                    stack.push(ArrayStackValue::Array(cell));
                 }
                 ArrayOp::Cum => {
                     let v = pop1(&mut stack)?;
+                    // C `:787` — no `calcFirstLast`, so CUM runs over the whole buffer
+                    // whatever the window says.
                     stack.push(unary(
                         v,
-                        |a| {
-                            let mut result = a.to_vec();
-                            for i in 1..result.len() {
-                                result[i] += result[i - 1];
+                        |mut c| {
+                            let buf = c.buf_mut();
+                            for i in 1..buf.len() {
+                                buf[i] += buf[i - 1];
                             }
-                            ArrayStackValue::Array(result)
+                            ArrayStackValue::Array(c)
                         },
                         PASS_THROUGH,
                     ));
@@ -606,87 +672,117 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 ArrayOp::Cat => {
                     let b = pop1(&mut stack)?;
                     let a = pop1(&mut stack)?;
-                    let mut result = match a {
-                        ArrayStackValue::Array(arr) => arr,
-                        ArrayStackValue::Double(d) => vec![d],
-                    };
-                    match b {
-                        ArrayStackValue::Array(arr) => result.extend(arr),
-                        ArrayStackValue::Double(d) => result.push(d),
+                    match (a, b) {
+                        // C `:1383-1391` (array, double): write the scalar at
+                        // `lastEl+1` and grow the window by one — but ONLY if there is
+                        // room left in the `arraySize` buffer. A left operand with no
+                        // window has `lastEl = arraySize-1`, so the test fails and CAT
+                        // is a no-op: compiled C, `CAT(AA,9)` on a full AA is AA.
+                        (ArrayStackValue::Array(mut cell), ArrayStackValue::Double(d)) => {
+                            let at = cell.span();
+                            if at >= 0 && at < cell.buf().len() as i64 {
+                                cell.buf_mut()[at as usize] = d;
+                                cell.set_num_el(at + 1);
+                            }
+                            stack.push(ArrayStackValue::Array(cell));
+                        }
+                        // C `:1359-1365` (array, array), reached after `toArray(ps,1)`
+                        // has promoted a scalar LEFT operand: copy the right operand's
+                        // WINDOW in after the left one's, stopping at the buffer end,
+                        // and set numEl to how far it got. C assigns numEl
+                        // unconditionally here, so even a no-copy CAT replaces the
+                        // "no window" sentinel with the concrete arraySize.
+                        (a, ArrayStackValue::Array(right)) => {
+                            let mut cell = a.into_cell(inputs.array_size);
+                            let mut i = cell.span().max(0) as usize;
+                            for &v in right.window() {
+                                if i >= cell.buf().len() {
+                                    break;
+                                }
+                                cell.buf_mut()[i] = v;
+                                i += 1;
+                            }
+                            cell.set_num_el(i as i64);
+                            stack.push(ArrayStackValue::Array(cell));
+                        }
+                        // (double, double) keeps the port's old shape here; C's
+                        // `case CAT: break;` (`:1411`) is R11-7's subject.
+                        (ArrayStackValue::Double(x), ArrayStackValue::Double(y)) => {
+                            stack.push(ArrayStackValue::Array(ArrayCell::new(
+                                vec![x, y],
+                                inputs.array_size,
+                            )));
+                        }
                     }
-                    stack.push(ArrayStackValue::Array(result));
                 }
                 ArrayOp::ArrayRandom => {
                     let arr: Vec<f64> = (0..inputs.array_size).map(|_| simple_random()).collect();
-                    stack.push(ArrayStackValue::Array(arr));
+                    stack.push(ArrayStackValue::array(arr));
                 }
                 ArrayOp::ArraySubrange | ArrayOp::ArraySubrangeInPlace => {
-                    // C `aCalcPerform.c:1520-1549`. Both bounds are INCLUSIVE, a
+                    // C `aCalcPerform.c:1519-1548`. Both bounds are INCLUSIVE, a
                     // negative bound counts back from the end, and the result is
                     // still a full `arraySize` buffer: `[` shifts the selected
                     // elements down to index 0 and zero-fills the tail, `{` leaves
                     // them where they are and zeroes everything outside.
+                    //
+                    // Both then set the WINDOW, which is the entire point of the
+                    // operator: `numEl = 1+j-i` for `[`, `numEl = j+1` for `{`
+                    // (`:1537-1544`). Compiled C, AA=[10,20,30,40,50,60]:
+                    // `AVG(AA[1,3])` is 30 (the three selected elements) while
+                    // `AVG(AA{1,3})` is 22.5 (0..3, the zeroed head included).
                     let n = inputs.array_size as i64;
                     let (i, j) = pop_subrange_bounds(&mut stack, n)?;
-                    let mut a = pop1(&mut stack)?.to_array(inputs.array_size);
-                    a.resize(inputs.array_size, 0.0);
-                    let out = if matches!(aop, ArrayOp::ArraySubrange) {
-                        let mut out = vec![0.0; inputs.array_size];
-                        // C: `for (k=0; i<=j; k++, i++) ps->a[k] = ps->a[i];`
-                        // then `for ( ; k<arraySize; k++) ps->a[k] = 0.;`
-                        for (k, src) in (i..=j).enumerate() {
-                            match (out.get_mut(k), a.get(src as usize)) {
+                    let mut cell = pop1(&mut stack)?.into_cell(inputs.array_size);
+                    if matches!(aop, ArrayOp::ArraySubrange) {
+                        let src = cell.buf().to_vec();
+                        let buf = cell.buf_mut();
+                        let mut k = 0usize;
+                        for s in i..=j {
+                            // C's `j` is clamped to arraySize, not arraySize-1, so its
+                            // copy loop can read one element PAST the buffer
+                            // (`:1536,:1540`). Stopping is the port's deviation from
+                            // that out-of-bounds read; the window below still takes
+                            // C's count.
+                            match (buf.get_mut(k), src.get(s as usize)) {
                                 (Some(dst), Some(&v)) => *dst = v,
                                 _ => break,
                             }
+                            k += 1;
                         }
-                        out
+                        buf[k..].fill(0.0);
+                        cell.set_num_el(1 + j - i);
                     } else {
                         // C: zero `[0,i)` and `(j,arraySize)`, keep the rest in place.
-                        for (k, cell) in a.iter_mut().enumerate() {
+                        for (k, v) in cell.buf_mut().iter_mut().enumerate() {
                             let k = k as i64;
                             if k < i || k > j {
-                                *cell = 0.0;
+                                *v = 0.0;
                             }
                         }
-                        a
-                    };
-                    stack.push(ArrayStackValue::Array(out));
+                        cell.set_num_el(j + 1);
+                    }
+                    stack.push(ArrayStackValue::Array(cell));
                 }
                 ArrayOp::ANeg => {
                     // C `:772` (array) / `:1046` (scalar) — ANEG zeroes the
                     // NEGATIVE elements and keeps the rest.
                     let v = pop1(&mut stack)?;
-                    stack.push(unary(
-                        v,
-                        |a| {
-                            ArrayStackValue::Array(
-                                a.iter().map(|&x| if x < 0.0 { 0.0 } else { x }).collect(),
-                            )
-                        },
-                        |d| if d < 0.0 { 0.0 } else { d },
-                    ));
+                    stack.push(v.map(|x| if x < 0.0 { 0.0 } else { x }));
                 }
                 ArrayOp::APos => {
                     // C `:773` (array) / `:1047` (scalar) — APOS zeroes the
                     // POSITIVE elements.
                     let v = pop1(&mut stack)?;
-                    stack.push(unary(
-                        v,
-                        |a| {
-                            ArrayStackValue::Array(
-                                a.iter().map(|&x| if x > 0.0 { 0.0 } else { x }).collect(),
-                            )
-                        },
-                        |d| if d > 0.0 { 0.0 } else { d },
-                    ));
+                    stack.push(v.map(|x| if x > 0.0 { 0.0 } else { x }));
                 }
                 ArrayOp::FetchAval => {
                     // C `FETCH_AVAL` (`:534-539`) — push `p_aresult`, the record's
                     // previous array result. The array counterpart of `VAL`.
-                    let mut prev = inputs.prev_aval.clone();
-                    prev.resize(inputs.array_size, 0.0);
-                    stack.push(ArrayStackValue::Array(prev));
+                    stack.push(ArrayStackValue::Array(ArrayCell::new(
+                        inputs.prev_aval.clone(),
+                        inputs.array_size,
+                    )));
                 }
                 ArrayOp::DynFetch => {
                     // C `A_FETCH` (`:1461-1477`) — `@x` is the scalar argument x
@@ -705,13 +801,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // record never allocated, are both an all-zero array — and the
                     // result is an array either way (C `toArray(ps,0)`).
                     let idx = my_nint(pop1_f64(&mut stack)?);
-                    let mut arr = usize::try_from(idx)
+                    let arr = usize::try_from(idx)
                         .ok()
                         .and_then(|i| inputs.arrays.get(i))
                         .cloned()
                         .unwrap_or_default();
-                    arr.resize(inputs.array_size, 0.0);
-                    stack.push(ArrayStackValue::Array(arr));
+                    stack.push(ArrayStackValue::Array(ArrayCell::new(
+                        arr,
+                        inputs.array_size,
+                    )));
                 }
                 ArrayOp::LenNoop => {
                     // C has no `case LEN` and no `default:` in aCalcPerform's
@@ -722,29 +820,29 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 ArrayOp::FitPoly => {
                     let y = pop1(&mut stack)?;
                     let x = pop1(&mut stack)?;
-                    let xa = x.as_array()?;
-                    let ya = y.as_array()?;
-                    let (a0, a1, a2) = fitting::fitpoly(xa, ya, None);
+                    let xa = x.as_cell()?.window().to_vec();
+                    let ya = y.as_cell()?.window().to_vec();
+                    let (a0, a1, a2) = fitting::fitpoly(&xa, &ya, None);
                     // Return as array [a0, a1, a2]
-                    stack.push(ArrayStackValue::Array(vec![a0, a1, a2]));
+                    stack.push(ArrayStackValue::array(vec![a0, a1, a2]));
                 }
                 ArrayOp::FitMPoly => {
                     let mask = pop1(&mut stack)?;
                     let y = pop1(&mut stack)?;
                     let x = pop1(&mut stack)?;
-                    let xa = x.as_array()?;
-                    let ya = y.as_array()?;
-                    let ma = mask.as_array()?;
-                    let (a0, a1, a2) = fitting::fitpoly(xa, ya, Some(ma));
-                    stack.push(ArrayStackValue::Array(vec![a0, a1, a2]));
+                    let xa = x.as_cell()?.window().to_vec();
+                    let ya = y.as_cell()?.window().to_vec();
+                    let ma = mask.as_cell()?.window().to_vec();
+                    let (a0, a1, a2) = fitting::fitpoly(&xa, &ya, Some(&ma));
+                    stack.push(ArrayStackValue::array(vec![a0, a1, a2]));
                 }
                 ArrayOp::FitQ => {
                     // Like FitPoly but returns quality metric
                     let y = pop1(&mut stack)?;
                     let x = pop1(&mut stack)?;
-                    let xa = x.as_array()?;
-                    let ya = y.as_array()?;
-                    let (a0, a1, a2) = fitting::fitpoly(xa, ya, None);
+                    let xa = x.as_cell()?.window().to_vec();
+                    let ya = y.as_cell()?.window().to_vec();
+                    let (a0, a1, a2) = fitting::fitpoly(&xa, &ya, None);
                     // Compute residual sum of squares
                     let rss: f64 = xa
                         .iter()
@@ -754,16 +852,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                             (yi - pred).powi(2)
                         })
                         .sum();
-                    stack.push(ArrayStackValue::Array(vec![a0, a1, a2, rss]));
+                    stack.push(ArrayStackValue::array(vec![a0, a1, a2, rss]));
                 }
                 ArrayOp::FitMQ => {
                     let mask = pop1(&mut stack)?;
                     let y = pop1(&mut stack)?;
                     let x = pop1(&mut stack)?;
-                    let xa = x.as_array()?;
-                    let ya = y.as_array()?;
-                    let ma = mask.as_array()?;
-                    let (a0, a1, a2) = fitting::fitpoly(xa, ya, Some(ma));
+                    let xa = x.as_cell()?.window().to_vec();
+                    let ya = y.as_cell()?.window().to_vec();
+                    let ma = mask.as_cell()?.window().to_vec();
+                    let (a0, a1, a2) = fitting::fitpoly(&xa, &ya, Some(&ma));
                     let rss: f64 = xa
                         .iter()
                         .zip(ya.iter())
@@ -774,7 +872,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                             (yi - pred).powi(2)
                         })
                         .sum();
-                    stack.push(ArrayStackValue::Array(vec![a0, a1, a2, rss]));
+                    stack.push(ArrayStackValue::array(vec![a0, a1, a2, rss]));
                 }
             },
 
@@ -821,19 +919,18 @@ fn domain_guarded(
 ) -> ArrayStackValue {
     match v {
         ArrayStackValue::Double(d) => Double(if d < 0.0 { 0.0 } else { f(d) }),
-        ArrayStackValue::Array(a) => {
-            let out = a
-                .into_iter()
-                .map(|x| {
-                    if x < 0.0 {
-                        *status = Some(CalcError::DomainError);
-                        0.0
-                    } else {
-                        f(x)
-                    }
-                })
-                .collect();
-            ArrayStackValue::Array(out)
+        ArrayStackValue::Array(mut cell) => {
+            // Element-wise, so the whole buffer — C's loop is `for (i=0;
+            // i<arraySize; i++)` (`:775-812`), with no `calcFirstLast`.
+            for x in cell.buf_mut() {
+                if *x < 0.0 {
+                    *status = Some(CalcError::DomainError);
+                    *x = 0.0;
+                } else {
+                    *x = f(*x);
+                }
+            }
+            ArrayStackValue::Array(cell)
         }
     }
 }
@@ -854,15 +951,34 @@ fn domain_guarded(
 /// Only operators that C really lists in that switch belong here. `NSMOOTH`,
 /// `NDERIV`, `CAT`, `SUBRANGE` and the `FIT*` family are separate C cases with
 /// their own scalar handling and do NOT use this.
+///
+/// The array branch takes the whole [`ArrayCell`], not a bare slice, precisely so
+/// each operator must SAY whether it means the buffer (`buf()`, element-wise) or
+/// the active window (`window()`, every reduction). Handing it a slice is what let
+/// the reductions silently fold over the zero fill.
 fn unary(
     v: ArrayStackValue,
-    on_array: impl FnOnce(&[f64]) -> ArrayStackValue,
+    on_array: impl FnOnce(ArrayCell) -> ArrayStackValue,
     on_scalar: impl FnOnce(f64) -> f64,
 ) -> ArrayStackValue {
     match v {
-        ArrayStackValue::Array(a) => on_array(&a),
+        ArrayStackValue::Array(c) => on_array(c),
         ArrayStackValue::Double(d) => ArrayStackValue::Double(on_scalar(d)),
     }
+}
+
+/// C's seeded window sum, shared by AVERAGE and STD_DEV (`:929`, `:936`):
+///
+/// ```c
+/// for (i=firstEl+1, d=ps->a[firstEl]; i<=lastEl; i++) {d += ps->a[i];}
+/// ```
+///
+/// The seed `a[firstEl]` is read unconditionally, so an EMPTY window still sums to
+/// `a[0]` rather than to 0 — the divergence from `window().iter().sum()` that
+/// keeps `AVG(AA[2,1])` a NaN (a[0]/0) instead of a 0/0-free 0.
+fn window_sum(cell: &ArrayCell) -> f64 {
+    let seed = cell.buf().first().copied().unwrap_or(0.0);
+    seed + cell.window().iter().skip(1).sum::<f64>()
 }
 
 /// C `case AVERAGE: break;` — the scalar branch leaves `ps->d` untouched, so the
@@ -892,21 +1008,21 @@ const ZERO: fn(f64) -> f64 = |_| 0.0;
 ///   discard the NaN and answer 5. (A NaN *later* in the array is skipped by
 ///   the same false comparison, so it never wins.)
 ///
-/// Returns `(value, index)` of the winner, or `None` for an empty array — C
-/// cannot reach that case (`arraySize >= 1`), and the callers answer 0 as the
-/// port's own empty-array convention.
-fn extremum(arr: &[f64]) -> Option<(f64, usize)> {
-    extremum_by(arr, |x, best| x > best)
-}
-
-fn extremum_by(arr: &[f64], better: impl Fn(f64, f64) -> bool) -> Option<(f64, usize)> {
-    let mut best = (*arr.first()?, 0usize);
-    for (i, &x) in arr.iter().enumerate().skip(1) {
+/// The seed is `a[firstEl]` — the first element of the BUFFER, since `firstEl` is
+/// always 0 — and C reads it even when the window is empty (the read is in bounds;
+/// only the loop is skipped). So `AMAX` of an empty window is `a[0]` and `IXMAX`
+/// is `firstEl`, not a zero conjured for the empty case.
+///
+/// Returns `(value, index)` of the winner; the index is absolute, which is again
+/// `firstEl == 0`'s doing.
+fn extremum(cell: &ArrayCell, better: impl Fn(f64, f64) -> bool) -> (f64, usize) {
+    let mut best = (cell.buf().first().copied().unwrap_or(0.0), 0usize);
+    for (i, &x) in cell.window().iter().enumerate().skip(1) {
         if better(x, best.0) {
             best = (x, i);
         }
     }
-    Some(best)
+    best
 }
 
 /// aCalc `IXZ` — the **real (fractional) index of the first zero crossing**

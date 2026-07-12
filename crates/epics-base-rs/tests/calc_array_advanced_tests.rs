@@ -14,7 +14,8 @@ fn test_smooth_basic() {
     inputs.arrays[0] = vec![0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let result = eval_arr_with("SMOO(AA)", &mut inputs);
     match result {
-        ArrayStackValue::Array(arr) => {
+        ArrayStackValue::Array(cell) => {
+            let arr = cell.buf();
             assert_eq!(arr.len(), 10);
             // Boundary points should be 0
             assert_eq!(arr[0], 0.0);
@@ -42,6 +43,7 @@ fn test_nsmooth() {
     // More smoothing should reduce the peak further
     match (once, twice) {
         (ArrayStackValue::Array(a), ArrayStackValue::Array(b)) => {
+            let (a, b) = (a.buf(), b.buf());
             // Peak at index 4 should be lower with more smoothing
             assert!(b[4] < a[4], "twice smoothed should be lower");
         }
@@ -58,8 +60,8 @@ fn test_deriv_linear() {
     inputs.arrays[0] = (0..10).map(|i| 2.0 * i as f64).collect();
     let result = eval_arr_with("DERIV(AA)", &mut inputs);
     match result {
-        ArrayStackValue::Array(arr) => {
-            for v in &arr {
+        ArrayStackValue::Array(cell) => {
+            for v in cell.buf() {
                 assert!((*v - 2.0).abs() < 1e-10, "deriv={}", v);
             }
         }
@@ -75,8 +77,8 @@ fn test_nderiv_linear() {
     inputs.arrays[0] = (0..10).map(|i| 3.0 * i as f64).collect();
     let result = eval_arr_with("NDERIV(AA, 5)", &mut inputs);
     match result {
-        ArrayStackValue::Array(arr) => {
-            for (i, &v) in arr.iter().enumerate() {
+        ArrayStackValue::Array(cell) => {
+            for (i, &v) in cell.buf().iter().enumerate() {
                 assert!((v - 3.0).abs() < 0.5, "nderiv[{}]={}", i, v);
             }
         }
@@ -91,29 +93,39 @@ fn test_cum() {
     let mut inputs = ArrayInputs::new(4);
     inputs.arrays[0] = vec![1.0, 2.0, 3.0, 4.0];
     let result = eval_arr_with("CUM(AA)", &mut inputs);
-    assert_eq!(result, ArrayStackValue::Array(vec![1.0, 3.0, 6.0, 10.0]));
+    assert_eq!(result, ArrayStackValue::array(vec![1.0, 3.0, 6.0, 10.0]));
 }
 
 // --- Cat ---
 
+/// CAT cannot GROW the `arraySize` buffer — it writes the right operand in after
+/// the left operand's window (`aCalcPerform.c:1359-1364`, `:1383-1388`). An operand
+/// with no window already ends at `arraySize-1`, so there is nowhere to write and
+/// CAT is a no-op. The windowed cases live in `calc_array_window.rs` (R10-6).
 #[test]
-fn test_cat_arrays() {
+fn test_cat_arrays_cannot_exceed_array_size() {
     let mut inputs = ArrayInputs::new(3);
     inputs.arrays[0] = vec![1.0, 2.0, 3.0];
     inputs.arrays[1] = vec![4.0, 5.0, 6.0];
     let result = eval_arr_with("CAT(AA, BB)", &mut inputs);
-    assert_eq!(
-        result,
-        ArrayStackValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-    );
+    assert_eq!(result, ArrayStackValue::array(vec![1.0, 2.0, 3.0]));
 }
 
 #[test]
-fn test_cat_array_scalar() {
+fn test_cat_array_scalar_cannot_exceed_array_size() {
     let mut inputs = ArrayInputs::new(3);
     inputs.arrays[0] = vec![1.0, 2.0, 3.0];
     let result = eval_arr_with("CAT(AA, 4)", &mut inputs);
-    assert_eq!(result, ArrayStackValue::Array(vec![1.0, 2.0, 3.0, 4.0]));
+    assert_eq!(result, ArrayStackValue::array(vec![1.0, 2.0, 3.0]));
+}
+
+/// With room left in the buffer the scalar lands at `lastEl+1` and the window grows.
+#[test]
+fn test_cat_array_scalar_appends_when_the_buffer_has_room() {
+    let mut inputs = ArrayInputs::new(4);
+    inputs.arrays[0] = vec![1.0, 2.0, 3.0, 9.0];
+    let result = eval_arr_with("CAT(AA[0,2], 4)", &mut inputs);
+    assert_eq!(result, ArrayStackValue::array(vec![1.0, 2.0, 3.0, 4.0]));
 }
 
 // --- ArrayRandom ---
@@ -123,9 +135,10 @@ fn test_arndm() {
     let mut inputs = ArrayInputs::new(5);
     let result = eval_arr_with("ARNDM", &mut inputs);
     match result {
-        ArrayStackValue::Array(arr) => {
+        ArrayStackValue::Array(cell) => {
+            let arr = cell.buf();
             assert_eq!(arr.len(), 5);
-            for &v in &arr {
+            for &v in arr {
                 assert!(v >= 0.0 && v <= 1.0, "random value {} out of range", v);
             }
         }
@@ -144,7 +157,8 @@ fn test_fitpoly_quadratic() {
     inputs.arrays[1] = y; // BB = y
     let result = eval_arr_with("FITPOLY(AA, BB)", &mut inputs);
     match result {
-        ArrayStackValue::Array(coeffs) => {
+        ArrayStackValue::Array(cell) => {
+            let coeffs = cell.buf();
             assert_eq!(coeffs.len(), 3);
             assert!((coeffs[0] - 1.0).abs() < 1e-4, "a0={}", coeffs[0]);
             assert!((coeffs[1] - 2.0).abs() < 1e-4, "a1={}", coeffs[1]);
@@ -165,7 +179,8 @@ fn test_fitq() {
     inputs.arrays[1] = y;
     let result = eval_arr_with("FITQ(AA, BB)", &mut inputs);
     match result {
-        ArrayStackValue::Array(coeffs) => {
+        ArrayStackValue::Array(cell) => {
+            let coeffs = cell.buf();
             assert_eq!(coeffs.len(), 4);
             assert!((coeffs[0] - 1.0).abs() < 1e-4, "a0={}", coeffs[0]);
             assert!((coeffs[3]).abs() < 1e-10, "rss={}", coeffs[3]); // perfect fit -> rss ~ 0

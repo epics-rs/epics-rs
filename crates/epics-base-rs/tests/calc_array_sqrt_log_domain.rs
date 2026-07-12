@@ -69,7 +69,7 @@ fn a_negative_element_fails_the_whole_evaluation() {
 fn a_non_negative_array_still_computes() {
     assert_eq!(
         array("SQRT(AA)", &[4.0, 9.0, 16.0, 25.0, 0.0, 1.0, 1.0, 1.0]).unwrap(),
-        ArrayStackValue::Array(vec![2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 1.0, 1.0])
+        ArrayStackValue::array(vec![2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 1.0, 1.0])
     );
 }
 

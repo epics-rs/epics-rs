@@ -10,7 +10,7 @@ pub use engine::opcodes::StringOp;
 pub use engine::value::StackValue;
 
 pub use engine::ArrayInputs;
-pub use engine::array_value::ArrayStackValue;
+pub use engine::array_value::{ArrayCell, ArrayStackValue};
 pub use engine::opcodes::ArrayOp;
 
 /// Compile an infix expression for the **numeric** engine — C `postfix()`

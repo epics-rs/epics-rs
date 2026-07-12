@@ -42,7 +42,7 @@ fn with_nan_at_2() -> [f64; 8] {
 fn isinf_on_an_array_is_element_wise() {
     assert_eq!(
         eval("ISINF(AA)", &with_inf_at_2(), &[], 0.0),
-        ArrayStackValue::Array(vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        ArrayStackValue::array(vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     );
 }
 

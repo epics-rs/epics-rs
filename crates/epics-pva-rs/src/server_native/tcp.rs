@@ -32,7 +32,7 @@ use crate::pvdata::encode::{
     EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
     encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
-use crate::pvdata::{FieldDesc, PvField, RpcReply};
+use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
@@ -78,6 +78,7 @@ fn render_option_value(f: &PvField) -> String {
     }
 }
 
+#[derive(Debug)]
 struct PipelineOptions {
     enabled: bool,
     queue_size: u32,
@@ -111,6 +112,7 @@ struct PipelineOptions {
 /// pipeline negotiation. Distinguishes the two cases the single `None`
 /// return used to conflate — a parsed set of options vs. a negotiation
 /// error the INIT must be rejected for.
+#[derive(Debug)]
 enum MonitorPipelineRequest {
     /// Parsed options to apply (pipeline on or off).
     Options(PipelineOptions),
@@ -146,87 +148,74 @@ enum MonitorPipelineRequest {
 /// emitted (`:560-569`). This faithfully differs from the review doc's
 /// imprecise `ackAny=garbage` Crit example.
 ///
-/// DIVERGENCE, deliberate and recorded: for a NON-scalar `ackAny` this port
-/// emits the `:570-573` "Unable to parse …" Crit and keeps serving. pvxs
-/// cannot actually reach that branch — `:556` runs `ackAny.as<std::string>()`
-/// *before* the `if/else if`, and that throws `NoConvert` on a non-scalar, so
-/// the exception escapes `handle_MONITOR` into the command-dispatch catch
-/// (`conn.cpp:277-282`), which logs and does `bev.reset()`: pvxs DROPS the
-/// circuit. The `:570-573` Crit is dead code. Matching that reset is a
-/// separate change from R9-32 (which is about the conversion below) and is
-/// filed as a finding candidate; this comment previously claimed pvxs takes
-/// the Crit path, which it does not.
-fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<MonitorOptionDiag>) {
+/// A NON-scalar `ackAny` (an array, a struct, an unselected union) is
+/// [`NoConvert`] — `Err`. pvxs runs the THROWING `ackAny.as<std::string>()`
+/// at `:556`, *before* the `if/else if`, and no `copyOut` arm converts those
+/// storages into a string (`data.cpp:466-499`). The exception escapes
+/// `handle_MONITOR` — nothing catches between there and the command-dispatch
+/// `catch` in `conn.cpp:277-282`, which logs and does `bev.reset()`. pvxs
+/// DROPS the circuit; it does not reply, and it does not serve the monitor.
+/// (`:570-573`'s "Unable to parse …" Crit is therefore dead code: it needs
+/// both conversions to fail, and any storage that fails the string one has
+/// already thrown at `:556`.) The caller turns this `Err` into the port's
+/// equivalent of `bev.reset()` — a fatal `PvaError` out of the TCP read loop.
+fn ack_at_from(
+    ack_any: Option<&PvField>,
+    queue_size: u32,
+) -> Result<(u32, Option<MonitorOptionDiag>), NoConvert> {
     // pvxs `MonitorOp::ackAt` struct default.
     let mut ack_at: u32 = 1;
     let mut diag: Option<MonitorOptionDiag> = None;
-    match ack_any {
-        // pvxs tries the PLAIN-INTEGER conversion FIRST — `ackAny.as(ival)`,
-        // `uint32_t ival` (`servermon.cpp:557`) — and falls to the string /
-        // percentage form only when that conversion fails (`:560`). Crucially
-        // it runs that conversion even for STRING storage: `copyOut` String →
-        // UInteger is `parseTo<uint64_t>` = `stoull(s,&idx,0)`, BASE 0
-        // (data.cpp:451-453, util.cpp:786-799). So `ackAny = "0x10"` is 16,
-        // `"010"` is 8, and `"-1"` wraps to `0xFFFF_FFFF` (then clamps to
-        // queueSize) — all in the INTEGER branch, before the percentage form is
-        // ever considered. The port's decimal-only `str::parse` fallback sat in
-        // the wrong branch and refused every one of them (R9-34).
-        Some(f) => {
-            if let Ok(n) = crate::pvdata::convert::as_u32(f) {
-                ack_at = n;
-            } else if let Ok(s) = crate::pvdata::convert::as_string(f) {
-                // `as(ival)` refused it, so this store is not a base-0 integer
-                // — with the integer conversion covering bool/int/real, only a
-                // string store can land here. pvxs's `else if(ackAny.as(sval))`
-                // branch: a `"N%"` percentage is the only form it acts on.
-                if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
-                    match pct.trim().parse::<f64>() {
-                        Ok(percent) => {
-                            // pvxs `servermon.cpp:563` historically
-                            // computed `clamp(percent,0,100) * limit` with NO
-                            // `/ 100`, so any percent >= 1% saturated to the full
-                            // queue after the `[1, limit]` clamp below, defeating
-                            // the percentage control. Divide by 100 so `"50%"` of a
-                            // queue of 4 is 2 — honoring the documented percentage
-                            // semantics. pvxs adopts the same fix.
-                            ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
-                        }
-                        Err(e) => {
-                            // pvxs `servermon.cpp:566-568`: a `"N%"` string whose
-                            // numeric prefix fails `parseTo<double>` is a Crit
-                            // logRemote; `ackAt` stays at its default.
-                            diag = Some(MonitorOptionDiag {
-                                level: MessageType::Fatal,
-                                message: format!(
-                                    "Unable to parse% record._options.ackAny : {s} : {e}"
-                                ),
-                            });
-                        }
-                    }
+    if let Some(f) = ack_any {
+        // `servermon.cpp:556` — `auto sval = ackAny.as<std::string>();`, the
+        // THROWING form, run unconditionally ahead of both branches. Its value
+        // is immediately overwritten by the `as(sval)` below, so its only
+        // effect is this throw.
+        let sval = crate::pvdata::convert::as_string(f)?;
+        // pvxs then tries the PLAIN-INTEGER conversion FIRST — `ackAny.as(ival)`,
+        // `uint32_t ival` (`:557`) — and falls to the percentage form only when
+        // that conversion fails (`:560`). It runs that conversion for STRING
+        // storage too: `copyOut` String → UInteger is `parseTo<uint64_t>` =
+        // `stoull(s,&idx,0)`, BASE 0 (data.cpp:451-453, util.cpp:786-799). So
+        // `"0x10"` is 16, `"010"` is 8, and `"-1"` wraps to `0xFFFF_FFFF` (then
+        // clamps to queueSize) — all in the INTEGER branch (R9-34).
+        if let Ok(n) = crate::pvdata::convert::as_u32(f) {
+            ack_at = n;
+        } else if let Some(pct) = sval.strip_suffix('%').filter(|p| !p.is_empty()) {
+            // pvxs `else if(ackAny.as(sval))` (`:560`) — the same string the
+            // throwing `as<std::string>()` above already produced. Only a `"N%"`
+            // percentage does anything here.
+            match pct.trim().parse::<f64>() {
+                Ok(percent) => {
+                    // pvxs `servermon.cpp:563` historically computed
+                    // `clamp(percent,0,100) * limit` with NO `/ 100`, so any
+                    // percent >= 1% saturated to the full queue after the
+                    // `[1, limit]` clamp below, defeating the percentage
+                    // control. Divide by 100 so `"50%"` of a queue of 4 is 2 —
+                    // honoring the documented percentage semantics. pvxs adopts
+                    // the same fix.
+                    ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
                 }
-                // else: a plain non-`%` string that is not a base-0 integer —
-                // pvxs leaves `ackAt` default with NO logRemote
-                // (`servermon.cpp:560-569` only logs the `%` branch).
-            } else {
-                // A non-scalar `ackAny` — no `copyOut` arm converts it. See the
-                // DIVERGENCE note above: pvxs throws out of the handler here and
-                // resets the circuit; the port logs and serves on.
-                diag = Some(MonitorOptionDiag {
-                    level: MessageType::Fatal,
-                    message: format!(
-                        "Unable to parse record._options.ackAny : {}",
-                        render_option_value(f)
-                    ),
-                });
+                Err(e) => {
+                    // pvxs `servermon.cpp:566-568`: a `"N%"` string whose
+                    // numeric prefix fails `parseTo<double>` is a Crit
+                    // logRemote; `ackAt` stays at its default.
+                    diag = Some(MonitorOptionDiag {
+                        level: MessageType::Fatal,
+                        message: format!("Unable to parse% record._options.ackAny : {sval} : {e}"),
+                    });
+                }
             }
         }
-        None => {}
+        // else: a plain non-`%` string that is not a base-0 integer — pvxs
+        // leaves `ackAt` default with NO logRemote (`:560-569` only logs the
+        // `%` branch).
     }
     // servermon.cpp:577-581.
     if ack_at == 0 {
         ack_at = queue_size / 2;
     }
-    (ack_at.clamp(1, queue_size), diag)
+    Ok((ack_at.clamp(1, queue_size), diag))
 }
 
 /// pvxs `servermon.cpp:332-333` — the pipeline ACK threshold `ack_at`
@@ -574,31 +563,33 @@ fn parse_monitor_init_nack(
 /// `record._options.queueSize`. pvxs `Subscription` defaults to
 /// `queueSize = 4` when pipeline is enabled; we follow.
 ///
-/// Returns `None` only when there is no `record._options` structure to
+/// `Ok(None)` only when there is no `record._options` structure to
 /// negotiate (a plain monitor). A present `_options` yields
 /// [`MonitorPipelineRequest::Options`], or [`MonitorPipelineRequest::Reject`]
 /// when `pipeline=true` is paired with a PRESENT-but-invalid
 /// `queueSize` (pvxs `servermon.cpp:537-540`).
-fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
-    let root = match req {
-        PvField::Structure(s) => s,
-        _ => return None,
+///
+/// `Err(NoConvert)` is pvxs's THIRD outcome, and the only one that is not a
+/// reply: an `ackAny` whose storage no `copyOut` arm converts throws out of
+/// `handle_MONITOR` and resets the circuit (see [`ack_at_from`]). The caller
+/// must fail the connection, not answer the INIT.
+fn monitor_pipeline_options(req: &PvField) -> Result<Option<MonitorPipelineRequest>, NoConvert> {
+    let PvField::Structure(root) = req else {
+        return Ok(None);
     };
-    let record = root
+    let Some(PvField::Structure(record_s)) = root
         .fields
         .iter()
-        .find_map(|(k, v)| (k == "record").then_some(v))?;
-    let record_s = match record {
-        PvField::Structure(s) => s,
-        _ => return None,
+        .find_map(|(k, v)| (k == "record").then_some(v))
+    else {
+        return Ok(None);
     };
-    let options = record_s
+    let Some(PvField::Structure(opt_s)) = record_s
         .fields
         .iter()
-        .find_map(|(k, v)| (k == "_options").then_some(v))?;
-    let opt_s = match options {
-        PvField::Structure(s) => s,
-        _ => return None,
+        .find_map(|(k, v)| (k == "_options").then_some(v))
+    else {
+        return Ok(None);
     };
     // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
     // options, accumulated alongside the effective options without
@@ -684,7 +675,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         match queue_size {
             // Valid: use the requested window (pvxs `op->limit = qSize`).
             Some(n) if n >= 2 => {
-                let (ack_at, ack_diag) = ack_at_from(ack_any, n);
+                let (ack_at, ack_diag) = ack_at_from(ack_any, n)?;
                 diagnostics.extend(ack_diag);
                 PipelineOptions {
                     enabled: true,
@@ -708,14 +699,14 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
                 let rendered = queue_size_field
                     .map(render_option_value)
                     .unwrap_or_default();
-                return Some(MonitorPipelineRequest::Reject(format!(
+                return Ok(Some(MonitorPipelineRequest::Reject(format!(
                     "can not pipeline invalid queueSize : {rendered}"
-                )));
+                ))));
             }
             // ABSENT: pvxs keeps the default `limit` (4) and leaves
             // pipeline enabled.
             _ => {
-                let (ack_at, ack_diag) = ack_at_from(ack_any, 4);
+                let (ack_at, ack_diag) = ack_at_from(ack_any, 4)?;
                 diagnostics.extend(ack_diag);
                 PipelineOptions {
                     enabled: true,
@@ -760,7 +751,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
             diagnostics,
         }
     };
-    Some(MonitorPipelineRequest::Options(opts))
+    Ok(Some(MonitorPipelineRequest::Options(opts)))
 }
 
 #[derive(Clone)]
@@ -6255,7 +6246,29 @@ async fn handle_op(
         // bug for default `pvmonitor` callers (initial snapshot + 4
         // window credits). Without pipeline=true we don't gate the
         // emit loop — mpsc backpressure remains the only limiter.
-        let pipeline_req = req_value.as_ref().and_then(monitor_pipeline_options);
+        //
+        // pvxs reads `record._options.{pipeline,queueSize,ackAny}` only inside
+        // `handle_MONITOR` (`servermon.cpp:523-582`); GET/PUT/PUT_GET/RPC never
+        // look at them. Parse them for MONITOR only, so every outcome of the
+        // reader — including the `NoConvert` throw below — is scoped to the one
+        // command pvxs parses them for.
+        //
+        // That throw is pvxs's third outcome, and the only one that is not a
+        // reply: `:556` runs `ackAny.as<std::string>()`, which no `copyOut` arm
+        // satisfies for an array / struct / unselected-union `ackAny`. Nothing
+        // catches between there and `conn.cpp:277-282`, which logs and calls
+        // `bev.reset()` — the circuit is dropped, with no INIT reply and no
+        // monitor. A fatal `PvaError` out of this read loop IS that reset. The
+        // port used to log a Crit CMD_MESSAGE and serve the monitor on with
+        // `ackAt = 1` (R9-33).
+        let pipeline_req = match req_value.as_ref().filter(|_| kind == OpKind::Monitor) {
+            Some(v) => monitor_pipeline_options(v).map_err(|e| {
+                PvaError::Decode(format!(
+                    "MONITOR INIT: record._options.ackAny is not convertible: {e}"
+                ))
+            })?,
+            None => None,
+        };
         // The client-requested `queueSize` overrides the server's default
         // monitor queue depth for THIS operation, whether or not pipeline
         // flow control is enabled (pvxs `op->limit = qSize` sits outside
@@ -8836,14 +8849,15 @@ mod tests {
     }
 
     /// Unwrap the parsed options, asserting the request was NOT a
-    /// pipeline-negotiation reject.
+    /// pipeline-negotiation reject and did NOT throw.
     fn parsed_opts(req: &PvField) -> PipelineOptions {
         match monitor_pipeline_options(req) {
-            Some(MonitorPipelineRequest::Options(o)) => o,
-            Some(MonitorPipelineRequest::Reject(msg)) => {
+            Ok(Some(MonitorPipelineRequest::Options(o))) => o,
+            Ok(Some(MonitorPipelineRequest::Reject(msg))) => {
                 panic!("expected parsed options, got a pipeline-negotiation Reject: {msg}")
             }
-            None => panic!("expected parsed options, got None (no _options structure)"),
+            Ok(None) => panic!("expected parsed options, got None (no _options structure)"),
+            Err(e) => panic!("expected parsed options, got a circuit-resetting NoConvert: {e}"),
         }
     }
 
@@ -8893,7 +8907,7 @@ mod tests {
         assert!(
             matches!(
                 monitor_pipeline_options(&req),
-                Some(MonitorPipelineRequest::Reject(_))
+                Ok(Some(MonitorPipelineRequest::Reject(_)))
             ),
             "pipeline + queueSize<2 must reject the INIT, not downgrade",
         );
@@ -8908,7 +8922,7 @@ mod tests {
             PvField::Scalar(ScalarValue::String("not-a-number".into())),
         );
         let got = monitor_pipeline_options(&req);
-        let Some(MonitorPipelineRequest::Reject(msg)) = got else {
+        let Ok(Some(MonitorPipelineRequest::Reject(msg))) = got else {
             panic!("pipeline + unconvertible queueSize must reject the INIT");
         };
         // pvxs `ctrl->error(SB()<<"can not pipeline invalid queueSize : "
@@ -8998,7 +9012,7 @@ mod tests {
         assert!(
             matches!(
                 monitor_pipeline_options(&req),
-                Some(MonitorPipelineRequest::Reject(_))
+                Ok(Some(MonitorPipelineRequest::Reject(_)))
             ),
             "Boolean queueSize converts to 1, which is < 2 → invalid",
         );
@@ -10005,28 +10019,64 @@ mod tests {
         );
     }
 
+    /// R9-33. A NON-scalar `ackAny` under an enabled pipeline THROWS in pvxs:
+    /// `servermon.cpp:556` runs `ackAny.as<std::string>()` ahead of both
+    /// branches, and no `copyOut` arm converts array / struct / unselected-union
+    /// storage into a string (`data.cpp:466-499`). Nothing catches it before
+    /// `conn.cpp:277-282`, which does `bev.reset()` — the circuit is dropped.
+    ///
+    /// The `:570-573` "Unable to parse …" Crit is dead code (it needs BOTH
+    /// conversions to fail, and anything that fails the string one has already
+    /// thrown at `:556`). The port used to emit exactly that Crit and serve the
+    /// monitor on with `ackAt = 1`, which is the divergence: pvxs never replies.
     #[test]
-    fn monitor_diag_ackany_non_scalar_under_pipeline_is_crit() {
-        // pvxs `servermon.cpp:570-573`: a NON-scalar ackAny fails both
-        // `as<int>` and `as<string>` → Crit logRemote. ackAt stays default.
-        let non_scalar = PvField::Structure(PvStructure {
-            struct_id: String::new(),
-            fields: vec![],
-        });
+    fn pva_r9_33_non_scalar_ack_any_throws_instead_of_serving() {
+        let non_scalar = [
+            PvField::Structure(PvStructure {
+                struct_id: String::new(),
+                fields: vec![],
+            }),
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![4].into())),
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        ];
+        for ack_any in non_scalar {
+            let label = format!("{ack_any:?}");
+            let req = make_pipeline_request_ack(
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                PvField::Scalar(ScalarValue::Int(16)),
+                ack_any,
+            );
+            let got = monitor_pipeline_options(&req);
+            assert!(
+                got.is_err(),
+                "non-scalar ackAny must throw (circuit reset), not serve: {label} → {got:?}"
+            );
+        }
+    }
+
+    /// R9-33, the scope boundary. pvxs reads `ackAny` ONLY inside
+    /// `if(op->pipeline)` (`servermon.cpp:554`), so the same unconvertible
+    /// value on a NON-pipeline monitor is never touched and the INIT proceeds.
+    #[test]
+    fn pva_r9_33_non_scalar_ack_any_without_pipeline_is_never_read() {
         let req = make_pipeline_request_ack(
-            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Boolean(false)),
             PvField::Scalar(ScalarValue::Int(16)),
-            non_scalar,
+            PvField::Structure(PvStructure {
+                struct_id: String::new(),
+                fields: vec![],
+            }),
         );
         let opts = parsed_opts(&req);
-        assert!(opts.enabled);
-        assert_eq!(opts.ack_at, 1, "non-scalar ackAny leaves ackAt default");
-        assert_eq!(opts.diagnostics.len(), 1, "one ackAny Crit");
-        assert_eq!(opts.diagnostics[0].level, MessageType::Fatal);
+        assert!(!opts.enabled);
         assert!(
-            opts.diagnostics[0].message.contains("ackAny"),
-            "message names the ackAny option: {}",
-            opts.diagnostics[0].message
+            opts.diagnostics.is_empty(),
+            "ackAny is not read without pipeline: {:?}",
+            opts.diagnostics
         );
     }
 
@@ -10185,6 +10235,101 @@ mod tests {
             reply[3],
             Command::Monitor.code(),
             "the INIT reply is a MONITOR frame after the diagnostic"
+        );
+    }
+
+    /// R9-33, on the wire. A pipelined MONITOR INIT whose `ackAny` no `copyOut`
+    /// arm converts must DROP THE CIRCUIT: pvxs's `ackAny.as<std::string>()`
+    /// (`servermon.cpp:556`) throws `NoConvert`, nothing catches it inside
+    /// `handle_MONITOR`, and `conn.cpp:277-282` does `bev.reset()`. So there is
+    /// no CMD_MESSAGE, no INIT reply, and no monitor — the connection dies.
+    ///
+    /// The port used to emit a Crit CMD_MESSAGE and serve the subscription on
+    /// with `ackAt = 1`. `handle_op` returning `Err` is this port's `bev.reset()`
+    /// (the TCP read loop tears the connection down on a `PvaError` return).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pva_r9_33_non_scalar_ack_any_resets_the_circuit() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 933;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // pipeline=true, a valid queueSize, and an ARRAY ackAny — `Int32A` is
+        // Kind::Integer but stores as an array, and `copyOut` has no scalar arm
+        // for array storage (`data.cpp:466-476`).
+        let req_val = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Int(vec![4].into())),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x88);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        // The 0x80 bit obliges the initial-nack rider (`servermon.cpp:494-496`).
+        init_payload.put_u32(4, order);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        let got = handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "unconvertible ackAny must be fatal to the connection, not served: {got:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "pvxs resets before replying: no CMD_MESSAGE and no INIT reply"
+        );
+        assert!(
+            channels[&sid].ops.is_empty(),
+            "no monitor op is registered for a circuit pvxs never answers"
         );
     }
 

@@ -114,7 +114,11 @@ pub enum Token {
     /// `aCalcPostfix()` element tables have no such symbol.
     FetchSval,
 
-    StringLiteral(String),
+    /// C `LITERAL_STRING` (`sCalcPostfix.c:803-812`). RAW BYTES: the compiler
+    /// copies the source verbatim between the quotes and interprets nothing.
+    /// Hence `Vec<u8>` rather than a `String` — there is no decoding step in
+    /// which a translation could hide.
+    StringLiteral(Vec<u8>),
 
     Plus,
     Minus,
@@ -635,27 +639,45 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn read_string_literal(&mut self, quote: u8) -> Result<String, CalcError> {
-        let mut result = String::new();
-        loop {
-            match self.advance() {
-                None => return Err(CalcError::Syntax), // unterminated string
-                Some(b) if b == quote => return Ok(result),
-                Some(b'\\') => match self.advance() {
-                    Some(b'n') => result.push('\n'),
-                    Some(b't') => result.push('\t'),
-                    Some(b'r') => result.push('\r'),
-                    Some(b'\\') => result.push('\\'),
-                    Some(b) if b == quote => result.push(b as char),
-                    Some(b) => {
-                        result.push('\\');
-                        result.push(b as char);
-                    }
-                    None => return Err(CalcError::Syntax),
-                },
-                Some(b) => result.push(b as char),
+    /// C `LITERAL_STRING` (`sCalcPostfix.c:803-812`), the whole of it:
+    ///
+    /// ```c
+    /// c = psrc[-1];                              /* the " or ' that opened it */
+    /// while (*psrc != c && *psrc) *pout++ = *psrc++;
+    /// *pout++ = '\0';
+    /// if (*psrc) psrc++;                         /* step over the close quote */
+    /// ```
+    ///
+    /// A byte-for-byte copy up to the matching quote or the end of the source.
+    /// Three consequences, all of them C's:
+    ///
+    /// * **No backslash escapes.** The literal keeps its backslashes, and `$T` /
+    ///   `TR_ESC` is the ONLY thing that translates them — which is precisely why
+    ///   sCalc has that operator. Pre-translating here made `$T` a double
+    ///   translation and changed the bytes on every path that does not translate:
+    ///   compiled C answers `BYTE("\t")` = 92 (the backslash), `LEN("a\tb")` = 4,
+    ///   and `PRINTF("%d\n",5)` = the 3 bytes `5\n` — a literal backslash and `n`,
+    ///   which is exactly what a serial-device scalcout then hands to `$T`.
+    /// * **The quote character cannot be embedded.** `"a\"b"` closes at the `\"`,
+    ///   leaves `b"` behind, and C stops with CALC_ERR_SYNTAX. The port used to
+    ///   accept it.
+    /// * **An unterminated literal is not an error.** The loop simply stops at the
+    ///   NUL and `if (*psrc) psrc++` does nothing. Compiled C: `"abc` compiles and
+    ///   evaluates to `abc`.
+    fn read_string_literal(&mut self, quote: u8) -> Vec<u8> {
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if b == quote {
+                break;
             }
+            self.pos += 1;
         }
+        let raw = self.input[start..self.pos].to_vec();
+        // `if (*psrc) psrc++` — step over the close quote if there was one.
+        if self.peek() == Some(quote) {
+            self.pos += 1;
+        }
+        raw
     }
 
     /// C `get_element`: consume the longest table symbol that prefixes the
@@ -807,7 +829,7 @@ pub fn tokenize(input: &str, kind: ExprKind) -> Result<Vec<Token>, CalcError> {
         // LITERAL_STRING: sCalcPostfix.c:97-98 only.
         if (b == b'"' || b == b'\'') && table.string_literals {
             tokenizer.advance();
-            let s = tokenizer.read_string_literal(b)?;
+            let s = tokenizer.read_string_literal(b);
             tokens.push(Token::StringLiteral(s));
             continue;
         }

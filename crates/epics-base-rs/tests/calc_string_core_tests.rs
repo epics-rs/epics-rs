@@ -23,19 +23,32 @@ fn test_string_literal_single_quote() {
     assert_eq!(eval_str("'world'"), StackValue::Str("world".into()));
 }
 
+// R13-3 — a string literal is RAW BYTES. C's `LITERAL_STRING`
+// (`sCalcPostfix.c:803-812`) is `while (*psrc != c && *psrc) *pout++ = *psrc++;`
+// — a byte-for-byte copy that interprets no backslash at all. `$T` / `TR_ESC` is
+// the only translator, which is why sCalc has that operator.
+//
+// These three used to assert the opposite (that the lexer translates), which is
+// the defect: it made `$T` a double translation and changed the bytes on every
+// path that does not translate.
+
 #[test]
-fn test_string_literal_escape_newline() {
-    assert_eq!(eval_str(r#""a\nb""#), StackValue::Str("a\nb".into()));
+fn test_string_literal_keeps_backslash_n_raw() {
+    // Compiled C: `LEN("a\nb")` = 4 — the bytes are `a`, `\`, `n`, `b`.
+    assert_eq!(eval_str(r#""a\nb""#), StackValue::Str("a\\nb".into()));
 }
 
 #[test]
-fn test_string_literal_escape_tab() {
-    assert_eq!(eval_str(r#""a\tb""#), StackValue::Str("a\tb".into()));
+fn test_string_literal_keeps_backslash_t_raw() {
+    // Compiled C: `BYTE("\t")` = 92, the backslash — not 9, a TAB.
+    assert_eq!(eval_str(r#""a\tb""#), StackValue::Str("a\\tb".into()));
 }
 
 #[test]
-fn test_string_literal_escape_backslash() {
-    assert_eq!(eval_str(r#""a\\b""#), StackValue::Str("a\\b".into()));
+fn test_string_literal_keeps_both_backslashes_raw() {
+    // Compiled C: `LEN("\\\\")` = 4. The lexer collapses nothing; `$T` is what
+    // turns `\\` into one backslash.
+    assert_eq!(eval_str(r#""a\\b""#), StackValue::Str("a\\\\b".into()));
 }
 
 #[test]

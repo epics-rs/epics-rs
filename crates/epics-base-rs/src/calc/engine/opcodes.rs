@@ -107,7 +107,10 @@ pub enum CoreOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StringOp {
     // Phase 2A: Core
-    PushString(String),
+    /// C `LITERAL_STRING`. The bytes the compiler copied out of the source
+    /// verbatim (`sCalcPostfix.c:808`) — raw, un-decoded, backslashes intact.
+    /// `$T` / `TR_ESC` is the only translator.
+    PushString(Vec<u8>),
     PushStringVar(u8),  // AA..LL string push
     StoreStringVar(u8), // AA..LL string store
     ToString,           // STR: number→string

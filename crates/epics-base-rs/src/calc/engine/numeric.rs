@@ -285,7 +285,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::IsInf => {
                     let a = pop1(&mut stack)?;
-                    stack.push(if a.is_infinite() { 1.0 } else { 0.0 });
+                    stack.push(super::c_isinf(a));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;

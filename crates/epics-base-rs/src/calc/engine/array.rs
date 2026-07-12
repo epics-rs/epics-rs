@@ -388,7 +388,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 // the predicate applied per element.
                 CoreOp::IsInf => {
                     let a = pop1(&mut stack)?;
-                    stack.push(a.map(|x| f64::from(u8::from(x.is_infinite()))));
+                    stack.push(a.map(super::c_isinf));
                 }
 
                 CoreOp::Atan2 => {

@@ -105,6 +105,24 @@ impl CompiledExpr {
     }
 }
 
+/// C `isinf` — the value the ISINF operator pushes in all three engines
+/// (`calcPerform.c:277`, `sCalcPerform.c:1407`, `aCalcPerform.c:826,1084`,
+/// each of which assigns the macro's result straight into a `double`).
+///
+/// It is a SIGN, not a predicate: glibc expands `isinf` to
+/// `__builtin_isinf_sign`, so `-inf` is `-1`, `+inf` is `+1`, everything else
+/// (finite, NaN) is `0`. Verified on this host by compiling the macro.
+///
+/// The three engines share this one definition so the sign cannot drift back to
+/// a boolean in one of them.
+pub(crate) fn c_isinf(v: f64) -> f64 {
+    if v.is_infinite() {
+        if v.is_sign_negative() { -1.0 } else { 1.0 }
+    } else {
+        0.0
+    }
+}
+
 /// C's subrange bound rule for a pair of NUMERIC bounds over a container of
 /// length `k` — aCalc's `[` over `arraySize` (`aCalcPerform.c:1527-1534`), and
 /// sCalc's `isDouble` branch over `strlen(ps->s)` (`sCalcPerform.c:1876-1886`),

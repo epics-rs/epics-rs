@@ -2,7 +2,7 @@ use super::cast::{c_int, c_long, d2ui};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
-use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
+use super::value::{ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
@@ -589,25 +589,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let v = pop1(&mut stack)?;
                     stack.push(match v {
                         StackValue::Double(d) => StackValue::Double(d),
-                        StackValue::Str(s) => StackValue::str(raw_from_escaped(s.as_bytes())),
+                        StackValue::Str(s) => StackValue::str_ncpy(raw_from_escaped(s.as_bytes())),
                     });
                 }
                 StringOp::Esc => {
                     // C ESC (sCalcPerform.c:1805-1815) — the same table run
-                    // backwards, and a double is again left alone. Its result is
-                    // bounded at THIRTY-EIGHT bytes, not 39: C passes
-                    // `SCALC_STRING_SIZE-1` as epicsStrSnPrintEscaped's dstlen,
-                    // and that function writes at most `dstlen-1` bytes before
-                    // its NUL (epicsString.c:133 `if (--rem > 0) *dst++ = chr`).
-                    // Compiled C: 20 newlines escape to 40 bytes and come back 38.
+                    // backwards, and a double is again left alone.
                     let v = pop1(&mut stack)?;
                     stack.push(match v {
                         StackValue::Double(d) => StackValue::Double(d),
-                        StackValue::Str(s) => {
-                            let mut esc = escaped_from_raw(s.as_bytes()).into_bytes();
-                            esc.truncate(SCALC_STRING_SIZE - 2);
-                            StackValue::str(esc)
-                        }
+                        StackValue::Str(s) => StackValue::str_ncpy(escaped_from_raw(s.as_bytes())),
                     });
                 }
                 StringOp::Printf => {
@@ -615,7 +606,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let val = pop1(&mut stack)?;
                     let fmt = pop1(&mut stack)?;
                     let result = simple_printf(fmt.as_bytes()?, &val)?;
-                    stack.push(StackValue::str(result));
+                    stack.push(StackValue::str_ncpy(result));
                 }
                 StringOp::Sscanf => {
                     // Pop format string, then input string
@@ -642,7 +633,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let val = pop1(&mut stack)?;
                     let fmt = pop1(&mut stack)?;
                     let result = bin_write(fmt.as_bytes()?, &val)?;
-                    stack.push(StackValue::str(result));
+                    stack.push(StackValue::str_ncpy(result));
                 }
                 StringOp::Crc16 => {
                     let v = pop1(&mut stack)?;
@@ -857,7 +848,10 @@ fn checksum_op(
         return StackValue::Str(s); // the helper returned -1; C writes nothing.
     };
     match combine {
-        Combine::Replace => StackValue::str(text),
+        // C `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)` (:1823, :1845, :1861):
+        // a 38-byte result. The two appending forms use `strncat` instead, whose
+        // `SCALC_STRING_SIZE-strlen(ps->s)-1` bounds the TOTAL to 39.
+        Combine::Replace => StackValue::str_ncpy(text),
         Combine::Append => StackValue::str([s.as_bytes(), text.as_bytes()].concat()),
         Combine::AsciiFrame => StackValue::str([b":", s.as_bytes(), text.as_bytes()].concat()),
     }

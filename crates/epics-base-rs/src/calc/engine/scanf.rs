@@ -259,6 +259,9 @@ impl Spec {
 
     /// Match this directive against `input[*p..]`, advancing `p`. `Err` is a
     /// matching failure or input exhaustion — both leave C's `i` short of 1.
+    ///
+    /// A string result is bounded at 38 bytes, not 39: C scans into `tmpstr` and
+    /// then copies with `strNcpy(ps->s, tmpstr, SCALC_STRING_SIZE-1)` (`:1684`).
     fn convert(&self, input: &[u8], p: &mut usize) -> Result<StackValue, CalcError> {
         match self.conv {
             // `%c` and `%[` do NOT skip leading whitespace.
@@ -268,7 +271,7 @@ impl Spec {
                 let end = end.ok_or(CalcError::InvalidFormat)?;
                 let text = input[*p..end].to_vec();
                 *p = end;
-                Ok(StackValue::str(text))
+                Ok(StackValue::str_ncpy(text))
             }
             b'[' => {
                 let set = self.set.as_ref().ok_or(CalcError::InvalidFormat)?;
@@ -282,7 +285,7 @@ impl Spec {
                 }
                 let text = input[*p..*p + n].to_vec();
                 *p += n;
-                Ok(StackValue::str(text))
+                Ok(StackValue::str_ncpy(text))
             }
             b's' => {
                 *p += leading_whitespace(&input[*p..]);
@@ -296,7 +299,7 @@ impl Spec {
                 }
                 let text = input[*p..*p + n].to_vec();
                 *p += n;
-                Ok(StackValue::str(text))
+                Ok(StackValue::str_ncpy(text))
             }
             b'e' | b'E' | b'f' | b'g' | b'G' => {
                 *p += leading_whitespace(&input[*p..]);

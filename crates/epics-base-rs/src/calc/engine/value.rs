@@ -54,6 +54,33 @@ impl ScalcString {
         ScalcString(b[..end].to_vec())
     }
 
+    /// C `strNcpy(dest, src, SCALC_STRING_SIZE-1)` — the OTHER bound, and it is
+    /// one byte shorter: **38**.
+    ///
+    /// `strNcpy(dest, src, N)` copies while `ii < N-1` (`sCalcPerform.c:68-74`),
+    /// so the bound is always `N-1`. The two `N`s C passes are not
+    /// interchangeable:
+    ///
+    /// ```c
+    /// strNcpy(ps->s, psarg[i], SCALC_STRING_SIZE);    /* FETCH_AA :1474  -> 39 */
+    /// strNcpy(ps->s, tmpstr,   SCALC_STRING_SIZE-1);  /* PRINTF   :1566  -> 38 */
+    /// ```
+    ///
+    /// The 38-byte form is what every opcode that builds its result in the
+    /// scratch buffer `tmpstr` uses: PRINTF (`:1566`), BIN_WRITE (`:1632`),
+    /// SSCANF's `%c`/`%[`/`%s` (`:1684`), TR_ESC (`:1801`), ESC (`:1814`) and
+    /// the three replacing checksums CRC16 (`:1823`), LRC (`:1845`) and XOR8
+    /// (`:1861`).
+    ///
+    /// The 39-byte form is FETCH_AA, LITERAL_STRING, AMODBUS's intermediate
+    /// (`:1849`) and every `strncat` (`:975`, `:1825`, `:1850`, `:1863`), whose
+    /// `SCALC_STRING_SIZE-strlen(ps->s)-1` bounds the TOTAL to 39.
+    pub fn from_strncpy(bytes: impl AsRef<[u8]>) -> Self {
+        let mut s = ScalcString::from_c(bytes);
+        s.0.truncate(SCALC_STRING_SIZE - 2);
+        s
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -132,6 +159,15 @@ impl StackValue {
     /// something each operator has to remember (see [`ScalcString`]).
     pub fn str(bytes: impl AsRef<[u8]>) -> StackValue {
         StackValue::Str(ScalcString::from_c(bytes))
+    }
+
+    /// The same, for the opcodes C bounds with `strNcpy(dest, src,
+    /// SCALC_STRING_SIZE-1)` — a **38**-byte result, not 39. Which of the two
+    /// bounds applies is a property of the opcode that produced the value, so
+    /// it is spelled at the one place the value is built, never re-checked
+    /// afterwards. See [`ScalcString::from_strncpy`] for the site list.
+    pub fn str_ncpy(bytes: impl AsRef<[u8]>) -> StackValue {
+        StackValue::Str(ScalcString::from_strncpy(bytes))
     }
 
     pub fn is_double(&self) -> bool {

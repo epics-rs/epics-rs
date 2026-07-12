@@ -104,7 +104,11 @@ fn a_suppressed_conversion_fails_the_perform() {
 }
 
 /// Negative control: the format operand must be a string (C `if (isDouble(ps))
-/// return(-1)`), and the R11-2 bound still truncates the result at 39 bytes.
+/// return(-1)`), and the result is bounded — at THIRTY-EIGHT bytes, because
+/// PRINTF copies its result back with `strNcpy(ps->s, tmpstr,
+/// SCALC_STRING_SIZE-1)` (`sCalcPerform.c:1566`) and `strNcpy` stops at `N-1`.
+/// Compiled sCalc: `PRINTF("%50.2f",1)` has strlen 38. R11-2 read this bound as
+/// 39 (R12-8).
 #[test]
 fn the_result_is_still_a_bounded_scalc_string() {
     let mut inp = StringInputs::new();
@@ -112,5 +116,5 @@ fn the_result_is_still_a_bounded_scalc_string() {
         scalc("PRINTF(1, 2)", &mut inp).is_err(),
         "format must be a string"
     );
-    assert_eq!(pf("PRINTF(\"%50.2f\", 1)").len(), 39);
+    assert_eq!(pf("PRINTF(\"%50.2f\", 1)").len(), 38);
 }

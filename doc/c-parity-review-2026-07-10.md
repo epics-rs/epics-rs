@@ -4201,3 +4201,124 @@ The a-acalc fixer's one-line recommendation: keep the deviation but make it
 opt-in deterministic — fixed default seed matching C's thread-private LCG so
 parity tests replay, time-seeding behind an explicit call. Still awaiting the
 user's disposition; code untouched.
+
+## Round 13 re-audit (2026-07-13)
+
+Five read-only opus auditor panels, one per category. Methods: category A
+compiled both upstream calc engines plus a Rust probe crate and diffed
+~1500 expressions; category B ran the compiled C tools vs the Rust tools
+head-to-head against one live softIoc (~140 paired invocations); category E
+compiled the exact recGblResetAlarms/recGblSetSevrVMsg bodies. Every verdict
+below is evidence-backed in the round transcript
+(`.caucus/sessions/01KX5QMAM71PJZFNWG0SFREHPX/rounds/01KXC72YPSPGYR4J62BNSD75D2.md`
++ round-spills, not tracked by git — verdict summaries here are the durable
+record).
+
+### Wave-10 fix verification
+
+All 35 wave-10 dispositions verified independently. 34 hold as landed;
+1 is INCOMPLETE:
+
+- `09e5fa9b` (R12-16/R12-20) INCOMPLETE — the `-0`/`-d` race picks the last
+  `-0`, C picks the last VALID `-0` (→ R13-16).
+- Both NOT-REAL adjudications UPHELD: R12-19 (signed-char cast at decode,
+  byte-identical on overflowing limits), R12-34 (pvxs SharedPV catches the
+  mask throw; pinned lines re-read).
+- The four-way merge resolution `ac5f5d9e` (`collect_subscriber_posts`)
+  verified correct by two panels independently (A: no drift vs `b93c1f21`;
+  E: all three semantic axes — independent LOG push, `last_posted`
+  single-owner, `val.clone()` value preservation).
+- "VERIFIED, INCOMPLETE" family halves folded into new findings: `b87dcbd7`
+  aCalc-only depth guard → R13-6; `17d98eee`/`b93c1f21` post mask → W10-A5;
+  `d4978e93` monitorStatus tail → W10-D2; `6be69cca` widened the slot-revive
+  gap → R13-50.
+- R11-C15's wave-10 ODLY refutation CONFIRMED by re-reading
+  calcoutRecord.c:244,280-283 — nsta/nsev survive the delaying return.
+
+### W10 candidate adjudications: 31 REAL / 2 NOT-REAL
+
+REAL: W10-A1..A8 (A1-A3 Medium, A4-A8 Low), W10-B1..B5 (B1-B4 Medium, B5
+Low), W10-C1 (upstream C++, Medium — gateway blast radius), W10-C2 (Low,
+superseded by R13-31/32), W10-D1 (user decision; auditor recommends match C),
+W10-D2 (Medium), W10-D3 (Low), W10-D5 (Low), W10-D6 (Medium, compiled repro),
+W10-E1 (Medium), W10-E2 (Medium), W10-E3 (user decision; both halves must
+move together), W10-E4 (**High** — broken SIOL is completely silent at
+default SIMS), W10-E5 (Medium), W10-E6 (Low, disclosed trade-off), W10-E7
+(Low, informational), W10-E8 (Medium).
+
+NOT-REAL:
+- **W10-C3** — pvxs does not implement PUT_GET at all (`serverconn.cpp:259-260`
+  is an empty body); the port's PUT_GET is a superset, not a divergence.
+  Action: relabel the `pv_request.rs:219-247` parity citation as
+  "pvAccessCPP/pvDatabaseCPP extension, no pvxs counterpart".
+  pvDatabaseCPP/pvAccessCPP are not on this machine, so the put/get-leg
+  masks remain unaudited against their actual reference.
+- **W10-D4** — the candidate misread C: `asynShellCommands.c:239`'s
+  `timeout = 2` is the I/O timeout; the queue timeout is `queueRequest(...,
+  0.0)` + `epicsEventWait` with no deadline (`:245-246`), so C hangs the
+  shell on a wedged port too. The port matches C. A real adjacent gap is
+  R13-49.
+
+### Open Findings — Round 13 (R13-1 .. R13-63, 32 findings)
+
+Category A (calc engines):
+### R13-1: `AND`/`OR` keywords compile as logical ops; C's are bitwise — **High**. `postfix.rs:107-108` vs postfix.c:174-176 / sCalcPostfix.c:237-239 / aCalcPostfix.c:234-236 (all map AND→BIT_AND, OR→BIT_OR). Compiled: `5 OR 3` → C 7, port 1; `12 AND 10` → C 8, port 1. All three engines; silently wrong VAL. XOR and the symbol forms are correct, which hides it.
+### R13-2: `[…]`/`{…}` after a function call binds to the wrong operand — **High**. `postfix.rs:523-535` flushes the function at `)`; C keeps it on the stack (in_stack_pri 9) and `[`/`{` (in_coming_pri 11) do not pop it, so the function applies to the subrange result. Compiled: `LEN("abcd")[0,1]` → C 2, port 4; `SQRT(4){"2","9"}` → 2 vs 9; aCalc `AMAX(AA)[0,1]` → 3 vs 9. Fix must defer function emission, not delete the flush.
+### R13-3: sCalc tokenizer interprets backslash escapes in string literals; C copies bytes raw — **High**. `token.rs:628-649` vs sCalcPostfix.c:803-812 (byte-for-byte copy; that is why TR_ESC/$T exist). Compiled: `BYTE("\t")` → C 92, port 9; `PRINTF("%d\n",5)` → C 3 bytes with literal backslash-n, port 2 bytes with LF. Port also accepts `"a\"b"` which C rejects. $T/checksum idioms agree by coincidence (both translate), hiding it.
+### R13-4: sCalc `>?`/`<?` drop C's string-compare and coercion paths — Medium. `string.rs:493-500` always numeric; C sCalcPerform.c:1296-1328 has left-double/right-double/both-string(strcmp→string result) branches. Compiled: `"abc">?"abd"` → C "abd", port 0. Two-arg sibling of W10-A1; fix together.
+### R13-5: sCalc `@`/`@@` still do not compile — R9-8 landed aCalc only — Medium. SCALC_TABLE has no entries; C sCalcPostfix.c:99-100 → A_FETCH/A_SFETCH, eval sCalcPerform.c:1446,1462. Compiled: `@0` (A=7) → C 7, port syntax error. A_SFETCH also missing from uses_string (C sCalcPostfix.c:461). Corrects the doc's "R9-8 FIXED, WIDENED" record.
+### R13-6: sCalc engine lacks the end-of-expression stack-depth guard (`b87dcbd7` fixed aCalc only) — Low, structural. `string.rs:782` invents 0.0 from an empty stack; C enforces on both paths (sCalcPerform.c:817-823, 2023-2032). No reachable divergence found in 20 probes; close the family half.
+### R13-7: UNTIL ceiling counted at run time, not by C's static pre-scan — Low. `string.rs:722-733` vs sCalcPerform.c:341-365 (pre-scan counts UNTIL opcodes present; tenth aborts −1 regardless of reachability). Probe: ten UNTILs on a dead `?:` branch → C −1, port evaluates.
+### R13-8: UNTIL string condition — C reads uninitialised `ps->d` (UB) — Low. sCalcPerform.c:1999 tests raw `d`; LITERAL_STRING never sets it. No C semantic to match. DISPOSITION (adopted): keep the port's defined `to_double` behaviour, document the deviation; do not port UB.
+
+Category B (CA tools):
+### R13-16: caget `-0`/`-d` race uses the last `-0`, not the last VALID `-0` — Medium. `caget-rs.rs:102-105` vs caget.c:497-503 (`type = DBR_LONG` only inside `if (outType != dec)`). `caget -0x -d DBR_DOUBLE -0q` → C DBR_DOUBLE, port DBR_LONG. Introduced by 09e5fa9b.
+### R13-17: every non-repeatable option is a hard clap error; C getopt accepts any option any number of times — **High**. All four tools, every option except `-0`/`-l`. `caget -w 5 -w 2` → C runs (last wins), port dies with clap's usage block (breaking 7faf7a3a's one-line-diagnostic contract in spirit). Structural fix: every C option becomes Append/Count with last-wins resolution in copt, so a newly declared option cannot re-open the family. W10-B2 is blocked behind this.
+### R13-18: `camonitor -t <key>` unknown letter prints no warning — Low. camonitor.c:248-251 warns per bad character (`%c`); `camonitor-rs.rs:529` `_ => {}` with a wrong "matches C" comment. Only `n` is a silent no-op in C.
+### R13-19: `camonitor -t n` drops one field separator — Medium. tool_lib.c:517-519 prints name, unconditional separator, timestamp, separator+value — two separators when no timestamp source; the port models the first separator as a suffix of the timestamp and emits one. Every `-t n` line is one column short. Fix: separator before the timestamp, unconditional, as C has it.
+### R13-20: float NaN prints `NaN`; C prints `nan` — Medium. `cli.rs:749-751,766-770` `format!("{x}")`; C `%g`. inf/-inf already match. Common case: unset alarm limits on stock ai/ao are NaN, so every `caget -d DBR_GR_*`/`DBR_CTRL_*` differs on four lines.
+### R13-21: `-lx`/`-lo`/`-lb` out-of-int32-range/NaN/±Inf — Low, USER DECISION. C's cast is UB (x86-64: uniform 0x80000000; aarch64 would saturate); port is a third answer. Auditor recommends a defined saturating rule + documented deviation over mirroring x86-64 UB.
+### R13-22: caput prints `Old :` before enum validation; C prints only the error — Medium. caput.c:485-506 (validate, return 1) precedes :532-535 (`Old :`). Port emits a spurious value line on a failed enum put; exit status already matches.
+### R13-23: caput never emits C's "enum index may be too large" warning — Low. caput.c:477-479, 505-507; put and value lines already byte-identical, warning missing.
+### R13-24: caput swallows a server-rejected write; C's libca prints a CA.Client.Exception block — Medium. Root in epics-ca-rs (no default exception handler for async server ECA_* on put), not caput.c. Both exit 0; C shows the operator a warning block, port shows nothing.
+### R13-25: `cainfo -n` — C falls into `default: usage()` (full usage block + version banner, exit 1); port prints one-line unrecognized-option, exit 1 — Low. A C wart (leftover `n` in the getopt string with no case).
+### R13-26: `-h`/`-V` suppress option warnings C prints first — Low. C's getopt emits earlier options' diagnostics before reaching `-h`; clap owns DisplayHelp/DisplayVersion and prints only the help. `caget -w abc -h` → C warns then usage; port help only.
+
+Category C (PVA):
+### R13-31: a nested-leaf pvRequest ships the whole parent structure — **High**. `encode.rs:1380-1381` (`canonical_changed_bitset` treats the mask's parent *permission* bit as select-whole-subtree) vs pvxs to_wire_valid/mark leaf semantics (dataencode.cpp:414-439, data.cpp:256-270, pinned by testxcode.cpp:111-116). `field(alarm.status)` → pvxs ships bitset {alarm.status} + one int32; port ships {alarm} + severity+status+message — fields the client did not select, on every GET and monitor frame. Two port tests assert the divergence with a false "pvxs byte-exact" label (encode.rs:3886-3910, 4033-4040) — invert, not preserve.
+### R13-32: wire changed-bitset is parent-compressed; pvxs is leaf-enumerated — Low (same root cause as R13-31, bytes-only, decode-safe). Wildcard request: port {0}, pvxs {1,3,4,5,7,8,9}. General form of what W10-C2 asked to pin.
+### R13-33: DBE_PROPERTY marks whole display/control/valueAlarm structs; pvxs assigns a leaf subset — Medium. `pvif.rs:83-85` parent paths vs iocsource.cpp:252-310 (getProperties assigns ~13 specific leaves; never display.form, control.minStep, valueAlarm.active/*Severity/hysteresis). Port ships those as freshly-changed hardcoded zeros. Residue of R12-31 at wrong granularity.
+### R13-34: a terminal (FINISH) post is squashed into a full queue; pvxs pushes it unconditionally — Medium. `tcp.rs:1691-1698` routes the terminal through push_squash_monitor; pvxs servermon.cpp:270-283 gates the squash on `|| !val` so a terminal always push_backs past limit. On a full FIFO the newest real update is destroyed and replaced by the FINISH marker (limit-1 updates delivered vs C's limit). Independent local fix.
+STRUCTURAL NOTE (R13-31/32/33 are one family): the port models "changed" as structure paths expanded by the encoder; pvxs models it as leaf valid flags, never expanded. Fix = leaf-enumerated wire bitset (delete canonical_changed_bitset's parent-collapse clauses) + change_leaves returns pvxs's actual leaf lists. Patching R13-31's clause alone leaves 32/33 open.
+
+Category D (asyn):
+### R13-46: `queue_gate`'s wildcard arm silently gates every op C does not queue — Medium, structural cause of R13-47/48 and W10-D6. `port_actor.rs:344` `_ => Some(user.connect_check())`. Exhaustive match (no `_`) forces per-variant classification.
+### R13-47: `CallParamCallbacks` is queue-gated — a driver's parameter publish is silently discarded on a disconnected/disabled port — **High**, compiled repro. C asynPortDriver.cpp:1785-1794 is a plain method, no gate, no queue. Port: `set_params_and_notify_blocking` returns Ok(()), actor refuses, parameter reads back ParamUndefined after reconnect. The documented ADCore pattern loses exactly the status updates announcing a disconnection.
+### R13-48: `DrvUserCreate` is queue-gated — C calls asynDrvUser->create directly — Medium, compiled repro. asynRecord.c:1242-1254 / devAsynInt32.c:263-277: a pure table lookup that cannot fail for connectivity; port returns Err(Disconnected) → record resolves DRVINFO to parameter 0 with ERRS set.
+### R13-49: iocsh asynOctetSet{Input,Output}Eos drop C's `pasynUser->timeout = 2` — Low. asynShellCommands.c:239,288 set it; the sibling asynSetOption handler does (`iocsh.rs:326`), the EOS handlers do not (`iocsh.rs:185`).
+### R13-50: a reused client slot never revives the child subport — **High**. C drvAsynIPServerPort.c:357-367 connectDevice()s the child on slot reuse; Rust `accept_one` (ip_server_port.rs:767) only assigns the socket. After any teardown sets the subport's cached `connected=false` (EOF before 6be69cca, any fatal errno after), the next accepted client is refused asynDisconnected forever (subport is correctly noAutoConnect). Structural fix: derive the subport's connected from `slot.is_occupied()` so "slot occupied but port disconnected" cannot be constructed.
+### R13-51: a waived request never triggers the port auto-connect C's portThread performs right after it — Low. asynManager.c:812-861: after draining the Connect queue C unconditionally attempts autoConnectDevice (2 s throttle). Port's Waived path skips auto_connect_device (port_actor.rs:449-451); a HOSTINFO repoint on a dead port defers the reconnect indefinitely on an I/O-Intr-only record.
+
+Category E (records/framework):
+### R13-61: AMSG is blanked on the alarm-clear cycle where C leaves it stale — Medium, compiled repro. `recgbl.rs:199` takes namsg unconditionally; C recGbl.c:191-195 assigns AND clears only inside `if (strcmp(namsg, amsg) != 0)`, so an unchanged message survives in namsg and AMSG keeps the last alarm text after the alarm clears. Port emits an empty-string AMSG event on clear. Most common via dbLink.c:321 (every failing link read re-raises the same message).
+### R13-62: the ACKS event is gated on a value change; C posts whenever the ack rule fires — Low, compiled repro. `recgbl.rs:221-226` requires acks != sevr; C recGbl.c:214-217 posts DBE_VALUE unconditionally inside the rule. Stat-only transition at constant severity (LINK→CALC at INVALID, ACKT=1): C posts stat+amsg+acks, port omits acks.
+### R13-63: transform's LA..LP fields are not served — Low. transformRecord.dbd:505-584 declares them; transformRecord.c:797,804 uses them as previously-posted cells. `caget T.LA` → C value, port "Invalid record field name". Readback-only gap (port's change detection uses last_posted).
+
+### Upstream C defect candidates (for the next CBUG catalogue pass)
+- CBUG-cand: LRC/AMODBUS on an empty string is an unbounded read — sCalcPerform.c:247 `i<strlen(rawInput)-1` wraps to SIZE_MAX; compiled upstream SEGFAULTS on `LRC("")`, `AMODBUS("")`, `LRC(AA)` with empty AA. Port returns "" and is safe. High (crash from a reachable record state).
+- CBUG-cand: W10-C1 CONFIRMED — QSRV singlesource.cpp:147 / groupsource.cpp:399 bare `connect()`; a client field typo resets the whole TCP circuit; through a gateway, every downstream user's channels. Medium.
+- CBUG-cand: FETCH_AA `strncpy(ps->s, psarg[i], SCALC_STRING_SIZE)` (sCalcPerform.c:872) leaves the local string unterminated at exactly 40 bytes and atof reads past it — latent, unreachable from a real char[40] field. Low.
+- CBUG-cand: `caget -w nan` hangs forever — ca_pend_io(NaN) never expires (tool_lib.c:628 path). Low.
+- CBUG-cand: sCalc PRINTF with more conversions than arguments reads garbage off the stack (sCalcPerform.c:1546-1564, snprintf with one vararg). Low.
+- CBUG-cand: sCalc UNTIL with a string condition tests uninitialised `ps->d` (sCalcPerform.c:1999). Low. Port disposition recorded at R13-8.
+
+### User-decision queue (updated)
+Awaiting instruction, code untouched: ARANDOM seeding; W10-D1 (CNCT waiver —
+auditor recommends matching C; the port's Waived behaviour would need to be a
+documented opt-in deviation to survive); W10-E3 (IVOV substitution — both
+halves move together if C parity is wanted; module doc declares the deviation
+deliberate); R13-21 (out-of-range float→int display — recommend defined
+saturating rule + documented deviation); long-form `--options` superset on
+the CA tools (deliberate superset — keep or gate); W10-E7 (port aai/aao or
+leave declared-inert). Adopted without ballot (recommendation = only sane
+option): R13-8 do-not-port-UB.

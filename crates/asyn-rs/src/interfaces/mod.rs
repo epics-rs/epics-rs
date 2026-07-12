@@ -130,6 +130,12 @@ pub enum Capability {
     Float64ArrayWrite,
     Motor,
     Gpib,
+    /// The `asynOption` interface (`get_option` / `set_option`). C drivers
+    /// register it explicitly (`option.interfaceType = asynOptionType` in
+    /// drvAsynIPPort.c:1025, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
+    /// drvAsynFTDIPort.cpp:582) and asynRecord's `optioniv` is the result of
+    /// `findInterface(asynOptionType)` (asynRecord.c:1177-1187).
+    Option,
     Flush,
     Connect,
 }
@@ -153,6 +159,7 @@ impl Capability {
             Self::Float64ArrayRead | Self::Float64ArrayWrite => InterfaceType::Float64Array,
             Self::Motor => InterfaceType::Motor,
             Self::Gpib => InterfaceType::Gpib,
+            Self::Option => InterfaceType::Option,
             Self::Flush | Self::Connect => InterfaceType::Common,
         }
     }
@@ -199,6 +206,15 @@ impl Capability {
 }
 
 /// Default capabilities for port drivers that only support scalar cache-based I/O.
+///
+/// This is the parameter-library port's interface set — the analogue of C's
+/// `asynPortDriver`, which registers every standard interface its
+/// `interfaceMask` names (asynPortDriver.cpp:4070). A transport that speaks only
+/// bytes (an IP socket, a serial line) registers far fewer and must override
+/// [`crate::port::PortDriver::capabilities`] to say so, because asynRecord reads
+/// that declaration into OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV and
+/// refuses I/O on an interface the port does not have (asynRecord.c:1177-1240,
+/// :1328-1360).
 pub fn default_capabilities() -> Vec<Capability> {
     vec![
         Capability::Int32Read,
@@ -215,6 +231,22 @@ pub fn default_capabilities() -> Vec<Capability> {
         Capability::EnumWrite,
         Capability::GenericPointerRead,
         Capability::GenericPointerWrite,
+        Capability::Option,
+        Capability::Flush,
+        Capability::Connect,
+    ]
+}
+
+/// The interface set of a byte-transport port: `asynCommon` + `asynOctet` +
+/// `asynOption`, exactly what drvAsynIPPort / drvAsynSerialPort /
+/// drvAsynFTDIPort register (drvAsynIPPort.c:1037-1053). No register interface,
+/// so a record pointed at one with IFACE=Int32 gets C's "No asynInt32 interface"
+/// rather than a silent cache read.
+pub fn octet_transport_capabilities() -> Vec<Capability> {
+    vec![
+        Capability::OctetRead,
+        Capability::OctetWrite,
+        Capability::Option,
         Capability::Flush,
         Capability::Connect,
     ]

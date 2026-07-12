@@ -724,6 +724,20 @@ impl PortDriver for DrvAsynIPServerPort {
         &mut self.base
     }
 
+    /// C drvAsynIPServerPort registers asynCommon and asynOctet, plus asynInt32
+    /// only when the socket is not SOCK_DGRAM (drvAsynIPServerPort.c:621-661) —
+    /// the Int32 interface carries the per-connection file descriptor. It
+    /// registers no asynOption.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        use crate::interfaces::Capability::*;
+        let mut caps = vec![OctetRead, OctetWrite, Flush, Connect];
+        if self.config.protocol == IpServerProtocol::Tcp {
+            caps.push(Int32Read);
+            caps.push(Int32Write);
+        }
+        caps
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let already_up = self.base.connected
             && (self.listener.lock().is_some() || self.udp_socket.lock().is_some());
@@ -1162,6 +1176,13 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C creates each accepted connection as a plain drvAsynIPPort
+    /// (`drvAsynIPPortConfigure`, drvAsynIPServerPort.c:690) — so a subport has
+    /// the byte-transport interface set: asynCommon + asynOption + asynOctet.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {

@@ -497,6 +497,12 @@ impl PortDriver for DrvAsynSerialPort {
         &mut self.base
     }
 
+    /// C drvAsynSerialPortWin32 registers the same set as the POSIX serial
+    /// driver: asynCommon, asynOption, asynOctet.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C connectIt: reject a connect on an already-open link rather than
         // leaking the first handle.

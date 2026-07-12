@@ -1164,6 +1164,14 @@ impl PortDriver for DrvAsynIPPort {
         &mut self.base
     }
 
+    /// C drvAsynIPPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynIPPort.c:1037-1053) — no register interface. A record with
+    /// IFACE=Int32/UInt32/Float64 on this port gets C's "No asyn<X> interface"
+    /// (asynRecord.c:1336-1358), not a silent parameter-cache read.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C drvAsynIPPort.c::connectIt (424-427): reject a connect on an
         // already-open link ("Link already open!") rather than opening a

@@ -97,6 +97,10 @@ pub fn create_port_runtime_boxed(
     let can_block = driver.base().flags.can_block;
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
+    // The driver's interface declaration, taken once here — C's port
+    // registration is where `registerInterface` is called too, and the set never
+    // changes afterwards (asynManager.c:2100-2120).
+    let interfaces = driver.capabilities();
 
     // Event broadcast
     let (event_tx, _) = broadcast::channel(256);
@@ -136,6 +140,7 @@ pub fn create_port_runtime_boxed(
     let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts);
     port_handle.set_can_block(can_block);
     port_handle.set_capabilities(multi_device, max_addr);
+    port_handle.set_interfaces(interfaces);
     let client = InProcessClient::new(port_handle.clone());
 
     let handle = PortRuntimeHandle {

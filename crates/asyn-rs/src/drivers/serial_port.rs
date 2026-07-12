@@ -677,6 +677,12 @@ impl PortDriver for DrvAsynSerialPort {
         &mut self.base
     }
 
+    /// C drvAsynSerialPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynSerialPort.c:1090-1110).
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C drvAsynSerialPort.c::connectIt (694-698): reject a connect on
         // an already-open link ("Link already open!") rather than opening a

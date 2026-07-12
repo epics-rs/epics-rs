@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interfaces::{Capability, InterfaceType};
 use crate::interrupt::InterruptManager;
 use crate::port::DrvUserInfo;
 use crate::port_actor::ActorMessage;
@@ -65,6 +66,15 @@ pub struct PortHandle {
     can_block: bool,
     multi_device: bool,
     max_addr: i32,
+    /// The port's interface registry — the driver's own
+    /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
+    /// port is registered. C's asynManager keeps the same thing as the list of
+    /// `registerInterface` calls the driver made, and clients ask for it with
+    /// `findInterface` (asynManager.c:1352-1372); asynRecord uses it to fill
+    /// OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV
+    /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
+    /// driver cannot gain or lose an interface after `registerInterface`.
+    interfaces: Arc<[Capability]>,
 }
 
 impl PortHandle {
@@ -80,7 +90,23 @@ impl PortHandle {
             can_block: false,
             multi_device: false,
             max_addr: 1,
+            interfaces: crate::interfaces::default_capabilities().into(),
         }
+    }
+
+    /// Record the driver's declared interface set — see [`Self::interfaces`].
+    /// Called by the runtime layer at handle construction, from the driver's own
+    /// [`crate::port::PortDriver::capabilities`].
+    pub fn set_interfaces(&mut self, interfaces: Vec<Capability>) {
+        self.interfaces = interfaces.into();
+    }
+
+    /// Does the port implement this interface? The port's `findInterface`
+    /// (asynManager.c:1352-1372).
+    pub fn has_interface(&self, iface: InterfaceType) -> bool {
+        self.interfaces
+            .iter()
+            .any(|cap| cap.interface_type() == iface)
     }
 
     /// Set whether this port can perform blocking I/O.

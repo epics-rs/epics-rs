@@ -85,6 +85,29 @@ impl InterfaceType {
             Self::Float64 => "Float64",
         }
     }
+
+    /// The asyn interface name C reports when the port does not implement it —
+    /// `"No asynUInt32Digital interface"` (asynRecord.c:1345), spelled in full,
+    /// unlike [`Self::c_errs_name`].
+    fn c_asyn_name(self) -> &'static str {
+        match self {
+            Self::Octet => "asynOctet",
+            Self::Int32 => "asynInt32",
+            Self::UInt32Digital => "asynUInt32Digital",
+            Self::Float64 => "asynFloat64",
+        }
+    }
+
+    /// The `crate::interfaces` interface this IFACE selects — the record's link
+    /// to the port's interface registry.
+    fn registry_type(self) -> crate::interfaces::InterfaceType {
+        match self {
+            Self::Octet => crate::interfaces::InterfaceType::Octet,
+            Self::Int32 => crate::interfaces::InterfaceType::Int32,
+            Self::UInt32Digital => crate::interfaces::InterfaceType::UInt32Digital,
+            Self::Float64 => crate::interfaces::InterfaceType::Float64,
+        }
+    }
 }
 
 // ===== Baud rate menu mapping =====
@@ -2060,7 +2083,7 @@ impl AsynRecord {
     fn read_options_from_driver(&mut self, handle: &PortHandle) {
         // C returns immediately when the port carries no asynOption interface
         // (asynRecord.c:1843-1844) — the record keeps the values it had.
-        if self.optioniv == 0 {
+        if !handle.has_interface(crate::interfaces::InterfaceType::Option) {
             return;
         }
         // Baud rate
@@ -2246,12 +2269,61 @@ impl AsynRecord {
         let Some(entry) = self.port_entry.clone() else {
             return;
         };
+        // C setOption (asynRecord.c:1766-1771): a port with no asynOption
+        // interface takes the same refusal as a missing I/O interface.
+        if !self.port_has(crate::interfaces::InterfaceType::Option) {
+            self.report_no_interface("asynOption");
+            return;
+        }
         if let Err(e) = entry.handle.set_option_blocking(key, value) {
             self.errs = format!("Error setting option, {}", e.message());
         }
         let before = self.field_snapshot(OPTION_READBACK_FIELDS);
         self.read_options_from_driver(&entry.handle);
         self.post_if_new(&before);
+    }
+
+    /// C's `state == stateNoDevice` refusal (asynRecord.c:356-357): a record with
+    /// no port refuses the transfer in `process()`, before `performIO` — and so
+    /// before the interface dispatch — because there is no port to ask about
+    /// interfaces. Both the `process()` gate and [`Self::perform_io`] report it
+    /// through here so the text has one owner.
+    fn report_not_connected(&mut self) {
+        self.errs = "Not connect to a port".to_string();
+    }
+
+    /// C's "the port does not implement this interface" refusal: report and raise
+    /// COMM_ALARM/MAJOR_ALARM, do no I/O. C runs it from `performIO`'s four
+    /// dispatch arms (asynRecord.c:1328-1360), from `setEos` on `!octetiv`
+    /// (:1957-1960) and from `setOption` on `!optioniv` (:1767-1770) — the same
+    /// three lines each time, so they are one owner here.
+    ///
+    /// The severity is staged in `io_alarm` and committed by `check_alarms` on
+    /// this cycle, like every other record alarm.
+    fn report_no_interface(&mut self, asyn_name: &str) {
+        self.errs = format!("No {asyn_name} interface");
+        self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
+    }
+
+    /// Does the connected port implement the interface?
+    ///
+    /// Asked of the port's own registry (`PortHandle::has_interface`, the
+    /// `findInterface` of asynRecord.c:1177-1240), not of the record's `*IV`
+    /// fields: those are *readbacks* that `connect_device` copies out of the same
+    /// registry for the operator to see. Keeping the gate on the registry means a
+    /// record cannot end up refusing I/O the port supports (or attempting I/O it
+    /// does not) because a readback field was left behind. A record with no port
+    /// has no interfaces.
+    fn has_interface(&self, iface: InterfaceType) -> bool {
+        self.port_has(iface.registry_type())
+    }
+
+    /// [`Self::has_interface`] for an interface with no IFACE menu entry —
+    /// `asynOption`, `asynGpib`. Same registry, same question.
+    fn port_has(&self, iface: crate::interfaces::InterfaceType) -> bool {
+        self.port_entry
+            .as_ref()
+            .is_some_and(|entry| entry.handle.has_interface(iface))
     }
 
     /// Write one EOS string to the driver, then re-read *both* back — the
@@ -2266,6 +2338,11 @@ impl AsynRecord {
         let Some(entry) = self.port_entry.clone() else {
             return;
         };
+        // C setEos (asynRecord.c:1956-1961).
+        if !self.has_interface(InterfaceType::Octet) {
+            self.report_no_interface(InterfaceType::Octet.c_asyn_name());
+            return;
+        }
         let field = if output { &self.oeos } else { &self.ieos };
         let bytes = translate_escape(field);
         let res = if output {
@@ -2375,13 +2452,22 @@ impl AsynRecord {
                     self.resolved_reason = self.reason as usize;
                 }
 
-                // All standard interfaces valid for our ports
-                self.octetiv = 1;
-                self.i32iv = 1;
-                self.ui32iv = 1;
-                self.f64iv = 1;
-                self.optioniv = 1;
-                self.gpibiv = 0; // No GPIB hardware in Rust ports
+                // C `connectDevice` asks the manager for each interface in turn —
+                // `findInterface(asynOptionType / asynOctetType / asynInt32Type /
+                // asynUInt32DigitalType / asynFloat64Type / asynGpibType)`,
+                // asynRecord.c:1177-1240 — and records what it found. A pure-octet
+                // transport therefore reads back i32iv/ui32iv/f64iv = 0, and
+                // `performIO` refuses I/O on an interface the port does not have
+                // (:1328-1360). The port's answer is the driver's own
+                // `capabilities()` declaration, taken at registration — see
+                // `PortHandle::has_interface`.
+                let has = |iface| i32::from(entry.handle.has_interface(iface));
+                self.octetiv = has(crate::interfaces::InterfaceType::Octet);
+                self.i32iv = has(crate::interfaces::InterfaceType::Int32);
+                self.ui32iv = has(crate::interfaces::InterfaceType::UInt32Digital);
+                self.f64iv = has(crate::interfaces::InterfaceType::Float64);
+                self.optioniv = has(crate::interfaces::InterfaceType::Option);
+                self.gpibiv = has(crate::interfaces::InterfaceType::Gpib);
 
                 self.port_entry = Some(entry.clone());
 
@@ -2659,9 +2745,7 @@ impl AsynRecord {
         let entry = match &self.port_entry {
             Some(e) => e.clone(),
             None => {
-                // C `process()` on `state == stateNoDevice` (asynRecord.c:356-357)
-                // — the record never reaches `performIO` without a device.
-                self.errs = "Not connect to a port".to_string();
+                self.report_not_connected();
                 return Ok(());
             }
         };
@@ -3354,7 +3438,10 @@ impl Record for AsynRecord {
 
             // Interface change → update validity flags
             "IFACE" => {
-                // All interfaces are valid for our port drivers
+                // C has no `special` case for IFACE: the field is read by
+                // `performIO` on the next process, where the port's interface
+                // registry decides whether the transfer runs at all
+                // (asynRecord.c:1328-1360, `has_interface`).
             }
 
             // REASON change
@@ -3601,6 +3688,29 @@ impl Record for AsynRecord {
 
         self.errs.clear();
 
+        // C refuses in this order, and the order is load-bearing: `process()`
+        // rejects `state == stateNoDevice` before it queues anything
+        // (asynRecord.c:356-357), so a record with no port never reaches
+        // `performIO`'s interface dispatch and never reports a missing interface
+        // — it reports "Not connect to a port".
+        let Some(entry) = self.port_entry.clone() else {
+            self.report_not_connected();
+            return Ok(ProcessOutcome::complete());
+        };
+
+        // Connected: `performIO` dispatches on IFACE and refuses the transfer
+        // when the port does not implement the selected interface — "No asynInt32
+        // interface" + COMM_ALARM/MAJOR_ALARM, no I/O (asynRecord.c:1328-1360).
+        // A pure-octet transport (an IP socket, a serial line) has exactly one
+        // valid interface, so this is the ordinary answer for a record pointed at
+        // one with IFACE=Int32, not an edge case. The gate sits here, above the
+        // blocking/non-blocking split, so both paths take the same refusal.
+        let iface = InterfaceType::from_u16(self.iface as u16);
+        if !self.has_interface(iface) {
+            self.report_no_interface(iface.c_asyn_name());
+            return Ok(ProcessOutcome::complete());
+        }
+
         // C `process()` (asynRecord.c:342-353) queues `performIO`, then
         // `canBlock(&yesNo)`: a blocking port runs the I/O on the port
         // thread (`pact = TRUE; return`) and the record completes on the
@@ -3609,10 +3719,7 @@ impl Record for AsynRecord {
         // database handle submits the I/O off the scan thread and re-enters
         // on completion; everything else (non-blocking port, or a record
         // not built into a database) keeps the synchronous inline path.
-        let blocking_handle = self
-            .port_entry
-            .as_ref()
-            .and_then(|e| e.handle.can_block().then(|| e.handle.clone()));
+        let blocking_handle = entry.handle.can_block().then(|| entry.handle.clone());
         if let (Some(handle), Some((name, db))) = (blocking_handle, self.async_ctx.clone()) {
             return Ok(self.spawn_async_io(handle, name, db));
         }
@@ -6689,5 +6796,138 @@ mod tests {
         );
         assert_eq!(rec.enbl, 1, "ENBL is re-read and unchanged");
         assert_eq!(rec.auct, 1, "AUCT is re-read and unchanged");
+    }
+
+    /// R9-53. C `connectDevice` asks the manager for each interface in turn
+    /// (`findInterface(asynOctetType / asynInt32Type / ... )`,
+    /// asynRecord.c:1177-1240) and records what it found; `performIO` then
+    /// refuses a transfer through an interface the port does not implement
+    /// (:1328-1360). The port hardcoded OCTETIV/I32IV/UI32IV/F64IV/OPTIONIV = 1,
+    /// so a pure-octet transport advertised register interfaces it never had and
+    /// a Read with IFACE=asynInt32 was dispatched at a driver with no Int32
+    /// support instead of being refused.
+    #[test]
+    fn connect_device_reads_the_ports_interface_registry() {
+        use crate::interfaces::octet_transport_capabilities;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        // A pure-octet transport: an IP socket, a serial line. asynOctet and
+        // asynOption, no register interfaces.
+        struct OctetTransport(PortDriverBase);
+        impl PortDriver for OctetTransport {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                octet_transport_capabilities()
+            }
+        }
+
+        let port_name = "r9_53_octet_transport";
+        let (rt, _jh) = create_port_runtime(
+            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device().unwrap();
+
+        assert_eq!(rec.octetiv, 1, "the transport carries asynOctet");
+        assert_eq!(rec.optioniv, 1, "and asynOption");
+        assert_eq!(rec.i32iv, 0, "but no asynInt32 (C :1204-1210)");
+        assert_eq!(rec.ui32iv, 0, "no asynUInt32Digital (C :1212-1218)");
+        assert_eq!(rec.f64iv, 0, "no asynFloat64 (C :1220-1226)");
+        assert_eq!(rec.gpibiv, 0, "no asynGpib (C :1228-1234)");
+
+        // performIO refuses the interface the port does not implement, with
+        // COMM_ALARM/MAJOR_ALARM and no I/O (C :1345-1348).
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynInt32 interface");
+        assert_eq!(rec.i32inp, 0, "no read ran");
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::COMM_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Major);
+
+        // The interface it does implement still runs.
+        rec.iface = InterfaceType::Octet as i32;
+        rec.errs.clear();
+        rec.imax = 16;
+        rec.ifmt = ASYN_FMT_ASCII;
+        rec.process().unwrap();
+        assert_ne!(
+            rec.errs, "No asynOctet interface",
+            "asynOctet is implemented and must not be refused"
+        );
+    }
+
+    /// R9-53, the interfaces with no IFACE menu entry: `setOption` and `setEos`
+    /// take the same refusal from the same owner. C `setOption` on `!optioniv`
+    /// (asynRecord.c:1766-1771) and `setEos` on `!octetiv` (:1956-1961) report
+    /// "No asyn<X> interface" and raise COMM_ALARM/MAJOR_ALARM without touching
+    /// the driver.
+    #[test]
+    fn option_and_eos_are_refused_on_a_port_that_lacks_the_interface() {
+        use crate::interfaces::Capability;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        // A GPIB-style octet port: asynOctet only — no asynOption (the Prologix
+        // driver's declaration).
+        struct OctetNoOption(PortDriverBase);
+        impl PortDriver for OctetNoOption {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<Capability> {
+                vec![Capability::OctetRead, Capability::OctetWrite]
+            }
+        }
+
+        let port_name = "r9_53_no_option";
+        let (rt, _jh) = create_port_runtime(
+            OctetNoOption(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        );
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            Arc::new(TraceManager::new()),
+        );
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.optioniv, 0, "no asynOption interface");
+        assert_eq!(rec.octetiv, 1);
+
+        rec.lbaud = 9600;
+        rec.special("LBAUD", true).unwrap();
+        assert_eq!(rec.errs, "No asynOption interface");
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::COMM_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Major);
+
+        // asynOctet is implemented, so the EOS put reaches the driver.
+        rec.errs.clear();
+        rec.ieos = "\\n".to_string();
+        rec.special("IEOS", true).unwrap();
+        assert_ne!(rec.errs, "No asynOctet interface");
     }
 }

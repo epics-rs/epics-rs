@@ -192,6 +192,12 @@ impl PortDriver for DrvAsynFtdiPort {
         &mut self.base
     }
 
+    /// C drvAsynFTDIPort registers asynCommon, asynOption and asynOctet
+    /// (drvAsynFTDIPort.cpp:579-613).
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        crate::interfaces::octet_transport_capabilities()
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         if !Self::has_hw_support() {
             return Err(AsynError::Status {

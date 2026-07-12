@@ -334,6 +334,19 @@ impl PortDriver for DrvAsynPrologixPort {
         &mut self.base
     }
 
+    /// C drvPrologixGPIB registers through `pasynGpib->registerPort`
+    /// (drvPrologixGPIB.c:592): asynCommon + asynOctet + asynGpib, and no
+    /// asynOption.
+    ///
+    /// `Gpib` is deliberately absent — see the same note on `DrvVxi11Port`: no
+    /// port operation carries a GPIB command, so asynRecord cannot dispatch
+    /// UCMD/ACMD and GPIBIV must stay 0 rather than advertise a path that does
+    /// not exist.
+    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+        use crate::interfaces::Capability::*;
+        vec![OctetRead, OctetWrite, Flush, Connect]
+    }
+
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         // Reset addressing state — fresh TCP connection means the
         // bridge's last-sent address is unknown, so the next write

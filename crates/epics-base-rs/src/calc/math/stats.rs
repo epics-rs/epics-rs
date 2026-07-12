@@ -74,14 +74,35 @@ pub fn fwhm(data: &[f64]) -> f64 {
     right - left
 }
 
-/// 5-point smoothing filter \[1,4,6,4,1\]/16.
-/// Boundary points are set to 0.
+/// C's SMOOTH (`aCalcPerform.c:968-975`) — the 5-point \[1,4,6,4,1\]/16 kernel,
+/// applied IN PLACE and only where all five taps fit:
+///
+/// ```c
+/// d = ps->a[firstEl]; e = ps->a[firstEl+1]; f = ps->a[firstEl+2];
+/// for (i=firstEl+2; i<=lastEl-2; i++) {
+///     ps->a[i] = d/16 + e/4 + 3*f/8 + ps->a[i+1]/4 + ps->a[i+2]/16;
+///     d=e; e=f; f=ps->a[i+1];
+/// }
+/// ```
+///
+/// The rolling `d`/`e`/`f` hold the PRE-pass values of `a[i-2]`, `a[i-1]`, `a[i]`
+/// (each is saved before the write that would clobber it), and `a[i+1]`/`a[i+2]` have
+/// not been reached yet — so despite the in-place write it is a straight convolution
+/// over the array as it was, exactly what an out-of-place buffer gives.
+///
+/// The two things it does NOT do are what the port got wrong:
+///
+/// * **the borders are left alone** — the loop simply does not cover the first two
+///   and last two elements, so they keep their ORIGINAL values. The port seeded a
+///   zero buffer and wrote only the interior, so `SMOO(AA)` zeroed four elements.
+/// * **a window under 5 elements is unchanged** — the loop body never runs (its
+///   bounds cross), so C returns the array untouched. The port answered all zeros.
 pub fn smooth(data: &[f64]) -> Vec<f64> {
     let n = data.len();
+    let mut result = data.to_vec();
     if n < 5 {
-        return vec![0.0; n];
+        return result;
     }
-    let mut result = vec![0.0; n];
     for i in 2..n - 2 {
         result[i] =
             (data[i - 2] + 4.0 * data[i - 1] + 6.0 * data[i] + 4.0 * data[i + 1] + data[i + 2])
@@ -90,7 +111,10 @@ pub fn smooth(data: &[f64]) -> Vec<f64> {
     result
 }
 
-/// Apply smoothing n times.
+/// C's NSMOOTH (`aCalcPerform.c:583-589`) — the SMOOTH pass run `n` times, each pass
+/// over the array the previous one left behind (C loops `for (k=firstEl; k<j+firstEl;
+/// k++)` around the very same in-place body). Border preservation compounds: a
+/// border element that SMOOTH keeps is a border element the next pass reads.
 pub fn nsmooth(data: &[f64], n: usize) -> Vec<f64> {
     let mut result = data.to_vec();
     for _ in 0..n {

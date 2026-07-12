@@ -1,3 +1,5 @@
+use std::future::Future;
+
 pub mod db_access;
 mod field_io;
 pub mod filters;
@@ -66,7 +68,19 @@ pub enum PvEntry {
 
 /// Callback for resolving external PV names (CA/PVA links).
 /// Returns the current value of the external PV, or None if unavailable.
-pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sync>;
+///
+/// **Async**, for the same reason [`LinkSet`] is: an external link's value
+/// lives on a tokio runtime, and a sync closure could only reach it through a
+/// blocking bridge that panics on a current-thread runtime. The one caller
+/// ([`PvDatabase::resolve_external_pv`]) is already async.
+pub type ExternalPvResolver = Arc<
+    dyn for<'a> Fn(
+            &'a str,
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = Option<EpicsValue>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 /// Async hook invoked by [`PvDatabase::has_name`] when a name is not yet
 /// in the database. Used by the CA gateway and similar proxy components
@@ -698,10 +712,12 @@ impl PvDatabase {
         }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let connected = targets
-                .iter()
-                .filter(|(lset, name)| lset.is_connected(name))
-                .count();
+            let mut connected = 0usize;
+            for (lset, name) in &targets {
+                if lset.is_connected(name).await {
+                    connected += 1;
+                }
+            }
             if connected == total {
                 return (connected, total);
             }
@@ -742,7 +758,7 @@ impl PvDatabase {
             return Vec::new();
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for n in ca_lset.link_names() {
+        for n in ca_lset.link_names().await {
             if self.has_name_no_resolve(&n).await {
                 targets.push((ca_lset.clone(), n));
             }
@@ -758,12 +774,13 @@ impl PvDatabase {
     /// without, instead of leaving the operator to run `dbcar`.
     /// `pva://` links are not in this set — they never block iocInit.
     pub async fn unconnected_external_links(&self) -> Vec<String> {
-        self.external_link_targets()
-            .await
-            .into_iter()
-            .filter(|(lset, name)| !lset.is_connected(name))
-            .map(|(_, name)| name)
-            .collect()
+        let mut names = Vec::new();
+        for (lset, name) in self.external_link_targets().await {
+            if !lset.is_connected(&name).await {
+                names.push(name);
+            }
+        }
+        names
     }
 
     /// Enumerate every link-shaped field on `record_name`. Returns
@@ -846,25 +863,35 @@ impl PvDatabase {
             // first one with a value for `name` wins. Schemes are
             // single-digit so this is cheap.
             let registry = self.inner.link_sets.read().await;
-            for s in registry.schemes() {
-                if let Some(lset) = registry.get(&s) {
-                    if let Some(v) = lset.get_value(name) {
-                        return Some(v);
-                    }
+            let lsets: Vec<_> = registry
+                .schemes()
+                .iter()
+                .filter_map(|s| registry.get(s))
+                .collect();
+            drop(registry);
+            for lset in lsets {
+                if let Some(v) = lset.get_value(name).await {
+                    return Some(v);
                 }
             }
-            drop(registry);
             // Fall through to legacy resolver.
-            let resolver = self.inner.external_resolver.read().await;
-            return resolver.as_ref().and_then(|r| r(name));
+            let resolver = self.inner.external_resolver.read().await.clone();
+            return match resolver {
+                Some(r) => r(name).await,
+                None => None,
+            };
         };
-        if let Some(lset) = self.inner.link_sets.read().await.get(scheme) {
-            if let Some(v) = lset.get_value(body) {
+        let lset = self.inner.link_sets.read().await.get(scheme);
+        if let Some(lset) = lset {
+            if let Some(v) = lset.get_value(body).await {
                 return Some(v);
             }
         }
-        let resolver = self.inner.external_resolver.read().await;
-        resolver.as_ref().and_then(|r| r(name))
+        let resolver = self.inner.external_resolver.read().await.clone();
+        match resolver {
+            Some(r) => r(name).await,
+            None => None,
+        }
     }
 
     /// Add a simple PV with an initial value.
@@ -1551,14 +1578,15 @@ mod tests {
         connect_at: tokio::time::Instant,
     }
 
+    #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        fn is_connected(&self, _: &str) -> bool {
+        async fn is_connected(&self, _: &str) -> bool {
             tokio::time::Instant::now() >= self.connect_at
         }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        fn link_names(&self) -> Vec<String> {
+        async fn link_names(&self) -> Vec<String> {
             self.names.clone()
         }
     }

@@ -75,14 +75,14 @@ async fn ca_link_resolves_remote_value() {
 
     // The monitor-backed cache now serves the remote value.
     use epics_base_rs::server::database::LinkSet;
-    let value = LinkSet::get_value(&resolver, "CALINK:SRC");
+    let value = LinkSet::get_value(&resolver, "CALINK:SRC").await;
     assert_eq!(
         value.and_then(|v| v.to_f64()),
         Some(73.5),
         "CA link must return the upstream PV's value"
     );
     assert!(
-        LinkSet::is_connected(&resolver, "CALINK:SRC"),
+        LinkSet::is_connected(&resolver, "CALINK:SRC").await,
         "CA link must report connected once a value is cached"
     );
     assert_eq!(resolver.link_count(), 1);
@@ -114,7 +114,9 @@ async fn ca_link_resolves_with_scheme_prefix() {
 
     use epics_base_rs::server::database::LinkSet;
     assert_eq!(
-        LinkSet::get_value(&resolver, "ca://CALINK:SCHEME").and_then(|v| v.to_f64()),
+        LinkSet::get_value(&resolver, "ca://CALINK:SCHEME")
+            .await
+            .and_then(|v| v.to_f64()),
         Some(404.0),
         "scheme-prefixed CA link must resolve to the upstream value"
     );
@@ -332,13 +334,18 @@ async fn ca_link_out_write_updates_remote_pv() {
         EpicsValue::Double(88.0),
         LinkPutOp::Plain,
     )
+    .await
     .expect("CA-link OUT write must succeed");
 
     // The resolver's monitor sees the server-side change — poll the
     // monitor-backed cache until the write propagates back.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if LinkSet::get_value(&resolver, "CALINK:OUT:DST").and_then(|v| v.to_f64()) == Some(88.0) {
+        if LinkSet::get_value(&resolver, "CALINK:OUT:DST")
+            .await
+            .and_then(|v| v.to_f64())
+            == Some(88.0)
+        {
             break;
         }
         assert!(
@@ -403,6 +410,7 @@ async fn ca_link_out_write_async_waits_for_completion() {
         EpicsValue::Double(42.0),
         LinkPutOp::Async,
     )
+    .await
     .expect("completion-aware CA-link OUT write must succeed");
 
     // An independent CA client GET reads the committed value back —
@@ -451,11 +459,14 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
         EpicsValue::Long(123),
         LinkPutOp::Plain,
     )
+    .await
     .expect("scheme-prefixed CA-link OUT write must succeed");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if LinkSet::get_value(&resolver, "ca://CALINK:OUT:SCHEME").and_then(|v| v.to_f64())
+        if LinkSet::get_value(&resolver, "ca://CALINK:OUT:SCHEME")
+            .await
+            .and_then(|v| v.to_f64())
             == Some(123.0)
         {
             break;
@@ -506,7 +517,7 @@ async fn ca_link_exposes_remote_metadata() {
     // so poll until the cached metadata lands.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let md = loop {
-        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC") {
+        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC").await {
             // Wait for the CTRL get to fill the limits, not just the
             // channel-info type/count from a partial first store.
             if md.graphic_limits.is_some() {
@@ -541,7 +552,7 @@ async fn ca_link_exposes_remote_metadata() {
 
     // While connected the metadata is served; the read path gates on the
     // connection flag exactly like the value/alarm getters.
-    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC"));
+    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC").await);
 }
 
 /// `install_calink_resolver` registers under the `ca` scheme so the

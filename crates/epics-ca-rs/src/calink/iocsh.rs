@@ -91,12 +91,24 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                     for (field, raw, parsed) in links {
                         if let epics_base_rs::server::record::ParsedLink::Ca(ca) = parsed {
                             let name = ca.pv;
-                            let connected =
-                                <CaLinkResolver as LinkSet>::is_connected(&resolver, &name);
-                            let value = <CaLinkResolver as LinkSet>::get_value(&resolver, &name);
-                            let alarm =
-                                <CaLinkResolver as LinkSet>::alarm_severity(&resolver, &name);
-                            let ts = <CaLinkResolver as LinkSet>::time_stamp(&resolver, &name);
+                            // The lset is async; this iocsh command is sync, so
+                            // its state is read through the same off-runtime
+                            // thread the record-field lookup above uses.
+                            let r = resolver.clone();
+                            let n = name.clone();
+                            let h = ctx.runtime_handle().clone();
+                            let (connected, value, alarm, ts) = std::thread::spawn(move || {
+                                h.block_on(async move {
+                                    (
+                                        <CaLinkResolver as LinkSet>::is_connected(&r, &n).await,
+                                        <CaLinkResolver as LinkSet>::get_value(&r, &n).await,
+                                        <CaLinkResolver as LinkSet>::alarm_severity(&r, &n).await,
+                                        <CaLinkResolver as LinkSet>::time_stamp(&r, &n).await,
+                                    )
+                                })
+                            })
+                            .join()
+                            .unwrap_or((false, None, None, None));
                             ctx.println(&format!(
                                 "    {field}={raw:?}  ca://{name}  connected={connected}"
                             ));

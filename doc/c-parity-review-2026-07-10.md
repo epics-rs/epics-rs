@@ -1692,6 +1692,239 @@ Severity: Medium.
 - Fixer-a7 was cut off once by an API server error mid-task and resumed by
   main with no loss (worktree state intact).
 
+## Round 10 — re-audit (2026-07-12): wave-7 fix verification + adjudications + fresh findings
+
+### Fix verification (wave 7)
+
+- Category A — all six commits (55903088, 414a3f18, 9f0b3fe0, 480dc413,
+  4cdf8ec7, 1052c1c9) VERIFIED CORRECT AND COMPLETE against compiled-C
+  and source evidence. MY_MAXFLOAT = `1e35f32 as f64` byte-matches C's
+  `(float)1e35` (1.0000000409184788e35). shift_elements matches
+  aCalcPerform.c:1416-1459 line-by-line.
+- Category B — R8-22+R8-23 event-queue redesign (c45e60a8/5affc90c)
+  VERIFIED at the byte/gate level against dbEvent.c: replace gate
+  `npend>0 && (flow_on || ring_space <= 36)`, append first_event,
+  nDuplicates raise/lower sites, drain/suspend gate, quota chain
+  selection (cap 35 monitors/queue), EVENTS_OFF/ON wiring, DBE select
+  filter, db_event_disable gate. The three documented module deviations
+  are the only ones. R9-16 (4f2e3c76), R9-17 NOT-REAL evidence
+  (a273458c), R9-18 (b54b0744, incl. EPICS-epoch stamp on the zeroed
+  Snapshot) all VERIFIED.
+- Category C — R8-34 MonitorTeardown (f1e2fca1) VERIFIED: `Fatal ⟹
+  circuit closed` holds by construction (close happens inside
+  `MonitorTeardown::invalid` before release); Invalid/FinishError split
+  matches clientmon.cpp:607-620; all five driver sites merely propagate.
+  R9-31 dbe_kind (7d4f5af0) and R9-32 ack_any_as_u32 (e226272a)
+  VERIFIED.
+- Category D — all wave-7 D commits VERIFIED faithful: R8-57 COM
+  line-by-line vs asynInterposeCom.c (IAC stuffing count quirk, signed
+  unstuffing cursor, +100 reply offsets, 61-byte restore handshake,
+  base-link ordering matches drvAsynIPPort.c:1061); R8-54/55/56,
+  R9-46..50 single owners confirmed.
+- Category E — 6 of ~20 sampled (highest-risk): R9-61..64 transform
+  order, R9-65 DOL-at-output, R9-70 DLY1 quirk (independently confirmed
+  against sseqRecord.c:1149-1155), R9-72 mask hook, R9-68 pArrays[0],
+  R8-75 TIFF ColorMode — all VERIFIED. R9-66/67, R8-71..74, R9-71,
+  R9-69 not line-verified this pass (disposition text consistent with
+  adjacent verified code).
+
+### Adjudications — all 26 wave-7 fixer-surfaced OPEN items CONFIRMED
+
+- **R9-4 CONFIRMED, WIDENED** — not just `AA/2`/`SQRT(AA)`: ADD/SUB
+  coerce when either side is double (sCalcPerform.c:964-978), MULT/DIV
+  coerce both unconditionally (:1015-1030), every unary/comparison
+  toDoubles. The port's `as_f64` TypeMismatch fails ALL of them.
+- **R9-5 CONFIRMED, sharpened** — scalar: C 0/no-alarm vs port
+  NaN/CALC_ALARM; array: C 0-elements/status -1 vs port NaN. And the
+  port checks only a[0] finiteness (acalcout.rs:371), so a negative
+  element not at index 0 misses the alarm C raises.
+- **R9-6 CONFIRMED** — C READ/WRITE are 2-operand `ps1=ps; DEC(ps)`
+  (sCalcPerform.c:1569,1693); port declares nargs:1
+  (postfix.rs:156-157).
+- **R9-7 CONFIRMED, WIDENED to scalcout + acalcout** — sCalcPerform.c
+  and aCalcPerform have the same END_EXPRESSION→-1 guard; port sites:
+  calc.rs:695/714, calcout.rs:1058 (no fallback at all), scalcout.rs:592,
+  acalcout equivalent. Structural fix (empty/failed compile carries an
+  empty program evaluating to -1) closes all four.
+- **R9-8 CONFIRMED** — every listed symbol verified present in C /
+  absent in port. Precisions: port DOES have `|-` SUBLAST (correctly
+  excluded); port's LEN is the string op, not aCalc's array LEN.
+- **R9-9 CONFIRMED (narrow)** — reachable only for strtod-parseable
+  literals with trailing alpha (`INFINITY`); Low.
+- **R9-19 CONFIRMED** — caget default mode is synchronous; calloc'd
+  non-NULL buffer means C renders zeroes on timeout (caget.c:207-291);
+  the `*** no data available` branch needs -c. Exact defect R9-18 fixed
+  for caput, unapplied to caget-rs (caget-rs.rs:836/840).
+- **R9-20 CONFIRMED (non-timeout facet live)** — timeout branch already
+  leaves `failed` untouched; the `not connected` (:826) and generic
+  `Err` (:853) branches still exit 1 where C exits 0 (caget.c:348).
+- **R9-21 CONFIRMED (narrowed)** — live divergence is a
+  writable-but-not-readable PV (ACF write-only): C's Old:-read fails,
+  is discarded (caput.c:531-535), put SUCCEEDS, exit 0; port exits 1
+  without attempting the put. True-disconnect exit codes coincide.
+- **R9-22 CONFIRMED** — `-S` reaches only the write-value builder
+  (caput-rs.rs:319); readback ValueFormat never sets
+  char_array_as_string (:402-413). format_value itself honors the flag
+  (cli.rs:343).
+- **R9-23 CONFIRMED** — Readback::Other echoes the submitted value
+  (caput-rs.rs:397-399, comment admits it); C prints `*** no read
+  access` / `*** CA error %s` and returns 0.
+- **R9-33 CONFIRMED** — `as<std::string>()` at servermon.cpp:556 is the
+  throwing form, runs BEFORE the if/else, nothing catches between
+  onSubscribe and the dispatch catch (conn.cpp:277-282) → bev.reset().
+  The :570-573 Crit is dead for non-scalars. Port serves on with
+  ack_at=1 (tcp.rs:257-267).
+- **R9-34 CONFIRMED** — pvxs tries `as(uint64)` FIRST even for string
+  storage: stoull base 0 → "0x10"→16, "010"→8, "-1"→0xFFFFFFFF→clamp.
+  Port is decimal-only fallback (tcp.rs:249).
+- **R9-35 CONFIRMED (consequence now verified)** — Int32A & 0xe0 =
+  Kind::Integer → `fld.as<uint8_t>()` on array storage → copyOut
+  data.cpp:468 falls through to :499 throw NoConvert → uncaught →
+  bev.reset(). Port serves VALUE|ALARM.
+- **R9-51 CONFIRMED (Low)** — four invented texts confirmed vs
+  asynRecord.c:515/:357/:1255; "returned no value" has no C analogue.
+- **R9-52 CONFIRMED (Low)** — monitorStatus sets TSIZ (asynRecord.c:1100)
+  and TFIL="Unknown" on foreign traceFd change (:1117-1124); Rust trace
+  manager fully supports both, readback stays stale.
+- **R9-53 CONFIRMED (Medium)** — C queries each interface via
+  findInterface (asynRecord.c:1177-1240); pure-octet ports get
+  i32iv/ui32iv/f64iv=0. PortDriver has no per-port interface registry —
+  structural gap.
+- **R9-54 CONFIRMED (High), panic reproduces** — adapter.rs:121,186
+  `Duration::from_secs_f64` panics on `-1`; C strtod accepts it
+  (asynEpicsUtils.c:125). Thread panic at record init. Distinct from
+  R9-46 (TMOT field).
+- **R9-55 CONFIRMED (Low)** — record-path negotiation pinned to 2 s;
+  needs an asynUser on the option trait (public API change).
+- **R9-56 CONFIRMED (Medium)** — C later-install = outermost
+  (asynManager.c:2216-2217); Rust earlier-push = outermost
+  (interpose/mod.rs:138,244). Echo/Delay pushed after EOS lands inner
+  where C puts it outer.
+- **R9-57 CONFIRMED (Low)** — unstuffing asynPrintIO(TRACEIO_FILTER)
+  dropped (asynInterposeCom.c:237-239); crtscts/ixon advisory texts
+  dropped. Blocked on trait surface (no asynUser on option path).
+- **R9-73 CONFIRMED** — calc.rs:694-731 evals unconditionally; only
+  sub/aSub declare AbortOnFirstFailure, and even that flag routes only
+  to suppress_subroutine_run, which calc's process() never checks.
+  Family spans calc/calcout/scalcout/acalcout.
+- **R9-74 CONFIRMED** — swait.rs:127 `!=` vs C
+  `fabs(oval-val) > mdel` (swaitRecord.c:432).
+- **R9-75 CONFIRMED** — LA..LL are DBF_DOUBLE fields
+  (swaitRecord.dbd:298-331), posted on change (swaitRecord.c:652).
+- **R9-76 CONFIRMED** — INAV..INLV/DOLV DBF_MENU fields missing; C
+  execOutput reads DOL only `if (!dolv)` (swaitRecord.c:765).
+- **R9-77 CONFIRMED** — event.rs declares no
+  fields_posted_with_monitor_mask; VAL posts forced VALUE|LOG where C
+  posts monitor_mask|DBE_VALUE (eventRecord.c:163).
+- **R9-78 CONFIRMED** — aSub OUTA..OUTU stored but never driven; C
+  pushes every output link when status==0 (aSubRecord.c:236-238).
+- **R9-79 CONFIRMED (widens R8-71)** — push() never consults Control;
+  C wraps pre-buffer + trigger eval + completion test in
+  `if (scopeControl)`. Port can auto-complete sequences while stopped.
+- **R9-80 CONFIRMED** — detect_color_mode dims-inference
+  (color_convert.rs:802) vs C default Mono
+  (NDPluginColorConvert.cpp:44); drives wrong pixel conversion.
+- **Round-9 scaler candidates** — user-stop COUTP double-fire CONFIRMED
+  → filed R10-61; RATE→TP quirk CONFIRMED → filed R10-62.
+
+### New findings
+
+### R10-1: aCalc IXZ returns the first exact-zero element index; C returns the interpolated real index of the first zero crossing
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:530-539` — IndexZero = `position(|&x| x == 0.0)` → integer index or -1.
+C reference: `aCalcPerform.c:879-892` — active IXZ finds the first sign change vs a[firstEl] and returns `j + fabs(a[j])/fabs(a[j]-a[j+1])`, a real (fractional) index; the exact-zero version the port implemented is C's `#if 0` dead code (:867-877, and even that uses `fabs < SMALL`, not `== 0.0`).
+Impact: for any waveform without a bit-exact 0.0 element (the normal case), the port returns -1 where C returns a meaningful fractional crossing index.
+
+### R10-2: aCalc IXMAX breaks ties to the last maximum; C keeps the first
+Severity: Low
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:504-514` — `max_by` returns the LAST of equal maxima.
+C reference: `aCalcPerform.c:846-855` — strict `>`, first maximum wins. (IXMIN uses min_by = first minimum, matches C — only IXMAX diverges.)
+Impact: `IXMAX(AA)` on [5,3,5] returns 2 vs C's 0 whenever the maximum repeats.
+
+### R10-3: aCalc ISINF/FINITE/ISNAN on an array operand collapse to a[0]; C is element-wise (ISINF) or an all-element reduction (FINITE/ISNAN)
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:347-353` (IsInf → pop1_f64 = a[0], scalar), :335-346 (IsNan), :355-366 (Finite).
+C reference: `aCalcPerform.c:826` — ISINF array branch is element-wise (array result); :1114-1120 FINITE = AND of finite() over ALL elements of every arg; :1138-1146 ISNAN = OR over all elements.
+Impact: `FINITE(AA)`/`ISNAN(AA)` on [1,2,inf] return 0/1 in C but 1/0 in the port; ISINF yields the wrong shape entirely.
+
+### R10-4: aCalc reduction/unary array ops raise TypeMismatch→CALC_ALARM on a scalar operand; C defines a scalar result
+Severity: Medium
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs` — Average:446-452, StdDev:454, Fwhm, ArraySum:470-476, ArrayMax, ArrayMin return TypeMismatch on Double; Cum:573, Deriv:562, NDeriv, Smooth, NSmooth, IndexMax/Min/Zero/NonZero call as_array()? which errors on a Double.
+C reference: `aCalcPerform.c:1094-1101` — AVERAGE/SMOOTH/ARRSUM/CUM break (scalar unchanged); STD_DEV/FWHM/DERIV/FITPOLY set d=0; IXMAX/IXMIN set d=0 (:1088-1089); IXZ = `fabs(d)<SMALL?0:-1`, IXNZ = `fabs(d)>SMALL?0:-1` (:1090-1091).
+Impact: legal expressions (AVG(5)→5, STD(5)→0) evaluate in C but force CALC_ALARM/INVALID and a frozen VAL in the port.
+
+### R10-5: aCalc IXNZ uses an exact != 0.0 test; C thresholds at SMALL (1e-9)
+Severity: Low
+Rust: `crates/epics-base-rs/src/calc/engine/array.rs:540-549`.
+C reference: `aCalcPerform.c:893-898` — `fabs(a[i]) > SMALL`.
+Impact: tiny-but-nonzero noise (1e-12) makes the port return that index while C skips below 1e-9.
+
+### R10-16: CA tools render alarm status 11 as HW_LIMIT (C: HWLIMIT) and out-of-range status as "Illegal value" (C: "??")
+Severity: Low
+Rust: `crates/epics-ca-rs/src/bin/caget-rs.rs:263` (`11 => "HW_LIMIT"`), :274 (default `"Illegal value"`); identical table duplicated at `caput-rs.rs:40,51` and `camonitor-rs.rs:280,291`.
+C reference: `alarmString.c` `epicsAlarmConditionStrings[11] = "HWLIMIT"`; `tool_lib.h:28-30` stat_to_str returns `"??"` out of range. Every other index (0-10, 12-21) matches.
+Impact: caget -a / camonitor / caput -l on HW_LIMIT_ALARM print a different token than C; the port's own alarm-string owner (`epics-bridge-rs/src/qsrv/pvif.rs:1060`) already uses "HWLIMIT", so the three tool copies are internally inconsistent too.
+
+### R10-31: native server disables a real-typed record._options.pipeline that pvxs enables
+Severity: Medium
+Rust: `crates/epics-pva-rs/src/server_native/tcp.rs:688-689` — Float/Double pipeline hardcoded false (comment at :684-687 flags it as an unaddressed choice).
+C reference: `servermon.cpp:525` — `pipeline.as(v)` routes Real through copyOutScalar → `bool(src)`: Double(1.0)→true, 0.0→false.
+Impact: MONITOR INIT with pipeline=Double(1.0) runs pvxs's credit-windowed pipeline sub-protocol but a plain monitor in the port — the whole flow-control wire shape differs, and any accompanying ackAny is silently ignored.
+
+### R10-32: native server drops a real/hex-string record._options.queueSize that pvxs converts
+Severity: Medium
+Rust: `crates/epics-pva-rs/src/server_native/tcp.rs:731-742` — queue_size match handles String (decimal-only) and ints; `_ => None` for Float/Double.
+C reference: `servermon.cpp:533-536` — `as(uint32_t)` converts reals (`uint64_t(double(src))`) and base-0 strings (stoull); `op->limit` applies OUTSIDE `if(op->pipeline)`, i.e. to non-pipeline monitors too.
+Impact: queueSize=Double(8.0) or "0x10": pvxs sets limit=8/16; the port rejects an enabled pipeline (`can not pipeline invalid queueSize`, an error pvxs never sends) or uses default depth 4 + spurious Warn for a plain monitor — different on-the-wire update squashing. (Boolean queueSize is NOT a divergence: pvxs as→1, <2, matches the port.)
+
+### R10-46: asynRecord never raises STATE_ALARM — the not-connected process and the AQR cancel both leave STAT/SEVR at NO_ALARM
+Severity: Medium
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs:2525` — perform_io on port_entry==None sets errs="not connected", returns Ok with no io_alarm; `mod.rs:3358-3361` — AQR cancels the token, no severity (comment at :3353 admits it).
+C reference: `asynRecord.c:357,361` — stateNoDevice reports and `recGblSetSevr(STATE_ALARM,MINOR_ALARM)` every process; :397-400 — AQR on wasQueued reports "I/O request canceled" then `recGblSetSevr(STATE_ALARM,MAJOR_ALARM)`.
+Impact: a record on a dead link processes with SEVR=NO_ALARM; operator interlocks keying on SEVR see a healthy record. (Distinct from R9-51, which is only the ERRS text.)
+
+### R10-47: asynRecord omits C's two unconditional resetError() calls, so ERRS goes stale on a TMOD=NoIO process or any field put
+Severity: Low
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs:3450` — process() returns for NoIo BEFORE the only ERRS clear at :3454; special() at :3058-3063 has no ERRS reset at entry.
+C reference: `asynRecord.c:339` — resetError unconditionally at stateIdle entry; :390 — resetError before special()'s field switch.
+Impact: after a failed transfer, a NoIO process or a put to TMSK/BAUD/PCNCT leaves the stale error string displayed; C clears and re-posts empty ERRS.
+
+### R10-48: an option field written at its index-0 ("Unknown") menu value skips the setOption→getOptions fall-through entirely
+Severity: Low
+Rust: `crates/asyn-rs/src/asyn_record/mod.rs:3231-3238` (PRTY `_ => return Ok(())`), same guard on DBIT/SBIT/MCTL/FCTL/IXON/IXOFF/IXANY/DRTO/BAUD (:3218-3318).
+C reference: `asynRecord.c:1787-1826` — setOption unconditionally sends `<choices>[0]="Unknown"`; :845-849 callbackSetOption falls through (`/* no break */`) into callbackGetOption→getOptions regardless of the set's success.
+Impact: selecting "Unknown" makes C attempt the write (driver rejects → ERRS) then refresh ALL option readbacks; Rust silently does nothing.
+
+### R10-61: scaler user-stop fires COUTP once where C double-fires it
+Severity: Medium
+Rust: `crates/scaler-rs/src/records/scaler.rs:787-808` — special("CNT") sets coutp_pending (:884) and process() sets just_finished_user_count (:772); both feed a single fire_coutp bool → one WriteDbLink{COUTP}.
+C reference: `scalerRecord.c:624` (special(): dbPutLink COUTP cnt=0) AND :463 (process(), guarded by justFinishedUserCount, dbPutLink COUTP) — two independent puts on the same stop.
+Impact: a record wired to .COUTP is processed twice on C at a user stop, once on Rust. User-start is unaffected (both fire once).
+
+### R10-62: scaler RATE write drops C's spurious TP monitor post
+Severity: Low
+Rust: `crates/scaler-rs/src/records/scaler.rs:923-925` — special("RATE") only clamps; nothing force-posts TP.
+C reference: `scalerRecord.c:690-693` — the RATE case ends `db_post_events(pscal, &(pscal->tp), DBE_VALUE)` — a copy-paste posting TP (not RATE) on every RATE write.
+Impact: `caput scaler.RATE` fires a spurious .TP monitor event on C; the port's .TP subscriber gets nothing. C's quirk is the contract.
+
+### Notes (round 10)
+
+- Auditor-B: procServ (epics-tools-rs) not audited — its upstream C is a
+  separate project absent from the epics-base reference tree; no C
+  comparison possible without fabricating a reference.
+- Auditor-E line-verified 6 of ~20 category-E wave-7 fixes (the
+  highest-risk set); the rest are consistent with adjacent verified
+  code but not independently re-opened.
+- Audited-clean sweeps this round (no finding): aCalc DIV/MOD myMAXFLOAT
+  shapes; CA repeater register fanout; access-rights transition path;
+  camonitor disconnect line; PVA Status/Size codecs; MONITOR exec subcmd
+  decode; pipeline nack seeding + clamp_watermarks; QSRV option parsing
+  (the native-server gap R10-31/32 is the contrast); COM
+  stuffing/negotiation byte budget; serial option enum mappings; GPIB
+  no-interface path; optics table limit violations; AD stats/roi_stat/
+  fft; mqtt payload JSON DFS; modbus datatype combine/split; std epid/
+  throttle.
+
 ## Review Log
 
 - Round 6 (2026-07-10): full-workspace 5-way opus fan-out (caucus panels, read-only,
@@ -1842,3 +2075,25 @@ Severity: Medium.
   is a PANIC at record init (@asyn negative timeout), R9-7 is the
   structural cause behind R9-3, R9-56 is the general interpose stack-order
   family behind R8-57's COM-specific fix. Next: R10 re-audit.
+- Round 10 (2026-07-12): same 5 auditor panels (opus, read-only), triple
+  mandate. Fix verification: all wave-7 commits VERIFIED CORRECT — the
+  event-queue redesign checked at the byte/gate level against dbEvent.c,
+  COM line-by-line against asynInterposeCom.c, MonitorTeardown's
+  Fatal⟹closed invariant confirmed by construction; third consecutive
+  clean wave (category E sampled 6 of ~20, noted). Adjudications: ALL 26
+  wave-7 fixer-surfaced items CONFIRMED (R9-4 widened to every
+  mixed-type op; R9-7 widened to scalcout/acalcout; R9-20/21 narrowed to
+  their live facets; R9-35's pvxs throw-consequence now traced to
+  bev.reset()), plus both round-9 scaler candidates confirmed and filed
+  (R10-61/62). 13 NEW findings: High 0 / Medium 7 / Low 6 —
+  A: 5 (3M/2L, aCalc array-op scalar/shape contract cluster:
+  IXZ interpolated crossing, ISINF/FINITE/ISNAN shape, scalar
+  reductions), B: 1 (1L, alarm-string table HW_LIMIT/"Illegal value"
+  3-site family), C: 2 (2M, native-server pvRequest option conversion —
+  real-typed pipeline, real/hex queueSize — the exact R7-34/R9-34
+  kind-dispatch family on the server side), D: 3 (1M/2L, asynRecord
+  STATE_ALARM severities, resetError sites, Unknown-option
+  fall-through), E: 2 (1M/1L, scaler COUTP double-fire + RATE→TP
+  copy-paste quirk). Finding volume declining (42→19→32→17→13) and
+  severity ceiling dropped to Medium for the first time. Fix wave 8
+  next: 42 items (29 confirmed carryovers + 13 new).

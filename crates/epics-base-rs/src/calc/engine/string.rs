@@ -432,62 +432,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(a % b));
                 }
 
-                // Vararg min/max — type-aware
+                // C `MAX` / `MIN` (`sCalcPerform.c:1927-1962`). The argument TYPES
+                // are settled for the whole call by a pre-scan over every one of
+                // them ([`Operands::of`]), never by the first one popped.
                 CoreOp::Max(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let first = pop1(&mut stack)?;
-                    match first {
-                        StackValue::Double(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1_f64(&mut stack)?;
-                                if v > result || result.is_nan() {
-                                    result = v;
-                                }
-                            }
-                            stack.push(StackValue::Double(result));
-                        }
-                        StackValue::Str(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1(&mut stack)?;
-                                let s = v.as_bytes()?;
-                                if s > result.as_bytes() {
-                                    result = ScalcString::from_c(s);
-                                }
-                            }
-                            stack.push(StackValue::Str(result));
-                        }
-                    }
+                    let args = pop_n(&mut stack, *nargs as usize)?;
+                    stack.push(Extremum::Max.fold(Operands::of(args)));
                 }
                 CoreOp::Min(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let first = pop1(&mut stack)?;
-                    match first {
-                        StackValue::Double(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1_f64(&mut stack)?;
-                                if v < result || result.is_nan() {
-                                    result = v;
-                                }
-                            }
-                            stack.push(StackValue::Double(result));
-                        }
-                        StackValue::Str(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1(&mut stack)?;
-                                let s = v.as_bytes()?;
-                                if s < result.as_bytes() {
-                                    result = ScalcString::from_c(s);
-                                }
-                            }
-                            stack.push(StackValue::Str(result));
-                        }
-                    }
+                    let args = pop_n(&mut stack, *nargs as usize)?;
+                    stack.push(Extremum::Min.fold(Operands::of(args)));
                 }
 
                 CoreOp::MaxVal => {
@@ -1643,6 +1597,15 @@ fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
 }
 
+/// Pop `n` operands in C's scan order: `[0]` is the top of the stack, which is
+/// where C's `ps` starts and the direction its `DEC(ps)` walks.
+fn pop_n(stack: &mut Vec<StackValue>, n: usize) -> Result<Vec<StackValue>, CalcError> {
+    if n == 0 || stack.len() < n {
+        return Err(CalcError::Underflow);
+    }
+    Ok(stack.split_off(stack.len() - n).into_iter().rev().collect())
+}
+
 /// C's mixed-type rule for the binary operators that HAVE a string branch —
 /// ADD, SUB/SUBLAST, and the six comparisons (sCalcPerform.c:964-978 and the
 /// comparison cases). Each is written the same way:
@@ -1667,6 +1630,104 @@ impl Pair {
         match (a, b) {
             (StackValue::Str(x), StackValue::Str(y)) => Pair::Strings(x, y),
             (a, b) => Pair::Numeric(a.to_double(), b.to_double()),
+        }
+    }
+}
+
+/// The n-ary form of [`Pair`], for C's `MAX` and `MIN` varargs
+/// (`sCalcPerform.c:1927-1962`).
+///
+/// C settles the type of the WHOLE operation before it compares anything, by
+/// pre-scanning every argument:
+///
+/// ```c
+/// for (i=0, j=0; i<nargs; j |= isDouble(ps-i), i++);
+/// if (j) { /* an arg is double: coerce all to double, compare numerically */ }
+/// else   { /* all args are string: compare with strcmp, answer a STRING */ }
+/// ```
+///
+/// One double anywhere makes every argument a double. Only an all-string call
+/// takes the `strcmp` path, and only that path can answer a string. The port
+/// branched on the type of the FIRST argument it popped, so `MAX(4,"a")` raised
+/// TypeMismatch where C answers 4 (`atof("a")` is 0), and `MAX("10",9)` would
+/// have compared strings where C compares numbers.
+enum Operands {
+    Numeric(Vec<f64>),
+    Strings(Vec<ScalcString>),
+}
+
+impl Operands {
+    /// `args` in C's scan order: `args[0]` is the top of the stack.
+    fn of(args: Vec<StackValue>) -> Operands {
+        if args.iter().any(StackValue::is_double) {
+            Operands::Numeric(args.iter().map(StackValue::to_double).collect())
+        } else {
+            Operands::Strings(
+                args.into_iter()
+                    .map(|v| match v {
+                        StackValue::Str(s) => s,
+                        StackValue::Double(_) => unreachable!("no arg is a double here"),
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Which end C's extremum operators keep.
+#[derive(Clone, Copy)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+impl Extremum {
+    /// C's `MAX` / `MIN` fold (`sCalcPerform.c:1930-1962`), walking DOWN the stack
+    /// from the top exactly as C does.
+    ///
+    /// ```c
+    /// toDouble(ps);
+    /// while (--nargs) {
+    ///     d = ps->d;  DEC(ps);  toDouble(ps);
+    ///     if (ps->d < d || isnan(d)) ps->d = d;   /* MAX; MIN uses > */
+    /// }
+    /// ```
+    ///
+    /// `isnan(d)` tests the RUNNING value, so once a NaN enters the fold it stays:
+    /// compiled C answers a PERFORM ERROR for `MAX(NAN,5)` (the record's non-finite
+    /// result check rejects the NaN), where the port used to drop the NaN and
+    /// answer 5.
+    fn fold(self, args: Operands) -> StackValue {
+        match args {
+            Operands::Numeric(vals) => {
+                let mut running = vals[0];
+                for &cur in &vals[1..] {
+                    let keep_running = match self {
+                        Extremum::Max => cur < running,
+                        Extremum::Min => cur > running,
+                    };
+                    if !(keep_running || running.is_nan()) {
+                        running = cur;
+                    }
+                }
+                StackValue::Double(running)
+            }
+            // `if (strcmp(ps->s, ps1->s) < 0) strcpy(ps->s, ps1->s);` — the running
+            // value survives only when the incoming argument loses. Byte order is
+            // `strcmp`'s: both compare unsigned bytes, and a prefix sorts first.
+            Operands::Strings(vals) => {
+                let mut running = vals[0].clone();
+                for cur in &vals[1..] {
+                    let keep_running = match self {
+                        Extremum::Max => cur.as_bytes() < running.as_bytes(),
+                        Extremum::Min => cur.as_bytes() > running.as_bytes(),
+                    };
+                    if !keep_running {
+                        running = cur.clone();
+                    }
+                }
+                StackValue::Str(running)
+            }
         }
     }
 }

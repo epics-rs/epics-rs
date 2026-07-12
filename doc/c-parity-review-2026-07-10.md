@@ -2499,7 +2499,14 @@ Category E — synApps/AD records (e9), 8/8 FIXED:
 - R11-62 FIXED f8263a63 — swait simulation mode (SIML/SIMM/SIOL/SIMS/SVAL);
   new `SimOutcome::SimulatedInputStage` shape, shared with busy's sim group.
 - R11-63 FIXED 6effe62f — CircularBuff flushes on soft trigger only when
-  `FlushOnSoftTrig != 0` (C), not `> 0`.
+  `FlushOnSoftTrig > 0`, which is C's gate (`if (flushOn > 0)`,
+  NDPluginCircularBuff.cpp:276). The port had collapsed the field to a
+  `bool`, i.e. `!= 0`, so a negative `caput` — the field is a writable
+  asynInt32 — flushed the pre-buffer where C does not. The field is now an
+  `i32` with one reader.
+  (Correction: this disposition line originally had the two sides swapped,
+  claiming C was `!= 0`. The R11-63 finding text at :2355 was right all
+  along — C is `> 0`, the port was `!= 0`.)
 - R11-64 FIXED 7b11c8b4 — epid posts secondary fields without the cycle's
   alarm bits; new `Record::fields_posted_without_alarm_bits()` hook (also
   used by transform).
@@ -2522,9 +2529,13 @@ Dedicated task — asynGpib (g9), R10-55 FIXED (merged 080bfd8c):
 Merge integrations resolved by main (not by any fixer, so they are
 Round 12's first verification targets):
 - d9 x g9 in `asyn_record/mod.rs` — `perform_io` keeps g9's phase dispatch
-  and takes d9's `PhaseFlow::Aborted` break; `process()` keeps g9's
-  port-check-first order with d9's I/O Intr gate above it (C tests gotValue
-  at :340-341, before the stateNoDevice refusal at :356).
+  and takes d9's `PhaseFlow::Aborted` break. `process()` kept g9's
+  port-check-first order but placed d9's I/O Intr gate **above** it, on the
+  claim that "C tests gotValue at :340-341, before the stateNoDevice refusal
+  at :356". **That claim is FALSE and the placement was wrong** — Round 12
+  (R12-46) proved it: C's `goto done` at :341 sits *inside* the
+  `state == stateIdle` arm of an if/else-if chain whose first test is `state`,
+  so a portless record never consults the flag. Fixed in e96a68ce.
 - a9b x a9a in `calc/engine/array.rs` — `CoreOp::IsInf` keeps a9a's
   `unary_op` form and a9b's `c_isinf` sign.
 - e9 x d9 in `record_trait.rs` — both added a Record hook at the same point;
@@ -2584,6 +2595,141 @@ Notes on this set:
   on `refs/stash` this wave (g9 restored a sibling's WIP onto commit 26275614).
   Fixers must not use stash; use `git diff > patch; git apply -R; …; git apply`
   for fail-before verification.
+
+## Round 12 — re-audit (2026-07-12): wave-9 verification + adjudications + fresh findings
+
+Five read-only opus auditors, one per category. Category A built compiled-C
+harnesses for all three engines plus a Rust probe crate and ran every claim
+side by side; B compiled C's `printf` conversions; C read pvxs; D and E
+worked from source with the C open (D states plainly that it built no C and
+that none of its four claims turns on compiler/libc behaviour).
+
+### Fix-verification — 48 fixes, 47 VERIFIED, 1 WRONG
+
+- **A (21 commits): all VERIFIED** against compiled aCalc/sCalc/base,
+  including the a9b×a9a `IsInf` merge integration. The un-numbered Round-11
+  note (FITMPOLY/FITMQ mask `> SMALL`) was folded in and verified.
+- **B (5): all VERIFIED**, but two carry uncited family gaps (R12-17, R12-19).
+- **C (6 + 1 NOT-REAL): all VERIFIED.** The auditor also confirms its own
+  Round-11 R11-32 filing was wrong: `std::min(NaN, 100.0)` is `NaN`, not
+  `100.0`, so pvxs lands where the port lands. Withdrawn.
+- **D (10): all VERIFIED**, and the `perform_io` merge integration VERIFIED.
+- **E (8): all VERIFIED**, and the `record_trait.rs` merge integration
+  VERIFIED (both hooks are wired, not merely declared).
+- **The `process()` merge integration (d9×g9) was WRONG** — see R12-46. Main
+  resolved that conflict on a false reading of C and no fixer reviewed it.
+  This is the one defect in 48 fixes, and it was introduced by the merge, not
+  by a fixer. Fixed in e96a68ce.
+
+### Adjudications — R11-C1..C15
+
+CONFIRMED (12): R11-C1, C3, C4, C5, C8, C9, C10, C11, C13, C14, C15 —
+and R11-C6, which was **strengthened**: compiled sCalc shows scalcout's SVAL
+is wrong at the *shipped default* PREC=0 (C renders `3`, the port
+`3.14159265`), not merely at PREC≠8. Raise to Medium-High.
+
+RECLASSIFIED (3):
+- **R11-C2** — the missing end-of-expression depth check is real in the code
+  but produces **no reachable divergence in the array engine**: ~30 shapes run
+  through compiled aCalc with `aCalcPerformDebug=1` never fire C's
+  `if (ps != top) return(-1)`, because `aCalcPostfix`'s SEPARATOR case keeps
+  the compile ledger exact. Worth adding as an invariant guard; not the bug it
+  was filed as. (The analogous string-engine gap *is* reachable — R12-1.)
+- **R11-C12** — CONFIRMED but the population is different from the filing: the
+  12 menuYesNo base records **plus busy** are affected, and **swait must be
+  dropped** — C's swait uses a plain `if (simm == menuYesNoNO) … else`
+  (swaitRecord.c:406-421) with no switch and no default arm, so any non-zero
+  SIMM takes the simulation branch and the port already matches.
+- **R11-C15** — CONFIRMED but via a different path than filed. The fetch-gate
+  route is REFUTED (`check_alarms` early-returns on the same condition that
+  skips the reset). The real route is **ODLY**: C's DLYA continuation never
+  calls `afterCalc`→`checkAlarms`, so `monitor()`'s `recGblResetAlarms` clears
+  STAT/SEVR on that pass, while the port's framework calls `check_alarms`
+  unconditionally and re-reads the un-consumed `calc_alarm`.
+
+### New findings — 24
+
+Category A (calc engines) — R12-1..9, all compiled-C verified:
+### R12-1: the string engine emits UNTIL_END at the `;`, before the condition — every UNTIL expression fails at run time
+Severity: High. R10-9's compile-ledger change is correct; the run-time loop it enables is not. The commit message for 51caf870 claims UNTIL now "evaluates to its condition"; compiled C shows it does not. Fix R11-C7 (loop-max as an error vs C's silent break, sCalcPerform.c:1997) as part of this — a loop-max that breaks silently is useless while the loop itself underflows.
+### R12-2/3: MODBUS/ADD_XOR8 emit raw bytes where C keeps the frame escaped until the octet layer translates it
+Severity: Medium. Compiled C: `MODBUS(AA)` is a 16-char escaped string; the port emits raw bytes the driver then double-processes.
+### R12-4: `AMODBUS` drops C's leading `:` (sCalcPerform.c:1846-1850)
+Severity: Medium. Compiled C `AMODBUS("010203")` = `:010203FA`; the port gives `010203FA`. ASCII-MODBUS frames lose their start delimiter.
+### R12-5: `SSCANF` is a hand-rolled subset — a failed conversion is silently 0 where C raises CALC_ALARM, and `%x`/`%o`/`%u`/`%c`/`%[` are unimplemented
+Severity: High. `string.rs:1150-1192` vs `sCalcPerform.c:1635-1690` (`if (i != 1) return(-1)`). Compiled: `SSCANF("abc","%d")` → C status −1 / CALC_ALARM, port 0 with a healthy record; `SSCANF("ff","%x")` → C 255, port 0. A protocol scalcout parsing a hex reply gets 0 and no alarm.
+### R12-6: aCalc `POWER` promotes its left operand and pairs element-wise; C collapses the exponent and only maps when the LEFT is an array
+Severity: Medium. `array.rs:157` vs `aCalcPerform.c:1306-1317` — POWER is not in the two-arg array dispatch. Compiled: `2**AA` is the scalar 2 in C, the array `[2,4,8,16,32,64]` in the port; both VAL and AVAL diverge, and the result *shape* diverges.
+### R12-7: sCalc `LEN` of a double returns 0; C converts to string first
+Severity: Medium. `string.rs:548-555` vs `sCalcPerform.c:1521-1526`. Compiled C: `LEN(4)` is **10** (`4.00000000`); the port answers 0.
+### R12-8: the `strNcpy` result bound is 38 bytes, not 39 — R11-2's uniform 39-byte `ScalcString` loses the distinction
+Severity: Medium. `value.rs:47-55` vs `sCalcPerform.c:68-74`: PRINTF/BIN_WRITE/SSCANF/TR_ESC/ESC and the checksums all pass `N = SCALC_STRING_SIZE-1` → a 38-byte bound; only `ADD` and `LITERAL_STRING` get 39. Making the bound structural was right; making it *uniformly* 39 was not. The fix is a second constructor for the `strNcpy` family, not a check at each call site.
+### R12-9: `LRC` rejects operands C accepts, turning a healthy record into CALC_ALARM
+Severity: Low. `checksum.rs:19-43` vs `sCalcPerform.c:230-256` — C's `hex()` returns 0 for a non-hex char and its loop ignores a trailing odd character. (C's same loop reads out of bounds for an *empty* operand — `strlen(0)-1` wraps. That is C UB; do not port it. Refuse the empty operand deliberately and say so.)
+
+Category B (CA tools) — R12-16..20:
+### R12-16: `caget`/`camonitor` reject C's `-0<base>` / `-l<base>` spelling outright — the integer/float base flags are unreachable
+Severity: High. The six base flags are declared as clap **long** options only (`caget-rs.rs:149-168`); C's getopt has `0:` and `l:` as single-dash options taking an argument (`caget.c:395,487`). Measured: `caget-rs -0x PV` → `error: unexpected argument '-0' found`, exit 2. **This makes the entire R11-16 fix unobservable through the C CLI** and silently breaks any script passing `-0x`.
+### R12-17: malformed numeric option arguments are hard exit-2 errors; C's getopt tools warn and continue with a default
+Severity: Medium. C warns and *runs the get* for `-w`/`-#`/`-p`/`-e`/`-f`/`-g` (caget.c:437-462 and the identical blocks in camonitor/caput/cainfo). Measured: 10 invocations across the four binaries exit 2 and read nothing. This is the family R10-18 opened and closed at one site — the fixer built `cli::scan_leading_i64` as the shared owner and wired only `caput -#`.
+### R12-18: usage-error exit code is 2 with clap's text; C returns 1 with its own diagnostic
+Severity: Low. `cainfo-rs.rs:111` already prints C's exact `No pv name specified.` and exits 1 — it shows the intended shape.
+### R12-19: `caget -d DBR_GR_CHAR` / `DBR_CTRL_CHAR` print the limits unsigned; C casts each through a signed `char`
+Severity: Medium. `caget-rs.rs:376-378` vs `tool_lib.c:370,381` — `ARGS_GR(T,F)` applies the macro's `F` cast, and for the CHAR classes `F` is `char`. Compiled: `printf("%8d",(char)255)` → `-1`. Same signed-`char` rule R11-16 fixed on the *value* path; the *limit* path was not swept with it.
+### R12-20: `caget -0<base>` does not force `type = DBR_LONG` (caget.c:493-495), so `-d <type> -0x` requests the wrong DBR
+Severity: Low. Blocked behind R12-16 today, but in the same C block — fix them together.
+
+Category C (PVA) — R12-31..34:
+### R12-31: a single-record PVA monitor re-sends the whole value with an all-changed bitset; pvxs sends only the DB event's marked leaves
+Severity: High. `qsrv/monitor.rs:265-299` → `pva_adapter.rs:1045-1049` → `tcp.rs:2102-2112` selects the full-selection bitset. C: `singlesource.cpp:47-68` marks only the event's leaves and `unmark()`s after each post; `servermon.cpp:172-174` serializes `marked ∩ pvMask`. Every monitor frame for a QSRV single-record PV — the most common thing QSRV serves — differs on the wire, and a client using `isMarked()`/`ifMarked()` sees metadata as freshly changed on every value tick.
+### R12-32: no `testmask` gate — an update whose marked set misses the pvRequest mask is still queued and framed; pvxs drops it in `doPost`
+Severity: Medium. `tcp.rs:2029-2031` pushes into the squash FIFO before any mask test. C: `servermon.cpp:261-268` guards the enqueue with `if(real || !val)`. The masked-out update also occupies a slot in the negotiated FIFO and can coalesce a real update out of it — so the squash *contents* differ, not just the frame count. The doc-comment at `tcp.rs:7756-7758` asserting parity here is wrong.
+### R12-33: an exhausted pipeline window stops draining the source instead of squashing at the negotiated limit
+Severity: Medium. `tcp.rs:2038-2101` — `credit.acquire().await` blocks inside the `select!` arm, so `rx.recv()` is not polled. C: `servermon.cpp:79-83,143` — `maybeReply` simply does not fire while the window is 0; `doPost` keeps squashing. A stalled pipelined client makes the port buffer ~`64 + limit` distinct updates and deliver them all on resume, where pvxs coalesces everything past `limit` into the queue tail. Breaks the same "one negotiated limit governs the squash" invariant R11-31 established.
+### R12-34: a MONITOR pvRequest selecting no existing field draws an op-error; pvxs's `request2mask` throw resets the circuit
+Severity: Low. `tcp.rs:6157-6178` vs `pvrequest.cpp:60-61` → `conn.cpp:277-282` (`bev.reset()`). Same class as R9-33, which wave 8 fixed by routing a MONITOR INIT throw to a fatal `PvaError`; the mask throw was not routed through it.
+
+Category D (asyn) — R12-46..48:
+### R12-46: the I/O Intr gate was placed above the port check; C dispatches on `state` first
+Severity: Medium. **Introduced by main's own d9×g9 merge resolution.** C's `if (gotValue) goto done` (:341) sits *inside* the `state == stateIdle` arm of an if/else-if chain whose first test is `state` (:331-361): a portless record never consults the flag, reports "Not connect to a port" with STATE_ALARM/MINOR, and `done:` (:370) discards the value. The port published it instead — a record with no port looked healthy and freshly updated, NO_ALARM, empty ERRS. FIXED e96a68ce (structural: `process` is now C's `done:` and owns the discard; `IoIntrScan::refresh` owns the clear on every binding change).
+### R12-47: no request can bypass the not-connected refusal — C's `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` is unmodelled
+Severity: High. `port.rs:462` (`check_ready` → `Disconnected`) refuses what C's `queueRequest` (asynManager.c:1536-1552) lets through when `priority == asynQueuePriorityConnect` **and** the user carries the reason. Six C call sites rely on it, and the port has none: (1) **the HOSTINFO put** (asynRecord.c:566-569, C's comment: *"Enable changing host:port when not connected"*) — this is the operator's only route to repoint a dead IP port, so a `drvAsynIPPort` aimed at a wrong or moved host **cannot be corrected at runtime at all**; (2) the connect-time option readback (asynRecord.c:1277-1280), so every asynRecord on a down serial/IP port shows BAUD/PRTY/… as "Unknown" where C populates them (note C's deliberate asymmetry: the *EOS* readback is queued at Low priority with no bypass, :1296, so IEOS/OEOS correctly stay blank); (3) `asynSetOption`/`asynShowOption`/`asynSetEos`/`asynShowEos` from iocsh, so configuring a serial line from `st.cmd` before the device is powered on works in C and is refused here. The drivers are already correct and are not the fix site — the refusal is imposed solely by the queue gate.
+### R12-48: the Connect-priority bypass also skips the *disabled* check, which C never skips
+Severity: Medium. `port_actor.rs:383` skips `check_ready` wholesale, and that is where both the disabled (`port.rs:456`) and disconnected (`:462`) refusals live. C conditions only `checkPortConnect` on the priority; `if(!pport->dpc.enabled) return asynDisabled;` (:1541-1546) is unconditional. So on a port disabled with `asynEnable(port,0)`, a `CNCT=1` put still opens the device connection — a port disabled precisely to keep the IOC off the hardware still touches it. The two refusals must be separated: the lifecycle/Connect class may bypass *connected*, never *enabled*.
+
+Category E (records/framework) — R12-61..65:
+### R12-61: SIMM=YES with unset SIML and SIOL silently does not simulate at all
+Severity: Medium. `processing.rs:4964-4966` returns `NotSimulated` *before* SIMM is read. C raises SIMM_ALARM independently of the SIOL read (longinRecord.c:413-414) and an unset (constant) SIOL still yields `val = sval`. The standard "simulate against a constant" idiom — `caput REC.SIMM 1; caput REC.SVAL 42` — is a complete no-op on the port. Affects every record routed through `check_simulation_mode`.
+### R12-62: scaler Sn loses its DBE_LOG post on the count-completion cycle
+Severity: Medium. C posts each changed Sn **twice** on that cycle — `updateCounts()` with DBE_VALUE (`:582`) and `monitor()`'s sweep with a literal DBE_LOG (`:770-772`), both reached because `:386` sets `ss = IDLE`. The port's per-field model (`record_instance.rs:2537-2556`, `log_swept` is an `else if` on `changed`) structurally cannot emit two events for one field in one cycle. A DBE_LOG-only archiver never receives the final counts — exactly the sample that matters.
+### R12-63: NDPluginProcess drops C's zero-coefficient guards, poisoning output with NaN
+Severity: Low. `process.rs:527,556-557` multiplies every term unconditionally; C guards each (`NDPluginProcess.cpp:204-208,220-225`). All ten coefficients default to 0, and `0.0 * NaN` is NaN — so one non-finite pixel permanently poisons `filter[i]` for every subsequent frame where C outputs the clean offset.
+### R12-64: the SIMM↔SSCN scan swap (`recGblCheckSimm`) is entirely unimplemented
+Severity: Medium. `recGbl.c:427-437` swaps SCAN with SSCN on every SIMM transition; workspace-wide `rg` finds no such behaviour at all. SSCN and OLDSIMM are inert storage: a simulated record keeps its production SCAN rate forever and `caput REC.SSCN` has no effect on anything.
+### R12-65: a failed SIML read raises no LINK_ALARM
+Severity: Low. `processing.rs:5008-5016` silently discards the failure; C sets `nsta = LINK_ALARM` (`recGbl.c:453-454`). Note the C quirk the port must reproduce: `nsta` is set directly, so SEVR stays NO_ALARM.
+
+### Structural notes from the auditors (read before briefing fix wave 10)
+
+- **R12-61/64/65 are one family**, not three symptoms: the port implements the
+  SIOL/SIMM read but not the surrounding `recGblGetSimm` / `recGblCheckSimm` /
+  `recGblInitSimm` contract. Port those three C functions as the single owner
+  of the simulation-mode transition.
+- **R11-C10 is the structural cause under R10-63.** Fixing it at the framework
+  (advance `last_posted` on the put-time post) lets scaler's closed-set hook
+  shrink and closes the same double-post for every other record. Do not hand it
+  out as an isolated per-record patch.
+- **R12-16 gates R12-20**, and **R12-1 subsumes R11-C7** — pair them.
+- Three fresh-hunt hypotheses were formed and then killed on the C, recorded so
+  they are not re-chased: `epicsStrSnPrintEscaped` emits lowercase `\xHH` not
+  octal (the port is right); scaler's DBE_LOG sweep is *not* unconditional
+  (only the completion-cycle edge survives, R12-62); NDPluginProcess does *not*
+  re-derive autoOffsetScale every frame (the port's one-shot matches).
+- Un-filed nit: `A:=B:=5` is `CALC_ERR_BAD_ASSIGNMENT` (3) in C and `Incomplete`
+  (8) in the port. Both reject, and CLCV is only 0/non-zero, so the code is
+  unobservable through CA.
+- The ARANDOM seeding deviation (time-seeded splitmix vs C's fixed-seed
+  thread-private LCG, aCalcPerform.c:1667-1685) still awaits disposition.
 
 ## Review Log
 
@@ -2834,3 +2980,34 @@ Notes on this set:
   (R11-C1..C15); a9b lost a candidate list (a)-(h) to context compaction, so
   Round 12 owes a fresh derive pass over the sCalc string-engine areas.
   Nothing pushed.
+- Round 12 (2026-07-12): 5 read-only opus auditors, triple mandate (verify
+  wave 9 / adjudicate R11-C1..C15 / fresh hunt). **47 of 48 wave-9 fixes
+  VERIFIED; the one WRONG is main's own d9xg9 merge resolution** (R12-46 —
+  the I/O Intr gate placed above the port check on a false reading of C's
+  :340-341; C's `goto done` is nested inside the `stateIdle` arm). Fixed at
+  source in e96a68ce with the cell invariant closed structurally. Two of the
+  three merge integrations verified clean. Adjudications: 12 CONFIRMED (R11-C6
+  strengthened — scalcout SVAL is wrong at the *shipped default* PREC=0, not
+  just PREC≠8), 3 RECLASSIFIED (R11-C2 unreachable in the array engine;
+  R11-C12's population is the 12 menuYesNo records + busy, and swait must be
+  dropped; R11-C15's fetch-gate route REFUTED, the real route is ODLY).
+  R11-32 formally withdrawn — the Category-C auditor confirms its own Round-11
+  filing misread libstdc++. 24 NEW findings: High 4 / Medium 15 / Low 5 —
+  A: 9 (the sCalc *string operator* surface is the weak spot: UNTIL emits
+  UNTIL_END before the condition so every loop fails at run time; SSCANF is a
+  hand-rolled subset that swallows conversion failures; MODBUS/AMODBUS frame
+  shape; LEN of a double; the 38-vs-39 strNcpy bound R11-2 flattened),
+  B: 5 (R12-16 HIGH — the `-0x`/`-lx` base flags do not parse at all, which
+  makes the entire R11-16 fix unobservable through the C CLI; plus the
+  warn-and-continue family R10-18 closed at only one site), C: 4 (R12-31 HIGH
+  — QSRV single-record monitors re-send the whole value with an all-changed
+  bitset; plus the missing testmask gate and the pipeline-starvation residual),
+  D: 3 (R12-47 HIGH — ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED unmodelled, so a
+  dead IP port's HOSTINFO cannot be repointed at runtime *at all*), E: 5 (the
+  recGblGetSimm/CheckSimm/InitSimm contract is largely unimplemented — SIMM=YES
+  with a constant SIOL is a silent no-op, and the SIMM↔SSCN scan swap does not
+  exist). Themes: this round's High findings are all *unreachable-feature*
+  defects — a fix landed correctly but the surface that would exercise it does
+  not parse (R12-16), does not queue (R12-47), does not loop (R12-1) or does
+  not mask (R12-31). Fix wave 10 next: 36 items (12 confirmed carryovers +
+  24 new), minus R12-46 already fixed.

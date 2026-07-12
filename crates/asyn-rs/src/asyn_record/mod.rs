@@ -1100,6 +1100,20 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
 /// `AQR` request (asynRecord.c:398).
 const CANCELED_MSG: &str = "I/O request canceled";
 
+/// The fields asynRecord.dbd marks `special(SPC_MOD)` — the complete set of puts
+/// that reach C `special()` (dbAccess only calls `special` for an SPC_MOD field).
+///
+/// This port's database calls [`Record::special`] after every accepted put, so
+/// the C set has to be stated: it is the gate in [`AsynRecord::special`], and the
+/// dispatch arms below it are the same 43 names. A field added to one must be
+/// added to the other — `spc_mod_fields_match_the_dbd` pins the list to the dbd.
+const SPC_MOD_FIELDS: &[&str] = &[
+    "PORT", "ADDR", "PCNCT", "DRVINFO", "REASON", "IFACE", "OEOS", "IEOS", "UI32MASK", "BAUD",
+    "LBAUD", "PRTY", "DBIT", "SBIT", "MCTL", "FCTL", "IXON", "IXOFF", "IXANY", "HOSTINFO", "DRTO",
+    "TMSK", "TB0", "TB1", "TB2", "TB3", "TB4", "TB5", "TIOM", "TIB0", "TIB1", "TIB2", "TINM",
+    "TINB0", "TINB1", "TINB2", "TINB3", "TSIZ", "TFIL", "AUCT", "CNCT", "ENBL", "AQR",
+];
+
 /// The fields C `getOptions` re-reads from the driver and POST_IF_NEWs
 /// (asynRecord.c:1834-1938: `REMEMBER_STATE` on each, then `POST_IF_NEW` after
 /// the `getOption` calls). Same set as [`AsynRecord::read_options_from_driver`]
@@ -2298,6 +2312,22 @@ impl AsynRecord {
         self.post_if_new(&before);
     }
 
+    /// C `resetError` (asynRecord.c:2050-2060): clear ERRS and post it if the
+    /// operator was looking at a message that is now gone.
+    ///
+    /// The single owner of "the record starts this operation with a clean ERRS".
+    /// C calls it at the entry of every operation that can report — `process()`
+    /// on an idle record (:339) and again in the callback it queues (:817),
+    /// `special()` (:390) and `connectDevice()` (:1151) — never at an exit, so no
+    /// diagnostic an operation raised can be cleaned up behind it. Clearing on
+    /// entry is what makes ERRS "the last operation's message", not "the last
+    /// message any operation left".
+    fn reset_error(&mut self) {
+        let before = self.field_snapshot(&["ERRS"]);
+        self.errs.clear();
+        self.post_if_new(&before);
+    }
+
     /// C's `state == stateNoDevice` refusal (asynRecord.c:356-357): a record with
     /// no port refuses the transfer in `process()`, before `performIO` — and so
     /// before the interface dispatch — because there is no port to ask about
@@ -2440,6 +2470,12 @@ impl AsynRecord {
     /// and leave this function's own `"Connect error, status=%d, %s"`
     /// (asynRecord.c:1158) in ERRS.
     fn connect_device(&mut self) -> Result<(), String> {
+        // C `connectDevice` opens with `resetError` (asynRecord.c:1151): the
+        // previous connection's diagnostic is cleared *before* the attempt, and
+        // whatever this attempt reports (`"Connect error…"`, `"Error in
+        // asynDrvUser->create()"`) is what stays in ERRS.
+        self.reset_error();
+
         if self.port.is_empty() {
             self.pcnct = 0;
             self.port_entry = None;
@@ -2514,10 +2550,6 @@ impl AsynRecord {
                 // POST_IF_NEW cache is seeded with the values C's `old` holds at
                 // the same point.
                 self.register_exception_callback();
-                // Only clear errors if drv_user_create succeeded (don't mask the error)
-                if self.errs.is_empty() || self.resolved_reason != 0 || self.drvinfo.is_empty() {
-                    self.errs.clear();
-                }
                 Ok(())
             }
             None => {
@@ -3327,6 +3359,18 @@ impl Record for AsynRecord {
         if !after {
             return Ok(());
         }
+        // C reaches `special()` only for the fields the dbd marks
+        // `special(SPC_MOD)`; this port's framework calls it after *every*
+        // accepted put, so [`SPC_MOD_FIELDS`] is the gate that restores C's set.
+        // Without it the entry `resetError` below would fire on a put to a plain
+        // field — VAL, NRRD, TMOT, or ERRS itself — and wipe a diagnostic C keeps.
+        if !SPC_MOD_FIELDS.contains(&field) {
+            return Ok(());
+        }
+        // C `special()` opens with `resetError` (asynRecord.c:390), before any
+        // field dispatch: whatever this put reports is the only thing in ERRS
+        // when it returns.
+        self.reset_error();
 
         match field {
             // Connection fields → reconnect. C overwrites `connectDevice`'s own
@@ -3695,6 +3739,16 @@ impl Record for AsynRecord {
             self.monitor_status();
         }
 
+        // Every fresh (`pact == FALSE`) process clears ERRS before it decides
+        // what to do: C `process()` calls `resetError` at the top of its idle
+        // branch (asynRecord.c:339) and the callback it queues calls it again on
+        // entry (:817) — both *above* the UCMD / ACMD / TMOD dispatch. So a
+        // record that failed a transfer and is then scanned with TMOD=NoIO comes
+        // back with an empty ERRS; the message does not outlive the cycle that
+        // raised it. This port merges C's process and its callback, so one reset
+        // here is both of C's.
+        self.reset_error();
+
         // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
         // priority: a pending UCMD universal GPIB command first, else a
         // pending ACMD addressed GPIB command, else octet/register I/O
@@ -3728,8 +3782,6 @@ impl Record for AsynRecord {
         if tmod == TransferMode::NoIo {
             return Ok(ProcessOutcome::complete());
         }
-
-        self.errs.clear();
 
         // C refuses in this order, and the order is load-bearing: `process()`
         // rejects `state == stateNoDevice` before it queues anything
@@ -4074,6 +4126,130 @@ mod tests {
         assert_eq!(
             rec.errs,
             "connectDevice failed: asynManager:connectDevice no port name provided"
+        );
+    }
+
+    /// R10-47: the list this port has to state — the dbd is C's source of truth
+    /// for which puts reach `special()`, and this port's database calls `special`
+    /// for every put — must be the dbd's, exactly.
+    #[test]
+    fn spc_mod_fields_match_the_dbd() {
+        // asynRecord.dbd: every `field(...) { ... special(SPC_MOD) ... }`.
+        let dbd = [
+            "PORT", "ADDR", "PCNCT", "DRVINFO", "REASON", "IFACE", "OEOS", "IEOS", "UI32MASK",
+            "BAUD", "LBAUD", "PRTY", "DBIT", "SBIT", "MCTL", "FCTL", "IXON", "IXOFF", "IXANY",
+            "HOSTINFO", "DRTO", "TMSK", "TB0", "TB1", "TB2", "TB3", "TB4", "TB5", "TIOM", "TIB0",
+            "TIB1", "TIB2", "TINM", "TINB0", "TINB1", "TINB2", "TINB3", "TSIZ", "TFIL", "AUCT",
+            "CNCT", "ENBL", "AQR",
+        ];
+        let mut ours = SPC_MOD_FIELDS.to_vec();
+        let mut theirs = dbd.to_vec();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(ours, theirs);
+    }
+
+    /// R10-47: C `process()` resets ERRS at the top of its idle branch
+    /// (asynRecord.c:339) and again in the callback it queues (:817) — both
+    /// *above* the TMOD dispatch. So a record that failed a transfer and is then
+    /// scanned with TMOD=NoIO comes back with an empty ERRS: the message does not
+    /// outlive the cycle that raised it.
+    #[test]
+    fn a_noio_process_clears_a_stale_errs() {
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::NoIo as i32;
+        rec.errs = "Read error, timeout".to_string();
+
+        rec.process().unwrap();
+
+        assert_eq!(
+            rec.errs, "",
+            "C process() resetError (asynRecord.c:339) runs above the TMOD check"
+        );
+    }
+
+    /// R10-47: C `special()` opens with `resetError` (asynRecord.c:390), before
+    /// any field dispatch — so an SPC_MOD put starts with a clean ERRS and only
+    /// its own diagnostic (here: none) is in it when it returns.
+    #[test]
+    fn a_special_put_clears_a_stale_errs() {
+        let mut rec = AsynRecord::default();
+        rec.errs = "Write error, nout=0, timeout".to_string();
+        rec.tmsk = 0;
+
+        rec.special("TMSK", true).unwrap();
+
+        assert_eq!(
+            rec.errs, "",
+            "C special() resetError (asynRecord.c:390) runs before the field dispatch"
+        );
+    }
+
+    /// R10-47 boundary: a put to a field the dbd does NOT mark `special(SPC_MOD)`
+    /// never reaches C `special()` at all, so it must not reset ERRS — including
+    /// a put to ERRS itself, which would otherwise erase what the operator just
+    /// wrote. This is what [`SPC_MOD_FIELDS`] gates.
+    #[test]
+    fn a_non_spc_mod_put_keeps_errs() {
+        let mut rec = AsynRecord::default();
+        rec.errs = "Read error, timeout".to_string();
+
+        rec.special("VAL", true).unwrap();
+        rec.special("ERRS", true).unwrap();
+
+        assert_eq!(
+            rec.errs, "Read error, timeout",
+            "a non-SPC_MOD put does not reach C special() and does not reset ERRS"
+        );
+    }
+
+    /// R10-47: `connectDevice` clears at its ENTRY (asynRecord.c:1151), so the
+    /// previous attempt's diagnostic never survives a new one. The port's old
+    /// end-of-function clear was conditional on `resolved_reason != 0`, which
+    /// left a stale message in place for the driver whose DRVINFO resolves to
+    /// parameter 0 — a legitimate reason.
+    #[test]
+    fn connect_device_entry_clears_the_previous_attempts_errs() {
+        use crate::interrupt::InterruptManager;
+        use crate::param::ParamType;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct ParamDriver(PortDriverBase);
+        impl PortDriver for ParamDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "r10_47_reason0";
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        // The port's first parameter — reason 0.
+        assert_eq!(
+            base.params.create_param("FIRST", ParamType::Int32).unwrap(),
+            0
+        );
+        let (tx, rx) = mpsc::channel(16);
+        let actor = PortActor::new(Box::new(ParamDriver(base)), rx);
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(16)));
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "FIRST".to_string();
+        rec.errs = "Connect error, status=3, port down".to_string();
+
+        rec.connect_device().unwrap();
+
+        assert_eq!(rec.resolved_reason, 0, "DRVINFO resolved to parameter 0");
+        assert_eq!(
+            rec.errs, "",
+            "a successful connect leaves no diagnostic behind, whatever the reason resolves to"
         );
     }
 

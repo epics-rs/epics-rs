@@ -657,3 +657,43 @@ fn test_printf_percent_escape() {
     let result = eval_str(r#"PRINTF("100%%", 0)"#);
     assert_eq!(result, StackValue::Str("100%%".into()));
 }
+
+// --- the `toString` operands (R12-7) ---
+//
+// C `LEN` (`sCalcPerform.c:1520`) and `REPLACE` (`:1903`) open by coercing their
+// operands with `toString(ps)` — the same macro TO_STRING, SUBRANGE and a string
+// store use. The port demanded a string and answered 0 / TypeMismatch instead.
+
+/// Compiled C: `LEN(4)` is 10 — the width of "4.00000000", the double's string
+/// form at the precision `to_string` hardcodes. The port answered 0.
+#[test]
+fn test_len_of_a_double_measures_its_string_form() {
+    assert_eq!(eval_str("LEN(4)"), StackValue::Double(10.0));
+    assert_eq!(eval_str("LEN(0)"), StackValue::Double(10.0));
+    assert_eq!(eval_str("LEN(3.14159265358979)"), StackValue::Double(10.0));
+    assert_eq!(eval_str(r#"LEN("abc")"#), StackValue::Double(3.0));
+    assert_eq!(eval_str(r#"LEN("")"#), StackValue::Double(0.0));
+}
+
+/// REPLACE (`{`) coerces ALL THREE operands, so a double in any position is
+/// legal. Compiled C: `4{"4","x"}` is "x.00000000", `"a4c"{"4",4}` is
+/// "a4.00000000c". The port raised TypeMismatch for every one of them.
+#[test]
+fn test_replace_coerces_every_operand() {
+    assert_eq!(
+        eval_str(r#"4{"4","x"}"#),
+        StackValue::Str("x.00000000".into())
+    );
+    assert_eq!(
+        eval_str(r#""a4c"{"4",4}"#),
+        StackValue::Str("a4.00000000c".into())
+    );
+    // The find text is coerced too, so "4.00000000" is what is looked for —
+    // and it is not in "a4c", which is therefore returned unchanged.
+    assert_eq!(eval_str(r#""a4c"{4,"x"}"#), StackValue::Str("a4c".into()));
+    // Only the first occurrence goes (C `strstr`).
+    assert_eq!(
+        eval_str(r#""hello"{"l","LL"}"#),
+        StackValue::Str("heLLlo".into())
+    );
+}

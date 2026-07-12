@@ -550,12 +550,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     }));
                 }
                 StringOp::Len => {
+                    // C `LEN` (sCalcPerform.c:1520-1526) opens with `toString(ps)`,
+                    // so a DOUBLE operand is measured in its string form:
+                    // `LEN(4)` is 10, the width of "4.00000000".
                     let v = pop1(&mut stack)?;
-                    let len = match &v {
-                        StackValue::Str(s) => s.len() as f64,
-                        StackValue::Double(_) => 0.0,
-                    };
-                    stack.push(StackValue::Double(len));
+                    stack.push(StackValue::Double(v.into_string_value().len() as f64));
                 }
                 StringOp::Byte => {
                     // C BYTE (sCalcPerform.c:1528-1533):
@@ -693,17 +692,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::str(out));
                 }
                 StringOp::Replace => {
-                    // Pop: string, find, replace
-                    let replace_val = pop1(&mut stack)?;
-                    let find_val = pop1(&mut stack)?;
-                    let s = pop1(&mut stack)?;
-                    let s = s.as_bytes()?;
-                    let find = find_val.as_bytes()?;
-                    let replace = replace_val.as_bytes()?;
-                    // Replace first occurrence only
+                    // C `REPLACE` (sCalcPerform.c:1903-1924) opens with
+                    // `toString` on ALL THREE operands, so `4{"4","x"}` is
+                    // "x.00000000" — the port raised TypeMismatch instead.
+                    // Only the first occurrence is replaced (C `strstr`).
+                    let replace = pop1(&mut stack)?.into_string_value();
+                    let find = pop1(&mut stack)?.into_string_value();
+                    let subject = pop1(&mut stack)?.into_string_value();
+                    let s = subject.as_bytes();
                     let mut result = s.to_vec();
-                    if let Some(pos) = find_sub(s, find) {
-                        result.splice(pos..pos + find.len(), replace.iter().copied());
+                    if let Some(pos) = find_sub(s, find.as_bytes()) {
+                        result.splice(pos..pos + find.len(), replace.as_bytes().iter().copied());
                     }
                     stack.push(StackValue::str(result));
                 }

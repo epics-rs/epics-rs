@@ -60,6 +60,15 @@ pub struct SwaitRecord {
     pub inp_passive: [i16; 12],  // INAP..INLP
     // numeric input values A-L
     pub num_vals: [f64; 12],
+    // LA..LL ("Last Val of Input x", C `swaitRecord.dbd:298-331`, DBF_DOUBLE,
+    // no SPC_NOMOD so a client may write them). C `monitor()`
+    // (swaitRecord.c:646-653) is the single writer during processing: for each
+    // input it changed, it posts the input, advances `*pprev = *pnew`, and
+    // posts the previous-value field too — both with `monitor_mask | DBE_VALUE`
+    // (see `fields_posted_with_monitor_mask`). The record had no LA..LL at all,
+    // so the change history C publishes was unreadable and a put was rejected
+    // with `FieldNotFound`.
+    pub prev_vals: [f64; 12],
     cached_should_output: bool,
     // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
     // no DLYA database field, unlike scalcout). `output_wait` marks that the
@@ -90,6 +99,7 @@ impl Default for SwaitRecord {
             inp_names: Default::default(),
             inp_passive: [0; 12],
             num_vals: [0.0; 12],
+            prev_vals: [0.0; 12],
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
@@ -164,6 +174,16 @@ impl SwaitRecord {
         // Single letter A-L
         if name.len() == 1 {
             CHAN.iter().position(|&c| c.to_string() == name)
+        } else {
+            None
+        }
+    }
+
+    /// LA..LL — the previous value of input A..L.
+    fn prev_val_index(name: &str) -> Option<usize> {
+        let bytes = name.as_bytes();
+        if bytes.len() == 2 && bytes[0] == b'L' {
+            CHAN.iter().position(|&c| c == bytes[1] as char)
         } else {
             None
         }
@@ -291,6 +311,68 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "L",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    // LA..LL — "Last Val of Input x" (swaitRecord.dbd:298-331). Writable: the
+    // .dbd gives them no `special(SPC_NOMOD)`, unlike calcRecord's LA..LU.
+    FieldDesc {
+        name: "LA",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LB",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LC",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LD",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LE",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LF",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LG",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LH",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LI",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LJ",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LK",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LL",
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
@@ -503,6 +585,14 @@ impl Record for SwaitRecord {
         // (see `output_link_value`).
         self.oval = self.val;
 
+        // C `swaitRecord.c::monitor` (646-653) advances each previous-input
+        // field to the input it just posted (`*pprev = *pnew`) — so LA..LL is
+        // "the value of input A..L as of the last cycle that posted it", which
+        // for these fields is every cycle the input changed. Assigning
+        // unconditionally is the same state: the C guard only skips the
+        // assignment when the two are already equal.
+        self.prev_vals = self.num_vals;
+
         // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
         // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
         // link by ODLY seconds via the watchdog, holding the record active
@@ -591,8 +681,15 @@ impl Record for SwaitRecord {
     /// `monitor_mask`), not on every change. `calcRecord.c:420` writes
     /// `monitor_mask | DBE_VALUE | DBE_LOG` in the same loop and keeps the
     /// framework default.
+    ///
+    /// LA..LL ride the same post: C advances `*pprev = *pnew` between the two
+    /// `db_post_events` calls, so the previous-value field is published with the
+    /// same mask as the input that moved it.
     fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
-        &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+        &[
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "LA", "LB", "LC", "LD",
+            "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL",
+        ]
     }
 
     /// `OEVT` ("Output Event"): post the numeric output event when output
@@ -632,6 +729,9 @@ impl Record for SwaitRecord {
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
+                }
+                if let Some(idx) = Self::prev_val_index(name) {
+                    return Some(EpicsValue::Double(self.prev_vals[idx]));
                 }
                 if let Some(idx) = Self::inp_name_index(name) {
                     return Some(EpicsValue::String(self.inp_names[idx].clone().into()));
@@ -712,6 +812,10 @@ impl Record for SwaitRecord {
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {
                     self.num_vals[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                } else if let Some(idx) = Self::prev_val_index(name) {
+                    self.prev_vals[idx] = value
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 } else if let Some(idx) = Self::inp_name_index(name) {

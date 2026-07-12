@@ -126,10 +126,29 @@ pub struct AlarmResetResult {
     pub prev_stat: u16,
     /// True iff `amsg` value changed in this reset cycle (epics-base PR #568).
     pub amsg_changed: bool,
-    /// True iff `acks` value was raised in this reset cycle (C parity
-    /// with `recGblResetAlarms` — `acks` tracks the highest unacknowledged
-    /// severity so operators can clear sticky alarms via a CA put).
-    pub acks_changed: bool,
+    /// True iff `recGblResetAlarms` POSTED `ACKS` this cycle — i.e. the
+    /// alarm-acknowledge rule fired (recGbl.c:214-217):
+    ///
+    /// ```c
+    /// if (stat_mask) {
+    ///     ...
+    ///     if (!pdbc->ackt || new_sevr >= pdbc->acks) {
+    ///         pdbc->acks = new_sevr;
+    ///         db_post_events(pdbc, &pdbc->acks, DBE_VALUE);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The post is UNCONDITIONAL inside the rule — there is no value-change
+    /// test — so this flag says "the rule fired", not "the value moved". Those
+    /// differ on any stat-only alarm transition at constant severity
+    /// (LINK→CALC both INVALID; HIGH→HIHI with `HSV = HHSV = MAJOR`), where C
+    /// re-posts an already-equal ACKS and a `DBE_VALUE`-only `.ACKS`
+    /// subscriber receives the event.
+    ///
+    /// The `if (stat_mask)` guard is already folded in — a consumer posts
+    /// `ACKS` on this flag alone and must NOT re-derive the guard.
+    pub acks_posted: bool,
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
@@ -224,24 +243,34 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
 
     let alarm_changed = common.sevr != prev_sevr || common.stat != prev_stat;
 
-    // C parity (recGbl.c:209-217): when an alarm-class field changed
-    // this cycle, update the alarm-acknowledge severity `acks`. If
-    // `ackt` is false (alarm is transient — automatically resets when
-    // the condition clears) OR the new severity is >= the currently
-    // remembered acks, raise `acks` to the new severity. Operators
-    // clear `acks` back to NoAlarm via a CA put to ACKS (handled in
-    // record_instance::put_common_field). Without this update, the
-    // alarm-handler workflow (sticky severity tracking) is silently
-    // disabled — every operator clear is a no-op because acks never
-    // gets raised in the first place.
-    let mut acks_changed = false;
-    if alarm_changed || amsg_changed {
-        if !common.ackt || (common.sevr as u16) >= (common.acks as u16) {
-            if common.acks != common.sevr {
-                common.acks = common.sevr;
-                acks_changed = true;
-            }
-        }
+    // C parity (recGbl.c:209-217): when an alarm-class field moved this cycle
+    // (C's `if (stat_mask)`, which is exactly `alarm_changed || amsg_changed`),
+    // update the alarm-acknowledge severity `acks`. If `ackt` is false (alarm
+    // is transient — automatically resets when the condition clears) OR the new
+    // severity is >= the currently remembered acks, raise `acks` to the new
+    // severity. Operators clear `acks` back to NoAlarm via a CA put to ACKS
+    // (handled in record_instance::put_common_field).
+    //
+    // ```c
+    // if (!pdbc->ackt || new_sevr >= pdbc->acks) {
+    //     pdbc->acks = new_sevr;
+    //     db_post_events(pdbc, &pdbc->acks, DBE_VALUE);
+    // }
+    // ```
+    //
+    // The assignment and the post sit together inside the rule, with NO
+    // value-change test around them: whenever the rule fires, C emits the
+    // event. Gating the post on `acks != sevr` (the pre-fix shape) dropped it
+    // on every stat-only transition at constant severity — LINK→CALC with both
+    // INVALID, or HIGH→HIHI with `HSV = HHSV = MAJOR` — where the rule fires,
+    // ACKS is already equal, and C still posts. `acks_posted` therefore reports
+    // the RULE, not the value.
+    let mut acks_posted = false;
+    if (alarm_changed || amsg_changed)
+        && (!common.ackt || (common.sevr as u16) >= (common.acks as u16))
+    {
+        common.acks = common.sevr;
+        acks_posted = true;
     }
 
     AlarmResetResult {
@@ -249,7 +278,7 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
         prev_sevr,
         prev_stat,
         amsg_changed,
-        acks_changed,
+        acks_posted,
     }
 }
 
@@ -578,7 +607,7 @@ mod tests {
         let result = rec_gbl_reset_alarms(&mut common);
 
         assert!(result.alarm_changed);
-        assert!(result.acks_changed, "first alarm raise must update acks");
+        assert!(result.acks_posted, "first alarm raise must update acks");
         assert_eq!(common.acks, AlarmSeverity::Major);
     }
 
@@ -599,9 +628,82 @@ mod tests {
         let result = rec_gbl_reset_alarms(&mut common);
         assert!(result.alarm_changed);
         assert!(
-            !result.acks_changed,
+            !result.acks_posted,
             "ackt=true must NOT lower acks when severity drops"
         );
+        assert_eq!(common.acks, AlarmSeverity::Major);
+    }
+
+    /// R13-62. C posts ACKS whenever the acknowledge RULE fires
+    /// (recGbl.c:214-217) — `if (!ackt || new_sevr >= acks) { acks = new_sevr;
+    /// db_post_events(&acks, DBE_VALUE); }` — with no value-change test around
+    /// the post. A stat-only transition at constant severity therefore re-posts
+    /// an ACKS that is already equal to SEVR.
+    ///
+    /// Compiled C, `ACKT=1`, LINK_ALARM/INVALID → CALC_ALARM/INVALID (STAT
+    /// moves 14→12, SEVR stays 3, ACKS already 3):
+    ///
+    /// ```text
+    /// cycle2 posts:  stat(mask=5)  amsg(mask=5)  acks(mask=1)
+    /// ```
+    ///
+    /// Three events, ACKS among them. The pre-fix gate (`acks != sevr`)
+    /// emitted STAT and AMSG but not ACKS, so a `DBE_VALUE`-only `.ACKS`
+    /// subscriber missed it.
+    #[test]
+    fn reset_alarms_posts_acks_on_a_stat_only_transition_at_constant_severity() {
+        let mut common = CommonFields::default();
+        assert!(common.ackt, "ACKT defaults to true");
+
+        // cycle 1: LINK_ALARM / INVALID. Raises acks to INVALID.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::LINK_ALARM,
+            AlarmSeverity::Invalid,
+            "field INP",
+        );
+        let c1 = rec_gbl_reset_alarms(&mut common);
+        assert!(c1.acks_posted);
+        assert_eq!(common.acks, AlarmSeverity::Invalid);
+
+        // cycle 2: CALC_ALARM / INVALID — STAT moves, SEVR does not, and ACKS
+        // is ALREADY equal to SEVR. C's rule fires (`new_sevr >= acks`) and
+        // posts anyway.
+        rec_gbl_set_sevr_msg(
+            &mut common,
+            alarm_status::CALC_ALARM,
+            AlarmSeverity::Invalid,
+            "calcPerform",
+        );
+        let c2 = rec_gbl_reset_alarms(&mut common);
+        assert!(c2.alarm_changed, "STAT moved LINK -> CALC");
+        assert_eq!(common.sevr, c2.prev_sevr, "SEVR did not move");
+        assert_eq!(
+            common.acks,
+            AlarmSeverity::Invalid,
+            "ACKS value is unchanged — it was already equal"
+        );
+        assert!(
+            c2.acks_posted,
+            "C posts ACKS whenever the ack rule fires, not only on a value change"
+        );
+    }
+
+    /// The other half of the boundary: when the ack rule does NOT fire, there
+    /// is no ACKS event at all. `ackt=true` + a severity BELOW the remembered
+    /// `acks` misses both arms of `if (!ackt || new_sevr >= acks)`.
+    #[test]
+    fn reset_alarms_posts_no_acks_when_the_rule_does_not_fire() {
+        let mut common = CommonFields::default();
+        rec_gbl_set_sevr(&mut common, alarm_status::HIHI_ALARM, AlarmSeverity::Major);
+        rec_gbl_reset_alarms(&mut common);
+        assert_eq!(common.acks, AlarmSeverity::Major);
+
+        // MAJOR -> MINOR with ackt=true: rule does not fire, so no post.
+        rec_gbl_set_sevr(&mut common, alarm_status::HIGH_ALARM, AlarmSeverity::Minor);
+        let result = rec_gbl_reset_alarms(&mut common);
+        assert!(result.alarm_changed);
+        assert!(!result.acks_posted);
         assert_eq!(common.acks, AlarmSeverity::Major);
     }
 
@@ -618,7 +720,7 @@ mod tests {
 
         rec_gbl_set_sevr(&mut common, alarm_status::HIGH_ALARM, AlarmSeverity::Minor);
         let result = rec_gbl_reset_alarms(&mut common);
-        assert!(result.acks_changed);
+        assert!(result.acks_posted);
         assert_eq!(
             common.acks,
             AlarmSeverity::Minor,

@@ -426,7 +426,7 @@ fn alarm_field_posts(
         posts.push(("STAT", stat_mask));
         posts.push(("AMSG", stat_mask));
     }
-    if alarm_result.acks_changed && !stat_mask.is_empty() {
+    if alarm_result.acks_posted {
         posts.push(("ACKS", EventMask::VALUE));
     }
     posts
@@ -4154,9 +4154,11 @@ impl PvDatabase {
                 alarm_posts.push(("STAT", stat_mask));
                 alarm_posts.push(("AMSG", stat_mask));
             }
-            // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only
-            // when an alarm field moved AND recGblResetAlarms raised it.
-            if alarm_result.acks_changed && !stat_mask.is_empty() {
+            // C parity (recGbl.c:214-217): ACKS is posted (DBE_VALUE) whenever
+            // the alarm-acknowledge rule fires — `acks_posted` already folds in
+            // C's `if (stat_mask)` guard, and the post carries no value-change
+            // test.
+            if alarm_result.acks_posted {
                 alarm_posts.push(("ACKS", EventMask::VALUE));
             }
             // The cycle's subscriber posts — assembled by the single owner
@@ -5552,7 +5554,7 @@ fn sim_process_tail(instance: &mut RecordInstance, alarm: SimTailAlarm, clear_ud
         instance.notify_field("STAT", stat_mask);
         instance.notify_field("AMSG", stat_mask);
     }
-    if alarm_result.acks_changed && !stat_mask.is_empty() {
+    if alarm_result.acks_posted {
         instance.notify_field("ACKS", EventMask::VALUE);
     }
 }

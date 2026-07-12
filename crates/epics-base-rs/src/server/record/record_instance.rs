@@ -2748,9 +2748,10 @@ impl RecordInstance {
             // any alarm field moved.
             alarm_posts.push(("AMSG", stat_mask));
         }
-        // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only when
-        // an alarm field moved (`stat_mask != 0`) AND it was raised.
-        if alarm_result.acks_changed && !stat_mask.is_empty() {
+        // C parity (recGbl.c:214-217): ACKS is posted (DBE_VALUE) whenever the
+        // alarm-acknowledge rule fires — `acks_posted` already folds in C's
+        // `if (stat_mask)` guard, and the post carries no value-change test.
+        if alarm_result.acks_posted {
             alarm_posts.push(("ACKS", EventMask::VALUE));
         }
 

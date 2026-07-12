@@ -6,10 +6,15 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, base_style, format_value,
-    sevr_to_str, stat_to_str,
+    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str,
+    stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
+use epics_ca_rs::copt::CTool;
+
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]).
+const TOOL: CTool = CTool::new("camonitor");
 
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
@@ -74,18 +79,19 @@ struct Args {
     #[arg(short = 's', long = "string-format")]
     string_format: bool,
 
-    #[arg(long = "lx", conflicts_with_all = ["lo_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lx_flag: bool,
-    #[arg(long = "lo", conflicts_with_all = ["lx_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lo_flag: bool,
-    #[arg(long = "lb", conflicts_with_all = ["lx_flag", "lo_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lb_flag: bool,
-    #[arg(long = "0x", conflicts_with_all = ["io_flag", "ib_flag"])]
-    ix_flag: bool,
-    #[arg(long = "0o", conflicts_with_all = ["ix_flag", "ib_flag"])]
-    io_flag: bool,
-    #[arg(long = "0b", conflicts_with_all = ["ix_flag", "io_flag"])]
-    ib_flag: bool,
+    /// `-0<base>`: print integers in base `x`/`o`/`b`. C spells this as a
+    /// getopt option TAKING AN ARGUMENT (`camonitor.c:224`
+    /// `"...g:l:#:0:w:..."`), so it is `-0` with an attached or separate
+    /// `<base>` — never a `--0x`-style flag, which no C script can pass.
+    #[arg(short = '0', value_name = "BASE", action = clap::ArgAction::Append)]
+    int_base: Vec<String>,
+
+    /// `-l<base>`: round a float to a long and print it in base `x`/`o`/`b`
+    /// (C `outTypeF`). Same option shape as `-0` (`camonitor.c:224`).
+    /// Unlike `caget`, `camonitor` has no `-d`, so `-0` here forces no DBR
+    /// type (`camonitor.c:337`).
+    #[arg(short = 'l', value_name = "BASE", action = clap::ArgAction::Append)]
+    float_base: Vec<String>,
 
     /// Alternate output field separator. Defaults to a single space.
     /// Mirrors C `camonitor.c:342` (`case 'F'`).
@@ -117,10 +123,10 @@ impl Args {
             };
         }
         // C `camonitor.c:325-340` writes exactly ONE of the two base globals
-        // per flag: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
-        // `outTypeF` (floats, via round-to-long). They never cross.
-        fmt.int_style = base_style(self.ix_flag, self.io_flag, self.ib_flag);
-        fmt.float_style = base_style(self.lx_flag, self.lo_flag, self.lb_flag);
+        // per occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>`
+        // sets `outTypeF` (floats, via round-to-long). They never cross.
+        fmt.int_style = TOOL.base('0', &self.int_base);
+        fmt.float_style = TOOL.base('l', &self.float_base);
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
         fmt.max_elements = self.max_elements;

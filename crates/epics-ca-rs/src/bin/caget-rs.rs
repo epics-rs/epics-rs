@@ -1,18 +1,23 @@
 use chrono::{DateTime, Local};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
+use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG, WallTime};
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat, base_style,
+    CountPrefix, FloatFormat, FloatStyle, IntStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
     ca_error_marker, dbr_value_field_type, format_c_g, format_value, scan_leading_i64, sevr_to_str,
     stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
 };
+use epics_ca_rs::copt::CTool;
 use epics_ca_rs::protocol::ECA_DISCONN;
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
+
+/// Owner of every C-scanned option argument in this binary (see
+/// [`epics_ca_rs::copt`]). The name is what C stamps into its warnings.
+const TOOL: CTool = CTool::new("caget");
 
 /// C `caget` output format (`caget.c:45`, `typedef enum { plain, terse,
 /// all, specifiedDbr }`). The request DBR type and the output format are
@@ -58,6 +63,50 @@ fn resolve_output_mode(matches: &clap::ArgMatches) -> OutputMode {
         format = requested;
     }
     format
+}
+
+/// C `caget.c` writes ONE `int type` that both `-d` and `-0<base>` assign,
+/// in getopt order, and the last assignment wins (`caget.c:416-434` for
+/// `-d`, `caget.c:493-495` for `-0`, which sets `type = DBR_LONG` whenever
+/// the base scanned valid). Observed on the compiled C:
+///
+/// ```text
+/// caget -d DBR_DOUBLE -0x TST:AO  →  Request type: DBR_LONG    Value: 0x1
+/// caget -0x -d DBR_DOUBLE TST:AO  →  Request type: DBR_DOUBLE  Value: 1.5
+/// ```
+///
+/// clap has no notion of that sequence, so the winner is recovered from the
+/// argument indices — the same mechanism `resolve_output_mode` uses. An
+/// invalid base (`-0q`) never reaches the assignment in C (it is guarded by
+/// `if (outType != dec)`), which is why the caller passes the ALREADY
+/// RESOLVED [`IntStyle`] rather than the raw argument.
+///
+/// The type only reaches the wire under `specifiedDbr`
+/// (`caget.c:175`), so `-0x` on its own still gets the native TIME type.
+fn resolve_dbr_type(
+    matches: &clap::ArgMatches,
+    int_style: IntStyle,
+    dbr_type: Option<u16>,
+) -> Option<u16> {
+    use clap::parser::ValueSource;
+    if int_style == IntStyle::Dec {
+        return dbr_type; // no valid `-0<base>`: `type` was never forced
+    }
+    let idx = |id| {
+        (matches.value_source(id) == Some(ValueSource::CommandLine))
+            .then(|| matches.index_of(id))
+            .flatten()
+    };
+    // `-0` may repeat; C re-assigns on each valid occurrence, so the LAST
+    // one is the one racing `-d`. `indices_of` yields them in order.
+    let last_base = matches
+        .indices_of("int_base")
+        .and_then(|mut i| i.next_back())
+        .unwrap_or(0);
+    match idx("dbr_type") {
+        Some(d) if d > last_base => dbr_type,
+        _ => Some(DBR_LONG),
+    }
 }
 
 // C `caget -V` prints a blank line then
@@ -146,25 +195,19 @@ struct Args {
     #[arg(short = 's', long = "string-format")]
     string_format: bool,
 
-    /// Round float to integer and print in hex (`-lx`).
-    #[arg(long = "lx", conflicts_with_all = ["lo_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lx_flag: bool,
-    /// Round float to integer and print in octal (`-lo`).
-    #[arg(long = "lo", conflicts_with_all = ["lx_flag", "lb_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lo_flag: bool,
-    /// Round float to integer and print in binary (`-lb`).
-    #[arg(long = "lb", conflicts_with_all = ["lx_flag", "lo_flag", "ix_flag", "io_flag", "ib_flag"])]
-    lb_flag: bool,
+    /// `-0<base>`: print integers in base `x` (hex), `o` (octal) or `b`
+    /// (binary), and request the value as `DBR_LONG`. C spells this as a
+    /// getopt option TAKING AN ARGUMENT (`caget.c:398` `"...#:d:0:w:..."`),
+    /// so it is `-0` with an attached or separate `<base>` — never a
+    /// `--0x`-style flag, which no C script can pass. Repeats are folded by
+    /// [`CTool::base`], which keeps C's "last VALID wins" rule.
+    #[arg(short = '0', value_name = "BASE", action = clap::ArgAction::Append)]
+    int_base: Vec<String>,
 
-    /// Print integers in hex (`-0x`).
-    #[arg(long = "0x", conflicts_with_all = ["io_flag", "ib_flag"])]
-    ix_flag: bool,
-    /// Print integers in octal (`-0o`).
-    #[arg(long = "0o", conflicts_with_all = ["ix_flag", "ib_flag"])]
-    io_flag: bool,
-    /// Print integers in binary (`-0b`).
-    #[arg(long = "0b", conflicts_with_all = ["ix_flag", "io_flag"])]
-    ib_flag: bool,
+    /// `-l<base>`: round a float to a long and print it in base `x`/`o`/`b`
+    /// (C `outTypeF`). Same option shape as `-0` (`caget.c:398`).
+    #[arg(short = 'l', value_name = "BASE", action = clap::ArgAction::Append)]
+    float_base: Vec<String>,
 
     /// Alternate output field separator. Defaults to a single space.
     #[arg(short = 'F', long = "field-separator", value_name = "OFS")]
@@ -195,11 +238,11 @@ impl Args {
                 precision: p,
             };
         }
-        // C `caget.c:485-497` writes exactly ONE of the two base globals per
-        // flag: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
+        // C `caget.c:485-499` writes exactly ONE of the two base globals per
+        // occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
         // `outTypeF` (floats, via round-to-long). They never cross.
-        fmt.int_style = base_style(self.ix_flag, self.io_flag, self.ib_flag);
-        fmt.float_style = base_style(self.lx_flag, self.lo_flag, self.lb_flag);
+        fmt.int_style = TOOL.base('0', &self.int_base);
+        fmt.float_style = TOOL.base('l', &self.float_base);
         fmt.enum_as_number = self.enum_as_number;
         fmt.char_array_as_string = self.char_array_as_string;
         fmt.max_elements = self.max_elements;
@@ -701,10 +744,13 @@ async fn main() {
     // `-s` (C `floatAsString`): request a native FLOAT/DOUBLE field's value
     // in string form so the SERVER converts it (C `caget.c:183-187`).
     let float_as_string = args.string_format;
+    // Built ONCE: `value_format` is what scans the `-0`/`-l` base arguments,
+    // so calling it twice would double every "Invalid argument" warning.
+    let fmt = args.value_format();
     // resolve `-d <type>` ONCE here, mirroring C `caget.c`'s
     // getopt-time resolution (`caget.c:416-434`). The "out of range or
     // invalid" diagnostic prints exactly once (not per PV).
-    let req_dbr_type: Option<u16> = match args.dbr_type.as_deref() {
+    let d_type: Option<u16> = match args.dbr_type.as_deref() {
         Some(s) => {
             let t = parse_dbr_type(s);
             if t.is_none() {
@@ -719,11 +765,17 @@ async fn main() {
     };
     // Resolve the output format from `-t`/`-a`/`-d` (command-line order,
     // mutual-exclusion warning). C `caget.c:430-434`: an invalid `-d`
-    // type reverts `format` to plain.
+    // type reverts `format` to plain. This gate reads the `-d` type ALONE:
+    // `-0<base>` never sets `format` in C, so a `-0x` alongside an invalid
+    // `-d` must not rescue `specifiedDbr`.
     let mut mode = resolve_output_mode(&matches);
-    if mode == OutputMode::SpecifiedDbr && req_dbr_type.is_none() {
+    if mode == OutputMode::SpecifiedDbr && d_type.is_none() {
         mode = OutputMode::Plain;
     }
+    // `-0<base>` assigns the SAME `int type` as `-d` (`caget.c:493`), racing
+    // it in getopt order. The type only reaches the wire under
+    // `specifiedDbr`, which is why `mode` is settled first.
+    let req_dbr_type = resolve_dbr_type(&matches, fmt.int_style, d_type);
     // Only `all` needs the DBR_TIME class for its native readback; the
     // enum/float substitutions below use `want_time` to pick the TIME
     // vs plain string form (C `caget.c:176-187`).
@@ -894,7 +946,6 @@ async fn main() {
         eprintln!("Read operation timed out: some PV data was not read.");
     }
 
-    let fmt = args.value_format();
     let sep = fmt.field_separator;
     // C's `reqElems` — non-zero iff the user passed `-#`. It feeds BOTH the
     // plain/terse count-prefix gate (`caget.c:286`) and the `-S` long-string
@@ -1047,16 +1098,17 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 mod tests {
     use super::{
         Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, caget_req_count,
-        dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_output_mode,
-        scan_leading_i64, specified_dbr_report,
+        dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,
+        resolve_output_mode, scan_leading_i64, specified_dbr_report,
     };
-    use clap::CommandFactory;
+    use clap::{CommandFactory, FromArgMatches, Parser};
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
     use epics_base_rs::types::WallTime;
     use epics_base_rs::types::{
         DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_LONG,
         DBR_STRING, DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
+    use epics_ca_rs::cli::IntStyle;
     use epics_ca_rs::cli::{
         EPICS_EPOCH_UNIX_SECS, FloatFormat, FloatStyle, ValueFormat, zero_dbr_snapshot,
         zero_dbr_value,
@@ -1068,6 +1120,78 @@ mod tests {
     fn mode_of(argv: &[&str]) -> OutputMode {
         let m = Args::command().get_matches_from(argv);
         resolve_output_mode(&m)
+    }
+
+    /// R12-16. C declares the two base options as getopt options TAKING AN
+    /// ARGUMENT (`caget.c:398`, `":taicnhsSVe:f:g:l:#:d:0:w:p:F:"`), so the
+    /// C spelling is `-0x` / `-l x` — a single dash. The Rust port declared
+    /// them as clap LONG flags (`--0x`), which made every one of these
+    /// invocations `error: unexpected argument '-0' found`, exit 2: the base
+    /// options were unreachable through the C CLI.
+    ///
+    /// Verified against the compiled C `caget` (EPICS 7.0.10.1-DEV):
+    ///   `caget -0x TST:LO` → `TST:LO   0xC8`.
+    #[test]
+    fn base_options_take_a_single_dash_argument_like_c_getopt() {
+        for argv in [
+            vec!["caget", "-0x", "PV"],
+            vec!["caget", "-0", "x", "PV"],
+            vec!["caget", "-lb", "PV"],
+            vec!["caget", "-l", "b", "PV"],
+            vec!["caget", "-0x", "-lb", "PV"],
+        ] {
+            let a = Args::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("C spells this `{argv:?}`; clap rejected it: {e}"));
+            assert_eq!(a.pv_names, ["PV"], "the base argument must not eat the PV");
+        }
+
+        let a = Args::try_parse_from(["caget", "-0x", "PV"]).expect("parses");
+        assert_eq!(a.value_format().int_style, IntStyle::Hex);
+        let a = Args::try_parse_from(["caget", "-lb", "PV"]).expect("parses");
+        assert_eq!(a.value_format().float_style, IntStyle::Bin);
+    }
+
+    /// R12-20. C's `-0<base>` assigns the SAME `int type` as `-d`
+    /// (`caget.c:493`, `type = DBR_LONG`), so the two race in getopt order
+    /// and the last one wins. Observed on the compiled C:
+    ///   `caget -d DBR_DOUBLE -0x TST:AO` → `Request type: DBR_LONG`, `0x1`
+    ///   `caget -0x -d DBR_DOUBLE TST:AO` → `Request type: DBR_DOUBLE`, `1.5`
+    /// An INVALID base never reaches the assignment (C guards it with
+    /// `if (outType != dec)`), so `-d DBR_DOUBLE -0q` keeps DBR_DOUBLE.
+    #[test]
+    fn zero_base_forces_dbr_long_in_getopt_order() {
+        let resolve = |argv: &[&str]| {
+            let m = Args::command().get_matches_from(argv);
+            let a = Args::from_arg_matches(&m).expect("parsed");
+            let d = a.dbr_type.as_deref().and_then(parse_dbr_type);
+            resolve_dbr_type(&m, a.value_format().int_style, d)
+        };
+        assert_eq!(resolve(&["caget", "-0x", "PV"]), Some(DBR_LONG));
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0x", "PV"]),
+            Some(DBR_LONG),
+            "-0 came last, so it wins"
+        );
+        assert_eq!(
+            resolve(&["caget", "-0x", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE),
+            "-d came last, so it wins"
+        );
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "-0q", "PV"]),
+            Some(DBR_DOUBLE),
+            "an invalid base is guarded out of the `type` assignment"
+        );
+        assert_eq!(
+            resolve(&["caget", "-d", "DBR_DOUBLE", "PV"]),
+            Some(DBR_DOUBLE)
+        );
+        assert_eq!(resolve(&["caget", "PV"]), None);
+        assert_eq!(
+            resolve(&["caget", "-lx", "PV"]),
+            None,
+            "-l sets outTypeF only; it never touches `type`"
+        );
     }
 
     /// The DEFAULT (synchronous) read path callocs its buffer BEFORE the wire

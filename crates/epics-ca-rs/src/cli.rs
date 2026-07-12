@@ -358,20 +358,6 @@ pub enum IntStyle {
     Bin,
 }
 
-/// Resolve one C base flag group (`-0x`/`-0o`/`-0b`, or `-lx`/`-lo`/`-lb`)
-/// into its [`IntStyle`], mirroring C's `switch ((char) *optarg)`
-/// (`caget.c:486-495`, `camonitor.c:327-336`). No flag of the group given →
-/// `Dec`, C's default for both `outTypeI` and `outTypeF`. The three flags of
-/// a group are mutually exclusive at the clap layer, so at most one is set.
-pub fn base_style(hex: bool, oct: bool, bin: bool) -> IntStyle {
-    match (hex, oct, bin) {
-        (true, _, _) => IntStyle::Hex,
-        (_, true, _) => IntStyle::Oct,
-        (_, _, true) => IntStyle::Bin,
-        _ => IntStyle::Dec,
-    }
-}
-
 /// Per-tool CLI formatting state.
 ///
 /// C keeps the integer base and the float base in TWO independent globals
@@ -1301,16 +1287,6 @@ mod tests {
             "1234.6",
             "-0x leaves DBR_DOUBLE on outTypeF = dec (the -e/-f/-g format)"
         );
-    }
-
-    /// C's base resolution: the flag letter picks the base, no flag → `dec`
-    /// (`caget.c:486-495`).
-    #[test]
-    fn base_style_resolves_c_out_type() {
-        assert_eq!(base_style(true, false, false), IntStyle::Hex);
-        assert_eq!(base_style(false, true, false), IntStyle::Oct);
-        assert_eq!(base_style(false, false, true), IntStyle::Bin);
-        assert_eq!(base_style(false, false, false), IntStyle::Dec);
     }
 
     #[test]

@@ -298,7 +298,16 @@ async fn main() {
     // zeroed buffer is an empty string, not a 0 index.
     let read_as_string = enum_dbr.is_some();
 
-    let mut fmt = ValueFormat::default();
+    // The readback display format. C's `charArrAsStr` (`-S`) is read by BOTH
+    // the write-value builder (`caput.c:514`, DBR_CHAR) and the readback print
+    // loop (`caput.c:211-222`), which escapes a CHAR-array readback back into
+    // its long-string form — so `-S` must reach the `Old :`/`New :` rendering,
+    // not just the wire value. `format_value` owns C's gate
+    // (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`).
+    let mut fmt = ValueFormat {
+        char_array_as_string: args.long_string,
+        ..ValueFormat::default()
+    };
     if let Some(c) = args.field_separator {
         fmt.field_separator = c;
     }

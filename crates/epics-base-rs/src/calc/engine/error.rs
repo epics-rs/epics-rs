@@ -26,6 +26,11 @@ pub enum CalcError {
     DomainError,
     NonFiniteResult,
     EmptyProgram,
+    /// aCalc's polynomial fit failed — fewer than three points in the window, or a
+    /// singular normal matrix (`calcUtil.c:271`, `:297`). C's `fitpoly` returns -1,
+    /// which DERIV/NDERIV/FITPOLY/FITMPOLY/FITQ/FITMQ assign to `status`
+    /// (`aCalcPerform.c:613`, `:985`, `:1008`, `:1029`, `:1221`, `:1270`).
+    FitFailed,
 }
 
 impl fmt::Display for CalcError {
@@ -55,6 +60,7 @@ impl fmt::Display for CalcError {
             CalcError::DomainError => write!(f, "Operand outside the operator's domain"),
             CalcError::NonFiniteResult => write!(f, "Result is not a finite number"),
             CalcError::EmptyProgram => write!(f, "Empty postfix program"),
+            CalcError::FitFailed => write!(f, "Polynomial fit failed"),
         }
     }
 }
@@ -96,6 +102,7 @@ impl CalcError {
             | CalcError::EmptyArray
             | CalcError::InvalidSubrange
             | CalcError::DomainError
+            | CalcError::FitFailed
             | CalcError::NonFiniteResult => 11,
             // CALC_ERR_NULL_ARG       = 12. `EmptyProgram` is an *evaluation*
             // failure — C's `perform()` returns a bare -1 with no error code

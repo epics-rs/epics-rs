@@ -61,16 +61,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     let code = &expr.code;
     let mut pc = 0;
 
-    // C's `status` (`aCalcPerform.c:422`) — a deferred failure flag, NOT an early
-    // return. An operator that trips it (the array SQRT/LOG domain guard) sets it
-    // and execution CONTINUES to the end of the expression; only then does
-    // aCalcPerform bail (`:1602-1605`) without writing p_dresult/p_aresult.
-    //
-    // The deferral is observable: aCalc's store opcodes write straight into the
-    // record's A..P / AA..LL fields, so a store sequenced AFTER the failing
-    // operator still lands in C. Returning early from the operator's arm would
-    // silently skip it.
-    let mut status: Option<CalcError> = None;
+    let mut status = Status::default();
 
     while pc < code.len() {
         let op = &code[pc];
@@ -570,19 +561,17 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 ArrayOp::Deriv => {
-                    // C `:976-989`: the derivative is taken over the window and written
-                    // back into it, and everything OUTSIDE the window is zeroed
-                    // (`:985-987`). A failed fit leaves C's scratch cell unwritten and
-                    // sets status; here the window comes out zeroed (the status is
-                    // R10-11's subject).
+                    // C `:976-989`: `deriv()` IS `nderiv(..., npts=2, ...)`
+                    // (`calcUtil.c:71-75`), so DERIV and NDERIV go through one kernel —
+                    // window in, window out, outside zeroed, status assigned.
+                    //
+                    // DERIV is in the unary switch, so a scalar takes the scalar branch
+                    // (`case DERIV: ps->d = 0;`) and never touches status.
                     unary_op(&mut stack, |v| {
                         unary(
                             v,
                             |mut c| {
-                                let d = derivative::deriv(c.window())
-                                    .unwrap_or_else(|| vec![0.0; c.window().len()]);
-                                c.window_mut().copy_from_slice(&d);
-                                c.clear_outside_window();
+                                derivative_into_window(&mut c, 2, &mut status);
                                 ArrayStackValue::Array(c)
                             },
                             ZERO,
@@ -609,10 +598,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let array_size = inputs.array_size;
                     unary_op(&mut stack, |v| {
                         let mut cell = v.into_cell(array_size);
-                        let d = derivative::nderiv(cell.window(), npts)
-                            .unwrap_or_else(|| vec![0.0; cell.window().len()]);
-                        cell.window_mut().copy_from_slice(&d);
-                        cell.clear_outside_window();
+                        derivative_into_window(&mut cell, npts, &mut status);
                         ArrayStackValue::Array(cell)
                     })?
                 }
@@ -807,7 +793,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         unary(
                             v,
                             |mut c| {
-                                fit_into_window(&mut c, None);
+                                fit_into_window(&mut c, None, &mut status);
                                 ArrayStackValue::Array(c)
                             },
                             ZERO,
@@ -831,7 +817,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let mask = pop(&mut stack)?.v.as_cell()?.clone();
                     try_unary_op(&mut stack, |v| {
                         let mut cell = v.into_cell(array_size);
-                        fit_into_window(&mut cell, Some(&mask));
+                        fit_into_window(&mut cell, Some(&mask), &mut status);
                         Ok(ArrayStackValue::Array(cell))
                     })?
                 }
@@ -844,7 +830,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     // CONSTANT one. An arg with no provenance names nothing.
                     let targets = pop_fit_targets(&mut stack, *nargs as usize, 4)?;
                     let mut cell = pop(&mut stack)?.v.into_cell(array_size);
-                    let coeffs = fit_into_window(&mut cell, None);
+                    let coeffs = fit_into_window(&mut cell, None, &mut status);
                     store_fit_coefficients(inputs, targets, coeffs);
                     push(&mut stack, ArrayStackValue::Array(cell));
                 }
@@ -859,7 +845,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let targets = pop_fit_targets(&mut stack, *nargs as usize, 5)?;
                     let mask = pop(&mut stack)?.v.into_cell(array_size);
                     let mut cell = pop(&mut stack)?.v.into_cell(array_size);
-                    let coeffs = fit_into_window(&mut cell, Some(&mask));
+                    let coeffs = fit_into_window(&mut cell, Some(&mask), &mut status);
                     store_fit_coefficients(inputs, targets, coeffs);
                     push(&mut stack, ArrayStackValue::Array(cell));
                 }
@@ -873,11 +859,41 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     // C `:1602-1605`: the deferred failure is consumed HERE, after the whole
     // expression has run (and after its stores have landed), and it suppresses the
     // result write entirely.
-    if let Some(err) = status {
-        return Err(err);
-    }
+    status.into_result()?;
 
     Ok(stack.last().map_or(Double(0.0), |c| c.v.clone()))
+}
+
+/// C's single `status` cell (`aCalcPerform.c:422`), read exactly ONCE, at the end of
+/// the expression (`:1602-1605`) — a deferred failure flag, not an early return.
+///
+/// The deferral is observable: aCalc's store opcodes write straight into the record's
+/// A..P / AA..LL fields, so a store sequenced AFTER a failing operator still lands.
+/// Returning early from the operator's arm would silently skip it.
+///
+/// Every write to the cell is an ASSIGNMENT — `status = deriv(...)` (`:613`, `:985`),
+/// `status = fitpoly(...)` (`:1008`, `:1029`, `:1221`, `:1270`), and `status = 0` at
+/// the head of each array SQRT/LOG guard (`:776`, `:792`, `:804`) — so the LAST
+/// fallible operator in the expression decides, and a CLEAN one clears an earlier
+/// failure. Compiled C, arraySize 4, CC all zero: `SQRT(CC-1)+SQRT(BB)` is status 0
+/// (with the failed left operand's zeros still in the sum), while the reverse order
+/// `SQRT(BB)+SQRT(CC-1)` is status -1.
+///
+/// That is why the only mutator is [`Status::set`], which takes the whole outcome:
+/// an operator cannot raise the flag without also being able to lower it, which is
+/// exactly what made the port's `Option` sticky.
+#[derive(Default)]
+struct Status(Option<CalcError>);
+
+impl Status {
+    /// C's `status = <fallible operator>`. `None` is C's 0.
+    fn set(&mut self, outcome: Option<CalcError>) {
+        self.0 = outcome;
+    }
+
+    fn into_result(self) -> Result<(), CalcError> {
+        self.0.map_or(Ok(()), Err)
+    }
 }
 
 /// C's `fitpoly` call shared by all four FIT operators (`:1020`, `:1027`, `:1221`,
@@ -889,23 +905,52 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
 /// where `mask[i] > SMALL` (`calcUtil.c:280`, SMALL = 1e-8) — a THRESHOLD, not
 /// `!= 0`, so a mask element of 1e-9 masks the point out.
 ///
-/// A failed fit (fewer than 3 points, or a singular normal matrix — `calcUtil.c:270`,
-/// `:296`) leaves C's `d`/`e`/`f` at whatever they held, which for the aCalc arms is
-/// 0 from the enclosing declaration; the curve therefore comes out all-zero and the
-/// operator's status goes to -1. The status is R10-11's subject; the zeros are here.
-fn fit_into_window(cell: &mut ArrayCell, mask: Option<&ArrayCell>) -> (f64, f64, f64) {
+/// A failed fit — fewer than 3 points in the window, or a singular normal matrix
+/// (`calcUtil.c:271`, `:297`) — is C's `fitpoly` returning -1, and every one of the
+/// four call sites ASSIGNS that to `status` (`:1008`, `:1029`, `:1221`, `:1270`). The
+/// assignment lives HERE, in the one helper they all go through, so a FIT operator
+/// cannot be written that forgets it. Compiled C, arraySize 6:
+/// `FITPOLY(BB[0,1])` (a two-point window) is status -1.
+///
+/// The curve then comes out all-zero. C's is not: `d`/`e`/`f` are aCalcPerform's
+/// general-purpose scratch doubles, so a failed fit leaves whatever the previous
+/// operator put there. It is unobservable either way — a non-zero status suppresses
+/// the result write entirely (`:1602-1605`) — and zeros are the deterministic choice.
+fn fit_into_window(
+    cell: &mut ArrayCell,
+    mask: Option<&ArrayCell>,
+    status: &mut Status,
+) -> (f64, f64, f64) {
     let window = mask.map_or_else(|| cell.window().len(), |m| m.window().len());
     let window = window.min(cell.buf().len());
     let x: Vec<f64> = (0..window).map(|i| i as f64).collect();
     let y = cell.buf()[..window].to_vec();
-    let coeffs =
-        fitting::fitpoly(&x, &y, mask.map(|m| &m.buf()[..window])).unwrap_or((0.0, 0.0, 0.0));
+    let fit = fitting::fitpoly(&x, &y, mask.map(|m| &m.buf()[..window]));
+    status.set(fit.is_none().then_some(CalcError::FitFailed));
+    let coeffs = fit.unwrap_or((0.0, 0.0, 0.0));
     let (c, b, a) = coeffs;
     for (i, xi) in x.iter().enumerate() {
         cell.buf_mut()[i] = c + b * xi + a * xi * xi;
     }
     cell.buf_mut()[window..].fill(0.0);
     coeffs
+}
+
+/// C's DERIV (`:976-989`) and NDERIV (`:594-617`) are one kernel: `deriv()` is
+/// literally `nderiv(x, y, n, d, 2, work)` (`calcUtil.c:71-75`). Both take the
+/// derivative over the WINDOW, write it back into the window, zero everything outside
+/// it (`:985-987`, `:614-616`), and ASSIGN the return value to `status` — so they
+/// share this helper, and the status write is not something a caller can omit.
+///
+/// A failed fit leaves C copying from a scratch cell it never wrote (a recycled
+/// freelist buffer); the port writes a zeroed window instead. Unobservable: the
+/// non-zero status suppresses the result write.
+fn derivative_into_window(cell: &mut ArrayCell, npts: i64, status: &mut Status) {
+    let d = derivative::nderiv(cell.window(), npts);
+    status.set(d.is_none().then_some(CalcError::FitFailed));
+    let d = d.unwrap_or_else(|| vec![0.0; cell.window().len()]);
+    cell.window_mut().copy_from_slice(&d);
+    cell.clear_outside_window();
 }
 
 /// Pop a FITQ/FITMQ argument list down to its non-coefficient arguments, answering
@@ -974,24 +1019,27 @@ fn store_fit_coefficients(inputs: &mut ArrayInputs, targets: FitTargets, coeffs:
 /// This is aCalc's rule only. base `calcPerform` takes the bare sqrt/log (NaN,
 /// no error) and sCalc returns -1 immediately (`sCalcPerform.c:521-541`); both
 /// are already faithful in `numeric.rs` and `string.rs`.
-fn domain_guarded(
-    v: ArrayStackValue,
-    f: fn(f64) -> f64,
-    status: &mut Option<CalcError>,
-) -> ArrayStackValue {
+fn domain_guarded(v: ArrayStackValue, f: fn(f64) -> f64, status: &mut Status) -> ArrayStackValue {
     match v {
+        // The scalar branch does not touch `status` at all — not even to clear it.
         Double(d) => Double(if d < 0.0 { 0.0 } else { f(d) }),
         ArrayStackValue::Array(mut cell) => {
             // Element-wise, so the whole buffer — C's loop is `for (i=0;
             // i<arraySize; i++)` (`:775-812`), with no `calcFirstLast`.
+            //
+            // `outcome` starts clean because C's array branch OPENS with `status = 0`
+            // (`:776`, `:792`, `:804`): a clean SQRT after a failed one clears the
+            // failure. See [`Status`].
+            let mut outcome = None;
             for x in cell.buf_mut() {
                 if *x < 0.0 {
-                    *status = Some(CalcError::DomainError);
+                    outcome = Some(CalcError::DomainError);
                     *x = 0.0;
                 } else {
                     *x = f(*x);
                 }
             }
+            status.set(outcome);
             ArrayStackValue::Array(cell)
         }
     }

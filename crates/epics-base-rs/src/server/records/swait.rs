@@ -5,7 +5,8 @@ use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue};
 
@@ -110,6 +111,32 @@ pub struct SwaitRecord {
     // INVALID severity. The OOPT switch that follows (:424) is outside the
     // gate and runs against the frozen VAL.
     fetch_gate_failed: bool,
+    // Simulation mode — C `swaitRecord.dbd:497-517` (SIOL, SVAL, SIML, SIMM,
+    // SIMS) and `swaitRecord.c:401-421`. The record had none of these fields, so
+    // a swait could not be put into simulation at all: SIMM was unreadable and
+    // unwritable, a SIML/SIOL link could not be configured, and every cycle ran
+    // the real input fetch + calc.
+    //
+    // SIML ("Sim Mode Location", DBF_INLINK) refreshes SIMM every process
+    // (`:402`); SIMM ("Simulation Mode", menuYesNo) selects the branch; SIOL
+    // ("Sim Input Specifctn", DBF_INLINK) feeds SVAL ("Simulation Value",
+    // DBF_DOUBLE), which becomes VAL; SIMS ("Sim mode Alarm Svrty",
+    // menuAlarmSevr) is the severity of the SIMM_ALARM every simulated cycle
+    // raises (`:421`).
+    //
+    // The framework owns the branch (`Record::simulation_substitutes_input_stage`
+    // + `check_simulation_mode`): it resolves SIMM from SIML, reads SIOL into
+    // SVAL, writes VAL, raises SIMM_ALARM, and pushes `simulation_active` here.
+    pub siml: String,
+    pub simm: i16,
+    pub siol: String,
+    pub sval: f64,
+    pub sims: i16,
+    // This cycle's simulation state, pushed by the framework through
+    // `set_simulation_active` before `process()` — the twin of
+    // `fetch_gate_failed`. C `swaitRecord.c:407/415`: a simulated cycle takes the
+    // `else` branch, which runs NEITHER `fetch_values()` NOR `calcPerform()`.
+    simulation_active: bool,
     // Async context + generation gate for `refresh_link_status`, the same
     // shape calcout/sseq use (see `link_status::LinkStatusGen`): a refresh
     // classifies a snapshot of the link names off-thread, and only the latest
@@ -152,6 +179,12 @@ impl Default for SwaitRecord {
             // and every name starts blank.
             pv_status: [SWAIT_NO_PV; 14],
             fetch_gate_failed: false,
+            siml: String::new(),
+            simm: 0,
+            siol: String::new(),
+            sval: 0.0,
+            sims: 0,
+            simulation_active: false,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             cached_should_output: true,
@@ -300,6 +333,33 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    // swaitRecord.dbd:497-517 — the simulation group. None is SPC_NOMOD, so all
+    // five are writable, exactly as in C.
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
         read_only: false,
     },
     FieldDesc {
@@ -705,12 +765,16 @@ impl Record for SwaitRecord {
 
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
     /// menu's choice labels in `.dbd` index order (`swaitRecord.dbd`):
-    /// `OOPT` is `menu(swaitOOPT)`, `DOPT` is `menu(swaitDOPT)`, and
-    /// `INAV`..`INLV`/`DOLV`/`OUTV` are `menu(swaitINAV)`.
+    /// `OOPT` is `menu(swaitOOPT)`, `DOPT` is `menu(swaitDOPT)`,
+    /// `INAV`..`INLV`/`DOLV`/`OUTV` are `menu(swaitINAV)`, and `SIMM` is
+    /// `menu(menuYesNo)` (`swaitRecord.dbd:510-513`) — the two-choice menu, not
+    /// the NO/YES/RAW `menuSimm` of the base analog records: swait has no raw
+    /// value to simulate. (`SIMS` is the shared `menuAlarmSevr`.)
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "OOPT" => Some(SWAIT_OOPT_CHOICES),
             "DOPT" => Some(SWAIT_DOPT_CHOICES),
+            "SIMM" => Some(MENU_YES_NO),
             _ if Self::pv_status_index(field).is_some() => Some(SWAIT_PV_STATUS_CHOICES),
             _ => None,
         }
@@ -787,6 +851,34 @@ impl Record for SwaitRecord {
         self.fetch_gate_failed = failed;
     }
 
+    /// C `swaitRecord.c:401-421` — swait's simulation replaces `fetch_values()`
+    /// and `calcPerform()`, and nothing else: the OOPT switch (`:424`),
+    /// `execOutput`, the monitors and the forward link all still run. So it is
+    /// the input-STAGE shape, not the whole-cycle `readValue` of ai/bi.
+    fn simulation_substitutes_input_stage(&self) -> bool {
+        true
+    }
+
+    fn set_simulation_active(&mut self, active: bool) {
+        self.simulation_active = active;
+    }
+
+    /// C `swaitRecord.c:415` — the simulation branch never calls
+    /// `fetch_values()`, so a simulated cycle reads no input link at all (A..L
+    /// keep their previous values, and no input's connection state can gate the
+    /// cycle). `Some(&[])` is "no active inputs this cycle", the same per-cycle
+    /// restriction sel uses for `Specified`.
+    fn select_input_links(
+        &self,
+        _selector: Option<u16>,
+    ) -> Option<Vec<(&'static str, &'static str)>> {
+        if self.simulation_active {
+            Some(Vec::new())
+        } else {
+            None
+        }
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the watchdog re-process scheduled by a
         // previous cycle (C `swaitRecord.c::process` `if (pact && outputWait)
@@ -814,7 +906,16 @@ impl Record for SwaitRecord {
         // raises READ_ALARM/INVALID instead (see `check_alarms`). The OOPT
         // decision below stays outside the gate, as in C — it runs against the
         // frozen VAL.
-        if !self.fetch_gate_failed {
+        if self.simulation_active {
+            // C `swaitRecord.c:415-421` — the SIMULATION branch. VAL already
+            // holds SVAL (the framework performed C's `dbGetLink(&siol)` and the
+            // `val = sval` / `udf = FALSE` assignment, and raised SIMM_ALARM at
+            // SIMS). `calcPerform` does not run, so no CALC_ALARM is raised —
+            // C's `recGblSetSevr(CALC_ALARM)` lives in the other branch, and its
+            // alarms are per-cycle, so a simulated cycle after a failed calc
+            // must not keep re-raising it.
+            self.calc_alarm = false;
+        } else if !self.fetch_gate_failed {
             // C `swaitRecord.c:409-410` — inside that gate, `calcPerform` runs
             // unconditionally, and a -1 is CALC_ALARM/INVALID with VAL left
             // alone. An empty or uncompilable CALC is the empty program and
@@ -974,6 +1075,11 @@ impl Record for SwaitRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIMM" => Some(EpicsValue::Short(self.simm)),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::Double(self.sval)),
+            "SIMS" => Some(EpicsValue::Short(self.sims)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
@@ -1058,6 +1164,31 @@ impl Record for SwaitRecord {
                     as f32;
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
+            "SIML" => match value {
+                EpicsValue::String(s) => self.siml = s.as_str_lossy().into_owned(),
+                _ => return Err(CaError::TypeMismatch("SIML".into())),
+            },
+            "SIOL" => match value {
+                EpicsValue::String(s) => self.siol = s.as_str_lossy().into_owned(),
+                _ => return Err(CaError::TypeMismatch("SIOL".into())),
+            },
+            "SIMM" => {
+                self.simm = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("SIMM".into()))?
+                    as i16;
+            }
+            "SIMS" => {
+                self.sims = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("SIMS".into()))?
+                    as i16;
+            }
+            "SVAL" => {
+                self.sval = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("SVAL".into()))?;
+            }
             "MDEL" => {
                 self.mdel = value
                     .to_f64()

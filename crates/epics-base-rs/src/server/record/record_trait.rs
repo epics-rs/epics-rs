@@ -1318,6 +1318,42 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// A `SIMM != NO` cycle substitutes only this record's INPUT STAGE — the
+    /// rest of its `process()` still runs.
+    ///
+    /// C's SIML/SIMM/SIOL group has three shapes, and this hook names the third:
+    ///
+    /// * `readValue` (ai, bi, longin, …): the simulated read replaces the device
+    ///   read, which is the whole of the record's input; the framework performs
+    ///   the SIOL read and completes the cycle itself.
+    /// * `writeValue` (ao, bo, …): the simulated write replaces the device write
+    ///   at the END of the body, so the body runs and only the output is
+    ///   redirected to SIOL.
+    /// * swait (`swaitRecord.c:401-421`): the simulated read replaces
+    ///   `fetch_values()` **and** `calcPerform()` and nothing else — VAL comes
+    ///   from SIOL through SVAL, and the OOPT switch, `execOutput`, the monitors
+    ///   and the forward link all still run from the record's own `process()`.
+    ///
+    /// A record that returns `true` gets, on a simulated cycle: SIMM resolved
+    /// from SIML, SIOL read into SVAL, `VAL = SVAL` and `UDF = FALSE` when that
+    /// read succeeded (C `:417-420` — a failed read changes neither), SIMM_ALARM
+    /// raised at SIMS *before* the body so it maximizes against whatever the
+    /// body raises (C `:421`), no input-link fetch, and
+    /// [`Self::set_simulation_active`] pushed before `process()`.
+    fn simulation_substitutes_input_stage(&self) -> bool {
+        false
+    }
+
+    /// This cycle's simulation state, pushed by the framework before
+    /// `process()` — the twin of [`Self::set_fetch_gate_failed`], and only for a
+    /// record that declares [`Self::simulation_substitutes_input_stage`].
+    ///
+    /// It is pushed on EVERY cycle of such a record (`false` included), so the
+    /// flag cannot survive the cycle it belongs to. The record uses it to skip
+    /// exactly what C's simulation branch skips — for swait, `fetch_values()`
+    /// (through [`Self::select_input_links`]) and `calcPerform()`.
+    fn set_simulation_active(&mut self, _active: bool) {}
+
     /// How C's `fetch_values()` for this record type reacts to a link read
     /// that fails. Drives the framework's [`Self::multi_input_links`] fetch
     /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].

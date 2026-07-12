@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 // --- Busy-specific types (inlined from busy-rs/types.rs) ---
@@ -124,6 +124,17 @@ pub struct BusyRecord {
     pub mask: u32,
     pub rbv: u32,
     pub orbv: u32,
+    // Simulation group (busyRecord.dbd:127-147). busy's `writeValue`
+    // (busyRecord.c:389-416) is the bo-shaped OUTPUT redirect: SIML resolves
+    // SIMM, SIMM=YES writes VAL out through SIOL instead of the device, and the
+    // cycle carries SIMM_ALARM at SIMS. The redirect itself is owned by the
+    // framework (`check_simulation_mode` -> `RedirectOutputToSiol`), which reads
+    // it off these fields — without them the record looks unconfigured and a
+    // simulated busy drives the real output.
+    pub simm: i16,
+    pub siml: String,
+    pub siol: String,
+    pub sims: i16,
     // HIGH timer state — set when a HIGH one-shot is in flight; the
     // next (timer-driven) process() forces VAL=0, mirroring C
     // boRecord.c::myCallbackFunc.
@@ -160,6 +171,10 @@ impl Default for BusyRecord {
             mask: 0,
             rbv: 0,
             orbv: 0,
+            simm: 0,
+            siml: String::new(),
+            siol: String::new(),
+            sims: 0,
             high_reset_pending: false,
             nsev: AlarmSevr::None,
             value_changed: false,
@@ -310,6 +325,26 @@ static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         read_only: true,
     },
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for BusyRecord {
@@ -432,6 +467,10 @@ impl Record for BusyRecord {
             "MASK" => Some(EpicsValue::ULong(self.mask)),
             "RBV" => Some(EpicsValue::ULong(self.rbv)),
             "ORBV" => Some(EpicsValue::ULong(self.orbv)),
+            "SIMM" => Some(EpicsValue::Short(self.simm)),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
     }
@@ -564,12 +603,55 @@ impl Record for BusyRecord {
                 };
                 Ok(())
             }
+            "SIMM" => match value {
+                EpicsValue::Short(v) => {
+                    self.simm = v;
+                    Ok(())
+                }
+                EpicsValue::Enum(v) => {
+                    self.simm = v as i16;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            "SIML" => match value {
+                EpicsValue::String(v) => {
+                    self.siml = v.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            "SIOL" => match value {
+                EpicsValue::String(v) => {
+                    self.siol = v.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
+            "SIMS" => match value {
+                EpicsValue::Short(v) => {
+                    self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.to_string())),
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`busyRecord.dbd:137-141`) — the
+    /// two-choice NO/YES menu, not the NO/YES/RAW `menuSimm` of the base binary
+    /// records. Served as `DBR_ENUM` with those labels; `SIMS` is the shared
+    /// `menuAlarmSevr`, resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_YES_NO),
+            _ => None,
+        }
     }
 
     /// VAL posts DBE_VALUE|DBE_LOG

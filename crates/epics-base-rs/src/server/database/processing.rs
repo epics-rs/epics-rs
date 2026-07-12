@@ -484,6 +484,14 @@ enum SimOutcome {
     /// forward-link / CP / RPRO tail exactly as `recGblFwdLink` does for a
     /// real process cycle, but skips the (already-substituted) body.
     Simulated,
+    /// Simulated record whose simulation replaces only the INPUT STAGE of its
+    /// body ([`Record::simulation_substitutes_input_stage`]) — swait. The SIOL
+    /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
+    /// have already happened here (C `swaitRecord.c:415-421`, which precedes the
+    /// OOPT switch); the caller runs the record body with its input-link fetch
+    /// suppressed, then the ordinary alarm/monitor/forward-link tail — none of
+    /// which C's simulation branch skips.
+    SimulatedInputStage,
     /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
     /// `writeValue` substitutes the device write with
     /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
@@ -1483,11 +1491,20 @@ impl PvDatabase {
         // `sim_output` carries the OUTPUT redirect (SIOL link, SIMS, RAW
         // flag) from this point to the OUT stage / alarm epilogue below;
         // `None` for a non-simulated record or a simulated INPUT.
+        // The cycle's simulation state, pushed to the record before the body —
+        // the twin of `set_fetch_gate_failed`. Written on EVERY cycle of a record
+        // that declares the input-stage shape (`false` included), so the flag
+        // cannot outlive the cycle it belongs to.
+        let mut sim_input_stage = false;
         let sim_output = match self.check_simulation_mode(&rec).await {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
                 return Ok(());
+            }
+            SimOutcome::SimulatedInputStage => {
+                sim_input_stage = true;
+                None
             }
             SimOutcome::DeferRead(delay) => {
                 // C `readValue`/`writeValue` async path: hold PACT and
@@ -1515,6 +1532,12 @@ impl PvDatabase {
                 raw_mode,
             } => Some((siol, sims, raw_mode)),
         };
+        {
+            let mut instance = rec.write().await;
+            if instance.record.simulation_substitutes_input_stage() {
+                instance.record.set_simulation_active(sim_input_stage);
+            }
+        }
 
         // 1. Read INP link value and DOL link (outside lock)
         let (inp_parsed, is_soft, dol_info) = {
@@ -4825,9 +4848,13 @@ impl PvDatabase {
     /// processing should proceed.
     async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
         // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
-        let (siml_link, siol_link, sims, sdly, _rtype, is_input, pact_held) = {
+        let (siml_link, siol_link, sims, sdly, _rtype, is_input, input_stage, pact_held) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
+            // swait: the simulation replaces the record's input STAGE, not its
+            // whole cycle. Declared by the record, not by a type-name list —
+            // the classification is a property of where C put the SIOL read.
+            let input_stage = instance.record.simulation_substitutes_input_stage();
             // C `prec->pact` at process entry — the value every readValue/
             // writeValue simulation guard keys on. The framework holds the
             // `processing` flag across an async wait owned by PACT (the SDLY
@@ -4879,20 +4906,21 @@ impl PvDatabase {
             // writes VAL out to SIOL, which the OUTPUT redirect (`!is_input` ->
             // `RedirectOutputToSiol` -> `write_simulated_output_siol`, VAL array
             // -> SIOL) already reproduces.
-            let is_input = matches!(
-                rtype.as_str(),
-                "ai" | "bi"
-                    | "mbbi"
-                    | "mbbiDirect"
-                    | "longin"
-                    | "int64in"
-                    | "stringin"
-                    | "lsi"
-                    | "event"
-                    | "waveform"
-                    | "histogram"
-                    | "aai"
-            );
+            let is_input = input_stage
+                || matches!(
+                    rtype.as_str(),
+                    "ai" | "bi"
+                        | "mbbi"
+                        | "mbbiDirect"
+                        | "longin"
+                        | "int64in"
+                        | "stringin"
+                        | "lsi"
+                        | "event"
+                        | "waveform"
+                        | "histogram"
+                        | "aai"
+                );
 
             let siml = instance
                 .record
@@ -4963,6 +4991,7 @@ impl PvDatabase {
                 sdly,
                 rtype,
                 is_input,
+                input_stage,
                 pact_held,
             )
         };
@@ -5033,6 +5062,45 @@ impl PvDatabase {
         // the synchronous branch below.
         if !pact_held && sdly >= 0.0 {
             return SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly));
+        }
+
+        // INPUT-STAGE record (swait). C `swaitRecord.c:415-421`:
+        //
+        // ```c
+        // } else {      /* SIMULATION MODE */
+        //     status = dbGetLink(&(pwait->siol),DBR_DOUBLE,&(pwait->sval),0,0);
+        //     if (status==0) {
+        //         pwait->val=pwait->sval;
+        //         pwait->udf=FALSE;
+        //     }
+        //     recGblSetSevr(pwait,SIMM_ALARM,pwait->sims);
+        // }
+        // ```
+        //
+        // The read substitutes `fetch_values()` + `calcPerform()` and nothing
+        // else, so this performs exactly those four lines and hands the cycle
+        // back: the OOPT switch, `execOutput`, the monitors and the forward link
+        // all still come from the record's own `process()`. SIMM_ALARM goes into
+        // the PENDING alarm (`rec_gbl_set_sevr` is C's MAXIMIZE) before the body
+        // runs, so a body-raised alarm maximizes against it exactly as in C.
+        if input_stage {
+            let siol_val = self.read_link_value_no_process(&siol_link).await;
+            let mut instance = rec.write().await;
+            // C `:417-420` — a FAILED read changes neither VAL nor UDF; only the
+            // SIMM_ALARM below is unconditional.
+            if let Some(siol_val) = siol_val {
+                let sval = EpicsValue::Double(siol_val.to_f64().unwrap_or(0.0));
+                let _ = instance.record.put_field_internal("SVAL", sval.clone());
+                let _ = instance.record.set_val(sval);
+                instance.common.udf = false;
+            }
+            let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
+            crate::server::recgbl::rec_gbl_set_sevr(
+                &mut instance.common,
+                crate::server::recgbl::alarm_status::SIMM_ALARM,
+                sev,
+            );
+            return SimOutcome::SimulatedInputStage;
         }
 
         // OUTPUT record: C `writeValue` substitutes the device write with the

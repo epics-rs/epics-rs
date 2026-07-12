@@ -2,9 +2,12 @@ use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::WallTime;
-use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str, stat_to_str};
+use epics_ca_rs::cli::{
+    PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str, stat_to_str, zero_dbr_snapshot,
+    zero_dbr_value,
+};
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
-use epics_ca_rs::{CaError, DbFieldType, EpicsValue, PvString};
+use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
 fn format_server_timestamp(ts: WallTime) -> String {
@@ -451,11 +454,6 @@ impl WriteValue {
     }
 }
 
-/// Unix seconds at the EPICS epoch (1990-01-01T00:00:00Z) — the instant a
-/// zeroed `epicsTimeStamp` denotes, which is what C prints for a timed-out
-/// readback under `-l` (see [`zero_readback`]).
-const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
-
 /// One `caput` readback — the `Old :` read (`caput.c:535`) and the `New :`
 /// read (`caput.c:583`) are the SAME C function, `caget()`
 /// (`caput.c:130-240`) — classified by C's contract.
@@ -478,67 +476,26 @@ enum Readback {
     Other(CaError),
 }
 
-/// The value C `caput` prints for a readback whose `ca_pend_io` timed out.
+/// The value C `caput` prints for a readback whose `ca_pend_io` timed out:
+/// the zeroed `calloc` buffer, sized from the DBR type it REQUESTED. Owned
+/// by [`epics_ca_rs::cli::zero_dbr_value`] — `caget` renders the same buffer
+/// on its own synchronous timeout, and the contract is C's, not caput's.
 ///
-/// C `calloc`s the readback buffer BEFORE issuing the get (`caput.c:167`)
-/// and, on `ECA_TIMEOUT`, only warns on stderr (`caput.c:186-188`) — it
-/// neither frees the buffer nor marks the PV's status. The print loop
-/// therefore sees `status == ECA_NORMAL` and `value != 0` (`caput.c:201-209`)
-/// and renders the still-ZEROED buffer: a numeric field prints `0`, a string
-/// (or ENUM-as-label) field prints an empty value, an array prints its
-/// element count then that many zeros, and `-l` prints a zeroed
-/// `epicsTimeStamp` (the EPICS epoch) with NO_ALARM/NO_ALARM
-/// (`tool_lib.c::print_time_val_sts`). `caget()` then returns 0
-/// (`caput.c:239`).
-///
-/// Note the `*** no data available (timeout)` branch (`caput.c:207-208`) is
-/// DEAD in caput: it needs `value == 0`, which only the callback get path
-/// allocates lazily (`caget.c:130`), and caput's readback is always the
-/// synchronous `ca_array_get`.
+/// `as_string` marks the ENUM-read-back-as-label case: that get requests a
+/// `DBR_STRING`, so its zeroed buffer is an empty string, not a `0` index.
 fn zero_readback(
     native: DbFieldType,
     as_string: bool,
     count: u32,
     long_mode: bool,
 ) -> (EpicsValue, Option<Snapshot>) {
-    let n = count.max(1) as usize;
-    let scalar = n == 1;
-    let zeros = |scalar_v: EpicsValue, array_v: EpicsValue| {
-        if scalar { scalar_v } else { array_v }
-    };
-    let value = if as_string || native == DbFieldType::String {
-        zeros(
-            EpicsValue::String(PvString::from("")),
-            EpicsValue::StringArray(vec![PvString::from(""); n]),
-        )
+    let base = if as_string {
+        DbFieldType::String
     } else {
-        match native {
-            DbFieldType::Short => zeros(EpicsValue::Short(0), EpicsValue::ShortArray(vec![0; n])),
-            DbFieldType::Float => {
-                zeros(EpicsValue::Float(0.0), EpicsValue::FloatArray(vec![0.0; n]))
-            }
-            DbFieldType::Enum => zeros(EpicsValue::Enum(0), EpicsValue::EnumArray(vec![0; n])),
-            DbFieldType::Char => zeros(EpicsValue::Char(0), EpicsValue::CharArray(vec![0; n])),
-            DbFieldType::Long => zeros(EpicsValue::Long(0), EpicsValue::LongArray(vec![0; n])),
-            // DbFieldType::Double, plus the internal-only widths (Int64,
-            // UInt64, UShort, ULong, UChar) that have no CA wire type: a CA
-            // server reports them promoted (DBR_DOUBLE / DBR_LONG / DBR_CHAR),
-            // so `native_field_type` never yields them here — and their zero
-            // renders as `0` in every one of those promotions anyway.
-            _ => zeros(
-                EpicsValue::Double(0.0),
-                EpicsValue::DoubleArray(vec![0.0; n]),
-            ),
-        }
+        native
     };
-    let snap = long_mode.then(|| {
-        Snapshot::new(
-            value.clone(),
-            0,
-            0,
-            WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
-        )
-    });
+    let value = zero_dbr_value(base, count);
+    let snap = long_mode.then(|| zero_dbr_snapshot(base, count));
     (value, snap)
 }
 
@@ -896,11 +853,12 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, EPICS_EPOCH_UNIX_SECS, Readback, WriteValue, build_write_value, classify_readback,
-        raw_from_escaped, raw_from_escaped_string, zero_readback,
+        Args, Readback, WriteValue, build_write_value, classify_readback, raw_from_escaped,
+        raw_from_escaped_string, zero_readback,
     };
     use clap::Parser;
     use epics_base_rs::types::WallTime;
+    use epics_ca_rs::cli::EPICS_EPOCH_UNIX_SECS;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {

@@ -3,8 +3,8 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
-    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value, sevr_to_str,
-    stat_to_str,
+    FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, dbr_value_field_type,
+    format_value, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -215,6 +215,7 @@ impl Args {
 /// `Plain` is the cheap typed-value path (no timestamp); `Time` is
 /// the DBR_TIME variant produced by `-a` so the print loop can lift
 /// the real server timestamp + alarm pair onto the wire.
+#[derive(Debug)]
 enum GetResult {
     Plain(EpicsValue),
     // Boxed to keep the enum variants size-balanced after Snapshot
@@ -505,6 +506,59 @@ fn caget_req_count(callback: bool, max_elements: Option<usize>, native: u32) -> 
     }
 }
 
+/// One PV's read outcome, plus whether its read timed out. C warns ONCE on
+/// stderr for a timed-out read phase (`caget.c:224-226` for `ca_pend_io`,
+/// `:238-239` for the callback wait) and then still runs the print loop, so
+/// the flag has to survive alongside the (possibly successful-looking)
+/// outcome.
+struct PvRead {
+    name: String,
+    outcome: Result<GetResult, String>,
+    timed_out: bool,
+}
+
+/// C's read-timeout contract for one PV — the single owner of what a
+/// timed-out `caget` read RENDERS.
+///
+/// The synchronous get (`ca_array_get`, the default) callocs its readback
+/// buffer BEFORE the wire request (`caget.c:207-215`) and `ca_pend_io`
+/// timing out neither frees it nor touches `pvs[n].status`. The print loop
+/// therefore sees `status == ECA_NORMAL` and `value != 0` and renders the
+/// still-ZEROED buffer (`caget.c:262-293`) — `0` for a scalar, an empty
+/// string for a string/ENUM-label readback, `count` zeros for an array, and
+/// under `-a` the EPICS-epoch stamp with NO_ALARM/NO_ALARM.
+///
+/// ONLY the callback get (`-c`, `ca_array_get_callback`) allocates lazily,
+/// inside its event handler (`caget.c:130`): a callback that never arrives
+/// leaves `value == NULL`, which is the sole way to reach C's
+/// `*** no data available (timeout)` branch (`caget.c:268`).
+///
+/// `base` is the value carrier of the DBR type actually requested; `None`
+/// means `ca_field_type` failed, i.e. the channel dropped after the connect
+/// barrier — which C reports as `ECA_DISCONN` (`caget.c:219-221`), not as a
+/// timeout.
+fn read_timeout(
+    callback: bool,
+    base: Option<DbFieldType>,
+    elems: u32,
+    zeroed: impl FnOnce(DbFieldType, u32) -> GetResult,
+) -> Result<GetResult, String> {
+    if callback {
+        return Err(TIMEOUT_ERR.to_string());
+    }
+    match base {
+        Some(b) => Ok(zeroed(b, elems)),
+        None => Err(NOT_CONNECTED_ERR.to_string()),
+    }
+}
+
+/// Marker the print loop matches to reach C's `*** no data available
+/// (timeout)` branch. Reachable only under `-c` — see [`read_timeout`].
+const TIMEOUT_ERR: &str = "timeout";
+/// Marker for a channel that dropped after the connect barrier (C
+/// `ECA_DISCONN`, `caget.c:219-221`).
+const NOT_CONNECTED_ERR: &str = "not connected";
+
 #[tokio::main]
 async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line
@@ -614,6 +668,9 @@ async fn main() {
             // synchronous path requests the full native count.
             let native = ch.element_count().unwrap_or(0);
             let req_count = caget_req_count(callback, max_elements, native);
+            // C sizes the readback buffer `dbr_size_n(dbrType, nElems)` with
+            // the SAME clamped count it puts on the wire (`caget.c:207-215`).
+            let elems = req_count.resolve(native);
             // C `caget.c:172-187`: the request DBR type depends on the
             // output format. `specifiedDbr` carries the `-d` type verbatim
             // (`pvs[n].dbrType = dbrType`) and keeps the full snapshot for
@@ -622,19 +679,32 @@ async fn main() {
             // substitutions, discarding any `-d` type. `native_field_type`
             // is libca `ca_field_type`, valid now that the channel is
             // connected.
+            let mut timed_out = false;
             let outcome = if mode == OutputMode::SpecifiedDbr {
                 let rt = req_dbr_type
                     .expect("specifiedDbr mode implies a resolved -d type (else reverts to plain)");
                 let native = ch.native_field_type().ok();
+                // The `-d` code passed `parse_dbr_type` (0..=38), so it always
+                // has a value carrier.
+                let base = dbr_value_field_type(rt);
+                let on_timeout = || {
+                    read_timeout(callback, base, elems, |b, n| GetResult::Specified {
+                        native,
+                        req_type: rt,
+                        snap: Box::new(zero_dbr_snapshot(b, n)),
+                    })
+                };
                 match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
                     Ok(Ok(snap)) => Ok(GetResult::Specified {
                         native,
                         req_type: rt,
                         snap: Box::new(snap),
                     }),
-                    Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                    Ok(Err(CaError::Timeout)) | Err(_) => {
+                        timed_out = true;
+                        on_timeout()
+                    }
                     Ok(Err(e)) => Err(format!("{e}")),
-                    Err(_) => Err("timeout".to_string()),
                 }
             } else {
                 // C `caget.c:177-187` readback substitution, in C's
@@ -653,20 +723,43 @@ async fn main() {
                             .then(|| nt.and_then(float_as_string_readback_dbr))
                             .flatten()
                     });
+                // The zeroed buffer takes the shape of the type REQUESTED: a
+                // substituted ENUM-label readback is a DBR_*_STRING get, so
+                // its zeroed buffer is an empty string, not a `0` index.
+                let base = match sub_dbr {
+                    Some(rt) => dbr_value_field_type(rt),
+                    None => nt,
+                };
                 if let Some(rt) = sub_dbr {
                     // Under `-a` the TIME-class string (DBR_TIME_STRING)
                     // still carries timestamp + alarm, so wrap it as `Time`.
+                    let on_timeout = || {
+                        read_timeout(callback, base, elems, |b, n| {
+                            if want_time {
+                                GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
+                            } else {
+                                GetResult::Plain(zero_dbr_value(b, n))
+                            }
+                        })
+                    };
                     match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
                         Ok(Ok(snap)) => Ok(if want_time {
                             GetResult::Time(Box::new(snap))
                         } else {
                             GetResult::Plain(snap.value)
                         }),
-                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                            timed_out = true;
+                            on_timeout()
+                        }
                         Ok(Err(e)) => Err(format!("{e}")),
-                        Err(_) => Err("timeout".to_string()),
                     }
                 } else if want_time {
+                    let on_timeout = || {
+                        read_timeout(callback, base, elems, |b, n| {
+                            GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
+                        })
+                    };
                     match tokio::time::timeout(
                         t,
                         ch.get_with_metadata_count(DbrClass::Time, req_count),
@@ -674,20 +767,31 @@ async fn main() {
                     .await
                     {
                         Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
-                        Ok(Err(CaError::Timeout)) => Err("timeout".to_string()),
+                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                            timed_out = true;
+                            on_timeout()
+                        }
                         Ok(Err(e)) => Err(format!("{e}")),
-                        Err(_) => Err("timeout".to_string()),
                     }
                 } else {
                     // plain / terse: cheap typed value, no metadata payload.
                     match ch.get_with_timeout_count(t, req_count).await {
                         Ok((_dbr, value)) => Ok(GetResult::Plain(value)),
-                        Err(CaError::Timeout) => Err("timeout".to_string()),
+                        Err(CaError::Timeout) => {
+                            timed_out = true;
+                            read_timeout(callback, base, elems, |b, n| {
+                                GetResult::Plain(zero_dbr_value(b, n))
+                            })
+                        }
                         Err(e) => Err(format!("{e}")),
                     }
                 }
             };
-            (name, outcome)
+            PvRead {
+                name,
+                outcome,
+                timed_out,
+            }
         }));
     }
 
@@ -695,6 +799,11 @@ async fn main() {
     let mut results = Vec::with_capacity(handles.len());
     for h in handles {
         results.push(h.await.unwrap());
+    }
+    // C's ONE stderr warning for a timed-out read phase (`caget.c:224-226`,
+    // `:238-239`) — it does not name the PV and does not stop the print loop.
+    if results.iter().any(|r| r.timed_out) {
+        eprintln!("Read operation timed out: some PV data was not read.");
     }
 
     let fmt = args.value_format();
@@ -715,7 +824,12 @@ async fn main() {
         }
     };
     let mut failed = false;
-    for (pv_name, result) in &results {
+    for PvRead {
+        name: pv_name,
+        outcome: result,
+        ..
+    } in &results
+    {
         match result {
             Ok(GetResult::Plain(value)) => {
                 let rendered = format_value(value, &fmt, None, req_elems_present);
@@ -789,6 +903,13 @@ async fn main() {
                 failed = true;
             }
             Err(e) if e.contains("timeout") => {
+                // Reachable only under `-c`: the callback get allocates its
+                // buffer inside the event handler (`caget.c:130`), so a
+                // callback that never arrives leaves `pvs[n].value == 0` and
+                // C prints this marker (`caget.c:268`). The SYNCHRONOUS get
+                // callocs up front and renders the zeroed buffer instead —
+                // see [`read_timeout`].
+                //
                 // C `caget`: `connect_pvs` returns 1 only on a
                 // `ca_pend_io` connect timeout; the data-read function
                 // (`caget.c:348`) always returns 0. A CONNECTED PV
@@ -886,22 +1007,105 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, OutputMode, ReqCount, caget_req_count, dbr_extended_str, dbr_text, parse_dbr_type,
-        resolve_output_mode, scan_leading_i64, specified_dbr_report,
+        Args, GetResult, OutputMode, ReqCount, caget_req_count, dbr_extended_str, dbr_text,
+        parse_dbr_type, read_timeout, resolve_output_mode, scan_leading_i64, specified_dbr_report,
     };
     use clap::CommandFactory;
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
+    use epics_base_rs::types::WallTime;
     use epics_base_rs::types::{
         DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_STRING,
         DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
-    use epics_ca_rs::EpicsValue;
-    use epics_ca_rs::cli::ValueFormat;
+    use epics_ca_rs::cli::{EPICS_EPOCH_UNIX_SECS, ValueFormat, zero_dbr_snapshot, zero_dbr_value};
+    use epics_ca_rs::{DbFieldType, EpicsValue};
     use std::time::SystemTime;
 
     fn mode_of(argv: &[&str]) -> OutputMode {
         let m = Args::command().get_matches_from(argv);
         resolve_output_mode(&m)
+    }
+
+    /// The DEFAULT (synchronous) read path callocs its buffer BEFORE the wire
+    /// request (`caget.c:207-215`), so a `ca_pend_io` timeout leaves the PV at
+    /// `status == ECA_NORMAL` with a non-NULL, still-ZEROED buffer, and the
+    /// print loop renders those zeroes (`caget.c:262-293`). Only `-c` can reach
+    /// `*** no data available (timeout)`, because only its event handler
+    /// allocates (`caget.c:130`).
+    ///
+    /// Pre-fix caget-rs printed the timeout marker on BOTH paths.
+    #[test]
+    fn synchronous_read_timeout_renders_the_zeroed_buffer() {
+        let plain = |callback, base, elems| {
+            read_timeout(callback, base, elems, |b, n| {
+                GetResult::Plain(zero_dbr_value(b, n))
+            })
+        };
+
+        // Synchronous scalar DOUBLE: C prints "0".
+        match plain(false, Some(DbFieldType::Double), 1) {
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::Double(0.0)),
+            other => panic!("sync timeout must yield the zeroed buffer, got {other:?}"),
+        }
+        // Synchronous array: C zeroes every one of the nElems it sized with.
+        match plain(false, Some(DbFieldType::Long), 3) {
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::LongArray(vec![0, 0, 0])),
+            other => panic!("sync array timeout must zero every element, got {other:?}"),
+        }
+        // An ENUM substituted to its label form is a DBR_*_STRING get, so its
+        // zeroed buffer is an empty string, not a 0 index.
+        match plain(false, Some(DbFieldType::String), 1) {
+            Ok(GetResult::Plain(v)) => assert_eq!(v, EpicsValue::String("".into())),
+            other => panic!("string readback timeout must yield \"\", got {other:?}"),
+        }
+
+        // Callback (`-c`) is the ONLY path with no buffer: it alone reaches
+        // C's `*** no data available (timeout)` marker.
+        match plain(true, Some(DbFieldType::Double), 1) {
+            Err(e) => assert!(
+                e.contains("timeout"),
+                "-c timeout must reach the marker branch, got {e}"
+            ),
+            other => panic!("-c has no calloc'd buffer to print, got {other:?}"),
+        }
+    }
+
+    /// `-a` / `-d` render the zeroed `dbr_time_*` header too: a zeroed
+    /// `epicsTimeStamp` is the EPICS epoch and the alarm pair is
+    /// NO_ALARM / NO_ALARM (`tool_lib.c::print_time_val_sts` then prints two
+    /// empty trailing fields).
+    #[test]
+    fn synchronous_read_timeout_carries_the_epics_epoch_stamp() {
+        let r = read_timeout(false, Some(DbFieldType::Double), 1, |b, n| {
+            GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
+        });
+        match r {
+            Ok(GetResult::Time(snap)) => {
+                assert_eq!(snap.value, EpicsValue::Double(0.0));
+                assert_eq!(snap.alarm.status, 0);
+                assert_eq!(snap.alarm.severity, 0);
+                assert_eq!(
+                    snap.timestamp,
+                    WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
+                    "a zeroed epicsTimeStamp is 1990-01-01T00:00:00Z"
+                );
+            }
+            other => panic!("-a sync timeout must yield a zeroed TIME snapshot, got {other:?}"),
+        }
+    }
+
+    /// `ca_field_type` failing means the channel dropped after the connect
+    /// barrier — C reports that as `ECA_DISCONN` (`caget.c:219-221`), not as a
+    /// timeout, so there is no buffer to zero.
+    #[test]
+    fn read_timeout_without_a_field_type_is_a_disconnect() {
+        let r = read_timeout(false, None, 1, |b, n| {
+            GetResult::Plain(zero_dbr_value(b, n))
+        });
+        match r {
+            Err(e) => assert!(e.contains("not connected"), "got {e}"),
+            other => panic!("a dropped channel is not a timeout, got {other:?}"),
+        }
     }
 
     /// `caget -c` (callback,
@@ -1115,8 +1319,6 @@ mod tests {
         assert_eq!(dbr_text(DBR_CLASS_NAME), "DBR_CLASS_NAME");
         assert_eq!(dbr_text(99), "DBR_invalid");
     }
-
-    use epics_ca_rs::DbFieldType;
 
     #[test]
     fn scan_leading_i64_matches_sscanf_d() {

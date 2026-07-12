@@ -1,7 +1,8 @@
 //! Helpers shared across the `caget` / `caput` / `cainfo` / `camonitor`
 //! command-line binaries.
 
-use epics_base_rs::types::{EpicsValue, PvString};
+use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
 use crate::client::{CaChannel, CaClient};
 
@@ -201,6 +202,96 @@ pub fn sevr_to_str(sevr: u16) -> &'static str {
         .get(sevr as usize)
         .copied()
         .unwrap_or(ALARM_STRING_UNKNOWN)
+}
+
+/// Unix seconds at the EPICS epoch (1990-01-01T00:00:00Z) — the instant a
+/// zeroed `epicsTimeStamp` denotes, and therefore the timestamp C's `-a` /
+/// `-l` modes print for a timed-out synchronous readback (see
+/// [`zero_dbr_snapshot`]).
+pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
+
+/// The value carrier of a CA request DBR code — the type C's
+/// `dbr_size_n(dbrType, nElems)` sizes its buffer from (`db_access.h`).
+/// Codes 0..=34 repeat the seven base types every 7 codes (`STRING SHORT
+/// FLOAT ENUM CHAR LONG DOUBLE`, through `DBR_CTRL_DOUBLE`); the four
+/// trailing special codes carry their own payload. `None` for a code
+/// outside 0..=38 (C `INVALID_DB_REQ`).
+pub fn dbr_value_field_type(dbr_type: u16) -> Option<DbFieldType> {
+    match dbr_type {
+        0..=34 => DbFieldType::from_u16(dbr_type % 7).ok(),
+        // DBR_PUT_ACKT / DBR_PUT_ACKS: a bare `dbr_put_ackt_t` (u16).
+        35 | 36 => Some(DbFieldType::UShort),
+        // DBR_STSACK_STRING / DBR_CLASS_NAME: a `dbr_string_t`.
+        37 | 38 => Some(DbFieldType::String),
+        _ => None,
+    }
+}
+
+/// The buffer C's *synchronous* CA readback prints when `ca_pend_io` times
+/// out — the single owner of that contract for `caget` and `caput`.
+///
+/// Both tools `calloc` the readback buffer BEFORE issuing `ca_array_get`
+/// (`caget.c:207-215`, `caput.c:167`), sized `dbr_size_n(dbrType, nElems)`.
+/// On `ECA_TIMEOUT` they only warn on stderr (`caget.c:224-226`,
+/// `caput.c:186-188`): the buffer is neither freed nor is the PV's status
+/// touched, so the print loop still sees `status == ECA_NORMAL` and
+/// `value != 0` (`caget.c:262-268`, `caput.c:201-207`) and renders the
+/// still-ZEROED buffer — a numeric field prints `0`, a string (or
+/// ENUM-as-label) field prints an empty value, and an array prints its
+/// element count then that many zeros.
+///
+/// The `*** no data available (timeout)` branch (`caget.c:268`,
+/// `caput.c:207`) needs `value == 0`, which ONLY the callback get can leave:
+/// `caget -c` allocates inside its event handler (`caget.c:130`), so a
+/// callback that never arrives leaves no buffer at all. That branch is
+/// therefore unreachable from any synchronous readback, and dead in `caput`,
+/// whose readback is always synchronous.
+///
+/// `base` is the carrier of the DBR type actually REQUESTED (see
+/// [`dbr_value_field_type`]) — not the channel's native type: an ENUM read
+/// back in label form is a `DBR_STRING` get, so its zeroed buffer is an
+/// empty string, not a `0` index.
+pub fn zero_dbr_value(base: DbFieldType, count: u32) -> EpicsValue {
+    // C sizes the buffer `dbr_size_n(dbrType, nElems)`; a scalar channel has
+    // nElems == 1.
+    let n = count.max(1) as usize;
+    let scalar = n == 1;
+    let pick = |scalar_v: EpicsValue, array_v: EpicsValue| if scalar { scalar_v } else { array_v };
+    match base {
+        DbFieldType::String => pick(
+            EpicsValue::String(PvString::from("")),
+            EpicsValue::StringArray(vec![PvString::from(""); n]),
+        ),
+        DbFieldType::Short => pick(EpicsValue::Short(0), EpicsValue::ShortArray(vec![0; n])),
+        DbFieldType::Float => pick(EpicsValue::Float(0.0), EpicsValue::FloatArray(vec![0.0; n])),
+        DbFieldType::Enum => pick(EpicsValue::Enum(0), EpicsValue::EnumArray(vec![0; n])),
+        DbFieldType::Char => pick(EpicsValue::Char(0), EpicsValue::CharArray(vec![0; n])),
+        DbFieldType::Long => pick(EpicsValue::Long(0), EpicsValue::LongArray(vec![0; n])),
+        DbFieldType::Double => pick(
+            EpicsValue::Double(0.0),
+            EpicsValue::DoubleArray(vec![0.0; n]),
+        ),
+        DbFieldType::Int64 => pick(EpicsValue::Int64(0), EpicsValue::Int64Array(vec![0; n])),
+        DbFieldType::UInt64 => pick(EpicsValue::UInt64(0), EpicsValue::UInt64Array(vec![0; n])),
+        DbFieldType::UShort => pick(EpicsValue::UShort(0), EpicsValue::UShortArray(vec![0; n])),
+        DbFieldType::ULong => pick(EpicsValue::ULong(0), EpicsValue::ULongArray(vec![0; n])),
+        DbFieldType::UChar => pick(EpicsValue::UChar(0), EpicsValue::UCharArray(vec![0; n])),
+    }
+}
+
+/// The zeroed `dbr_time_*` header C renders alongside [`zero_dbr_value`] on
+/// a synchronous readback timeout: a zeroed `epicsTimeStamp` is the EPICS
+/// epoch, and the alarm pair is NO_ALARM / NO_ALARM — for which
+/// `tool_lib.c::print_time_val_sts` prints two empty trailing fields. The
+/// metadata blocks stay `None`, which renders as C's zeroed `dbr_gr_*` /
+/// `dbr_ctrl_*` limits.
+pub fn zero_dbr_snapshot(base: DbFieldType, count: u32) -> Snapshot {
+    Snapshot::new(
+        zero_dbr_value(base, count),
+        0,
+        0,
+        WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0),
+    )
 }
 
 /// Float number representation requested via `-e` / `-f` / `-g`.

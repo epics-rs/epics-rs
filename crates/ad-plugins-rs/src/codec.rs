@@ -1470,7 +1470,11 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Fence: the write only queues the enable for the data thread.
+        assert!(
+            handle.wait_params_applied(std::time::Duration::from_secs(10)),
+            "data thread did not apply EnableCallbacks"
+        );
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

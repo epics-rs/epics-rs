@@ -3974,3 +3974,230 @@ silently edited above.
   (`optics/opticsApp/src/tableRecord.c:1918,1934,1945`) is the standard Numerical Recipes
   1-based formulation and is **correct**. The divergence was in the port's 0-based
   translation (`saturating_sub` clamping at 0), since fixed. Nothing to report upstream.
+
+---
+
+## Fix wave 10 — dispositions (2026-07-13)
+
+Seven opus fixer panels, one worktree each; main merged and verified. Scope:
+the 12 confirmed R11-C carryovers plus the 24 Round-12 findings, minus R12-46
+(already fixed in e96a68ce). Every fix carries a negative-controlled test
+(observed to FAIL on the pre-fix tree). Verified on the merged tree:
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo nextest run --workspace` **8389 passed / 0 failed / 2 skipped**,
+`cargo test --doc --workspace` clean, fmt clean.
+
+**33 FIXED, 2 NOT-REAL, 1 filed-route-refuted-but-adjacent-defect-fixed.**
+
+### Category A — sCalc string engine (8 commits)
+- R12-1 + R11-C7 FIXED `ce1e7dab` — UNTIL_END is an operator-stack entry
+  (in_stack_pri 0), placed by the flush rules as in C; loop-max is a silent
+  break (settable `sCalcLoopMax`, default 1000), `LoopLimitExceeded` deleted.
+- R12-2 + R12-3 FIXED `e2fa5d84` — ONE defect, and wider than filed: compiled C
+  shows the digest is escaped text, the operand is unescaped first, CRC16/XOR8
+  return a *string*, and neither guard is an error. Single `checksum_op` owner.
+- R12-4 FIXED `e844f2b0` — `AMODBUS` bounds `":" + operand` to 39 *then*
+  appends the LRC (one bound over the concatenation).
+- R12-5 FIXED `c84f1ace` — C hands the format to libc `sscanf`; the port now
+  has a real scanf engine (`engine/scanf.rs`), shared with BIN_READ. C's
+  greedy `%%` skip and second-conversion rejection reproduced; the one UB
+  format (`"%d %% %s"` → char* into %d) refused deliberately.
+- R12-7 FIXED `57552394` — the citation was LEN; the `toString` sweep found
+  REPLACE also uncoerced (C coerces all three operands). Both via
+  `into_string_value`.
+- R12-8 FIXED `a596e2e3` — second constructor (`ScalcString::from_strncpy`,
+  38-byte bound) for the 8 `strNcpy(N-1)` sites; ADD/LITERAL keep 39.
+- R12-9 FIXED `dc5385a6` — C's `hex()` maps non-hex to 0 and drops a trailing
+  odd char; `hex_decode` (the rejector) deleted. The empty operand stays
+  refused: C's `strlen("")-1` wrap is UB (harness segfaults), not a contract.
+- R11-C6 FIXED `5949dbdb` — structural: `scalc_result(&value)` deleted,
+  `scalc_perform(expr, inputs, precision)` is C's signature; only the numeric
+  epilogue takes PREC. Prerequisite found and fixed in the same commit:
+  `uses_string` keyed on an opcode the compiler never emits, so no AA-reading
+  program was USES_STRING (this also mis-sized MODULO's cast width).
+
+### Category A — aCalc array engine (6 commits)
+- R11-C1 FIXED `cca653c6` — MAX/MIN/`>?`/`<?` in the two-arg array dispatch;
+  compiled C also overturned two adjacent beliefs fixed in the same commit:
+  the vararg fold is NaN-poisoning in BOTH argument orders, and `5>?NaN` is 5.
+- R12-6 FIXED `1ce0f33b` — POWER collapses its exponent and maps only on the
+  left. C1/C6 are opposite directions of the same shape rule — two commits,
+  by design, not one dispatch change.
+- R11-C2 FIXED `b87dcbd7` — invariant guard (`CalcError::StackLeak`,
+  `try_from([Cell;1])` epilogue); commit states plainly no reachable
+  divergence exists (compiler ledger is exact), confirming the Round-12
+  reclassification.
+- R11-C3 FIXED `705a9cf2` — unset array var is a zero buffer (`toArray`);
+  `IXZ(AA)`=-1, `FWHM(AA)`=5 against C with a NULL array arg.
+- R11-C5 FIXED `b93c1f21` — AMASK posts on STORE, not on change. The sweep
+  widened into the framework: the subscriber-post loop existed as FOUR
+  copy-pasted instances; unified into `RecordInstance::collect_subscriber_posts`
+  with the new dynamic `take_cycle_posted_fields` hook. One behaviour change
+  disclosed: the simulation-path copy gained the `process_posted_fields` gate
+  the other three had.
+- R11-C4 FIXED `17d98eee` — NEWM compares the fetched value against the value
+  the field held BEFORE the fetch (not last-posted); a caput reverted by the
+  cycle's own INAA fetch now posts. `put_field_internal_default` extracted so
+  overriders wrap the single owner.
+
+### Category B — CA tools (3 commits)
+- R12-16 + R12-20 FIXED `09e5fa9b` (one commit — same C getopt block):
+  `-0x`/`-lb` parse as single-dash options with an argument; invalid base
+  warns and keeps the last VALID base; only `-0` forces DBR_LONG, racing `-d`
+  in getopt order. 13 invocations byte-identical to compiled C.
+- R12-17 FIXED `5bf9df8b` — wider than cited: ALL numeric options across the
+  four binaries route through the new single owner `copt.rs::CTool` (clap
+  type-checks none). Compiled C also showed `-# 0` means "not specified"
+  (one encoding, now `req_elems: u64` with 0=unset) and the count prefix
+  fires on scalars (`-# 1` on a scalar prints `1 200`). 34 invocations
+  byte-identical.
+- R12-18 FIXED `7faf7a3a` — usage errors: one stderr line, C's text, exit 1;
+  required-positional moved from clap to main-validates, matching getopt.
+- R12-19 **NOT-REAL** — the signed-char cast already happens at decode
+  (`codec.rs:1144`); `caget-rs -d DBR_CTRL_CHAR` output is byte-identical to
+  C. Reading the printer suggested "unsigned"; running both proved otherwise.
+
+### Category C — PVA (4 commits)
+- R12-31 FIXED `e88c849d` — single-record monitors carry the DB event's
+  marked leaves (`DbSubscription::recv_event` → promotion → `change_leaf_paths`).
+  The DBE→leaf table had a private duplicate in group.rs; moved to
+  `qsrv/pvif.rs` as the single owner (~223 lines deleted).
+- R12-32 FIXED `826ccebf` — the queue is `MonitorQueue::push()`, which owns
+  pvxs's `real || !val` test by construction (the VecDeque is gone). The
+  wrong parity doc-comment at tcp.rs:7756 corrected (it was wrong twice).
+- R12-33 FIXED `07c54d4e` — `credit.acquire().await` removed; emit is a
+  guarded select arm, `rx.recv()` always polled. Negative control needed
+  BURST=200 (40 did not discriminate — the fixer fixed the test, not the
+  finding). Pre-fix: 7 distinct values past a queueSize-4 window; post: 4.
+- R12-34 **NOT-REAL** `b1d55370` (adjudication + lock test) — pvxs's
+  `request2mask` throw is raised inside the SOURCE's connect callback, and
+  pvxs's own hosting source (SharedPV) CATCHES it → op error, circuit alive
+  ("not re-throwing for consistency", sharedpv.cpp:96-101; pinned by pvxs's
+  own testget.cpp:380-393). The circuit reset only happens in QSRV's bare
+  `connect()` calls — filed as an upstream C++ defect candidate. Inverse
+  control: applying the requested fix broke 3 tests (circuit dropped).
+
+### Category D — asyn (4 commits)
+- R12-47 FIXED `9ea48721` — `ConnectCheck` waiver modelled;
+  `AsynUser::queue_even_if_not_connected()` sets reason+priority together so
+  they cannot be split. HOSTINFO put and connect-time option readback run on
+  a dead port; the EOS readback deliberately still refused (C's asymmetry).
+- R12-48 FIXED `47af0c09` — `queue_gate` is a total match over `RequestOp`
+  (no `_` arm); `check_queue` runs `check_enabled()` first, unconditionally,
+  with no argument to skip it. The two refusals cannot be re-fused.
+- R11-C9 FIXED `6be69cca` — the sweep found the write paths were the INVERSE
+  defect (cleared the slot on would-block); one classifier
+  (`ClientSlot::classify_io_error`) is now the only caller of `clear()`.
+- R11-C8 FIXED `d4978e93` — REASON put blanks DRVINFO (the reconnect
+  re-resolution is the real bug) and posts via the `MONITOR_STATUS_FIELDS`
+  snapshot.
+
+### Category E — simulation contract (5 commits, one owner)
+- R12-61 FIXED `bc90badc` — `recgbl::simm` module; the root cause named:
+  C's "no data" from a constant link is a SUCCESS (`dbConstGetValue` writes
+  nothing, returns 0); `SimLinkFetch::{Value,NoData,Failed}` makes the
+  conflation unrepresentable. Population defect found by the sweep: C
+  declares SVAL on 9 records, the port had 3 — six added (bi, event,
+  int64in, longin, mbbi, mbbiDirect).
+- R12-64 FIXED `682301d9` + `a93ee742` — `rec_gbl_save_simm`/`rec_gbl_check_simm`
+  perform C's genuine SCAN↔SSCN swap (USHRT_MAX opt-out included); the
+  iocInit I/O-Intr demotion was a hand-rolled bypass, now routed through the
+  single `set_scan` owner.
+- R12-65 FIXED `f1c63307` — both C shapes: `recGblGetSimm`'s direct
+  `nsta = LINK_ALARM` (SEVR stays NO_ALARM — quirk reproduced), and
+  busy/swait's `dbGetLink` → full LINK_ALARM/INVALID.
+- R11-C12 FIXED `8a0a2c13` — population re-derived from the C: 8 menuSimm
+  records keep RAW; 13 menuYesNo + busy take C's default arm (soft INVALID,
+  no substitution, and process continues — the `-1` is not an abort); swait
+  confirmed dropped (no switch in C). Keyed on the record's own menu arity,
+  not on the literal 2.
+
+### Category E — posting/alarm path (7 commits)
+- R11-C10 FIXED `ba2777fb` — the framework fix: `record_value_post` is the
+  private owner of `last_posted`; a put's post is the record's only post for
+  that put. Scaler's closed-set hook shrunk to its real C reason.
+- R12-62 FIXED `de7cb26a` — the DBE_LOG sweep is an independent push in the
+  builder (C emits two events for Sn on the completion cycle). The
+  pre-existing test asserting "exactly once" encoded the pre-fix model and
+  was corrected.
+- R11-C11 FIXED `56743aac` — `ProcessAction::ScanOnce`; the framework
+  executor owns C's `if (precord->scan)` gate.
+- R11-C14 FIXED `f3854e07` — transform on sCalc (non-finite → CALC_ALARM
+  via `sCalcPerform`'s `:2056` epilogue) + no VAL post from a process cycle
+  (fixed at `deadband_post`, honouring `process_posted_fields`).
+- R11-C15 FIXED `3f39e50d` — **the ODLY route from Round 12 is REFUTED**: the
+  delaying C cycle raises nsta/nsev before the ASYNC return and only
+  `recGblResetAlarms` clears them, so the continuation COMMITS the alarm in
+  both C and the port — no divergence there. The real defect at the same
+  anchor: acalcout read `calc_alarm` outside `check_alarms`, so a
+  limit/link-driven INVALID (IVOA=Set_output_to_IVOV) drove the calculated
+  value instead of IVOV. Closed with the `mem::take` one-consumer form; the
+  phantom `get_field("CALC_ALARM")` arm deleted.
+- R11-C13 FIXED `530382bb` — swait UDF has exactly C's two clear sites and no
+  alarm; `Record::raises_udf_alarm()` (default true) is where a record opts
+  out of the framework's UDF alarm. C-side sweep: only swait has a reachable
+  divergence; 16 other no-UDF-guard record types stay latent at the default.
+- R12-63 FIXED `b01e195e` — `accumulate(acc, coef, term)` single owner;
+  C's `if (coef)` guard on all six sites (the port had fused them to three).
+
+### Merge integrations (by main, on the merge commits)
+- The four subscriber-post builder loops conflicted (a-acalc's unification
+  vs e-records'/e-simm's in-place semantics). Resolution: adopt the
+  `collect_subscriber_posts` owner at all four sites and port the two
+  semantic changes INTO the owner (R12-62 independent LOG push; R11-C10
+  `posted_value`/`record_value_post`). Verified by the branches' own
+  negative-controlled tests on the merged tree.
+- `a299dbae` — transform bridged onto `scalc_perform` (e-records used
+  `scalc_result`, which a-scalc deleted); transform is C's psresult==NULL
+  caller, so it consumes `StackValue::to_double` only.
+- `915dd0e9` — c-pva's marked-leaves tests took the read guard; R11-C10 made
+  `notify_field` `&mut self`. Three test sites moved to the write guard.
+- `d3062924` — a doc table fenced as text (rustdoc tried to compile it).
+
+### Open Findings — surfaced during fix wave 10 (pending independent verify)
+
+Category A (calc engines):
+### W10-A1: MAX/MIN reject a double where C coerces — C pre-scans all args (`j |= isDouble`, sCalcPerform.c:1927) and coerces everything to double if any one is; the port checks only the first popped. Compiled: `MAX(4,"a")`=4, `MIN(4,"a")`=0; port raises TypeMismatch.
+### W10-A2: SUBLAST rejects a double where C coerces — C's `|-` (:980-988) is numeric subtraction when either operand is a double. Compiled: `4|-"."`=4, `"a.b"|-4`=−4; port raises TypeMismatch.
+### W10-A3: aCalc UNTIL cannot execute — the shared postfix now emits Until/UntilEnd for aCalc too, but `engine/array.rs` has no `Opcode::Control` arm (evals to `CalcError::Internal`). Check what C's aCalc actually does with UNTIL before porting.
+### W10-A4: dead opcode `StringOp::PushStringVar` — emitted by nothing after R11-C6; eval still has an arm. Cleanup.
+### W10-A5: aCalcout AMASK post carries the cycle's DBE_ALARM bits — C posts AMASK arrays with a literal DBE_VALUE|DBE_LOG (:295) but NEWM with `monitor_mask|…` (:1033); the port's hook posts both with alarm bits. Needs a per-field mask on the hook.
+### W10-A6: aCalcout AA..LL can still post on mere change — C's only two array posts are AMASK and NEWM; the port's change detection can invent an event (NELM/NUSE change path).
+### W10-A7: `sseq::put_field_internal` ends in bare `put_field`, dropping the DBF coercion for non-special-cased fields — `put_field_internal_default` (added 17d98eee) is the one-line fix.
+### W10-A8: aCalcout keeps link-delivered elements beyond `acalcGetNumElements` — invisible today, exposed by a later NUSE increase.
+
+Category B (CA tools):
+### W10-B1: `-w` negative timeout does not time out — C hands the negative to `ca_pend_io` (connect timeout, exit 1); the port clamps to the default and succeeds. `cli.rs:52-62` + the test that asserts the clamp.
+### W10-B2: `-e`/`-f`/`-g` precedence is fixed e>f>g, not getopt-order-last-wins — same shape as the fixed `-0`/`-d` race; `matches.indices_of` makes order recoverable.
+### W10-B3: camonitor prints an epoch stamp for an undefined timestamp where C prints `<undefined>`.
+### W10-B4: camonitor timestamp is 1 µs low vs C (7/7 paired invocations) — looks like truncation where C rounds ns→µs; root cause not chased.
+### W10-B5: cainfo prints the raw IP where C resolves the host name.
+
+Category C (PVA):
+### W10-C1 (upstream C++ candidate): QSRV's `singlesource.cpp:147` / `groupsource.cpp:399` call `MonitorSetupOp::connect()` bare, so a client field typo resets the whole TCP circuit; SharedPV shows the intended catch → `conn->error`. For the Upstream C defects section next catalogue pass.
+### W10-C2: the connect-time monitor seed synthesizes its bitset at frame time (decode-equivalent to pvxs today) — pin with a test so `canonical_changed_bitset` changes cannot silently drift the seed frame.
+### W10-C3: `put_get_masks` (PUT_GET INIT) has no pvxs counterpart — modelled on pvDatabaseCPP; the file's parity citation is to a different codebase there.
+
+Category D (asyn):
+### W10-D1: C refuses an asynRecord CNCT put on a disconnected port (no sentinel, addr>=0) — the port's Connect ops keep `Waived`. A C wart + knowing divergence; needs adjudication.
+### W10-D2: `asynCallbackSpecial` ends EVERY special callback in `monitorStatus` (asynRecord.c:897); the Rust OPTIONIV/EOS/CNCT arms do not repost. Same family as R11-C8, different arms.
+### W10-D3: no connect-time EOS readback in the Rust record (C: asynRecord.c:1291).
+### W10-D4: iocsh `asynSetEos` has no queue timeout (C: 2 s, asynShellCommands.c:245) — a wedged port hangs the shell.
+### W10-D5: the server subport ignores `disconnectOnReadTimeout` (drvAsynIPPort honours it).
+### W10-D6: `RequestOp::Report` is queued and therefore gated — C's `asynReport` is a direct call that works on a disabled/disconnected port.
+
+Category E (records/framework):
+### W10-E1: `.ACKS` can double-post in one cycle — excluded from neither the generic builder loop nor `alarm_posts`. (SEVR/STAT/AMSG/UDF are excluded; ACKS is not.)
+### W10-E2: scaler DLY>0 on a non-Passive record starts the count late — C's `delayCallbackFunc` calls `scanOnce` unconditionally on expiry; the port waits for the next periodic scan.
+### W10-E3: acalcout IVOV substitution target — C sets ONLY `oval` (:934) and the device support picks the OUT buffer per DOPT/NELM, so IVOA is a no-op on OUT under DOPT=Use_VAL; the port writes VAL+AVAL / OVAL+OAV and always sources arrays. Module doc declares the deviation deliberate — needs adjudication (the two halves must move together if C parity is wanted).
+### W10-E4: a failed SIOL read raises no LINK_ALARM (C: dbGetLink → setLinkAlarm → LINK_ALARM/INVALID); only SIMM_ALARM is raised. Every SIOL-reading record.
+### W10-E5: busy does not abort on a failed SIML read — C returns before the device write (busyRecord.c:399-401); the port alarms but still writes.
+### W10-E6: SSCN/OLDSIMM are served on record types whose C dbd declares neither (CommonFields placement; OLDSIMM newly joins the pre-existing SSCN entry in KNOWN_NON_FIELDLIST). Disclosed structural trade-off.
+### W10-E7: aai/aao are not ported (2 of C's 21 SSCN records); their table entries are inert.
+### W10-E8: a simulated histogram is frozen (SIOL→VAL no-ops against the bin array). Pre-existing, documented in a processing.rs comment.
+
+### ARANDOM (report-only)
+The a-acalc fixer's one-line recommendation: keep the deviation but make it
+opt-in deterministic — fixed default seed matching C's thread-private LCG so
+parity tests replay, time-seeding behind an explicit call. Still awaiting the
+user's disposition; code untouched.

@@ -12,12 +12,6 @@ use crate::calc::math::{derivative, fitting, stats};
 /// uses NaN and sCalc returns an error.
 const MY_MAXFLOAT: f64 = 1e35f32 as f64;
 
-/// C `until_scratch[MAX_UNTIL_OP]` with `MAX_UNTIL_OP 10` (`aCalcPerform.c:297`,
-/// `:307`), guarded by `if (i > (MAX_UNTIL_OP-1)) return(-1)` (`:369-373`).
-/// Compiled aCalc fails the perform on the tenth distinct UNTIL, so the usable
-/// ceiling is nine — the same ceiling sCalc has.
-const MAX_UNTILS: usize = 9;
-
 /// C `volatile int aCalcLoopMax = 1000` (`aCalcPerform.c:70`), exported to the ioc
 /// shell with `epicsExportAddress(int, aCalcLoopMax)` — a settable global, not a
 /// constant, and a SEPARATE one from `sCalcLoopMax`. It bounds the TOTAL number of
@@ -74,6 +68,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     if expr.is_empty() {
         return Err(CalcError::EmptyProgram);
     }
+
+    // C's static UNTIL pre-scan (`:355-390`), which runs before any opcode does and
+    // fails the perform outright when the postfix holds more than nine of them.
+    expr.check_until_ceiling()?;
 
     // C `:326` — `*amask = 0`, before a single opcode runs. The mask means "array
     // fields THIS run stored into", so the engine that runs it is its only owner: no
@@ -961,16 +959,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     let until_pc = pc - 1;
                     match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
                         Some((_, depth)) => *depth = stack.len(),
-                        None => {
-                            // C's `until_scratch[MAX_UNTIL_OP]` with
-                            // `if (i > (MAX_UNTIL_OP-1)) return(-1)` (`:369-373`):
-                            // the TENTH distinct UNTIL fails the perform, so nine
-                            // is the ceiling.
-                            if until_marks.len() >= MAX_UNTILS {
-                                return Err(CalcError::Overflow);
-                            }
-                            until_marks.push((until_pc, stack.len()));
-                        }
+                        // No ceiling to enforce here — `check_until_ceiling` refused
+                        // a program with more than nine UNTILs before the first
+                        // opcode ran. This table is a location map, nothing more.
+                        None => until_marks.push((until_pc, stack.len())),
                     }
                 }
                 // C `:1569-1590`, in this order:

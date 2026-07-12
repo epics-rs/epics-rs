@@ -65,6 +65,44 @@ impl CompiledExpr {
             .all(|op| matches!(op, Opcode::Core(opcodes::CoreOp::End)))
     }
 
+    /// C's UNTIL ceiling — a STATIC pre-scan of the whole postfix, run before a
+    /// single opcode executes (`sCalcPerform.c:341-365`, and `aCalcPerform.c:355-390`
+    /// with `MAX_UNTIL_OP` for the literal 10):
+    ///
+    /// ```c
+    /// /* find all UNTIL operators in postfix, noting their locations */
+    /// for (i=0, post=postfix; *post != END_EXPRESSION; post++) {
+    ///     switch (*post) {
+    ///     case UNTIL:
+    ///         until_scratch[i].until_loc = post;
+    ///         i++;
+    ///         if (i>9) { printf("sCalcPerform: too many UNTILs\n"); return(-1); }
+    ///         break;
+    ///     ...
+    /// ```
+    ///
+    /// The count is of UNTIL **opcodes present**, not of UNTILs executed, so
+    /// reachability is irrelevant: compiled C fails
+    /// `0?(UNTIL(1)+…ten of them…):7` with -1 even though the conditional never
+    /// takes that branch — and runs the nine-UNTIL version to 7.
+    ///
+    /// Both evaluators used to count at RUN time instead, incrementing as each new
+    /// UNTIL was first reached, so the ten-on-a-dead-branch program evaluated
+    /// happily. This is the single owner of the ceiling for both of them; the
+    /// scratch table each keeps at run time is now only a location map, with no
+    /// ceiling of its own to enforce.
+    pub fn check_until_ceiling(&self) -> Result<(), CalcError> {
+        let untils = self
+            .code
+            .iter()
+            .filter(|op| matches!(op, Opcode::Control(opcodes::ControlOp::Until(_))))
+            .count();
+        if untils > MAX_UNTILS {
+            return Err(CalcError::Overflow);
+        }
+        Ok(())
+    }
+
     /// Compute which input arguments this expression reads and which it
     /// stores into, equivalent to C `calcArgUsage` (`calcPerform.c:429-507`).
     ///
@@ -152,6 +190,12 @@ pub(crate) fn subrange_bounds(i: i64, j: i64, k: i64) -> (i64, i64) {
 /// fields A..U). Doubled-letter previous-value slots (LA..LU) and any
 /// per-record array slots scale to the same size.
 pub const CALC_NARGS: usize = 21;
+
+/// C's `until_scratch[10]` guarded by `if (i>9) return(-1)` (`sCalcPerform.c:329`,
+/// `:356-360`) and aCalc's `MAX_UNTIL_OP 10` with `if (i > (MAX_UNTIL_OP-1))`
+/// (`aCalcPerform.c:297`, `:369-373`). The TENTH distinct UNTIL fails the perform,
+/// so the usable ceiling is nine — the same in both engines.
+const MAX_UNTILS: usize = 9;
 
 #[derive(Debug, Clone)]
 pub struct NumericInputs {

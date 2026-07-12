@@ -14,6 +14,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         return Err(CalcError::EmptyProgram);
     }
 
+    // C's static UNTIL pre-scan (`:341-365`), which runs before any opcode does and
+    // fails the perform outright when the postfix holds more than nine of them —
+    // whether or not they are ever reached.
+    expr.check_until_ceiling()?;
+
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -736,15 +741,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let until_pc = pc - 1;
                     match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
                         Some((_, depth)) => *depth = stack.len(),
-                        None => {
-                            // C's `until_scratch[10]` with `if (i>9) return(-1)`
-                            // (`:356-360`) — compiled C fails the perform on the
-                            // TENTH distinct UNTIL, so nine is the ceiling.
-                            if until_marks.len() >= MAX_UNTILS {
-                                return Err(CalcError::Overflow);
-                            }
-                            until_marks.push((until_pc, stack.len()));
-                        }
+                        // No ceiling to enforce here: the program cannot hold more
+                        // than nine UNTILs, because `check_until_ceiling` refused it
+                        // before the first opcode ran. This table is a location map,
+                        // nothing more.
+                        None => until_marks.push((until_pc, stack.len())),
                     }
                 }
                 super::opcodes::ControlOp::UntilEnd(start_pc) => {
@@ -972,11 +973,6 @@ fn hunt_double(s: &[u8]) -> f64 {
 /// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
 /// are written around. It is sCalc's alone: base and aCalc compare exactly.
 const SMALL: f64 = 1e-11;
-
-/// C `until_scratch[10]` guarded by `if (i>9) return(-1)` (`sCalcPerform.c:329`,
-/// `:356-360`). Compiled sCalc fails the perform on the tenth distinct UNTIL, so
-/// the usable ceiling is nine.
-const MAX_UNTILS: usize = 9;
 
 /// C `volatile int sCalcLoopMax = 1000` (`sCalcPerform.c:52`), exported to the
 /// ioc shell with `epicsExportAddress(int, sCalcLoopMax)` — a settable global,

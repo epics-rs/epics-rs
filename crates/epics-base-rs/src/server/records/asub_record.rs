@@ -121,6 +121,30 @@ pub struct ASubRecord {
     /// subroutine only when SNAM differs from ONAM; ONAM is set to SNAM on a
     /// successful swap.
     pub onam: PvString,
+    /// This cycle's C `process` status, delivered by the framework's single
+    /// `do_sub` owner through [`Record::set_subroutine_status`]. C pushes every
+    /// OUT link only under `if (!status)` (aSubRecord.c:232-239), so this is the
+    /// whole gate: `0` drives OUTA..OUTU, anything else drives nothing. A record
+    /// that has never processed starts non-zero — no outputs before the first
+    /// successful `do_sub`.
+    sub_status: i64,
+}
+
+/// `OUTA..OUTU` -> `VALA..VALU`, the pairs C's push loop walks
+/// (`dbPutLink(&(&prec->outa)[i], ..., (&prec->vala)[i], (&prec->neva)[i])`).
+fn asub_output_links() -> &'static [(&'static str, &'static str)] {
+    use std::sync::OnceLock;
+    static PAIRS: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    PAIRS.get_or_init(|| {
+        SUFFIX
+            .iter()
+            .map(|&c| {
+                let link: &'static str = Box::leak(format!("OUT{c}").into_boxed_str());
+                let val: &'static str = Box::leak(format!("VAL{c}").into_boxed_str());
+                (link, val)
+            })
+            .collect()
+    })
 }
 
 impl Default for ASubRecord {
@@ -145,9 +169,17 @@ impl Default for ASubRecord {
             lflg: 0,
             subl: String::new(),
             onam: PvString::new(),
+            // Never processed: C's `status` is only 0 after a `do_sub` that
+            // returned 0, so nothing is driven out before then.
+            sub_status: SUBROUTINE_NOT_RUN,
         }
     }
 }
+
+/// The `sub_status` of a record that has not yet completed a `do_sub` — any
+/// non-zero value; C's `status` is a `long` that only a successful `do_sub`
+/// leaves at 0.
+const SUBROUTINE_NOT_RUN: i64 = -1;
 
 /// Parse a per-channel field name into `(prefix, channel index)`.
 /// E.g. `"INPC"` -> `("INP", 2)`, `"VALU"` -> `("VAL", 20)`,
@@ -545,6 +577,39 @@ impl Record for ASubRecord {
     /// `dbGetLink` and `process` (216-218) then skips `do_sub`.
     fn input_fetch_policy(&self) -> InputFetchPolicy {
         InputFetchPolicy::AbortOnFirstFailure
+    }
+
+    /// The cycle status from the framework's single `do_sub` owner. Stored
+    /// verbatim; [`Self::multi_output_links`] is its only reader.
+    fn set_subroutine_status(&mut self, status: i64) {
+        self.sub_status = status;
+    }
+
+    /// C `aSubRecord.c::process` (232-239) pushes EVERY output link once the
+    /// cycle's status is 0:
+    ///
+    /// ```c
+    /// if (!status) {
+    ///     for (i = 0; i < NUM_ARGS; i++)
+    ///         dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], (&prec->vala)[i],
+    ///             (&prec->neva)[i]);
+    /// }
+    /// ```
+    ///
+    /// The port stored OUTA..OUTU and never wrote them, so a subroutine's
+    /// results reached VALA..VALU (and CA monitors on them) but no downstream
+    /// record. `status` is 0 only when `fetch_values` succeeded AND `do_sub` ran
+    /// and returned 0, so a failed input link, an unresolved SNAM and a
+    /// subroutine that reported failure each suppress every push — the gate is
+    /// the status itself, not a per-link condition. The framework's generic
+    /// `multi_output_links` dispatch skips an empty link name, which is C's
+    /// `dbPutLink` on an unset link (a no-op).
+    fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
+        if self.sub_status == 0 {
+            asub_output_links()
+        } else {
+            &[]
+        }
     }
 }
 

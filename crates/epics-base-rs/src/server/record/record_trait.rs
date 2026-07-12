@@ -1129,6 +1129,29 @@ pub trait Record: Send + Sync + 'static {
     /// pattern as [`Record::set_resolved_input_links`].
     fn set_fetch_gate_failed(&mut self, _failed: bool) {}
 
+    /// Report this cycle's subroutine status — C `process`'s `status` variable
+    /// for `sub`/`aSub`:
+    ///
+    /// ```c
+    /// status = fetch_values(prec);
+    /// if (!status) { status = do_sub(prec); prec->val = status; }
+    /// ...
+    /// if (!status)                      /* aSubRecord.c:232-239 */
+    ///     for (i = 0; i < NUM_ARGS; i++)
+    ///         dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], (&prec->vala)[i],
+    ///             (&prec->neva)[i]);
+    /// ```
+    ///
+    /// so `0` — and only `0` — means the input fetch succeeded AND `do_sub` ran
+    /// and returned success. It is the gate on aSub's OUT-link pushes.
+    ///
+    /// Delivered by `RecordInstance::run_registered_subroutine`, the single
+    /// owner of the `do_sub` call, on every one of its exit paths (the
+    /// suppressed cycle, no bound routine, the routine's own return).
+    ///
+    /// Default: ignore (records with no subroutine).
+    fn set_subroutine_status(&mut self, _status: i64) {}
+
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())

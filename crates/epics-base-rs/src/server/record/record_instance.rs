@@ -379,6 +379,16 @@ pub struct RecordInstance {
     pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
 }
 
+/// The cycle status [`RecordInstance::run_registered_subroutine`] reports when
+/// `do_sub` was skipped — C's `fetch_values` failure / `S_db_BadSub` path, which
+/// leaves `process`'s `status` non-zero (aSubRecord.c:216-224).
+const SUBROUTINE_STATUS_SKIPPED: i64 = -1;
+/// No subroutine is bound: C `do_sub` returns `S_db_BadSub` (aSubRecord.c:255).
+const SUBROUTINE_STATUS_NO_SUB: i64 = -2;
+/// The bound subroutine returned `Err` — no C counterpart (a C subroutine
+/// returns a `long`), and a failed cycle either way.
+const SUBROUTINE_STATUS_ERROR: i64 = -3;
+
 /// C `monitor()`'s post of the deadband field, as assembled by the single owner
 /// [`RecordInstance::deadband_post`].
 pub(crate) struct DeadbandPost {
@@ -2014,23 +2024,42 @@ impl RecordInstance {
     /// `sub`/`aSub` runs identically regardless of how it is processed.
     /// Previously only `process_local` invoked the subroutine, so on the
     /// main engine path `VAL`/`VALA..VALU`/`OUTA..OUTU` never updated.
+    /// The cycle's status is delivered to the record on EVERY exit path — see
+    /// [`Record::set_subroutine_status`], which aSub's OUT-link gate reads. The
+    /// delivery is factored out of the body below so a future early return
+    /// cannot skip it: the body returns the status, this wrapper publishes it.
     pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
+        let outcome = self.run_subroutine_body();
+        // A subroutine that errored out has no C counterpart (a C subroutine
+        // returns a `long`); it is a failed cycle, so it takes the non-zero
+        // arm — no outputs.
+        let status = *outcome.as_ref().unwrap_or(&SUBROUTINE_STATUS_ERROR);
+        self.record.set_subroutine_status(status);
+        outcome.map(|_| ())
+    }
+
+    /// Returns C `process`'s `status` for this cycle: 0 only when `do_sub` ran
+    /// and returned 0.
+    fn run_subroutine_body(&mut self) -> CaResult<i64> {
         use crate::server::recgbl::{self, alarm_status};
 
         // aSub `LFLG=READ`: a `SUBL` re-resolution that found a bad/unregistered
         // name (C `fetch_values` -> `S_db_BadSub`) or failed to read the link
         // signals "skip do_sub this cycle" — C `process` runs `do_sub` only on
-        // `!status`. One-shot: taken (cleared) whether or not a subroutine is
-        // set, so it never leaks into the next cycle. The single consumer of
-        // the flag, shared by every process path.
+        // `!status`. The framework's failed input-link fetch arms the same flag.
+        // One-shot: taken (cleared) whether or not a subroutine is set, so it
+        // never leaks into the next cycle. The single consumer of the flag,
+        // shared by every process path.
         if std::mem::take(&mut self.suppress_subroutine_run) {
-            return Ok(());
+            return Ok(SUBROUTINE_STATUS_SKIPPED);
         }
 
         // Clone the Arc so the borrow on `self.subroutine` is released
         // before we mutate `self.record` / `self.common` below.
         let Some(sub_fn) = self.subroutine.clone() else {
-            return Ok(());
+            // C `do_sub` with no bound routine returns `S_db_BadSub`
+            // (aSubRecord.c:255-258), so the cycle's status is non-zero.
+            return Ok(SUBROUTINE_STATUS_NO_SUB);
         };
         // C `do_sub` returns the subroutine's `long` status.
         let status = sub_fn(&mut *self.record)?;
@@ -2062,7 +2091,7 @@ impl RecordInstance {
                 .unwrap_or(AlarmSeverity::NoAlarm);
             recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::SOFT_ALARM, brsv);
         }
-        Ok(())
+        Ok(status)
     }
 
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.

@@ -326,42 +326,28 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::Atan2 => binary(&mut stack, |a, b| zip_map(a, b, |x, y| y.atan2(x)))?,
                 CoreOp::Fmod => binary(&mut stack, |a, b| zip_map(a, b, |x, y| x % y))?,
 
-                CoreOp::Max(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = pop_f64(&mut stack)?;
-                    for _ in 1..n {
-                        let v = pop_f64(&mut stack)?;
-                        if v > result || result.is_nan() {
-                            result = v;
-                        }
-                    }
-                    push(&mut stack, Double(result));
-                }
-                CoreOp::Min(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let mut result = pop_f64(&mut stack)?;
-                    for _ in 1..n {
-                        let v = pop_f64(&mut stack)?;
-                        if v < result || result.is_nan() {
-                            result = v;
-                        }
-                    }
-                    push(&mut stack, Double(result));
-                }
-                CoreOp::MaxVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    push(&mut stack, Double(if a > b { a } else { b }));
-                }
-                CoreOp::MinVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    push(&mut stack, Double(if a < b { a } else { b }));
-                }
+                // The vararg `MAX()`/`MIN()` — C `:1155-1191`. See [`vararg_extremum`].
+                CoreOp::Max(nargs) => vararg_extremum(
+                    &mut stack,
+                    *nargs as usize,
+                    inputs.array_size,
+                    Extremum::Max,
+                )?,
+                CoreOp::Min(nargs) => vararg_extremum(
+                    &mut stack,
+                    *nargs as usize,
+                    inputs.array_size,
+                    Extremum::Min,
+                )?,
+                // `>?` and `<?` are ordinary members of C's two-arg dispatch
+                // (`aCalcPerform.c:1326-1327` lists MAX_VAL/MIN_VAL alongside the
+                // comparisons), so an array operand on EITHER side yields an
+                // element-wise ARRAY. The port collapsed both operands to their
+                // a[0] and answered a scalar, which a record then broadcast into
+                // AVAL. [`max_val`]/[`min_val`] carry the one formula C uses in all
+                // three operand shapes; `zip_map` is C's promotion.
+                CoreOp::MaxVal => binary(&mut stack, |a, b| zip_map(a, b, max_val))?,
+                CoreOp::MinVal => binary(&mut stack, |a, b| zip_map(a, b, min_val))?,
 
                 CoreOp::StoreVar(idx) => {
                     // C `STORE_A..STORE_P` (`:456-464`) — `p_dArg[i] = ps->d`, a write
@@ -1067,6 +1053,135 @@ fn domain_guarded(v: ArrayStackValue, f: fn(f64) -> f64, status: &mut Status) ->
     }
 }
 
+/// C's `MAX_VAL` — the `>?` operator. ONE formula, used verbatim in all THREE
+/// operand shapes of C's two-arg dispatch: array/array (`:1351`), array/scalar
+/// (`:1376`) and scalar/scalar (`:1403`) are each `if (x < y) x = y`.
+///
+/// It is deliberately not `f64::max`. The comparison is the bare C one, so a NaN
+/// is not "the missing value" it is for IEEE maxNum — it simply loses every
+/// comparison, and which operand holds it decides the answer. Compiled C:
+/// `5 >? NaN` is 5 (the `<` is false, so the left operand stands), while
+/// `NaN >? 5` is NaN (likewise false, and the left operand is the NaN).
+fn max_val(x: f64, y: f64) -> f64 {
+    if x < y { y } else { x }
+}
+
+/// C's `MIN_VAL` — `<?`, the mirror image (`:1352`, `:1377`, `:1404`).
+fn min_val(x: f64, y: f64) -> f64 {
+    if x > y { y } else { x }
+}
+
+/// Which of the two extremum operators is running. The point of the type is that
+/// C's `case MAX:` and `case MIN:` are ONE arm distinguished by a single `op ==
+/// MAX` test (`:1155-1191`), so the two must not drift apart into copied loops.
+#[derive(Clone, Copy)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+impl Extremum {
+    /// C's ARRAY-branch element rule (`:1166-1175`): `if (other > acc) acc = other`
+    /// for MAX. That is exactly the `>?` formula, which is why this delegates to it
+    /// rather than restating the comparison — one rule, two operators.
+    fn fold_element(self, acc: f64, other: f64) -> f64 {
+        match self {
+            Extremum::Max => max_val(acc, other),
+            Extremum::Min => min_val(acc, other),
+        }
+    }
+
+    /// C's SCALAR-branch keep test (`:1185`, `:1187`) — `ps->d < d` for MAX. Note
+    /// this is NOT the array rule: the scalar branch alone carries an `isnan` test,
+    /// which is why it cannot reuse [`Self::fold_element`]. See [`vararg_extremum`].
+    fn keeps(self, arg: f64, acc: f64) -> bool {
+        match self {
+            Extremum::Max => arg < acc,
+            Extremum::Min => arg > acc,
+        }
+    }
+}
+
+/// C's vararg `MAX()`/`MIN()` (`aCalcPerform.c:1155-1191`) — one opcode with two
+/// branches, chosen by whether ANY argument is an array (`:1159`, `j |=
+/// isArray(ps-i)`). The port answered a scalar built from each argument's a[0] in
+/// both, so a record's AVAL got a broadcast scalar instead of the element-wise
+/// extremum.
+///
+/// **Array branch** (`:1161-1178`). C coerces the BOTTOMMOST argument with
+/// `toArray(ps1,1)` and folds every other argument into it, so:
+///
+/// * the result cell is the FIRST argument's — it keeps that argument's window,
+///   and a scalar first argument brings `toArray`'s cleared window (and its NaN->0
+///   fill) with it. Compiled C, arraySize 6, AA=[1,5,2,8,3,9]:
+///   `AVG(MAX(AA[1,3],0))` is 5 (the 3-element window survives) while
+///   `AVG(MAX(0,AA[1,3]))` is 2.5 (the promoted scalar's window is the whole
+///   buffer, so the fold's zero tail counts).
+/// * the other arguments are read over the WHOLE `arraySize` buffer, not their
+///   windows (`for (i=0; i<arraySize; i++)`).
+/// * the fold is a bare comparison with no NaN test, so a NaN argument never wins.
+///   Compiled C: `MAX(AA,NaN)` is AA unchanged.
+///
+/// **Scalar branch** (`:1180-1189`). C starts the accumulator at the TOPMOST (last)
+/// argument and folds DOWN through the earlier ones, and this branch — unlike the
+/// array one — carries `|| isnan(d)`:
+///
+/// ```c
+/// while (--nargs) { d = ps->d; DEC(ps); if (ps->d < d || isnan(d)) ps->d = d; }
+/// ```
+///
+/// The running value therefore WINS whenever it is NaN, and a NaN argument that
+/// arrives later replaces a healthy running value (it is not `<` it). Either way a
+/// NaN anywhere in the list reaches the end: compiled C, `MAX(5,NaN)` and
+/// `MAX(NaN,5)` are both NaN (status -1). The port's test was inverted — it
+/// DISCARDED a NaN accumulator — so both answered 5.
+fn vararg_extremum(
+    stack: &mut Vec<Cell>,
+    nargs: usize,
+    array_size: usize,
+    op: Extremum,
+) -> Result<(), CalcError> {
+    let args = popn(stack, nargs)?;
+    if args.is_empty() {
+        return Err(CalcError::Underflow);
+    }
+
+    let result = if args.iter().any(ArrayStackValue::is_array) {
+        let mut it = args.into_iter();
+        let mut acc = it.next().ok_or(CalcError::Underflow)?.into_cell(array_size);
+        for arg in it {
+            match arg {
+                ArrayStackValue::Array(other) => {
+                    for (a, &o) in acc.buf_mut().iter_mut().zip(other.buf()) {
+                        *a = op.fold_element(*a, o);
+                    }
+                }
+                Double(d) => {
+                    for a in acc.buf_mut() {
+                        *a = op.fold_element(*a, d);
+                    }
+                }
+            }
+        }
+        ArrayStackValue::Array(acc)
+    } else {
+        let vals: Vec<f64> = args
+            .iter()
+            .map(ArrayStackValue::as_f64)
+            .collect::<Result<_, _>>()?;
+        let mut acc = *vals.last().ok_or(CalcError::Underflow)?;
+        for &arg in vals.iter().rev().skip(1) {
+            if !op.keeps(arg, acc) && !acc.is_nan() {
+                acc = arg;
+            }
+        }
+        Double(acc)
+    };
+
+    push(stack, result);
+    Ok(())
+}
+
 /// C's unary array-operator dispatch (`aCalcPerform.c:769-1101`) is ONE operator
 /// with TWO branches, chosen by the operand's shape:
 ///
@@ -1338,12 +1453,6 @@ fn popn(stack: &mut Vec<Cell>, n: usize) -> Result<Vec<ArrayStackValue>, CalcErr
 
 fn pop_f64(stack: &mut Vec<Cell>) -> Result<f64, CalcError> {
     pop(stack)?.v.as_f64()
-}
-
-fn pop2_f64(stack: &mut Vec<Cell>) -> Result<(f64, f64), CalcError> {
-    let b = pop_f64(stack)?;
-    let a = pop_f64(stack)?;
-    Ok((a, b))
 }
 
 /// Forward-scan for a matching conditional opcode, mirroring C `cond_search`

@@ -87,11 +87,17 @@
 //!   raised `nsev`). Mirrors the framework-wide `rec_gbl_set_sevr` (returns
 //!   void); a higher pre-existing severity can thus perturb next-cycle
 //!   hysteresis vs C.
-//! - In-place array-variable mutation: C `aCalcPerform` may modify the input
-//!   arrays `aa..ll`, and `monitor()` re-posts each array flagged in `newm`
-//!   (aCalcoutRecord.c:1031-1035). The engine evaluates over a clone, so
-//!   mutations are dropped and `AMASK`/`NEWM` stay inert (only `AVAL`/`OAV`
-//!   results are captured). Advanced/uncommon aCalc usage.
+//! - `NEWM` — C sets it in `fetch_values` when an INAA..INLL link delivers an
+//!   array DIFFERENT from the one the field held (aCalcoutRecord.c:1105), and
+//!   `monitor()` posts those arrays and clears it (`:1031-1036`). The port's
+//!   input-link fetch does not compute it, so `NEWM` stays 0 and the changed
+//!   input arrays are posted by the framework's change detection instead.
+//!   (`AMASK` — the arrays the EXPRESSION stored into — is a different mask and
+//!   is computed; see [`AcalcoutRecord::apply_stores`].)
+//! - Array posting is change-gated, not write-gated. C `afterCalc` posts every
+//!   array field flagged in `AMASK` (`:293-297`), so a store that writes the value
+//!   the field already held still posts. The framework posts on change, so that
+//!   one case posts nothing here.
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
@@ -107,6 +113,23 @@ use super::link_status::LINK_CON;
 
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
 const VERSION: f64 = 1.4;
+
+/// Everything one `aCalcPerform` call changed — its result, and the variable stores
+/// it made on the way there.
+///
+/// C does not need this type: it hands aCalcPerform pointers into the record, so a
+/// store IS the record write and the caller reads the effect back out of its own
+/// fields. The engine here works on an owned [`ArrayInputs`], so the effect is
+/// returned as a value and applied by one owner ([`AcalcoutRecord::apply_stores`]).
+/// Splitting the result from the stores is what makes C's DEFERRED status honest:
+/// a failing expression writes no VAL/AVAL, but the stores it already made stand.
+struct CalcPass {
+    /// `None` when aCalcPerform returned -1 before writing a result.
+    result: Option<(f64, Vec<f64>, bool)>,
+    /// `A..L` / `AA..LL` as the pass left them, plus [`ArrayInputs::amask`] — the
+    /// array fields it stored into.
+    inputs: ArrayInputs,
+}
 
 const ARR_NAMES: [&str; 12] = [
     "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
@@ -357,23 +380,32 @@ impl AcalcoutRecord {
     /// Evaluate a compiled expression over the current inputs. `prev_val` seeds
     /// the `VAL` token (see [`Self::build_inputs`]).
     ///
-    /// `Some((scalar, array, finite))` — the result is returned even when
-    /// non-finite, because C `aCalcPerform` stores `*p_dresult`/`aval`
-    /// unconditionally and only *then* returns -1 for a NaN/Inf scalar
-    /// (`aCalcPerform.c:1622-1644`). `finite=false` carries that -1 so the
-    /// caller writes the NaN/Inf into VAL/AVAL (matching C, which drives it to
-    /// OUT under the default `IVOA=Continue`) and still raises CALC_ALARM.
-    /// `None` — the engine could not produce any result (rare for a compiled
-    /// expression); the caller leaves VAL/AVAL unchanged.
+    /// The pass returns EVERYTHING it changed, not just its result, because a C
+    /// aCalcPerform call changes more than its result: C hands it pointers to the
+    /// record's own `a..p` and `aa..ll` fields (`aCalcoutRecord.c:1283-1285`), so a
+    /// store opcode (`A := ...`, `AA := ...`) writes the record IN PLACE. The engine
+    /// here evaluates over an owned [`ArrayInputs`], so the pass hands its effect
+    /// back and [`Self::apply_stores`] is the one place that lands it.
+    ///
+    /// `result`:
+    /// * `Some((scalar, array, finite))` — `finite=false` still carries a result,
+    ///   because C stores `*p_dresult`/`aval` and only *then* returns -1 for a
+    ///   NaN/Inf scalar (`aCalcPerform.c:1622-1644`); the caller writes the NaN/Inf
+    ///   into VAL/AVAL (C drives it to OUT under the default `IVOA=Continue`) and
+    ///   still raises CALC_ALARM.
+    /// * `None` — aCalcPerform returned -1 before writing a result (`:1602-1605`), so
+    ///   VAL/AVAL keep their previous values. The STORES still stand: C's status is
+    ///   deferred to the end of the expression, and the stores it already made went
+    ///   straight into the record's fields on the way there.
     fn eval(
         &self,
         compiled: &CompiledExpr,
         n: usize,
         prev_val: f64,
         prev_aval: &[f64],
-    ) -> Option<(f64, Vec<f64>, bool)> {
+    ) -> CalcPass {
         let mut inputs = self.build_inputs(n, prev_val, prev_aval);
-        match acalc_eval(compiled, &mut inputs) {
+        let result = match acalc_eval(compiled, &mut inputs) {
             Ok(result) => {
                 let v = result.as_f64().unwrap_or(0.0);
                 // C fills AVAL from a scalar result with `toArray(ps,1)`
@@ -385,6 +417,31 @@ impl AcalcoutRecord {
                 Some((v, arr, v.is_finite()))
             }
             Err(_) => None,
+        };
+        CalcPass { result, inputs }
+    }
+
+    /// Land one pass's variable stores back into the record's fields — C's store
+    /// opcodes writing through the pointers it was handed (`aCalcPerform.c:456-491`).
+    ///
+    /// The single owner of that write-back: no other path may copy an `ArrayInputs`
+    /// into `num_vals`/`arr_vals`, so a store cannot land without its AMASK bit and a
+    /// bit cannot be set without its store. The caller owns AMASK's accumulation
+    /// across the two passes, because C does: the CALC pass is handed `&pcalc->amask`
+    /// and resets it (`:326`), and the OCAL pass ORs its own mask in
+    /// (`aCalcoutRecord.c:1289-1291`).
+    ///
+    /// Only the first `n` elements of an array field are written — C's store loops run
+    /// `j < arraySize` (`:483-486`), where arraySize is NUSE (or NELM), so elements
+    /// past NUSE keep whatever the field already held.
+    fn apply_stores(&mut self, inputs: &ArrayInputs, n: usize) {
+        let scalars = self.num_vals.len();
+        self.num_vals.copy_from_slice(&inputs.num_vars[..scalars]);
+        for (dst, src) in self.arr_vals.iter_mut().zip(&inputs.arrays) {
+            if dst.len() < n {
+                dst.resize(n, 0.0);
+            }
+            dst[..n].copy_from_slice(&src[..n]);
         }
     }
 
@@ -1295,7 +1352,13 @@ impl Record for AcalcoutRecord {
         let mut calc_failed = false;
         // CALC pass: the `VAL` token reads `prec->val` (this pass's result
         // field) before it is overwritten.
-        match self.eval(&self.compiled_calc, n, self.val, &self.aval) {
+        let pass = self.eval(&self.compiled_calc, n, self.val, &self.aval);
+        // C passes `&pcalc->amask` straight into aCalcPerform, which zeroes it at
+        // entry (`aCalcPerform.c:326`) — so the CALC pass REPLACES the record's mask
+        // and nothing carries over from the previous process.
+        self.amask = pass.inputs.amask;
+        self.apply_stores(&pass.inputs, n);
+        match pass.result {
             Some((v, arr, finite)) => {
                 self.val = v;
                 self.aval = arr;
@@ -1312,7 +1375,16 @@ impl Record for AcalcoutRecord {
             // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
             // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
             // OCAL accumulator like "VAL+1" runs on OVAL.
-            match self.eval(&self.compiled_ocal, n, self.oval, &self.oav) {
+            //
+            // It sees the CALC pass's stores, because C's two calls share the same
+            // record fields — which is why `apply_stores` above must land before this
+            // `eval` rebuilds its inputs from them.
+            let pass = self.eval(&self.compiled_ocal, n, self.oval, &self.oav);
+            // C `aCalcoutRecord.c:1289-1291` — the OCAL pass gets a LOCAL mask that is
+            // then OR'd in, so a CALC-pass store stays flagged.
+            self.amask |= pass.inputs.amask;
+            self.apply_stores(&pass.inputs, n);
+            match pass.result {
                 Some((v, arr, finite)) => {
                     self.oval = v;
                     self.oav = arr;

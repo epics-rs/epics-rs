@@ -52,6 +52,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
         return Err(CalcError::EmptyProgram);
     }
 
+    // C `:326` — `*amask = 0`, before a single opcode runs. The mask means "array
+    // fields THIS run stored into", so the engine that runs it is its only owner: no
+    // caller may pre-set it, and every caller may trust it afterwards.
+    inputs.amask = 0;
+
     let mut stack: Vec<Cell> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -370,18 +375,30 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 }
 
                 CoreOp::StoreVar(idx) => {
+                    // C `STORE_A..STORE_P` (`:456-464`) — `p_dArg[i] = ps->d`, a write
+                    // straight into the record's A..P field.
                     let v = pop_f64(&mut stack)?;
                     inputs.num_vars[*idx as usize] = v;
                 }
                 CoreOp::StoreDoubleVar(idx) => {
+                    // C `STORE_AA..STORE_LL` (`:466-491`): the WHOLE arraySize buffer
+                    // is written into the record's array field, and the field is then
+                    // MARKED — `*amask |= 1<<i` — which is how the record learns to
+                    // post it.
+                    //
+                    // A scalar value is BROADCAST across the buffer (`pd[j] = ps->d`,
+                    // `:485`) and not run through `toArray`, so — unlike everywhere
+                    // else in aCalc — a NaN scalar stores NaN rather than zeros.
+                    // The port used to write the scalar into the SCALAR variable of the
+                    // same index instead, so `AA := 5` set A.
+                    let i = *idx as usize;
                     let v = pop(&mut stack)?.v;
-                    match v {
-                        ArrayStackValue::Array(cell) => {
-                            inputs.arrays[*idx as usize] = cell.into_buf();
-                        }
-                        Double(d) => {
-                            inputs.num_vars[*idx as usize] = d;
-                        }
+                    if i < inputs.arrays.len() {
+                        inputs.arrays[i] = match v {
+                            ArrayStackValue::Array(cell) => cell.into_buf(),
+                            Double(d) => vec![d; inputs.array_size],
+                        };
+                        inputs.amask |= 1 << i;
                     }
                 }
             },

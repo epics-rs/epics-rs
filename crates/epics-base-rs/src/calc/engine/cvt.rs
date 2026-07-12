@@ -123,17 +123,61 @@ pub fn to_string(v: f64) -> String {
 }
 
 /// C `printf`'s `%f`: `precision` fractional digits, always fixed-point.
-fn fmt_f(v: f64, precision: usize) -> String {
+pub fn fmt_f(v: f64, precision: usize) -> String {
     if !v.is_finite() {
         return non_finite(v, false);
     }
     format!("{v:.precision$}")
 }
 
+/// C `printf`'s `%g`/`%G` (C99 7.21.6.1p8): `%e` when the decimal exponent is
+/// below -4 or at least the precision, `%f` otherwise, and trailing zeros are
+/// dropped from the fraction either way — unless `alt` (the `#` flag) keeps them.
+/// A precision of 0 is taken as 1.
+pub fn fmt_g(v: f64, precision: usize, upper: bool, alt: bool) -> String {
+    if !v.is_finite() {
+        return non_finite(v, upper);
+    }
+    let p = precision.max(1);
+    // The exponent C tests is the one `%e` would PRINT at precision p-1 — i.e.
+    // after rounding, so 9.99e2 at p=2 is 1.0e3 and takes the `%e` branch.
+    let probe = format!("{v:.*e}", p - 1);
+    let exp: i32 = probe
+        .split_once('e')
+        .expect("Rust LowerExp always emits `e`")
+        .1
+        .parse()
+        .expect("Rust LowerExp always emits an integer");
+
+    let rendered = if exp < -4 || exp >= p as i32 {
+        fmt_e(v, p - 1, upper)
+    } else {
+        fmt_f(v, (p as i32 - 1 - exp).max(0) as usize)
+    };
+    if alt {
+        return rendered;
+    }
+    strip_trailing_zeros(&rendered)
+}
+
+/// `%g`'s trailing-zero removal: only within the fractional digits, and the
+/// decimal point goes with them.
+fn strip_trailing_zeros(s: &str) -> String {
+    let (num, suffix) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    };
+    if !num.contains('.') {
+        return s.to_string();
+    }
+    let trimmed = num.trim_end_matches('0').trim_end_matches('.');
+    format!("{trimmed}{suffix}")
+}
+
 /// C `printf`'s `%e`/`%E`: one digit, the fraction, then `e±` and AT LEAST TWO
 /// exponent digits. Rust's `{:e}` writes no sign and no padding (`1e16`), so the
 /// exponent is rebuilt here.
-fn fmt_e(v: f64, precision: usize, upper: bool) -> String {
+pub fn fmt_e(v: f64, precision: usize, upper: bool) -> String {
     if !v.is_finite() {
         return non_finite(v, upper);
     }
@@ -239,6 +283,21 @@ mod tests {
         assert_eq!(fmt_e(1.5e-7, 3, false), "1.500e-07");
         assert_eq!(fmt_e(1.5e120, 1, true), "1.5E+120");
         assert_eq!(fmt_e(0.0, 6, false), "0.000000e+00");
+    }
+
+    /// C `printf("%g")` of each.
+    #[test]
+    fn g_switches_form_and_drops_trailing_zeros() {
+        assert_eq!(fmt_g(100000.0, 6, false, false), "100000");
+        assert_eq!(fmt_g(1000000.0, 6, false, false), "1e+06");
+        assert_eq!(fmt_g(0.0001, 6, false, false), "0.0001");
+        assert_eq!(fmt_g(0.00001, 6, false, false), "1e-05");
+        assert_eq!(fmt_g(1e-7, 6, true, false), "1E-07");
+        assert_eq!(fmt_g(3.14159265, 6, false, false), "3.14159");
+        assert_eq!(fmt_g(1.5, 6, false, false), "1.5");
+        assert_eq!(fmt_g(0.0, 6, false, false), "0");
+        // `#` keeps them: C `printf("%#g", 1.5)`.
+        assert_eq!(fmt_g(1.5, 6, false, true), "1.50000");
     }
 
     /// The `%*.*e` branch of `cvtDoubleToString` at a precision the record can

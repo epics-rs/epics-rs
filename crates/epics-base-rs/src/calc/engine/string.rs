@@ -870,142 +870,325 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn simple_printf(bytes: &[u8], val: &StackValue) -> Result<Vec<u8>, CalcError> {
-    // Find first format specifier
-    let mut i = 0;
-    let mut result: Vec<u8> = Vec::new();
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'%' {
-                result.push(b'%');
-                i += 2;
-                continue;
-            }
-            // Parse format specifier: %[flags][width][.precision]type
-            let spec_start = i;
-            i += 1; // skip %
-            // Skip flags
-            while i < bytes.len() && matches!(bytes[i], b'-' | b'+' | b' ' | b'0' | b'#') {
-                i += 1;
-            }
-            // Skip width
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            // Skip precision
-            if i < bytes.len() && bytes[i] == b'.' {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            if i >= bytes.len() {
-                return Err(CalcError::InvalidFormat);
-            }
-            let spec = bytes[i];
-            i += 1;
-            let fmt_str =
-                std::str::from_utf8(&bytes[spec_start..i]).map_err(|_| CalcError::InvalidFormat)?;
-            match spec {
-                b'd' | b'i' => {
-                    let v = val.to_double() as i64;
-                    result.extend_from_slice(c_format_int(fmt_str, v).as_bytes());
-                }
-                b'f' | b'e' | b'g' | b'E' | b'G' => {
-                    let v = val.to_double();
-                    result.extend_from_slice(c_format_float(fmt_str, v).as_bytes());
-                }
-                b'x' | b'X' | b'o' => {
-                    let v = val.to_double() as i64;
-                    result.extend_from_slice(c_format_int(fmt_str, v).as_bytes());
-                }
-                b's' => match val {
-                    StackValue::Str(s) => result.extend_from_slice(s.as_bytes()),
-                    // C PRINTF (sCalcPerform.c:1553) `toString(ps1)` before the
-                    // snprintf, so `%s` of a double is cvtDoubleToString, not a
-                    // shortest-round-trip rendering.
-                    StackValue::Double(d) => {
-                        result.extend_from_slice(cvt::to_string(*d).as_bytes());
-                    }
-                },
-                _ => return Err(CalcError::InvalidFormat),
-            }
-            // Append rest of format string literally
-            result.extend_from_slice(&bytes[i..]);
-            return Ok(result);
-        } else {
-            result.push(bytes[i]);
-            i += 1;
-        }
-    }
-    // No format specifier found, return format string as-is
-    Ok(result)
-}
-
-fn c_format_int(fmt: &str, val: i64) -> String {
-    // Parse width and type from format string
-    let bytes = fmt.as_bytes();
-    let spec = bytes[bytes.len() - 1];
-    // Extract flags, width
-    let inner = &fmt[1..fmt.len() - 1]; // between % and type
-    let width: usize = inner
-        .trim_start_matches(|c: char| !c.is_ascii_digit())
-        .parse()
-        .unwrap_or(0);
-    let left_align = inner.contains('-');
-    let zero_pad = inner.starts_with('0') && !left_align;
-
-    let formatted = match spec {
-        b'd' | b'i' => format!("{}", val),
-        b'x' => format!("{:x}", val as u64),
-        b'X' => format!("{:X}", val as u64),
-        b'o' => format!("{:o}", val as u64),
-        _ => format!("{}", val),
-    };
-
-    if width > formatted.len() {
-        let pad = width - formatted.len();
-        if left_align {
-            format!("{}{}", formatted, " ".repeat(pad))
-        } else if zero_pad {
-            format!("{}{}", "0".repeat(pad), formatted)
-        } else {
-            format!("{}{}", " ".repeat(pad), formatted)
-        }
-    } else {
-        formatted
+/// C PRINTF (`sCalcPerform.c:1535-1567`).
+///
+/// ```c
+/// s = ps->s;
+/// while ((s1 = strstr(s, "%%"))) {s = s1+2;}          /* PAST the LAST "%%" */
+/// if (((s = strpbrk(s, "%")) == NULL) ||
+///     ((s = strpbrk(s+1, "*cdeEfgGiousxX")) == NULL)) {
+///     strcpy(tmpstr, ps->s);                          /* the RAW format */
+/// } else {
+///     switch (*s) {
+///     default: case '*':  return(-1);
+///     case 'c','d','i','o','u','x','X': toDouble(ps1); l = myNINT(ps1->d);
+///                                       snprintf(tmpstr, N, ps->s, l);    break;
+///     case 'e','E','f','g','G':         toDouble(ps1);
+///                                       snprintf(tmpstr, N, ps->s, ps1->d); break;
+///     case 's':                         toString(ps1);
+///                                       snprintf(tmpstr, N, ps->s, ps1->s); break;
+///     }
+/// }
+/// ```
+///
+/// Two things the port got wrong follow from that scan, and compiled C confirms
+/// both:
+///
+///   * When the scan finds no conversion, C copies the format RAW — `%%` and
+///     all. `PRINTF("100%%", x)` is `100%%`, not `100%`; and because the scan
+///     starts AFTER the last `%%`, a conversion that sits BEFORE one is not a
+///     conversion at all: `PRINTF("%.2f%%", 3.14159)` is the literal `%.2f%%`.
+///   * When it does find one, C hands the WHOLE format to `snprintf` with that
+///     single argument — so every flag, width and precision applies, and the
+///     `%%` earlier in the format collapse: `PRINTF("a%%b %5.2f!", 3.14159)` is
+///     `a%b  3.14!`.
+fn simple_printf(fmt: &[u8], val: &StackValue) -> Result<Vec<u8>, CalcError> {
+    match conversion_index(fmt) {
+        // `strcpy(tmpstr, ps->s)` — not a re-render of the format, a copy of it.
+        None => Ok(fmt.to_vec()),
+        // C's `case '*': return(-1)`. (Its `default:` is unreachable: the scan's
+        // strpbrk set contains nothing else.)
+        Some(i) if fmt[i] == b'*' => Err(CalcError::InvalidFormat),
+        Some(_) => Ok(c_snprintf(fmt, val)),
     }
 }
 
-fn c_format_float(fmt: &str, val: f64) -> String {
-    let bytes = fmt.as_bytes();
-    let spec = bytes[bytes.len() - 1];
-    let inner = &fmt[1..fmt.len() - 1];
+/// The conversion the C scan finds in a PRINTF/BIN_WRITE format — the index of
+/// the character, since BIN_WRITE also needs the `h`/`l` modifier in front of it
+/// (`s[-1]`). C runs the identical block in both (`sCalcPerform.c:1541-1544` and
+/// `:1574-1577`), so it is one function here; the two differ only in what they do
+/// when there is no conversion (PRINTF copies the format, BIN_WRITE fails).
+///
+/// This is NOT `findConversionIndicator` (`:105-150`), which SSCANF and BIN_READ
+/// use: that one also skips assign-suppressed conversions and knows `%[...]`.
+fn conversion_index(fmt: &[u8]) -> Option<usize> {
+    // `while ((s1 = strstr(s, "%%"))) {s = s1+2;}`
+    let mut s = 0usize;
+    while let Some(p) = find_sub(&fmt[s..], b"%%") {
+        s += p + 2;
+    }
+    // `if ((s = strpbrk(s, "%")) == NULL) ...`
+    let pct = find_byte(&fmt[s..], b'%')? + s;
+    // `if ((s = strpbrk(s+1, "*cdeEfgGiousxX")) == NULL) ...` — note this scans
+    // to the END of the format, not to the end of the spec.
+    let conv = fmt[pct + 1..]
+        .iter()
+        .position(|b| b"*cdeEfgGiousxX".contains(b))?;
+    Some(pct + 1 + conv)
+}
 
-    // Parse precision
-    let precision = if let Some(dot_pos) = inner.find('.') {
-        inner[dot_pos + 1..].parse::<usize>().unwrap_or(6)
-    } else {
-        6
+/// One conversion specification: `%[flags][width][.precision][length]conv`.
+struct Spec {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    alt: bool,
+    width: usize,
+    precision: Option<usize>,
+    conv: u8,
+    /// One past the conversion character.
+    end: usize,
+}
+
+/// Parse the spec that starts at `fmt[i] == b'%'`. `None` when what follows is
+/// not a conversion C would render (`%z`, a trailing `%`), which `snprintf` then
+/// emits literally.
+fn parse_spec(fmt: &[u8], i: usize) -> Option<Spec> {
+    let mut j = i + 1;
+    let (mut minus, mut plus, mut space, mut zero, mut alt) = (false, false, false, false, false);
+    while let Some(&c) = fmt.get(j) {
+        match c {
+            b'-' => minus = true,
+            b'+' => plus = true,
+            b' ' => space = true,
+            b'0' => zero = true,
+            b'#' => alt = true,
+            _ => break,
+        }
+        j += 1;
+    }
+    let mut width = 0usize;
+    while let Some(&c) = fmt.get(j) {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        width = width * 10 + (c - b'0') as usize;
+        j += 1;
+    }
+    let mut precision = None;
+    if fmt.get(j) == Some(&b'.') {
+        j += 1;
+        let mut p = 0usize;
+        while let Some(&c) = fmt.get(j) {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            p = p * 10 + (c - b'0') as usize;
+            j += 1;
+        }
+        precision = Some(p);
+    }
+    // Length modifiers: C passes a `long` or a `double` whatever the format says,
+    // so these change nothing here.
+    while matches!(
+        fmt.get(j),
+        Some(b'h' | b'l' | b'L' | b'q' | b'j' | b'z' | b't')
+    ) {
+        j += 1;
+    }
+    let conv = *fmt.get(j)?;
+    if !b"cdiouxXeEfgGs".contains(&conv) {
+        return None;
+    }
+    Some(Spec {
+        minus,
+        plus,
+        space,
+        zero,
+        alt,
+        width,
+        precision,
+        conv,
+        end: j + 1,
+    })
+}
+
+/// C `snprintf(tmpstr, TMPSTR_SIZE, format, arg)` with ONE argument: the format
+/// is walked from the start, `%%` becomes `%`, and the argument lands in the
+/// first conversion.
+///
+/// A format with a SECOND conversion is undefined behaviour in C (snprintf reads
+/// a vararg that was never passed), so there is no behaviour to match: the extra
+/// spec is copied out literally rather than fed an invented value.
+fn c_snprintf(fmt: &[u8], val: &StackValue) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    let mut consumed = false;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            out.push(fmt[i]);
+            i += 1;
+            continue;
+        }
+        if fmt.get(i + 1) == Some(&b'%') {
+            out.push(b'%');
+            i += 2;
+            continue;
+        }
+        match parse_spec(fmt, i) {
+            Some(spec) if !consumed => {
+                consumed = true;
+                out.extend_from_slice(&render_spec(&spec, val));
+                i = spec.end;
+            }
+            Some(spec) => {
+                out.extend_from_slice(&fmt[i..spec.end]);
+                i = spec.end;
+            }
+            None => {
+                out.push(fmt[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn render_spec(spec: &Spec, val: &StackValue) -> Vec<u8> {
+    let body = match spec.conv {
+        b's' => {
+            let text = val.clone().into_string_value();
+            let mut b = text.as_bytes().to_vec();
+            // `%.Ns` prints at most N bytes.
+            if let Some(p) = spec.precision {
+                b.truncate(p);
+            }
+            return pad(b, spec.width, spec.minus, false);
+        }
+        // C `l = myNINT(ps1->d)` and then a `%d`/`%x`/... conversion, which reads
+        // an INT out of the vararg: the value is the low 32 bits of that long.
+        b'c' | b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
+            let l = my_nint(val.to_double()) as i64;
+            return pad(render_int(spec, l), spec.width, spec.minus, spec.zero);
+        }
+        b'e' | b'E' => cvt::fmt_e(
+            val.to_double(),
+            spec.precision.unwrap_or(6),
+            spec.conv == b'E',
+        ),
+        b'f' => cvt::fmt_f(val.to_double(), spec.precision.unwrap_or(6)),
+        b'g' | b'G' => cvt::fmt_g(
+            val.to_double(),
+            spec.precision.unwrap_or(6),
+            spec.conv == b'G',
+            spec.alt,
+        ),
+        _ => unreachable!("parse_spec only returns C's conversion characters"),
     };
+    // Float: the sign flags, the `#` decimal point, then the padding. C does not
+    // zero-pad a non-finite value.
+    let d = val.to_double();
+    let mut body = body;
+    if spec.alt && !body.contains('.') && d.is_finite() {
+        body.push('.');
+    }
+    if d.is_sign_positive() && !body.starts_with('+') {
+        if spec.plus {
+            body.insert(0, '+');
+        } else if spec.space {
+            body.insert(0, ' ');
+        }
+    }
+    pad(
+        body.into_bytes(),
+        spec.width,
+        spec.minus,
+        spec.zero && d.is_finite(),
+    )
+}
 
-    match spec {
-        b'f' => format!("{:.prec$}", val, prec = precision),
-        b'e' => format!("{:.prec$e}", val, prec = precision),
-        b'E' => format!("{:.prec$E}", val, prec = precision),
-        b'g' | b'G' => {
-            // Use shorter of %f and %e
-            let f_str = format!("{:.prec$}", val, prec = precision);
-            let e_str = format!("{:.prec$e}", val, prec = precision);
-            if e_str.len() < f_str.len() {
-                e_str
+fn render_int(spec: &Spec, l: i64) -> Vec<u8> {
+    if spec.conv == b'c' {
+        return vec![l as u8];
+    }
+    let (mut prefix, digits) = match spec.conv {
+        b'd' | b'i' => {
+            let v = l as i32;
+            let sign = if v < 0 {
+                "-".to_string()
+            } else if spec.plus {
+                "+".to_string()
+            } else if spec.space {
+                " ".to_string()
             } else {
-                f_str
-            }
+                String::new()
+            };
+            (sign, v.unsigned_abs().to_string())
         }
-        _ => format!("{}", val),
+        b'u' => (String::new(), (l as u32).to_string()),
+        b'o' => {
+            let d = format!("{:o}", l as u32);
+            let p = if spec.alt && !d.starts_with('0') {
+                "0".to_string()
+            } else {
+                String::new()
+            };
+            (p, d)
+        }
+        b'x' | b'X' => {
+            let v = l as u32;
+            let d = if spec.conv == b'x' {
+                format!("{v:x}")
+            } else {
+                format!("{v:X}")
+            };
+            let p = match (spec.alt, v, spec.conv) {
+                (true, 0, _) => String::new(),
+                (true, _, b'x') => "0x".to_string(),
+                (true, _, _) => "0X".to_string(),
+                _ => String::new(),
+            };
+            (p, d)
+        }
+        _ => unreachable!("render_int only sees C's integer conversions"),
+    };
+    // `%.Nd` is a MINIMUM digit count, zero-filled, and it turns the `0` flag off.
+    let digits = match spec.precision {
+        Some(p) if digits.len() < p => format!("{}{digits}", "0".repeat(p - digits.len())),
+        _ => digits,
+    };
+    prefix.push_str(&digits);
+    prefix.into_bytes()
+}
+
+/// The width field. `zero` pads with `0` after any sign or `0x` prefix, and is
+/// ignored when the value is left-justified (C: "the 0 flag is ignored with -").
+fn pad(body: Vec<u8>, width: usize, minus: bool, zero: bool) -> Vec<u8> {
+    if body.len() >= width {
+        return body;
     }
+    let fill = width - body.len();
+    if minus {
+        let mut out = body;
+        out.extend(std::iter::repeat_n(b' ', fill));
+        return out;
+    }
+    if !zero {
+        let mut out = vec![b' '; fill];
+        out.extend(body);
+        return out;
+    }
+    // Keep the sign / `0x` in front of the zeros.
+    let skip = match body.first() {
+        Some(b'-' | b'+' | b' ') => 1,
+        _ if body.starts_with(b"0x") || body.starts_with(b"0X") => 2,
+        _ => 0,
+    };
+    let mut out = body[..skip].to_vec();
+    out.extend(std::iter::repeat_n(b'0', fill));
+    out.extend_from_slice(&body[skip..]);
+    out
 }
 
 fn simple_sscanf(input: &[u8], fmt: &[u8]) -> StackValue {
@@ -1118,23 +1301,12 @@ impl BinField {
 /// C `BIN_WRITE` (sCalcPerform.c:1569-1633): write `val` into `fmt`'s field as
 /// raw little-endian bytes, then escape those bytes back into a string.
 ///
-/// C finds the conversion character with its own inline scan — skip every `%%`,
-/// take the next `%`, then the first character of `*cdeEfgGiousxX` after it —
-/// and bails out (`return -1`) on `*` (suppressed assignment), on `s`, and when
-/// there is no conversion character at all.
+/// C finds the conversion character with the same scan PRINTF uses
+/// ([`conversion_index`]) and bails out (`return -1`) on `*` (suppressed
+/// assignment), on `s`, and — unlike PRINTF — when there is no conversion
+/// character at all.
 fn bin_write(f: &[u8], val: &StackValue) -> Result<String, CalcError> {
-    // `while ((s1 = strstr(s, "%%"))) {s = s1+2;}` — advance past the LAST `%%`.
-    let mut i = 0;
-    while let Some(p) = find_sub(&f[i..], b"%%") {
-        i += p + 2;
-    }
-    let pct = find_byte(&f[i..], b'%').ok_or(CalcError::InvalidFormat)? + i;
-    let conv = f[pct + 1..]
-        .iter()
-        .position(|b| b"*cdeEfgGiousxX".contains(b))
-        .ok_or(CalcError::InvalidFormat)?
-        + pct
-        + 1;
+    let conv = conversion_index(f).ok_or(CalcError::InvalidFormat)?;
 
     let field = BinField::parse(f[conv], f.get(conv.wrapping_sub(1)).copied())
         .ok_or(CalcError::InvalidFormat)?;

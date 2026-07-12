@@ -331,6 +331,10 @@ fn test_printf_no_spec() {
 
 #[test]
 fn test_printf_percent_escape() {
+    // R11-5: C's scan finds no conversion after the last `%%`, so PRINTF
+    // `strcpy`s the RAW format — the `%%` is NOT collapsed. Compiled C:
+    // PRINTF("100%%", 0) is `100%%`. (`%%` collapses only when a live
+    // conversion sends the format through snprintf — see tests/scalc_printf.rs.)
     let result = eval_str(r#"PRINTF("100%%", 0)"#);
-    assert_eq!(result, StackValue::Str("100%".into()));
+    assert_eq!(result, StackValue::Str("100%%".into()));
 }

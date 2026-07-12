@@ -285,35 +285,71 @@ impl CTool {
         level
     }
 
-    /// C `-e` / `-f` / `-g`: `sscanf("%d", &digits)` and then a range gate
-    /// (`caget.c:470-484`). BOTH failures — an unscannable argument and an
-    /// out-of-range digit count — warn and leave `dblFormatStr` at its
-    /// default, so `None` here means "keep the default float format".
-    /// The two messages are distinct and neither carries the `-h` suffix.
+    /// One `-e` / `-f` / `-g` occurrence: `sscanf("%d", &digits)` and then a
+    /// range gate (`caget.c:470-484`). BOTH failures — an unscannable argument
+    /// and an out-of-range digit count — warn and leave `dblFormatStr` at its
+    /// current value, so `None` means "this occurrence changes nothing". The
+    /// two messages are distinct and neither carries the `-h` suffix.
     ///
     /// `opt` is the option letter, which C interpolates into the message and
     /// also uses as the printf conversion (`sprintf(dblFormatStr,
     /// "%%-.%d%c", digits, opt)`).
+    fn digits(self, opt: char, arg: &str) -> Option<u32> {
+        let _ = self.0;
+        let Some(d) = scan_i32(arg) else {
+            eprintln!("Invalid precision argument '{arg}' for option '-{opt}' - ignored.");
+            return None;
+        };
+        if (0..=VALID_DOUBLE_DIGITS).contains(&d) {
+            Some(d as u32)
+        } else {
+            eprintln!("Precision {d} for option '-{opt}' out of range - ignored.");
+            None
+        }
+    }
+
+    /// C `-e` / `-f` / `-g` (W10-B2): the three letters share ONE
+    /// `dblFormatStr`, and the `sprintf` that rewrites it sits in the VALID
+    /// branch of a single getopt case (`caget.c:470-484`, `camonitor.c:310-324`
+    /// — note `case 'e': case 'f': case 'g':` all fall into the same body).
+    /// So the effective format is the LAST VALID occurrence *in command-line
+    /// order across all three letters* — there is no `e` > `f` > `g`
+    /// precedence, and an invalid occurrence never clears an earlier valid one:
     ///
-    /// EVERY occurrence is scanned (so each bad one gets its own warning) and
-    /// the LAST VALID one wins: the `sprintf` that rewrites `dblFormatStr`
-    /// sits in the valid branch only, so `caget -e 99 -e 3` warns about 99 and
-    /// still formats with `%.3e`, and `caget -e 3 -e 99` warns and keeps
-    /// `%.3e`.
-    pub fn digits(self, opt: char, occurrences: &[String]) -> Option<u32> {
-        let mut digits = None;
-        for arg in occurrences {
-            let Some(d) = scan_i32(arg) else {
-                eprintln!("Invalid precision argument '{arg}' for option '-{opt}' - ignored.");
-                continue;
-            };
-            if (0..=VALID_DOUBLE_DIGITS).contains(&d) {
-                digits = Some(d as u32);
-            } else {
-                eprintln!("Precision {d} for option '-{opt}' out of range - ignored.");
+    /// ```text
+    /// caget -e 2 -f 4 TST:AO   C: 1.5000       (f is last)
+    /// caget -f 4 -g 2 TST:AO   C: 1.5          (g is last)
+    /// caget -f 4 -e 99 TST:AO  C: 1.5000       (the invalid -e changes nothing)
+    /// ```
+    ///
+    /// Every occurrence is scanned, so each bad one emits its own warning in
+    /// order. `opts` is `(letter, clap id)` for the three; the return is the
+    /// winning `(letter, precision)`, or `None` to keep the default format.
+    ///
+    /// Taking the occurrences from `ArgMatches` rather than from three
+    /// separate `Vec<String>` fields is what makes the ORDER recoverable — a
+    /// per-field resolver cannot see that `-f` came after `-e`.
+    pub fn float_precision(
+        self,
+        matches: &clap::ArgMatches,
+        opts: &[(char, &str)],
+    ) -> Option<(char, u32)> {
+        let mut events: Vec<(usize, char, &str)> = Vec::new();
+        for &(letter, id) in opts {
+            if let (Some(idx), Some(vals)) =
+                (matches.indices_of(id), matches.get_many::<String>(id))
+            {
+                events.extend(idx.zip(vals).map(|(i, v)| (i, letter, v.as_str())));
             }
         }
-        digits
+        events.sort_by_key(|&(i, _, _)| i);
+        let mut chosen = None;
+        for (_, letter, arg) in events {
+            if let Some(d) = self.digits(letter, arg) {
+                chosen = Some((letter, d));
+            }
+        }
+        chosen
     }
 
     /// C `-F`: `fieldSeparator = (char) *optarg` (`caget.c:505`) — the FIRST
@@ -580,17 +616,87 @@ mod tests {
     /// All four still read the PV.
     #[test]
     fn digits_gates_on_c_range() {
-        assert_eq!(CAGET.digits('e', &one("3")), Some(3));
-        assert_eq!(CAGET.digits('e', &one("3x")), Some(3));
-        assert_eq!(CAGET.digits('e', &one("0")), Some(0));
+        assert_eq!(CAGET.digits('e', "3"), Some(3));
+        assert_eq!(CAGET.digits('e', "3x"), Some(3));
+        assert_eq!(CAGET.digits('e', "0"), Some(0));
+        assert_eq!(CAGET.digits('e', "18"), Some(18), "VALID_DOUBLE_DIGITS");
+        assert_eq!(CAGET.digits('e', "19"), None);
+        assert_eq!(CAGET.digits('e', "-2"), None);
+        assert_eq!(CAGET.digits('f', "abc"), None);
+    }
+
+    /// The `-e`/`-f`/`-g` resolver, exercised through a clap `Command` shaped
+    /// like the tools' (three `Append` options), so the command-line ORDER the
+    /// C rule turns on is real rather than simulated.
+    fn precision_of(argv: &[&str]) -> Option<(char, u32)> {
+        let opt = |id: &'static str, c: char| {
+            clap::Arg::new(id)
+                .short(c)
+                .action(clap::ArgAction::Append)
+                .allow_hyphen_values(true)
+        };
+        let m = clap::Command::new("caget")
+            .arg(opt("fmt_e", 'e'))
+            .arg(opt("fmt_f", 'f'))
+            .arg(opt("fmt_g", 'g'))
+            .arg(clap::Arg::new("pv").num_args(0..))
+            .get_matches_from(argv);
+        CAGET.float_precision(&m, &[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
+    }
+
+    /// W10-B2. C's `case 'e': case 'f': case 'g':` share ONE body writing ONE
+    /// `dblFormatStr` (`caget.c:470-484`), so the LAST VALID occurrence in
+    /// command-line order wins — ACROSS the three letters, not just within
+    /// one. Observed on the compiled C `caget` against `TST:AO` (VAL=1.5):
+    ///   `-e 2 -f 4` → `1.5000`      `-e 5 -g 2`  → `1.5`
+    ///   `-f 4 -g 2` → `1.5`         `-f 4 -e 99` → `1.5000`
+    #[test]
+    fn float_precision_is_the_last_valid_occurrence_in_getopt_order() {
+        assert_eq!(precision_of(&["caget", "-e", "2"]), Some(('e', 2)));
+        assert_eq!(precision_of(&["caget"]), None, "no -e/-f/-g → the default");
+
         assert_eq!(
-            CAGET.digits('e', &one("18")),
-            Some(18),
-            "VALID_DOUBLE_DIGITS"
+            precision_of(&["caget", "-e", "2", "-f", "4"]),
+            Some(('f', 4)),
+            "-f is last; there is no e > f precedence"
         );
-        assert_eq!(CAGET.digits('e', &one("19")), None);
-        assert_eq!(CAGET.digits('e', &one("-2")), None);
-        assert_eq!(CAGET.digits('f', &one("abc")), None);
+        assert_eq!(
+            precision_of(&["caget", "-e", "5", "-g", "2"]),
+            Some(('g', 2))
+        );
+        assert_eq!(
+            precision_of(&["caget", "-f", "4", "-g", "2"]),
+            Some(('g', 2))
+        );
+        assert_eq!(
+            precision_of(&["caget", "-g", "2", "-e", "5"]),
+            Some(('e', 5)),
+            "and no g > e precedence either"
+        );
+
+        // An INVALID occurrence never reaches the sprintf, so it cannot clear
+        // an earlier valid one — whatever letter it carries.
+        assert_eq!(
+            precision_of(&["caget", "-f", "4", "-e", "99"]),
+            Some(('f', 4)),
+            "out of range"
+        );
+        assert_eq!(
+            precision_of(&["caget", "-f", "4", "-g", "abc"]),
+            Some(('f', 4)),
+            "unscannable"
+        );
+
+        // Repeats within one letter fold the same way (R13-17).
+        assert_eq!(
+            precision_of(&["caget", "-e", "2", "-e", "6"]),
+            Some(('e', 6))
+        );
+        assert_eq!(
+            precision_of(&["caget", "-e", "2", "-f", "4", "-e", "6"]),
+            Some(('e', 6)),
+            "the last valid one wins no matter how the letters interleave"
+        );
     }
 
     /// C takes `(char) *optarg` — the first byte, rest discarded.
@@ -646,14 +752,6 @@ mod tests {
             DEFAULT_CA_PRIORITY,
             "a bad -p resets to DEFAULT_CA_PRIORITY"
         );
-
-        assert_eq!(CAGET.digits('e', &many(&["2", "6"])), Some(6));
-        assert_eq!(
-            CAGET.digits('e', &many(&["3", "99"])),
-            Some(3),
-            "an out-of-range repeat never reaches the sprintf"
-        );
-        assert_eq!(CAGET.digits('e', &many(&["99", "3"])), Some(3));
 
         assert_eq!(CAGET.field_separator(&many(&[",", ";"])), Some(';'));
         assert_eq!(CAGET.stat_level(&many(&["1", "2"])), 2);

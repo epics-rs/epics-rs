@@ -297,28 +297,23 @@ impl Args {
     /// Build a [`ValueFormat`] from the CLI flags. Every C-scanned argument
     /// goes through [`TOOL`], which warns and falls back exactly like C's
     /// getopt loop — nothing here can fail the program.
-    fn value_format(&self) -> ValueFormat {
+    fn value_format(&self, matches: &clap::ArgMatches) -> ValueFormat {
         let mut fmt = ValueFormat::default();
-        // All three are scanned (not short-circuited) so that EACH malformed
-        // precision emits its own warning, as C's getopt loop does. A repeated
-        // `-e` overwrites `dblFormatStr` again, so only the LAST occurrence of
-        // each letter can be the effective one (`copt::last`).
-        let e = TOOL.digits('e', &self.fmt_e);
-        let f = TOOL.digits('f', &self.fmt_f);
-        let g = TOOL.digits('g', &self.fmt_g);
-        if let Some(precision) = e {
+        // W10-B2. `-e`/`-f`/`-g` are ONE getopt case writing ONE `dblFormatStr`
+        // (`caget.c:470-484`), so the LAST VALID occurrence across the three letters wins
+        // — in command-line order, not by an `e` > `f` > `g` precedence. The
+        // order lives in `matches`, which is why the three `Vec<String>` fields
+        // cannot resolve it themselves. Every occurrence is still scanned, so
+        // each malformed precision emits its own warning as C's loop does.
+        if let Some((letter, precision)) =
+            TOOL.float_precision(matches, &[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
+        {
             fmt.float = FloatFormat {
-                style: FloatStyle::E,
-                precision,
-            };
-        } else if let Some(precision) = f {
-            fmt.float = FloatFormat {
-                style: FloatStyle::F,
-                precision,
-            };
-        } else if let Some(precision) = g {
-            fmt.float = FloatFormat {
-                style: FloatStyle::G,
+                style: match letter {
+                    'e' => FloatStyle::E,
+                    'f' => FloatStyle::F,
+                    _ => FloatStyle::G,
+                },
                 precision,
             };
         }
@@ -796,7 +791,7 @@ async fn main() {
     let priority = TOOL.priority(&args.priority);
     // Built ONCE: `value_format` is what scans the `-0`/`-l` base arguments,
     // so calling it twice would double every "Invalid argument" warning.
-    let fmt = args.value_format();
+    let fmt = args.value_format(&matches);
     // Resolve `-t`/`-a`/`-d` in command-line order — C's getopt loop writes
     // `format` and `type` from the same three cases, and an invalid `-d`
     // reverts `format` to plain (`caget.c:369-375,416-434`). `-0<base>` never
@@ -1200,10 +1195,12 @@ mod tests {
             assert_eq!(a.pv_names, ["PV"], "the base argument must not eat the PV");
         }
 
-        let a = Args::try_parse_from(["caget", "-0x", "PV"]).expect("parses");
-        assert_eq!(a.value_format().int_style, IntStyle::Hex);
-        let a = Args::try_parse_from(["caget", "-lb", "PV"]).expect("parses");
-        assert_eq!(a.value_format().float_style, IntStyle::Bin);
+        let m = Args::command().get_matches_from(["caget", "-0x", "PV"]);
+        let a = Args::from_arg_matches(&m).expect("parses");
+        assert_eq!(a.value_format(&m).int_style, IntStyle::Hex);
+        let m = Args::command().get_matches_from(["caget", "-lb", "PV"]);
+        let a = Args::from_arg_matches(&m).expect("parses");
+        assert_eq!(a.value_format(&m).float_style, IntStyle::Bin);
     }
 
     /// R12-20. C's `-0<base>` assigns the SAME `int type` as `-d`
@@ -1219,7 +1216,7 @@ mod tests {
             let m = Args::command().get_matches_from(argv);
             let a = Args::from_arg_matches(&m).expect("parsed");
             let d = resolve_format(&m).1;
-            resolve_dbr_type(&m, a.value_format().int_style, d)
+            resolve_dbr_type(&m, a.value_format(&m).int_style, d)
         };
         assert_eq!(resolve(&["caget", "-0x", "PV"]), Some(DBR_LONG));
         assert_eq!(

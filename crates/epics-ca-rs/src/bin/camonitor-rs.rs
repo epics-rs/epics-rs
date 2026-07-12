@@ -145,26 +145,23 @@ struct Args {
 }
 
 impl Args {
-    fn value_format(&self) -> ValueFormat {
+    fn value_format(&self, matches: &clap::ArgMatches) -> ValueFormat {
         let mut fmt = ValueFormat::default();
-        // All three are scanned (not short-circuited) so that EACH malformed
-        // precision emits its own warning, as C's getopt loop does.
-        let e = TOOL.digits('e', &self.fmt_e);
-        let f = TOOL.digits('f', &self.fmt_f);
-        let g = TOOL.digits('g', &self.fmt_g);
-        if let Some(precision) = e {
+        // W10-B2. `-e`/`-f`/`-g` are ONE getopt case writing ONE `dblFormatStr`
+        // (`camonitor.c:310-324`), so the LAST VALID occurrence across the three letters wins
+        // — in command-line order, not by an `e` > `f` > `g` precedence. The
+        // order lives in `matches`, which is why the three `Vec<String>` fields
+        // cannot resolve it themselves. Every occurrence is still scanned, so
+        // each malformed precision emits its own warning as C's loop does.
+        if let Some((letter, precision)) =
+            TOOL.float_precision(matches, &[('e', "fmt_e"), ('f', "fmt_f"), ('g', "fmt_g")])
+        {
             fmt.float = FloatFormat {
-                style: FloatStyle::E,
-                precision,
-            };
-        } else if let Some(precision) = f {
-            fmt.float = FloatFormat {
-                style: FloatStyle::F,
-                precision,
-            };
-        } else if let Some(precision) = g {
-            fmt.float = FloatFormat {
-                style: FloatStyle::G,
+                style: match letter {
+                    'e' => FloatStyle::E,
+                    'f' => FloatStyle::F,
+                    _ => FloatStyle::G,
+                },
                 precision,
             };
         }
@@ -185,8 +182,10 @@ impl Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::from_arg_matches(&TOOL.get_matches(Args::command()))
-        .expect("clap validated the arguments");
+    // Parse via ArgMatches (not the plain derive) so the command-line order of
+    // `-e`/`-f`/`-g` is recoverable for C's last-valid-wins rule (W10-B2).
+    let matches = TOOL.get_matches(Args::command());
+    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
 
     if args.version > 0 {
         println!("{VERSION_INFO}");
@@ -201,7 +200,7 @@ async fn main() {
     // plain last-wins (`copt::last`, R13-17).
     let ca_timeout = TOOL.timeout(&args.timeout, epics_ca_rs::cli::env_default_timeout());
     let priority = TOOL.priority(&args.priority);
-    let fmt = Arc::new(args.value_format());
+    let fmt = Arc::new(args.value_format(&matches));
     // The `-m <msk>` DBE_* mask + the `-t` timestamp mode, resolved once for
     // all PVs. `prev_all`/`start` back the relative and incremental timestamp
     // renderings.

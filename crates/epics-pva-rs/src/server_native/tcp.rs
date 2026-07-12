@@ -6260,10 +6260,7 @@ async fn handle_op(
         // connection-fatal `Decode` error (the read loop closes the
         // circuit) instead of a per-op Status that left a malformed-INIT
         // peer free to keep reusing the connection. The EMPTY-MASK case
-        // below is different — pvxs builds the mask inside the source's
-        // `onOp` (`serverget.cpp:198-203`), whose throw is caught and
-        // signalled as a remote *op* error (`serverget.cpp:407-413`),
-        // so that stays an op-level Status reply.
+        // below is different — see the `request_to_mask` arm.
         //
         // The VALUE body is read per pvxs `from_wire_full`. The Rust client's
         // default selectors (and RPC INIT) send a descriptor whose
@@ -6302,11 +6299,42 @@ async fn handle_op(
                 Err(e) => {
                     // The only variant today is `EmptyMask`: pvRequest
                     // selected no field that exists in the value
-                    // descriptor (e.g. `field(noSuch)`). pvxs treats
-                    // this as an INIT-level error
-                    // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
-                    // fell back to all-fields, leaking fields the client
-                    // didn't request.
+                    // descriptor (e.g. `field(noSuch)`). pvxs raises it
+                    // as `throw std::runtime_error("pvRequest must select
+                    // at least one field")` (`pvrequest.cpp:61-62`), from
+                    // inside `request2mask()` — which runs in
+                    // `Server{GPR,Monitor}Setup::connect()`
+                    // (`serverget.cpp:200`, `servermon.cpp:402`), i.e.
+                    // inside the *source's* connect callback, never in the
+                    // protocol handler. Who catches it is therefore the
+                    // source's choice, and pvxs's own hosting API catches
+                    // it on both legs:
+                    //   GET/PUT — `serverget.cpp:406-412` wraps
+                    //     `chan->onOp(...)` in try/catch and signals a
+                    //     remote *op* error.
+                    //   MONITOR — `servermon.cpp:591-592` calls
+                    //     `chan->onSubscribe(...)` UNGUARDED, but the only
+                    //     library source, `SharedPV::Impl::connectSub`
+                    //     (`sharedpv.cpp:76,94-101`), catches around
+                    //     `conn->connect()` and calls `conn->error(msg)`
+                    //     ("not re-throwing for consistency") — an op-level
+                    //     Status reply with the circuit left up. pvxs's own
+                    //     regression for this throw (`test/testget.cpp:
+                    //     380-393`, SharedPV mailbox, `.field("invalid")`)
+                    //     asserts exactly that remote error.
+                    // So an op-level Status is the parity behaviour and this
+                    // is deliberately NOT a fatal `PvaError`. The circuit
+                    // reset one can observe against a C QSRV IOC comes from
+                    // QSRV's sources alone (`ioc/singlesource.cpp:147`,
+                    // `ioc/groupsource.cpp:399` call `connect()` bare, so the
+                    // throw unwinds through `servermon.cpp:592` into
+                    // `conn.cpp:277-282`'s `bev.reset()`): one client's typo'd
+                    // pvRequest drops the shared TCP circuit carrying every
+                    // other channel on it. That is an upstream C++ defect, not
+                    // a contract to port.
+                    //
+                    // Pre-fix Rust silently fell back to all-fields, leaking
+                    // fields the client didn't request.
                     send_chan_op_error(
                         &chan_tx,
                         kind,

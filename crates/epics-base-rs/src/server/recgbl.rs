@@ -208,6 +208,43 @@ pub fn rec_gbl_set_sevr_msg(
     }
 }
 
+/// C `setLinkAlarm` (dbLink.c:318-323) — **the single owner of "a link
+/// operation failed"**, and the failure path of every `dbGetLink`,
+/// `dbPutLink` and `dbPutLinkAsync`:
+///
+/// ```c
+/// static void setLinkAlarm(struct link* plink)
+/// {
+///     recGblSetSevrMsg(plink->precord, LINK_ALARM, INVALID_ALARM,
+///                      "field %s", dbLinkFieldName(plink));
+/// }
+/// ```
+///
+/// `field` is the LINK FIELD's name — `INP`, `SIOL`, `SIML`, `OUT` — and it
+/// reaches the operator as the record's `AMSG`. Every failing link read must
+/// go through here, or the record publishes a lower severity than C (and a
+/// broken link goes silent when the record's other alarms are quiet).
+///
+/// The severity is a MAXIMIZE (`rec_gbl_set_sevr_msg` is strict-greater), so
+/// WHERE this is called relative to the record's other `recGblSetSevr` calls
+/// decides ties. Callers must reproduce C's ORDER, not just C's set of alarms:
+/// a base record raises `SIMM_ALARM` BEFORE its SIOL read (longinRecord.c:414
+/// then :416), so with `SIMS = INVALID` the equal-severity LINK_ALARM loses and
+/// STAT stays SIMM_ALARM; swait raises it AFTER (swaitRecord.c:416 then :420),
+/// so LINK_ALARM wins there.
+///
+/// NOT used for `dbTryGetLink`, which does not call `setLinkAlarm`:
+/// `recGblGetSimm`'s SIML read (recGbl.c:453-454) instead writes
+/// `nsta = LINK_ALARM` directly, leaving SEVR untouched.
+pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &str) {
+    rec_gbl_set_sevr_msg(
+        common,
+        alarm_status::LINK_ALARM,
+        AlarmSeverity::Invalid,
+        format!("field {field}"),
+    );
+}
+
 /// Transfer nsta/nsev to stat/sevr, detect alarm change, reset nsta/nsev.
 /// Matches EPICS recGblResetAlarms. Call at end of process cycle.
 ///

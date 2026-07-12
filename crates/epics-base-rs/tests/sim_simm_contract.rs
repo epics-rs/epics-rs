@@ -340,6 +340,98 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
 }
 
 // ---------------------------------------------------------------------------
+// W10-E4 — a failed SIOL read raises LINK_ALARM, and the SIMM/LINK tie is
+//          decided by C's CALL ORDER
+// ---------------------------------------------------------------------------
+//
+// A base record reads SIOL with a plain `dbGetLink` (`longinRecord.c:416`,
+// aiRecord, histogramRecord, waveformRecord), whose failure path is
+// `setLinkAlarm` (dbLink.c:322) -> `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM,
+// "field %s")`. The port raised only SIMM_ALARM, so under the DEFAULT
+// `SIMS = NO_ALARM` a broken simulation link was completely silent.
+//
+// The order is load-bearing. C raises SIMM_ALARM at the TOP of the YES arm
+// (`longinRecord.c:414`), BEFORE the read at `:416`. `recGblSetSevr` is a
+// strict-greater MAXIMIZE, so at `SIMS = INVALID` the two alarms tie and the one
+// raised FIRST (SIMM) keeps STAT. Compiled C (`recGblResetAlarms` +
+// `recGblSetSevrVMsg`, verbatim):
+//
+// ```text
+// longin (SIMM then LINK), SIMS=INVALID:   sevr=3 stat=19 amsg=''
+// longin (SIMM then LINK), SIMS=NO_ALARM:  sevr=3 stat=14 amsg='field SIOL'
+// ```
+//
+// swait reverses the order (`dbGetLink` at :416, `recGblSetSevr` at :420) and so
+// reverses the winner — pinned in `swait_simulation_mode.rs`.
+
+/// The headline: with the DEFAULT `SIMS = NO_ALARM`, a broken SIOL is reported
+/// as LINK_ALARM/INVALID with AMSG "field SIOL". The port reported NO_ALARM.
+#[tokio::test]
+async fn failed_siol_read_raises_link_alarm_at_default_sims() {
+    let db = PvDatabase::new();
+    let mut li = LonginRecord::new(5);
+    li.simm = 1; // YES — simulate
+    li.siol = "NO:SUCH:RECORD".to_string(); // dbGetLink fails
+    li.sims = 0; // NO_ALARM — the dbd default
+    db.add_record("SIOLFAIL", Box::new(li)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("SIOLFAIL", &mut v, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("SIOLFAIL").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "C `dbGetLink` -> `setLinkAlarm` -> recGblSetSevrMsg(LINK_ALARM, INVALID)"
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "SIMS=NO_ALARM raises nothing, so LINK_ALARM lands unopposed"
+    );
+    assert_eq!(
+        inst.common.amsg, "field SIOL",
+        "C `setLinkAlarm` formats \"field %s\" from the link's field name"
+    );
+}
+
+/// The ordering boundary: at `SIMS = INVALID` the two alarms are EQUAL, and a
+/// base record raised SIMM FIRST — so the strict-greater `recGblSetSevr` leaves
+/// SIMM_ALARM in STAT and the LINK_ALARM loses the tie. (AMSG is empty: the
+/// SIMM raise went through message-less `recGblSetSevr`, which CLEARS namsg.)
+#[tokio::test]
+async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
+    let db = PvDatabase::new();
+    let mut li = LonginRecord::new(5);
+    li.simm = 1;
+    li.siol = "NO:SUCH:RECORD".to_string();
+    li.sims = 3; // INVALID — same severity as the LINK_ALARM
+    db.add_record("SIOLTIE", Box::new(li)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("SIOLTIE", &mut v, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("SIOLTIE").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::SIMM_ALARM,
+        "C raises SIMM BEFORE the SIOL read (longinRecord.c:414 then :416), so the \
+         equal-severity LINK_ALARM cannot displace it"
+    );
+    assert_eq!(
+        inst.common.amsg, "",
+        "the SIMM raise is a message-less recGblSetSevr, which clears namsg"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // R11-C12 — SIMM = 2 (RAW) on a `menu(menuYesNo)` record is the `default:` arm
 // ---------------------------------------------------------------------------
 //

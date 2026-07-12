@@ -162,3 +162,47 @@ fn r10_6_cat_appends_inside_the_buffer_and_grows_the_window() {
         "the LEFT operand is promoted (toArray), filling the buffer; nothing fits after it"
     );
 }
+
+/// R11-7 — and CAT of two SCALARS is a no-op: `case CAT: break;` (`:1411`). With
+/// neither operand an array the two-arg dispatch takes the scalar branch, and the left
+/// operand's cell IS the result cell, so the answer is the LEFT scalar — still a
+/// scalar. Compiled C, A=5, B=7: `CAT(A,B)` is 5, and `AVG(CAT(A,B))` is 5.
+///
+/// The port built a two-element array [5,7]. C has nowhere to put one: CAT
+/// concatenates INTO the left operand's buffer, and a scalar has no buffer.
+#[test]
+fn r11_7_cat_of_two_scalars_is_the_left_scalar() {
+    let mut i = ArrayInputs::new(6);
+    i.num_vars[0] = 5.0;
+    i.num_vars[1] = 7.0;
+
+    assert_eq!(
+        acalc("CAT(A,B)", &mut i).unwrap(),
+        ArrayStackValue::Double(5.0),
+        "the result must stay a SCALAR, not become [5,7]"
+    );
+    assert_eq!(
+        d("AVG(CAT(A,B))", &mut i),
+        5.0,
+        "a two-element array would have averaged to 6"
+    );
+    assert_eq!(
+        d("CAT(CAT(A,B),C)", &mut i),
+        5.0,
+        "chaining does not accumulate: each CAT is still the left scalar"
+    );
+}
+
+/// The negative control for that: as soon as EITHER operand is an array, CAT is the
+/// window writer again — the scalar no-op is the scalar branch's rule alone.
+#[test]
+fn r11_7_cat_still_concatenates_when_an_operand_is_an_array() {
+    let mut i = ArrayInputs::new(6);
+    i.num_vars[1] = 7.0;
+    i.arrays[0] = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+    assert_eq!(
+        a("CAT(AA[0,1],B)", &mut i),
+        vec![1.0, 2.0, 7.0, 0.0, 0.0, 0.0]
+    );
+}

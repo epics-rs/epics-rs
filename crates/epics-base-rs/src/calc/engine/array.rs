@@ -670,11 +670,19 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                             cell.set_num_el(i as i64);
                             ArrayStackValue::Array(cell)
                         }
-                        // (double, double) keeps the port's old shape here; C's
-                        // `case CAT: break;` (`:1411`) is R11-7's subject.
-                        (Double(x), Double(y)) => {
-                            ArrayStackValue::Array(ArrayCell::new(vec![x, y], array_size))
-                        }
+                        // C `:1411` — `case CAT: break;`. With neither operand an array
+                        // the two-arg dispatch takes the SCALAR branch, where CAT does
+                        // nothing at all. The left operand's cell IS the result cell, so
+                        // the result is the LEFT scalar, still a scalar, and the right
+                        // one is discarded with its cell. Compiled C, A=5, B=7:
+                        // `CAT(A,B)` is 5 and `AVG(CAT(A,B))` is 5.
+                        //
+                        // The port built a two-element ARRAY [5,7] here. That is not a
+                        // missing feature of C's — CAT concatenates into the LEFT
+                        // operand's buffer, and a scalar has none — and it made the
+                        // operator's result type depend on its operands in a way nothing
+                        // else in the two-arg family does.
+                        (Double(x), Double(_)) => Double(x),
                     })?
                 }
                 ArrayOp::ArrayRandom => {

@@ -80,20 +80,48 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     push_src(&mut stack, Double(inputs.num_vars[i]), Some(i));
                 }
                 CoreOp::PushDoubleVar(idx) => {
-                    // In array evaluator, double vars are array vars. C's fresh
-                    // push clears the window (`INC`: `ps->numEl = -1`,
-                    // `aCalcPerform.c:88`), which is what `ArrayCell::new` gives.
-                    // Array fetches leave `sourceDouble` at -1 — only the SCALAR
-                    // fetches set it.
+                    // In the array evaluator, double vars are array vars. C's
+                    // `FETCH_AA..FETCH_LL` (`aCalcPerform.c:440-454`) opens with
+                    // `INC(ps); toArray(ps,0);` — so the cell is an `arraySize`
+                    // ARRAY *before* a single element is read, and it stays one
+                    // whatever the record holds:
+                    //
+                    // ```c
+                    // INC(ps); toArray(ps,0); ps->a[0] = 0.;
+                    // if (num_aArgs > i) {
+                    //     if (pp_aArg[i]) { for (i=0;i<arraySize;i++) ps->a[i] = pp_aArg[i][i]; }
+                    //     else            { for (i=0;i<arraySize;i++) ps->a[i] = 0.0; }
+                    // }
+                    // ```
+                    //
+                    // An array field the record never allocated — C's `pp_aArg[i] ==
+                    // NULL` — is an arraySize buffer of ZEROS, NOT the scalar 0. The
+                    // port keyed off an empty `Vec` and pushed `Double(0.0)`, which
+                    // gave the operators above it a scalar operand and so the wrong
+                    // BRANCH of every shape-sensitive one. Compiled C, arraySize 6,
+                    // with pp_aArg[0] = NULL:
+                    //
+                    //   IXZ(AA)  -> -1   (the array branch finds no zero CROSSING)
+                    //                    port: 0, from the scalar branch's `|d| < SMALL`
+                    //   FWHM(AA) -> 5    (the array branch's no-crossing fallback, lastEl)
+                    //                    port: 0, from the scalar branch's ZERO
+                    //
+                    // `ArrayCell::new` resizes to `array_size`, so it IS C's
+                    // `toArray(ps,0)` plus the zero fill. Going through it
+                    // unconditionally is what removes the dual meaning: an empty
+                    // `Vec` in `inputs.arrays` no longer means "a scalar", it means
+                    // exactly what C means by a NULL record array. `@@x`
+                    // (`ArrayOp::DynAFetch`) and `AVAL` (`ArrayOp::FetchAval`)
+                    // already fetch this way; this makes the named fetch agree.
+                    //
+                    // C's fresh push also clears the window (`INC`: `ps->numEl = -1`,
+                    // `:93`), which `ArrayCell::new` gives, and leaves `sourceDouble`
+                    // at -1 — only the SCALAR fetches set it.
                     let arr = inputs.arrays[*idx as usize].clone();
-                    if arr.is_empty() {
-                        push(&mut stack, Double(0.0));
-                    } else {
-                        push(
-                            &mut stack,
-                            ArrayStackValue::Array(ArrayCell::new(arr, inputs.array_size)),
-                        );
-                    }
+                    push(
+                        &mut stack,
+                        ArrayStackValue::Array(ArrayCell::new(arr, inputs.array_size)),
+                    );
                 }
 
                 CoreOp::Pi => push(&mut stack, Double(std::f64::consts::PI)),

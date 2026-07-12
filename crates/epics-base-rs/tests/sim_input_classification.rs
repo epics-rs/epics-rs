@@ -56,14 +56,16 @@ async fn sim_waveform_reads_siol_array_into_val() {
     );
 }
 
-/// A simulated `histogram` must NOT run the real device read nor write VAL out
-/// to its SIOL target. (It reads SIOL inward; the SIOL scalar does not land in
-/// the bin-count array, so VAL stays put — the histogram SIOL->SVAL feed +
-/// accumulation is a separate pre-existing gap.) Under the pre-fix output
-/// misclassification the record ran `add_count` and wrote its VAL array out to
-/// the SIOL target, overwriting it.
+/// W10-E8 — a simulated `histogram` reads SIOL INWARD, lands the scalar in
+/// SGNL (`histogramRecord.c:384-387` `dbGetLink(&siol, DBR_DOUBLE, &sval)`;
+/// `sgnl = sval`) and bins it (`:218-219` `if (status == 0) add_count(prec)`).
+/// It must not write its VAL array out to the SIOL target.
+///
+/// SIOL = 42.0 with LLIM=0, ULIM=100, NELM=4 → WDTH=25, and C's
+/// `for (i = 1; i <= nelm; i++) if (temp <= i*wdth) break;` picks i=2, so
+/// `bptr[1]` is incremented: VAL = [0, 1, 0, 0].
 #[tokio::test]
-async fn sim_histogram_does_not_write_val_out_to_siol() {
+async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
     let db = PvDatabase::new();
     db.add_record("HGIN_SW", Box::new(AoRecord::new(1.0)))
         .await
@@ -89,10 +91,54 @@ async fn sim_histogram_does_not_write_val_out_to_siol() {
         matches!(src, EpicsValue::Double(v) if (v - 42.0).abs() < 1e-10),
         "simulated histogram did NOT write VAL out to SIOL (input direction), got {src:?}"
     );
-    // The bin-count array is unchanged (no accumulation from the sim read).
+    // C `:385-386`: the SIOL scalar lands in SVAL, then in SGNL.
+    assert_eq!(
+        db.get_pv("HGIN.SVAL").await.unwrap(),
+        EpicsValue::Double(42.0)
+    );
+    assert_eq!(
+        db.get_pv("HGIN.SGNL").await.unwrap(),
+        EpicsValue::Double(42.0),
+        "C `prec->sgnl = prec->sval` (histogramRecord.c:385)"
+    );
+
+    // C `:219` `add_count(prec)`: 42.0 with WDTH=25 falls in bin 1.
     let val = db.get_pv("HGIN").await.unwrap();
     assert!(
+        matches!(val, EpicsValue::LongArray(ref a) if a.as_slice() == [0, 1, 0, 0]),
+        "the simulated signal is binned exactly once, got {val:?}"
+    );
+}
+
+/// A FAILED SIOL read leaves C's `status != 0`, so `readValue` never runs
+/// `prec->sgnl = prec->sval` (`:385`, gated on `status == 0`) and `process`
+/// never runs `add_count` (`:218-219`, the same gate). No bin moves.
+#[tokio::test]
+async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
+    let db = PvDatabase::new();
+    db.add_record("HGF_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    let mut hg = HistogramRecord::new(4, 0.0, 100.0);
+    hg.siml = "HGF_SW".to_string();
+    hg.siol = "NO:SUCH:RECORD".to_string();
+    hg.sval = 42.0; // would land in bin 1 if the read were treated as OK
+    db.add_record("HGF", Box::new(hg)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("HGF", &mut v, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.get_pv("HGF.SGNL").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "C gates `prec->sgnl = prec->sval` on status == 0 — a failed read assigns nothing"
+    );
+    let val = db.get_pv("HGF").await.unwrap();
+    assert!(
         matches!(val, EpicsValue::LongArray(ref a) if a.as_slice() == [0, 0, 0, 0]),
-        "histogram bin array unchanged in sim (no real-device accumulation), got {val:?}"
+        "add_count is gated on the same status == 0, got {val:?}"
     );
 }

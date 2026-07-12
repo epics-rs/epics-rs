@@ -4988,13 +4988,11 @@ impl PvDatabase {
             // `histogramRecord.c:209`->`:384` `dbGetLink(&siol, DBR_DOUBLE,
             // &sval)`). They are classified as inputs so a simulated cycle
             // reads SIOL rather than running the real device read and writing
-            // VAL back out. `waveform` is exact: the SIOL array lands in VAL via
-            // `set_val`. `histogram` reads SIOL but lands the scalar in VAL via
-            // the shared `set_val` path, which no-ops against the bin-count
-            // array — so a simulated histogram is frozen (no SIOL->SVAL feed, no
-            // bin accumulation). That residual is pre-existing and unmodeled;
-            // the classification only ensures a simulated histogram no longer
-            // performs the real device read or corrupts the SIOL target.
+            // VAL back out. Each lands the value where its own C `readValue`
+            // lands it, through `Record::land_simulated_value`: `waveform` puts
+            // the SIOL array in VAL (the default `set_val`), `histogram` puts
+            // the scalar in SGNL and bins it (`histogramRecord.c:385` +
+            // `:219` `add_count`), because its VAL is the bin-count array.
             //
             // `aai` is also a SIOL-reading input, but the SIOL read lives in
             // its soft DEVICE support, not the record support. `aaiRecord.c::
@@ -5268,7 +5266,7 @@ impl PvDatabase {
                     let _ = instance.record.put_field_internal("SVAL", sval);
                 }
                 if let Some(sval) = instance.record.get_field("SVAL") {
-                    let _ = instance.record.set_val(sval);
+                    let _ = instance.record.land_simulated_value(sval);
                 }
                 instance.common.udf = false;
             }
@@ -5453,10 +5451,14 @@ impl PvDatabase {
                     instance.record.set_process_context(&ctx);
                     let _ = instance.record.process();
                 } else {
-                    // Records without RVAL fall back to SIMM=YES
-                    // semantics: the SIOL value goes straight into
-                    // VAL; no conversion to run.
-                    let _ = instance.record.set_val(siol_val);
+                    // Records without RVAL fall back to SIMM=YES semantics: the
+                    // SIOL value lands where C's `readValue` lands it — VAL for
+                    // the base records (`longinRecord.c:417` `val = sval`), SGNL
+                    // plus the bin increment for `histogram`
+                    // (`histogramRecord.c:385` + `:219`). `land_simulated_value`
+                    // is the single owner of that assignment; no conversion to
+                    // run either way.
+                    let _ = instance.record.land_simulated_value(siol_val);
                 }
             }
 

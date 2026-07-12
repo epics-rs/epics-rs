@@ -1592,6 +1592,23 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Land the scalar a simulated cycle read from SIOL (through SVAL, where
+    /// the record has one) — C `readValue`'s assignment plus whatever the
+    /// record's `process()` body then does with it, under the same
+    /// `status == 0` gate the framework applies before calling this.
+    ///
+    /// The base records assign the value straight to VAL — `longinRecord.c:417`
+    /// `prec->val = prec->sval;` — which is the default (`set_val`).
+    ///
+    /// `histogram` does NOT: `histogramRecord.c:385-386` lands it in SGNL
+    /// (`prec->sgnl = prec->sval;`), and `process()` (`:218-219`,
+    /// `if (status == 0) add_count(prec);`) bins that signal into the VAL
+    /// bin-count array. Its VAL is the array, so a `set_val` of the scalar
+    /// no-ops and the simulated record is frozen. It overrides.
+    fn land_simulated_value(&mut self, value: EpicsValue) -> CaResult<()> {
+        self.set_val(value)
+    }
+
     /// Whether the record's C `switch (prec->simm)` carries a `default:` arm
     /// that REFUSES a SIMM value outside its own menu:
     ///

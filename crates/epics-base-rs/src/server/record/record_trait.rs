@@ -1373,6 +1373,36 @@ pub trait Record: Send + Sync + 'static {
         crate::server::recgbl::simm::record_type_has_sscn(self.record_type())
     }
 
+    /// The record's `readValue`/`writeValue` ABORTS when the SIML read fails —
+    /// it returns before performing any I/O, so the cycle does no device write,
+    /// no SIOL redirect, and raises no SIMM_ALARM.
+    ///
+    /// `busy` is the only record that does this (busyRecord.c:397-400):
+    ///
+    /// ```c
+    /// status = dbGetLink(&prec->siml, DBR_USHORT, &prec->simm, 0, 0);
+    /// if (status)
+    ///     return(status);          /* <-- before write_busy AND before dbPutLink */
+    /// ```
+    ///
+    /// The LINK_ALARM that `dbGetLink`'s `setLinkAlarm` already raised is the
+    /// cycle's only simulation alarm.
+    ///
+    /// The other two families do NOT abort, for different reasons:
+    ///
+    /// - The 21 [`Self::uses_recgbl_simm_helpers`] records look like they do —
+    ///   `readValue` has `status = recGblGetSimm(...); if (status) return status;`
+    ///   (longinRecord.c:403-405) — but `recGblGetSimm` ends with an
+    ///   unconditional `return 0` (recGbl.c:456), so that branch is DEAD and the
+    ///   record always proceeds to its `switch (prec->simm)`.
+    /// - `swait` reads SIML with a plain `dbGetLink` and simply never tests the
+    ///   status (swaitRecord.c:402), so it proceeds too.
+    ///
+    /// Default: `false`.
+    fn aborts_on_failed_siml_read(&self) -> bool {
+        false
+    }
+
     /// The record joined (`true`) or left (`false`) the `SCAN="I/O Intr"` list.
     ///
     /// C parity: `dbScan.c::scanAdd` calls the record's device support

@@ -352,6 +352,22 @@ impl Record for BusyRecord {
         "busy"
     }
 
+    /// W10-E5. `busyRecord.c:397-400` — a failed SIML read returns from
+    /// `writeValue` BEFORE `write_busy` and before the SIOL `dbPutLink`:
+    ///
+    /// ```c
+    /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
+    /// if (status)
+    ///     return(status);
+    /// ```
+    ///
+    /// busy is the only record in the port that does this — the recGblGetSimm
+    /// records' equivalent branch is dead code (`recGblGetSimm` always returns
+    /// 0, recGbl.c:456) and swait never tests the status (swaitRecord.c:402).
+    fn aborts_on_failed_siml_read(&self) -> bool {
+        true
+    }
+
     /// C `boRecord.c::process` IVOA=set_to_IVOV: `val = ivov` then
     /// `rval = (epicsUInt32)val` (busy shares boRecord's process).
     /// OVAL is the *saved previous* VAL and is NOT overwritten by the

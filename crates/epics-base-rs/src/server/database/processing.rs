@@ -493,6 +493,23 @@ enum SimOutcome {
     /// the body is left to run), an OUTPUT's `writeValue` follows it (the body
     /// runs, only the write is suppressed).
     IllegalMode { is_output: bool },
+    /// The SIML read FAILED and the record's support ABORTS on it — C
+    /// `writeValue` returns before performing any I/O
+    /// ([`Record::aborts_on_failed_siml_read`]; `busy` is the only one):
+    ///
+    /// ```c
+    /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
+    /// if (status)
+    ///     return(status);      /* before write_busy AND before the SIOL dbPutLink */
+    /// ```
+    ///
+    /// Like [`Self::IllegalMode`] with `is_output`, this suppresses the cycle's
+    /// output and nothing else: the body runs and `process()` still does
+    /// `checkAlarms` / `monitor` / `recGblFwdLink`. It differs in the alarm — the
+    /// LINK_ALARM that `dbGetLink`'s `setLinkAlarm` already raised is the only
+    /// one; no SOFT_ALARM and no SIMM_ALARM is added, because C never reaches the
+    /// `switch (prec->simm)` that would raise them.
+    AbortedBeforeWrite,
     /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
     /// `writeValue` substitutes the device write with
     /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
@@ -1497,21 +1514,33 @@ impl PvDatabase {
         // that declares the input-stage shape (`false` included), so the flag
         // cannot outlive the cycle it belongs to.
         let mut sim_input_stage = false;
-        // C `switch (prec->simm)` `default:` on an OUTPUT record: the body runs
-        // (it is `writeValue`, at the END of `process()`, that refuses), but the
-        // device / OUT-link / SIOL write is suppressed. Set only by
-        // `SimOutcome::IllegalMode { is_output: true }`.
-        let mut sim_illegal_out = false;
+        // C `writeValue` returned before performing ANY output. `writeValue`
+        // runs at the END of C `process()`, so the body has already run and
+        // only the device / OUT-link / SIOL write is lost. Two C paths reach
+        // it, and both mean exactly this one thing:
+        //   * `switch (prec->simm)` `default:` — `recGblSetSevr(SOFT_ALARM,
+        //     INVALID_ALARM); return -1;`  (`SimOutcome::IllegalMode`)
+        //   * a failed SIML read — `if (status) return status;`
+        //     (`SimOutcome::AbortedBeforeWrite`, busyRecord.c:399-401)
+        let mut sim_write_aborted = false;
         let sim_output = match self.check_simulation_mode(&rec).await {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
                 return Ok(());
             }
+            SimOutcome::AbortedBeforeWrite => {
+                // C busy `writeValue`: `status = dbGetLink(&prec->siml, ...);
+                // if (status) return status;` — the SIML read failed, so the
+                // routine returns before `write_busy` AND before the SIOL
+                // redirect. `dbGetLink` has already raised LINK_ALARM/INVALID.
+                sim_write_aborted = true;
+                None
+            }
             SimOutcome::IllegalMode { is_output } => {
                 if is_output {
                     // `writeValue` follows the body, so only the write is lost.
-                    sim_illegal_out = true;
+                    sim_write_aborted = true;
                     None
                 } else {
                     // `readValue` precedes the body and IS the body's input, so
@@ -2907,11 +2936,12 @@ impl PvDatabase {
                 // (it reads the post-body OVAL/RVAL), so the normal device/OUT
                 // write is suppressed here.
                 None
-            } else if sim_illegal_out {
-                // C `writeValue` `default:` arm: `recGblSetSevr(SOFT_ALARM,
-                // INVALID_ALARM); status = -1;` — it returns BEFORE both the
-                // device write and the SIOL redirect, so this cycle performs no
-                // output at all.
+            } else if sim_write_aborted {
+                // C `writeValue` returned before writing — either the
+                // `default:` arm (`recGblSetSevr(SOFT_ALARM, INVALID_ALARM);
+                // status = -1;`) or a failed SIML read. Both return BEFORE the
+                // device write and BEFORE the SIOL redirect, so this cycle
+                // performs no output at all.
                 None
             } else if skip_out {
                 None
@@ -4770,11 +4800,16 @@ impl PvDatabase {
     ///
     /// Called from `check_simulation_mode` on every `pact == FALSE` entry —
     /// C's `if (!prec->pact)` guard around it (aiRecord.c:475).
+    ///
+    /// Returns the SIML-read status the record's `readValue`/`writeValue` sees:
+    /// `true` when the read FAILED. Only a record that declares
+    /// [`Record::aborts_on_failed_siml_read`] (busy) acts on it — see that hook
+    /// for why the other two families do not.
     pub(crate) async fn rec_gbl_get_simm(
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
         siml: &crate::server::record::ParsedLink,
-    ) {
+    ) -> bool {
         use crate::server::recgbl::simm::SimLinkFetch;
         // `recGblSaveSimm(*psscn, poldsimm, *psimm)` — latch the outgoing mode
         // BEFORE the SIML read can move SIMM.
@@ -4788,7 +4823,9 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour of
         // `read_link_value_no_process`) would stomp the operator's put back to
         // the constant on the very next process.
-        match self.fetch_sim_link(siml).await {
+        let fetch = self.fetch_sim_link(siml).await;
+        let failed = matches!(fetch, SimLinkFetch::Failed);
+        match fetch {
             SimLinkFetch::Value(v) => {
                 let simm = v.to_f64().unwrap_or(0.0) as i16;
                 let mut instance = rec.write().await;
@@ -4823,8 +4860,10 @@ impl PvDatabase {
         }
         // `recGblCheckSimm(pcommon, psscn, *poldsimm, *psimm)` — a SIML-driven
         // SIMM transition swaps SCAN with SSCN exactly like a `caput REC.SIMM`
-        // does.
+        // does. C runs it even on a FAILED read (recGbl.c:455 is past the
+        // LINK_ALARM line), so the swap is not conditional on the status.
         self.apply_simm_scan_swap(rec).await;
+        failed
     }
 
     /// Run C `recGblCheckSimm` on a record and hand the resulting scan move to
@@ -5090,7 +5129,28 @@ impl PvDatabase {
         // (`rec_gbl_get_simm`, C `recGblGetSimm`), which is the ONLY site that
         // writes SIMM.
         if !pact_held {
-            self.rec_gbl_get_simm(rec, &siml_link).await;
+            let siml_read_failed = self.rec_gbl_get_simm(rec, &siml_link).await;
+            // W10-E5. `busyRecord.c:397-400` returns from `writeValue` on a
+            // failed SIML read — BEFORE `write_busy` and before the SIOL
+            // `dbPutLink`. So C never reaches the `switch (prec->simm)` below:
+            // no device write, no SIOL redirect, no SIMM_ALARM. The LINK_ALARM
+            // that `dbGetLink`'s `setLinkAlarm` raised inside `rec_gbl_get_simm`
+            // is the cycle's only simulation alarm.
+            //
+            // Only a record that declares it aborts takes this path — busy. The
+            // recGblGetSimm records' equivalent `if (status) return status;` is
+            // dead code (recGbl.c:456 always returns 0) and swait never tests
+            // the status (swaitRecord.c:402), so both fall through to the switch
+            // with SIMM at whatever value it already held.
+            if siml_read_failed {
+                let aborts = {
+                    let instance = rec.read().await;
+                    instance.record.aborts_on_failed_siml_read()
+                };
+                if aborts {
+                    return SimOutcome::AbortedBeforeWrite;
+                }
+            }
         }
 
         // Check SIMM. The dispatch is the record's own C `switch (prec->simm)`,

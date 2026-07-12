@@ -576,3 +576,93 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
     );
     assert_eq!(inst.common.sevr, AlarmSeverity::Minor);
 }
+
+// ---------------------------------------------------------------------------
+// W10-E5 — a failed SIML read on `busy` returns BEFORE the output write
+// ---------------------------------------------------------------------------
+//
+// busyRecord.c:388-401 `writeValue`:
+//
+// ```c
+//     status = dbGetLink(&prec->siml, DBR_USHORT, &prec->simm, 0, 0);
+//     if (status)
+//         return status;                     /* <- before write_busy AND
+//                                               before the SIOL dbPutLink */
+//     if (prec->simm == menuYesNoNO) {
+//         status = pdset->write_busy(prec);
+//         ...
+// ```
+//
+// The 21 `recGblGetSimm` records cannot take this branch: recGbl.c:456 ends
+// `recGblGetSimm` with an unconditional `return 0`, so their
+// `if (status) return status;` is dead code. `swait` reads SIML with a plain
+// `dbGetLink` but never tests the status (swaitRecord.c:402). `busy` is the
+// only record that actually aborts.
+
+/// A broken SIML on a `busy` with a local OUT link: C returns from
+/// `writeValue` before the write, so the OUT target must not be driven.
+#[tokio::test]
+async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
+    let db = PvDatabase::new();
+    db.add_record("E5TGT", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+
+    let mut b = BusyRecord::new();
+    b.siml = "NO:SUCH:RECORD".to_string();
+    db.add_record("E5BUSY", Box::new(b)).await.unwrap();
+    db.put_pv("E5BUSY.OUT", EpicsValue::String("E5TGT".into()))
+        .await
+        .unwrap();
+    db.put_pv("E5BUSY", EpicsValue::Short(1)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("E5BUSY", &mut v, 0)
+        .await
+        .unwrap();
+
+    let inst = db.get_record("E5BUSY").await.unwrap();
+    let inst = inst.read().await;
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "dbGetLink -> setLinkAlarm on the failed SIML read"
+    );
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    drop(inst);
+
+    assert_eq!(
+        db.get_pv("E5TGT").await.unwrap(),
+        EpicsValue::Long(0),
+        "busyRecord.c:399-401 returns before write_busy — the OUT target keeps its value"
+    );
+}
+
+/// The same busy in SIMM=YES: the abort precedes the SIOL redirect too, so a
+/// failed SIML read means NO write of any kind — not even the simulated one.
+#[tokio::test]
+async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
+    let db = PvDatabase::new();
+    db.add_record("E5STGT", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+
+    let mut b = BusyRecord::new();
+    b.siml = "NO:SUCH:RECORD".to_string();
+    b.siol = "E5STGT".to_string();
+    b.simm = 1; // YES — but the SIML read overwrites SIMM before it is tested,
+    // and in C the failed read returns before that test is ever reached.
+    db.add_record("E5SBUSY", Box::new(b)).await.unwrap();
+    db.put_pv("E5SBUSY", EpicsValue::Short(1)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("E5SBUSY", &mut v, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.get_pv("E5STGT").await.unwrap(),
+        EpicsValue::Long(0),
+        "the `if (status) return status` precedes the `dbPutLink(&prec->siol, ...)`"
+    );
+}

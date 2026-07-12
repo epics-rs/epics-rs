@@ -155,7 +155,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 CoreOp::Neg => unary_op(&mut stack, |a| a.map(|x| -x))?,
-                CoreOp::Power => binary(&mut stack, |a, b| zip_map(a, b, |x, y| x.powf(y)))?,
+                // POWER is NOT one of C's two-arg array operators. It is its own
+                // case (`aCalcPerform.c:1306-1317`), and it is the only binary
+                // operator in aCalc that does not pair element-wise:
+                //
+                // ```c
+                // case POWER:
+                //     ps1 = ps; DEC(ps);
+                //     toDouble(ps1);                            /* <- the EXPONENT collapses */
+                //     if (isArray(ps)) { for (i=0; i<arraySize; i++) ps->a[i] = pow(ps->a[i], ps1->d); }
+                //     else             { ps->d = pow(ps->d, ps1->d); }
+                // ```
+                //
+                // So the exponent is always a SCALAR — an array exponent becomes its
+                // a[0] and the rest of it is never read — and the LEFT operand alone
+                // decides the result's shape. Compiled C, arraySize 6:
+                //
+                //   AA=[1,2,3,4,5,6]            `2**AA`  -> the SCALAR 2 (= pow(2, AA[0]))
+                //   AA=[1,2,3,4,5,6]            `AA**2`  -> [1,4,9,16,25,36]
+                //   AA=[1..6], CC=[3,1,1,1,1,1] `AA**CC` -> [1,8,27,64,125,216], i.e. AA**3
+                //
+                // `zip_map` promoted the left operand instead, so `2**AA` came out as
+                // the array [2,4,8,16,32,64]: both the VALUE and the SHAPE of the
+                // result diverged, and a record's VAL and AVAL diverged with them.
+                //
+                // `map` is C's in-place element-wise write, so the left operand's
+                // window survives — compiled C, AA=[1,5,2,8,3,9]: `(AA[1,3])**2` is
+                // [25,4,64,0,0,0] and `AVG((AA[1,3])**2)` is 31, the 3-element
+                // window's own average.
+                CoreOp::Power => {
+                    let exp = pop(&mut stack)?.v.as_f64()?;
+                    unary_op(&mut stack, |a| a.map(|x| x.powf(exp)))?
+                }
 
                 // Comparison (element-wise for arrays). aCalc compares EXACTLY —
                 // C's operators are the bare C ones in all three operand shapes

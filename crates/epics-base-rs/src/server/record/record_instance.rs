@@ -1718,7 +1718,7 @@ impl RecordInstance {
     /// `motorRecord`/`scalerRecord`, or its own `process`). Arming the
     /// framework path for those too would write the link twice per cycle.
     fn record_declares_field(&self, name: &str) -> bool {
-        self.record.field_list().iter().any(|f| f.name == name)
+        self.record.implements_field(name)
     }
 
     /// Set a common field value from a runtime `dbPut` (CA/PVA/`dbpf`/link).

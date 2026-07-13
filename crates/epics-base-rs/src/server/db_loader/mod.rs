@@ -1312,14 +1312,27 @@ pub fn apply_fields(
     for (name, value_str) in fields {
         let upper_name = name.to_uppercase();
 
-        // Try record-specific field first
-        let field_desc = record
+        // Two separate questions, and they must stay separate: *who owns* this
+        // field (the record, or the framework's dbCommon fallback), and *what
+        // type* the `.db` string parses as. `field_list()` is the spec and now
+        // carries every field the `.dbd` declares — including INP/OUT, which
+        // most record types leave to the framework — so ownership is asked of
+        // `implements_field()`, not of table membership.
+        let owned = record.implements_field(&upper_name);
+        let spec_type = record
             .field_list()
             .iter()
-            .find(|f| f.name == upper_name.as_str());
+            .find(|f| f.name == upper_name.as_str())
+            .map(|f| f.dbf_type);
 
-        if let Some(desc) = field_desc {
-            let dbf_type = desc.dbf_type;
+        if owned {
+            // The spec's type, or — for a port-internal field the `.dbd` does
+            // not declare — the type the record actually stores it as.
+            let dbf_type = spec_type
+                .or_else(|| record.get_field(&upper_name).map(|v| v.db_field_type()))
+                .ok_or_else(|| {
+                    CaError::InvalidValue(format!("field {upper_name}: no type to parse it as"))
+                })?;
             // A `DBF_MENU` field's `.db` value resolves against THAT field's
             // own menu (label-first, then a numeric index) — C dbStaticLib
             // `dbPutStringNum`. Using the field's choices, not a cross-menu

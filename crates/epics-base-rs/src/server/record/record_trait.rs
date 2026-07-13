@@ -902,8 +902,39 @@ pub trait Record: Send + Sync + 'static {
     /// Set a field value by name.
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()>;
 
-    /// Return the list of field descriptors.
+    /// Return the list of field descriptors — the record type's `.dbd`
+    /// declaration.
+    ///
+    /// This is a *spec*: it says what each field's type, menu and
+    /// `special(SPC_NOMOD)` are. It does NOT say who implements the field.
+    /// Ask [`Record::implements_field`] for that — see its docs for why the
+    /// two must not be the same question.
     fn field_list(&self) -> &'static [FieldDesc];
+
+    /// Does this record type implement `name` in its own `get_field` /
+    /// `put_field`, as opposed to leaving it to the framework's dbCommon
+    /// handling?
+    ///
+    /// This used to be answered by `field_list()` membership, which conflated
+    /// two questions: "what is this field?" and "who owns it?". They give
+    /// different answers for `INP`/`OUT`: every record type *declares* them in
+    /// the `.dbd`, but only some drive the link themselves
+    /// (`multi_output_links` for `acalcout`/`scalcout`, device support for
+    /// `motorRecord`/`scalerRecord`); for the rest the framework arms
+    /// `parsed_inp`/`parsed_out` and drives it. While `field_list()` was
+    /// hand-written and incomplete the conflation was invisible, because the
+    /// hand-written tables happened to omit exactly the fields the framework
+    /// owns. A complete, spec-derived `field_list()` makes membership true for
+    /// every record, so ownership needs its own predicate or the framework
+    /// would stop arming any link at all.
+    ///
+    /// The default answers it truthfully — a record implements the fields its
+    /// own `get_field` can produce. (Verified equivalent to the old
+    /// `field_list()` membership on all 1,757 fields of all 40 record types at
+    /// the time of the split, so the split changed no behaviour.)
+    fn implements_field(&self, name: &str) -> bool {
+        self.get_field(name).is_some()
+    }
 
     /// `SPC_NOMOD` that a record's `cvt_dbaddr` decides **at runtime, from
     /// record state** — the dynamic half of the no-modify declaration.

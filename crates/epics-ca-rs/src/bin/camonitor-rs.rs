@@ -5,8 +5,8 @@ use std::time::SystemTime;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
-    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_time, format_value,
-    sevr_to_str, stat_to_str,
+    CountPrefix, FloatFormat, FloatStyle, PV_NAME_WIDTH, ValueFormat, format_time,
+    format_value_segment, sevr_to_str, stat_to_str,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 use epics_ca_rs::copt::CTool;
@@ -415,12 +415,13 @@ async fn monitor_pv(
                         prev_client: &mut prev_chan_client,
                     };
                     render_timestamp(spec, snap.timestamp, recv_time, start, &mut st)
-                }
-                .map(|ts| format!("{ts}{sep}"))
-                .unwrap_or_default();
+                };
                 drop(fs);
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(
+                // C's separator is a PREFIX of the value's items, not a suffix
+                // of the timestamp (`tool_lib.c:481-489`), so `-t n` — whose
+                // timestamp is empty — still prints it.
+                let value_seg = format_value_segment(
                     &snap.value,
                     &fmt,
                     enum_strings,
@@ -437,10 +438,10 @@ async fn monitor_pv(
                 if stat == 0 && sevr == 0 {
                     // C `tool_lib.c` line 500: print `<sep><sep>` —
                     // two empty alarm fields trailing the value.
-                    println!("{name_col}{sep}{time_seg}{rendered}{sep}{sep}");
+                    println!("{name_col}{sep}{time_seg}{value_seg}{sep}{sep}");
                 } else {
                     println!(
-                        "{name_col}{sep}{time_seg}{rendered}{sep}{stat_str}{sep}{sevr_str}",
+                        "{name_col}{sep}{time_seg}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
                         stat_str = stat_to_str(stat),
                         sevr_str = sevr_to_str(sevr),
                     );
@@ -563,8 +564,14 @@ struct TimestampState<'a> {
     prev_client: &'a mut Option<SystemTime>,
 }
 
-/// Render the timestamp column for one event under `spec`. Returns
-/// `None` when no time column should be printed (`-t n`).
+/// Render the timestamp column for one event under `spec` — the EMPTY string
+/// under `-t n`, which prints no time column.
+///
+/// C has no "no timestamp" branch to special-case: `print_time_val_sts` prints
+/// the name, then an unconditional separator, then whatever the timestamp
+/// block emitted (nothing, when neither `tsSrcServer` nor `tsSrcClient` is
+/// set), and the value brings its OWN separator (`tool_lib.c:517-519`). So the
+/// empty column is just an empty string, and the caller needs no branch.
 ///
 /// Mirrors C `print_time_val_sts` (`tool_lib.c:407-467`): the FIRST
 /// event of each channel always prints an ABSOLUTE stamp (C
@@ -578,7 +585,7 @@ fn render_timestamp(
     client_ts: SystemTime,
     start: SystemTime,
     state: &mut TimestampState<'_>,
-) -> Option<String> {
+) -> String {
     // The server stamp is a `WallTime`; join it to the local-clock comparison
     // domain (client/start/baselines are `SystemTime`) for the µs-formatted
     // display and f64-seconds diffs below. The conversion is 100 ns-granular
@@ -655,7 +662,7 @@ fn render_timestamp(
     if print_abs {
         *state.first_printed = true;
     }
-    if out.is_empty() { None } else { Some(out) }
+    out
 }
 
 #[cfg(test)]
@@ -771,7 +778,12 @@ mod tests {
         };
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
-        assert!(render_timestamp(none, t1.into(), t1, start, &mut st).is_none());
+        assert_eq!(
+            render_timestamp(none, t1.into(), t1, start, &mut st),
+            "",
+            "`-t n` renders an EMPTY column, not an absent one — C has no \
+             no-timestamp branch, it just prints nothing there"
+        );
 
         // Server relative: first event ABSOLUTE (== absolute render of
         // t1), NOT "10.000000".
@@ -779,14 +791,14 @@ mod tests {
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         let first = render_timestamp(srv(TimestampKind::Relative), t1.into(), t1, start, &mut st);
         assert_eq!(
-            first.as_deref(),
-            Some(super::format_server_timestamp(t1).as_str()),
+            first,
+            super::format_server_timestamp(t1),
             "first event must render the absolute server stamp"
         );
         // Second event: diff against the FIRST SERVER stamp (t1), so
         // t2 - t1 = 3s — NOT t2 - start (= 13s).
         let second = render_timestamp(srv(TimestampKind::Relative), t2.into(), t2, start, &mut st);
-        assert_eq!(second.as_deref(), Some(srv_diff(3.0).as_str()));
+        assert_eq!(second, srv_diff(3.0));
     }
 
     #[test]
@@ -803,13 +815,13 @@ mod tests {
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         assert_eq!(
-            render_timestamp(srv, t1.into(), t1, start, &mut st).as_deref(),
-            Some(super::format_server_timestamp(t1).as_str()),
+            render_timestamp(srv, t1.into(), t1, start, &mut st),
+            super::format_server_timestamp(t1),
             "leading incremental event is absolute"
         );
         assert_eq!(
-            render_timestamp(srv, t2.into(), t2, start, &mut st).as_deref(),
-            Some(srv_diff(3.0).as_str()),
+            render_timestamp(srv, t2.into(), t2, start, &mut st),
+            srv_diff(3.0),
             "second incremental event diffs against the prior stamp"
         );
     }
@@ -835,12 +847,12 @@ mod tests {
         // Second event: 7 - 10 = -3s, rendered with a leading '-'.
         let second = render_timestamp(srv, t2.into(), t2, start, &mut st);
         assert_eq!(
-            second.as_deref(),
-            Some(srv_diff(-3.0).as_str()),
+            second,
+            srv_diff(-3.0),
             "backward step must render as a negative delta, not +3"
         );
         assert!(
-            second.as_deref().unwrap().contains("-3.000000"),
+            second.contains("-3.000000"),
             "delta carries a minus sign: {second:?}"
         );
     }
@@ -862,13 +874,10 @@ mod tests {
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         // First: absolute client receive time in parens.
         let first = render_timestamp(cr, start.into(), c1, start, &mut st);
-        assert_eq!(
-            first.as_deref(),
-            Some(format!("({})", super::format_server_timestamp(c1)).as_str())
-        );
+        assert_eq!(first, format!("({})", super::format_server_timestamp(c1)));
         // Second: client diff vs program start → 10s (NOT vs c1).
         let second = render_timestamp(cr, start.into(), c2, start, &mut st);
-        assert_eq!(second.as_deref(), Some(cli_diff(10.0).as_str()));
+        assert_eq!(second, cli_diff(10.0));
     }
 
     #[test]
@@ -890,22 +899,16 @@ mod tests {
         // Leading event absolute: server stamp then (client stamp).
         let first = render_timestamp(both, s1.into(), c1, start, &mut st);
         assert_eq!(
-            first.as_deref(),
-            Some(
-                format!(
-                    "{}({})",
-                    super::format_server_timestamp(s1),
-                    super::format_server_timestamp(c1)
-                )
-                .as_str()
+            first,
+            format!(
+                "{}({})",
+                super::format_server_timestamp(s1),
+                super::format_server_timestamp(c1)
             )
         );
         // Second event: server (s2 - tsFirst=s1) = 3s, client
         // (c2 - tsStart=start) = 10s.
         let second = render_timestamp(both, s2.into(), c2, start, &mut st);
-        assert_eq!(
-            second.as_deref(),
-            Some(format!("{}{}", srv_diff(3.0), cli_diff(10.0)).as_str())
-        );
+        assert_eq!(second, format!("{}{}", srv_diff(3.0), cli_diff(10.0)));
     }
 }

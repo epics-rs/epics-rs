@@ -2,7 +2,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::cli::{
     CountPrefix, PV_NAME_WIDTH, ValueFormat, ca_error_marker, format_time, format_value,
-    sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::copt::CTool;
@@ -22,7 +22,9 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
     // hardcoded 0 — which is why `caput` never sets `ValueFormat::req_elems`
     // even though `-#` is accepted on the command line (its value is
     // overwritten before the put, `caput.c:418,441`).
-    let val = format_value(
+    // The separator before the value is C's per-item PREFIX
+    // (`tool_lib.c:481-489`), not a suffix of the timestamp.
+    let val = format_value_segment(
         &snap.value,
         fmt,
         enum_strings,
@@ -32,10 +34,10 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
     let stat = snap.alarm.status;
     let sevr = snap.alarm.severity;
     if stat == 0 && sevr == 0 {
-        format!("{name_col}{sep}{ts}{sep}{val}{sep}{sep}")
+        format!("{name_col}{sep}{ts}{val}{sep}{sep}")
     } else {
         format!(
-            "{name_col}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+            "{name_col}{sep}{ts}{val}{sep}{stat_str}{sep}{sevr_str}",
             stat_str = stat_to_str(stat),
             sevr_str = sevr_to_str(sevr),
         )

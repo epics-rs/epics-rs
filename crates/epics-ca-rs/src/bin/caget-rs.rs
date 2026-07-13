@@ -3,8 +3,8 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{DBR_CLASS_NAME, DBR_LONG};
 use epics_ca_rs::cli::{
     CountPrefix, FloatFormat, FloatStyle, NO_DATA_MARKER, PV_NAME_WIDTH, ValueFormat,
-    ca_error_marker, dbr_value_field_type, format_c_g, format_time, format_value, sevr_to_str,
-    stat_to_str, zero_dbr_snapshot, zero_dbr_value,
+    ca_error_marker, dbr_value_field_type, format_c_g, format_time, format_value,
+    format_value_segment, sevr_to_str, stat_to_str, zero_dbr_snapshot, zero_dbr_value,
 };
 use epics_ca_rs::client::{
     CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
@@ -1052,7 +1052,9 @@ async fn main() {
                 // fields) on NO_ALARM. Mirror that exactly using the
                 // alarm pair the DBR_TIME response carried.
                 let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-                let rendered = format_value(
+                // The separator before the value is C's per-item PREFIX
+                // (`tool_lib.c:481-489`), not a suffix of the timestamp.
+                let value_seg = format_value_segment(
                     &snap.value,
                     &fmt,
                     enum_strings,
@@ -1064,17 +1066,15 @@ async fn main() {
                 let sevr = snap.alarm.severity;
                 if stat == 0 && sevr == 0 {
                     println!(
-                        "{name}{sep}{ts}{sep}{val}{sep}{sep}",
+                        "{name}{sep}{ts}{value_seg}{sep}{sep}",
                         name = pad_name(is_scalar, pv_name),
                         sep = sep,
-                        val = rendered,
                     );
                 } else {
                     println!(
-                        "{name}{sep}{ts}{sep}{val}{sep}{stat_str}{sep}{sevr_str}",
+                        "{name}{sep}{ts}{value_seg}{sep}{stat_str}{sep}{sevr_str}",
                         name = pad_name(is_scalar, pv_name),
                         sep = sep,
-                        val = rendered,
                         stat_str = stat_to_str(stat),
                         sevr_str = sevr_to_str(sevr),
                     );

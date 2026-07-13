@@ -570,6 +570,54 @@ pub fn format_value(
     }
 }
 
+/// C `print_time_val_sts`'s VALUE SEGMENT (`tool_lib.c:481-489`) — everything
+/// between the timestamp and the trailing alarm fields, separator included.
+///
+/// This is not the loop [`format_value`] renders. The plain/terse loops write
+/// the count with a TRAILING separator and then JOIN the elements
+/// (`printf("%lu%c", ...)`, then `if (i) printf("%c", ...)`, `caget.c:286-289`).
+/// `print_time_val_sts` instead writes every item — the optional count, each
+/// element, the `-S` long string — as `printf("%c%s", fieldSeparator, item)`:
+/// the separator is a PREFIX.
+///
+/// Two consequences the joined form cannot express, and both are divergences
+/// the port shipped (R13-19):
+///
+/// * the separator belongs to the VALUE, not to the timestamp before it, so an
+///   ABSENT timestamp (`camonitor -t n`) must not swallow it — C prints the
+///   name, then an unconditional separator, then the (possibly empty)
+///   timestamp, then `sep`+value, giving two adjacent separators;
+/// * a value with NO items prints NO separator at all (a never-processed
+///   waveform reports `nElems == 0`, and C's element loop then runs zero
+///   times).
+pub fn format_value_segment(
+    v: &EpicsValue,
+    fmt: &ValueFormat,
+    enum_strings: Option<&[PvString]>,
+    count_prefix: CountPrefix,
+) -> String {
+    let sep = fmt.field_separator;
+    let total = v.count() as usize;
+    let leads = count_prefix.leads(fmt.req_elems != 0, total);
+
+    if total == 0 {
+        return if leads {
+            // `-#` on an empty array: C prints `%c%lu` and the element loop
+            // then runs zero times, so nothing trails the count.
+            format!("{sep}{total}")
+        } else {
+            // No count, no elements: C's loop prints nothing whatsoever.
+            String::new()
+        };
+    }
+    // With at least one item, `sep + join(items, sep)` is byte-for-byte C's
+    // `concat(sep + item)`.
+    format!(
+        "{sep}{body}",
+        body = format_value(v, fmt, enum_strings, count_prefix)
+    )
+}
+
 /// C's element loop alone: every element of the value, capped at `reqElems`
 /// and joined by the `-F` separator. The leading count is NOT emitted here —
 /// [`format_value`] owns it, so scalar and array carriers cannot disagree

@@ -3074,7 +3074,7 @@ mod tests {
             "EOS is the only stack layer; COM is the base"
         );
         drv.connect(&AsynUser::default()).unwrap();
-        drv.set_input_eos(b"\n").unwrap();
+        drv.set_input_eos(&AsynUser::default(), b"\n").unwrap();
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 3];

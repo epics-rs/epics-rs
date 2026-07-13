@@ -117,6 +117,25 @@ pub enum AsynError {
     #[error("queueRequest timeout on port {port}")]
     QueueTimeout { port: String },
 
+    /// The port's queue gate refused the request, so it was **never queued and
+    /// never ran** — C's `queueRequest` returning `asynDisabled` /
+    /// `asynDisconnected` (asynManager.c:1541-1552).
+    ///
+    /// Distinct from an [`AsynError::Status`] carrying the same `AsynStatus`,
+    /// and that distinction is the whole point: in C the two arrive by different
+    /// routes and mean opposite things. A refusal is `queueRequest`'s *return
+    /// value* — the callback never runs, so nothing it implies happened: no
+    /// bytes moved, no option was written, no readback, no `monitorStatus`
+    /// (asynRecord.c:571-576 reports `pasynUser->errorMessage` and frees the
+    /// user). A driver error arrives *inside* the callback, which did run and
+    /// whose tail C still executes. Collapsing them into one variant made a
+    /// refused `special()` report as a callback that ran (R14-46).
+    ///
+    /// Built only by the gate owner ([`crate::port::PortDriverBase::check_queue`])
+    /// and asked about through [`AsynError::never_ran`].
+    #[error("asyn: {status:?} - {message}")]
+    QueueRefused { status: AsynStatus, message: String },
+
     #[error("port not found: {0}")]
     PortNotFound(String),
 
@@ -205,7 +224,7 @@ impl AsynError {
     /// `asynStatusToEpicsAlarm` default branch (asynEpicsUtils.c:234-266).
     pub fn status(&self) -> AsynStatus {
         match self {
-            AsynError::Status { status, .. } => *status,
+            AsynError::Status { status, .. } | AsynError::QueueRefused { status, .. } => *status,
             AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
                 source.status()
             }
@@ -219,11 +238,56 @@ impl AsynError {
     /// reports the same text whether or not it moved bytes first.
     pub fn message(&self) -> String {
         match self {
-            AsynError::Status { message, .. } => message.clone(),
+            AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
+                message.clone()
+            }
             AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
                 source.message()
             }
             other => other.to_string(),
+        }
+    }
+
+    /// Re-stamp a gate refusal as one: the request was rejected by
+    /// `queueRequest` and never ran. The gate owner
+    /// ([`crate::port::PortDriverBase::check_queue`]) is the only caller — the
+    /// same checks reached any other way (a driver's own `check_ready` inside a
+    /// request that *is* running) stay [`AsynError::Status`], because there the
+    /// callback did run.
+    pub(crate) fn into_queue_refusal(self) -> AsynError {
+        match self {
+            AsynError::Status { status, message } => AsynError::QueueRefused { status, message },
+            other => other,
+        }
+    }
+
+    /// True iff the request never ran at all — the port's queue gate refused it
+    /// ([`AsynError::QueueRefused`]) or it sat past its deadline and was removed
+    /// ([`AsynError::QueueTimeout`]).
+    ///
+    /// The single owner of that question, and the one every caller of a queued
+    /// request must ask before doing anything a *completed* request implies.
+    /// C draws the line structurally: both outcomes are decided before
+    /// `processUser` is ever dispatched — `queueRequest` returns the refusal
+    /// (asynManager.c:1541-1552) and `queueTimeoutCallback` runs `timeoutUser`
+    /// *instead of* `processUser` (:647-700) — so no bytes moved, no option or
+    /// EOS was written, no connect was attempted, and none of the follow-up work
+    /// a completed request implies (asynRecord's `setOption` → `getOptions`
+    /// fall-through, its `monitorStatus` tail) may run.
+    pub fn never_ran(&self) -> bool {
+        self.is_queue_refused() || self.is_queue_timeout()
+    }
+
+    /// True iff the port's queue gate refused the request — see
+    /// [`AsynError::QueueRefused`]. Ask [`AsynError::never_ran`] unless you
+    /// specifically need to tell a refusal from a queue timeout.
+    pub fn is_queue_refused(&self) -> bool {
+        match self {
+            AsynError::QueueRefused { .. } => true,
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.is_queue_refused()
+            }
+            _ => false,
         }
     }
 

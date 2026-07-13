@@ -5,7 +5,10 @@
 //! pattern using a character-by-character state machine with resynchronization.
 //! On write, appends the output EOS to outgoing data.
 
+use std::collections::HashMap;
+
 use crate::error::AsynResult;
+use crate::port::eos_device_key;
 use crate::user::AsynUser;
 
 use super::{EomReason, OctetInterpose, OctetNext, OctetReadResult, PartialOctetRead};
@@ -31,15 +34,10 @@ impl Default for EosConfig {
     }
 }
 
-/// EOS interpose layer with internal read buffer and character-by-character
-/// state machine matching, including resynchronization on partial matches.
-///
-/// Matches the C implementation's behavior:
-/// - Fixed-size internal buffer (2048 bytes)
-/// - Character-by-character EOS matching with resynchronization
-/// - Filters ASYN_EOM_CNT from lower layer reads
-/// - Null-terminates output when there's room
-pub struct EosInterpose {
+/// One device's EOS state — C's `eosPvt` (asynInterposeEos.c:35-54), of which
+/// there is exactly one per (port, addr) because `asynInterposeEosConfig` takes
+/// the addr and creates the instance for it (:84-120).
+struct EosDevice {
     config: EosConfig,
     /// Fixed-size internal read buffer.
     in_buf: Vec<u8>,
@@ -51,8 +49,8 @@ pub struct EosInterpose {
     eos_in_match: usize,
 }
 
-impl EosInterpose {
-    pub fn new(config: EosConfig) -> Self {
+impl EosDevice {
+    fn new(config: EosConfig) -> Self {
         Self {
             config,
             in_buf: vec![0u8; INPUT_BUFFER_SIZE],
@@ -75,13 +73,68 @@ impl EosInterpose {
         self.in_buf_tail = 0;
         self.eos_in_match = 0;
     }
+}
 
-    pub fn get_input_eos(&self) -> &[u8] {
-        &self.config.input_eos
+/// EOS interpose layer with internal read buffer and character-by-character
+/// state machine matching, including resynchronization on partial matches.
+///
+/// Matches the C implementation's behavior:
+/// - One [`EosDevice`] per addressed device (C's per-(port, addr) `eosPvt`), so
+///   two devices on a multi-device port hold two terminators *and* two
+///   read-ahead buffers — neither device's bytes can be served to the other
+/// - Fixed-size internal buffer (2048 bytes) per device
+/// - Character-by-character EOS matching with resynchronization
+/// - Filters ASYN_EOM_CNT from lower layer reads
+/// - Null-terminates output when there's room
+pub struct EosInterpose {
+    /// The terminators a device starts with — the config this layer was
+    /// installed with, C's `asynInterposeEosConfig` arguments.
+    initial: EosConfig,
+    /// The port's device model, set at install ([`OctetInterpose::attach_port`]).
+    multi_device: bool,
+    devices: HashMap<i32, EosDevice>,
+}
+
+impl EosInterpose {
+    pub fn new(config: EosConfig) -> Self {
+        Self {
+            initial: config,
+            multi_device: false,
+            devices: HashMap::new(),
+        }
     }
 
-    pub fn get_output_eos(&self) -> &[u8] {
-        &self.config.output_eos
+    /// The state for the device this `asynUser` addresses, created on first
+    /// touch with the layer's configured terminators.
+    fn device(&mut self, addr: i32) -> &mut EosDevice {
+        let key = eos_device_key(self.multi_device, addr);
+        let initial = self.initial.clone();
+        self.devices
+            .entry(key)
+            .or_insert_with(|| EosDevice::new(initial))
+    }
+
+    pub fn get_input_eos(&self, addr: i32) -> &[u8] {
+        self.devices
+            .get(&eos_device_key(self.multi_device, addr))
+            .map_or(&self.initial.input_eos, |d| &d.config.input_eos)
+    }
+
+    pub fn get_output_eos(&self, addr: i32) -> &[u8] {
+        self.devices
+            .get(&eos_device_key(self.multi_device, addr))
+            .map_or(&self.initial.output_eos, |d| &d.config.output_eos)
+    }
+}
+
+#[cfg(test)]
+impl EosInterpose {
+    /// Test-only view of one device's `eosPvt` — the read-ahead buffer bounds
+    /// and the partial-match position the boundary tests below assert on.
+    fn peek(&self, addr: i32) -> &EosDevice {
+        self.devices
+            .get(&eos_device_key(self.multi_device, addr))
+            .expect("device state is created on first touch")
     }
 }
 
@@ -120,14 +173,18 @@ impl OctetInterpose for EosInterpose {
                 eom_reason: EomReason::CNT,
             });
         }
+        // C's `eosPvt` for the device this read addresses: its terminator, its
+        // read-ahead buffer, its match position. Nothing below can reach
+        // another device's bytes.
+        let dev = self.device(user.addr);
         let mut n_read: usize = 0;
         let mut eom = EomReason::empty();
 
         loop {
             // Process buffered data character by character
-            if self.in_buf_tail != self.in_buf_head {
-                let c = self.in_buf[self.in_buf_tail];
-                self.in_buf_tail += 1;
+            if dev.in_buf_tail != dev.in_buf_head {
+                let c = dev.in_buf[dev.in_buf_tail];
+                dev.in_buf_tail += 1;
                 buf[n_read] = c;
                 n_read += 1;
 
@@ -136,20 +193,22 @@ impl OctetInterpose for EosInterpose {
                 // With an empty terminator we still deliver the buffered
                 // byte above, we just never match/strip — so cleared-EOS
                 // reads drain `in_buf` instead of dropping it.
-                if !self.config.input_eos.is_empty() {
-                    let eos = &self.config.input_eos;
-                    if c == eos[self.eos_in_match] {
-                        self.eos_in_match += 1;
-                        if self.eos_in_match == eos.len() {
+                let eos_len = dev.config.input_eos.len();
+                if eos_len > 0 {
+                    let expected = dev.config.input_eos[dev.eos_in_match];
+                    let first = dev.config.input_eos[0];
+                    if c == expected {
+                        dev.eos_in_match += 1;
+                        if dev.eos_in_match == eos_len {
                             // Full EOS match — remove the EOS bytes from the
                             // output count. Only the EOS bytes written into
                             // *this* buffer can be removed: when a 2-byte EOS
                             // straddles two read() calls, the leading byte was
                             // already returned to the previous caller, so
-                            // `n_read` here may be smaller than `eos.len()`.
-                            // An unguarded `n_read -= eos.len()` underflows.
-                            self.eos_in_match = 0;
-                            n_read -= eos.len().min(n_read);
+                            // `n_read` here may be smaller than `eos_len`.
+                            // An unguarded `n_read -= eos_len` underflows.
+                            dev.eos_in_match = 0;
+                            n_read -= eos_len.min(n_read);
                             eom |= EomReason::EOS;
                             break;
                         }
@@ -157,11 +216,7 @@ impl OctetInterpose for EosInterpose {
                         // Resynchronize the search. Since asyn allows a maximum
                         // two-character EOS, we only need to check if the current
                         // character matches the first EOS character.
-                        if c == eos[0] {
-                            self.eos_in_match = 1;
-                        } else {
-                            self.eos_in_match = 0;
-                        }
+                        dev.eos_in_match = usize::from(c == first);
                     }
                 }
 
@@ -200,7 +255,7 @@ impl OctetInterpose for EosInterpose {
             // (`port_actor`'s scratch `Vec`, `SyncIO`'s) owns a different one
             // and drops it on `?`. Only bytes that travel inside the error
             // reach the record.
-            let result = match next.read(user, &mut self.in_buf[..]) {
+            let result = match next.read(user, &mut dev.in_buf[..]) {
                 Ok(r) => r,
                 Err(e) => {
                     if n_read < maxchars {
@@ -228,8 +283,8 @@ impl OctetInterpose for EosInterpose {
                 break;
             }
 
-            self.in_buf_tail = 0;
-            self.in_buf_head = result.nbytes_transferred;
+            dev.in_buf_tail = 0;
+            dev.in_buf_head = result.nbytes_transferred;
         }
 
         // Null terminate if there's room (C parity)
@@ -249,14 +304,15 @@ impl OctetInterpose for EosInterpose {
         data: &[u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
-        if self.config.output_eos.is_empty() {
+        let out_eos = self.device(user.addr).config.output_eos.clone();
+        if out_eos.is_empty() {
             return next.write(user, data);
         }
 
-        // Append output EOS to the data
-        let mut buf = Vec::with_capacity(data.len() + self.config.output_eos.len());
+        // Append this device's output EOS to the data
+        let mut buf = Vec::with_capacity(data.len() + out_eos.len());
         buf.extend_from_slice(data);
-        buf.extend_from_slice(&self.config.output_eos);
+        buf.extend_from_slice(&out_eos);
         // C `asynInterposeEos.c::writeIt` (:189-197) runs one common tail
         // regardless of status: `*nbytesTransfered = min(nbytesActual,
         // numchars); return status`. So the clamp — never report the appended
@@ -272,20 +328,28 @@ impl OctetInterpose for EosInterpose {
         }
     }
 
+    fn attach_port(&mut self, multi_device: bool) {
+        self.multi_device = multi_device;
+    }
+
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
-        self.reset_link_state();
+        // C `flushIt` runs on the addressed device's `eosPvt`
+        // (asynInterposeEos.c:258-266): flushing one device does not throw away
+        // another's read-ahead.
+        self.device(user.addr).reset_link_state();
         next.flush(user)
     }
 
-    fn set_input_eos(&mut self, eos: &[u8]) {
-        self.config.input_eos = eos.to_vec();
+    fn set_input_eos(&mut self, addr: i32, eos: &[u8]) {
+        let dev = self.device(addr);
+        dev.config.input_eos = eos.to_vec();
         // Reset the resync state machine — a mid-stream terminator change
         // must not carry a partial match from the old terminator.
-        self.eos_in_match = 0;
+        dev.eos_in_match = 0;
     }
 
-    fn set_output_eos(&mut self, eos: &[u8]) {
-        self.config.output_eos = eos.to_vec();
+    fn set_output_eos(&mut self, addr: i32, eos: &[u8]) {
+        self.device(addr).config.output_eos = eos.to_vec();
     }
 
     /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151): on
@@ -296,7 +360,12 @@ impl OctetInterpose for EosInterpose {
     /// over from a 2-byte terminator that straddled the drop makes the first
     /// byte of the new session complete a spurious EOS match.
     fn connection_changed(&mut self) {
-        self.reset_link_state();
+        // The connect exception is port-level: C fires it at every `eosPvt`
+        // registered on the port (`exceptionOccurred`, asynManager.c:2100-2140,
+        // walks the exception-user list), so every device drops its read-ahead.
+        for dev in self.devices.values_mut() {
+            dev.reset_link_state();
+        }
     }
 }
 
@@ -447,9 +516,9 @@ mod tests {
         // Flush should clear internal state
         let mut user2 = AsynUser::default();
         interpose.flush(&mut user2, &mut base).unwrap();
-        assert_eq!(interpose.in_buf_head, 0);
-        assert_eq!(interpose.in_buf_tail, 0);
-        assert_eq!(interpose.eos_in_match, 0);
+        assert_eq!(interpose.peek(0).in_buf_head, 0);
+        assert_eq!(interpose.peek(0).in_buf_tail, 0);
+        assert_eq!(interpose.peek(0).eos_in_match, 0);
     }
 
     /// C parity (`asynInterposeEos.c::readIt:191,199`): clearing the input
@@ -474,13 +543,14 @@ mod tests {
         assert_eq!(&buf[..first.nbytes_transferred], b"AB");
         assert!(first.eom_reason.contains(EomReason::EOS));
         assert_ne!(
-            interpose.in_buf_tail, interpose.in_buf_head,
+            interpose.peek(0).in_buf_tail,
+            interpose.peek(0).in_buf_head,
             "read-ahead must leave CD\\n buffered"
         );
 
         // Clear IEOS (the binary-suppress path). The next read must deliver
         // the buffered "CD\n", not skip to the (now empty) lower layer.
-        interpose.set_input_eos(b"");
+        interpose.set_input_eos(0, b"");
         let mut buf2 = [0u8; 16];
         let second = interpose.read(&user, &mut buf2, &mut base).unwrap();
         assert_eq!(
@@ -509,15 +579,16 @@ mod tests {
         let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"OLD1");
         assert_ne!(
-            interpose.in_buf_tail, interpose.in_buf_head,
+            interpose.peek(0).in_buf_tail,
+            interpose.peek(0).in_buf_head,
             "precondition: OLD2\\n is buffered read-ahead"
         );
 
         // The link drops and comes back (either edge fires C's
         // asynExceptionConnect).
         interpose.connection_changed();
-        assert_eq!(interpose.in_buf_head, 0);
-        assert_eq!(interpose.in_buf_tail, 0);
+        assert_eq!(interpose.peek(0).in_buf_head, 0);
+        assert_eq!(interpose.peek(0).in_buf_tail, 0);
 
         let mut new_link = MockOctetBase::new(b"NEW1\n");
         let r = interpose.read(&user, &mut buf, &mut new_link).unwrap();
@@ -547,12 +618,13 @@ mod tests {
         let r = interpose.read(&user, &mut buf, &mut old_link).unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"AB\r");
         assert_eq!(
-            interpose.eos_in_match, 1,
+            interpose.peek(0).eos_in_match,
+            1,
             "precondition: the trailing \\r left a partial match"
         );
 
         interpose.connection_changed();
-        assert_eq!(interpose.eos_in_match, 0);
+        assert_eq!(interpose.peek(0).eos_in_match, 0);
 
         // New session's first byte is '\n' — the terminator's second byte.
         // With a stale match it would complete the EOS and return 0 bytes;
@@ -568,16 +640,66 @@ mod tests {
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
 
+    /// R14-49: on a multi-device port each device gets its own `eosPvt` — its
+    /// own terminator *and* its own read-ahead buffer (C creates one per
+    /// (port, addr), asynInterposeEos.c:84-120). A shared buffer would serve one
+    /// device's bytes to another.
+    #[test]
+    fn each_device_keeps_its_own_terminator_and_read_ahead() {
+        let mut interpose = EosInterpose::new(EosConfig::default());
+        interpose.attach_port(true);
+        interpose.set_input_eos(1, b"\n");
+        interpose.set_input_eos(2, b";");
+        assert_eq!(interpose.get_input_eos(1), b"\n");
+        assert_eq!(interpose.get_input_eos(2), b";");
+
+        let dev1 = AsynUser::default().with_addr(1);
+        let dev2 = AsynUser::default().with_addr(2);
+        // One lower read drains the whole stream into *device 1's* buffer: it
+        // returns "AB" on its own terminator and holds "CD;" as read-ahead.
+        let mut base = MockOctetBase::new(b"AB\nCD;");
+        let mut buf = [0u8; 16];
+        let r = interpose.read(&dev1, &mut buf, &mut base).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"AB");
+        assert!(r.eom_reason.contains(EomReason::EOS));
+
+        // Device 2 reads with the stream exhausted. With a port-wide buffer it
+        // would be handed device 1's "CD" and stop on device 2's ';'.
+        let r = interpose.read(&dev2, &mut buf, &mut base).unwrap();
+        assert_eq!(
+            r.nbytes_transferred, 0,
+            "a device must never be served another device's read-ahead"
+        );
+
+        // Device 1's own next read still gets its buffered remainder, on its
+        // own terminator ('\n' — not device 2's ';').
+        let r = interpose.read(&dev1, &mut buf, &mut base).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"CD;");
+        assert!(!r.eom_reason.contains(EomReason::EOS));
+    }
+
+    /// The single-device boundary: no `ASYN_MULTIDEVICE`, so every addr resolves
+    /// to the port itself and must share one terminator (see
+    /// [`crate::port::eos_device_key`]).
+    #[test]
+    fn a_single_device_port_collapses_every_addr_onto_one_terminator() {
+        let mut interpose = EosInterpose::new(EosConfig::default());
+        interpose.attach_port(false);
+        interpose.set_input_eos(-1, b"\n");
+        assert_eq!(interpose.get_input_eos(0), b"\n");
+        assert_eq!(interpose.get_input_eos(7), b"\n");
+    }
+
     #[test]
     fn test_eos_config_getters_setters() {
         let mut interpose = EosInterpose::new(EosConfig::default());
-        assert!(interpose.get_input_eos().is_empty());
+        assert!(interpose.get_input_eos(0).is_empty());
 
-        interpose.set_input_eos(b"\n");
-        assert_eq!(interpose.get_input_eos(), b"\n");
+        interpose.set_input_eos(0, b"\n");
+        assert_eq!(interpose.get_input_eos(0), b"\n");
 
-        interpose.set_output_eos(b"\r\n");
-        assert_eq!(interpose.get_output_eos(), b"\r\n");
+        interpose.set_output_eos(0, b"\r\n");
+        assert_eq!(interpose.get_output_eos(0), b"\r\n");
     }
 
     #[test]

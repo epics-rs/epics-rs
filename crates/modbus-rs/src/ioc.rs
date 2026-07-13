@@ -489,10 +489,12 @@ impl ModbusPortDriver {
         // (and, in the old poller task, kill the poller for good).
         self.io_status = match self.engine.poll(self.transport.as_mut()) {
             Ok(_) => AsynStatus::Success,
-            Err(e) => match to_asyn(e) {
-                AsynError::Status { status, .. } => status,
-                _ => AsynStatus::Error,
-            },
+            // `AsynError::status()` is the single owner of "which asynStatus is
+            // this?" — it reads a queue refusal (a disabled/disconnected port
+            // turning the request down) as the `asynDisabled`/`asynDisconnected`
+            // it is, where matching `AsynError::Status` by hand flattened both to
+            // `asynError` and told every record the wrong reason.
+            Err(e) => to_asyn(e).status(),
         };
 
         // C `doModbusIO` moves the statistics counters on every I/O — success or

@@ -333,9 +333,9 @@ async fn open_monitor(
     // `BridgeChannel::create_monitor_with_value_mask`; group
     // and pva_pv-registered channels fall through to the
     // default mask (their DBE selection is not yet wired).
-    // An unconvertible (array-typed) DBE never reaches here: pvxs throws out of
-    // `onSubscribe` at INIT and resets the circuit, which the port enforces in
-    // `QsrvPvStore::check_monitor_request` before this op is even registered. If
+    // An unconvertible (array-typed) DBE never reaches here: it fails
+    // `QsrvPvStore::check_monitor_request` at INIT, which errors the op (CBUG-C2
+    // — pvxs resets the whole circuit there instead) before it is registered. If
     // one somehow arrives, take pvxs's `dbe = 0` fallback rather than inventing
     // a third behaviour.
     //
@@ -432,10 +432,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// pvxs `SingleSource::onSubscribe` (`ioc/singlesource.cpp:114-140`) reads
     /// `record._options.DBE` with the THROWING `as<T>()`, before `connect()`
     /// emits the INIT reply. An array-typed DBE of integer, real or string
-    /// element kind raises `NoConvert` there and resets the circuit
-    /// ([`MonitorRequestFatal`]). This is the INIT-time half of that read; the
-    /// mask itself is resolved at START by `open_monitor`, which is where the
-    /// port opens the subscription.
+    /// element kind raises `NoConvert` there. This is the INIT-time half of that
+    /// read; the mask itself is resolved at START by `open_monitor`, which is
+    /// where the port opens the subscription.
+    ///
+    /// DEVIATION from C++, deliberate — CBUG-C2. QSRV lets that `NoConvert`
+    /// unwind out of its bare `connect()` into `conn.cpp:277-282`'s
+    /// `bev.reset()`, so one client's malformed `record._options` drops the
+    /// shared TCP circuit and every other channel on it. Here the failure is an
+    /// `OpError`: this MONITOR gets an error INIT reply, and nothing else on the
+    /// circuit notices.
     ///
     /// Scoped to SINGLE-RECORD channels, because that is the only pvxs source
     /// that reads DBE:
@@ -450,9 +456,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: &epics_pva_rs::server_native::source::AccessChecked,
         ctx: &epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<
-        Output = Result<(), epics_pva_rs::server_native::source::MonitorRequestFatal>,
-    > + Send {
+    ) -> impl std::future::Future<Output = Result<(), epics_pva_rs::server_native::source::OpError>> + Send
+    {
         let pva_pvs = self.pva_pvs.clone();
         let provider = self.provider.clone();
         let name = checked.pv_name().to_string();

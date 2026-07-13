@@ -6645,11 +6645,20 @@ async fn handle_op(
         // whose storage no `copyOut` arm converts raises `NoConvert`, nothing
         // catches it on the way out of `handle_MONITOR`, and
         // `conn.cpp:277-282` calls `bev.reset()`. The port opens the
-        // subscription at START, not INIT, so the throwing half of `onSubscribe`
-        // is its own INIT-time hook: `check_monitor_request`. Its `Err` is a
-        // fatal `PvaError` out of this read loop — the connection teardown that
-        // IS `bev.reset()`. Sources that read no such option (the default impl)
-        // return `Ok`, so nothing else changes. (R9-35.)
+        // subscription at START, not INIT, so the failing half of `onSubscribe`
+        // is its own INIT-time hook: `check_monitor_request`. (R9-35.)
+        //
+        // DEVIATION from C++, deliberate — CBUG-C2. QSRV's `bev.reset()` is a
+        // per-operation failure escalated to a transport reset: one client's
+        // malformed `record._options` drops the shared TCP circuit, and with it
+        // every OTHER channel multiplexed on it. Through a gateway that is one
+        // user's field typo disconnecting every other user. So the hook's `Err`
+        // is an `OpError`, answered here the same way as the pvRequest-mask
+        // failure above: an INIT reply carrying an error `Status`, the op left
+        // unregistered, the circuit and its other channels untouched. This is
+        // also what pvxs's OWN library source does for the same throw
+        // (`sharedpv.cpp:94-101` catches around `connect()` and calls
+        // `conn->error(msg)`); only QSRV's sources leave it bare.
         if kind == OpKind::Monitor {
             let init_ctx = crate::server_native::source::ChannelContext {
                 peer,
@@ -6673,10 +6682,8 @@ async fn handle_op(
                 )
                 .await;
             if let Err(e) = source.check_monitor_request(&checked, &init_ctx).await {
-                return Err(PvaError::Decode(format!(
-                    "MONITOR INIT for \"{}\": unconvertible record._options: {e}",
-                    ch.name
-                )));
+                send_chan_op_error(&chan_tx, kind, ioid, subcmd, e.wire_status(), order).await?;
+                return Ok(());
             }
             // R10-37: the source's `onSubscribe` diagnostics are INIT-time.
             // pvxs records them INSIDE `onSubscribe` — `singlesource.cpp:129`'s
@@ -6687,9 +6694,9 @@ async fn handle_op(
             // and re-parse at START to log there, putting the message AFTER the
             // INIT reply (and emitting it for group / native-PVA channels, whose
             // pvxs sources never read DBE at all). Draining here, before the
-            // reply is built, is pvxs's order. Only on the Ok path: a DBE that
-            // THROWS resets the circuit without a reply, and pvxs's throw
-            // happens before its logRemote.
+            // reply is built, is pvxs's order. Only on the Ok path: the failing
+            // DBE returns above with an error INIT reply, and pvxs's throw
+            // likewise happens before its logRemote, so it logs nothing either.
             flush_remote_log(&init_ctx.log, ioid, order, &chan_tx).await;
         }
 

@@ -1721,6 +1721,18 @@ impl PvDatabase {
         // fetch below), so `pre_input_link_actions` is a strictly
         // earlier hook. The record needs `dtyp` to decide whether the
         // callback DSET is active, so push the process context first.
+        //
+        // The ReadDbLink actions of this stage go through the reporting owner
+        // (`execute_read_db_links`), not the fire-and-forget one: a failed read
+        // here is a `dbGetLink` failure like any other, and the record must be
+        // able to see it. C `aaoRecord.c::process` (167-168) aborts the whole
+        // cycle when its closed-loop DOL fetch fails —
+        // `if ((status = fetchValue(prec, 0))) return status;` returns BEFORE
+        // `writeValue`, `monitor` and `recGblFwdLink` — which it can only do
+        // because `fetchValue`'s `dbGetLink` status reaches it. Discarding the
+        // outcome (as this stage did) let a dead DOL write a stale VAL to OUT,
+        // post monitors and fire the forward link, every cycle, with no alarm.
+        let mut pre_input_resolved: Vec<&'static str> = Vec::new();
         {
             let pre_input_actions = {
                 let mut instance = rec.write().await;
@@ -1729,8 +1741,19 @@ impl PvDatabase {
                 instance.record.pre_input_link_actions()
             };
             if !pre_input_actions.is_empty() {
-                self.execute_process_actions(name, &rec, pre_input_actions, visited, depth)
-                    .await;
+                let (reads, others): (Vec<_>, Vec<_>) =
+                    pre_input_actions.into_iter().partition(|a| {
+                        matches!(a, crate::server::record::ProcessAction::ReadDbLink { .. })
+                    });
+                if !reads.is_empty() {
+                    pre_input_resolved = self
+                        .execute_read_db_links(name, &rec, &reads, visited, depth)
+                        .await;
+                }
+                if !others.is_empty() {
+                    self.execute_process_actions(name, &rec, others, visited, depth)
+                        .await;
+                }
             }
         }
 
@@ -1866,11 +1889,13 @@ impl PvDatabase {
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
         )> = Vec::new();
-        // Link fields (the `multi_input_links` first element) whose
-        // fetch actually produced a value this cycle — pushed to the
-        // record via `set_resolved_input_links` so its `process()` can
-        // observe link-fetch success (C `RTN_SUCCESS(dbGetLink(...))`).
-        let mut resolved_link_fields: Vec<&'static str> = Vec::new();
+        // Link fields whose fetch actually produced a value this cycle —
+        // pushed to the record via `set_resolved_input_links` so its
+        // `process()` can observe link-fetch success (C
+        // `RTN_SUCCESS(dbGetLink(...))`). ONE list per cycle, covering every
+        // framework-run input read: the pre-input stage (aao DOL, sseq SELL),
+        // the `multi_input_links` fetch, and the pre-process ReadDbLink reads.
+        let mut resolved_link_fields: Vec<&'static str> = pre_input_resolved;
         // sel `Specified`-mode fetch gate. C `selRecord.c::process`
         // (114) runs `do_sel` only when `fetch_values` succeeds. In
         // Specified mode the fetch list is exactly INP[SELN] (via
@@ -3607,13 +3632,65 @@ impl PvDatabase {
         }
     }
 
-    /// Execute ReadDbLink actions before process().
-    /// Reads linked PV values and writes them into record fields via put_field_internal.
-    /// Returns the `link_field` names whose read produced a value, so the
-    /// caller can fold them into the per-cycle `set_resolved_input_links`
-    /// report (C `RTN_SUCCESS(dbGetLink(...))`). An empty link is skipped
-    /// and NOT reported — it is a CONSTANT link in C, which records must
-    /// not treat as a failed fetch.
+    /// One record-declared input link read — the framework's `dbGetLink`.
+    ///
+    /// The value goes into `target_field`; the outcome is reported back so the
+    /// caller can fold it into the per-cycle `set_resolved_input_links` report
+    /// (C `RTN_SUCCESS(dbGetLink(...))`):
+    ///
+    /// * `None` — nothing was attempted: the link is empty, i.e. a CONSTANT
+    ///   link in C, which records must not treat as a failed fetch;
+    /// * `Some(true)` — the read produced a value;
+    /// * `Some(false)` — the read FAILED (dead DB target, disconnected CA).
+    ///   C `dbGetLink` (`dbLink.c:316-323`) runs `setLinkAlarm(plink)` on a
+    ///   non-zero status, i.e. `recGblSetSevrMsg(precord, LINK_ALARM,
+    ///   INVALID_ALARM, "%s", dbLinkFieldName(plink))` — so the failure raises
+    ///   LINK/INVALID carrying the link's field name as the AMSG, right here,
+    ///   as an effect of the read itself. Every caller inherits it; none can
+    ///   forget it.
+    async fn read_db_link_into_field(
+        &self,
+        rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
+        link_field: &'static str,
+        target_field: &'static str,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> Option<bool> {
+        let link_str = {
+            let instance = rec.read().await;
+            instance
+                .record
+                .get_field(link_field)
+                .and_then(|v| {
+                    if let EpicsValue::String(s) = v {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        };
+        if link_str.is_empty() {
+            return None;
+        }
+        let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
+        match self.read_link_value(&parsed, visited, depth).await {
+            Some(value) => {
+                let mut instance = rec.write().await;
+                let _ = instance.record.put_field_internal(target_field, value);
+                Some(true)
+            }
+            None => {
+                let mut instance = rec.write().await;
+                crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
+                Some(false)
+            }
+        }
+    }
+
+    /// Execute the ReadDbLink actions of a stage, and report which
+    /// `link_field`s produced a value — see [`Self::read_db_link_into_field`],
+    /// which owns the read (and its LINK/INVALID alarm on failure).
     async fn execute_read_db_links(
         &self,
         _record_name: &str,
@@ -3629,30 +3706,12 @@ impl PvDatabase {
                 link_field,
                 target_field,
             } = action
+                && self
+                    .read_db_link_into_field(rec, link_field, target_field, visited, depth)
+                    .await
+                    == Some(true)
             {
-                let link_str = {
-                    let instance = rec.read().await;
-                    instance
-                        .record
-                        .get_field(link_field)
-                        .and_then(|v| {
-                            if let EpicsValue::String(s) = v {
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default()
-                };
-                if link_str.is_empty() {
-                    continue;
-                }
-                let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
-                if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
-                    let mut instance = rec.write().await;
-                    let _ = instance.record.put_field_internal(target_field, value);
-                    resolved.push(*link_field);
-                }
+                resolved.push(*link_field);
             }
         }
         resolved
@@ -3681,32 +3740,12 @@ impl PvDatabase {
                     link_field,
                     target_field,
                 } => {
-                    // 1. Get the link string from the record
-                    let link_str = {
-                        let instance = rec.read().await;
-                        instance
-                            .record
-                            .get_field(link_field)
-                            .and_then(|v| {
-                                if let EpicsValue::String(s) = v {
-                                    Some(s)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    };
-                    if link_str.is_empty() {
-                        continue;
-                    }
-                    // 2. Parse and read the linked PV
-                    let parsed =
-                        crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
-                    if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
-                        // 3. Write into the record field (internal put bypasses read-only)
-                        let mut instance = rec.write().await;
-                        let _ = instance.record.put_field_internal(target_field, value);
-                    }
+                    // The read (and the LINK/INVALID alarm a failed one raises,
+                    // C `dbGetLink` -> `setLinkAlarm`) belongs to ONE owner, so
+                    // an input link cannot fail silently on one stage and
+                    // loudly on another.
+                    self.read_db_link_into_field(rec, link_field, target_field, visited, depth)
+                        .await;
                 }
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)

@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessAction, Record, parse_link_v2};
+use crate::server::record::{
+    FieldDesc, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, parse_link_v2,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Which EPICS record-type name an [`ArrayRecord`] reports. The four
@@ -107,6 +109,12 @@ pub struct WaveformRecord {
     /// `init_record` cannot reach, so the outcome is carried here and folded
     /// in by `post_init_finalize_undef`.
     constant_dol_loaded: bool,
+    /// aao closed-loop: did this cycle ask the framework to fetch DOL, and did
+    /// that fetch fail? C `fetchValue(prec, 0)`'s `dbGetLink` status
+    /// (aaoRecord.c:366-374), which `process` returns on (167-168). The
+    /// framework reports the outcome through `set_resolved_input_links`.
+    dol_fetch_requested: bool,
+    dol_read_failed: bool,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -203,6 +211,8 @@ impl Default for WaveformRecord {
             omsl: 0,
             dol: String::new(),
             constant_dol_loaded: false,
+            dol_fetch_requested: false,
+            dol_read_failed: false,
         }
     }
 }
@@ -1230,10 +1240,59 @@ impl Record for WaveformRecord {
         if dol_is_constant(&self.dol) {
             return Vec::new();
         }
+        // The cycle now depends on this fetch — `set_resolved_input_links`
+        // reports whether it landed.
+        self.dol_fetch_requested = true;
         vec![ProcessAction::ReadDbLink {
             link_field: "DOL",
             target_field: "VAL",
         }]
+    }
+
+    /// The framework's per-cycle report of which input-link fetches produced a
+    /// value — C `RTN_SUCCESS(dbGetLink(...))`. For the closed-loop aao that
+    /// is `fetchValue`'s status: a requested DOL fetch missing from the report
+    /// is C's non-zero `dbGetLink` status, which aborts the cycle in
+    /// [`Self::process`].
+    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        self.dol_read_failed = self.dol_fetch_requested && !resolved.contains(&"DOL");
+        self.dol_fetch_requested = false;
+    }
+
+    /// C `aaoRecord.c::process` (164-174):
+    ///
+    /// ```c
+    ///     if (!pact) {
+    ///         prec->udf = FALSE;
+    ///         if (!!(status = fetchValue(prec, 0)))
+    ///             return status;
+    ///         recGblGetTimeStampSimm(...);
+    ///     }
+    ///     status = writeValue(prec);
+    ///     ...
+    ///     monitor(prec);
+    ///     recGblFwdLink(prec);
+    /// ```
+    ///
+    /// A failed closed-loop DOL fetch RETURNS — before `writeValue`, before the
+    /// timestamp, before `monitor` and before `recGblFwdLink`, with PACT still
+    /// clear. Nothing is written out and nothing is posted: the record must not
+    /// push a stale VAL to its device/OUT target as if it were the new desired
+    /// output. (`fetchValue`'s `dbGetLink` has already raised LINK/INVALID via
+    /// `setLinkAlarm`; C leaves it PENDING in nsta/nsev, because the abort also
+    /// skips the `recGblResetAlarms` inside `monitor`.) `CompleteNoEmit` is that
+    /// return exactly — no device write, no OUT, no monitor, no FLNK, no alarm
+    /// commit, PACT clear.
+    ///
+    /// The port ran the whole cycle regardless: the framework's pre-input stage
+    /// discarded the read failure, so a dead DOL meant OUT kept receiving the
+    /// last good value and downstream records kept being triggered by it.
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        if self.dol_read_failed {
+            self.dol_read_failed = false;
+            return Ok(ProcessOutcome::complete_no_emit());
+        }
+        Ok(ProcessOutcome::complete())
     }
 
     /// epics-base PR #a02c310 follow-up: subArray slices its input

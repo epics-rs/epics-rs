@@ -1212,8 +1212,11 @@ impl Record for ScalcoutRecord {
     ///
     /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
     ///   (:83-89, :131-134) — `DBR_STRING` from `OSV`, the OCAL string
-    ///   result. In the port a link/menu/device field is a `DBF_STRING`
-    ///   and a menu is a `DBF_ENUM`, so those two types are the class.
+    ///   result. All seven classes are reported by
+    ///   [`OutTarget::puts_as_string`], which the target resolution settles:
+    ///   the port's `DbFieldType` is a DBR wire type and has no `Menu` or
+    ///   `Device` variant, so matching on it alone missed every menu target
+    ///   (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …) and `DTYP`.
     /// - `DBF_CHAR`/`DBF_UCHAR` with `n_elements > 1` (:92-96, :136-138) —
     ///   `DBF_CHAR` array of `min(n_elements, sizeof(sval)) = min(n, 40)`
     ///   bytes. C reads that buffer from `OSV` on the ASYNCHRONOUS branch
@@ -1232,10 +1235,10 @@ impl Record for ScalcoutRecord {
         if link_field != "OUT" {
             return staged;
         }
+        if target.puts_as_string {
+            return EpicsValue::String(self.osv.clone());
+        }
         match target.field_type {
-            Some(DbFieldType::String) | Some(DbFieldType::Enum) => {
-                EpicsValue::String(self.osv.clone())
-            }
             Some(DbFieldType::Char) | Some(DbFieldType::UChar) if target.element_count > 1 => {
                 // `n_elements > sizeof(pscalcout->sval)` clamp — the C
                 // buffers are `char[SCALC_STRING_SIZE]` (40).
@@ -1661,6 +1664,10 @@ mod tests {
         rec
     }
 
+    /// A target as `PvDatabase::resolve_out_target` would report it for a
+    /// STRING/ENUM/numeric field: those two DBR types are in C's string class
+    /// on their own. A `DBF_MENU`/`DBF_DEVICE` target is NOT expressible as a
+    /// `DbFieldType` — see [`out_target_menu`].
     fn out_target(
         field_type: Option<DbFieldType>,
         element_count: i64,
@@ -1670,6 +1677,23 @@ mod tests {
             field_type,
             element_count,
             is_ca_link,
+            puts_as_string: matches!(
+                field_type,
+                Some(DbFieldType::String) | Some(DbFieldType::Enum)
+            ),
+        }
+    }
+
+    /// A `DBF_MENU` target (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …) as the
+    /// resolver reports it: the menu INDEX is a short, so `field_type` is
+    /// `Short` — nothing in the DBR type says "menu". The class comes from
+    /// `puts_as_string`, which the target record settles.
+    fn out_target_menu() -> OutTarget {
+        OutTarget {
+            field_type: Some(DbFieldType::Short),
+            element_count: 1,
+            is_ca_link: false,
+            puts_as_string: true,
         }
     }
 
@@ -1703,6 +1727,39 @@ mod tests {
                 &out_target(Some(DbFieldType::Enum), 1, false)
             ),
             EpicsValue::String("ocal-str".into())
+        );
+    }
+
+    /// R15-64 boundary: a `DBF_MENU` / `DBF_DEVICE` target — `PRIO`, `STAT`,
+    /// `SEVR`, `DISS`, `ACKT`, `DTYP` — is in C's `DBR_STRING` case list
+    /// (`devsCalcoutSoft.c:128-130`) just like STRING and ENUM, and the port's
+    /// DBR-typed `field_type` (a menu index is a `Short`) cannot say so. The
+    /// class travels in `puts_as_string`; matching on `field_type` alone sent
+    /// the numeric OVAL to every menu target.
+    #[test]
+    fn r15_64_menu_target_gets_osv() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer("OUT", staged, &out_target_menu()),
+            EpicsValue::String("ocal-str".into()),
+            "a DBF_MENU target takes DBR_STRING from OSV, not DBR_DOUBLE from OVAL"
+        );
+    }
+
+    /// The complement: a plain numeric target still takes the staged OVAL —
+    /// C's `default:` arm (`devsCalcoutSoft.c:140`).
+    #[test]
+    fn r15_64_numeric_target_still_gets_oval() {
+        let rec = three_buffer_scalcout();
+        let staged = EpicsValue::Double(rec.oval);
+        assert_eq!(
+            rec.multi_output_buffer(
+                "OUT",
+                staged,
+                &out_target(Some(DbFieldType::Double), 1, false)
+            ),
+            EpicsValue::Double(7.0)
         );
     }
 

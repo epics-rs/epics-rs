@@ -655,6 +655,47 @@ impl RecordInstance {
             .or_else(|| super::menu_choices::shared_menu_choices(field))
     }
 
+    /// Is `field` one of the DBF classes C's soft device support writes as
+    /// `DBR_STRING`?
+    ///
+    /// `devsCalcoutSoft.c:128-130` (and its async twin, :83-85) switches the
+    /// scalcout OUT put on the TARGET field's DBF type and sends `OSV` — the
+    /// string result — for seven of them:
+    ///
+    /// ```c
+    /// case DBF_STRING: case DBF_ENUM: case DBF_MENU: case DBF_DEVICE:
+    /// case DBF_INLINK: case DBF_OUTLINK: case DBF_FWDLINK:
+    ///     status = dbPutLink(&pscalcout->out, DBR_STRING, &pscalcout->osv, 1);
+    /// ```
+    ///
+    /// [`DbFieldType`] is the port's DBR *wire* type and cannot express
+    /// `DBF_MENU` / `DBF_DEVICE` — C's DBF class is not the DBR type. The
+    /// classification therefore lives here, with the record's field metadata,
+    /// where each class is already known:
+    ///
+    /// * `DBF_STRING` and the three link classes — the port stores links and
+    ///   `DTYP` (C's only `DBF_DEVICE` field) as strings;
+    /// * `DBF_ENUM` — an enum-typed field;
+    /// * `DBF_MENU` — a menu-index field, i.e. one this record resolves choice
+    ///   labels for ([`Self::menu_choices_for`]): `PRIO`, `STAT`, `SEVR`,
+    ///   `DISS`, `ACKT`, `SCAN`, `IVOA`, `OMSL`, … The index is stored as a
+    ///   short, so a same-named field that is NOT a menu index (scalcout's
+    ///   string `OSV` shares a name with the alarm-severity menu) is
+    ///   classified by its own type, not by the name collision.
+    ///
+    /// Everything else (`DBF_DOUBLE`, `DBF_LONG`, `DBF_CHAR`, …) falls to the
+    /// device support's `default:` arm.
+    pub(crate) fn field_puts_as_string(&self, field: &str) -> bool {
+        let Some(value) = self.resolve_field(field) else {
+            return false;
+        };
+        match value.db_field_type() {
+            DbFieldType::String | DbFieldType::Enum => true,
+            DbFieldType::Short | DbFieldType::UShort => self.menu_choices_for(field).is_some(),
+            _ => false,
+        }
+    }
+
     /// Promote a `DBF_MENU` field's value to its `DBR_ENUM` client form: a
     /// menu index stored as a short becomes [`EpicsValue::Enum`], so the
     /// wire type a client sees is `DBR_ENUM` (CA) / `NTEnum` (PVA),

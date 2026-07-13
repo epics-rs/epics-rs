@@ -39,16 +39,32 @@ pub struct OutTarget {
     /// buffer choice on sync-vs-async (`devsCalcoutSoft.c:76`, gated on
     /// `plink->type == CA_LINK && pscalcout->wait`) reads this.
     pub is_ca_link: bool,
+    /// True when the target field is one of the seven DBF classes C's soft
+    /// device support puts as `DBR_STRING` — `DBF_STRING`, `DBF_ENUM`,
+    /// `DBF_MENU`, `DBF_DEVICE`, `DBF_INLINK`, `DBF_OUTLINK`, `DBF_FWDLINK`
+    /// (`devsCalcoutSoft.c:83-85`, `:128-130`).
+    ///
+    /// Carried here rather than re-derived from [`Self::field_type`] because
+    /// [`DbFieldType`] is the DBR *wire* type: it has no `Menu` or `Device`
+    /// variant, so a menu target (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …)
+    /// or `DTYP` is indistinguishable from a plain numeric/string field by
+    /// type alone. The classification is made once, at resolution, by the
+    /// side that holds the target's field metadata
+    /// (`RecordInstance::field_puts_as_string`); a record's
+    /// [`Record::multi_output_buffer`] just reads the answer.
+    pub puts_as_string: bool,
 }
 
 impl OutTarget {
     /// C's initializer state: `field_type = 0` is never *used* as a type by
     /// the port (a `None` type routes to the device support's `default:`
-    /// arm), and `n_elements = 1`.
+    /// arm), and `n_elements = 1`. An unresolved target is not in the string
+    /// class — C's `field_type = 0` matches no `case` and falls to `default:`.
     pub const UNRESOLVED: Self = Self {
         field_type: None,
         element_count: 1,
         is_ca_link: false,
+        puts_as_string: false,
     };
 }
 

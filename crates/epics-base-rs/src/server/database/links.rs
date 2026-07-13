@@ -1135,11 +1135,23 @@ impl PvDatabase {
     ) -> OutTarget {
         let external = |name: String| async move {
             match self.external_link_metadata(&name).await {
-                Some(m) => OutTarget {
-                    field_type: m.dbf_type.map(link_dbf_to_field_type),
-                    element_count: m.element_count.unwrap_or(1).max(1),
-                    is_ca_link: true,
-                },
+                Some(m) => {
+                    let field_type = m.dbf_type.map(link_dbf_to_field_type);
+                    OutTarget {
+                        field_type,
+                        element_count: m.element_count.unwrap_or(1).max(1),
+                        is_ca_link: true,
+                        // A remote channel reports the DBR type its DBF class
+                        // is served as (`dbCaGetLinkDBFtype` → the channel's
+                        // type): a remote `DBF_MENU`/`DBF_DEVICE`/link field
+                        // arrives as `DBR_ENUM`/`DBR_STRING`, so the two wire
+                        // types ARE the string class over a CA link.
+                        puts_as_string: matches!(
+                            field_type,
+                            Some(DbFieldType::String) | Some(DbFieldType::Enum)
+                        ),
+                    }
+                }
                 None => OutTarget {
                     is_ca_link: true,
                     ..OutTarget::UNRESOLVED
@@ -1181,6 +1193,11 @@ impl PvDatabase {
                     field_type,
                     element_count: element_count.max(1),
                     is_ca_link: false,
+                    // C's `dbNameToAddr` gives the target field's DBF CLASS,
+                    // which includes `DBF_MENU` / `DBF_DEVICE` — classes the
+                    // port's DBR-typed `field_type` cannot name. The target
+                    // record classifies its own field.
+                    puts_as_string: guard.field_puts_as_string(&db.field),
                 }
             }
             crate::server::record::ParsedLink::Ca(_)

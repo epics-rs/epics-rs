@@ -9,21 +9,28 @@ fn eval_str(expr: &str) -> StackValue {
 
 // --- TR_ESC / ESC ---
 
+// The calc source carries ONE backslash. The sCalc lexer copies string literals
+// raw (`sCalcPostfix.c:803-812`), so `TR_ESC` receives the two bytes `\` `n` and
+// is the one and only thing that translates them. These used to be written with
+// two backslashes to cancel out a translation the lexer was wrongly doing first
+// (R13-3). Compiled C: `TR_ESC("a\tb")` is a TAB, `TR_ESC("a\\tb")` is the
+// literal two bytes `\t`.
+
 #[test]
 fn test_tr_esc_newline() {
-    let result = eval_str(r#"TR_ESC("hello\\nworld")"#);
+    let result = eval_str(r#"TR_ESC("hello\nworld")"#);
     assert_eq!(result, StackValue::Str("hello\nworld".into()));
 }
 
 #[test]
 fn test_tr_esc_tab() {
-    let result = eval_str(r#"TR_ESC("a\\tb")"#);
+    let result = eval_str(r#"TR_ESC("a\tb")"#);
     assert_eq!(result, StackValue::Str("a\tb".into()));
 }
 
 #[test]
 fn test_tr_esc_hex() {
-    let result = eval_str(r#"TR_ESC("\\x41")"#);
+    let result = eval_str(r#"TR_ESC("\x41")"#);
     assert_eq!(result, StackValue::Str("A".into()));
 }
 
@@ -710,9 +717,9 @@ fn test_replace_coerces_every_operand() {
 
 /// The USES_STRING marker (`sCalcPostfix.c:447-475`) picks the whole evaluator,
 /// and C's list opens with FETCH_AA..FETCH_LL — so merely reading `AA` marks the
-/// program. The port's marker named an opcode its own compiler never emits
-/// (`StringOp::PushStringVar`; `AA` compiles to `CoreOp::PushDoubleVar`), so no
-/// `AA`-reading program was marked.
+/// program. The port's marker used to name an opcode its own compiler never emits
+/// (a `StringOp::PushStringVar`, since deleted; `AA` compiles to
+/// `CoreOp::PushDoubleVar`), so no `AA`-reading program was marked.
 ///
 /// The two evaluators differ arithmetically in exactly one place, MODULO's cast
 /// width — `(int)` in the string evaluator, `(long)` in the numeric one — which

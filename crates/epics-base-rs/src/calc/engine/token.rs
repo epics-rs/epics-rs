@@ -47,6 +47,15 @@ pub enum FuncName {
     /// argument that the operand indexes.
     DynFetch,
     DynAFetch,
+    /// sCalc `@` / `@@` (`sCalcPostfix.c:99-100`) — `A_FETCH` and `A_SFETCH`.
+    /// `@` is the same idea as aCalc's, but it lands on the string engine's
+    /// stack, and `@@` is a different opcode entirely: aCalc's fetches the ARRAY
+    /// argument (`A_AFETCH`), sCalc's fetches the STRING argument (`A_SFETCH`).
+    /// Separate names because the opcode a token compiles to is a function of the
+    /// token alone — the same rule that gives aCalc's no-op `LEN` its own
+    /// [`FuncName::ALenNoop`].
+    SDynFetch,
+    SDynSFetch,
     /// aCalc `LEN` (`aCalcPostfix.c:199`) — a table entry with no implementation
     /// in `aCalcPerform`, so it compiles and does nothing. Distinct from the
     /// sCalc `LEN` string length ([`FuncName::Len`]), which IS implemented.
@@ -114,7 +123,11 @@ pub enum Token {
     /// `aCalcPostfix()` element tables have no such symbol.
     FetchSval,
 
-    StringLiteral(String),
+    /// C `LITERAL_STRING` (`sCalcPostfix.c:803-812`). RAW BYTES: the compiler
+    /// copies the source verbatim between the quotes and interprets nothing.
+    /// Hence `Vec<u8>` rather than a `String` — there is no decoding step in
+    /// which a translation could hide.
+    StringLiteral(Vec<u8>),
 
     Plus,
     Minus,
@@ -146,7 +159,12 @@ pub enum Token {
     Bang, // !
     Question,
     Colon,
-
+    // NOTE: there are no `AND` / `OR` keyword tokens. All three C tables give the
+    // words the SAME `code` as the symbols `&` and `|` — `BIT_AND` and `BIT_OR`
+    // (postfix.c:174-175, sCalcPostfix.c:237-238, aCalcPostfix.c:234-235) — just
+    // as `XOR` shares `BIT_EXCL_OR` with `^`. They are alternate spellings of the
+    // bitwise operators, never of `&&` / `||`, so they lex straight to
+    // [`Token::BitAnd`] / [`Token::BitOr`] and no opcode mapping can diverge.
     LParen,
     RParen,
     Comma,
@@ -164,10 +182,6 @@ pub enum Token {
 
     MaxOp, // >?
     MinOp, // <?
-
-    // Keyword operators
-    AndKeyword, // AND
-    OrKeyword,  // OR
 
     UntilKeyword,
 }
@@ -296,8 +310,11 @@ static BASE_TABLE: ElementTable = ElementTable {
         ("TAN", Token::Func(FuncName::Tan)),
         ("TANH", Token::Func(FuncName::Tanh)),
         ("VAL", Token::FetchVal),
-        ("AND", Token::AndKeyword),
-        ("OR", Token::OrKeyword),
+        // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
+        // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
+        // carry. They are not `&&`/`||`.
+        ("AND", Token::BitAnd),
+        ("OR", Token::BitOr),
         ("XOR", Token::BitXor),
         // Operators, postfix.c:145-179.
         ("!=", Token::Ne),
@@ -399,6 +416,11 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("SSCANF", Token::Func(FuncName::Sscanf)),
         ("STR", Token::Func(FuncName::Str)),
         ("SVAL", Token::FetchSval),
+        // sCalcPostfix.c:99-100 — sCalc has the dynamic-argument fetches too, at
+        // the same priorities as aCalc's (UNARY_OPERATOR, 9/10). `@x` is the
+        // scalar argument x indexes, `@@x` the STRING argument.
+        ("@", Token::Func(FuncName::SDynFetch)),
+        ("@@", Token::Func(FuncName::SDynSFetch)),
         ("TAN", Token::Func(FuncName::Tan)),
         ("TANH", Token::Func(FuncName::Tanh)),
         ("TR_ESC", Token::Func(FuncName::TrEsc)),
@@ -406,8 +428,11 @@ static SCALC_TABLE: ElementTable = ElementTable {
         ("VAL", Token::FetchVal),
         ("WRITE", Token::Func(FuncName::BinWrite)),
         ("XOR8", Token::Func(FuncName::Xor8)),
-        ("AND", Token::AndKeyword),
-        ("OR", Token::OrKeyword),
+        // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
+        // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
+        // carry. They are not `&&`/`||`.
+        ("AND", Token::BitAnd),
+        ("OR", Token::BitOr),
         ("XOR", Token::BitXor),
         // Operators, sCalcPostfix.c:217-255.
         ("!=", Token::Ne),
@@ -535,8 +560,11 @@ static ACALC_TABLE: ElementTable = ElementTable {
         ("TANH", Token::Func(FuncName::Tanh)),
         ("UNTIL", Token::UntilKeyword),
         ("VAL", Token::FetchVal),
-        ("AND", Token::AndKeyword),
-        ("OR", Token::OrKeyword),
+        // The word forms of the BITWISE operators: C gives `AND`/`OR`/`XOR` the
+        // codes `BIT_AND`/`BIT_OR`/`BIT_EXCL_OR`, the same codes `&`/`|`/`^`
+        // carry. They are not `&&`/`||`.
+        ("AND", Token::BitAnd),
+        ("OR", Token::BitOr),
         ("XOR", Token::BitXor),
         // Operators, aCalcPostfix.c:226-262. No `|-` (that is sCalc's
         // SUBLAST), no `>>>`.
@@ -625,27 +653,45 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn read_string_literal(&mut self, quote: u8) -> Result<String, CalcError> {
-        let mut result = String::new();
-        loop {
-            match self.advance() {
-                None => return Err(CalcError::Syntax), // unterminated string
-                Some(b) if b == quote => return Ok(result),
-                Some(b'\\') => match self.advance() {
-                    Some(b'n') => result.push('\n'),
-                    Some(b't') => result.push('\t'),
-                    Some(b'r') => result.push('\r'),
-                    Some(b'\\') => result.push('\\'),
-                    Some(b) if b == quote => result.push(b as char),
-                    Some(b) => {
-                        result.push('\\');
-                        result.push(b as char);
-                    }
-                    None => return Err(CalcError::Syntax),
-                },
-                Some(b) => result.push(b as char),
+    /// C `LITERAL_STRING` (`sCalcPostfix.c:803-812`), the whole of it:
+    ///
+    /// ```c
+    /// c = psrc[-1];                              /* the " or ' that opened it */
+    /// while (*psrc != c && *psrc) *pout++ = *psrc++;
+    /// *pout++ = '\0';
+    /// if (*psrc) psrc++;                         /* step over the close quote */
+    /// ```
+    ///
+    /// A byte-for-byte copy up to the matching quote or the end of the source.
+    /// Three consequences, all of them C's:
+    ///
+    /// * **No backslash escapes.** The literal keeps its backslashes, and `$T` /
+    ///   `TR_ESC` is the ONLY thing that translates them — which is precisely why
+    ///   sCalc has that operator. Pre-translating here made `$T` a double
+    ///   translation and changed the bytes on every path that does not translate:
+    ///   compiled C answers `BYTE("\t")` = 92 (the backslash), `LEN("a\tb")` = 4,
+    ///   and `PRINTF("%d\n",5)` = the 3 bytes `5\n` — a literal backslash and `n`,
+    ///   which is exactly what a serial-device scalcout then hands to `$T`.
+    /// * **The quote character cannot be embedded.** `"a\"b"` closes at the `\"`,
+    ///   leaves `b"` behind, and C stops with CALC_ERR_SYNTAX. The port used to
+    ///   accept it.
+    /// * **An unterminated literal is not an error.** The loop simply stops at the
+    ///   NUL and `if (*psrc) psrc++` does nothing. Compiled C: `"abc` compiles and
+    ///   evaluates to `abc`.
+    fn read_string_literal(&mut self, quote: u8) -> Vec<u8> {
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if b == quote {
+                break;
             }
+            self.pos += 1;
         }
+        let raw = self.input[start..self.pos].to_vec();
+        // `if (*psrc) psrc++` — step over the close quote if there was one.
+        if self.peek() == Some(quote) {
+            self.pos += 1;
+        }
+        raw
     }
 
     /// C `get_element`: consume the longest table symbol that prefixes the
@@ -797,7 +843,7 @@ pub fn tokenize(input: &str, kind: ExprKind) -> Result<Vec<Token>, CalcError> {
         // LITERAL_STRING: sCalcPostfix.c:97-98 only.
         if (b == b'"' || b == b'\'') && table.string_literals {
             tokenizer.advance();
-            let s = tokenizer.read_string_literal(b)?;
+            let s = tokenizer.read_string_literal(b);
             tokens.push(Token::StringLiteral(s));
             continue;
         }

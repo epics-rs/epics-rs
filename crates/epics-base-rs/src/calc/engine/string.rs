@@ -14,6 +14,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         return Err(CalcError::EmptyProgram);
     }
 
+    // C's static UNTIL pre-scan (`:341-365`), which runs before any opcode does and
+    // fails the perform outright when the postfix holds more than nine of them —
+    // whether or not they are ever reached.
+    expr.check_until_ceiling()?;
+
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
@@ -432,71 +437,42 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(a % b));
                 }
 
-                // Vararg min/max — type-aware
+                // C `MAX` / `MIN` (`sCalcPerform.c:1927-1962`). The argument TYPES
+                // are settled for the whole call by a pre-scan over every one of
+                // them ([`Operands::of`]), never by the first one popped.
                 CoreOp::Max(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let first = pop1(&mut stack)?;
-                    match first {
-                        StackValue::Double(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1_f64(&mut stack)?;
-                                if v > result || result.is_nan() {
-                                    result = v;
-                                }
-                            }
-                            stack.push(StackValue::Double(result));
-                        }
-                        StackValue::Str(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1(&mut stack)?;
-                                let s = v.as_bytes()?;
-                                if s > result.as_bytes() {
-                                    result = ScalcString::from_c(s);
-                                }
-                            }
-                            stack.push(StackValue::Str(result));
-                        }
-                    }
+                    let args = pop_n(&mut stack, *nargs as usize)?;
+                    stack.push(Extremum::Max.fold(Operands::of(args)));
                 }
                 CoreOp::Min(nargs) => {
-                    let n = *nargs as usize;
-                    if stack.len() < n {
-                        return Err(CalcError::Underflow);
-                    }
-                    let first = pop1(&mut stack)?;
-                    match first {
-                        StackValue::Double(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1_f64(&mut stack)?;
-                                if v < result || result.is_nan() {
-                                    result = v;
-                                }
-                            }
-                            stack.push(StackValue::Double(result));
-                        }
-                        StackValue::Str(mut result) => {
-                            for _ in 1..n {
-                                let v = pop1(&mut stack)?;
-                                let s = v.as_bytes()?;
-                                if s < result.as_bytes() {
-                                    result = ScalcString::from_c(s);
-                                }
-                            }
-                            stack.push(StackValue::Str(result));
-                        }
-                    }
+                    let args = pop_n(&mut stack, *nargs as usize)?;
+                    stack.push(Extremum::Min.fold(Operands::of(args)));
                 }
 
-                CoreOp::MaxVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(if a > b { a } else { b }));
-                }
-                CoreOp::MinVal => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double(if a < b { a } else { b }));
+                // C `MAX_VAL` / `MIN_VAL` — the `>?` / `<?` operators
+                // (`sCalcPerform.c:1296-1328`). They are NOT numeric-only: they
+                // are written in the same three-branch shape as ADD, SUB and the
+                // comparisons, which is exactly what [`Pair::of`] models. Both
+                // operands strings => strcmp, and the RESULT IS THE STRING.
+                //
+                // Compiled C: `"abc">?"abd"` = "abd", `"b"<?"a"` = "a". The port
+                // used `pop2_f64` and answered the double 0 for both.
+                //
+                // Distinct from `MAX` / `MIN` (a different opcode, W10-A1): those
+                // pre-scan n arguments; these classify a pair, and they carry no
+                // `isnan` clause — `NAN >? 5` keeps the NaN because `NAN < 5` is
+                // false, so C's `if (ps->d < ps1->d)` simply never fires.
+                CoreOp::MaxVal | CoreOp::MinVal => {
+                    let which = match core {
+                        CoreOp::MaxVal => Extremum::Max,
+                        _ => Extremum::Min,
+                    };
+                    let b = pop1(&mut stack)?;
+                    let a = pop1(&mut stack)?;
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(a, b) => StackValue::Double(which.pick(a, b)),
+                        Pair::Strings(a, b) => StackValue::Str(which.pick(a, b)),
+                    });
                 }
 
                 // Store
@@ -526,9 +502,6 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     // over-long literal is truncated at RUN time, not compile
                     // time.
                     stack.push(StackValue::str(s));
-                }
-                StringOp::PushStringVar(idx) => {
-                    stack.push(StackValue::Str(inputs.str_vars[*idx as usize].clone()));
                 }
                 StringOp::StoreStringVar(idx) => {
                     let v = pop1(&mut stack)?;
@@ -698,16 +671,60 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::str(result));
                 }
                 StringOp::SubLast => {
-                    // Remove last occurrence of substring
-                    let pattern = pop1(&mut stack)?;
-                    let s = pop1(&mut stack)?;
-                    let s = s.as_bytes()?;
-                    let pat = pattern.as_bytes()?;
-                    let mut result = s.to_vec();
-                    if let Some(pos) = rfind_sub(s, pat) {
-                        result.drain(pos..pos + pat.len());
-                    }
-                    stack.push(StackValue::str(result));
+                    // C gives SUBLAST no case of its own: it shares `case SUB`
+                    // (`sCalcPerform.c:979-1012`), so it is the SAME operator
+                    // with the same mixed-type rule, and only the both-strings
+                    // branch splits on `op == SUB` (first occurrence) vs
+                    // SUBLAST (last one). A double on either side therefore makes
+                    // `|-` plain subtraction: C's `4|-"."` is 4 and `"a.b"|-4` is
+                    // -4. The port took `as_bytes()?` on both operands and raised
+                    // TypeMismatch for either.
+                    let b = pop1(&mut stack)?;
+                    let a = pop1(&mut stack)?;
+                    stack.push(match Pair::of(a, b) {
+                        Pair::Numeric(x, y) => StackValue::Double(x - y),
+                        Pair::Strings(x, y) => {
+                            let mut out = x.into_bytes();
+                            if let Some(pos) = rfind_sub(&out, y.as_bytes()) {
+                                out.drain(pos..pos + y.len());
+                            }
+                            StackValue::str(out)
+                        }
+                    });
+                }
+                StringOp::DynFetch => {
+                    // C `A_FETCH` (`sCalcPerform.c:1446-1460`):
+                    //
+                    // ```c
+                    // if (isDouble(ps)) d = ps->d; else { d = atof(ps->s); ps->s = NULL; }
+                    // i = myNINT(d);
+                    // if (i >= numArgs || i < 0) { printf(...); ps->d = 0; }
+                    // else                        ps->d = parg[i];
+                    // ```
+                    //
+                    // so the operand is the INDEX: `@0` is A, `@1` is B, and a
+                    // string index goes through `atof` first (`@"1"` is B). Out of
+                    // range is 0, not an error. `numArgs` is the caller's argument
+                    // count, which here is the length of `num_vars`.
+                    let idx = my_nint(pop1(&mut stack)?.to_double());
+                    let v = f64_to_index(idx)
+                        .and_then(|i| inputs.num_vars.get(i))
+                        .copied()
+                        .unwrap_or(0.0);
+                    stack.push(StackValue::Double(v));
+                }
+                StringOp::DynSFetch => {
+                    // C `A_SFETCH` (`sCalcPerform.c:1462-1476`) — the same index
+                    // rule, applied to the STRING arguments: `@@0` is AA. C points
+                    // the cell at its local buffer and empties it BEFORE the range
+                    // test, so an out-of-range `@@` is the empty STRING (still a
+                    // string, still not an error).
+                    let idx = my_nint(pop1(&mut stack)?.to_double());
+                    let s = f64_to_index(idx)
+                        .and_then(|i| inputs.str_vars.get(i))
+                        .cloned()
+                        .unwrap_or_default();
+                    stack.push(StackValue::Str(s));
                 }
             },
 
@@ -721,15 +738,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     let until_pc = pc - 1;
                     match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
                         Some((_, depth)) => *depth = stack.len(),
-                        None => {
-                            // C's `until_scratch[10]` with `if (i>9) return(-1)`
-                            // (`:356-360`) — compiled C fails the perform on the
-                            // TENTH distinct UNTIL, so nine is the ceiling.
-                            if until_marks.len() >= MAX_UNTILS {
-                                return Err(CalcError::Overflow);
-                            }
-                            until_marks.push((until_pc, stack.len()));
-                        }
+                        // No ceiling to enforce here: the program cannot hold more
+                        // than nine UNTILs, because `check_until_ceiling` refused it
+                        // before the first opcode ran. This table is a location map,
+                        // nothing more.
+                        None => until_marks.push((until_pc, stack.len())),
                     }
                 }
                 super::opcodes::ControlOp::UntilEnd(start_pc) => {
@@ -753,6 +766,32 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     }
                     // C PEEKS the condition (`:1999`: `if (ps->d == 0)`); it pops
                     // nothing, which is why UNTIL_END has a runtime effect of 0.
+                    //
+                    // DELIBERATE DEVIATION — a STRING-valued condition.
+                    //
+                    // C's line is `if (ps->d==0)` with NO `toDouble(ps)` in front of
+                    // it, and `LITERAL_STRING`'s push (`:1493-1499`) sets `ps->s` and
+                    // never touches `ps->d`. So when the condition is a string, C
+                    // tests an UNINITIALISED double — whatever was last left in that
+                    // stack cell — and the string's own content is irrelevant.
+                    // Compiled upstream, both of these exit after ONE iteration
+                    // (A=1), because the stale `d` happened to be non-zero:
+                    //
+                    //     A:=0;UNTIL(A:=A+1;"0")   ->  A=1, result "0"
+                    //     A:=0;UNTIL(A:=A+1;"1")   ->  A=1, result "1"
+                    //
+                    // There is no C semantic here to match: the same expression under
+                    // a different stack history takes a different branch. The port
+                    // reads the condition through `to_double` (`atof`), the same
+                    // coercion every other numeric context applies to a string, so
+                    // `"0"` is false and loops to `sCalcLoopMax` while `"1"` is true
+                    // and exits. That is defined, and it is what an expression writing
+                    // `UNTIL(...; "0")` can only have meant.
+                    //
+                    // Ported UB would be worse than a documented difference, so this
+                    // is on the record as a divergence rather than reproduced.
+                    // aCalc's UNTIL_END (`array.rs`) carries the same deviation for
+                    // an array-valued condition, for the same reason.
                     let cond = match stack.last() {
                         Some(v) => v.to_double(),
                         None => return Err(CalcError::Underflow),
@@ -779,7 +818,38 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         }
     }
 
-    let result = stack.last().cloned().unwrap_or(StackValue::Double(0.0));
+    // C checks the depth on BOTH evaluator paths, in the same place and to the
+    // same rule — `sCalcPerform.c:817-823` (no-string path) and `:2023-2032`
+    // (string path):
+    //
+    // ```c
+    // /* if everything is peachy, the stack should end at its first position */
+    // if (pd != topd) return(-1);        /* no-string path */
+    // if (ps != top)  return(-1);        /* string path    */
+    // ```
+    //
+    // The stack pointer starts one BELOW the first slot and every push increments
+    // first, so "ends at its first position" means the stack holds EXACTLY ONE
+    // value. A leaked operand and a fully-consumed stack are both -1, and C writes
+    // neither `*presult` nor `psresult`.
+    //
+    // The port returned `stack.last()`: a leaked operand was published as VAL/SVAL,
+    // and an empty stack invented a 0.0 that C never produces. `aCalcPerform.c:1607`
+    // has the identical check, closed for aCalc by b87dcbd7; this is the sCalc half
+    // of that family, and it takes the same shape — the one-value invariant PRODUCES
+    // the result rather than being checked beside it.
+    //
+    // Like the aCalc half, it is an invariant guard: `sCalcPostfix`'s compile-time
+    // `runtime_depth` ledger rejects any program that would not end at depth 1, so
+    // no source expression the port's compiler accepts can reach it. (Compiled C
+    // DOES reach it — `4|-2` is -1 there — but for a reason the port does not yet
+    // model: C's double-only evaluator has no `case SUBLAST`, silently skips it, and
+    // the operand it should have consumed is what trips this check. That gap is
+    // reported separately; it is not this guard.)
+    let result = match <[StackValue; 1]>::try_from(stack) {
+        Ok([result]) => result,
+        Err(_) => return Err(CalcError::StackLeak),
+    };
     // Both of C's evaluator paths end with the same line — `sCalcPerform.c:833`
     // (no-string) and `:2056` (string):
     //     return(((isnan(*presult)||isinf(*presult)) ? -1 : 0));
@@ -926,11 +996,6 @@ fn hunt_double(s: &[u8]) -> f64 {
 /// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons
 /// are written around. It is sCalc's alone: base and aCalc compare exactly.
 const SMALL: f64 = 1e-11;
-
-/// C `until_scratch[10]` guarded by `if (i>9) return(-1)` (`sCalcPerform.c:329`,
-/// `:356-360`). Compiled sCalc fails the perform on the tenth distinct UNTIL, so
-/// the usable ceiling is nine.
-const MAX_UNTILS: usize = 9;
 
 /// C `volatile int sCalcLoopMax = 1000` (`sCalcPerform.c:52`), exported to the
 /// ioc shell with `epicsExportAddress(int, sCalcLoopMax)` — a settable global,
@@ -1275,6 +1340,15 @@ fn my_nint(d: f64) -> f64 {
     if d >= 0.0 { d + 0.5 } else { d - 0.5 }.trunc()
 }
 
+/// C's `i = myNINT(d); if (i >= numArgs || i < 0)` — the rounded index as a
+/// subscript, or `None` when it is negative (the `>= numArgs` half is the
+/// caller's `get`). NaN and the non-representable magnitudes take the `None`
+/// branch, which is where C's `(int)` cast would land them anyway.
+fn f64_to_index(d: f64) -> Option<usize> {
+    let i = super::cast::c_int(d);
+    usize::try_from(i).ok()
+}
+
 /// The binary field a printf/scanf conversion character names, with `h`/`l`
 /// applied. This is the one place that reads C's `s[-1]` length modifier, so
 /// BIN_READ and BIN_WRITE cannot disagree about a width.
@@ -1605,16 +1679,17 @@ pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcR
 /// this list mirrors it case for case.
 fn uses_string(code: &[Opcode]) -> bool {
     code.iter().any(|op| match op {
-        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest
-        // trigger by far. The port's compiler emits them as `PushDoubleVar`
-        // (`postfix.rs:377`), not as the `StringOp::PushStringVar` this list
-        // used to name, so every `AA`-reading program was missing the marker.
+        // FETCH_AA..FETCH_LL — C's first twelve cases, and the commonest trigger
+        // by far. `AA` compiles to `PushDoubleVar` in every engine (`postfix.rs`,
+        // `Token::DoubleVar`); which of the two things it means — a string in the
+        // string evaluator, a numeric AA elsewhere — is the EVALUATOR's business,
+        // not the compiler's, so there is one opcode and this is where it is
+        // recognised.
         Opcode::Core(CoreOp::PushDoubleVar(_)) => true,
         // FETCH_SVAL.
         Opcode::Core(CoreOp::FetchSval) => true,
         Opcode::String(s) => match s {
-            StringOp::PushStringVar(_)   // FETCH_AA..FETCH_LL
-            | StringOp::ToString         // TO_STRING
+            StringOp::ToString           // TO_STRING
             | StringOp::Printf           // PRINTF
             | StringOp::BinWrite         // BIN_WRITE
             | StringOp::Sscanf           // SSCANF
@@ -1630,9 +1705,13 @@ fn uses_string(code: &[Opcode]) -> bool {
             | StringOp::LrcAppend        // AMODBUS
             | StringOp::Xor8             // XOR8
             | StringOp::Xor8Append       // ADD_XOR8
-            | StringOp::Len => true,     // LEN
-            // Absent from C's list, deliberately:
+            | StringOp::Len              // LEN
+            | StringOp::DynSFetch => true, // A_SFETCH (`sCalcPostfix.c:461`)
+            // Absent from C's list, deliberately — `A_FETCH` (`@`) among them: it
+            // answers a double, so an expression whose only "string" element is a
+            // `@` keeps the no-string evaluator.
             StringOp::ToDouble | StringOp::Byte | StringOp::SubLast
+            | StringOp::DynFetch
             | StringOp::StoreStringVar(_) => false,
         },
         _ => false,
@@ -1641,6 +1720,15 @@ fn uses_string(code: &[Opcode]) -> bool {
 
 fn pop1(stack: &mut Vec<StackValue>) -> Result<StackValue, CalcError> {
     stack.pop().ok_or(CalcError::Underflow)
+}
+
+/// Pop `n` operands in C's scan order: `[0]` is the top of the stack, which is
+/// where C's `ps` starts and the direction its `DEC(ps)` walks.
+fn pop_n(stack: &mut Vec<StackValue>, n: usize) -> Result<Vec<StackValue>, CalcError> {
+    if n == 0 || stack.len() < n {
+        return Err(CalcError::Underflow);
+    }
+    Ok(stack.split_off(stack.len() - n).into_iter().rev().collect())
 }
 
 /// C's mixed-type rule for the binary operators that HAVE a string branch —
@@ -1667,6 +1755,119 @@ impl Pair {
         match (a, b) {
             (StackValue::Str(x), StackValue::Str(y)) => Pair::Strings(x, y),
             (a, b) => Pair::Numeric(a.to_double(), b.to_double()),
+        }
+    }
+}
+
+/// The n-ary form of [`Pair`], for C's `MAX` and `MIN` varargs
+/// (`sCalcPerform.c:1927-1962`).
+///
+/// C settles the type of the WHOLE operation before it compares anything, by
+/// pre-scanning every argument:
+///
+/// ```c
+/// for (i=0, j=0; i<nargs; j |= isDouble(ps-i), i++);
+/// if (j) { /* an arg is double: coerce all to double, compare numerically */ }
+/// else   { /* all args are string: compare with strcmp, answer a STRING */ }
+/// ```
+///
+/// One double anywhere makes every argument a double. Only an all-string call
+/// takes the `strcmp` path, and only that path can answer a string. The port
+/// branched on the type of the FIRST argument it popped, so `MAX(4,"a")` raised
+/// TypeMismatch where C answers 4 (`atof("a")` is 0), and `MAX("10",9)` would
+/// have compared strings where C compares numbers.
+enum Operands {
+    Numeric(Vec<f64>),
+    Strings(Vec<ScalcString>),
+}
+
+impl Operands {
+    /// `args` in C's scan order: `args[0]` is the top of the stack.
+    fn of(args: Vec<StackValue>) -> Operands {
+        if args.iter().any(StackValue::is_double) {
+            Operands::Numeric(args.iter().map(StackValue::to_double).collect())
+        } else {
+            Operands::Strings(
+                args.into_iter()
+                    .map(|v| match v {
+                        StackValue::Str(s) => s,
+                        StackValue::Double(_) => unreachable!("no arg is a double here"),
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Which end C's extremum operators keep.
+#[derive(Clone, Copy)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+impl Extremum {
+    /// C's binary keep-rule, `if (ps->d < ps1->d) ps->d = ps1->d;` for `MAX_VAL`
+    /// (`sCalcPerform.c:1300`) — the LEFT operand survives unless it strictly
+    /// loses, so a tie keeps the left. `ScalcString` orders by its bytes, which is
+    /// `strcmp`: both compare unsigned bytes and a prefix sorts first.
+    ///
+    /// `MAX`/`MIN`'s n-ary [`Self::fold`] cannot use this: it carries an extra
+    /// `isnan(d)` clause that `MAX_VAL`/`MIN_VAL` do not have.
+    fn pick<T: PartialOrd>(self, a: T, b: T) -> T {
+        let right_wins = match self {
+            Extremum::Max => a < b,
+            Extremum::Min => a > b,
+        };
+        if right_wins { b } else { a }
+    }
+
+    /// C's `MAX` / `MIN` fold (`sCalcPerform.c:1930-1962`), walking DOWN the stack
+    /// from the top exactly as C does.
+    ///
+    /// ```c
+    /// toDouble(ps);
+    /// while (--nargs) {
+    ///     d = ps->d;  DEC(ps);  toDouble(ps);
+    ///     if (ps->d < d || isnan(d)) ps->d = d;   /* MAX; MIN uses > */
+    /// }
+    /// ```
+    ///
+    /// `isnan(d)` tests the RUNNING value, so once a NaN enters the fold it stays:
+    /// compiled C answers a PERFORM ERROR for `MAX(NAN,5)` (the record's non-finite
+    /// result check rejects the NaN), where the port used to drop the NaN and
+    /// answer 5.
+    fn fold(self, args: Operands) -> StackValue {
+        match args {
+            Operands::Numeric(vals) => {
+                let mut running = vals[0];
+                for &cur in &vals[1..] {
+                    let keep_running = match self {
+                        Extremum::Max => cur < running,
+                        Extremum::Min => cur > running,
+                    };
+                    if !(keep_running || running.is_nan()) {
+                        running = cur;
+                    }
+                }
+                StackValue::Double(running)
+            }
+            // `if (strcmp(ps->s, ps1->s) < 0) strcpy(ps->s, ps1->s);` — the running
+            // value survives only when the incoming argument loses. Byte order is
+            // `strcmp`'s: both compare unsigned bytes, and a prefix sorts first.
+            Operands::Strings(vals) => {
+                let mut running = vals[0].clone();
+                for cur in &vals[1..] {
+                    let keep_running = match self {
+                        Extremum::Max => cur.as_bytes() < running.as_bytes(),
+                        Extremum::Min => cur.as_bytes() > running.as_bytes(),
+                    };
+                    if !keep_running {
+                        running = cur.clone();
+                    }
+                }
+                StackValue::Str(running)
+            }
         }
     }
 }
@@ -1832,5 +2033,84 @@ mod parity_tests {
         assert!(scalc("1/0", &mut inp).is_err()); // C: PERFORM st=-1
         assert!(scalc("-1/0", &mut inp).is_err()); // C: PERFORM st=-1
         assert!(scalc("0/0", &mut inp).is_err()); // C: PERFORM st=-1
+    }
+}
+
+/// The end-of-expression depth invariant — C's `if (pd != topd) return(-1)` on the
+/// no-string path (`sCalcPerform.c:817-823`) and `if (ps != top) return(-1)` on the
+/// string path (`:2023-2032`).
+///
+/// These programs are hand-built because `sCalcPostfix` CANNOT emit them: its
+/// compile-time `runtime_depth` ledger rejects anything that would not end at depth
+/// 1, which is why no source expression reaches the guard. Compiled C agrees with
+/// the port's compiler on every probe — `A:=1`, `AA:=4` and `1;2` are all
+/// "Incomplete expression, operand missing" in both, and `A:=1;A+1` compiles and
+/// runs to 2 in both.
+///
+/// So the guard is tested where it applies: at the engine's own boundary, against a
+/// program that violates the invariant. Same reasoning, and same shape, as the aCalc
+/// half in `array.rs` (b87dcbd7).
+#[cfg(test)]
+mod stack_depth_invariant {
+    use super::*;
+    use crate::calc::engine::ExprKind;
+
+    fn run(code: Vec<Opcode>) -> Result<StackValue, CalcError> {
+        let expr = CompiledExpr {
+            code,
+            kind: ExprKind::String,
+            loop_pairs: Vec::new(),
+        };
+        eval(&expr, &mut StringInputs::new())
+    }
+
+    #[test]
+    fn a_leaked_operand_is_an_error_not_the_top_of_stack() {
+        // Two pushes and no operator to consume them: C ends with the stack pointer
+        // one ABOVE its first position and returns -1, writing neither *presult nor
+        // psresult. The port used to return `stack.last()` — the 2.0 — and publish
+        // it as VAL/SVAL.
+        let leaked = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn an_empty_stack_is_an_error_not_a_zero() {
+        // A store consumes the only value, so the program ends at depth 0 — C's
+        // pointer is left one BELOW the first position and the check fails just as
+        // hard. The port used to invent a 0.0 that C never produces.
+        let consumed = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::StoreVar(0)),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(consumed), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn a_leaked_string_operand_is_an_error_too() {
+        // The string path has its own copy of the check (`:2023-2032`), and it is the
+        // same rule: depth 1, whatever the type of the value.
+        let leaked = vec![
+            Opcode::String(StringOp::PushString(b"a".to_vec())),
+            Opcode::String(StringOp::PushString(b"b".to_vec())),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(leaked), Err(CalcError::StackLeak));
+    }
+
+    #[test]
+    fn exactly_one_value_is_the_result() {
+        let balanced = vec![
+            Opcode::Core(CoreOp::PushConst(1.0)),
+            Opcode::Core(CoreOp::PushConst(2.0)),
+            Opcode::Core(CoreOp::Add),
+            Opcode::Core(CoreOp::End),
+        ];
+        assert_eq!(run(balanced), Ok(StackValue::Double(3.0)));
     }
 }

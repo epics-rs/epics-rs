@@ -244,7 +244,9 @@ fn scalc_sub_first_occurrence_operator() {
 /// SSCANF, ESC, BIN_READ and BIN_WRITE — the same opcodes the long names emit.
 #[test]
 fn scalc_dollar_aliases() {
-    assert_eq!(s_str("$T(\"a\\\\nb\")"), "a\nb"); // TR_ESC
+    // The calc source is `$T("a\nb")` — ONE backslash. The lexer copies the
+    // literal raw (sCalcPostfix.c:803-812) and `$T` is the only translator.
+    assert_eq!(s_str("$T(\"a\\nb\")"), "a\nb"); // TR_ESC
     assert_eq!(s_str("$P(\"%d\",65)"), "65"); // PRINTF
     assert_eq!(s_num("$S(\"12\",\"%d\")"), 12.0); // SSCANF
     assert_eq!(s_str("$E(\"a\tb\")"), "a\\tb"); // ESC

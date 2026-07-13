@@ -900,12 +900,7 @@ pub(crate) fn build_configured_ip_port(
     no_process_eos: bool,
 ) -> AsynResult<DrvAsynIPPort> {
     let mut driver = DrvAsynIPPort::new(port, host)?;
-    if no_auto_connect {
-        driver.base_mut().auto_connect = false;
-    }
-    if !no_process_eos {
-        driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
-    }
+    DrvAsynIPPort::apply_ip_port_configure(driver.base_mut(), no_auto_connect, no_process_eos);
     Ok(driver)
 }
 
@@ -1062,6 +1057,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 .ok_or_else(|| "serverInfo required".to_string())?;
             let max_clients = arg_int(args, 2).unwrap_or(0);
             let no_auto_connect = arg_int(args, 4).unwrap_or(0) != 0;
+            let no_process_eos = arg_int(args, 5).unwrap_or(0) != 0;
 
             let mut config = match IpServerConfig::parse(&server_info) {
                 Ok(c) => c,
@@ -1073,6 +1069,12 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             // C takes maxClients from the shell argument and rejects 0
             // ("No clients.", drvAsynIPServerPort.c:545-548).
             config.max_clients = max_clients.max(0) as usize;
+            // C stores noProcessEos on the server and hands it to every child's
+            // `drvAsynIPPortConfigure` (:688-694) — that is its only use. The
+            // argument was parsed into the command's arg list and then never
+            // read, so a `\n`-terminated client of an IP server never had an EOS
+            // layer to terminate on (R19-107).
+            config.no_process_eos = no_process_eos;
 
             let mut driver = match DrvAsynIPServerPort::with_config(&port, config) {
                 Ok(d) => d,

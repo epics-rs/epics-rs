@@ -1067,6 +1067,42 @@ impl DrvAsynIPPort {
         self.base.install_octet_interpose(layer);
     }
 
+    /// Everything `drvAsynIPPortConfigure` gives a port beyond constructing the
+    /// driver (drvAsynIPPort.c:1043-1066):
+    ///
+    /// ```c
+    /// pasynManager->registerPort(tty->portName, ASYN_CANBLOCK, !noAutoConnect, ...);
+    /// pasynOctetBase->initialize(tty->portName, &tty->octet, 0, 0, 1);  /* interruptProcess */
+    /// if (!noProcessEos) asynInterposeEosConfig(portName, -1, 1, 1);
+    /// ```
+    ///
+    /// It takes the `PortDriverBase` rather than `&mut self` because **C's
+    /// IP-server child ports are created by this very call** —
+    /// `drvAsynIPServerPortConfigure` runs `drvAsynIPPortConfigure(pl->portName,
+    /// tty->serverInfo, priority, 1 /*noAutoConnect*/, tty->noProcessEos)` for
+    /// each slot (drvAsynIPServerPort.c:688-694). A child is not "a port plus
+    /// some of what a port gets": it gets all of it. Sharing one owner is what
+    /// makes that true here too — the child inherited none of it while each
+    /// property lived inside `DrvAsynIPPort::new` (R19-107, R19-108).
+    pub(crate) fn apply_ip_port_configure(
+        base: &mut crate::port::PortDriverBase,
+        no_auto_connect: bool,
+        no_process_eos: bool,
+    ) {
+        // `pasynOctetBase->initialize(..., interruptProcess = 1)`: every
+        // successful octet read on the port fans out to its octet interrupt
+        // users, which is what drives a SCAN="I/O Intr" record.
+        base.octet_interrupt_process = true;
+        // `registerPort(..., !noAutoConnect, ...)`.
+        base.auto_connect = !no_auto_connect;
+        // `asynInterposeEosConfig(portName, -1, 1, 1)` unless suppressed. Without
+        // it the port has NO EOS layer at all, so an IEOS set on it is accepted,
+        // reads back, and terminates nothing.
+        if !no_process_eos {
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        }
+    }
+
     /// Create the socket C's `connectIt` creates: fresh fd, then every option
     /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:448-459)
     /// and `SO_REUSEPORT` (:461-477) — applied **before** the socket is bound or

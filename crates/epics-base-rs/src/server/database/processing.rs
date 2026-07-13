@@ -3636,44 +3636,11 @@ impl PvDatabase {
         // pre-commit in `dispatch_multi_output_values` (see R14-62). This tail
         // is C's `recGblFwdLink` equivalent only.
 
-        // 5. FLNK -- only process if target is Passive (like C dbScanFwdLink).
-        // FLNK goes through C `dbScanPassive` -> `processTarget`, which
-        // propagates `src.putf` to the target the same way OUT links do.
+        // 5. FLNK — C `dbScanFwdLink` → `dbScanPassive` → `processTarget`,
+        // through the single owner that holds the Passive gate.
         if let Some(flnk) = flnk_name {
-            if let Some(target_rec) = self.get_record(flnk).await {
-                let (target_scan, should_process) = {
-                    let mut tg = target_rec.write().await;
-                    let pact = tg.is_processing();
-                    let on_chain = visited.contains(flnk);
-                    let scan = tg.common.scan;
-                    if !pact {
-                        tg.common.putf = src.putf;
-                        // C `dbNotifyAdd` (dbDbLink.c:460) lives inside
-                        // `processTarget`, which `dbScanPassive` reaches
-                        // ONLY for a passive target (it returns early for
-                        // non-passive — dbDbLink.c:431). Gate the join on
-                        // the same passive condition as the process call
-                        // below: a non-passive FLNK target is dropped here
-                        // and must NOT join, or it would `enter` the
-                        // wait-set without ever processing to `leave` it,
-                        // hanging the completion forever.
-                        if scan == crate::server::record::ScanType::Passive {
-                            join_put_notify(&mut tg, src.notify);
-                        }
-                    } else if src.putf && !on_chain {
-                        tg.common.rpro = true;
-                        tg.common.putf = false;
-                    }
-                    (scan, !pact)
-                };
-                if should_process && target_scan == crate::server::record::ScanType::Passive {
-                    // recursive FLNK within one chain — gate
-                    // already held by the foreign entry record.
-                    let _ = self
-                        .process_record_with_links_recursive(flnk, visited, depth + 1)
-                        .await;
-                }
-            }
+            self.process_target(flnk, src.putf, src.notify, visited, depth)
+                .await;
         }
 
         // 5b. FLNK whose target is external (`pva://`/`ca://`): C
@@ -4593,41 +4560,12 @@ impl PvDatabase {
         // event record: post the named software event.
         self.dispatch_event_record(&rec).await;
 
-        // FLNK -- only process if target is Passive (C `dbScanFwdLink` ->
-        // `dbScanPassive` -> `processTarget` propagates PUTF the same way
-        // OUT links do).
+        // FLNK — the async-completion tail's copy of the same C path, through
+        // the same single owner (C `dbScanFwdLink` → `dbScanPassive` →
+        // `processTarget`).
         if let Some(ref flnk) = flnk_name {
-            if let Some(target_rec) = self.get_record(flnk).await {
-                let (target_scan, should_process) = {
-                    let mut tg = target_rec.write().await;
-                    let pact = tg.is_processing();
-                    let on_chain = visited.contains(flnk);
-                    let scan = tg.common.scan;
-                    if !pact {
-                        tg.common.putf = src_putf;
-                        // C `dbNotifyAdd` (dbDbLink.c:460) is reached only
-                        // inside `processTarget`, which `dbScanPassive`
-                        // calls solely for a passive target. Gate the join
-                        // on the same passive condition as the process
-                        // call below so a dropped (non-passive) target
-                        // never `enter`s the wait-set without `leave`ing.
-                        if scan == crate::server::record::ScanType::Passive {
-                            join_put_notify(&mut tg, src_notify.as_ref());
-                        }
-                    } else if src_putf && !on_chain {
-                        tg.common.rpro = true;
-                        tg.common.putf = false;
-                    }
-                    (scan, !pact)
-                };
-                if should_process && target_scan == crate::server::record::ScanType::Passive {
-                    // recursive FLNK within one chain — gate
-                    // already held by the foreign entry record.
-                    let _ = self
-                        .process_record_with_links_recursive(flnk, visited, depth + 1)
-                        .await;
-                }
-            }
+            self.process_target(flnk, src_putf, src_notify.as_ref(), visited, depth)
+                .await;
         }
 
         // FLNK whose target is external (`pva://`/`ca://`): forwarded

@@ -4305,7 +4305,7 @@ async fn handle_put_get(
             OpKind::PutGet,
             ioid,
             subcmd,
-            "PUT_GET not served (serve_put_get disabled for pvxs compatibility)",
+            Status::error("PUT_GET not served (serve_put_get disabled for pvxs compatibility)"),
             order,
         )
         .await?;
@@ -4334,7 +4334,7 @@ async fn handle_put_get(
                 OpKind::PutGet,
                 ioid,
                 subcmd,
-                "unknown channel sid",
+                Status::error("unknown channel sid"),
                 order,
             )
             .await?;
@@ -4367,7 +4367,7 @@ async fn handle_put_get(
                 OpKind::PutGet,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -4382,7 +4382,7 @@ async fn handle_put_get(
                     OpKind::PutGet,
                     ioid,
                     subcmd,
-                    "must provide prototype",
+                    Status::error("must provide prototype"),
                     order,
                 )
                 .await?;
@@ -4420,7 +4420,7 @@ async fn handle_put_get(
                     OpKind::PutGet,
                     ioid,
                     subcmd,
-                    &format!("invalid pvRequest mask: {e}"),
+                    Status::error(format!("invalid pvRequest mask: {e}")),
                     order,
                 )
                 .await?;
@@ -4496,7 +4496,7 @@ async fn handle_put_get(
                 OpKind::PutGet,
                 ioid,
                 subcmd,
-                "operation not initialised",
+                Status::error("operation not initialised"),
                 order,
             )
             .await?;
@@ -4606,7 +4606,11 @@ async fn handle_put_get(
         // separately-read cached get. The read-only legs stay a plain
         // READ-gated `get_value_checked`. A panic in either user handler
         // becomes an error reply instead of skipping the reply below.
-        let read_value: Result<Option<crate::server_native::source::SourceRead>, String> =
+        // The error slot holds the `Status` this reply will carry, not text:
+        // a source fronting a remote (the gateway) reports its upstream's own
+        // Status, and rendering it to a string here is what put a Rust `{:?}`
+        // dump on the wire (R18-27).
+        let read_value: Result<Option<crate::server_native::source::SourceRead>, Status> =
             if let Some((changed, put_delta)) = put_payload {
                 let checked = src
                     .access_gate()
@@ -4629,8 +4633,8 @@ async fn handle_put_get(
                 .await
                 {
                     Ok(Ok(v)) => Ok(v),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(panic) => Err(panic),
+                    Ok(Err(e)) => Err(e.wire_status()),
+                    Err(panic) => Err(Status::error(panic)),
                 }
             } else {
                 let read_checked = src
@@ -4644,7 +4648,9 @@ async fn handle_put_get(
                         &ctx.authority,
                     )
                     .await;
-                catch_handler_panic(src.read_checked(read_checked, ctx)).await
+                catch_handler_panic(src.read_checked(read_checked, ctx))
+                    .await
+                    .map_err(Status::error)
             };
 
         flush_remote_log(&op_log, ioid, order, &tx_clone).await;
@@ -4674,7 +4680,7 @@ async fn handle_put_get(
                 let empty = BitSet::with_capacity(intro.total_bits());
                 empty.write_into(order, &mut payload);
             }
-            Err(msg) => Status::error(msg).write_into(order, &mut payload),
+            Err(status) => status.write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::PutGet.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -4759,7 +4765,7 @@ async fn handle_process(
                 OpKind::Process,
                 ioid,
                 subcmd,
-                "unknown channel sid",
+                Status::error("unknown channel sid"),
                 order,
             )
             .await?;
@@ -4792,7 +4798,7 @@ async fn handle_process(
                 OpKind::Process,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -4811,7 +4817,7 @@ async fn handle_process(
                     OpKind::Process,
                     ioid,
                     subcmd,
-                    "must provide prototype",
+                    Status::error("must provide prototype"),
                     order,
                 )
                 .await?;
@@ -4954,7 +4960,7 @@ async fn handle_process(
         payload.put_u8(subcmd);
         match result {
             Ok(()) => Status::ok().write_into(order, &mut payload),
-            Err(msg) => Status::error(msg).write_into(order, &mut payload),
+            Err(e) => e.wire_status().write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::Process.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -5077,7 +5083,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "unknown channel sid",
+                Status::error("unknown channel sid"),
                 order,
             )
             .await?;
@@ -5104,7 +5110,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -5169,8 +5175,15 @@ async fn handle_channel_array(
                 // Not supported / resolution failure: reply with the error
                 // Status on the INIT frame (pvAccessCPP `send`: a creation
                 // error still answers QOS_INIT). No op registered.
-                send_chan_op_error(&chan_tx, OpKind::Array, ioid, subcmd, &e.message, order)
-                    .await?;
+                send_chan_op_error(
+                    &chan_tx,
+                    OpKind::Array,
+                    ioid,
+                    subcmd,
+                    e.wire_status(),
+                    order,
+                )
+                .await?;
             }
         }
         return Ok(());
@@ -5189,7 +5202,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "bad request id",
+                Status::error("bad request id"),
                 order,
             )
             .await?;
@@ -5270,7 +5283,7 @@ async fn handle_channel_array(
                 OpKind::Array,
                 ioid,
                 subcmd,
-                "other request pending",
+                Status::error("other request pending"),
                 order,
             )
             .await?;
@@ -5355,7 +5368,7 @@ async fn handle_channel_array(
                     }
                 }
             }
-            Err(e) => Status::error(e.message).write_into(order, &mut payload),
+            Err(e) => e.wire_status().write_into(order, &mut payload),
         }
         let h = PvaHeader::application(true, order, Command::Array.code(), payload.len() as u32);
         let mut buf = Vec::new();
@@ -6273,7 +6286,7 @@ async fn handle_op(
                 kind,
                 ioid,
                 subcmd,
-                "max ops per channel exceeded",
+                Status::error("max ops per channel exceeded"),
                 order,
             )
             .await?;
@@ -6297,7 +6310,7 @@ async fn handle_op(
                     kind,
                     ioid,
                     subcmd,
-                    "must provide prototype",
+                    Status::error("must provide prototype"),
                     order,
                 )
                 .await?;
@@ -6397,7 +6410,7 @@ async fn handle_op(
                         kind,
                         ioid,
                         subcmd,
-                        &format!("invalid pvRequest mask: {e}"),
+                        Status::error(format!("invalid pvRequest mask: {e}")),
                         order,
                     )
                     .await?;
@@ -6462,7 +6475,15 @@ async fn handle_op(
         if kind == OpKind::Monitor
             && let Some(MonitorPipelineRequest::Reject(msg)) = &pipeline_req
         {
-            send_chan_op_error(&chan_tx, kind, ioid, subcmd, msg, order).await?;
+            send_chan_op_error(
+                &chan_tx,
+                kind,
+                ioid,
+                subcmd,
+                Status::error(msg.to_string()),
+                order,
+            )
+            .await?;
             return Ok(());
         }
         // pvxs `servermon.cpp:529/542/567/572` — emit `ServerConn::logRemote()`
@@ -6553,7 +6574,7 @@ async fn handle_op(
                                 kind,
                                 ioid,
                                 subcmd,
-                                &format!("invalid channel filter: {e}"),
+                                Status::error(format!("invalid channel filter: {e}")),
                                 order,
                             )
                             .await?;
@@ -6922,16 +6943,22 @@ async fn handle_op(
                             OpKind::Get,
                             ioid,
                             subcmd,
-                            "PV not found",
+                            Status::error("PV not found"),
                             order,
                         )
                         .await;
                         return;
                     }
                     Err(msg) => {
-                        let _ =
-                            send_chan_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order)
-                                .await;
+                        let _ = send_chan_op_error(
+                            &tx_clone,
+                            OpKind::Get,
+                            ioid,
+                            subcmd,
+                            Status::error(msg.to_string()),
+                            order,
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -6942,7 +6969,9 @@ async fn handle_op(
                         OpKind::Get,
                         ioid,
                         subcmd,
-                        &format!("source value does not match opened descriptor: {e}"),
+                        Status::error(format!(
+                            "source value does not match opened descriptor: {e}"
+                        )),
                         order,
                     )
                     .await;
@@ -7063,7 +7092,7 @@ async fn handle_op(
                                 OpKind::Put,
                                 ioid,
                                 subcmd,
-                                "PV not found",
+                                Status::error("PV not found"),
                                 order,
                             )
                             .await;
@@ -7075,7 +7104,7 @@ async fn handle_op(
                                 OpKind::Put,
                                 ioid,
                                 subcmd,
-                                &msg,
+                                Status::error(msg.to_string()),
                                 order,
                             )
                             .await;
@@ -7275,8 +7304,8 @@ async fn handle_op(
                             true
                         }
                     }
-                    Err(msg) => {
-                        Status::error(msg).write_into(order, &mut payload);
+                    Err(e) => {
+                        e.wire_status().write_into(order, &mut payload);
                         false
                     }
                 };
@@ -7600,8 +7629,8 @@ async fn handle_op(
                         encode_pv_field(&resp_value, &resp_desc, order, &mut payload);
                         true
                     }
-                    Err(msg) => {
-                        Status::error(msg).write_into(order, &mut payload);
+                    Err(e) => {
+                        e.wire_status().write_into(order, &mut payload);
                         false
                     }
                 };
@@ -7827,10 +7856,10 @@ async fn send_op_error(
     // data-phase error as an INIT response, so a client waiting for GET
     // data saw an unexpected INIT instead of the failure status.
     subcmd: u8,
-    msg: &str,
+    status: Status,
     order: ByteOrder,
 ) -> PvaResult<()> {
-    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let buf = build_op_error_frame(kind, ioid, subcmd, status, order);
     let _ = tx.send(buf).await;
     Ok(())
 }
@@ -7845,10 +7874,10 @@ async fn send_chan_op_error(
     kind: OpKind,
     ioid: u32,
     subcmd: u8,
-    msg: &str,
+    status: Status,
     order: ByteOrder,
 ) -> PvaResult<()> {
-    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let buf = build_op_error_frame(kind, ioid, subcmd, status, order);
     let _ = chan_tx.send(buf).await;
     Ok(())
 }
@@ -7861,14 +7890,14 @@ fn build_op_error_frame(
     kind: OpKind,
     ioid: u32,
     subcmd: u8,
-    msg: &str,
+    status: Status,
     order: ByteOrder,
 ) -> Vec<u8> {
     let cmd = kind.command();
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
     payload.put_u8(subcmd);
-    Status::error(msg.to_string()).write_into(order, &mut payload);
+    status.write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
     let mut buf = Vec::new();
     h.write_into(&mut buf);

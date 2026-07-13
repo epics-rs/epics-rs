@@ -1384,6 +1384,126 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
     );
 }
 
+/// R18-25: one slow pipelined downstream must not starve its co-subscribers.
+///
+/// Two downstream monitors share ONE upstream monitor (same PV, same
+/// credential). One is pipelined and never keeps up; the other is a plain
+/// monitor that consumes everything instantly. The healthy one must keep
+/// receiving updates while the slow one is stuck.
+///
+/// Pre-fix the gateway declared `monitor_watermarks = Some((0, 0))`, so the
+/// slow op's every DATA emission drained its window to LOW and cast a *pause*
+/// vote on the shared upstream. The aggregate rule ("pause iff every VOTING op
+/// wants pause") counted only ops that had themselves crossed LOW — and a
+/// non-pipelined op never crosses anything, so it never votes and its Resume
+/// can never come. The slow client's single vote paused the upstream and the
+/// healthy client stopped receiving: it saw the seed and nothing after.
+///
+/// pva2pva never throttles upstream (`moncache.cpp:133-137` polls the upstream
+/// dry, with a bare `//TODO: flow control` where a throttle would go); a slow
+/// downstream is absorbed in its own `overflowElement` and counted in
+/// `ndropped` (`:151-174`). The gateway now does the same and declares no
+/// watermarks at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+    use epics_pva_rs::pv_request::PvRequestExpr;
+
+    fn extract_double(v: &PvField) -> Option<f64> {
+        if let PvField::Structure(s) = v {
+            for (name, f) in &s.fields {
+                if name == "value"
+                    && let PvField::Scalar(ScalarValue::Double(d)) = f
+                {
+                    return Some(*d);
+                }
+            }
+        }
+        None
+    }
+
+    let (_us, us_addr, us_pv) = spawn_upstream("GW:STARVE:PV", 0.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+
+    // The slow one: pipelined with a tiny window, and it never returns from its
+    // callback quickly enough to ACK. Its window closes and stays closed.
+    let slow_client = gw.client_config();
+    let slow_req = PvRequestExpr::parse("record[pipeline=true,queueSize=2]").expect("pvRequest");
+    let h_slow = tokio::spawn(async move {
+        let _ = slow_client
+            .pvmonitor_events(
+                "GW:STARVE:PV",
+                Some(&slow_req),
+                MonitorEventMask::default(),
+                move |ev| {
+                    // Wedged for longer than the whole test: the window closes
+                    // on its first delivery and never reopens.
+                    if let MonitorEvent::Data { .. } = ev {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                },
+            )
+            .await;
+    });
+
+    // The healthy one: a plain monitor on the same PV, consuming instantly.
+    let fast_client = gw.client_config();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let seen_cb = seen.clone();
+    let h_fast = tokio::spawn(async move {
+        let _ = fast_client
+            .pvmonitor_events(
+                "GW:STARVE:PV",
+                None,
+                MonitorEventMask::default(),
+                move |ev| {
+                    if let MonitorEvent::Data { value, .. } = ev
+                        && let Some(d) = extract_double(&value)
+                    {
+                        seen_cb.lock().unwrap().push(d);
+                    }
+                },
+            )
+            .await;
+    });
+
+    // Both subscriptions establish and take their seed; the slow one is now
+    // wedged inside its first callback with a closed window.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let before = seen.lock().unwrap().len();
+
+    // Upstream keeps posting. Every one of these must reach the healthy
+    // downstream — the slow one's backpressure is its own problem.
+    for i in 1..=20i64 {
+        us_pv.try_post(nt_double_value(i as f64));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let seen_final = seen.lock().unwrap().clone();
+    h_slow.abort();
+    h_fast.abort();
+
+    assert!(
+        seen_final.len() > before,
+        "the healthy co-subscriber received nothing after the slow pipelined \
+         client stalled: the gateway paused the SHARED upstream on that \
+         client's vote (saw {seen_final:?}, {before} of them before the posts)"
+    );
+    assert_eq!(
+        seen_final.last().copied(),
+        Some(20.0),
+        "the healthy co-subscriber must track the upstream to its latest value, \
+         saw {seen_final:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // PUT_GET leg: the gateway must forward a
 // downstream PUT_GET as ONE upstream PUT_GET — preserving the downstream
@@ -2220,17 +2340,23 @@ impl ChannelSource for MarkedMonitorSource {
     }
 }
 
-/// R17-32: the gateway's MONITOR seed must declare the leaves UPSTREAM
-/// assigned, not a full mask.
+/// R18-28: the gateway's MONITOR seed declares the WHOLE STRUCTURE, however
+/// the upstream marked the events that built the cached snapshot.
+///
+/// pva2pva — the C++ gateway this port's cache is modelled on — copies the
+/// merged element into the starting MonitorUser's buffer and sets the root
+/// bit: `elem->changedBitSet->set(0); // indicate all changed`
+/// (`moncache.cpp:304-312`). Our encoder cannot emit bit 0, so the decodable
+/// equivalent is the canonical full leaf bitset, i.e. `marked: None`.
 ///
 /// Wire shape reproduced: the upstream monitor's seed frames bits `[value]`
-/// only; the gateway's cache decodes it (zero-filling `spare`) and seeds its
-/// downstream monitor from that snapshot. Pre-fix the seed went out as
-/// `SourceRead { marked: None }` → the server framed the canonical full
-/// bitset `[value, spare]`, shipping a `spare` the upstream never sent.
-/// Post-fix the seed carries the snapshot's mark union, `[value]`.
+/// only; the gateway's cache decodes and merges it, then seeds its downstream
+/// monitor from that snapshot. R17-32 (`c05a56f6`) mistook pva2pva's UPDATE
+/// rule (`:142`, copy the upstream changed bitset) for its SEED rule and made
+/// the seed carry the upstream mark union — a seed that can omit `alarm` and
+/// `timeStamp`. This test fails against that commit (`marked == Some(["value"])`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn r17_32_gateway_monitor_seed_forwards_upstream_marks() {
+async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
     let pv = "GW:MONMARK:PV";
     let (_us, us_addr) = spawn_upstream_source(MarkedMonitorSource {
         pv_name: pv.to_string(),
@@ -2274,10 +2400,98 @@ async fn r17_32_gateway_monitor_seed_forwards_upstream_marks() {
         .initial
         .expect("the cached upstream seed must be forwarded as the downstream seed");
 
+    assert!(
+        initial.marked.is_none(),
+        "the monitor seed must declare the whole structure (pva2pva's root \
+         bit, moncache.cpp:304-312); declaring only the upstream's marks \
+         ({:?}) lets a seed omit alarm/timeStamp",
+        initial.marked
+    );
+}
+
+/// An upstream IOC that refuses the write with a `Status` of its own —
+/// `Fatal`, with a message AND a stack. Everything the downstream client is
+/// owed is in that Status; the gateway's only job is not to touch it.
+struct RefusingUpstream;
+
+impl RefusingUpstream {
+    const PV: &'static str = "GW:R18_27:PV";
+    const MESSAGE: &'static str = "record is locked by another client";
+    const STACK: &'static str = "iocsource.cpp:397";
+
+    fn refusal() -> epics_pva_rs::proto::Status {
+        epics_pva_rs::proto::Status::Detailed {
+            kind: epics_pva_rs::proto::StatusKind::Fatal,
+            message: Self::MESSAGE.into(),
+            stack: Self::STACK.into(),
+        }
+    }
+}
+
+impl ChannelSource for RefusingUpstream {
+    async fn list_pvs(&self) -> Vec<String> {
+        vec![Self::PV.into()]
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == Self::PV;
+        async move { matches }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(nt_double_desc())
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        Some(nt_double_value(1.0))
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        true
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Err(OpError::remote(Self::refusal()))
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+}
+
+/// R18-27: the gateway forwards the upstream `Status` VERBATIM.
+///
+/// The downstream client asked the upstream's question, so it is owed the
+/// upstream's answer: kind `Fatal`, the upstream message, the upstream stack.
+/// pva2pva cannot re-author it (the downstream requester is handed straight to
+/// the upstream channel — `p2pApp/channel.cpp:117-127`); the Rust gateway has
+/// two legs and must forward it explicitly.
+///
+/// Pre-fix the upstream reply was rendered with `format!("PUT INIT failed:
+/// {:?}", init.status)` (`ops_v2.rs:1289`) and re-authored as a local `Error`,
+/// so the wire carried a Rust `Debug` dump, the `Fatal` kind was downgraded to
+/// `Error`, and the stack was dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r18_27_gateway_forwards_the_upstream_status_verbatim() {
+    let (_us, us_addr) = spawn_upstream_source(RefusingUpstream);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let client = gw.client_config();
+
+    let err = client
+        .pvput_pv_field(RefusingUpstream::PV, &nt_double_value(7.0))
+        .await
+        .expect_err("the upstream refuses this write, so the gateway PUT must fail");
+
+    let status = match err {
+        epics_pva_rs::error::PvaError::RemoteError(s) => s,
+        other => panic!(
+            "a non-success reply Status must reach the caller as RemoteError(Status), got: {other:?}"
+        ),
+    };
     assert_eq!(
-        initial.marked,
-        Some(vec!["value".to_string()]),
-        "the monitor seed must declare the upstream's marks; a full mask \
-         (marked: None) frames `spare`, a leaf upstream never assigned"
+        status,
+        RefusingUpstream::refusal(),
+        "the gateway must put the upstream's own Status on the downstream wire \
+         (kind/message/stack intact), not a rendering of it"
     );
 }

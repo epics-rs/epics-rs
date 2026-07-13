@@ -50,12 +50,19 @@ pub enum PvaError {
     #[error("channel disconnected")]
     Disconnected,
 
-    /// Server emitted a `CMD_MESSAGE` / op-error reply rather than
-    /// the expected response payload. Mirrors pvxs `RemoteError`.
-    /// Distinct from [`PvaError::Protocol`] (which is reserved for
-    /// framing / decoder errors detected on this side).
+    /// The server answered the operation with a non-success `Status`.
+    /// Mirrors pvxs `RemoteError`. Distinct from [`PvaError::Protocol`]
+    /// (which is reserved for framing / decoder errors detected on this side).
+    ///
+    /// It carries the peer's `Status` **as the peer sent it** — kind, message,
+    /// and stack — not a rendering of it. A proxy (the PVA gateway) forwards
+    /// that Status to its own downstream verbatim, which pva2pva gets for free
+    /// by handing the downstream requester straight to the upstream channel
+    /// (`p2pApp/channel.cpp:117-127`). Formatting it into a string here is what
+    /// put a Rust `{:?}` dump on the PVA wire and coerced every upstream
+    /// FATAL/WARN into a downstream ERROR (R18-27).
     #[error("remote error: {0}")]
-    RemoteError(String),
+    RemoteError(crate::proto::Status),
 
     /// Sentinel returned when a long-lived operation (monitor /
     /// streaming RPC) completed normally. Mirrors pvxs `Finished`.
@@ -168,7 +175,11 @@ impl From<errors::Disconnect> for PvaError {
 
 impl From<errors::RemoteError> for PvaError {
     fn from(e: errors::RemoteError) -> Self {
-        PvaError::RemoteError(e.message)
+        // The discrete type carries only text (a CMD_MESSAGE error line has no
+        // Status on the wire), so the promoted Status is a locally-authored
+        // ERROR. Op replies, which DO carry a peer Status, construct
+        // `PvaError::RemoteError(status)` directly and never pass through here.
+        PvaError::RemoteError(crate::proto::Status::error(e.message))
     }
 }
 
@@ -215,7 +226,24 @@ mod tests {
         let r = errors::RemoteError::new("ECA_NOACCESS");
         let e: PvaError = r.into();
         match e {
-            PvaError::RemoteError(m) => assert_eq!(m, "ECA_NOACCESS"),
+            PvaError::RemoteError(s) => assert_eq!(s.message(), Some("ECA_NOACCESS")),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// R18-27: a peer Status reaches the caller as itself — kind, message and
+    /// stack survive — so a proxy can put it back on the wire unchanged.
+    #[test]
+    fn remote_error_preserves_peer_status_kind_and_stack() {
+        use crate::proto::{Status, StatusKind};
+        let peer = Status::Detailed {
+            kind: StatusKind::Fatal,
+            message: "no write access".into(),
+            stack: "iocsource.cpp:397".into(),
+        };
+        let e = PvaError::RemoteError(peer.clone());
+        match e {
+            PvaError::RemoteError(s) => assert_eq!(s, peer),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

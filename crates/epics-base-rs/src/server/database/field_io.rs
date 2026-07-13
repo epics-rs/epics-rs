@@ -101,6 +101,32 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
     Ok(())
 }
 
+/// Does an *external* put to `field` drive a processing cycle on this record?
+///
+/// C `dbPutField` (`dbAccess.c:1263-1268`) and pvxs `IOCSource::
+/// doPostProcessing` (`iocsource.cpp:397-403`) ask the same question with the
+/// same three terms: the `PROC` field always, else a `pp(TRUE)` field on a
+/// Passive record. (`dbrType < DBR_PUT_ACKT` is subsumed: the alarm-ack fields
+/// are not `pp(TRUE)`.) A caller that FORCES processing
+/// (`record._options.process=true`) does not consult this at all — force is
+/// the caller's own term, not the record's.
+///
+/// Single owner of the rule: the single-record put route
+/// ([`PvDatabase::put_record_field_from_ca`]) tests it while it already holds
+/// the instance, and the QSRV group PUT — whose C twin is `doPostProcessing` —
+/// reaches it through [`PvDatabase::put_drives_processing`]. Neither can drift
+/// from C or from the other.
+///
+/// `field` must already be upper-cased.
+pub(crate) fn put_drives_processing_of(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+) -> bool {
+    field == "PROC"
+        || (instance.common.scan == crate::server::record::ScanType::Passive
+            && instance.record.processes_after_put(field))
+}
+
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
 /// of the link writes it queued ([`Record::take_special_actions`]).
 ///
@@ -365,6 +391,26 @@ impl PvDatabase {
         // gate owner, identical to the one the CA route crosses.
         check_put_disabled(&instance, &field_upper)?;
         Ok(())
+    }
+
+    /// pvxs `IOCSource::doPostProcessing`'s record-side terms
+    /// (`iocsource.cpp:397-403`): does a put to `record_name.field` drive a
+    /// processing cycle on its own?
+    ///
+    /// The QSRV group PUT asks this for a member whose write bypassed
+    /// [`Self::put_record_field_from_ca`] (a `+type:"proc"` trigger, or a
+    /// member that is `changing` but has no writable leaf), so that route
+    /// applies the SAME gate as a plain field put instead of processing
+    /// unconditionally. `false` for an unknown record — there is nothing to
+    /// process. Force (`record._options.process=true`) is the caller's term
+    /// and is not asked about here; see [`put_drives_processing_of`].
+    pub async fn put_drives_processing(&self, record_name: &str, field: &str) -> bool {
+        let field_upper = field.to_ascii_uppercase();
+        let Some(rec) = self.get_record(record_name).await else {
+            return false;
+        };
+        let instance = rec.read().await;
+        put_drives_processing_of(&instance, &field_upper)
     }
 
     async fn put_pv_inner(
@@ -1402,8 +1448,7 @@ impl PvDatabase {
         // pp set), never the default.
         let should_process = {
             let instance = rec.read().await;
-            instance.common.scan == crate::server::record::ScanType::Passive
-                && instance.record.processes_after_put(&field)
+            put_drives_processing_of(&instance, &field)
         };
 
         if !should_process {

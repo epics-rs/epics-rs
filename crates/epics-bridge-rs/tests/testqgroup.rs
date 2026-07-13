@@ -1720,6 +1720,133 @@ async fn r17_31_group_scalar_member_serves_long_string() {
     }
 }
 
+/// R18-26: a `+type:"plain"` long-string member's DESCRIPTOR and VALUE must
+/// be the same type.
+///
+/// pvxs builds the plain leaf from `getChannelValueType`
+/// (`addMembersForPlainType`, groupconfigprocessor.cpp:886-895), which is
+/// `TypeCode::String` for a `DBR_CHAR` array with `format()=="String"`
+/// (iocsource.cpp:634-636), and `getArrayValue` fills that same leaf by
+/// collapsing the buffer at the NUL (:132-137). The port derived the two
+/// independently: `52fe221b` taught the NT owner about long strings but the
+/// plain arm's local `match nt_type` had no `LongString` case, so it fell to
+/// `_ => Scalar(Byte)` while the read path still served `ScalarArray(bytes)` —
+/// a descriptor a client cannot decode the value against.
+#[tokio::test]
+async fn r18_26_plain_long_string_member_descriptor_matches_value() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    const JSON: &str = r#"{
+        "TEST:grpplls": {
+            "msg": { "+channel": "TEST:plls.VAL", "+type": "plain" }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:plls",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:plls").await.expect("record");
+        rec.write().await.set_info("Q:form", "String");
+    }
+    db.put_pv("TEST:plls", EpicsValue::CharArray(b"hi\0".to_vec()))
+        .await
+        .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grpplls")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    // Descriptor: the bare leaf is a scalar string, not a byte scalar.
+    let desc = ch.get_field().await.expect("get_field");
+    let fields = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    let msg_desc = fields
+        .iter()
+        .find(|(n, _)| n == "msg")
+        .map(|(_, d)| d)
+        .expect("msg descriptor");
+    assert_eq!(
+        msg_desc,
+        &FieldDesc::Scalar(ScalarType::String),
+        "a plain long-string member's leaf is TypeCode::String"
+    );
+
+    // Value: the same type the descriptor advertises, NUL-collapsed.
+    let got = ch.get(&empty_request()).await.expect("get");
+    match find_field(&got, "msg") {
+        Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
+        other => panic!("plain long-string member must serve a scalar string, got {other:?}"),
+    }
+}
+
+/// A `+type:"plain"` CHAR waveform WITHOUT `info(Q:form,"String")` stays a
+/// byte array on both surfaces — the tag is what selects the long-string view
+/// (pvxs `getChannelValueType` requires `format()=="String"`), so the paired
+/// leaf must not collapse every char array.
+#[tokio::test]
+async fn r18_26_plain_char_waveform_without_qform_stays_a_byte_array() {
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    const JSON: &str = r#"{
+        "TEST:grpplraw": {
+            "raw": { "+channel": "TEST:plraw.VAL", "+type": "plain" }
+        }
+    }"#;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:plraw",
+        Box::new(WaveformRecord::new(40, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    db.put_pv("TEST:plraw", EpicsValue::CharArray(vec![1, 0, 3]))
+        .await
+        .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grpplraw")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def);
+
+    let desc = ch.get_field().await.expect("get_field");
+    let fields = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    assert_eq!(
+        fields.iter().find(|(n, _)| n == "raw").map(|(_, d)| d),
+        Some(&FieldDesc::ScalarArray(ScalarType::Byte)),
+        "no Q:form tag ⟹ the plain leaf is still a byte array"
+    );
+
+    let got = ch.get(&empty_request()).await.expect("get");
+    match find_field(&got, "raw") {
+        Some(PvField::ScalarArray(a)) => assert_eq!(a.len(), 3, "the NUL is a value, not a stop"),
+        other => panic!("expected a byte array, got {other:?}"),
+    }
+}
+
 /// Build the NTScalar wrapper a real client sends for a `+type:"scalar"`
 /// member — the group type advertises the wrapper, so a PUT carries
 /// `member.value`, never a bare leaf (pvxs `IOCSource::put` reads

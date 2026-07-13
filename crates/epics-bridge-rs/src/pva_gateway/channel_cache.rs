@@ -34,10 +34,9 @@ use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::client_native::ops_v2::Pauser;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
-use epics_pva_rs::server_native::source::{ChannelInvalidator, SourceRead, WatermarkKind};
+use epics_pva_rs::server_native::source::{ChannelInvalidator, SourceRead};
 
 use super::error::{GwError, GwResult};
 
@@ -105,236 +104,73 @@ pub struct UpstreamEntry {
     _monitor_task: AbortOnDrop,
     /// Sticky "recently used" bit, lowered by the cleanup tick.
     drop_poke: parking_lot::Mutex<bool>,
-    /// single owner of upstream backpressure for this entry —
-    /// the per-op pause votes, the pause/resume handle on the *current*
-    /// upstream subscription, and the lock that serializes every physical
-    /// drive of it. Shared (`Arc`) between the spawned monitor task (which
-    /// reinstalls the handle on each reconnect via
-    /// [`PauseControl::install`]) and the gateway's single watermark applier
-    /// task (which folds votes via [`Self::apply_watermark_vote`] and drives
-    /// via [`Self::reconcile_pause`]). Consolidating these into one owner is
-    /// what keeps the invariant "the installed Pauser's physical state always
-    /// equals the current aggregate vote" — see [`PauseControl`].
-    pause: Arc<PauseControl>,
 }
 
-/// The pause/resume surface the gateway drives on the *current* upstream
-/// subscription. The real variant wraps the client [`Pauser`]; the
-/// `#[cfg(test)]` variant records the last requested level so the
-/// single-owner reconcile can be boundary-tested without a live upstream.
-enum PauseSink {
-    Real(Pauser),
-    #[cfg(test)]
-    Fake(Arc<parking_lot::Mutex<Vec<bool>>>),
-}
-
-impl PauseSink {
-    /// Drive this sink to `want_paused`. Async because the real Pauser
-    /// sends a pipeline control frame to the upstream server.
-    async fn apply(&self, want_paused: bool) {
-        match self {
-            PauseSink::Real(p) => {
-                if want_paused {
-                    p.pause().await;
-                } else {
-                    p.resume().await;
-                }
-            }
-            #[cfg(test)]
-            PauseSink::Fake(rec) => rec.lock().push(want_paused),
-        }
-    }
-}
-
-/// the single owner of one upstream entry's backpressure.
-///
-/// **Invariant:** at every settled point, the currently-installed sink's
-/// physical pause-state equals [`Self::all_voting_paused`] over `votes` —
-/// the aggregate of the live downstream ops' votes.
-///
-/// Two things can move either side of that equation: a vote changes
-/// (`apply_vote`, written solely by the gateway's single applier task) or
-/// the physical sink is *replaced* on an upstream reconnect (`install`),
-/// which resets the wire pipeline to flowing. pvxs monitor pause is
-/// per-connection (`clientmon.cpp:379-414`, `:633-635`), so a disconnect
-/// ([`Self::clear`]) drops the standing votes together with the sink; a
-/// reconnect therefore installs against an empty aggregate and the fresh
-/// subscription runs. Both vote-change and install end in
-/// [`Self::reconcile`], which re-reads the aggregate **at drive time**
-/// (level-triggered, not edge-triggered) and drives the
-/// *currently-installed* sink to it. `drive` serializes every reconcile so
-/// the applier's edge-drive and a reconnect's re-install can never
-/// interleave a stale pause/resume — the last reconcile to run reads the
-/// final level and drives the final sink. This is why a backpressure vote
-/// that lands during the reconnect gap still pauses the fresh sink at
-/// install time instead of running unthrottled until the next HIGH→LOW
-/// cycle.
-struct PauseControl {
-    /// Per-downstream-op pause votes: `op_id -> (last seq, wants_pause)`.
-    /// One upstream monitor fans out to N downstream subscriber ops (same
-    /// PV+credential); each contributes a vote so the gateway can
-    /// reference-count them — the upstream pauses only when EVERY live op
-    /// wants pause, and resumes as soon as any has room. `seq` orders an
-    /// op's own transitions (its LOW fires from the server emission loop,
-    /// its HIGH from the ACK path, so they can arrive reordered — a stale
-    /// one is rejected per op). A `Withdraw` removes the op's entry so a
-    /// torn-down op cannot strand the shared upstream paused. Mutated solely
-    /// by the gateway's single watermark applier task via [`Self::apply_vote`].
-    votes: parking_lot::Mutex<std::collections::HashMap<u64, (u64, bool)>>,
-    /// Pause/resume handle on the *current* upstream subscription. Refreshed
-    /// by the auto-restart loop on every successful monitor cycle via
-    /// [`Self::install`]; `None` while the loop is in the gap between
-    /// disconnects.
-    sink: parking_lot::Mutex<Option<PauseSink>>,
-    /// Serializes every physical drive of `sink` so the applier edge-drive
-    /// and a reconnect re-install cannot race a stale level onto the wire.
-    /// Async (held across the Pauser's `.await`) — see [`Self::reconcile`].
-    drive: tokio::sync::Mutex<()>,
-}
-
-impl PauseControl {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            votes: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            sink: parking_lot::Mutex::new(None),
-            drive: tokio::sync::Mutex::new(()),
-        })
-    }
-
-    /// Aggregate predicate: pause the shared upstream iff at least one op
-    /// is voting and every voting op wants pause.
-    fn all_voting_paused(votes: &std::collections::HashMap<u64, (u64, bool)>) -> bool {
-        !votes.is_empty() && votes.values().all(|(_, wants_pause)| *wants_pause)
-    }
-
-    /// Fold one downstream op's watermark transition into the votes and
-    /// return whether the aggregate pause-state changed (see
-    /// [`UpstreamEntry::apply_watermark_vote`] for the full contract). The
-    /// returned bool is only an *edge hint* for the applier — the physical
-    /// drive always re-reads the level in [`Self::reconcile`].
-    fn apply_vote(&self, op_id: u64, seq: u64, kind: WatermarkKind) -> Option<bool> {
-        let mut votes = self.votes.lock();
-        let was_paused = Self::all_voting_paused(&votes);
-        match kind {
-            WatermarkKind::Pause => match votes.get_mut(&op_id) {
-                Some(entry) if seq > entry.0 => *entry = (seq, true),
-                Some(_) => {} // stale/reordered for this op — keep newer
-                None => {
-                    votes.insert(op_id, (seq, true));
-                }
-            },
-            WatermarkKind::Resume => {
-                if let Some(entry) = votes.get_mut(&op_id)
-                    && seq > entry.0
-                {
-                    *entry = (seq, false);
-                }
-                // Absent op: ignore — never re-insert on a resume so a late
-                // HIGH after a Withdraw cannot resurrect a dead voter.
-            }
-            WatermarkKind::Withdraw => {
-                votes.remove(&op_id);
-            }
-        }
-        let now_paused = Self::all_voting_paused(&votes);
-        (now_paused != was_paused).then_some(now_paused)
-    }
-
-    /// Drive the installed sink to the current aggregate vote. The sole
-    /// physical driver of the sink (applier edge AND reconnect install both
-    /// route here). Holds `drive` across the read+apply so two reconciles
-    /// serialize; the level is re-read inside the lock so the last reconcile
-    /// wins. No-op when no sink is installed (upstream between connections).
-    async fn reconcile(&self) {
-        let _drive = self.drive.lock().await;
-        let want_paused = Self::all_voting_paused(&self.votes.lock());
-        // Clone the sink handle out from under the (sync) slot lock before
-        // the await so we never hold a parking_lot guard across `.await`.
-        let sink = match &*self.sink.lock() {
-            Some(PauseSink::Real(p)) => Some(PauseSink::Real(p.clone())),
-            #[cfg(test)]
-            Some(PauseSink::Fake(rec)) => Some(PauseSink::Fake(rec.clone())),
-            None => None,
-        };
-        if let Some(sink) = sink {
-            sink.apply(want_paused).await;
-        }
-    }
-
-    /// Install a freshly-(re)connected upstream sink and reconcile it to the
-    /// current aggregate vote. After a reconnect the previous connection's
-    /// votes were dropped at disconnect ([`Self::clear`]) — pvxs per-
-    /// connection pause semantics — so the aggregate is empty and the fresh
-    /// subscription starts flowing; only a backpressure vote that arrived
-    /// during the reconnect gap pauses it. The reconcile still matters: it
-    /// drives that gap-vote onto the new sink at install time rather than
-    /// waiting for the next HIGH→LOW edge.
-    async fn install(&self, pauser: Pauser) {
-        *self.sink.lock() = Some(PauseSink::Real(pauser));
-        self.reconcile().await;
-    }
-
-    /// Drop the installed sink AND the standing per-connection backpressure
-    /// votes (upstream disconnected). pvxs monitor pause is per-connection:
-    /// a disconnect returns the monitor to `Connecting` with no paused flag
-    /// preserved (`clientmon.cpp:379-414`) and the reconnect autostarts the
-    /// fresh subscription (`clientmon.cpp:633-635`). The previous
-    /// connection's pause votes are therefore void here — dropping them lets
-    /// the next [`Self::install`] reconcile an EMPTY aggregate and start the
-    /// replacement flowing instead of carrying the old pause forward. A
-    /// downstream op still short of window re-asserts HIGH on the new
-    /// connection and re-pauses then. No physical drive — there is nothing
-    /// connected to pause.
-    fn clear(&self) {
-        self.votes.lock().clear();
-        *self.sink.lock() = None;
-    }
-
-    #[cfg(test)]
-    fn vote_count(&self) -> usize {
-        self.votes.lock().len()
-    }
-
-    #[cfg(test)]
-    async fn install_fake(&self, rec: Arc<parking_lot::Mutex<Vec<bool>>>) {
-        *self.sink.lock() = Some(PauseSink::Fake(rec));
-        self.reconcile().await;
-    }
-}
+// **Invariant: a downstream monitor never throttles the upstream** (R18-25).
+//
+// One upstream monitor fans out to every downstream subscriber of the same
+// (PV, credential). Nothing a single downstream does may slow that shared
+// upstream, because the upstream is not its to slow: its co-subscribers are
+// reading the same stream and a pause is not divisible.
+//
+// This is pva2pva's design, and it is explicit about it —
+// `MonitorCacheEntry::notify` (`moncache.cpp:133-174`) polls the upstream dry
+// (`while((update=monitor->poll()))`) with a bare `//TODO: flow control` where
+// an upstream throttle would go, and absorbs a downstream that cannot keep up
+// *in that downstream's own buffer*: its `overflowElement` accumulates the
+// changed/overrun bitsets and takes the latest value, `ndropped` counts what
+// was coalesced away, and the upstream keeps flowing for everyone else.
+//
+// The port does the same, structurally: each downstream forwarder owns a
+// `broadcast::Receiver` and an mpsc queue, and a slow one lags its OWN
+// receiver — `RecvError::Lagged` → `pending_overrun` → the next body it
+// forwards carries the overrun mark (`subscribe_raw_inner` /
+// `subscribe_inner` in `source.rs`). That is the overflow element.
+//
+// What used to be here — a `PauseControl` that reference-counted per-op
+// pipeline-window votes and drove the upstream client's `Pauser` — could not
+// be made correct: an op became a *voter* only by crossing its own LOW
+// watermark, so a non-pipelined downstream never voted, and the aggregate
+// "pause iff every voting op wants pause" then ignored it entirely. One slow
+// pipelined client paused the shared upstream and every healthy co-subscriber
+// starved with no way to resume it. Deleting the throttle is what closes that
+// family: there is no sink to drive, so no vote can strand anyone.
 
 #[derive(Default)]
 struct EntryState {
-    /// Most recent value seen on the upstream monitor, together with the
-    /// leaves the upstream has assigned in it — the UNION of every
-    /// upstream event's changed set since this snapshot began (a first
-    /// event, an introspection change, or a disconnect starts a new one).
+    /// Most recent value seen on the upstream monitor: the merge of every
+    /// upstream event since the snapshot began (a first event, an
+    /// introspection change, or a disconnect starts a new one). A delta
+    /// event is merged onto the prior snapshot by
+    /// `fill_unmarked_from_prior`, so this is always a whole structure.
     ///
-    /// Value and marks are one field precisely because they are one fact:
-    /// the snapshot is a merge of upstream deltas (`fill_unmarked_from_prior`
-    /// carries unmarked leaves forward), so "which leaves does this snapshot
-    /// actually carry from upstream" is only answerable by accumulating the
-    /// marks alongside the value. A caller cannot take the value without
-    /// its marks and re-declare a full mask (R17-32).
-    ///
-    /// `SourceRead::marked == None` keeps its wire meaning — the whole
-    /// structure was assigned (upstream set the root bit).
-    latest: Option<SourceRead>,
+    /// It carries no mark set of its own, because a monitor seed built from
+    /// it does not declare one: pva2pva's seed is `elem->changedBitSet->set(0)`
+    /// — the ROOT bit, "all changed" (`moncache.cpp:304-312`). See
+    /// [`monitor_seed`], the one owner of that rule.
+    latest: Option<PvField>,
     /// Type descriptor learned from the first INIT response.
     introspection: Option<FieldDesc>,
 }
 
-/// Accumulate an upstream event's changed leaves into the snapshot's mark
-/// union. `None` means "whole structure" on both sides and absorbs: once
-/// upstream has assigned everything, every leaf of the snapshot is real.
-fn union_marks(prior: Option<Vec<String>>, event: Option<Vec<String>>) -> Option<Vec<String>> {
-    match (prior, event) {
-        (Some(a), Some(b)) => {
-            let mut set: std::collections::BTreeSet<String> = a.into_iter().collect();
-            set.extend(b);
-            Some(set.into_iter().collect())
-        }
-        _ => None,
-    }
+/// The monitor seed for a cached snapshot — the ONE place the gateway
+/// decides what a downstream seed declares (R18-28).
+///
+/// pva2pva seeds a starting `MonitorUser` with the cache's merged element
+/// and marks the **root** bit: `elem->pvStructurePtr->copy(*lval);
+/// elem->changedBitSet->set(0); // indicate all changed`
+/// (`moncache.cpp:304-312`) — *not* the union of the upstream marks that
+/// built `lval`. Our encoder cannot emit bit 0 (`pvdata/encode.rs`
+/// trims to leaves), so the decodable equivalent is the canonical full leaf
+/// bitset, which is exactly what `SourceRead { marked: None }` frames.
+/// Routing every seed through this function makes "a seed is whole-structure"
+/// hold by construction: no caller can hand the server a partial mask.
+///
+/// A `None` return means no upstream event has arrived yet (pva2pva's
+/// `!havedata`, `moncache.cpp:285` + `:304`), so there is no seed frame at
+/// all: the downstream monitor's first frame is the first upstream update.
+fn monitor_seed(state: &RwLock<EntryState>) -> Option<SourceRead> {
+    state.read().latest.clone().map(SourceRead::from)
 }
 
 /// Result of folding one upstream monitor event into [`EntryState`].
@@ -352,8 +188,13 @@ struct MonitorEventOutcome {
     /// changed-bitset" — used for a whole-structure (root-bit) event and
     /// when the body could not be decoded. `Some(paths)` carries the real
     /// changed leaves so the downstream cooked monitor advertises the
-    /// upstream's actual changed-bitset, not a synthesised full mask
-    /// (pva2pva `p2pApp/moncache.cpp:142,189`).
+    /// upstream's actual changed-bitset, not a synthesised full mask.
+    ///
+    /// This is the UPDATE path, and only the update path: pva2pva copies the
+    /// upstream event's changed bitset onto each downstream element
+    /// (`moncache.cpp:142` `*lastelem->changedBitSet = *update->changedBitSet`,
+    /// `:189` the per-user copy). The SEED is a different rule entirely — the
+    /// root bit, see [`monitor_seed`].
     marked: Option<Vec<String>>,
 }
 
@@ -430,33 +271,15 @@ fn apply_monitor_event(
     s.introspection = Some(desc.clone());
     match s.latest.take() {
         Some(prior) if !type_changed => {
-            // The merged snapshot carries the union of what upstream has
-            // assigned: this event's leaves plus every leaf a prior event
-            // put there (`fill_unmarked_from_prior` keeps those values).
-            let value = epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
-                desc,
-                &changed,
-                0,
-                v,
-                &prior.value,
-            );
-            s.latest = Some(SourceRead {
-                value,
-                marked: union_marks(prior.marked, marked.clone()),
-            });
+            s.latest = Some(epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                desc, &changed, 0, v, &prior,
+            ));
         }
-        // First event, or an introspection change that replaced the
-        // snapshot wholesale: the union starts over at this event's marks.
-        _ => {
-            s.latest = Some(SourceRead {
-                value: v,
-                marked: marked.clone(),
-            })
-        }
+        _ => s.latest = Some(v),
     }
     // Read merged value while still holding the write lock so callers
     // receive the exact value that was stored — no separate re-acquisition.
-    let value = s.latest.as_ref().map(|r| r.value.clone());
+    let value = s.latest.clone();
     MonitorEventOutcome {
         was_first,
         type_changed,
@@ -530,19 +353,13 @@ fn signal_disconnect_boundary(
 }
 
 impl UpstreamEntry {
-    /// Latest cached value AND the leaves upstream assigned in it (the
-    /// union of every upstream event's changed set since the snapshot
-    /// began). A monitor seed built from this declares exactly those
-    /// leaves downstream — never a synthesised full mask over leaves the
-    /// decoder merely zero-filled (R17-32; pva2pva `moncache.cpp:142,189`
-    /// forwards the upstream's own changed bitset).
-    ///
-    /// `None` ⟹ no upstream event yet, so there is nothing to seed with:
-    /// the seed is omitted and the downstream monitor's first frame is the
-    /// first upstream update (pva2pva delivers `lastelem` on `start()`
-    /// only when `havedata`).
+    /// The downstream monitor seed for this entry's cached snapshot — the
+    /// merged upstream value, declared whole-structure, or `None` when no
+    /// upstream event has arrived yet. See [`monitor_seed`] for the rule and
+    /// its pva2pva citation; this is a thin accessor so that rule has exactly
+    /// one owner.
     pub fn snapshot(&self) -> Option<SourceRead> {
-        self.state.read().latest.clone()
+        monitor_seed(&self.state)
     }
 
     /// Cached introspection if known.
@@ -620,48 +437,6 @@ impl UpstreamEntry {
 
     fn poke(&self) {
         *self.drop_poke.lock() = true;
-    }
-
-    /// fold one downstream op's watermark transition into
-    /// this shared entry's pause votes and return the resulting upstream
-    /// pause-state transition, if any.
-    ///
-    /// Returns `Some(true)` when the aggregate just became "pause the
-    /// upstream", `Some(false)` when it just became "resume", and `None`
-    /// when the applied state is unchanged. The applier uses the
-    /// `Some(_)`/`None` as an *edge hint* to decide whether to reconcile;
-    /// the physical drive re-reads the level in [`Self::reconcile_pause`].
-    /// The aggregate rule is **pause iff there is ≥1 live voting op and
-    /// EVERY live op wants pause** — a fast co-subscriber keeps the
-    /// upstream flowing for everyone, a slow one falls back to
-    /// broadcast-lag coalescing, and the upstream pauses only when no
-    /// downstream can make progress.
-    ///
-    /// Per-op ordering: a `Pause`/`Resume` is applied only if its `seq` is
-    /// strictly newer than the op's last-recorded seq, so a LOW and HIGH
-    /// reordered between the two server tasks resolve to the op's truly
-    /// last crossing. `Resume` for an op not currently voting is ignored
-    /// (a HIGH that lost its race with a `Withdraw`, or for an op that
-    /// never paused). `Withdraw` removes the op unconditionally (terminal,
-    /// FIFO-last from the op's own subscriber task) so a torn-down op never
-    /// strands the shared upstream. Mutated solely by the gateway's single
-    /// watermark applier task.
-    pub fn apply_watermark_vote(&self, op_id: u64, seq: u64, kind: WatermarkKind) -> Option<bool> {
-        self.pause.apply_vote(op_id, seq, kind)
-    }
-
-    /// drive the installed upstream Pauser to the current
-    /// aggregate vote. Called by the gateway's single applier task after a
-    /// vote edge, and by the reconnect loop after re-installing the Pauser
-    /// (via [`PauseControl::install`]). Level-triggered and serialized — see
-    /// [`PauseControl::reconcile`].
-    pub async fn reconcile_pause(&self) {
-        self.pause.reconcile().await;
-    }
-
-    #[cfg(test)]
-    pub fn wm_vote_count(&self) -> usize {
-        self.pause.vote_count()
     }
 }
 
@@ -935,9 +710,8 @@ impl ChannelCache {
     /// recency bit), or `None` without inserting / spawning.
     ///
     /// Used by paths that act on an ALREADY-cached entry without wanting to
-    /// resolve a miss — e.g. the watermark applier, which folds a pause/resume
-    /// vote into an existing upstream monitor and simply skips when the entry
-    /// is gone. The full `lookup` path remains for
+    /// resolve a miss, and simply skip when the entry is gone. The full
+    /// `lookup` path remains for
     /// `has_pv`/`get_value`/`subscribe`/`is_writable` etc. that genuinely need
     /// to resolve (connect) the PV.
     pub async fn peek(&self, pv_name: &str) -> Option<Arc<UpstreamEntry>> {
@@ -1190,7 +964,6 @@ impl ChannelCache {
             broadcast::channel::<crate::pva_gateway::source::RawEvent>(BROADCAST_CAPACITY);
         let first_event = Arc::new(Notify::new());
         let state = Arc::new(RwLock::new(EntryState::default()));
-        let pause = PauseControl::new();
 
         let latest_raw = Arc::new(RwLock::new(None::<crate::pva_gateway::source::RawEvent>));
 
@@ -1200,7 +973,6 @@ impl ChannelCache {
         let tx_raw_for_task = tx_raw.clone();
         let state_for_task = state.clone();
         let first_event_for_task = first_event.clone();
-        let pause_for_task = pause.clone();
         let latest_raw_for_task = latest_raw.clone();
         // The downstream-forwarded pvRequest (if any) is re-cloned per
         // reconnect because each `pvmonitor_raw_frames_handle_with_request`
@@ -1233,13 +1005,6 @@ impl ChannelCache {
                 // first-event signal + future typed `subscribe()`
                 // callers, which today are unused for the gateway
                 // path).
-                //
-                // Pauser: the `_handle` variant returns a
-                // SubscriptionHandle whose `pauser()` we hand to
-                // `pause_for_task.install(..)` below. Downstream watermark
-                // events fold into the entry's vote map and the applier
-                // drives the installed Pauser to the aggregate — pvxs
-                // `MonitorControlOp::pipeline` parity.
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
                 let latest_raw_inner = latest_raw_for_task.clone();
@@ -1359,10 +1124,11 @@ impl ChannelCache {
                 };
                 // `pvmonitor_raw_frames_handle*` returns immediately
                 // with a handle whose internal task drives the
-                // monitor loop. We install the pauser into the slot
-                // for downstream watermark callbacks, then wait for
-                // the task to terminate (clean disconnect, channel
-                // close, or fatal error).
+                // monitor loop; we wait for that task to terminate
+                // (clean disconnect, channel close, or fatal error).
+                // The handle's `pauser()` is deliberately unused: the
+                // gateway never throttles a shared upstream (see the
+                // invariant above the `UpstreamEntry` fields).
                 let handle = match handle_result {
                     Ok(h) => h,
                     Err(e) => {
@@ -1389,20 +1155,7 @@ impl ChannelCache {
                         continue;
                     }
                 };
-                // Install the fresh Pauser and reconcile it to the current
-                // aggregate. pvxs monitor pause is per-connection: the prior
-                // connection's votes were dropped at its disconnect (`clear`,
-                // below), so a reconnect installs against an empty aggregate
-                // and the new subscription runs — clientmon.cpp:379-414 drops
-                // the paused flag on disconnect, :633-635 autostarts on
-                // reconnect. Only a backpressure vote that landed during the
-                // reconnect gap pauses it. Routed through the single owner so
-                // the installed-Pauser-matches-aggregate invariant holds.
-                pause_for_task.install(handle.pauser()).await;
                 let raw_result = handle.wait().await;
-                // Disconnect: drop the sink AND the per-connection votes so
-                // the next reconnect starts flowing (see `clear`).
-                pause_for_task.clear();
                 // Upstream disconnected — surface it to downstream PVA
                 // monitors as a subscription boundary (MONITOR FINISH →
                 // reopen), mirroring pva2pva moncache.cpp unlisten rather than
@@ -1470,7 +1223,6 @@ impl ChannelCache {
             first_event,
             _monitor_task: AbortOnDrop(join.abort_handle()),
             drop_poke: parking_lot::Mutex::new(true),
-            pause,
         })
     }
 
@@ -1735,7 +1487,6 @@ impl ChannelCache {
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
-            pause: PauseControl::new(),
         });
         // Pre-mark the parked variant connected: store a `first_event`
         // permit so a `lookup_with_request` resolves it immediately
@@ -1803,24 +1554,11 @@ mod tests {
     use epics_pva_rs::proto::{BitSet, ByteOrder};
     use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
 
-    /// The cached snapshot's value alone, for the tests that only assert
-    /// the merge result. The marks it is stored with are asserted by
-    /// [`r17_32_snapshot_carries_the_union_of_upstream_marks`].
+    /// The cached snapshot's merged value. What a monitor seed built from it
+    /// declares on the wire is asserted by
+    /// [`r18_28_monitor_seed_declares_the_whole_structure`].
     fn latest_value(state: &RwLock<EntryState>) -> Option<PvField> {
-        state.read().latest.as_ref().map(|r| r.value.clone())
-    }
-
-    /// The cached snapshot's marks — what a monitor seed declares. Panics
-    /// when there is no snapshot, so `None` here means only what it means on
-    /// the wire: the whole structure.
-    fn latest_marks(state: &RwLock<EntryState>) -> Option<Vec<String>> {
-        state
-            .read()
-            .latest
-            .as_ref()
-            .expect("a snapshot must exist")
-            .marked
-            .clone()
+        state.read().latest.clone()
     }
 
     /// The reconnect loop's re-subscribe delay must be applied on EVERY
@@ -1893,282 +1631,6 @@ mod tests {
             &mut body,
         );
         body
-    }
-
-    /// Within ONE op, a LOW and HIGH that
-    /// reach the applier reordered (they fire from the server emission loop
-    /// vs the ACK path) must resolve to the op's truly-last crossing. The
-    /// per-op `seq` is the gate: only a strictly-newer transition for that
-    /// op is applied; a stale one is discarded. Tested by boundary:
-    /// fresh, reordered-lower Pause, stale Resume, newer, idempotent.
-    #[tokio::test]
-    async fn fr11_per_op_seq_rejects_reordered_stale_transition() {
-        let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
-        cache.insert_test_entry("WM:PV").await;
-        let entry = cache.peek("WM:PV").await.expect("entry present");
-        const OP: u64 = 1;
-
-        // First Pause (seq 2): the sole voting op now wants pause → the
-        // aggregate becomes "pause the upstream".
-        assert_eq!(
-            entry.apply_watermark_vote(OP, 2, WatermarkKind::Pause),
-            Some(true),
-            "first pause vote pauses the shared upstream"
-        );
-        // A Pause re-ordered behind it (lower seq 1) is discarded — it
-        // must not clobber the op's newer state; aggregate unchanged.
-        assert_eq!(
-            entry.apply_watermark_vote(OP, 1, WatermarkKind::Pause),
-            None,
-            "reordered stale (lower-seq) pause is skipped, no edge"
-        );
-        // Resume (seq 3) is newer → the op no longer wants pause → resume.
-        assert_eq!(
-            entry.apply_watermark_vote(OP, 3, WatermarkKind::Resume),
-            Some(false),
-            "newer resume releases the upstream"
-        );
-        // A stale Resume (seq 2 < 3) and a stale Pause (seq 2 < 3) are both
-        // discarded — the op stays resumed; no edge either way.
-        assert_eq!(
-            entry.apply_watermark_vote(OP, 2, WatermarkKind::Resume),
-            None,
-            "stale resume is skipped"
-        );
-        assert_eq!(
-            entry.apply_watermark_vote(OP, 2, WatermarkKind::Pause),
-            None,
-            "a pause re-ordered behind the newer resume cannot re-pause"
-        );
-        // Withdraw drops the op; aggregate goes empty (resumed→empty, both
-        // non-paused) → no edge, and the vote map is clean.
-        assert_eq!(
-            entry.apply_watermark_vote(OP, 0, WatermarkKind::Withdraw),
-            None,
-            "withdraw of a resumed op produces no pause edge"
-        );
-        assert_eq!(entry.wm_vote_count(), 0, "withdraw clears the op vote");
-    }
-
-    /// The shared upstream entry must
-    /// reference-count pause votes across co-subscribers — pause iff EVERY
-    /// live op wants pause, resume as soon as ANY has room. This is the
-    /// multi-op composition the old last-writer-wins single-seq gate could
-    /// not represent (a fast op's climbing seq shadowed a slow op's pause).
-    /// Tested by the aggregate boundaries with two ops A,B sharing one
-    /// entry, B cycling at a HIGHER seq than A throughout.
-    #[tokio::test]
-    async fn fr11_pause_votes_compose_across_co_subscribers() {
-        let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
-        cache.insert_test_entry("WM:PV").await;
-        let entry = cache.peek("WM:PV").await.expect("entry present");
-        const A: u64 = 10;
-        const B: u64 = 20;
-        use WatermarkKind::{Pause, Resume, Withdraw};
-
-        // A pauses: the only voting op wants pause → pause upstream.
-        assert_eq!(entry.apply_watermark_vote(A, 2, Pause), Some(true));
-        // B also pauses: all voting ops paused, already paused → no edge.
-        assert_eq!(entry.apply_watermark_vote(B, 3, Pause), None);
-        // B (faster) gets room and resumes: NOT all paused → resume, even
-        // though A still wants pause. A fast co-subscriber keeps the
-        // upstream flowing; A falls back to broadcast-lag coalescing.
-        assert_eq!(entry.apply_watermark_vote(B, 4, Resume), Some(false));
-        // B cycles repeatedly at climbing seqs (5,6,7…). A's standing pause
-        // vote (seq 2) is NEVER shadowed by B's higher seqs — the per-op
-        // key isolates them. Upstream pauses only when B is also paused.
-        assert_eq!(entry.apply_watermark_vote(B, 5, Pause), Some(true));
-        assert_eq!(entry.apply_watermark_vote(B, 6, Resume), Some(false));
-        assert_eq!(entry.apply_watermark_vote(B, 7, Pause), Some(true));
-        // A finally gets room: NOT all paused → resume.
-        assert_eq!(entry.apply_watermark_vote(A, 8, Resume), Some(false));
-
-        // Strand guard: drive both to paused, then tear A down while paused
-        // — B alone still wants pause, so the upstream STAYS paused (no
-        // spurious resume), and tearing B down empties the votes → resume.
-        assert_eq!(entry.apply_watermark_vote(A, 9, Pause), Some(true));
-        assert_eq!(entry.apply_watermark_vote(B, 10, Pause), None);
-        assert_eq!(
-            entry.apply_watermark_vote(A, 0, Withdraw),
-            None,
-            "withdrawing one paused op leaves the other's pause standing"
-        );
-        assert_eq!(
-            entry.apply_watermark_vote(B, 0, Withdraw),
-            Some(false),
-            "withdrawing the last paused op resumes the shared upstream"
-        );
-        assert_eq!(entry.wm_vote_count(), 0, "all votes withdrawn");
-    }
-
-    /// pvxs monitor pause is per-connection: a disconnect drops the paused
-    /// flag (`clientmon.cpp:379-414`) and the reconnect autostarts the fresh
-    /// subscription (`clientmon.cpp:633-635`). The gateway mirrors that — the
-    /// standing per-connection backpressure votes are dropped at disconnect
-    /// (`clear`), so the reconnect installs a FLOWING subscription rather
-    /// than carrying the previous connection's pause forward (which would
-    /// strand the new upstream monitor idle until a later resume). A
-    /// downstream op still short of window re-asserts HIGH on the new
-    /// connection. Boundary: a standing all-paused aggregate at disconnect →
-    /// the reconnect sink is driven to unpaused.
-    #[tokio::test]
-    async fn fr11_reconnect_drops_standing_pause_per_connection() {
-        let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
-        cache.insert_test_entry("WM:PV").await;
-        let entry = cache.peek("WM:PV").await.expect("entry present");
-
-        // A standing pause vote exists on the live connection.
-        assert_eq!(
-            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
-            Some(true)
-        );
-
-        // Upstream disconnects: the per-connection pause state is dropped.
-        entry.pause.clear();
-        assert_eq!(
-            entry.wm_vote_count(),
-            0,
-            "disconnect drops the standing per-connection votes"
-        );
-
-        // Reconnect installs a fresh sink: it must start FLOWING (unpaused),
-        // not re-apply the previous connection's pause.
-        let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
-        entry.pause.install_fake(rec.clone()).await;
-        assert_eq!(
-            *rec.lock(),
-            vec![false],
-            "reconnect resumes delivery; the old connection's pause does not persist"
-        );
-    }
-
-    /// The reconcile is level-triggered, so a
-    /// reconnect while the aggregate is "resumed" must NOT spuriously pause
-    /// the fresh subscription. Boundary: a co-subscriber has room (aggregate
-    /// resumed) at reconnect → the new sink is driven to unpaused.
-    #[tokio::test]
-    async fn fr11_reconnect_reinstall_stays_unpaused_when_aggregate_resumed() {
-        let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
-        cache.insert_test_entry("WM:PV").await;
-        let entry = cache.peek("WM:PV").await.expect("entry present");
-
-        // Two ops: one paused, one with room → aggregate is NOT all-paused.
-        assert_eq!(
-            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
-            Some(true)
-        );
-        assert_eq!(
-            entry.apply_watermark_vote(2, 2, WatermarkKind::Resume),
-            None,
-            "a fresh op voting resume keeps the aggregate non-paused-only"
-        );
-        // op 2 never paused so its Resume is ignored; op 1 alone still wants
-        // pause → aggregate is still all-paused. Give op 2 a real pause then
-        // resume so it is a live, resumed voter alongside op 1's pause.
-        assert_eq!(
-            entry.apply_watermark_vote(2, 3, WatermarkKind::Pause),
-            None,
-            "both ops want pause now → still all-paused, no edge"
-        );
-        assert_eq!(
-            entry.apply_watermark_vote(2, 4, WatermarkKind::Resume),
-            Some(false),
-            "op 2 gets room → aggregate resumes"
-        );
-
-        // Reconnect while resumed: the fresh sink must stay unpaused.
-        let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
-        entry.pause.install_fake(rec.clone()).await;
-        assert_eq!(
-            *rec.lock(),
-            vec![false],
-            "reconnect must not pause a fresh sink when a co-subscriber has room"
-        );
-    }
-
-    /// `reconcile` with no installed sink
-    /// (upstream between connections) is a no-op — it must not panic and
-    /// records nothing.
-    #[tokio::test]
-    async fn fr11_reconcile_without_installed_sink_is_noop() {
-        let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
-        cache.insert_test_entry("WM:PV").await;
-        let entry = cache.peek("WM:PV").await.expect("entry present");
-        assert_eq!(
-            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
-            Some(true)
-        );
-        // No sink installed; reconcile must simply return.
-        entry.reconcile_pause().await;
-        assert!(
-            entry.pause.sink.lock().is_none(),
-            "no sink installed after a bare reconcile"
-        );
-    }
-
-    /// Two-driver invariant: the whole point
-    /// of routing every physical drive through one `drive`-serialized,
-    /// level-triggered `reconcile` is that a reconnect re-install and the
-    /// applier's edge-drive can run CONCURRENTLY without stranding the
-    /// installed Pauser in the wrong state. Exercise that under real
-    /// multi-thread contention: race an `install` (sink swap + reconcile)
-    /// against many bare reconciles, then flip the aggregate and settle.
-    /// Post-quiesce invariant: the LAST level driven equals the FINAL
-    /// aggregate, and no interleaving deadlocks or panics. (Catches a
-    /// regression that drops the drive lock or captures the sink/level
-    /// outside it.)
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fr11_concurrent_install_and_reconcile_settles_to_aggregate() {
-        let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
-        cache.insert_test_entry("WM:PV").await;
-        let entry = cache.peek("WM:PV").await.expect("entry present");
-        let pc = entry.pause.clone();
-        let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
-
-        // Aggregate starts "all paused".
-        assert_eq!(
-            entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
-            Some(true)
-        );
-
-        // Race the reconnect install against a burst of edge-drive reconciles.
-        let mut handles = Vec::new();
-        {
-            let pc = pc.clone();
-            let rec = rec.clone();
-            handles.push(tokio::spawn(async move { pc.install_fake(rec).await }));
-        }
-        for _ in 0..8 {
-            let pc = pc.clone();
-            handles.push(tokio::spawn(async move { pc.reconcile().await }));
-        }
-        for h in handles {
-            h.await.expect("no panic/deadlock under concurrent drives");
-        }
-        // Every drive observed the paused aggregate; the install path drove
-        // at least one paused level onto the fresh sink.
-        assert!(
-            rec.lock().iter().any(|&p| p),
-            "the install path drove the standing pause onto the fresh sink"
-        );
-
-        // Flip the aggregate to resumed, then settle with a final reconcile.
-        assert_eq!(
-            entry.apply_watermark_vote(1, 3, WatermarkKind::Resume),
-            Some(false)
-        );
-        pc.reconcile().await;
-        assert!(
-            !*rec.lock().last().expect("at least one drive recorded"),
-            "after concurrent drives + a resume edge, the sink settles to the \
-             final aggregate (resumed)"
-        );
     }
 
     /// BUG 2 regression: `apply_monitor_event` must update
@@ -2352,17 +1814,18 @@ mod tests {
         assert_eq!(o3.marked, Some(vec!["b".to_string()]));
     }
 
-    /// R17-32 regression: the SNAPSHOT (what a monitor seed forwards) must
-    /// carry the UNION of the upstream marks that built it. Pre-fix the
-    /// cache stored only the merged value, so every seed declared
-    /// `marked: None` and the server framed a canonical full bitset over
-    /// leaves the upstream had never assigned (the decoder's zero-fill).
+    /// R18-28 regression: the monitor SEED declares the whole structure,
+    /// whatever the upstream events that built the snapshot marked. pva2pva
+    /// hands a starting MonitorUser the merged element with the ROOT bit set
+    /// (`moncache.cpp:304-312`, "indicate all changed"); it does NOT replay
+    /// the union of the upstream changed bitsets — that rule (`:142`) belongs
+    /// to the update path. The R17-32 fix took the update rule for the seed
+    /// rule and shipped seeds that could omit `alarm`/`timeStamp`.
     ///
-    /// Boundaries: first event; delta accumulating a second leaf; a
-    /// re-marking of an already-marked leaf (no growth); a root-bit event
-    /// absorbing the union to "whole structure".
+    /// Boundaries: no upstream event (no seed at all); a partially-marked
+    /// first event; a delta on top of it; a root-bit event.
     #[test]
-    fn r17_32_snapshot_carries_the_union_of_upstream_marks() {
+    fn r18_28_monitor_seed_declares_the_whole_structure() {
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
             fields: vec![
@@ -2380,48 +1843,46 @@ mod tests {
         };
         let state = RwLock::new(EntryState::default());
 
-        // First event marks only `a`: the snapshot carries `a` alone — `b`
-        // is a decoder zero, not an upstream value.
+        // No upstream event yet: pva2pva's `!havedata` — no seed element at
+        // all, so the downstream monitor's first frame is the first update.
+        assert!(monitor_seed(&state).is_none());
+
+        // First event marks only `a`. The seed still declares the whole
+        // structure: pva2pva sets the root bit on the merged element.
         apply_monitor_event(
             &state,
             &desc,
             &encode_body(&desc, &full(10, 0), &[1]),
             ByteOrder::Little,
         );
-        assert_eq!(latest_marks(&state), Some(vec!["a".to_string()]));
-
-        // Re-marking `a` does not grow the union.
-        apply_monitor_event(
-            &state,
-            &desc,
-            &encode_body(&desc, &full(11, 0), &[1]),
-            ByteOrder::Little,
+        let seed = monitor_seed(&state).expect("an upstream event ⟹ a seed");
+        assert_eq!(seed.value, full(10, 0));
+        assert!(
+            seed.marked.is_none(),
+            "a seed is whole-structure (root bit), not the upstream's marks"
         );
-        assert_eq!(latest_marks(&state), Some(vec!["a".to_string()]));
 
-        // A `b` delta merges onto the snapshot: now BOTH leaves are real.
+        // A `b` delta merges onto the snapshot; the seed is still whole.
         apply_monitor_event(
             &state,
             &desc,
             &encode_body(&desc, &full(0, 20), &[2]),
             ByteOrder::Little,
         );
-        assert_eq!(
-            latest_marks(&state),
-            Some(vec!["a".to_string(), "b".to_string()]),
-            "the snapshot's marks accumulate across upstream deltas"
-        );
-        assert_eq!(latest_value(&state), Some(full(11, 20)));
+        let seed = monitor_seed(&state).expect("an upstream event ⟹ a seed");
+        assert_eq!(seed.value, full(10, 20));
+        assert!(seed.marked.is_none());
 
-        // A root-bit event assigns the whole structure — the union absorbs
-        // to `None` (full mask), which is the honest answer from then on.
+        // A root-bit event — the same seed, no special case.
         apply_monitor_event(
             &state,
             &desc,
             &encode_body(&desc, &full(1, 2), &[0, 1, 2]),
             ByteOrder::Little,
         );
-        assert_eq!(latest_marks(&state), None);
+        let seed = monitor_seed(&state).expect("an upstream event ⟹ a seed");
+        assert_eq!(seed.value, full(1, 2));
+        assert!(seed.marked.is_none());
     }
 
     /// `apply_monitor_event` flags a descriptor change so
@@ -2487,7 +1948,6 @@ mod tests {
             first_event: Arc::new(Notify::new()),
             _monitor_task: AbortOnDrop(task.abort_handle()),
             drop_poke: parking_lot::Mutex::new(false),
-            pause: PauseControl::new(),
         };
         assert_eq!(entry.subscriber_count(), 0);
         let _r1 = entry.subscribe();
@@ -2519,7 +1979,6 @@ mod tests {
                 first_event: Arc::new(Notify::new()),
                 _monitor_task: AbortOnDrop(task.abort_handle()),
                 drop_poke: parking_lot::Mutex::new(drop_poke),
-                pause: PauseControl::new(),
             }
         }
 
@@ -2560,7 +2019,7 @@ mod tests {
         use crate::pva_gateway::source::RawEvent;
         use tokio::sync::broadcast;
         let state = RwLock::new(EntryState::default());
-        state.write().latest = Some(SourceRead::from(PvField::Scalar(ScalarValue::Double(1.0))));
+        state.write().latest = Some(PvField::Scalar(ScalarValue::Double(1.0)));
         let latest_raw = RwLock::new(Some(RawEvent {
             body: bytes::Bytes::from_static(&[1, 2, 3]),
             byte_order: ByteOrder::Big,

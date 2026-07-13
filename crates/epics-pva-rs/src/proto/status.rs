@@ -171,6 +171,29 @@ impl Status {
     }
 }
 
+impl std::fmt::Display for Status {
+    /// Human rendering for logs. This is NOT how a Status crosses the wire —
+    /// it crosses as itself, through [`Status::write_into`]. A proxy that
+    /// renders an upstream Status to text and re-wraps it (`{:?}`, `to_string`)
+    /// destroys the kind and the stack; see `OpError::remote`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Status::OkNoMsg => f.write_str("OK"),
+            Status::Detailed {
+                kind,
+                message,
+                stack,
+            } => {
+                write!(f, "{kind:?}: {message}")?;
+                if !stack.is_empty() {
+                    write!(f, " [{stack}]")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -996,7 +996,13 @@ pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
     }
 
     match actual_port {
-        Some(port) => Ok(BoundTcp { listeners, port }),
+        Some(bound_port) => {
+            announce_tcp_port(port, bound_port);
+            Ok(BoundTcp {
+                listeners,
+                port: bound_port,
+            })
+        }
         None => {
             // C `cantProceed("CAS: No TCP server started\n")` at
             // `caservertask.c:752`. Every configured interface failed
@@ -1007,6 +1013,42 @@ pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
             )))
         }
     }
+}
+
+/// What C does the moment it knows which TCP port the server actually got
+/// (`caservertask.c:576-593`): tell the operator when it is not the port they
+/// configured, and publish it as `RSRV_SERVER_PORT` either way.
+///
+/// The port did neither. A `softIoc` whose configured TCP port was taken came
+/// up silently on a random one — its SEARCH replies pointed at a port nobody
+/// had been told about, and any `st.cmd` that reads `RSRV_SERVER_PORT` (the
+/// documented way to learn it) got nothing.
+///
+/// `configured == 0` is the caller asking for an ephemeral port outright
+/// (`softioc-rs --port 0`); C cannot express that — `envGetInetPortConfigParam`
+/// rejects any port at or below 5000 — so getting one back is what was asked
+/// for, not a fallback, and C's warning has nothing to say about it.
+fn announce_tcp_port(configured: u16, bound: u16) {
+    if configured != 0 && bound != configured {
+        // C `caservertask.c:580-590`, five `errlogPrintf` lines, verbatim —
+        // including the trailing comma on line 2 and the missing period on
+        // line 5. Captured from the compiled `softIoc` with its configured TCP
+        // port held by another process.
+        let w = epics_base_rs::runtime::log::erl_warning();
+        eprintln!("cas {w}: Configured TCP port was unavailable.");
+        eprintln!("cas {w}: Using dynamically assigned TCP port {bound},");
+        eprintln!("cas {w}: but now two or more servers share the same UDP port.");
+        eprintln!("cas {w}: Depending on your IP kernel this server may not be");
+        eprintln!("cas {w}: reachable with UDP unicast (a host's IP in EPICS_CA_ADDR_LIST)");
+    }
+    // C `caservertask.c:592`: `epicsEnvSet("RSRV_SERVER_PORT", buf)`,
+    // unconditional — the variable always names the port the server ended up
+    // on, which is the only reason a startup script can find a `--port 0` IOC.
+    //
+    // SAFETY: C's `epicsEnvSet` is the same process-wide `putenv`, called from
+    // `rsrv_init` during IOC startup. This runs on the same startup path,
+    // before the server has spawned the tasks that read the environment.
+    unsafe { std::env::set_var("RSRV_SERVER_PORT", bound.to_string()) };
 }
 
 /// Serve CA connections on listeners already bound by
@@ -6251,6 +6293,23 @@ mod multi_nic_listener_tests {
             .await;
         });
         (port, handle)
+    }
+
+    /// R18-22, the half a stderr capture cannot see: C publishes the port the
+    /// server ACTUALLY bound as `RSRV_SERVER_PORT` (`caservertask.c:592`),
+    /// unconditionally — which is the only way a startup script can find an
+    /// IOC that was given an ephemeral port. The port never set it, so
+    /// `RSRV_SERVER_PORT` was unset in every Rust IOC that ever ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn the_bound_tcp_port_is_published_as_rsrv_server_port() {
+        // SAFETY: gated by `serial_test::serial`.
+        unsafe { std::env::remove_var("RSRV_SERVER_PORT") };
+        let bound = bind_tcp_listeners(0).await.expect("listener bound");
+        assert_eq!(
+            std::env::var("RSRV_SERVER_PORT").ok(),
+            Some(bound.port().to_string())
+        );
     }
 
     /// Confirm `INTF_ADDR_LIST=127.0.0.1` results in a listener that

@@ -518,118 +518,42 @@ impl CompressRecord {
 }
 
 static COMPRESS_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        // C `field(NSAM,DBF_ULONG)` (compressRecord.dbd.pod:424).
-        name: "NSAM",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALG",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        // C `field(N,DBF_ULONG)` (compressRecord.dbd.pod:431).
-        name: "N",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        // C `field(OFF,DBF_ULONG)` (compressRecord.dbd.pod:473).
-        name: "OFF",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        // C `field(NUSE,DBF_ULONG)` (compressRecord.dbd.pod:477).
-        name: "NUSE",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    // C `field(NSAM,DBF_ULONG)` (compressRecord.dbd.pod:424).
+    FieldDesc::new("NSAM", DbFieldType::ULong, true),
+    FieldDesc::new("ALG", DbFieldType::Short, false),
+    // C `field(N,DBF_ULONG)` (compressRecord.dbd.pod:431).
+    FieldDesc::new("N", DbFieldType::ULong, false),
+    // C `field(OFF,DBF_ULONG)` (compressRecord.dbd.pod:473).
+    FieldDesc::new("OFF", DbFieldType::ULong, true),
+    // C `field(NUSE,DBF_ULONG)` (compressRecord.dbd.pod:477).
+    FieldDesc::new("NUSE", DbFieldType::ULong, true),
     // C `field(OUSE,DBF_ULONG){ special(SPC_NOMOD) }`
     // (compressRecord.dbd.pod:481-484) — the "last posted NUSE" latch that
     // gates C `monitor()`'s NUSE post. Record-owned runtime state.
-    FieldDesc {
-        name: "OUSE",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
+    FieldDesc::new("OUSE", DbFieldType::ULong, true),
     // C `field(INPN,DBF_LONG){ special(SPC_NOMOD) }`
     // (compressRecord.dbd.pod:503-506) — "Number of elements in Working
     // Buffer": the INP element count that triggers C's WPTR reallocation.
-    FieldDesc {
-        name: "INPN",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RES",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BALG",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PBUF",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ILIL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IHIL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        // C `field(INX,DBF_ULONG)` (compressRecord.dbd.pod:513).
-        name: "INX",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CVB",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
+    FieldDesc::new("INPN", DbFieldType::Long, true),
+    FieldDesc::new("RES", DbFieldType::Short, false),
+    FieldDesc::new("BALG", DbFieldType::Short, false),
+    FieldDesc::new("PBUF", DbFieldType::Short, false),
+    FieldDesc::new("ILIL", DbFieldType::Double, false),
+    FieldDesc::new("IHIL", DbFieldType::Double, false),
+    // C `field(INX,DBF_ULONG)` (compressRecord.dbd.pod:513).
+    FieldDesc::new("INX", DbFieldType::ULong, true),
+    FieldDesc::new("CVB", DbFieldType::Double, true),
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
     // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
     // to common fields (where the record's own get_field shadows them with
     // defaults, zeroing DBR_GR/DBR_CTRL limits). compressRecord.c declares
     // EGU/HOPR/LOPR/PREC as record fields.
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("EGU", DbFieldType::String, false),
+    FieldDesc::new("HOPR", DbFieldType::Double, false),
+    FieldDesc::new("LOPR", DbFieldType::Double, false),
+    FieldDesc::new("PREC", DbFieldType::Short, false),
 ];
 
 /// Choice labels for the compression algorithm menu, in index order.

@@ -112,121 +112,29 @@ impl BoRecord {
 }
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "RVAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ORAW",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "RBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ORBV",
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MASK",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ONAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ZSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "COSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Enum, false),
+    FieldDesc::new("RVAL", DbFieldType::ULong, false),
+    FieldDesc::new("ORAW", DbFieldType::ULong, true),
+    FieldDesc::new("RBV", DbFieldType::ULong, true),
+    FieldDesc::new("ORBV", DbFieldType::ULong, true),
+    FieldDesc::new("MASK", DbFieldType::ULong, false),
+    FieldDesc::new("ZNAM", DbFieldType::String, false),
+    FieldDesc::new("ONAM", DbFieldType::String, false),
+    FieldDesc::new("ZSV", DbFieldType::Short, false),
+    FieldDesc::new("OSV", DbFieldType::Short, false),
+    FieldDesc::new("COSV", DbFieldType::Short, false),
+    FieldDesc::new("LALM", DbFieldType::UShort, true),
+    FieldDesc::new("MLST", DbFieldType::UShort, true),
+    FieldDesc::new("OMSL", DbFieldType::Short, false),
+    FieldDesc::new("DOL", DbFieldType::String, false),
+    FieldDesc::new("HIGH", DbFieldType::Double, false),
+    FieldDesc::new("IVOA", DbFieldType::Short, false),
+    FieldDesc::new("IVOV", DbFieldType::UShort, false),
+    FieldDesc::new("SIMM", DbFieldType::Short, false),
+    FieldDesc::new("SIML", DbFieldType::String, false),
+    FieldDesc::new("SIOL", DbFieldType::String, false),
+    FieldDesc::new("SIMS", DbFieldType::Short, false),
+    FieldDesc::new("SDLY", DbFieldType::Double, false),
 ];
 
 impl Record for BoRecord {

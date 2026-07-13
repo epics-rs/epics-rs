@@ -337,366 +337,90 @@ static SCALCOUT_STRING_INPUT_LINKS: &[(&str, &str)] = &[
 ];
 
 static SCALCOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SVAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    FieldDesc::new("SVAL", DbFieldType::String, false),
     // sCalcoutRecord.dbd:60-67 — PVAL is a plain DBF_DOUBLE (an operator may
     // write it to force or suppress the next OOPT decision); PSVL is
     // `special(SPC_NOMOD)`, so a put to it is refused.
-    FieldDesc {
-        name: "PVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PSVL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
+    FieldDesc::new("PVAL", DbFieldType::Double, false),
+    FieldDesc::new("PSVL", DbFieldType::String, true),
     // sCalcoutRecord.dbd:858 — `field(LALM,DBF_DOUBLE) { special(SPC_NOMOD) }`:
     // the level `checkAlarms` last alarmed at, written by the ladder and refused
     // to clients. The other nine alarm fields (HIHI/LOLO/HIGH/LOW + their
     // severities + HYST) are deliberately ABSENT from this list so they route to
     // `RecordInstance::common.analog_alarm` / `common.hyst` — the same path
     // calc/calcout/ai/ao take.
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "CALC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("LALM", DbFieldType::Double, true),
+    FieldDesc::new("CALC", DbFieldType::String, false),
     // sCalcoutRecord.dbd:75,438 — `field(CLCV,DBF_LONG)` / `field(OCLV,DBF_LONG)`.
-    FieldDesc {
-        name: "CLCV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OCLV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OCAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OSV",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ODLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLYA",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OEVT",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
+    FieldDesc::new("CLCV", DbFieldType::Long, false),
+    FieldDesc::new("OCLV", DbFieldType::Long, false),
+    FieldDesc::new("OOPT", DbFieldType::Short, false),
+    FieldDesc::new("DOPT", DbFieldType::Short, false),
+    FieldDesc::new("OCAL", DbFieldType::String, false),
+    FieldDesc::new("OVAL", DbFieldType::Double, false),
+    FieldDesc::new("OSV", DbFieldType::String, false),
+    FieldDesc::new("IVOA", DbFieldType::Short, false),
+    FieldDesc::new("IVOV", DbFieldType::Double, false),
+    FieldDesc::new("PREC", DbFieldType::Short, false),
+    FieldDesc::new("MDEL", DbFieldType::Double, false),
+    FieldDesc::new("ADEL", DbFieldType::Double, false),
+    FieldDesc::new("ODLY", DbFieldType::Double, false),
+    FieldDesc::new("DLYA", DbFieldType::Short, true),
+    FieldDesc::new("OEVT", DbFieldType::UShort, false),
     // Input links
-    FieldDesc {
-        name: "INPA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("INPA", DbFieldType::String, false),
+    FieldDesc::new("INPB", DbFieldType::String, false),
+    FieldDesc::new("INPC", DbFieldType::String, false),
+    FieldDesc::new("INPD", DbFieldType::String, false),
+    FieldDesc::new("INPE", DbFieldType::String, false),
+    FieldDesc::new("INPF", DbFieldType::String, false),
+    FieldDesc::new("INPG", DbFieldType::String, false),
+    FieldDesc::new("INPH", DbFieldType::String, false),
+    FieldDesc::new("INPI", DbFieldType::String, false),
+    FieldDesc::new("INPJ", DbFieldType::String, false),
+    FieldDesc::new("INPK", DbFieldType::String, false),
+    FieldDesc::new("INPL", DbFieldType::String, false),
     // Numeric vars A-L
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "K",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "L",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
+    FieldDesc::new("A", DbFieldType::Double, false),
+    FieldDesc::new("B", DbFieldType::Double, false),
+    FieldDesc::new("C", DbFieldType::Double, false),
+    FieldDesc::new("D", DbFieldType::Double, false),
+    FieldDesc::new("E", DbFieldType::Double, false),
+    FieldDesc::new("F", DbFieldType::Double, false),
+    FieldDesc::new("G", DbFieldType::Double, false),
+    FieldDesc::new("H", DbFieldType::Double, false),
+    FieldDesc::new("I", DbFieldType::Double, false),
+    FieldDesc::new("J", DbFieldType::Double, false),
+    FieldDesc::new("K", DbFieldType::Double, false),
+    FieldDesc::new("L", DbFieldType::Double, false),
     // String vars AA-LL
-    FieldDesc {
-        name: "AA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "CC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "FF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "GG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "II",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "JJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "KK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("AA", DbFieldType::String, false),
+    FieldDesc::new("BB", DbFieldType::String, false),
+    FieldDesc::new("CC", DbFieldType::String, false),
+    FieldDesc::new("DD", DbFieldType::String, false),
+    FieldDesc::new("EE", DbFieldType::String, false),
+    FieldDesc::new("FF", DbFieldType::String, false),
+    FieldDesc::new("GG", DbFieldType::String, false),
+    FieldDesc::new("HH", DbFieldType::String, false),
+    FieldDesc::new("II", DbFieldType::String, false),
+    FieldDesc::new("JJ", DbFieldType::String, false),
+    FieldDesc::new("KK", DbFieldType::String, false),
+    FieldDesc::new("LL", DbFieldType::String, false),
     // INAA..INLL — the string-input links (sCalcoutRecord.dbd:151-223,
     // DBF_INLINK). Served as strings, exactly like INPA..INPL.
-    FieldDesc {
-        name: "INAA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INBB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INCC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INDD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INEE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INFF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INGG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INHH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INII",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INJJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INKK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INLL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("INAA", DbFieldType::String, false),
+    FieldDesc::new("INBB", DbFieldType::String, false),
+    FieldDesc::new("INCC", DbFieldType::String, false),
+    FieldDesc::new("INDD", DbFieldType::String, false),
+    FieldDesc::new("INEE", DbFieldType::String, false),
+    FieldDesc::new("INFF", DbFieldType::String, false),
+    FieldDesc::new("INGG", DbFieldType::String, false),
+    FieldDesc::new("INHH", DbFieldType::String, false),
+    FieldDesc::new("INII", DbFieldType::String, false),
+    FieldDesc::new("INJJ", DbFieldType::String, false),
+    FieldDesc::new("INKK", DbFieldType::String, false),
+    FieldDesc::new("INLL", DbFieldType::String, false),
 ];
 
 /// Choice labels for the `scalcout` output-execute-option menu, in index

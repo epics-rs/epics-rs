@@ -125,11 +125,11 @@ async fn ca_hold(db: &PvDatabase) -> Arc<CaHoldState> {
 /// from the DESTINATION's DBF type (C `processCallback`'s switch on
 /// `dbGetLinkDBFtype(&lnk)`), and a target whose type does not resolve gets
 /// no put at all (C's `default: break`). C has no field-less record.
-static DOUBLE_VAL_FIELD: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: epics_base_rs::types::DbFieldType::Double,
-    read_only: false,
-}];
+static DOUBLE_VAL_FIELD: &[FieldDesc] = &[FieldDesc::new(
+    "VAL",
+    epics_base_rs::types::DbFieldType::Double,
+    false,
+)];
 
 /// A target that never finishes its own `process()` — it goes
 /// async-pending and stays there until the test drives

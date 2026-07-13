@@ -65,21 +65,9 @@ impl Record for TypedProbe {
     }
 }
 
-static STRING_VAL: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: DbFieldType::String,
-    read_only: false,
-}];
-static DOUBLE_VAL: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: DbFieldType::Double,
-    read_only: false,
-}];
-static CHAR_VAL: &[FieldDesc] = &[FieldDesc {
-    name: "VAL",
-    dbf_type: DbFieldType::Char,
-    read_only: false,
-}];
+static STRING_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::String, false)];
+static DOUBLE_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
+static CHAR_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Char, false)];
 
 fn probe(
     fields: &'static [FieldDesc],

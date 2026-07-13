@@ -172,198 +172,46 @@ impl DfanoutRecord {
 }
 
 static DFANOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELM",
-        // SELM is DBF_MENU menu(dfanoutSELM) (dfanoutRecord.dbd.pod) — served
-        // as DBR_ENUM with the menu's choice labels, see DFANOUT_SELM_CHOICES.
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELN",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTN",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTO",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OUTP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    // SELM is DBF_MENU menu(dfanoutSELM) (dfanoutRecord.dbd.pod) — served
+    // as DBR_ENUM with the menu's choice labels, see DFANOUT_SELM_CHOICES.
+    FieldDesc::new("SELM", DbFieldType::Enum, false),
+    FieldDesc::new("SELN", DbFieldType::UShort, false),
+    FieldDesc::new("OUTA", DbFieldType::String, false),
+    FieldDesc::new("OUTB", DbFieldType::String, false),
+    FieldDesc::new("OUTC", DbFieldType::String, false),
+    FieldDesc::new("OUTD", DbFieldType::String, false),
+    FieldDesc::new("OUTE", DbFieldType::String, false),
+    FieldDesc::new("OUTF", DbFieldType::String, false),
+    FieldDesc::new("OUTG", DbFieldType::String, false),
+    FieldDesc::new("OUTH", DbFieldType::String, false),
+    FieldDesc::new("OUTI", DbFieldType::String, false),
+    FieldDesc::new("OUTJ", DbFieldType::String, false),
+    FieldDesc::new("OUTK", DbFieldType::String, false),
+    FieldDesc::new("OUTL", DbFieldType::String, false),
+    FieldDesc::new("OUTM", DbFieldType::String, false),
+    FieldDesc::new("OUTN", DbFieldType::String, false),
+    FieldDesc::new("OUTO", DbFieldType::String, false),
+    FieldDesc::new("OUTP", DbFieldType::String, false),
+    FieldDesc::new("DOL", DbFieldType::String, false),
+    FieldDesc::new("OMSL", DbFieldType::Short, false),
+    FieldDesc::new("SELL", DbFieldType::String, false),
+    FieldDesc::new("IVOA", DbFieldType::Short, false),
+    FieldDesc::new("IVOV", DbFieldType::Double, false),
+    FieldDesc::new("HIHI", DbFieldType::Double, false),
+    FieldDesc::new("HIGH", DbFieldType::Double, false),
+    FieldDesc::new("LOW", DbFieldType::Double, false),
+    FieldDesc::new("LOLO", DbFieldType::Double, false),
+    FieldDesc::new("HHSV", DbFieldType::Short, false),
+    FieldDesc::new("HSV", DbFieldType::Short, false),
+    FieldDesc::new("LSV", DbFieldType::Short, false),
+    FieldDesc::new("LLSV", DbFieldType::Short, false),
+    FieldDesc::new("HYST", DbFieldType::Double, false),
+    FieldDesc::new("LALM", DbFieldType::Double, true),
+    FieldDesc::new("MDEL", DbFieldType::Double, false),
+    FieldDesc::new("ADEL", DbFieldType::Double, false),
+    FieldDesc::new("MLST", DbFieldType::Double, true),
+    FieldDesc::new("ALST", DbFieldType::Double, true),
 ];
 
 impl Record for DfanoutRecord {

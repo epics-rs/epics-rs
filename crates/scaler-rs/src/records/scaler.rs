@@ -534,154 +534,50 @@ use std::sync::LazyLock;
 
 static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
     let mut fields = vec![
-        FieldDesc {
-            name: "VAL",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "FREQ",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "CNT",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "PCNT",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "SS",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "US",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "CONT",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RATE",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "RAT1",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "DLY",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "DLY1",
-            dbf_type: DbFieldType::Float,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "NCH",
-            dbf_type: DbFieldType::Short,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "TP",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "TP1",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "T",
-            dbf_type: DbFieldType::Double,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "VERS",
-            dbf_type: DbFieldType::Float,
-            read_only: true,
-        },
-        FieldDesc {
-            name: "PREC",
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "EGU",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "OUT",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "COUT",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
-        FieldDesc {
-            name: "COUTP",
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        },
+        FieldDesc::new("VAL", DbFieldType::Double, false),
+        FieldDesc::new("FREQ", DbFieldType::Double, false),
+        FieldDesc::new("CNT", DbFieldType::Short, false),
+        FieldDesc::new("PCNT", DbFieldType::Short, true),
+        FieldDesc::new("SS", DbFieldType::Short, true),
+        FieldDesc::new("US", DbFieldType::Short, true),
+        FieldDesc::new("CONT", DbFieldType::Short, false),
+        FieldDesc::new("RATE", DbFieldType::Float, false),
+        FieldDesc::new("RAT1", DbFieldType::Float, false),
+        FieldDesc::new("DLY", DbFieldType::Float, false),
+        FieldDesc::new("DLY1", DbFieldType::Float, false),
+        FieldDesc::new("NCH", DbFieldType::Short, true),
+        FieldDesc::new("TP", DbFieldType::Double, false),
+        FieldDesc::new("TP1", DbFieldType::Double, false),
+        FieldDesc::new("T", DbFieldType::Double, true),
+        FieldDesc::new("VERS", DbFieldType::Float, true),
+        FieldDesc::new("PREC", DbFieldType::Short, false),
+        FieldDesc::new("EGU", DbFieldType::String, false),
+        FieldDesc::new("OUT", DbFieldType::String, false),
+        FieldDesc::new("COUT", DbFieldType::String, false),
+        FieldDesc::new("COUTP", DbFieldType::String, false),
     ];
     for i in 1..=MAX_SCALER_CHANNELS {
         let s: &'static str = Box::leak(format!("S{}", i).into_boxed_str());
         // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649) — 32-bit
         // unsigned hardware counts; storage is already u32.
-        fields.push(FieldDesc {
-            name: s,
-            dbf_type: DbFieldType::ULong,
-            read_only: true,
-        });
+        fields.push(FieldDesc::new(s, DbFieldType::ULong, true));
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
         // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
-        fields.push(FieldDesc {
-            name: pr,
-            dbf_type: DbFieldType::ULong,
-            read_only: false,
-        });
+        fields.push(FieldDesc::new(pr, DbFieldType::ULong, false));
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let g: &'static str = Box::leak(format!("G{}", i).into_boxed_str());
-        fields.push(FieldDesc {
-            name: g,
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        });
+        fields.push(FieldDesc::new(g, DbFieldType::Short, false));
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let d: &'static str = Box::leak(format!("D{}", i).into_boxed_str());
-        fields.push(FieldDesc {
-            name: d,
-            dbf_type: DbFieldType::Short,
-            read_only: false,
-        });
+        fields.push(FieldDesc::new(d, DbFieldType::Short, false));
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let nm: &'static str = Box::leak(format!("NM{}", i).into_boxed_str());
-        fields.push(FieldDesc {
-            name: nm,
-            dbf_type: DbFieldType::String,
-            read_only: false,
-        });
+        fields.push(FieldDesc::new(nm, DbFieldType::String, false));
     }
     fields
 });

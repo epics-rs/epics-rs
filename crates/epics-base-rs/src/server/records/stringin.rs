@@ -72,51 +72,15 @@ impl StringinRecord {
 }
 
 static STRINGIN_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MPST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "APST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::String, false),
+    FieldDesc::new("OVAL", DbFieldType::String, true),
+    FieldDesc::new("SIMM", DbFieldType::Short, false),
+    FieldDesc::new("SIML", DbFieldType::String, false),
+    FieldDesc::new("SIOL", DbFieldType::String, false),
+    FieldDesc::new("SIMS", DbFieldType::Short, false),
+    FieldDesc::new("SDLY", DbFieldType::Double, false),
+    FieldDesc::new("MPST", DbFieldType::Short, false),
+    FieldDesc::new("APST", DbFieldType::Short, false),
 ];
 
 impl Record for StringinRecord {

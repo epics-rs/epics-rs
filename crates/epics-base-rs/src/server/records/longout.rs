@@ -161,166 +161,38 @@ impl LongoutRecord {
 }
 
 static LONGOUT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "EGU",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HOPR",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOPR",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVH",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DRVL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OOPT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PVAL",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OOCH",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Long, false),
+    FieldDesc::new("EGU", DbFieldType::String, false),
+    FieldDesc::new("HOPR", DbFieldType::Long, false),
+    FieldDesc::new("LOPR", DbFieldType::Long, false),
+    FieldDesc::new("DRVH", DbFieldType::Long, false),
+    FieldDesc::new("DRVL", DbFieldType::Long, false),
+    FieldDesc::new("HIHI", DbFieldType::Long, false),
+    FieldDesc::new("HIGH", DbFieldType::Long, false),
+    FieldDesc::new("LOW", DbFieldType::Long, false),
+    FieldDesc::new("LOLO", DbFieldType::Long, false),
+    FieldDesc::new("HHSV", DbFieldType::Short, false),
+    FieldDesc::new("HSV", DbFieldType::Short, false),
+    FieldDesc::new("LSV", DbFieldType::Short, false),
+    FieldDesc::new("LLSV", DbFieldType::Short, false),
+    FieldDesc::new("HYST", DbFieldType::Double, false),
+    FieldDesc::new("LALM", DbFieldType::Double, false),
+    FieldDesc::new("IVOA", DbFieldType::Short, false),
+    FieldDesc::new("IVOV", DbFieldType::Long, false),
+    FieldDesc::new("ADEL", DbFieldType::Double, false),
+    FieldDesc::new("MDEL", DbFieldType::Double, false),
+    FieldDesc::new("ALST", DbFieldType::Double, false),
+    FieldDesc::new("MLST", DbFieldType::Double, false),
+    FieldDesc::new("OMSL", DbFieldType::Short, false),
+    FieldDesc::new("DOL", DbFieldType::String, false),
+    FieldDesc::new("SIMM", DbFieldType::Short, false),
+    FieldDesc::new("SIML", DbFieldType::String, false),
+    FieldDesc::new("SIOL", DbFieldType::String, false),
+    FieldDesc::new("SIMS", DbFieldType::Short, false),
+    FieldDesc::new("SDLY", DbFieldType::Double, false),
+    FieldDesc::new("OOPT", DbFieldType::Short, false),
+    FieldDesc::new("PVAL", DbFieldType::Long, true),
+    FieldDesc::new("OOCH", DbFieldType::Short, false),
 ];
 
 /// Choice labels for the output-execute-option menu, in index order.

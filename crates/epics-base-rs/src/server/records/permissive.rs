@@ -64,31 +64,11 @@ impl Default for PermissiveRecord {
 }
 
 static PERMISSIVE_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "WFLG",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OFLG",
-        dbf_type: DbFieldType::UShort,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "LABL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::UShort, false),
+    FieldDesc::new("OVAL", DbFieldType::UShort, true),
+    FieldDesc::new("WFLG", DbFieldType::UShort, false),
+    FieldDesc::new("OFLG", DbFieldType::UShort, true),
+    FieldDesc::new("LABL", DbFieldType::String, false),
 ];
 
 impl Record for PermissiveRecord {

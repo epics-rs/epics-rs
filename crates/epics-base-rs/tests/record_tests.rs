@@ -1843,11 +1843,7 @@ impl Record for HookTrackingRecord {
         }
     }
     fn field_list(&self) -> &'static [FieldDesc] {
-        static FIELDS: &[FieldDesc] = &[FieldDesc {
-            name: "VAL",
-            dbf_type: DbFieldType::Double,
-            read_only: false,
-        }];
+        static FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
         FIELDS
     }
     fn validate_put(&self, field: &str, _value: &EpicsValue) -> CaResult<()> {

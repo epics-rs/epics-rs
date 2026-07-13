@@ -97,55 +97,19 @@ impl Default for SubRecord {
 }
 
 static SUB_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SNAM",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    FieldDesc::new("SNAM", DbFieldType::String, false),
     // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
-    FieldDesc {
-        name: "INAM",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
+    FieldDesc::new("INAM", DbFieldType::String, true),
     // Monitor/archive deadbands (client-writable) + last-posted/alarm
     // trackers (SPC_NOMOD in C, read-only to clients).
-    FieldDesc {
-        name: "MDEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ADEL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "MLST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "ALST",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
+    FieldDesc::new("MDEL", DbFieldType::Double, false),
+    FieldDesc::new("ADEL", DbFieldType::Double, false),
+    FieldDesc::new("LALM", DbFieldType::Double, true),
+    FieldDesc::new("MLST", DbFieldType::Double, true),
+    FieldDesc::new("ALST", DbFieldType::Double, true),
     // Bad-return severity menu (menuAlarmSevr).
-    FieldDesc {
-        name: "BRSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("BRSV", DbFieldType::Short, false),
     // INPA..INPU
     field_str("INPA"),
     field_str("INPB"),
@@ -193,19 +157,11 @@ static SUB_FIELDS: &[FieldDesc] = &[
 ];
 
 const fn field_str(name: &'static str) -> FieldDesc {
-    FieldDesc {
-        name,
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    }
+    FieldDesc::new(name, DbFieldType::String, false)
 }
 
 const fn field_dbl(name: &'static str) -> FieldDesc {
-    FieldDesc {
-        name,
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    }
+    FieldDesc::new(name, DbFieldType::Double, false)
 }
 
 impl Record for SubRecord {

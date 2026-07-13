@@ -127,198 +127,46 @@ impl SelRecord {
 }
 
 static SEL_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELM",
-        // SELM is DBF_MENU menu(selSELM) (selRecord.dbd.pod:290) — served as
-        // DBR_ENUM with the menu's choice labels, see SELM_CHOICES.
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELN",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "NVL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPB",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPC",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPD",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPE",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPF",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPG",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPH",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPI",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPJ",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPK",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INPL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "A",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "B",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "C",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "D",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "E",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "F",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "G",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "H",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "I",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "J",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "K",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "L",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIHI",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HIGH",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOW",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LOLO",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HHSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LLSV",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "HYST",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LALM",
-        dbf_type: DbFieldType::Double,
-        read_only: true,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    // SELM is DBF_MENU menu(selSELM) (selRecord.dbd.pod:290) — served as
+    // DBR_ENUM with the menu's choice labels, see SELM_CHOICES.
+    FieldDesc::new("SELM", DbFieldType::Enum, false),
+    FieldDesc::new("SELN", DbFieldType::UShort, false),
+    FieldDesc::new("NVL", DbFieldType::String, false),
+    FieldDesc::new("INPA", DbFieldType::String, false),
+    FieldDesc::new("INPB", DbFieldType::String, false),
+    FieldDesc::new("INPC", DbFieldType::String, false),
+    FieldDesc::new("INPD", DbFieldType::String, false),
+    FieldDesc::new("INPE", DbFieldType::String, false),
+    FieldDesc::new("INPF", DbFieldType::String, false),
+    FieldDesc::new("INPG", DbFieldType::String, false),
+    FieldDesc::new("INPH", DbFieldType::String, false),
+    FieldDesc::new("INPI", DbFieldType::String, false),
+    FieldDesc::new("INPJ", DbFieldType::String, false),
+    FieldDesc::new("INPK", DbFieldType::String, false),
+    FieldDesc::new("INPL", DbFieldType::String, false),
+    FieldDesc::new("A", DbFieldType::Double, false),
+    FieldDesc::new("B", DbFieldType::Double, false),
+    FieldDesc::new("C", DbFieldType::Double, false),
+    FieldDesc::new("D", DbFieldType::Double, false),
+    FieldDesc::new("E", DbFieldType::Double, false),
+    FieldDesc::new("F", DbFieldType::Double, false),
+    FieldDesc::new("G", DbFieldType::Double, false),
+    FieldDesc::new("H", DbFieldType::Double, false),
+    FieldDesc::new("I", DbFieldType::Double, false),
+    FieldDesc::new("J", DbFieldType::Double, false),
+    FieldDesc::new("K", DbFieldType::Double, false),
+    FieldDesc::new("L", DbFieldType::Double, false),
+    FieldDesc::new("HIHI", DbFieldType::Double, false),
+    FieldDesc::new("HIGH", DbFieldType::Double, false),
+    FieldDesc::new("LOW", DbFieldType::Double, false),
+    FieldDesc::new("LOLO", DbFieldType::Double, false),
+    FieldDesc::new("HHSV", DbFieldType::Short, false),
+    FieldDesc::new("HSV", DbFieldType::Short, false),
+    FieldDesc::new("LSV", DbFieldType::Short, false),
+    FieldDesc::new("LLSV", DbFieldType::Short, false),
+    FieldDesc::new("HYST", DbFieldType::Double, false),
+    FieldDesc::new("LALM", DbFieldType::Double, true),
 ];
 
 impl Record for SelRecord {

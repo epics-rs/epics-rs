@@ -278,11 +278,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             let dbf = dbf_type_ident(&fi.dbf_type);
             let ro = fi.read_only;
             quote! {
-                #krate::server::record::FieldDesc {
-                    name: #name_str,
-                    dbf_type: #krate::types::DbFieldType::#dbf,
-                    read_only: #ro,
-                }
+                #krate::server::record::FieldDesc::new(#name_str, #krate::types::DbFieldType::#dbf, #ro)
             }
         })
         .collect();

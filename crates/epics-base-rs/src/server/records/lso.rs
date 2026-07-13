@@ -107,94 +107,30 @@ impl LsoRecord {
 }
 
 static LSO_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::Char,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "SIZV",
-        // C declares SIZV as DBF_USHORT (lsoRecord.dbd.pod:128): the VAL buffer
-        // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LEN",
-        // C declares LEN as DBF_ULONG (lsoRecord.dbd.pod:135): the current
-        // string byte length is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "OLEN",
-        // C declares OLEN as DBF_ULONG (lsoRecord.dbd.pod:139): the previously
-        // posted byte length is an unsigned 32-bit count.
-        dbf_type: DbFieldType::ULong,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "IVOA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "IVOV",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OMSL",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Char, false),
+    FieldDesc::new("OVAL", DbFieldType::Char, true),
+    // C declares SIZV as DBF_USHORT (lsoRecord.dbd.pod:128): the VAL buffer
+    // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
+    FieldDesc::new("SIZV", DbFieldType::UShort, false),
+    // C declares LEN as DBF_ULONG (lsoRecord.dbd.pod:135): the current
+    // string byte length is an unsigned 32-bit count.
+    FieldDesc::new("LEN", DbFieldType::ULong, true),
+    // C declares OLEN as DBF_ULONG (lsoRecord.dbd.pod:139): the previously
+    // posted byte length is an unsigned 32-bit count.
+    FieldDesc::new("OLEN", DbFieldType::ULong, true),
+    FieldDesc::new("IVOA", DbFieldType::Short, false),
+    FieldDesc::new("IVOV", DbFieldType::Char, false),
+    FieldDesc::new("OMSL", DbFieldType::Short, false),
+    FieldDesc::new("DOL", DbFieldType::String, false),
+    FieldDesc::new("SIMM", DbFieldType::Short, false),
+    FieldDesc::new("SIML", DbFieldType::String, false),
+    FieldDesc::new("SIOL", DbFieldType::String, false),
+    FieldDesc::new("SIMS", DbFieldType::Short, false),
+    FieldDesc::new("SDLY", DbFieldType::Double, false),
     // `menuPost` menu fields (DBF_MENU). Exposed as Short, matching the
     // record's other menu field (SIMM); C `lsoRecord.dbd.pod:172/178`.
-    FieldDesc {
-        name: "MPST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "APST",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
+    FieldDesc::new("MPST", DbFieldType::Short, false),
+    FieldDesc::new("APST", DbFieldType::Short, false),
 ];
 
 impl Record for LsoRecord {

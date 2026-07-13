@@ -283,16 +283,8 @@ struct PickyReader {
 }
 
 static PICKY_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "INP",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::Double, false),
+    FieldDesc::new("INP", DbFieldType::String, false),
 ];
 
 impl Record for PickyReader {

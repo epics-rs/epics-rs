@@ -43,36 +43,12 @@ pub struct EventRecord {
 }
 
 static EVENT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMM",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIML",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIOL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SIMS",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SDLY",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::String, false),
+    FieldDesc::new("SIMM", DbFieldType::Short, false),
+    FieldDesc::new("SIML", DbFieldType::String, false),
+    FieldDesc::new("SIOL", DbFieldType::String, false),
+    FieldDesc::new("SIMS", DbFieldType::Short, false),
+    FieldDesc::new("SDLY", DbFieldType::Double, false),
 ];
 
 impl Default for EventRecord {

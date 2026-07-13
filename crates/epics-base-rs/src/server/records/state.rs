@@ -65,16 +65,8 @@ impl StateRecord {
 }
 
 static STATE_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OVAL",
-        dbf_type: DbFieldType::String,
-        read_only: true,
-    },
+    FieldDesc::new("VAL", DbFieldType::String, false),
+    FieldDesc::new("OVAL", DbFieldType::String, true),
 ];
 
 impl Record for StateRecord {

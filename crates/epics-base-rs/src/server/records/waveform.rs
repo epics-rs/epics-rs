@@ -684,53 +684,21 @@ impl WaveformRecord {
 macro_rules! array_field_list {
     ($valty:expr, $nelm_ro:expr, $nord_ty:expr $(, $extra:expr)* $(,)?) => {
         &[
-            FieldDesc {
-                name: "VAL",
-                dbf_type: $valty,
-                read_only: false,
-            },
-            FieldDesc {
-                // `DBF_ULONG` on all four (waveformRecord.dbd.pod:447,
-                // aaiRecord :349, aaoRecord :382, subArrayRecord :379).
-                name: "NELM",
-                dbf_type: DbFieldType::ULong,
-                read_only: $nelm_ro,
-            },
-            FieldDesc {
-                name: "NORD",
-                dbf_type: $nord_ty,
-                read_only: true,
-            },
-            FieldDesc {
-                name: "FTVL",
-                dbf_type: DbFieldType::Short,
-                read_only: true,
-            },
+            FieldDesc::new("VAL", $valty, false),
+                        // `DBF_ULONG` on all four (waveformRecord.dbd.pod:447,
+            // aaiRecord :349, aaoRecord :382, subArrayRecord :379).
+            FieldDesc::new("NELM", DbFieldType::ULong, $nelm_ro),
+            FieldDesc::new("NORD", $nord_ty, true),
+            FieldDesc::new("FTVL", DbFieldType::Short, true),
             // Display/control metadata fields. Typed storage + get_field/put_field
             // already back these; they MUST be in field_list so the db loader applies
             // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
             // to common fields (where the record's own get_field shadows them with
             // defaults, zeroing DBR_GR/DBR_CTRL limits).
-            FieldDesc {
-                name: "EGU",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "HOPR",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "LOPR",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "PREC",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
+            FieldDesc::new("EGU", DbFieldType::String, false),
+            FieldDesc::new("HOPR", DbFieldType::Double, false),
+            FieldDesc::new("LOPR", DbFieldType::Double, false),
+            FieldDesc::new("PREC", DbFieldType::Short, false),
             $($extra),*
         ]
     };
@@ -758,41 +726,13 @@ macro_rules! array_sim_field_list {
             true,
             // waveform/aai/aao: NORD is DBF_ULONG.
             DbFieldType::ULong,
-            FieldDesc {
-                name: "SIML",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "SIMM",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "SIOL",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "SIMS",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "SDLY",
-                dbf_type: DbFieldType::Double,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "MPST",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "APST",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
+            FieldDesc::new("SIML", DbFieldType::String, false),
+            FieldDesc::new("SIMM", DbFieldType::Short, false),
+            FieldDesc::new("SIOL", DbFieldType::String, false),
+            FieldDesc::new("SIMS", DbFieldType::Short, false),
+            FieldDesc::new("SDLY", DbFieldType::Double, false),
+            FieldDesc::new("MPST", DbFieldType::Short, false),
+            FieldDesc::new("APST", DbFieldType::Short, false),
             $($extra),*
         )
     };
@@ -807,16 +747,8 @@ macro_rules! waveform_field_list {
     ($valty:expr) => {
         array_sim_field_list!(
             $valty,
-            FieldDesc {
-                name: "RARM",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "BUSY",
-                dbf_type: DbFieldType::Short,
-                read_only: true,
-            },
+            FieldDesc::new("RARM", DbFieldType::Short, false),
+            FieldDesc::new("BUSY", DbFieldType::Short, true),
         )
     };
 }
@@ -846,16 +778,8 @@ macro_rules! aao_field_list {
     ($valty:expr) => {
         array_sim_field_list!(
             $valty,
-            FieldDesc {
-                name: "OMSL",
-                dbf_type: DbFieldType::Short,
-                read_only: false,
-            },
-            FieldDesc {
-                name: "DOL",
-                dbf_type: DbFieldType::String,
-                read_only: false,
-            },
+            FieldDesc::new("OMSL", DbFieldType::Short, false),
+            FieldDesc::new("DOL", DbFieldType::String, false),
         )
     };
 }
@@ -879,25 +803,13 @@ macro_rules! subarray_field_list {
             false,
             // subArray alone declares NORD `DBF_LONG` (subArrayRecord.dbd.pod:394).
             DbFieldType::Long,
-            FieldDesc {
-                // `DBF_ULONG` (subArrayRecord.dbd.pod:371).
-                name: "MALM",
-                dbf_type: DbFieldType::ULong,
-                read_only: true,
-            },
-            FieldDesc {
-                // `DBF_ULONG` (subArrayRecord.dbd.pod:385).
-                name: "INDX",
-                dbf_type: DbFieldType::ULong,
-                read_only: false,
-            },
+            // `DBF_ULONG` (subArrayRecord.dbd.pod:371).
+            FieldDesc::new("MALM", DbFieldType::ULong, true),
+            // `DBF_ULONG` (subArrayRecord.dbd.pod:385).
+            FieldDesc::new("INDX", DbFieldType::ULong, false),
             // subArray declares BUSY too (`subArrayRecord.dbd.pod:390-393`),
             // `special(SPC_NOMOD)` like waveform's. It has no RARM.
-            FieldDesc {
-                name: "BUSY",
-                dbf_type: DbFieldType::Short,
-                read_only: true,
-            },
+            FieldDesc::new("BUSY", DbFieldType::Short, true),
         )
     };
 }

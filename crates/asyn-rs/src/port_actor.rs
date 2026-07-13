@@ -272,6 +272,7 @@ impl PortActor {
 
             // Process one eligible request from the heap
             self.process_one();
+            self.port_thread_auto_connect();
         }
         let _ = self.driver.shutdown();
     }
@@ -359,6 +360,9 @@ impl PortActor {
 
                 // Process one eligible request from the heap
                 self.process_one();
+
+                // C `portThread`'s post-drain auto-connect, run on every wake.
+                self.port_thread_auto_connect();
             }
         });
         let _ = self.driver.shutdown();
@@ -407,12 +411,45 @@ impl PortActor {
         }
 
         let _ = self.driver.connect(&AsynUser::default());
+        // Anchor the auto-connect throttle window on this attempt, so the
+        // port-thread wake below ([`Self::port_thread_auto_connect`]) does not
+        // fire a second attempt at the same hardware microseconds later. In C
+        // the two paths interleave the same way — the timer's queued callback
+        // runs, and `portThread` then reaches `autoConnectDevice(pport,0)`
+        // (asynManager.c:856-861), whose `connectAttempt` stamps
+        // `lastConnectDisconnect` (:718) — so the window ends up anchored at the
+        // attempt either way.
+        self.driver
+            .base_mut()
+            .stamp_auto_connect_attempt(-1, Instant::now());
 
         if !self.driver.base().is_connected() {
             // Still down — back off and try again (C :3281).
             let retry = self.driver.base().seconds_between_port_connect;
             self.driver.base_mut().connect_retry_at = Some(Instant::now() + retry);
         }
+    }
+
+    /// C `portThread`'s post-drain auto-connect (asynManager.c:856-861): the
+    /// woken port thread finds `!pport->dpc.connected` and runs one
+    /// 2 s-throttled `autoConnectDevice(pport,0)`.
+    ///
+    /// It runs on **every** wake, and an exception announcement is such a wake:
+    /// `announceExceptionOccurred` signals `notifyPortThread` for every
+    /// exception on a CANBLOCK port (:635-636), and `enable` ends in
+    /// `exceptionOccurred` (:2247). That — not any re-arm inside the enable
+    /// itself — is what makes `asynEnable(port,1)` bring a down port back up in
+    /// C. The Rust actor previously had only the disconnect-EDGE retry timer as
+    /// an autonomous connect path, so a port disabled while down stayed down
+    /// after re-enable until some I/O request forced a connect (R15-46).
+    ///
+    /// The rule is uniform — every pass of the actor loop ends here — because
+    /// every decision it could special-case already lives inside
+    /// [`Self::auto_connect_port`]: [`Self::connect_gate`] refuses on a disabled
+    /// or defunct port, and the 2 s throttle bounds an exception storm to one
+    /// attempt per window.
+    fn port_thread_auto_connect(&mut self) {
+        self.auto_connect_port();
     }
 
     fn drain_channel(&mut self) {
@@ -874,21 +911,13 @@ impl PortActor {
         let result = self.dispatch_io(&mut user, &op);
         let _ = reply.send(result);
 
-        // C `portThread`, immediately after the Connect-priority queue is
-        // drained: `if(!pport->dpc.connected) autoConnectDevice(pport,0)`
-        // (asynManager.c:856-861). The waived requests are exactly what rides
-        // that queue — `asynSetOption`/`asynSetEos` from `st.cmd`, the record's
-        // HOSTINFO repoint (asynRecord.c:566-569) — and C's whole point is that
-        // the thread tries to bring the line *up* on the new configuration the
-        // moment the request that changed it has run, rather than waiting for
-        // some later I/O to force a connect. The attempt is port-level only
-        // (C passes `pdevice = 0`) and throttled to one per 2 s window, so an
-        // explicit Disconnect — which stamps `last_connect_disconnect` as it
-        // runs — is not undone by the very pass that performed it, exactly as
-        // in C (:712-713).
-        if gate == Some(ConnectCheck::Waived) {
-            self.auto_connect_port();
-        }
+        // The port-level auto-connect C's `portThread` runs after this
+        // (asynManager.c:856-861) is not this function's — it is the actor
+        // loop's, once per wake ([`Self::port_thread_auto_connect`]), because in
+        // C it is the *thread*, not the request, that performs it. That is what
+        // brings a dead line up on the new configuration a waived
+        // `asynSetOption`/`asynSetEos`/HOSTINFO repoint just wrote, and equally
+        // what brings a re-enabled port back up with no request at all (R15-46).
     }
 
     /// The port context [`AsynUser::trace`] carries — the driver's trace manager
@@ -2691,6 +2720,114 @@ mod tests {
         // Coming back up disarms it.
         assert!(base.set_connected(true));
         assert!(base.connect_retry_at.is_none());
+    }
+
+    /// R15-46: the enable exception is a port-thread wake, and a woken port
+    /// thread reconnects a down port.
+    ///
+    /// C `enable` ends in `exceptionOccurred` (asynManager.c:2247);
+    /// `announceExceptionOccurred` signals `notifyPortThread` for every exception
+    /// on a CANBLOCK port (:635-636); the woken `portThread` finds
+    /// `!pport->dpc.connected` and runs the 2 s-throttled
+    /// `autoConnectDevice(pport,0)` (:856-861). So `asynEnable(port,1)` brings a
+    /// port that went down while disabled back up, with no I/O request at all.
+    ///
+    /// One case per gate boundary: re-enabled (must attempt), disabled (must
+    /// not), defunct (must not), and an exception storm (throttled to one).
+    #[test]
+    fn re_enabling_a_down_port_reconnects_it_with_no_io_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct EnableDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+            /// A link that never comes up, so the counter measures attempts
+            /// rather than the one transition that ends them.
+            comes_up: bool,
+        }
+        impl PortDriver for EnableDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                if self.comes_up {
+                    self.base.set_connected(true);
+                }
+                Ok(())
+            }
+        }
+
+        // A down, enabled, auto-connect port with no throttle window running
+        // (`init_connected` does not stamp a transition).
+        let spawn = |enabled: bool, defunct: bool, comes_up: bool| {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut base = PortDriverBase::new("enable_test", 1, PortFlags::default());
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            base.init_connected(false);
+            base.auto_connect = true;
+            base.enabled = enabled;
+            base.defunct = defunct;
+            let tx = spawn_actor(EnableDriver {
+                base,
+                connect_calls: calls.clone(),
+                comes_up,
+            });
+            (tx, calls)
+        };
+
+        // Boundary 1 — disabled: the wake finds the queue gate refusing, so no
+        // attempt reaches the hardware (C `portThread` :802-805; R14-50).
+        let (tx, calls) = spawn(true, false, true);
+        send_and_wait(
+            &tx,
+            RequestOp::SetEnable { yes: false },
+            AsynUser::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a disabled port makes no connect attempt"
+        );
+
+        // Boundary 2 — re-enabled: the same wake now passes the gate and the
+        // port comes back up, with no I/O request having been submitted.
+        send_and_wait(&tx, RequestOp::SetEnable { yes: true }, AsynUser::default()).unwrap();
+        let r = send_and_wait(&tx, RequestOp::GetConnected, AsynUser::default()).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "re-enabling a down auto-connect port must attempt exactly one connect"
+        );
+        assert_eq!(r.int_val, Some(1), "...and the port is back up");
+
+        // Boundary 3 — defunct: shut down for good, so even a wake on an
+        // otherwise-enabled port never touches the hardware again
+        // (C `shutdownPort`, asynManager.c:2282-2283).
+        let (tx, calls) = spawn(true, true, true);
+        let _ = send_and_wait(&tx, RequestOp::GetEnable, AsynUser::default());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a defunct port makes no connect attempt"
+        );
+
+        // Boundary 4 — exception storm on a link that stays down: C's 2 s
+        // throttle (:712-713) bounds it to one attempt per window, however many
+        // exceptions are announced.
+        let (tx, calls) = spawn(true, false, false);
+        for _ in 0..5 {
+            send_and_wait(&tx, RequestOp::SetEnable { yes: true }, AsynUser::default()).unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an exception storm is throttled to one connect attempt per 2 s window"
+        );
     }
 
     #[test]

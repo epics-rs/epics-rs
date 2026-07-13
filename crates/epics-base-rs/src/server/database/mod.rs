@@ -34,6 +34,20 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
     }
 }
 
+/// C `dbIsValueField` (`dbAccess.c:463-469`): is this field the record
+/// type's *value* field?
+///
+/// A record type's value field is the one the DBD names `VAL` — the DBD
+/// parser records exactly that field's index as `indvalFlddes`
+/// (`dbLexRoutines.c:777-780`), which is what `dbIsValueField` compares
+/// against. Metadata that C/pvxs apply "to VAL only" (e.g. QSRV's
+/// `Q:form` → `display.form.index`, `iocsource.cpp:53`) key on this
+/// predicate, so it lives beside [`parse_pv_name`], whose `"REC"` → `VAL`
+/// default is the other half of the same rule.
+pub fn is_value_field(field: &str) -> bool {
+    field.eq_ignore_ascii_case("VAL")
+}
+
 /// Apply timestamp to a record based on its TSE field.
 /// `is_soft` indicates a Soft Channel device type.
 ///

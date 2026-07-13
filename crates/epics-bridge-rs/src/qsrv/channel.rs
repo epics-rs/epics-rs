@@ -374,6 +374,32 @@ impl PutOptions {
 // BridgeChannel
 // ---------------------------------------------------------------------------
 
+/// Resolve a channel's record path (the name with any `{json}` / `[range]`
+/// filter suffix already peeled by `split_channel_name`) into the record it
+/// names, its uppercased field, and whether the `$` long-string modifier was
+/// requested. The single owner of the `REC.FIELD` → field rule — a bare `REC`
+/// binds to `VAL` (`parse_pv_name`), and the `$` modifier is peeled before the
+/// split (C `dbChannel.c:486-505`).
+pub(super) fn resolve_record_field(record_path: &str) -> (&str, String, bool) {
+    let (core, string_view) = match record_path.strip_suffix('$') {
+        Some(core) => (core, true),
+        None => (record_path, false),
+    };
+    let (record_name, field) = epics_base_rs::server::database::parse_pv_name(core);
+    (record_name, field.to_ascii_uppercase(), string_view)
+}
+
+/// `dbIsValueField(dbChannelFldDes(chan))` for a QSRV channel name (single
+/// channel) or a group member's `+channel` — the fact QSRV's
+/// `IOCSource::initialize` gates `display.form.index` on
+/// (`iocsource.cpp:53`). Peels the filter suffix and `$` modifier first, so
+/// `REC.VAL{"dbnd":…}` and `REC` are VAL while `REC.RVAL` is not.
+pub(super) fn channel_is_value_field(name: &str) -> bool {
+    let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
+    let (_, field, _) = resolve_record_field(&parsed.record_path);
+    epics_base_rs::server::database::is_value_field(&field)
+}
+
 /// A PVA channel backed by a single EPICS database record.
 ///
 /// a channel binds to `record.FIELD`, not just `record`.
@@ -505,13 +531,7 @@ impl BridgeChannel {
         // so the modifier is the final character of the record path. It is
         // left there (the CA server detects it on the record path too,
         // `epics-ca-rs` `tcp.rs`) and peeled here for field resolution.
-        let resolution_name = parsed.record_path.as_str();
-        let (resolution_name, string_view) = match resolution_name.strip_suffix('$') {
-            Some(core) => (core, true),
-            None => (resolution_name, false),
-        };
-        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(resolution_name);
-        let field_upper = field.to_ascii_uppercase();
+        let (record_name, field_upper, string_view) = resolve_record_field(&parsed.record_path);
 
         let rec = db
             .get_record(record_name)

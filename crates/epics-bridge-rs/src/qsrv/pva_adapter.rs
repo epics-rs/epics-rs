@@ -258,6 +258,12 @@ enum OpenedMonitor {
 /// * a SINGLE record is one root-level `Scalar` mapping — its NT IS the served
 ///   structure.
 ///
+/// Each mapping also carries whether its channel addresses the record's VAL
+/// field (`channel_is_value_field`), because `IOCSource::initialize` assigns
+/// `display.form.index` for VAL only (`iocsource.cpp:53`) — the mark set must
+/// not claim it for a `REC.RVAL` channel or a group member bound to a non-VAL
+/// field.
+///
 /// `narrow_enum_value_leaves` then resolves the semantic `value` leaf against
 /// the concrete value, so an NTEnum marks `value.index` (assigned by
 /// `getScalarValue`) and leaves `value.choices` to the property set.
@@ -274,13 +280,21 @@ async fn read_marks(
         Some(def) => {
             let mut paths = vec!["record._options.atomic".to_string()];
             for m in &def.members {
-                paths.extend(super::pvif::read_leaf_paths(&m.field_name, m.mapping));
+                paths.extend(super::pvif::read_leaf_paths(
+                    &m.field_name,
+                    m.mapping,
+                    super::channel::channel_is_value_field(&m.channel),
+                ));
             }
             paths
         }
         // A single-record channel: the NT is the root, mapped as pvxs's
         // `MappingInfo::Scalar` (value + alarm + timeStamp + properties).
-        None => super::pvif::read_leaf_paths("", super::FieldMapping::Scalar),
+        None => super::pvif::read_leaf_paths(
+            "",
+            super::FieldMapping::Scalar,
+            super::channel::channel_is_value_field(name),
+        ),
     };
     let PvField::Structure(root) = value else {
         return Some(paths);

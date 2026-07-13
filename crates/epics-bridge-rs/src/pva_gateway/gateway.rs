@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use epics_base_rs::server::access_security::{AccessSecurityConfig, parse_acf};
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::config::env as pva_env;
 use epics_pva_rs::error::PvaResult;
 use epics_pva_rs::server_native::source::{ChannelSource, DynSource};
 use epics_pva_rs::server_native::{
@@ -156,18 +157,19 @@ impl PvaGatewayConfig {
     /// `.with_env()` on it separately if you also want
     /// `EPICS_PVA[S]_*` applied to the downstream server.
     pub fn with_env(mut self) -> Self {
+        // Both timeout doubles go through the PVA env resolver (pvxs
+        // `parse_timeout`): an out-of-range value such as `1e300` is finite
+        // and positive, so a bare filter let it reach `from_secs_f64`, which
+        // panics above `u64::MAX` seconds. The resolver rejects it and the
+        // configured default stands.
         if let Ok(s) = std::env::var("EPICS_PVA_GW_CLEANUP_INTERVAL") {
-            if let Ok(secs) = s.parse::<f64>() {
-                if secs > 0.0 && secs.is_finite() {
-                    self.cleanup_interval = Duration::from_secs_f64(secs);
-                }
+            if let Some(secs) = pva_env::parse_timeout_env("EPICS_PVA_GW_CLEANUP_INTERVAL", &s) {
+                self.cleanup_interval = Duration::from_secs_f64(secs);
             }
         }
         if let Ok(s) = std::env::var("EPICS_PVA_GW_CONNECT_TMO") {
-            if let Ok(secs) = s.parse::<f64>() {
-                if secs > 0.0 && secs.is_finite() {
-                    self.connect_timeout = Duration::from_secs_f64(secs);
-                }
+            if let Some(secs) = pva_env::parse_timeout_env("EPICS_PVA_GW_CONNECT_TMO", &s) {
+                self.connect_timeout = Duration::from_secs_f64(secs);
             }
         }
         if let Ok(s) = std::env::var("EPICS_PVA_GW_MAX_CACHE_ENTRIES") {
@@ -439,6 +441,43 @@ mod tests {
         PvaGatewayConfig {
             server_config: PvaServerConfig::isolated(),
             ..PvaGatewayConfig::default()
+        }
+    }
+
+    /// R16-32: `EPICS_PVA_GW_*` timeout doubles are finite and positive at
+    /// `1e300`, so the old guard passed them to `Duration::from_secs_f64`,
+    /// which panics above `u64::MAX` seconds — the gateway aborted at
+    /// startup. The shared pvxs `parse_timeout` resolver rejects the value
+    /// and the default stands; a whitespace-padded value is accepted, as
+    /// pvxs's `stod`/`parseTo` do.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn gw_timeout_env_out_of_range_keeps_default() {
+        let names = ["EPICS_PVA_GW_CLEANUP_INTERVAL", "EPICS_PVA_GW_CONNECT_TMO"];
+        let prev: Vec<_> = names.iter().map(|n| std::env::var(n).ok()).collect();
+        unsafe {
+            for n in names {
+                std::env::set_var(n, "1e300");
+            }
+        }
+        let cfg = PvaGatewayConfig::default().with_env();
+        assert_eq!(cfg.cleanup_interval, DEFAULT_CLEANUP_INTERVAL);
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
+        unsafe {
+            for n in names {
+                std::env::set_var(n, " 7 ");
+            }
+        }
+        let cfg = PvaGatewayConfig::default().with_env();
+        assert_eq!(cfg.cleanup_interval, Duration::from_secs(7));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(7));
+        unsafe {
+            for (n, p) in names.iter().zip(prev) {
+                match p {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
         }
     }
 

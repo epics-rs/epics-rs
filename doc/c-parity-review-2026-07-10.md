@@ -4929,3 +4929,39 @@ Category E (records/framework):
   single run (not evidence of resolution).
 - Comment-only nit (not filed): beacon.rs cites online_notify.c:68 for
   delay=0.02; actual line 66.
+
+---
+
+## Scoped audit: aai/aao record parity (2026-07-13, resolves W10-E7)
+
+User-approved scope (option: dedicated audit, fix real gaps; shared
+WaveformRecord+ArrayKind structure is settled). Dedicated read-only
+panel; every claim proven by a probe crate driving the real port
+(IocBuilder::db_string → process_record → get_pv), not source-reading.
+Round transcript: rounds/01KXCXZMT7EJ6JBXAKMHQCME9F.md.
+
+**W10-E7 verdict: STALE — retired.** aai/aao are ported and live
+(db_loader mints them, record_type() correct, RECORDS_WITH_SSCN carries
+both, SIMM machinery reaches them at runtime). The real, never-audited
+gaps are the .db-load surface and the aao closed-loop failure path:
+
+### R15-76: field(SIMM/SIML/SIOL/SIMS/SDLY/MPST/APST) silently dropped at .db load on aai/aao/waveform — **High**. waveform.rs:975-1020/:903-958/:355-416 (no field_list carries them; SDLY has no storage anywhere) + db_loader apply_fields → put_common_field_bounded → FieldNotFound → stderr-and-continue. C: ordinary declared fields (aaiRecord.dbd.pod:374-434 etc.). Simulation and On-Change posting cannot be configured from a .db — the only way real IOCs configure them; MPST/APST never take so every cycle posts the full array. Runtime caput works (field_io tries record.put_field first), which is why existing sim tests are green over a dead loader path.
+### R15-77: an aao whose closed-loop DOL read fails still writes the stale array to OUT, posts, fires FLNK — no alarm — **High**. waveform.rs:1507-1521 → processing.rs:3705-3709/:3651-3655 (`if let Some(value) = read_link_value` — failure is a silent no-op) vs aaoRecord.c:167-168 (fetchValue failure returns BEFORE writeValue/monitor/recGblFwdLink) + dbLink.c:338-339/:319-323 (dbGetLink raises LINK/INVALID inside the get). Probe: DOL="NOSUCHREC" → port writes [9,9] to TGT, runs FLNK, SEVR=0; C: never written, never run, LINK/INVALID.
+### R15-78: a constant INP on aai/waveform is never loaded at init and is re-applied EVERY cycle — clobbering client data — **High**. init_record does nothing (waveform.rs:1052-1063); links.rs:709-710 returns the constant every cycle → set_val. C: devAaiSoft.c:55-65 dbLoadLinkArray ONCE at init (NORD set, UDF cleared); read_aai returns immediately on a constant (:91-92); devWfSoft.c same. Probe: INP="5", caput [7,8,9], process → port Double(5.0) NORD=1 (client data destroyed); C keeps [7,8,9]. Array constants ("1 2 3"): C loads [1,2,3]; port loads nothing then writes scalar 1.0 per cycle.
+### R15-79: a scalar source into an array VAL replaces the buffer with a scalar variant — FTVL/VAL invariant broken, On-Change hash dead — Medium. waveform.rs:1246-1249 (put_field VAL fallback `other => { nord=1; val=other }`) vs C reads into the typed bptr (scalar → one element in the array). array_content_bytes has no scalar arm → hash empty → On-Change posting never fires again; resize wipes data. The everyday config DOL="SETPOINT" (scalar ao feeding closed-loop aao) turns VAL scalar and propagates the scalar into the OUT target.
+### R15-80: NELM=1 must yield NORD=1 at init; the port yields 0 — Medium. waveform.rs Default/new/init_record vs aaiRecord.c:113, aaoRecord.c:116-120, waveformRecord.c:100. get_field truncates at NORD → a NELM=1 record serves a zero-length array to every client until first process.
+### R15-81: a failed SIOL read on a simulated aai/waveform leaves UDF set; C clears UDF unconditionally on these types — Low. processing.rs:5410-5418 gates the clear on read status; the justifying comment cites waveformRecord.c:352 but :144 clears unconditionally right after (aaiRecord.c:174, aaoRecord.c:165 same). None of the three has checkAlarms → C never raises UDF_ALARM on them; the port's raises_udf_alarm() defaults true (masked only because LINK/INVALID wins strict-greater).
+### R15-82: aao OMSL=closed_loop with a constant DOL is never seeded at init — Low. waveform.rs:1502-1506 (disclosed residual) vs aaoRecord.c:147 fetchValue(prec,1) → dbLoadLinkArray + nord + UDF clear. Same missing primitive as R15-78 — one constant-array-link loader closes both.
+
+NOT-REAL adjudications: devAaoSoft discarding dbPutLink's status is not
+an alarm gap (setLinkAlarm fires INSIDE dbPutLink before the dset sees
+the status; port's put-owner matches); aao VAL→OUT write WORKS end-to-end
+(output_link_value falls back OVAL→val(), NORD-truncated — exactly
+devAaoSoft.c:55-57; also covers the simulated SIOL write path);
+aai/aao missing checkAlarms is correct by construction (C has none);
+HASH/MPST/APST mechanism verified exact vs aaiRecord.c:312-346 incl.
+compiled-C hash vectors — R15-76/79 are what break it in practice.
+
+Coverage note: R15-76/78/79/80/81 reach waveform too (shared struct,
+shared field_list gap, shared put_field VAL arm) — fix anchors are
+family-wide.

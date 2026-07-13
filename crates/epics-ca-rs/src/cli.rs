@@ -24,6 +24,25 @@ pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
 pub const INDEFINITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
+/// Deadline meaning "already expired", which is what a NEGATIVE `-w` (or
+/// `EPICS_CLI_TIMEOUT`) is in C (W10-B1).
+///
+/// C hands `caTimeout` straight to `ca_pend_io`, which turns it into a
+/// deadline `now + caTimeout`. A negative value puts that deadline in the
+/// PAST, so `ca_pend_io` returns `ECA_TIMEOUT` without ever waiting, and
+/// `connect_pvs` (`tool_lib.c:628-638`) reports the connect failure and exits
+/// 1 — even for a PV that is right there:
+///
+/// ```text
+/// caget -w -1 TST:AO   C: Channel connect timed out: 'TST:AO' not found.  (exit 1)
+/// ```
+///
+/// A zero-length `Duration` reproduces that exactly (an armed `tokio::timeout`
+/// with it elapses at once) and cannot be confused with `-w 0`, which means
+/// wait FOREVER and resolves to [`INDEFINITE_TIMEOUT`]. Naming it keeps
+/// "expired" a state a reader can see, rather than a magic zero.
+pub const EXPIRED_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
+
 /// Read `EPICS_CLI_TIMEOUT` from the environment, falling back to
 /// [`DEFAULT_CLI_TIMEOUT_SECS`] when unset, unparsable, or non-finite.
 /// Mirrors C `tool_lib.c:use_ca_timeout_env` (commit 1d056c6): it sets
@@ -31,29 +50,54 @@ pub const INDEFINITE_TIMEOUT: std::time::Duration =
 /// back to the default on a parse failure — the env var is consulted
 /// only when the caller did not pass `-w`/`--wait`. A value of `0` is a
 /// valid timeout meaning "wait forever" (see [`INDEFINITE_TIMEOUT`]), so
-/// it is passed through here and resolved by [`timeout_duration`];
-/// negatives and non-finite values stay clamped to the default.
+/// it is passed through here and resolved by [`timeout_duration`], and so is
+/// a NEGATIVE value, which C treats as an already-expired deadline
+/// ([`EXPIRED_TIMEOUT`], W10-B1). Only the non-finite values stay clamped to
+/// the default.
 pub fn env_default_timeout() -> f64 {
     std::env::var("EPICS_CLI_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
+        // C `use_ca_timeout_env` accepts ANY value `epicsScanDouble` parses,
+        // negatives included — `EPICS_CLI_TIMEOUT=-1 caget TST:AO` reports a
+        // connect timeout and exits 1, exactly as `-w -1` does. Clamping the
+        // negative here hid the same defect [`timeout_duration`] had (W10-B1).
+        // Only the non-finite values are held back (see `timeout_duration`).
+        .filter(|v| v.is_finite())
         .unwrap_or(DEFAULT_CLI_TIMEOUT_SECS)
 }
 
 /// Convert a user-supplied timeout (CLI `-w` or env var) into a
 /// `std::time::Duration`.
 ///
-/// A value of `0` means "wait indefinitely", matching C `ca_pend_io(0)`
-/// / `ca_pend_event(0)` (see [`INDEFINITE_TIMEOUT`]) — NOT the 1 s
-/// default. `Duration::from_secs_f64` panics on NaN / infinity /
-/// negative values; clap accepts those literally so this guard clamps
-/// them to [`DEFAULT_CLI_TIMEOUT_SECS`] (defensive, epics-base 1655d68e).
+/// Three states, because C has three (W10-B1):
+///
+/// * `0` means wait INDEFINITELY — C `ca_pend_io(0)` / `ca_pend_event(0)`,
+///   see [`INDEFINITE_TIMEOUT`]. NOT the 1 s default.
+/// * a NEGATIVE value is a deadline in the past, i.e. already
+///   [`EXPIRED_TIMEOUT`]: C waits not at all and reports a connect timeout.
+///   The port used to clamp it to the default and connect happily, which is
+///   the opposite outcome.
+/// * anything positive and finite is that many seconds.
+///
+/// `Duration::from_secs_f64` panics on NaN and infinity, and clap hands those
+/// through literally, so the guard against them stays — they resolve to
+/// [`DEFAULT_CLI_TIMEOUT_SECS`].
+///
+/// DEVIATION, deliberate: C's `-w nan` reaches `ca_pend_io(nan)`, where every
+/// deadline comparison is false and the tool HANGS forever. We treat NaN as
+/// the default instead. An infinite `-w inf` is likewise treated as the
+/// default rather than as a ~forever wait.
 pub fn timeout_duration(secs: f64) -> std::time::Duration {
     if secs == 0.0 {
+        // Covers -0.0 too: C's `caTimeout == 0` test is numeric, and -0.0 is
+        // not negative for it either.
         return INDEFINITE_TIMEOUT;
     }
-    let s = if secs.is_finite() && secs > 0.0 {
+    if secs < 0.0 {
+        return EXPIRED_TIMEOUT;
+    }
+    let s = if secs.is_finite() {
         secs
     } else {
         DEFAULT_CLI_TIMEOUT_SECS
@@ -1390,20 +1434,39 @@ mod tests {
         assert_eq!(PV_NAME_WIDTH, 30);
     }
 
-    /// `Duration::from_secs_f64` panics on NaN / +Inf / negative.
-    /// `timeout_duration` must clamp those to the safe default rather
-    /// than panic — the user-supplied value reaches us via clap which
-    /// happily parses "NaN", "inf", "-1" as f64.
+    /// W10-B1. `-w` has THREE states in C, and the port had two: it clamped a
+    /// negative timeout to the default and connected happily, where C's
+    /// deadline is already in the past and the connect fails at once. The
+    /// boundaries of `secs`, one case each:
     #[test]
-    fn timeout_duration_clamps_pathological_floats() {
-        let d = timeout_duration(f64::NAN);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(f64::INFINITY);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(f64::NEG_INFINITY);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(-1.0);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
+    fn timeout_duration_has_c_s_three_states() {
+        // < 0 — the deadline is in the PAST. C: `ca_pend_io` returns
+        // ECA_TIMEOUT without waiting → `Channel connect timed out`, exit 1.
+        assert_eq!(timeout_duration(-1.0), EXPIRED_TIMEOUT);
+        assert_eq!(timeout_duration(-0.5), EXPIRED_TIMEOUT);
+        assert_eq!(timeout_duration(-1e9), EXPIRED_TIMEOUT);
+        assert_eq!(
+            timeout_duration(f64::NEG_INFINITY),
+            EXPIRED_TIMEOUT,
+            "an infinitely-past deadline is still just past"
+        );
+        // == 0 — wait FOREVER (`ca_pend_io(0)`), not the 1 s default.
+        assert_eq!(timeout_duration(0.0), INDEFINITE_TIMEOUT);
+        assert_eq!(timeout_duration(-0.0), INDEFINITE_TIMEOUT, "C: `-0.0 == 0`");
+        // > 0 — that many seconds.
+        assert_eq!(timeout_duration(2.5).as_secs_f64(), 2.5);
+
+        // `Duration::from_secs_f64` panics on NaN and +Inf and clap hands both
+        // through literally ("-w nan"), so the guard stays. DEVIATION: C's
+        // `-w nan` hangs forever inside `ca_pend_io`; we use the default.
+        assert_eq!(
+            timeout_duration(f64::NAN).as_secs_f64(),
+            DEFAULT_CLI_TIMEOUT_SECS
+        );
+        assert_eq!(
+            timeout_duration(f64::INFINITY).as_secs_f64(),
+            DEFAULT_CLI_TIMEOUT_SECS
+        );
     }
 
     /// Sane positive values pass through unchanged.
@@ -1435,20 +1498,31 @@ mod tests {
         assert_eq!(r.unwrap(), 7);
     }
 
-    /// Env-var path must reject the same pathological set so a
-    /// misconfigured `EPICS_CLI_TIMEOUT` doesn't propagate. Serialised
-    /// because env-var mutation races every other test that consults
-    /// `EPICS_CLI_TIMEOUT` (none today, but #[serial] is cheap insurance).
+    /// The env path is the SAME timeout as `-w` and must fold the same way
+    /// (W10-B1). C `use_ca_timeout_env` sets `caTimeout` to any value
+    /// `epicsScanDouble` accepts, so a negative `EPICS_CLI_TIMEOUT` reaches
+    /// `ca_pend_io` as an expired deadline exactly as `-w -1` does — observed
+    /// on the compiled C: `EPICS_CLI_TIMEOUT=-1 caget TST:AO` prints
+    /// `Channel connect timed out: 'TST:AO' not found.` and exits 1.
+    ///
+    /// Only NaN / inf are held back, and only because
+    /// `Duration::from_secs_f64` panics on them (see `timeout_duration`).
+    /// Serialised because env-var mutation races any other reader.
     #[serial_test::serial]
     #[test]
-    fn env_default_timeout_rejects_nan_inf() {
+    fn env_default_timeout_passes_negatives_through_and_holds_back_nan_inf() {
         // SAFETY: serial_test::serial guarantees no concurrent env access.
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "NaN") };
         assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "inf") };
         assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "-3") };
-        assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
+        assert_eq!(env_default_timeout(), -3.0, "C keeps the negative");
+        assert_eq!(
+            timeout_duration(env_default_timeout()),
+            EXPIRED_TIMEOUT,
+            "and it resolves to an already-expired deadline"
+        );
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "2.5") };
         assert!((env_default_timeout() - 2.5).abs() < 1e-9);
         unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };

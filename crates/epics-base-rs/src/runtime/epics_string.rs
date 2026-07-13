@@ -39,45 +39,52 @@
 /// * Any other escaped character — the character itself (`\q` is `q`).
 /// * A trailing lone `\` is dropped.
 ///
-/// A `\xHH` above 0x7F denotes a single byte in C. The `.db` loader models
-/// values as Rust `String`, so it is emitted as the Latin-1 code point of that
-/// byte; the character is preserved, its UTF-8 encoding is two bytes rather
-/// than C's one.
-pub fn raw_from_escaped(src: &str) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
+/// A `\xHH` denotes ONE byte — including `HH >= 0x80`, where C's `OUT(u)`
+/// (`epicsString.c:106`) writes a single `char`. That is why this returns
+/// BYTES: a `DBF_STRING` is a byte string with a 40-byte budget, and modelling
+/// it as a Rust `String` turned `\xff` into the two UTF-8 bytes of U+00FF.
+/// Measured on softIoc — `field(VAL,"h\xffz")` stores the three bytes `h`,
+/// `0xFF`, `z` (`dbgf` prints `"h\xffz"`, ONE escape; a two-byte UTF-8
+/// encoding would print `"h\xc3\xbfz"`).
+pub fn raw_from_escaped(src: &str) -> Vec<u8> {
+    raw_from_escaped_bytes(src.as_bytes())
+}
+
+/// [`raw_from_escaped`] on bytes — C takes a `char *`, and so does this.
+pub fn raw_from_escaped_bytes(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
     let mut i = 0;
 
-    while i < chars.len() {
-        let c = chars[i];
+    while i < src.len() {
+        let c = src[i];
         i += 1;
 
-        if c != '\\' {
+        if c != b'\\' {
             out.push(c);
             continue;
         }
 
         // A lone trailing backslash: C breaks out of the loop, emitting nothing.
-        let Some(&esc) = chars.get(i) else { break };
+        let Some(&esc) = src.get(i) else { break };
         i += 1;
 
         match esc {
-            'a' => out.push('\x07'),
-            'b' => out.push('\x08'),
-            'f' => out.push('\x0c'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'v' => out.push('\x0b'),
-            '\\' => out.push('\\'),
-            '\'' => out.push('\''),
-            '"' => out.push('"'),
-            '0' => out.push('\0'),
-            'x' => {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'\'' => out.push(b'\''),
+            b'"' => out.push(b'"'),
+            b'0' => out.push(0),
+            b'x' => {
                 let mut value: u32 = 0;
                 let mut digits = 0;
                 while digits < 2 {
-                    match chars.get(i).and_then(|c| c.to_digit(16)) {
+                    match src.get(i).and_then(|c| (*c as char).to_digit(16)) {
                         Some(d) => {
                             value = value << 4 | d;
                             digits += 1;
@@ -93,7 +100,8 @@ pub fn raw_from_escaped(src: &str) -> String {
                     // past it.
                     continue;
                 }
-                out.push(char::from_u32(value).expect("two hex digits are always a code point"));
+                // C `OUT(u)`: ONE byte, whatever the two hex digits spell.
+                out.push(value as u8);
             }
             other => out.push(other),
         }
@@ -109,31 +117,46 @@ mod tests {
     /// The softIoc transcripts quoted in the module docs.
     #[test]
     fn oracle_cases() {
-        assert_eq!(raw_from_escaped("hex\\x41end"), "hexAend");
-        assert_eq!(raw_from_escaped("d:\\q."), "d:q.");
-        assert_eq!(raw_from_escaped("u:\\u0041."), "u:u0041.");
-        assert_eq!(raw_from_escaped("b:\\x4a."), "b:J.");
-        assert_eq!(raw_from_escaped("a \\\"b\\\" c"), "a \"b\" c");
-        assert_eq!(raw_from_escaped("x\\ty"), "x\ty");
-        assert_eq!(raw_from_escaped("sq:\\tx"), "sq:\tx");
+        assert_eq!(raw_from_escaped("hex\\x41end"), b"hexAend");
+        assert_eq!(raw_from_escaped("d:\\q."), b"d:q.");
+        assert_eq!(raw_from_escaped("u:\\u0041."), b"u:u0041.");
+        assert_eq!(raw_from_escaped("b:\\x4a."), b"b:J.");
+        assert_eq!(raw_from_escaped("a \\\"b\\\" c"), b"a \"b\" c");
+        assert_eq!(raw_from_escaped("x\\ty"), b"x\ty");
+        assert_eq!(raw_from_escaped("sq:\\tx"), b"sq:\tx");
     }
 
     #[test]
     fn control_escapes() {
         assert_eq!(
             raw_from_escaped("\\a\\b\\f\\n\\r\\t\\v\\\\\\'"),
-            "\x07\x08\x0c\n\r\t\x0b\\'"
+            b"\x07\x08\x0c\n\r\t\x0b\\'"
         );
-        assert_eq!(raw_from_escaped("a\\0b"), "a\0b");
+        assert_eq!(raw_from_escaped("a\\0b"), b"a\0b");
     }
 
     /// A single hex digit is enough for the translation (the `.db` lexer
     /// demands two, but `echo` reaches the same function with no lexer).
     #[test]
     fn hex_escape_takes_one_or_two_digits() {
-        assert_eq!(raw_from_escaped("\\x41"), "A");
-        assert_eq!(raw_from_escaped("\\x7"), "\x07");
-        assert_eq!(raw_from_escaped("\\x41x"), "Ax");
+        assert_eq!(raw_from_escaped("\\x41"), b"A");
+        assert_eq!(raw_from_escaped("\\x7"), b"\x07");
+        assert_eq!(raw_from_escaped("\\x41x"), b"Ax");
+    }
+
+    /// R19-68: a `\xHH` at or above 0x80 is ONE byte, as C's `OUT(u)` writes
+    /// one `char`. Modelled as a Rust `String` it was the TWO UTF-8 bytes of
+    /// the Latin-1 code point, and every DBF_STRING carrying one was wrong on
+    /// the wire and against the 40-byte budget.
+    ///
+    /// softIoc: `record(stringin,"X1"){field(VAL,"h\xffz")}` -> `dbgf X1.VAL`
+    /// prints `"h\xffz"` — ONE escape. A two-byte UTF-8 encoding of U+00FF
+    /// would print `"h\xc3\xbfz"`.
+    #[test]
+    fn a_high_hex_escape_is_one_byte() {
+        assert_eq!(raw_from_escaped("h\\xffz"), vec![b'h', 0xFF, b'z']);
+        assert_eq!(raw_from_escaped("\\x80"), vec![0x80]);
+        assert_eq!(raw_from_escaped("\\xc3\\xa9"), vec![0xC3, 0xA9]);
     }
 
     /// `\x` with no hex digit at all: the `\x` disappears and the next
@@ -141,17 +164,17 @@ mod tests {
     /// there is still honoured.
     #[test]
     fn hex_escape_without_digits_reexamines_the_next_char() {
-        assert_eq!(raw_from_escaped("\\xzz"), "zz");
-        assert_eq!(raw_from_escaped("a\\x\\tb"), "a\tb");
+        assert_eq!(raw_from_escaped("\\xzz"), b"zz");
+        assert_eq!(raw_from_escaped("a\\x\\tb"), b"a\tb");
     }
 
     #[test]
     fn trailing_backslash_is_dropped() {
-        assert_eq!(raw_from_escaped("abc\\"), "abc");
+        assert_eq!(raw_from_escaped("abc\\"), b"abc");
     }
 
     #[test]
     fn plain_text_is_untouched() {
-        assert_eq!(raw_from_escaped("@asyn(PORT,0)"), "@asyn(PORT,0)");
+        assert_eq!(raw_from_escaped("@asyn(PORT,0)"), b"@asyn(PORT,0)");
     }
 }

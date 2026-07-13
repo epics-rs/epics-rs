@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{self, Record, SubroutineFn};
+use crate::server::record::{Record, SubroutineFn};
 use crate::types::EpicsValue;
 
 use super::cvt_bpt::BrkTable;
-use super::database::PvDatabase;
+use super::database::{PvDatabase, RecordLoad};
 use super::device_support;
 use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
 use super::{DeviceSupportFactory, RecordFactory};
@@ -211,19 +211,16 @@ impl IocBuilder {
 
         // 2. Inline records
         for (name, record) in self.records {
+            // The sink runs C's `iocInit` passes (`run_init_passes`) — an
+            // inline record has no `.db` field set to load first, so it is
+            // complete the moment it is added. Common-link classification
+            // (init_links) and the mbboDirect UDF finalisation stay on the
+            // `.db` path only: an inline record has no parsed common fields
+            // to classify or fold.
             db.add_record(&name, record).await?;
-            // C iocInit runs init_record on EVERY record in the database;
-            // inline records previously skipped both passes, so a record
-            // type with init-time invariants (e.g. the motor speed/limit
-            // sync behind init_invariants_synced) behaved differently
-            // inline vs .db-loaded. Common-link classification
-            // (init_links) and the mbboDirect UDF finalisation stay on
-            // the .db path only: an inline record has no parsed common
-            // fields to classify or fold.
             if let Some(rec_arc) = db.get_record(&name).await {
                 {
                     let mut instance = rec_arc.write().await;
-                    instance.run_init_passes(&name);
                     // Seed MLST/ALST/LALM from val so the first process posts a
                     // monitor only on a real change (C init_record invariant).
                     instance.record.seed_deadband_tracking();
@@ -256,21 +253,22 @@ impl IocBuilder {
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;
 
-            db.add_record(&def.name, record).await?;
+            // The record and its whole loaded field set enter the database
+            // together: the sink applies the common fields and the info tags,
+            // and only then runs C's `iocInit` passes — so the initial UDF
+            // severity is evaluated against the `.db`'s final UDF/STAT/UDFS
+            // (C `dbLoadRecords` → `iocInit`, not the reverse).
+            db.add_loaded_record(
+                &def.name,
+                record,
+                RecordLoad {
+                    common_fields,
+                    info_tags: std::mem::take(&mut def.info_tags),
+                },
+            )
+            .await?;
 
-            // info(...) tags — populate before `init_record` so device
-            // support reading them from `instance.info` sees the values.
-            if !def.info_tags.is_empty() {
-                if let Some(rec_arc) = db.get_record(&def.name).await {
-                    let mut instance = rec_arc.write().await;
-                    for (k, v) in &def.info_tags {
-                        instance.set_info(k, v);
-                    }
-                }
-            }
-
-            // alias(...) directives — register before init so links
-            // resolved during init can reach this record by alias.
+            // alias(...) directives.
             for alias in &def.aliases {
                 if let Err(e) = db.add_alias(alias, &def.name).await {
                     eprintln!(
@@ -280,44 +278,9 @@ impl IocBuilder {
                 }
             }
 
-            // Apply common fields and device support to the RecordInstance
+            // Device support and the post-init owners for the RecordInstance
             if let Some(rec_arc) = db.get_record(&def.name).await {
                 let mut instance = rec_arc.write().await;
-                for (name, value) in common_fields {
-                    // `.db` load: C's loader converter, whose menu bound
-                    // differs from a runtime dbPut's
-                    // (`dbStaticRun.c::dbPutStringNum` vs `putStringMenu`).
-                    match instance.put_common_field_db_load(&name, value) {
-                        Ok(record::CommonFieldPutResult::ScanChanged {
-                            old_scan,
-                            new_scan,
-                            phas,
-                        }) => {
-                            drop(instance);
-                            db.update_scan_index(&def.name, old_scan, new_scan, phas, phas)
-                                .await;
-                            instance = rec_arc.write().await;
-                        }
-                        Ok(record::CommonFieldPutResult::PhasChanged {
-                            scan,
-                            old_phas,
-                            new_phas,
-                        }) => {
-                            drop(instance);
-                            db.update_scan_index(&def.name, scan, scan, old_phas, new_phas)
-                                .await;
-                            instance = rec_arc.write().await;
-                        }
-                        Ok(record::CommonFieldPutResult::NoChange) => {}
-                        Err(e) => {
-                            eprintln!("put_common_field({name}) failed for {}: {e}", def.name);
-                        }
-                    }
-                }
-                // init_record passes, through their owner (which also runs C's
-                // `doInitRecord0` prologue: pact=FALSE + the initial UDF
-                // severity).
-                instance.run_init_passes(&def.name);
                 // Hand the record its resolved common link fields so a
                 // link-classifying record (calcout INAV..INUV/OUTV) can run
                 // its C `init_record` checkLinks step now — the common OUT

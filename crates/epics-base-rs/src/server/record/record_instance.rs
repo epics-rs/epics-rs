@@ -704,7 +704,15 @@ impl RecordInstance {
     /// severity goes away on its first process.
     ///
     /// `name` is used only for the init-failure diagnostics C sends to errlog.
-    pub fn run_init_passes(&mut self, name: &str) {
+    ///
+    /// Crate-private on purpose: the passes must run against the record's FINAL
+    /// loaded field set (the initial UDF severity is a function of UDF/STAT/
+    /// UDFS, and a `.db` `field(VAL,…)` clears UDF at load — C
+    /// `dbStaticLib.c:2653-2661`). The one caller is the creation sink,
+    /// [`crate::server::database::PvDatabase::add_loaded_record`], which takes
+    /// the load and the record together so no path can init a half-loaded
+    /// record.
+    pub(crate) fn run_init_passes(&mut self, name: &str) {
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
         // `PactExit` invariant (`deferred_notify_put.is_some()` ⟹ PACT) makes a

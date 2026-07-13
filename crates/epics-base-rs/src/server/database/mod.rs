@@ -24,6 +24,33 @@ use crate::server::pv::ProcessVariable;
 use crate::server::record::{Record, RecordInstance, ScanType};
 use crate::types::EpicsValue;
 
+/// What a `.db` definition carries into the creation sink alongside the record
+/// itself: the `dbCommon` fields `db_loader::apply_fields` could not route to
+/// the record's own `field_list`, and the record's `info(...)` tags.
+///
+/// It exists so that [`PvDatabase::add_loaded_record`] receives a record's
+/// COMPLETE loaded state in one call. A caller cannot add the record and then
+/// apply its `.db` fields, because the sink runs C's `iocInit` passes — whose
+/// result depends on those fields — before the record is reachable at all.
+#[derive(Default, Debug, Clone)]
+pub struct RecordLoad {
+    /// `dbCommon` fields, in `.db` file order (a later `field(UDF,…)` wins).
+    pub common_fields: Vec<(String, EpicsValue)>,
+    /// `info(key, "value")` tags.
+    pub info_tags: Vec<(String, String)>,
+}
+
+impl RecordLoad {
+    /// The common fields alone — the shape every `.db` loader path produces
+    /// from [`crate::server::db_loader::apply_fields`].
+    pub fn from_common_fields(common_fields: Vec<(String, EpicsValue)>) -> Self {
+        Self {
+            common_fields,
+            info_tags: Vec::new(),
+        }
+    }
+}
+
 /// Parse a PV name into (base_name, field_name).
 /// "TEMP.EGU" → ("TEMP", "EGU")
 /// "TEMP"     → ("TEMP", "VAL")
@@ -1211,6 +1238,35 @@ impl PvDatabase {
     /// TOCTOU window where `remove_record` could land between them
     /// and leave a phantom scan entry.
     pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
+        self.add_loaded_record(name, record, RecordLoad::default())
+            .await
+    }
+
+    /// Add a record together with the field set its `.db` definition loaded
+    /// into it — the creation sink for every `dbLoadRecords` path.
+    ///
+    /// C's `dbLoadRecords` writes a record's ENTIRE field set through
+    /// `dbStaticLib` (including the `UDF = 0` that `dbPutString`
+    /// (`dbStaticLib.c:2653-2661`) implies for any put to a field named
+    /// `VAL`), and only afterwards does `iocInit::doInitRecord0`
+    /// (`iocInit.c:508-536`) evaluate `if (udf && stat == UDF_ALARM) sevr =
+    /// udfs`. The port used to add the record first and apply its loaded common
+    /// fields afterwards, so the init passes ran against a PRE-LOAD field set:
+    /// every record with a `field(VAL,…)` latched `SEVR = INVALID` at creation
+    /// and the `UDF = 0` that arrived a moment later could not lower it again.
+    /// A whole `.db` of setpoint defaults and sim constants came up red.
+    ///
+    /// Taking the loaded fields here is what makes C's ordering hold by
+    /// construction: there is no window in which the init passes can observe a
+    /// record whose `.db` fields have not landed, because the record is not
+    /// reachable until they have. [`RecordInstance::run_init_passes`] is
+    /// crate-private for the same reason — the sink is the only caller.
+    pub async fn add_loaded_record(
+        &self,
+        name: &str,
+        record: Box<dyn Record>,
+        load: RecordLoad,
+    ) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
         self.check_name_free(name).await?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
@@ -1240,15 +1296,32 @@ impl PvDatabase {
             }
         }
 
+        // The `.db` load, applied to the instance BEFORE the init passes below
+        // — C's `dbLoadRecords` → `iocInit` ordering. The `.db` value coercion
+        // (`put_common_field_db_load`) differs from a runtime `dbPut`'s: C's
+        // loader converter has a wider menu bound (`dbStaticRun.c`).
+        //
+        // The scan-index entry is built from `instance.common.scan` further
+        // down, i.e. from the POST-load field set, so a `field(SCAN,…)` needs
+        // no index fix-up here — the record has not been published yet.
+        for (field, value) in load.common_fields {
+            if let Err(e) = instance.put_common_field_db_load(&field, value) {
+                eprintln!("put_common_field({field}) failed for {name}: {e}");
+            }
+        }
+        // `info(...)` tags land before `init_record`, so device support that
+        // reads them at init sees the values.
+        for (key, value) in &load.info_tags {
+            instance.set_info(key, value);
+        }
+
         // C's `iocInit` init passes, through their owner (the `doInitRecord0`
         // prologue — `pact = FALSE` plus the initial UDF severity — then
-        // `init_record(0)`, `init_record(1)`, and the UDF tail). `add_record`
-        // is the creation sink every path funnels through, so a record built
-        // programmatically or by iocsh `dbCreateRecord` is initialised exactly
-        // like a `.db`-loaded one instead of skipping the passes the seed below
-        // assumes have run. The `.db` paths run the passes again once their
-        // field set is applied — C's own ordering, since `iocInit` sees the
-        // final merged fields — which is why the owner is idempotent.
+        // `init_record(0)`, `init_record(1)`, and the UDF tail). This sink is
+        // the single site that runs them: a record built programmatically, by
+        // iocsh `dbCreateRecord`, or from a `.db` is initialised the same way,
+        // and — since the load above has already landed — always against its
+        // FINAL field set.
         instance.run_init_passes(name);
 
         // The init-seed owner: every CONSTANT link the record declares

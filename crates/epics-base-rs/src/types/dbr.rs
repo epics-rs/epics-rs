@@ -154,7 +154,7 @@ impl DbFieldType {
     /// signed CA type that holds the full `0..=65535` range), `UChar` →
     /// `DBR_CHAR` (4, same 1-byte wire type — the bytes are identical, only
     /// the interpretation is unsigned).
-    fn ca_wire_type(&self) -> u16 {
+    pub fn ca_wire_type(&self) -> u16 {
         match self {
             Self::Int64 | Self::UInt64 | Self::ULong => Self::Double as u16,
             Self::UShort => Self::Long as u16,

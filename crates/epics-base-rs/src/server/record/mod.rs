@@ -1,5 +1,6 @@
 mod alarm;
 mod common_fields;
+pub mod dbd_generated;
 mod link;
 mod menu_choices;
 mod pini;

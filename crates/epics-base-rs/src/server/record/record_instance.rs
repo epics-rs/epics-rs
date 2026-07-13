@@ -660,6 +660,41 @@ impl RecordInstance {
         self.common.udf = udf;
     }
 
+    /// SINGLE OWNER of the DTYP -> soft-output-dset mapping. The dset table
+    /// decides what a soft OUT-link write carries; no caller may re-derive it.
+    ///
+    /// C ships two soft output dsets per output record type and DTYP picks one:
+    /// `devXxxSoft.c::write_xxx` puts VAL/OVAL on the OUT link, while
+    /// `devXxxSoftRaw.c::write_xxx` puts the RAW word — `dbPutLink(&prec->out,
+    /// DBR_LONG, &prec->rval, 1)` (`devAoSoftRaw.c:44`, `devBoSoftRaw.c:65`) or
+    /// `data = prec->rval & prec->mask` (`devMbboSoftRaw.c:71-75`,
+    /// `devMbboDirectSoftRaw.c:71-75`).
+    ///
+    /// `Record::raw_soft_output_value` IS the SoftRaw column of that table:
+    /// `Some` exactly for the record types C ships a SoftRaw dset for. A record
+    /// type C has no SoftRaw dset for keeps the plain soft-channel value —
+    /// `DTYP="Raw Soft Channel"` on a `longout` is a `.db` error C rejects at
+    /// init ("no device support"), and the port's lenient reading of it (the
+    /// same one [`crate::server::device_support::is_soft_dtyp`] already applies
+    /// on the input side) must not turn the write into a silent no-op.
+    ///
+    /// `None` means DTYP names device support that owns the write — real
+    /// hardware, or "Async Soft Channel", whose dset is a registered async
+    /// device.
+    pub fn soft_output_value(&self) -> Option<Option<EpicsValue>> {
+        if self.common.dtyp == "Raw Soft Channel" {
+            return Some(
+                self.record
+                    .raw_soft_output_value()
+                    .or_else(|| self.record.output_link_value()),
+            );
+        }
+        if self.common.dtyp.is_empty() || self.common.dtyp == "Soft Channel" {
+            return Some(self.record.output_link_value());
+        }
+        None
+    }
+
     /// Set a single `info("key", "value")` tag on this record. Last
     /// write wins. Used by the .db loader (`info(...)` directive) and
     /// `dbpf`-style tools.

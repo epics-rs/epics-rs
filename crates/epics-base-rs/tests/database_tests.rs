@@ -2546,7 +2546,7 @@ async fn test_ca_put_no_double_device_write() {
 // epics-base f2fe9d12 (devBiSoftRaw): a `bi` record with
 // `DTYP="Raw Soft Channel"`, MASK set, and a soft INP link must mask
 // the link value into RVAL before the RVAL→VAL convert. The framework
-// must route the INP value to `apply_raw_input` (not `set_val`).
+// must route the INP value to `raw_soft_input` (not `set_val`).
 #[tokio::test]
 async fn test_bi_raw_soft_channel_inp_applies_mask() {
     let db = PvDatabase::new();

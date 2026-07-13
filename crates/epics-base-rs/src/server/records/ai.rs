@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, ValuePostGate};
+use crate::server::record::{
+    FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record, ValuePostGate,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Analog input record with conversion support.
@@ -704,6 +706,23 @@ impl Record for AiRecord {
     /// `read_ai` returns 2 ("don't convert").
     fn soft_channel_skips_convert(&self) -> bool {
         true
+    }
+
+    /// C `devAiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_LONG,
+    /// &prec->rval)` at init (`devAiSoftRaw.c:38-42`), `dbGetLink(pinp,
+    /// DBR_LONG, &prec->rval, 0, 0)` per read (`:50`), and `read_ai` returns 0,
+    /// so the record's own `RVAL → VAL` convert (ROFF/ASLO/AOFF/LINR/SMOO) runs.
+    /// `ai` has no MASK, so both entry points store the same word.
+    fn raw_soft_input(&mut self, _entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        // RVAL is epicsInt32 and the link is read as DBR_LONG: C's cast, owned
+        // by `c_cast`.
+        let Some(rval) = value.to_f64().map(crate::types::c_cast::f64_to_i32) else {
+            return Some(Err(CaError::TypeMismatch(
+                "ai Raw Soft Channel: INP value not numeric".into(),
+            )));
+        };
+        self.rval = rval;
+        Some(Ok(()))
     }
 
     /// C `aiRecord.c:460-465` posts `RVAL` with VAL's own `monitor_mask`,

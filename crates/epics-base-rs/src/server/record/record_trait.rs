@@ -3,6 +3,27 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::scan::ScanType;
 
+/// Which of a `devXxxSoftRaw` dset's two entry points is delivering a value to
+/// [`Record::raw_soft_input`]. They are not the same function in C, and they do
+/// not agree about `MASK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawSoftEntry {
+    /// `devXxxSoftRaw::init_record` — `recGblInitConstantLink(&prec->inp,
+    /// DBF_x, &prec->rval)` (`devAiSoftRaw.c:41`, `devBiSoftRaw.c:42`,
+    /// `devMbbiSoftRaw.c:42`, `devMbbiDirectSoftRaw.c:42`). A CONSTANT `INP`
+    /// (`field(INP,"12")`) is loaded ONCE, at iocInit, straight into `RVAL`.
+    ///
+    /// `recGblInitConstantLink` is a plain typed store — **no MASK**. The mask
+    /// lives in `read_xxx`, which a constant INP never reaches (a constant link
+    /// delivers nothing at process).
+    InitConstant,
+    /// `devXxxSoftRaw::read_xxx` — the per-cycle `dbGetLink(&prec->inp, ...)`
+    /// followed by the dset's own masking (`devBiSoftRaw.c:56-57` `if
+    /// (prec->mask) prec->rval &= prec->mask;`, `devMbbiSoftRaw.c:78-79`
+    /// unconditionally).
+    Read,
+}
+
 /// Metadata describing a single field in a record.
 #[derive(Debug, Clone)]
 pub struct FieldDesc {
@@ -976,18 +997,6 @@ pub trait Record: Send + Sync + 'static {
         self.put_field_internal(field, value)
     }
 
-    /// Whether this record implements the `DTYP="Raw Soft Channel"`
-    /// read path via [`Record::apply_raw_input`]. Records that return
-    /// `true` opt into framework routing of the INP link value through
-    /// `apply_raw_input` (RVAL + MASK) instead of the default
-    /// soft-channel `VAL` direct write.
-    ///
-    /// Default `false` keeps any record that has not been wired for
-    /// raw soft channel on the legacy path (which sets VAL directly).
-    fn accepts_raw_soft_input(&self) -> bool {
-        false
-    }
-
     /// Whether this record's `INP` is read by DEVICE SUPPORT (a C `DSET`), as
     /// opposed to by the record body itself.
     ///
@@ -1004,18 +1013,45 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
-    /// Apply a value read from a `DTYP="Raw Soft Channel"` INP link.
+    /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`
+    /// read supports (`devAiSoftRaw`, `devBiSoftRaw`, `devMbbiSoftRaw`,
+    /// `devMbbiDirectSoftRaw`).
     ///
-    /// Mirrors the C `devXxxSoftRaw.c` `read_xxx()` convention: the
-    /// raw value goes to `RVAL` (so the record's `process()` then runs
-    /// the standard `RVAL → VAL` conversion). Records that expose a
-    /// `MASK` field must apply it here, matching epics-base
-    /// `f2fe9d12` (devBiSoftRaw: `prec->rval &= prec->mask`).
+    /// The value read from the INP link goes to **`RVAL`**, not `VAL`: the
+    /// record's own `RVAL → VAL` convert then runs (that is the whole
+    /// difference from `"Soft Channel"`, whose `read_xxx` returns 2 and writes
+    /// `VAL` directly).
     ///
-    /// Only invoked by the framework when
-    /// [`Record::accepts_raw_soft_input`] returns `true`.
-    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
-        self.set_val(value)
+    /// **`Some`/`None` IS the dset table.** A record type that implements this
+    /// is one for which C ships a SoftRaw input dset; a record type that does
+    /// not, C has no such dset for, so `DTYP="Raw Soft Channel"` on it is a
+    /// configuration C rejects at iocInit. There is no separate boolean saying
+    /// whether the record "accepts" raw input — that boolean existed, defaulted
+    /// to `false`, had ONE override in the workspace, and silently sent the
+    /// other three input records' raw values into `VAL`, where their own convert
+    /// then overwrote them from an unseeded `RVAL=0` (R19-66). A capability
+    /// answer that can disagree with the implementation is the bug.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        let _ = (entry, value);
+        None
+    }
+
+    /// The `DTYP="Raw Soft Channel"` OUTPUT dset — C's four `devXxxSoftRaw.c`
+    /// write supports: the value `write_xxx()` puts to the OUT link.
+    ///
+    /// `devAoSoftRaw.c` / `devBoSoftRaw.c` put `RVAL` (`dbPutLink(&prec->out,
+    /// DBR_LONG, &prec->rval, 1)`); `devMbboSoftRaw.c` /
+    /// `devMbboDirectSoftRaw.c` put `RVAL & MASK` as `DBR_ULONG`. All four
+    /// write the RAW word — never the engineering `OVAL` that
+    /// [`Record::output_link_value`] (the `"Soft Channel"` dset) puts.
+    ///
+    /// Same rule as [`Record::raw_soft_input`]: `Some`/`None` IS the dset
+    /// table. Before this hook existed, a `DTYP="Raw Soft Channel"` output
+    /// record matched neither the soft-OUT arm (which tests for `"Soft
+    /// Channel"`) nor the device arm (it has no device), so it wrote **nothing
+    /// at all** to OUT.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        None
     }
 
     /// Apply a raw device value read *back* from an output record's device

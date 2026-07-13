@@ -479,12 +479,14 @@ fn test_bi_record() {
 
 // epics-base f2fe9d12 (devBiSoftRaw): "Raw Soft Channel" INP reads
 // must apply MASK to RVAL before the RVAL→VAL conversion. Verifies the
-// `Record::apply_raw_input` override on BiRecord.
+// `Record::raw_soft_input` override on BiRecord.
 #[test]
 fn test_bi_raw_soft_channel_applies_mask() {
     let mut rec = BiRecord::new(0);
     rec.mask = 0x0F;
-    rec.apply_raw_input(EpicsValue::Long(0xFF)).unwrap();
+    rec.raw_soft_input(RawSoftEntry::Read, EpicsValue::Long(0xFF))
+        .expect("bi has a SoftRaw dset")
+        .unwrap();
     assert_eq!(rec.rval, 0x0F, "mask must clamp RVAL to low nibble");
     let _ = rec.process().unwrap();
     match rec.get_field("VAL") {
@@ -498,7 +500,8 @@ fn test_bi_raw_soft_channel_applies_mask() {
 fn test_bi_raw_soft_channel_mask_zero_passthrough() {
     let mut rec = BiRecord::new(0);
     rec.mask = 0;
-    rec.apply_raw_input(EpicsValue::Long(0xDEAD_BEEFu32 as i32))
+    rec.raw_soft_input(RawSoftEntry::Read, EpicsValue::Long(0xDEAD_BEEFu32 as i32))
+        .expect("bi has a SoftRaw dset")
         .unwrap();
     // RVAL is DBF_ULONG (biRecord.dbd.pod:199); same bit pattern, unsigned.
     assert_eq!(rec.rval, 0xDEAD_BEEF_u32);
@@ -544,7 +547,9 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
 fn test_bi_raw_soft_channel_mask_to_zero() {
     let mut rec = BiRecord::new(1);
     rec.mask = 0x01;
-    rec.apply_raw_input(EpicsValue::Long(0xFE)).unwrap();
+    rec.raw_soft_input(RawSoftEntry::Read, EpicsValue::Long(0xFE))
+        .expect("bi has a SoftRaw dset")
+        .unwrap();
     assert_eq!(rec.rval, 0);
     let _ = rec.process().unwrap();
     match rec.get_field("VAL") {

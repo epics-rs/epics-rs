@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Binary input record matching C biRecord behavior.
@@ -276,30 +276,25 @@ impl Record for BiRecord {
         ))
     }
 
-    fn accepts_raw_soft_input(&self) -> bool {
-        true
-    }
-
-    /// `DTYP="Raw Soft Channel"` reads the link value into `RVAL` and
-    /// applies `MASK` (epics-base f2fe9d12, devBiSoftRaw): a non-zero
-    /// MASK gates which bits of the source contribute to the
-    /// subsequent RVAL→VAL conversion.
-    fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
-        // C `devBiSoftRaw` reads the link with `dbGetLink(.., DBR_ULONG,
-        // &prec->rval, ..)`: `getDoubleUlong`'s bare cast, owned by `c_cast`
-        // (RVAL is epicsUInt32, so it is the 64-bit-convert-then-truncate
-        // rule, not the signed i32 one).
-        let rval = value
-            .to_f64()
-            .map(crate::types::c_cast::f64_to_u32)
-            .ok_or_else(|| {
-                CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
-            })?;
+    /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
+    /// &prec->rval)` at init, `dbGetLink(.., DBR_ULONG, &prec->rval, ..)` +
+    /// `if (prec->mask) prec->rval &= prec->mask;` per read (epics-base
+    /// `f2fe9d12`). The mask is in `read_bi` ONLY, so the init constant load is
+    /// unmasked.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        // RVAL is epicsUInt32, so the DBR_ULONG store is `getDoubleUlong`'s
+        // bare cast — the 64-bit-convert-then-truncate rule owned by `c_cast`,
+        // not the signed i32 one.
+        let Some(rval) = value.to_f64().map(crate::types::c_cast::f64_to_u32) else {
+            return Some(Err(CaError::TypeMismatch(
+                "bi Raw Soft Channel: INP value not numeric".into(),
+            )));
+        };
         self.rval = rval;
-        if self.mask != 0 {
+        if entry == RawSoftEntry::Read && self.mask != 0 {
             self.rval &= self.mask;
         }
-        Ok(())
+        Some(Ok(()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

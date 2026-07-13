@@ -234,6 +234,16 @@ impl Record for BoRecord {
         "bo"
     }
 
+    /// C `devBoSoftRaw::write_bo` (`devBoSoftRaw.c:47-54`):
+    /// `dbPutLink(&prec->out, DBR_LONG, &prec->rval, 1)` — the RAW word
+    /// (`VAL ? MASK : 0`), not the `VAL` that `devBoSoft` writes.
+    /// C `devBoSoftRaw.c::write_bo` (65): `dbPutLink(&prec->out, DBR_LONG,
+    /// &prec->rval, 1)`. RVAL is DBF_ULONG; C hands its bit pattern to a
+    /// DBR_LONG put, so the cast is C's reinterpretation, not a range clamp.
+    fn raw_soft_output_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::Long(self.rval as i32))
+    }
+
     // C recBo.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
         // IVOV is DBF_USHORT (boRecord.dbd.pod:372); VAL is the binary enum

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
@@ -208,6 +208,27 @@ impl MbbiRecord {
             }
         }
         65535
+    }
+
+    /// The mask `devMbbiSoftRaw::read_mbbi` ANDs the raw word with.
+    ///
+    /// C builds it in the dset's `init_record` (`devMbbiSoftRaw.c:44-49`):
+    /// `if (prec->nobt == 0) prec->mask = 0xffffffff;` — which OVERRIDES an
+    /// explicitly configured MASK — `prec->mask <<= prec->shft;`. The record's
+    /// own `init_record` has already set `mask = (1 << nobt) - 1` when MASK was
+    /// left at 0 (`mbbiRecord.c:154-155`).
+    ///
+    /// C stores the shifted mask back into the MASK *field*; the port applies
+    /// the shift here instead and leaves MASK as the record declared it, because
+    /// the record's `process()` reads MASK on the (shared) device-readback path
+    /// where it must stay unshifted.
+    fn raw_soft_mask(&self) -> u32 {
+        let base = if self.nobt == 0 {
+            0xffff_ffff
+        } else {
+            self.mask
+        };
+        base.checked_shl(u32::from(self.shft)).unwrap_or(0)
     }
 
     /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
@@ -687,6 +708,25 @@ impl Record for MbbiRecord {
             "SIMM" => Some(MENU_SIMM),
             _ => None,
         }
+    }
+
+    /// C `devMbbiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
+    /// &prec->rval)` at init (`devMbbiSoftRaw.c:42`, unmasked), and per read
+    /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` followed by
+    /// `prec->rval &= prec->mask` (`:78-79`, UNCONDITIONAL — unlike `bi`, whose
+    /// dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
+    /// record's `RVAL >> SHFT` → state-index convert then runs.
+    fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
+        let Some(rval) = value.to_f64().map(crate::types::c_cast::f64_to_u32) else {
+            return Some(Err(CaError::TypeMismatch(
+                "mbbi Raw Soft Channel: INP value not numeric".into(),
+            )));
+        };
+        self.rval = rval;
+        if entry == RawSoftEntry::Read {
+            self.rval &= self.raw_soft_mask();
+        }
+        Some(Ok(()))
     }
 
     /// C rset `get_enum_strs`/`put_enum_str` (mbbiRecord.c:251-291) — ZRST..FFST

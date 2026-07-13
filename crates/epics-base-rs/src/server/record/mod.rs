@@ -31,9 +31,9 @@ pub use record_instance::{AlarmAck, DeferredNotifyPut, NotifyWaitSet, RecordInst
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, LinkReadAs,
-    OutTarget, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record,
-    RecordProcessResult, SubroutineFn, ValuePostGate, coerce_put_value, put_field_internal_default,
-    seed_input_links,
+    OutTarget, ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, RawSoftEntry,
+    Record, RecordProcessResult, SubroutineFn, ValuePostGate, coerce_put_value,
+    put_field_internal_default, seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanType, SimModeScan};

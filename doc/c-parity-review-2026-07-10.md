@@ -4965,3 +4965,223 @@ compiled-C hash vectors — R15-76/79 are what break it in practice.
 Coverage note: R15-76/78/79/80/81 reach waveform too (shared struct,
 shared field_list gap, shared put_field VAL arm) — fix anchors are
 family-wide.
+
+---
+
+## Fix wave 13 — dispositions (2026-07-13)
+
+All 21 Round-15 findings plus all 7 scoped aai/aao findings fixed, one
+commit per finding, on 6 worktree fixer branches, merged:
+A `caucus/WG0SFREHPX/fixer-a-calc-21bd43a5-2` (2 commits),
+B `…fixer-b-catools-710a473a-2` (3), C `…fixer-c-pva-2167e637-2` (5),
+D `…fixer-d-asyn-cec348ea-2` (6), E `…fixer-e-records-402d4f3e-2` (5),
+aai/aao `…fixer-aai-aao-d942e609-1` (7). Post-merge full-workspace gate
+(run twice, after the 5-branch merge and again after the aai/aao merge):
+clippy `-D warnings` clean, nextest 8732/8732 (two epics-ca-rs CLI tests
+flaked once under load in the second run — `a_rejected_enum_string_
+prints_no_old_value`, `caget_prints_nothing_when_one_pv_of_many_never_
+connects` — both pass isolated and in the clean rerun; joins the known
+flake list), doctests clean.
+
+- R15-1 `927bd592` — counts live IN the input structs: StringInputs gains
+  num_args/num_sargs, ArrayInputs num_dargs/num_aargs, clamped at
+  construction; all 17 access sites route through num_arg/str_arg/
+  array_arg/store_array accessors; store_array owns the amask pair (C
+  sets it inside the num_aArgs guard). Callers pass real counts —
+  scalcout 12/12, acalcout 12/12, transform 16/0. Distinct: numeric.rs
+  (C calcPerform takes no count). DOCUMENTED DEVIATION: C's out-of-count
+  FETCH leaves the stack element stale (sCalcPerform.c:862-864,
+  aCalcPerform.c:436, unreachable-garbage paths); port pushes 0.
+- R15-2 `da548415` — R14-7 regression closed: the bound is the WRITER's.
+  write_array_field(src, bound, select) — client put bounds at
+  no_elements (= NELM under default SIZE, cvt_dbaddr:628), link fetch at
+  the NUSE window; splice/zero-fill rule stays shared. SIZE=NUSE
+  correctly narrows the client too.
+- R15-16 `9187fdcc` — new epics-ca-rs/src/estdlib.rs ports
+  epicsParseDouble (epicsStdlib.c:149-176: hex floats, inf/nan words,
+  ERANGE rejection, trailing-garbage rejection) + envGetDoubleConfigParam
+  (envSubr.c:191-211) + total f64→Duration (inf → Duration::MAX,
+  negative → ZERO). All ten env-derived from_secs_f64 chains route
+  through it; client/mod.rs:1238 caput_callback joined (same unvalidated
+  conversion). FINDING PREMISE CORRECTED vs compiled C: strtod("inf")
+  succeeds — EPICS_CA_CONN_TMO=inf is a valid never-expiring deadline in
+  C (why C caget exits 0); 1e400 IS rejected (ERANGE). Implemented C's
+  actual split, not the prescribed "reject non-finite".
+- R15-17 `07ec3ab1` — C's named diagnostics layered on the resolver
+  (envSubr.c:205, cac.cpp:192-193, udpiiu.cpp:79-89, online_notify.c:59-64);
+  each knob resolves once per process (OnceLock), as C's constructors do.
+  stderr diffed BYTE-IDENTICAL vs compiled caget for CONN_TMO ∈ {abc,
+  1e400, inf, 0x10} and MAX_SEARCH_PERIOD ∈ {abc, 30}. DOCUMENTED
+  DEVIATION: NaN search period takes the 60 s low clamp; C propagates
+  NaN into its timer wheel and stops searching.
+- R15-18 `3b2d5ce6` — copt::scan_double delegates to
+  estdlib::epics_scan_double; -w hex/ERANGE stderr byte-identical vs
+  compiled caget.
+- R15-31 `bf22429b` — root-meta members mark leaves through the same
+  change_leaf_paths producer (empty prefix yields timeStamp/alarm —
+  pvxs's set); EventMark::Derive left with no producer and RETIRED
+  (leaves_or_derive → marked_leaves). Supersedes R14-32's "RETAINED"
+  note.
+- R15-32 `5e2f2488` — MonitorQueue::real's marked:None arm gates on
+  canonical_changed_bitset(intro, mask) non-empty — gate == wire on both
+  arms; field(alarm.bogus) now stays silent as pvxs does.
+- R15-33 `85a1c37f` — structural version: ChannelSource::read_checked →
+  SourceRead { value, marked }; one read_changed_bitset rule shared by
+  MONITOR data, seed, GET and PUT_GET; QSRV declares marks via
+  read_leaf_paths (getProperties never assigns control.minStep,
+  valueAlarm.active/*Severity/hysteresis — pinned by pvxs's
+  testqsingle.cpp:129-149). Retired the last value-diff consumer:
+  build_monitor_payload_partial, monitor_emits_partial, prev_value,
+  encode::diff_changed_bitset all deleted.
+- R15-34 `e018091d` — change_leaf_paths collapses a subscripted prefix
+  (a[0].x) to the enclosing array field (a), matching Value::mark
+  (data.cpp:256-270).
+- R15-35 `f391479a` — rg found the false overrun claim at FOUR sites
+  (tcp.rs squash accumulator, MonitorUpdate::overrun doc, gateway cooked
+  fanout doc + test doc); all now state only the raw forwarder puts
+  overrun bits on the wire. getTimeAlarm comment states the DBR_UTAG
+  condition.
+- R15-46 `57b341ba` — every actor pass ends in a throttled
+  port_thread_auto_connect() — C's notifyPortThread wake (exception
+  announcements included, asynManager.c:635-636 → :856-861);
+  service_connect_timer stamps the throttle so timer and wake cannot
+  double-connect. Disable→enable reconnects with exactly one attempt.
+- R15-47 `143092c3` — device-level enabled/connected refusals only on
+  non-CANBLOCK ports (asynManager.c:1551); a CANBLOCK port PARKS a
+  disabled device's request (portThread :874-884, rescan on state
+  change; parked request still honors its queue timer), disconnected
+  device takes autoConnectDevice then the timeout reply.
+- R15-48 `4fc19eb6` — octet interpose STACK keyed by
+  eos_device_key(multi_device, addr); resolution is C's findInterface
+  (device chain first, port chain second); iocsh addr threaded through
+  the Push requests. Closes the wave-12 open lead.
+- R15-49 `b7fee690` — one owner: report_error() writes ERRS and posts on
+  change (asynRecord.c:2028-2049); all 16 diagnostic writers route
+  through it; reset_error() is the clear path.
+- R15-50 `a10089e9` — invented defunct refusal text gone; a shut-down
+  port answers "port X disabled" (shutdownPort clears enabled,
+  asynManager.c:2282-2283); enable() on it carries C's exact
+  "asynManager:enable: port has been shut down". Structural:
+  PortDriverBase::defunct is private, shutdown_lifecycle its only
+  setter — defunct ⟹ !enabled holds by construction. Closes the
+  wave-12 documented deviation.
+- R15-51 `170fd865` — report takes &mut dyn fmt::Write at every layer;
+  PortActor::report_port is the single owner naming the stream (stdout,
+  asynShellCommands.c:589). Driver block = asynPortDriver::report
+  (:3676-3710): Timestamp line, EOS pair gated on registered asynOctet,
+  details≥3 interrupt-client block; per-address line prints the DEVICE's
+  autoConnect. DOCUMENTED DEVIATIONS: Timestamp rendered via chrono
+  (new asyn-rs dep, already workspace-wide); interrupt-client lines
+  carry interface/addr/reason/mask, not C's callback/userPvt pointers.
+- R15-61 `f0b63a8a` — the two C alarm snapshots are now NAMED:
+  LinkAlarm::pending() (nsta/nsev/namsg — dbDbPutValue, dbDbLink.c:382-383)
+  for every put path, LinkAlarm::committed() (stat/sevr/amsg —
+  dbDbGetValue :229-232) for the read path. rg: 7 construction sites,
+  6 same-defect (all put paths, fixed), 1 distinct
+  (read_link_with_alarm — C's get path, correctly committed).
+- R15-62 `b301a4b9` — multi_out_phase_of() classifies by what the link
+  IS: dfanout/seq = Output (value-carrying dbPutLink, pre-commit,
+  seqRecord.c:264 vs :227), fanout LNK0..F = ForwardLink (dbScanFwdLink,
+  no put, no alarm). Failed seq LNKn put alarms the same cycle.
+- R15-63 `b2002d43` — write_sim_siol_value DELETED;
+  write_simulated_output_siol calls write_out_link_value with
+  field "SIOL". SIOL is the same kind of link as OUT (alarm/MS/PP all
+  through the put owner). Closes the wave-12 open lead.
+- R15-64 `cd1c2d6f` — fixed at type resolution, not in the record:
+  OutTarget carries puts_as_string, filled once by
+  RecordInstance::field_puts_as_string (String/Enum, or a short with
+  menu choices — C's DBF_MENU/DBF_DEVICE, devsCalcoutSoft.c:128-130);
+  scalcout::multi_output_buffer consumes the flag.
+- R15-65 `1501cfe7` — reported symptom NOT REAL (the generic gate
+  already applied IVOV to VAL); actual defect found by probe: IVOA was
+  re-derived AFTER the outputs ran, so a failing push that raised
+  INVALID retro-triggered the IVOV arm and overwrote VAL. The pre-output
+  gate is now the single IVOA owner (decides skip_out, applies IVOV once
+  on checkAlarms severity, dfanoutRecord.c:127-146);
+  dispatch_multi_output_values just pushes prec->val.
+- R15-76 `9a998d56` — SIML/SIMM/SIOL/SIMS/SDLY/MPST/APST added to the
+  aai/aao/waveform field lists, all four kinds' field sets rebuilt from
+  ONE macro chain (a field can no longer be declared for one kind and
+  forgotten for a sibling); `sdly` storage added (also missing on
+  longin/int64in/event — same .db gate, fixed same commit).
+- R15-80 `3f3928d4` — NORD=1 seed for NELM=1 moved into init_record
+  pass 0 (after .db fields apply), where C has it; subArray excluded
+  (subArrayRecord.c:101).
+- R15-79 `22eeeb19` — one owner land_val_in_buffer routes every VAL
+  source through convert_to(FTVL) into the NELM-sized typed buffer; the
+  scalar-in-VAL variant is unrepresentable. Un-breaks the On-Change
+  hash, resize_val_preserving, and the everyday DOL="SETPOINT"
+  closed-loop aao.
+- R15-78 `b7b791e9` — new framework owner rec_gbl_init_constant_inp
+  (beside rec_gbl_init_simm) loads a constant INP once at init through
+  the same sink the process path uses; read_link_value_soft's Constant
+  arm now delivers nothing at process. Link layer gained the bracketed
+  array-constant form ([1,2,3] → parsed elements). The everyday victim:
+  an UNSET INP (a constant link in C) no longer wipes client-written
+  arrays every cycle.
+- R15-82 `8195e6a4` — C's init && isConst arm (aaoRecord.c:147
+  fetchValue(prec,1)) reusing R15-78's loader + R15-79's landing rule;
+  UDF clear rides post_init_finalize_undef.
+- R15-77 `a5bfdc4b` — read_db_link_into_field is the single owner of a
+  record-declared input-link read and raises C's setLinkAlarm
+  (LINK/INVALID, AMSG "field DOL") itself; pre-input reads join the
+  per-cycle set_resolved_input_links report, which aao reads as
+  fetchValue's status → CompleteNoEmit (C's early return: nothing
+  written to OUT, no post, no FLNK). Consumers classified: sseq
+  SELL→SELN has no abort in C; epid's pre-input action is a write.
+- R15-81 `b9cb555d` — Record::clears_udf_unconditionally (default
+  false) consulted by the simulation tail + raises_udf_alarm → false,
+  for waveform/aai/aao only; subArray keeps both defaults
+  (subArrayRecord.c:148-150). Regression test fails with the fix line
+  reverted.
+
+### Doc correction (aai/aao audit section above)
+
+R15-78's write-up says C parses field(INP,"1 2 3") as the constant
+array [1,2,3]. It does not: dbParseLink (dbStaticLib.c:2346-2357) makes
+a constant iff empty, whole-string-double, or BRACKETED; "1 2 3" fails
+epicsParseDouble on trailing garbage and becomes a PV_LINK to a record
+named "1". The fixer implemented the bracketed form and removed the
+port's whitespace-list heuristic, which had the same wrong belief baked
+in.
+
+### Documented deviations added this wave
+- R15-1: out-of-count FETCH pushes 0 where C leaves stack garbage
+  (unreachable-garbage paths, sCalcPerform.c:862-864/:426,
+  aCalcPerform.c:436).
+- R15-16: none — C's actual inf-accepting split implemented.
+- R15-17: NaN search period clamps to 60 s low; C's NaN would stop the
+  search timer entirely.
+- R15-51: chrono timestamp; interrupt-client lines carry
+  interface/addr/reason/mask instead of C's pointers.
+
+### Open leads — surfaced during fix wave 13 (Round 16 input)
+- Gateway cooked-path overrun signal is dead on the wire:
+  MonitorUpdate::overrun is accumulated (squash + cooked fanout) and
+  read by nobody; every cooked builder writes pvxs's hard-empty overrun
+  bitset. pva2pva (moncache.cpp:160-168) DOES set the bits, pvxs's
+  server (servermon.cpp:174-176) never does — the port's server is
+  both. Which reference governs the gateway's cooked path needs an
+  adjudication; R15-35 scoped comment-only.
+- The R15-78 constant-link defect REMAINS on the multi-input path
+  (links.rs::read_link_value — calc/sub/sel/aSub INPA..L): C seeds via
+  recGblInitConstantLink at init and dbGetLink delivers nothing after;
+  the port re-applies every cycle, so caput to a calc's A with
+  field(INPA,"5") is still clobbered. Finding-sized; needs per-record
+  init seeding across calc/calcout/sub/sel/aSub/scalcout/acalcout/
+  swait/epid.
+- parse_link_v2 splits link modifiers before its numeric test, so
+  "1 2 3" and "5 PP" become Constant("1")/Constant("5") where C's
+  dbParseLink tests the WHOLE string first and yields a PV_LINK.
+  Classifier reorder touches every link field (INP/OUT/FLNK/SDIS) —
+  its own change.
+- epics-pva-rs env doubles (config/env.rs:678/691,
+  server_native/runtime.rs:468/471/482) use str::parse — reject hex
+  floats; guarded finite-positive so no panic; pvxs is their reference,
+  not epicsStdlib.
+- Wave-12 env-double open lead CLOSED by R15-16..18 (estdlib resolver).
+- Known-flake additions: epics-ca-rs cli_caput_enum_order::
+  a_rejected_enum_string_prints_no_old_value, cli_connect_gate::
+  caget_prints_nothing_when_one_pv_of_many_never_connects,
+  client::transport::flow_control_tests::r6_17_events_off_at_the_
+  contiguous_frame_boundary (wall-clock sleeps in its harness).

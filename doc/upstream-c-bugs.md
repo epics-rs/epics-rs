@@ -1146,7 +1146,24 @@ Proof: measured on the compiled camonitor on this host during the R16-19 fix wav
 ---
 
 ### CBUG-D4: libCom's two escape printers render NUL differently — `\0` vs `\x00`
-Bucket: REPRODUCED · Severity: Low
+Bucket: REPRODUCED (adjudicated 2026-07-14 — **keep both; not a defect to fix**) · Severity: Low
+
+**Adjudication.** The divergence is real (both switch bodies re-read in the local tree:
+`epicsStrnEscapedFromRaw` has `case '\0': OUT('\\'); OUT('0');` at `:145`;
+`epicsStrPrintEscaped` `:245-259` has no `'\0'` arm, so NUL falls to
+`fprintf(fp, "\\x%02x", ...)`). Every other arm of the two switches is identical.
+
+But the "Defect" line below overstates it: these are **not two implementations of one
+escape table**. They have different contracts, and only one of them has an inverse —
+`epicsStrnEscapedFromRaw` is the round-trippable escape (undone by
+`epicsStrnRawFromEscaped`, and it is what `.db`/`.dbd` quoting relies on), whereas
+`epicsStrPrintEscaped` is a display escape streamed to a `FILE*` with no inverse. So there
+is no shared table for them to disagree *about*.
+
+Unifying them in the port would therefore *break* byte-parity with C on whichever path we
+changed, for a purely cosmetic gain — and asyn trace files are diffed against C's. The port
+keeps both renderings (see Port, below), which is correct as written. **No port change; the
+entry stays catalogued so the inconsistency is not "rediscovered" as a port bug later.**
 C: `epics-base modules/libcom/src/misc/epicsString.c` — `epicsStrnEscapedFromRaw` has an
 explicit `case '\0': OUT('\\'); OUT('0');` (`:145`), while `epicsStrPrintEscaped`
 (`:230-262`) has no `'\0'` case, so a NUL falls to the `fprintf(fp, "\\x%02x", ...)` default arm and

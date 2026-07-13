@@ -564,6 +564,14 @@ struct Acceptor {
 }
 
 impl Acceptor {
+    /// Copy the parent's trace masks onto the child port that just took a
+    /// connection — C `drvAsynIPServerPort.c:367-369`.
+    fn seed_child_trace(&self, child: &str) {
+        let Some(trace) = &self.trace else { return };
+        trace.set_trace_mask(Some(child), trace.get_trace_mask(Some(&self.port_name)));
+        trace.set_trace_io_mask(Some(child), trace.get_trace_io_mask(Some(&self.port_name)));
+    }
+
     /// Accept one pending connection and assign it to a free slot. Returns the
     /// slot index used, or `None` when no connection is pending.
     ///
@@ -598,6 +606,14 @@ impl Acceptor {
                 slot.assign(stream, peer);
                 self.announcer.announce(AsynException::Connect, i as i32);
                 let child = format!("{}:{}", self.port_name, i);
+                // C :367-369 — "Set the new port to initially have the same
+                // trace mask that we have". The connection is what makes the
+                // child a live port, so the accept is where it inherits the
+                // parent's tracing; `asynSetTraceMask SERVER -1 0x9` in an
+                // st.cmd, before any client exists, must therefore reach the
+                // client that later connects. Initially: a later change to the
+                // parent does not follow (C copies once, here too).
+                self.seed_child_trace(&child);
                 asyn_trace!(
                     Some(self.trace),
                     &self.port_name,
@@ -2278,6 +2294,48 @@ mod tests {
             vec!["srv_announce:0".to_string(), "srv_announce:1".to_string()],
             "the addr-0 user must hear about the slot-1 client too"
         );
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+    }
+
+    /// R19-121 boundary: a child port inherits the parent's trace masks at the
+    /// accept, and only at the accept.
+    ///
+    /// C `drvAsynIPServerPort.c:367-369` copies both masks onto the child when
+    /// the connection lands — *"Set the new port to initially have the same
+    /// trace mask that we have"*. The two boundaries: a mask set on the parent
+    /// BEFORE the client connects (the st.cmd case: `asynSetTraceMask SERVER -1
+    /// 0x9`) must reach the child; a mask set AFTER it connects must not (C
+    /// copies once, it does not track).
+    #[test]
+    fn a_child_port_inherits_the_parents_trace_masks_at_the_accept() {
+        use crate::services::PortServices;
+        use crate::trace::TraceIoMask;
+        use std::net::TcpStream as ClientStream;
+
+        let trace = Arc::new(TraceManager::new());
+        let services = PortServices::new(trace.clone());
+        let mut srv = DrvAsynIPServerPort::new("srv_trace", "127.0.0.1:0").unwrap();
+        services.bind(srv.base_mut());
+
+        // st.cmd, before any client exists.
+        let parent_mask = TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER;
+        let parent_io = TraceIoMask::ASCII | TraceIoMask::HEX;
+        trace.set_trace_mask(Some("srv_trace"), parent_mask);
+        trace.set_trace_io_mask(Some("srv_trace"), parent_io);
+
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let _client = ClientStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+
+        assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
+        assert_eq!(trace.get_trace_io_mask(Some("srv_trace:0")), parent_io);
+
+        // A later change to the parent does not follow the already-connected
+        // child: C copies at the accept, it does not keep them linked.
+        trace.set_trace_mask(Some("srv_trace"), TraceMask::ERROR);
+        assert_eq!(trace.get_trace_mask(Some("srv_trace:0")), parent_mask);
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

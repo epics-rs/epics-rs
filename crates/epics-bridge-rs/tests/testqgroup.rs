@@ -636,6 +636,7 @@ async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
         let initial = match seed
             .initial
             .expect("a group monitor seeds from its monitor-stamped value")
+            .value
         {
             PvField::Structure(s) => s,
             other => panic!("group seed must be a structure: {other:?}"),

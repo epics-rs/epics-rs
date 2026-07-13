@@ -662,6 +662,44 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
+    /// **The read handoff the server FRAMES.** Every value the server
+    /// serializes with a changed-bitset — the GET reply, the PUT_GET
+    /// readback, the connect-time monitor seed — comes back through here as
+    /// a [`SourceRead`]: the value plus, optionally, the leaves the source
+    /// ACTUALLY assigned into it.
+    ///
+    /// pvxs frames a read as `to_wire_valid(R, value, &pvMask)`
+    /// (`serverget.cpp:104`), and that value is a `cloneEmpty()` the source
+    /// filled in: `IOCSource::initialize` + `IOCSource::get`
+    /// (`singlesource.cpp:283`, `groupsource.cpp:484`) assign a SUBSET of
+    /// the structure, so only those leaves carry `valid` and only they reach
+    /// the wire. `getProperties` (`iocsource.cpp:252-310`) never assigns
+    /// `control.minStep`, `valueAlarm.active`, the four `valueAlarm.*Severity`
+    /// leaves or `valueAlarm.hysteresis` — pinned by pvxs's own
+    /// `testqsingle.cpp:129-149` delta, where those seven are absent while
+    /// `display.form.index` / `.choices` (from `initialize`) are present.
+    ///
+    /// The port's `PvField` has no "unassigned" state — every NT leaf is
+    /// populated — so a source that assigns a subset says so with `marked`.
+    /// `marked: None` means "everything the request selected", which is what
+    /// a source posting a wholly-assigned value means (a `SharedPV`'s
+    /// `open()`-ed Value, a gateway's upstream snapshot).
+    ///
+    /// The default routes through [`Self::get_value_checked`], so every
+    /// ACL / credential-routing override a source already has still applies;
+    /// a source overrides THIS method only to declare its marks.
+    fn read_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<SourceRead>> + Send {
+        async move {
+            self.get_value_checked(checked, ctx)
+                .await
+                .map(SourceRead::from)
+        }
+    }
+
     /// Re-check READ access for
     /// `(pv_name, ctx)` through the SOURCE-SPECIFIC ACL gate that
     /// served the original subscription. Returns `Some(token)` on
@@ -848,11 +886,11 @@ pub trait ChannelSource: Send + Sync + 'static {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send {
         async move {
             self.put_delta_checked(checked.clone(), desc, changed, delta, ctx.clone())
                 .await?;
-            Ok(self.get_value_checked(checked, ctx).await)
+            Ok(self.read_checked(checked, ctx).await)
         }
     }
 
@@ -1170,7 +1208,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// current value exactly once at attach, `sharedpv.cpp:69-92`;
     /// pva2pva copies one `lastelem` per `start()`, `moncache.cpp:270-320`).
     ///
-    /// The default seeds from the ACF-aware [`Self::get_value_checked`]
+    /// The default seeds from the ACF-aware [`Self::read_checked`]
     /// (server-equivalent) and treats the source's
     /// [`Self::subscribe_checked_opts_marked`] stream as updates-only —
     /// correct for every source whose subscription does not itself
@@ -1188,7 +1226,7 @@ pub trait ChannelSource: Send + Sync + 'static {
             let updates = self
                 .subscribe_checked_opts_marked(checked.clone(), ctx.clone(), opts)
                 .await?;
-            let initial = self.get_value_checked(checked, ctx).await;
+            let initial = self.read_checked(checked, ctx).await;
             Some(SubscriptionSeed {
                 initial,
                 updates,
@@ -1198,9 +1236,9 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// Raw fast-path counterpart of [`Self::subscribe_seeded`]. Returns
-    /// a decoded [`PvField`] seed (the server encodes the START frame
+    /// a decoded [`SourceRead`] seed (the server encodes the START frame
     /// through the regular path even on the raw path) plus the raw
-    /// update stream. Default seeds via [`Self::get_value_checked`] and
+    /// update stream. Default seeds via [`Self::read_checked`] and
     /// delegates the stream to [`Self::subscribe_raw_checked_opts`];
     /// returns `None` when the source exposes no raw path.
     fn subscribe_raw_seeded(
@@ -1213,7 +1251,7 @@ pub trait ChannelSource: Send + Sync + 'static {
             let updates = self
                 .subscribe_raw_checked_opts(checked.clone(), ctx.clone(), opts)
                 .await?;
-            let initial = self.get_value_checked(checked, ctx).await;
+            let initial = self.read_checked(checked, ctx).await;
             Some(SubscriptionSeed {
                 initial,
                 updates,
@@ -1528,13 +1566,68 @@ impl MonitorUpdate {
 }
 
 impl From<PvField> for MonitorUpdate {
-    /// A plain value with no explicit marked set — the server derives
-    /// the changed-bitset (full mask or value-diff) as before. No
+    /// A plain value with no explicit marked set — the server frames the
+    /// full request mask, as it does for any wholly-assigned value. No
     /// overrun: a freshly produced value reports no lost intermediate.
     fn from(value: PvField) -> Self {
         Self {
             value,
             marked: None,
+            type_changed: false,
+            overrun: Vec::new(),
+        }
+    }
+}
+
+/// A value the server is about to FRAME with a changed-bitset — a GET
+/// reply, a PUT_GET readback, or a connect-time monitor seed — plus the
+/// leaves the source assigned into it. The read-side mirror of
+/// [`MonitorUpdate`]'s `value` + `marked` pair, and `marked` carries the
+/// identical meaning on both: the dot-separated field paths the source
+/// actually wrote, or `None` for "everything the request selected".
+///
+/// This exists because pvxs reads a `cloneEmpty()` that its source only
+/// partially fills (`IOCSource::initialize` + `IOCSource::get`), so
+/// `to_wire_valid(R, value, &pvMask)` frames a SUBSET of the request mask.
+/// The port's `PvField` is always fully populated, so the subset has to be
+/// stated. See [`ChannelSource::read_checked`].
+#[derive(Debug, Clone)]
+pub struct SourceRead {
+    /// The value to serialize.
+    pub value: PvField,
+    /// The leaves the source assigned, or `None` for "all of them".
+    pub marked: Option<Vec<String>>,
+}
+
+impl SourceRead {
+    /// A read whose marked leaves the source declares explicitly.
+    pub fn marked(value: PvField, marked: Vec<String>) -> Self {
+        Self {
+            value,
+            marked: Some(marked),
+        }
+    }
+}
+
+impl From<PvField> for SourceRead {
+    /// A wholly-assigned value: the server frames every leaf the request
+    /// selected, which is what pvxs's fully-marked `Value` frames.
+    fn from(value: PvField) -> Self {
+        Self {
+            value,
+            marked: None,
+        }
+    }
+}
+
+impl From<SourceRead> for MonitorUpdate {
+    /// The connect-time seed IS the monitor's first post (pvxs's `first`),
+    /// so it enters the queue as one — carrying the same marked set the
+    /// source declared for the read.
+    fn from(read: SourceRead) -> Self {
+        Self {
+            value: read.value,
+            marked: read.marked,
             type_changed: false,
             overrun: Vec::new(),
         }
@@ -1595,7 +1688,7 @@ pub struct RawMonitorEvent {
 /// seed travels back with the stream rather than via a separate
 /// `get_value` call the server would issue out of band.
 ///
-/// `initial` is a decoded [`PvField`] even on the raw fast path: the
+/// `initial` is a decoded [`SourceRead`] even on the raw fast path: the
 /// server always encodes the first frame through the regular encode
 /// path (raw bodies may not be cached yet at START — see the raw seed
 /// note in the server monitor task), so the seed value type is uniform
@@ -1606,7 +1699,7 @@ pub struct SubscriptionSeed<T> {
     /// unopened `SharedPV` or a gateway entry awaiting its first
     /// upstream event) — the server then emits nothing until the first
     /// `updates` item.
-    pub initial: Option<PvField>,
+    pub initial: Option<SourceRead>,
     /// Post-seed update stream. By contract this MUST NOT repeat
     /// `initial`.
     pub updates: mpsc::Receiver<T>,
@@ -1728,6 +1821,12 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
+    /// The framed read handoff (value + assigned leaves). Dyn forwarder.
+    fn read_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SourceRead>> + Send + 'a>>;
     /// Per-source access gate. Dyn forwarder.
     fn access_gate(&self) -> &AccessGate;
     /// Source-registry beacon-change counter. Dyn forwarder.
@@ -1768,7 +1867,7 @@ pub trait ChannelSourceObj: Send + Sync {
         delta: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send + 'a>,
     >;
     /// Dyn forwarder for ChannelArray INIT.
     fn channel_array_init<'a>(
@@ -2014,6 +2113,13 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
             self, checked, ctx,
         ))
     }
+    fn read_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SourceRead>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::read_checked(self, checked, ctx))
+    }
     fn access_gate(&self) -> &AccessGate {
         <Self as ChannelSource>::access(self)
     }
@@ -2065,7 +2171,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         delta: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::put_get_checked(
             self, checked, desc, changed, delta, ctx,

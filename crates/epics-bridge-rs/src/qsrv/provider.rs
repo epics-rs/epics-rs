@@ -1105,7 +1105,7 @@ impl BridgeProvider {
     /// single serving owner. Every group lookup on the serve path
     /// (`channel_find`, `create_channel*`, `channel_list`) goes
     /// through this gate, so the dual meaning cannot reach a client.
-    async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
+    pub(crate) async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
         let def = self.groups.read().get(name).cloned()?;
         if self.record_exists(name).await {
             return None;

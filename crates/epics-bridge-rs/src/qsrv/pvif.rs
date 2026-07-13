@@ -207,6 +207,62 @@ pub fn change_leaf_paths(prefix: &str, mapping: FieldMapping, change: EventMask)
         .collect()
 }
 
+/// The leaves a full READ of one mapping assigns — pvxs
+/// `IOCSource::initialize` followed by `IOCSource::get(…, UpdateType::
+/// Everything, …)`, the pair every QSRV read runs (`singlesource.cpp:283`,
+/// `groupsource.cpp:454-460`). This is what a GET reply / monitor seed
+/// frames, and it is a SUBSET of the request mask: pvxs reads into a
+/// `cloneEmpty()`, so a leaf nobody assigned never reaches the wire.
+///
+/// Over `change_leaf_paths(prefix, mapping, VALUE|ALARM|PROPERTY)` it adds:
+///
+/// * `display.form.choices` and `display.form.index` — `IOCSource::
+///   initialize` (`iocsource.cpp:39-65`) fills the form enum for a `Scalar`
+///   mapping. Present in pvxs's own pinned delta (`testqsingle.cpp:129-149`)
+///   even though no DBE class assigns them;
+/// * a `Const` member's own node — `IOCSource::get` assigns `info.cval`
+///   (`iocsource.cpp:319-322`) on a read, where no runtime event ever fires
+///   for it.
+///
+/// `Structure` / `Proc` members assign nothing on a read either (pvxs skips
+/// them: `iocsource.cpp:316-317`, and `groupsource.cpp:495` / `:513` `continue`
+/// before even reading), so they stay unmarked.
+///
+/// The seven leaves the port's NT carries but `getProperties` never assigns —
+/// `control.minStep`, `valueAlarm.active`, the four `valueAlarm.*Severity`,
+/// `valueAlarm.hysteresis` — are absent here exactly as they are absent from
+/// pvxs's delta.
+pub fn read_leaf_paths(prefix: &str, mapping: FieldMapping) -> Vec<String> {
+    let everything = EventMask::VALUE | EventMask::ALARM | EventMask::PROPERTY;
+    let mut paths = change_leaf_paths(prefix, mapping, everything);
+    match mapping {
+        // `IOCSource::initialize` — Scalar only.
+        FieldMapping::Scalar => {
+            // A subscripted member already collapsed to its enclosing array
+            // field, which marks the whole field; nothing to add under it.
+            if enclosing_array_field(prefix).is_none() {
+                for form in ["display.form.choices", "display.form.index"] {
+                    paths.push(if prefix.is_empty() {
+                        form.to_string()
+                    } else {
+                        format!("{prefix}.{form}")
+                    });
+                }
+            }
+        }
+        // A const member is assigned on every read, never posted.
+        FieldMapping::Const => {
+            if let Some(array_field) = enclosing_array_field(prefix) {
+                paths.push(array_field.to_string());
+            } else if !prefix.is_empty() {
+                paths.push(prefix.to_string());
+            }
+        }
+        _ => {}
+    }
+    paths
+}
+
 /// The `StructureArray` field a subscripted member path is nested in — the
 /// text before its FIRST `[`. `"a[0].x"` → `"a"`, `"a[0].b[1].c"` → `"a"`
 /// (marking propagates up through every enclosing top, and only the
@@ -2135,6 +2191,101 @@ mod tests {
         assert!(
             !narrowed.contains(&"state.value".to_string()),
             "bare enum `value` leaf (expands to choices) must not survive: {narrowed:?}"
+        );
+    }
+
+    /// R15-33 — a READ (GET reply, PUT_GET readback, monitor seed) frames
+    /// what the source ASSIGNED, and QSRV's source assigns a strict subset
+    /// of the NT.
+    ///
+    /// pvxs reads into a `cloneEmpty()` through `IOCSource::initialize` +
+    /// `IOCSource::get(…, Everything, …)` (`singlesource.cpp:283`,
+    /// `groupsource.cpp:454-460`), then frames it with
+    /// `to_wire_valid(R, value, &pvMask)` (`serverget.cpp:104`). So the wire
+    /// carries only assigned leaves, and `getProperties`
+    /// (`iocsource.cpp:252-310`) assigns neither `control.minStep`, nor
+    /// `valueAlarm.active`, nor the four `valueAlarm.*Severity` leaves, nor
+    /// `valueAlarm.hysteresis` — pinned by pvxs's own delta,
+    /// `testqsingle.cpp:129-149`, where those seven are absent while
+    /// `display.form.index` / `.choices` (from `initialize`, which no DBE
+    /// class ever posts) are present.
+    ///
+    /// Tested per boundary: the never-assigned seven, the initialize-only
+    /// form pair, the mappings `initialize` skips (Meta / Plain), and the
+    /// read-only-assigned `Const` node.
+    #[test]
+    fn read_leaf_paths_frames_pvxs_initialize_plus_get_everything() {
+        let scalar = read_leaf_paths("", FieldMapping::Scalar);
+
+        // The seven leaves the port's NT carries and `getProperties` never
+        // assigns. Absent from the read → absent from the wire.
+        for never in [
+            "control.minStep",
+            "valueAlarm.active",
+            "valueAlarm.lowAlarmSeverity",
+            "valueAlarm.lowWarningSeverity",
+            "valueAlarm.highWarningSeverity",
+            "valueAlarm.highAlarmSeverity",
+            "valueAlarm.hysteresis",
+        ] {
+            assert!(
+                !scalar.contains(&never.to_string()),
+                "`getProperties` never assigns {never} — it must not be framed: {scalar:?}"
+            );
+        }
+
+        // `IOCSource::initialize` assigns the display form for a Scalar, so a
+        // read carries it even though no DBE class posts it.
+        for form in ["display.form.choices", "display.form.index"] {
+            assert!(
+                scalar.contains(&form.to_string()),
+                "`IOCSource::initialize` assigns {form} on a read: {scalar:?}"
+            );
+        }
+
+        // A read is `get(Everything)`: the value, the alarm/timeStamp pair and
+        // every property leaf `getProperties` does assign.
+        for assigned in ["value", "alarm", "timeStamp", "display.units"] {
+            assert!(
+                scalar.contains(&assigned.to_string()),
+                "get(Everything) assigns {assigned}: {scalar:?}"
+            );
+        }
+
+        // `initialize` is `info.type == Scalar`-only: a Meta member carries
+        // alarm + timeStamp and no form, and a value-only mapping is marked
+        // whole with nothing under it.
+        let meta = read_leaf_paths("m", FieldMapping::Meta);
+        assert_eq!(
+            meta,
+            vec!["m.timeStamp".to_string(), "m.alarm".to_string()],
+            "a `+type:meta` member assigns only the alarm/timeStamp pair"
+        );
+        assert_eq!(
+            read_leaf_paths("p", FieldMapping::Plain),
+            vec!["p".to_string()],
+            "a value-only mapping is the value: marked whole, no metadata under it"
+        );
+
+        // `IOCSource::get` assigns `info.cval` for a Const member
+        // (`iocsource.cpp:319-322`) — a read frames it, no event ever posts
+        // it. Structure/Proc members are skipped on read as on post.
+        assert_eq!(
+            read_leaf_paths("k", FieldMapping::Const),
+            vec!["k".to_string()],
+            "a const member is assigned on every read"
+        );
+        assert!(
+            read_leaf_paths("s", FieldMapping::Structure).is_empty(),
+            "pvxs skips a Structure member on a read (`iocsource.cpp:316-317`)"
+        );
+
+        // A subscripted member collapses to its enclosing array field on a
+        // read exactly as on a post — that field is the only markable bit.
+        assert_eq!(
+            read_leaf_paths("a[0].x", FieldMapping::Scalar),
+            vec!["a".to_string()],
+            "a subscripted member marks the enclosing array field, whole"
         );
     }
 }

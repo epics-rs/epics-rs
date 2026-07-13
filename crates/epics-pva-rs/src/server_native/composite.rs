@@ -564,6 +564,26 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// Resolve the OWNING source and return ITS read — value AND assigned
+    /// leaves. Without this forward the trait default would call the
+    /// composite's own `get_value_checked` (which does resolve the owner)
+    /// but report `marked: None`, silently widening every GET / seed the
+    /// top-level composite fronts — and `PvaServer::start` always wraps the
+    /// user source in one.
+    fn read_checked(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<crate::server_native::source::SourceRead>> + Send
+    {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
+            src.read_checked(inner_checked, ctx).await
+        }
+    }
+
     fn put_value_checked(
         &self,
         checked: AccessChecked,
@@ -624,7 +644,9 @@ impl ChannelSource for CompositeSource {
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<Option<crate::server_native::source::SourceRead>, OpError>,
+    > + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {

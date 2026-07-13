@@ -2221,12 +2221,25 @@ impl PvDatabase {
             // VAL-direct path.
             let is_raw_soft = instance.common.dtyp == "Raw Soft Channel"
                 && instance.record.accepts_raw_soft_input();
-            let soft_inp_applied = inp_value.is_some() && !is_raw_soft;
+            let mut soft_inp_applied = inp_value.is_some() && !is_raw_soft;
             if let Some(inp_val) = inp_value {
                 if is_raw_soft {
                     let _ = instance.record.apply_raw_input(inp_val);
                 } else {
                     let _ = instance.record.set_val(inp_val);
+                }
+            } else if is_soft && crate::server::recgbl::simm::is_constant(&inp_parsed) {
+                // C `dbLinkIsConstant(&prec->inp)` at process. The load-once
+                // rule (a constant delivers nothing here — it was loaded at
+                // init) is the default and stays the default; the ONE soft
+                // device support that re-reads its constant INP every process
+                // is `devSASoft.c::read_sa` (subArray), which also re-subsets
+                // on an EMPTY INP. `Record::read_constant_inp` is that
+                // device-support-layer exception: every other record's default
+                // returns false and nothing happens, exactly as before.
+                let constant = crate::server::recgbl::simm::constant_load_value(&inp_parsed);
+                if instance.record.read_constant_inp(constant) {
+                    soft_inp_applied = true;
                 }
             } else if is_soft
                 && matches!(

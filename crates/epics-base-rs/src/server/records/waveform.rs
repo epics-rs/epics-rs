@@ -287,9 +287,32 @@ impl WaveformRecord {
         }
     }
 
+    /// How many elements the VAL buffer physically holds — the single owner of
+    /// the "how big is `bptr`" rule, so every allocation/resize/landing site
+    /// agrees by construction.
+    ///
+    /// * waveform/aai/aao: `NELM` (`waveformRecord.c:104`
+    ///   `callocMustSucceed(prec->nelm, ...)`).
+    /// * subArray: `MALM` (`subArrayRecord.c:100` `callocMustSucceed(prec->malm,
+    ///   ...)`). MALM is the declared length of the SOURCE array; NELM is only
+    ///   the slice length. C's `cvt_dbaddr` (168) reports `no_elements = malm`
+    ///   and `put_array_info` (190-202) caps NORD at MALM, so a client may write
+    ///   up to MALM elements into VAL and the record slices NELM of them out at
+    ///   process. Sizing the buffer to NELM instead truncated the client's array
+    ///   before the slice could see it: with `NELM=3 INDX=1` a put of
+    ///   `[10,20,30,40,50]` kept only `[10,20,30]`, so the INDX slice could only
+    ///   ever yield `[20,30]` where C yields `[20,30,40]`.
+    fn val_capacity(&self) -> usize {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            self.malm.max(1) as usize
+        } else {
+            self.nelm.max(0) as usize
+        }
+    }
+
     /// Land a VAL source in the FTVL-typed buffer — the single owner of the
-    /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of NELM
-    /// elements on every path, by construction.
+    /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of
+    /// [`Self::val_capacity`] elements on every path, by construction.
     ///
     /// C never replaces the buffer, whatever the source's shape: every write
     /// hands `dbGetLink`/`dbPutField` a pointer to the FTVL-typed `bptr` with
@@ -315,16 +338,17 @@ impl WaveformRecord {
     /// value-coercion owner, against the FTVL element type — C's
     /// `dbFastConvert` into `bptr`.
     fn land_val_in_buffer(&mut self, value: EpicsValue) -> CaResult<()> {
-        let nelm = self.nelm.max(0) as usize;
+        let cap = self.val_capacity();
         let converted = value.convert_to(self.ftvl_element_type());
-        // NORD is capped at NELM (a VAL buffer holds at most NELM elements; C
-        // bounds every request to NELM, so NORD <= NELM by construction) and the
-        // buffer is resized to NELM to preserve the CA channel element count.
+        // NORD is capped at the buffer capacity (C bounds every request to the
+        // allocated element count, so NORD <= capacity by construction) and the
+        // buffer is resized to that capacity to preserve the CA channel element
+        // count.
         macro_rules! land {
             ($src:expr, $variant:ident, $zero:expr) => {{
                 let mut arr = $src;
-                self.nord = arr.len().min(nelm) as i32;
-                arr.resize(nelm, $zero);
+                self.nord = arr.len().min(cap) as i32;
+                arr.resize(cap, $zero);
                 self.val = EpicsValue::$variant(arr);
                 Ok(())
             }};
@@ -394,12 +418,12 @@ impl WaveformRecord {
         }
     }
 
-    /// Reallocate VAL buffer to match current FTVL and NELM.
+    /// Reallocate VAL buffer to match current FTVL and [`Self::val_capacity`].
     ///
     /// menuFtype indices: STRING=0, CHAR=1, UCHAR=2, SHORT=3, USHORT=4,
     /// LONG=5, ULONG=6, INT64=7, UINT64=8, FLOAT=9, DOUBLE=10, ENUM=11
     fn reallocate_val(&mut self) {
-        let n = self.nelm.max(0) as usize;
+        let n = self.val_capacity();
         self.val = match self.ftvl {
             1 => EpicsValue::CharArray(vec![0; n]),  // CHAR (epicsInt8)
             2 => EpicsValue::UCharArray(vec![0; n]), // UCHAR (epicsUInt8)
@@ -413,9 +437,9 @@ impl WaveformRecord {
         self.nord = 0;
     }
 
-    /// Resize the VAL buffer to the current NELM **while preserving
-    /// existing element data** — shrink truncates, grow zero-pads, and
-    /// NORD is clamped to the new length.
+    /// Resize the VAL buffer to the current [`Self::val_capacity`] **while
+    /// preserving existing element data** — shrink truncates, grow zero-pads,
+    /// and NORD is clamped to the new length.
     ///
     /// C parity: `waveformRecord` does not support a destructive
     /// run-time NELM change — `init_record` allocates `bptr` once and a
@@ -423,7 +447,7 @@ impl WaveformRecord {
     /// contents a CA client just stored. Keeping the data on resize is
     /// the non-destructive equivalent.
     fn resize_val_preserving(&mut self) {
-        let n = self.nelm.max(0) as usize;
+        let n = self.val_capacity();
         match &mut self.val {
             EpicsValue::CharArray(v) => v.resize(n, 0),
             EpicsValue::UCharArray(v) => v.resize(n, 0),
@@ -510,6 +534,120 @@ impl WaveformRecord {
             _ => {}
         }
         out
+    }
+
+    /// C `subArrayRecord.c::readValue` (310-314): NELM and INDX are clamped
+    /// against MALM at every process — never at field put, so the `.db` load
+    /// order of NELM/MALM/INDX cannot matter. MALM is always >= 1
+    /// (`init_record` floors it, 96-97).
+    fn sa_clamp_bounds(&mut self) {
+        let malm = self.malm.max(1);
+        if self.nelm > malm {
+            self.nelm = malm;
+        }
+        if self.indx >= malm {
+            self.indx = malm - 1;
+        }
+        if self.indx < 0 {
+            self.indx = 0;
+        }
+    }
+
+    /// C `devSASoft.c::subset` (39-56) — the ONE subArray slicing primitive:
+    ///
+    /// ```c
+    ///     long ecount = nRequest - prec->indx;
+    ///     if (ecount > 0) {
+    ///         if (ecount > prec->nelm) ecount = prec->nelm;
+    ///         memmove(prec->bptr, (char *)prec->bptr + prec->indx * esize,
+    ///                 ecount * esize);
+    ///     } else ecount = 0;
+    ///     prec->nord = ecount;
+    ///     prec->udf = FALSE;
+    /// ```
+    ///
+    /// `n_request` is the element count currently valid at the HEAD of the
+    /// buffer — what `dbLoadLinkArray` / `dbGetLink` just landed there, or NORD
+    /// itself when the INP is empty and there is nothing to load. The shift is
+    /// in place and destructive: C `memmove`s `bptr` down by INDX and leaves the
+    /// tail stale, and NORD is what bounds every read, so the port does the
+    /// same. (That is what makes a repeatedly-processed empty-INP subArray eat
+    /// its own array — `[10,20,30,40,50]` INDX=1 NELM=3 goes `[20,30,40]` →
+    /// `[30,40]` → `[40]` → empty+UDF. Verified against a built softIoc.)
+    ///
+    /// UDF is not touched here: C's `process` overwrites it on the next line
+    /// with `prec->udf = !!status` (subArrayRecord.c:148), and that status is
+    /// `readValue`'s `nord <= 0` test — which is [`Record::value_is_undefined`].
+    fn sa_subset(&mut self, n_request: i32) {
+        let len = self.val.count() as i32;
+        let n_request = n_request.clamp(0, len);
+        let indx = self.indx.max(0);
+        let mut ecount = n_request - indx;
+        if ecount > 0 {
+            if ecount > self.nelm {
+                ecount = self.nelm;
+            }
+            let start = indx as usize;
+            let end = start + ecount as usize;
+            macro_rules! shift {
+                ($v:expr) => {
+                    if start > 0 {
+                        $v.copy_within(start..end, 0);
+                    }
+                };
+            }
+            match &mut self.val {
+                EpicsValue::CharArray(v) => shift!(v),
+                EpicsValue::UCharArray(v) => shift!(v),
+                EpicsValue::ShortArray(v) => shift!(v),
+                EpicsValue::UShortArray(v) => shift!(v),
+                EpicsValue::LongArray(v) => shift!(v),
+                EpicsValue::ULongArray(v) => shift!(v),
+                EpicsValue::Int64Array(v) => shift!(v),
+                EpicsValue::UInt64Array(v) => shift!(v),
+                EpicsValue::FloatArray(v) => shift!(v),
+                EpicsValue::DoubleArray(v) => shift!(v),
+                EpicsValue::EnumArray(v) => shift!(v),
+                // A STRING-FTVL subArray: `PvString` is not `Copy`, so the
+                // element move is a rotate rather than a `copy_within` — same
+                // result, C's `memmove` over `MAX_STRING_SIZE`-wide slots.
+                EpicsValue::StringArray(v) => {
+                    if start > 0 {
+                        v[..end].rotate_left(start);
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            ecount = 0;
+        }
+        self.nord = ecount;
+    }
+
+    /// C `devSASoft.c::read_sa`'s load half (97-119): ask the INP for
+    /// `nRequest = min(INDX + NELM, MALM)` elements into `bptr`, then
+    /// `subset(nRequest)` with the count the link actually landed.
+    ///
+    /// The DB-link arm (`dbGetLink` via `dbLinkDoLocked`) and the constant arm
+    /// (`dbLoadLinkArray`) differ ONLY in where `source` came from, so both go
+    /// through here — one slicing rule, no per-path special case.
+    /// [`Self::land_val_in_buffer`] is `dbFastConvert`-into-`bptr`: it converts
+    /// to the FTVL element type and lands at most `val_capacity()` (= MALM)
+    /// elements, and a SCALAR source is one element at `bptr[0]` with
+    /// `nRequest = 1`.
+    fn sa_load_and_subset(&mut self, source: EpicsValue) -> CaResult<()> {
+        self.sa_clamp_bounds();
+        let n_request = self
+            .indx
+            .saturating_add(self.nelm)
+            .min(self.malm.max(1))
+            .max(0);
+        let mut src = source.convert_to(self.ftvl_element_type());
+        src.truncate(n_request as usize);
+        let loaded = src.count() as i32;
+        self.land_val_in_buffer(src)?;
+        self.sa_subset(loaded);
+        Ok(())
     }
 }
 
@@ -813,8 +951,15 @@ impl Record for WaveformRecord {
             }
             if self.nelm > self.malm {
                 self.nelm = self.malm;
-                self.reallocate_val();
             }
+            // C `callocMustSucceed(prec->malm, dbValueSize(prec->ftvl))`
+            // (subArrayRecord.c:100) — the buffer is MALM elements wide, sized
+            // here (after the `.db` has applied FTVL/MALM) rather than at any
+            // single field put, so the load order of FTVL/MALM/NELM cannot
+            // matter. Preserving resize, not a wipe: a `record()`-builder
+            // subArray may already hold element data (a `.db` cannot — VAL is
+            // `DBF_NOACCESS`).
+            self.resize_val_preserving();
             return Ok(());
         }
         if self.nord == 0 && self.nelm == 1 {
@@ -1006,15 +1151,23 @@ impl Record for WaveformRecord {
                         )));
                     }
                     if matches!(self.kind, ArrayKind::SubArray) {
-                        // subArray: NELM is the slice length; the buffer is
-                        // re-derived from the source on `set_val`, so a fresh
-                        // zeroed allocation here is correct. NO MALM clamp here
-                        // — C clamps NELM->MALM at init_record and at process
-                        // (subArrayRecord.c:103-104, 310-311), never at field
-                        // put, so the .db load order of NELM vs MALM cannot
-                        // matter. `init_record` and `set_val` apply the clamp.
+                        // subArray: NELM is the SLICE LENGTH, not the buffer
+                        // size — the buffer is MALM wide (`val_capacity`) and a
+                        // NELM put does not touch it. C's NELM is a plain
+                        // `epicsUInt32` field: `dbPutField` stores it, the
+                        // `pp(TRUE)` process re-slices, and `bptr` (allocated
+                        // once at `init_record`) keeps its contents throughout.
+                        // Reallocating a zeroed buffer here EMPTIED VAL on every
+                        // NELM put: C `caput SA.NELM 2` on an `INP="[1,2,3,4]"`
+                        // subArray reads back `VAL=[1,2] NORD=2`; the port read
+                        // back an empty VAL with NORD=0.
+                        //
+                        // NO MALM clamp here either — C clamps NELM->MALM at
+                        // init_record and at process (subArrayRecord.c:103-104,
+                        // 310-311), never at field put, so the .db load order of
+                        // NELM vs MALM cannot matter. `init_record` and
+                        // `sa_clamp_bounds` (the readValue equivalent) apply it.
                         self.nelm = n;
-                        self.reallocate_val();
                     } else {
                         // waveform/aai/aao: preserve the existing
                         // element data instead of wiping VAL.
@@ -1322,79 +1475,102 @@ impl Record for WaveformRecord {
         Ok(ProcessOutcome::complete())
     }
 
-    /// epics-base PR #a02c310 follow-up: subArray slices its input
-    /// array on `set_val`. Effective slice = source[INDX .. INDX+NELM]
-    /// further capped by `min(source.len, MALM)` (MALM=0 → no extra
-    /// cap, matching C dbCommon defaults where the field is set by
-    /// the record initialiser). All other ArrayKind values delegate
-    /// to the trait's default `put_field("VAL", ...)` write.
+    /// Delivery of an INP-link value into the record's value buffer.
+    ///
+    /// waveform/aai/aao land the array whole (`devWfSoft.c::readLocked`:
+    /// `dbGetLink(pinp, ftvl, bptr, 0, &nRequest)` with `nRequest = NELM`).
+    /// subArray is the slicing record: its device support asks the link for
+    /// `INDX + NELM` elements and subsets them (`devSASoft.c::read_sa`), which
+    /// is [`Self::sa_load_and_subset`] — the same primitive the constant-INP
+    /// process reload uses, so link delivery and constant reload cannot drift
+    /// apart.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            return self.sa_load_and_subset(value);
+        }
+        match self.put_field("VAL", value.clone()) {
+            Ok(()) => Ok(()),
+            Err(CaError::TypeMismatch(_)) => {
+                let target = self
+                    .get_field("VAL")
+                    .map(|v| v.db_field_type())
+                    .unwrap_or(DbFieldType::Double);
+                let coerced = value.convert_to(target);
+                self.put_field("VAL", coerced)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// C `devSASoft.c::read_sa` (92-123), the CONSTANT-INP arm — subArray is
+    /// the documented exception to the load-once rule every other soft input
+    /// device support follows:
+    ///
+    /// ```c
+    ///     rt.nRequest = prec->indx + prec->nelm;
+    ///     if (rt.nRequest > prec->malm) rt.nRequest = prec->malm;
+    ///     if (dbLinkIsConstant(&prec->inp)) {
+    ///         status = dbLoadLinkArray(&prec->inp, prec->ftvl, prec->bptr, &rt.nRequest);
+    ///         if (status == S_db_badField) {   /* INP was empty */
+    ///             rt.nRequest = prec->nord;
+    ///             status = 0;
+    ///         }
+    ///     }
+    ///     ...
+    ///     if (!status) subset(prec, rt.nRequest);
+    /// ```
+    ///
+    /// So on EVERY process:
+    ///
+    /// * a non-empty constant INP (`field(INP,"[1,2,3,4]")`) is re-loaded and
+    ///   re-sliced — a client caput to VAL is restored to the INDX window of the
+    ///   constant on the next cycle;
+    /// * an EMPTY/unset INP still subsets, with `nRequest = NORD` — the
+    ///   "client writes VAL, the record slices it by INDX" pattern, which is the
+    ///   standard way a subArray is driven with no input link at all.
+    ///
+    /// Both arms were dead in the port: `set_val` (the only slicing site) runs
+    /// on link delivery, and after R15-78 a constant INP delivers nothing at
+    /// process — so INDX was inert on exactly the two configurations C
+    /// documents.
+    ///
+    /// The other three array kinds keep the default (`false`): `devWfSoft.c`
+    /// and `devAaiSoft.c` both open with `if (dbLinkIsConstant(pinp)) return 0;`.
+    fn read_constant_inp(&mut self, value: Option<EpicsValue>) -> bool {
         if !matches!(self.kind, ArrayKind::SubArray) {
-            return match self.put_field("VAL", value.clone()) {
-                Ok(()) => Ok(()),
-                Err(CaError::TypeMismatch(_)) => {
-                    let target = self
-                        .get_field("VAL")
-                        .map(|v| v.db_field_type())
-                        .unwrap_or(DbFieldType::Double);
-                    let coerced = value.convert_to(target);
-                    self.put_field("VAL", coerced)
-                }
-                Err(e) => Err(e),
-            };
-        }
-        // C subArrayRecord.c process (readValue) clamps NELM and INDX against
-        // MALM every cycle (310-311, 313-314); MALM is always >= 1
-        // (init_record floors it, 96-97). This is the readValue equivalent, so
-        // apply the same clamps here — the slice is then correct regardless of
-        // the .db load order of NELM/MALM/INDX.
-        let malm = self.malm.max(1);
-        if self.nelm > malm {
-            self.nelm = malm;
-        }
-        if self.indx >= malm {
-            self.indx = malm - 1;
-        }
-        let start = self.indx.max(0) as usize;
-        let take = self.nelm.max(0) as usize;
-        let malm_cap = malm as usize; // MALM is always a real source-view cap
-        let nelm_buf = take; // physical buffer is sized to NELM
-        macro_rules! slice {
-            ($v:ident, $arr:ident, $variant:ident, $zero:expr) => {{
-                let src_len = $arr.len().min(malm_cap);
-                let end = (start + take).min(src_len);
-                let valid = if start >= src_len { 0 } else { end - start };
-                let mut out: Vec<_> = if valid > 0 {
-                    $arr[start..end].to_vec()
-                } else {
-                    Vec::new()
-                };
-                out.resize(nelm_buf, $zero);
-                self.nord = valid as i32;
-                self.val = EpicsValue::$variant(out);
-            }};
+            return false;
         }
         match value {
-            EpicsValue::CharArray(arr) => slice!(value, arr, CharArray, 0u8),
-            EpicsValue::UCharArray(arr) => slice!(value, arr, UCharArray, 0u8),
-            EpicsValue::ShortArray(arr) => slice!(value, arr, ShortArray, 0i16),
-            EpicsValue::LongArray(arr) => slice!(value, arr, LongArray, 0i32),
-            EpicsValue::FloatArray(arr) => slice!(value, arr, FloatArray, 0.0f32),
-            EpicsValue::DoubleArray(arr) => slice!(value, arr, DoubleArray, 0.0f64),
-            other => {
-                // Scalar fed into subArray (e.g. CA put of a single
-                // number): degrade to "NORD=1 at offset 0" semantics
-                // when INDX==0, else NORD=0. Matches what C does
-                // through dbScalarToArray.
-                if start == 0 {
-                    self.nord = 1;
-                    self.val = other;
-                } else {
-                    self.nord = 0;
-                }
+            Some(v) => {
+                let _ = self.sa_load_and_subset(v);
+            }
+            None => {
+                // `S_db_badField` — the INP is empty: nRequest = NORD, subset
+                // the buffer the client wrote.
+                self.sa_clamp_bounds();
+                let n_request = self.nord;
+                self.sa_subset(n_request);
             }
         }
-        Ok(())
+        true
+    }
+
+    /// C `subArrayRecord.c::readValue` (318-319) `if (prec->nord <= 0) status =
+    /// -1;` + `process` (148-150) `prec->udf = !!status; if (status)
+    /// recGblSetSevr(prec, UDF_ALARM, prec->udfs);` — a subArray whose slice
+    /// came out EMPTY is UNDEFINED and alarms at UDFS. (Reached when INDX walks
+    /// past the data: an empty-INP subArray re-subsetting its own buffer runs
+    /// out of elements, and a client can put INDX beyond NORD.) The framework
+    /// owns `common.udf`; this is the record's half of C's `udf = !!status`.
+    ///
+    /// waveform/aai/aao keep the default answer for an array VAL (defined) —
+    /// they clear UDF unconditionally in `process()` anyway
+    /// ([`Self::clears_udf_unconditionally`]).
+    fn value_is_undefined(&self) -> bool {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            return self.nord <= 0;
+        }
+        false
     }
 }
 

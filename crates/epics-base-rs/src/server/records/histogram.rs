@@ -24,12 +24,22 @@ pub struct HistogramRecord {
     pub ulim: f64,     // Upper limit
     pub llim: f64,     // Lower limit
     pub wdth: f64,     // Width of one bucket = (ulim-llim)/nelm
-    pub sgnl: f64,     // Signal value to bin (C: DBF_DOUBLE)
-    pub cmd: i16,      // 0=Read, 1=Clear, 2=Start, 3=Stop
-    pub csta: bool,    // Counting state — TRUE while counting is enabled
-    pub sdel: f64,     // Signal deadband (monitor refresh period, seconds)
-    pub mdel: i32,     // Monitor count deadband
-    pub mcnt: i32,     // Counts accumulated since last monitor post
+    pub sgnl: f64,     // Signal value to bin (C: DBF_DOUBLE, special(SPC_MOD))
+    /// C `field(SVL,DBF_INLINK)` (`histogramRecord.dbd.pod:212`) — "Signal Value
+    /// Location", the record's ONLY input link. `histogramRecord` declares NO
+    /// INP: its soft device support reads SVL into SGNL
+    /// (`devHistogramSoft.c:52` `dbGetLink(&prec->svl, DBR_DOUBLE, &prec->sgnl,
+    /// 0, 0)` every process; `:44` `recGblInitConstantLink(&prec->svl,
+    /// DBF_DOUBLE, &prec->sgnl)` at init), and `process()` bins whatever SGNL
+    /// then holds. The port had no SVL at all and drove the record from a
+    /// nonexistent INP, so `field(SVL,"MYSIG")` was dropped at load and the
+    /// record was inert.
+    pub svl: String,
+    pub cmd: i16,   // 0=Read, 1=Clear, 2=Start, 3=Stop
+    pub csta: bool, // Counting state — TRUE while counting is enabled
+    pub sdel: f64,  // Signal deadband (monitor refresh period, seconds)
+    pub mdel: i32,  // Monitor count deadband
+    pub mcnt: i32,  // Counts accumulated since last monitor post
     // Simulation block (histogramRecord.dbd.pod:245-282). SIMM is
     // DBF_MENU menu(menuYesNo) (NO/YES), SIMS is DBF_MENU menu(menuAlarmSevr);
     // both served as DBR_ENUM shorts. SIOL/SIML are the simulation
@@ -45,6 +55,13 @@ pub struct HistogramRecord {
     pub siml: String,
     pub sims: i16,
     pub sdly: f64,
+    /// Did `init_record` pass 1 seed SGNL from a CONSTANT SVL? C
+    /// `devHistogramSoft.c::init_record` (44-45): `if
+    /// (recGblInitConstantLink(&prec->svl, DBF_DOUBLE, &prec->sgnl)) prec->udf =
+    /// FALSE;`. UDF lives in the common fields, which `init_record` cannot
+    /// reach, so the outcome is carried here and folded in by
+    /// `post_init_finalize_undef` (the same shape aao uses for its constant DOL).
+    constant_svl_loaded: bool,
 }
 
 impl Default for HistogramRecord {
@@ -65,6 +82,7 @@ impl Default for HistogramRecord {
             llim,
             wdth: (ulim - llim) / nelm as f64,
             sgnl: 0.0,
+            svl: String::new(),
             cmd: 0,
             // C init leaves CSTA at its DBD default; the histogram
             // record counts by default (CSTA defaults TRUE) so a
@@ -80,6 +98,7 @@ impl Default for HistogramRecord {
             siml: String::new(),
             sims: 0,
             sdly: -1.0,
+            constant_svl_loaded: false,
         }
     }
 }
@@ -188,6 +207,15 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    // C `field(SVL,DBF_INLINK)` (histogramRecord.dbd.pod:212) — the record's
+    // only input link. Membership here is what makes `field(SVL,"MYSIG")` load:
+    // `apply_fields` routes a name NOT in `field_list` to the common fields,
+    // where it is rejected and skipped.
+    FieldDesc {
+        name: "SVL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
     FieldDesc {
         name: "CMD",
         dbf_type: DbFieldType::Short,
@@ -264,6 +292,83 @@ impl Record for HistogramRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// `histogramRecord.dbd.pod` declares NO `INP` — the record's DBF_INLINK is
+    /// `SVL` (:212), read into SGNL by `devHistogramSoft.c`. C's dbd rejects
+    /// `field(INP,...)` on a histogram ("field not found"), and so does the
+    /// common-field owner via this hook: a histogram must not be driveable from
+    /// an INP the C record type does not have, or a `.db` written against the
+    /// port is unloadable on a C IOC (and vice versa).
+    fn declares_inp_link(&self) -> bool {
+        false
+    }
+
+    /// C `devHistogramSoft.c::read_histogram` (50-54):
+    /// `dbGetLink(&prec->svl, DBR_DOUBLE, &prec->sgnl, 0, 0)` on EVERY process.
+    /// A CONSTANT (or unset) SVL is a no-op there — `dbConstGetValue` writes
+    /// nothing — and was loaded once at init instead (see [`Self::init_record`]),
+    /// so only a real link emits a fetch. Same gate as the aao's DOL.
+    ///
+    /// The value lands in SGNL through `put_field_internal`, NOT `put_field`:
+    /// `dbGetLink` writes the field's memory directly and never runs C's
+    /// `special()`, so the SPC_MOD `add_count` on a SGNL *caput* must not fire
+    /// here — `process()` performs the cycle's single bin increment
+    /// (`histogramRecord.c:218-219`).
+    fn pre_input_link_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        if crate::server::recgbl::simm::is_constant(&crate::server::record::parse_link_v2(
+            &self.svl,
+        )) {
+            return Vec::new();
+        }
+        vec![crate::server::record::ProcessAction::ReadDbLink {
+            link_field: "SVL",
+            target_field: "SGNL",
+        }]
+    }
+
+    /// Internal (link / framework) delivery of a field value — C's
+    /// direct-to-memory write, which does NOT run `special()`. SGNL is the one
+    /// field where that distinction is observable on a histogram: its
+    /// `put_field` arm carries the SPC_MOD `add_count` (`histogramRecord.c:334`),
+    /// and routing a link read through it would count the sample twice (once
+    /// here, once in `process()`).
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        if name.eq_ignore_ascii_case("SGNL") {
+            self.sgnl = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch("SGNL".into()))?;
+            return Ok(());
+        }
+        crate::server::record::put_field_internal_default(self, name, value)
+    }
+
+    /// C `devHistogramSoft.c::init_record` (40-48): a CONSTANT SVL seeds SGNL
+    /// once — `recGblInitConstantLink(&prec->svl, DBF_DOUBLE, &prec->sgnl)` —
+    /// and the record is then DEFINED. No bin increment: `add_count` runs only
+    /// from `process()` and from the SGNL `special()`.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass != 1 {
+            return Ok(());
+        }
+        let svl = crate::server::record::parse_link_v2(&self.svl);
+        if let Some(v) = crate::server::recgbl::simm::constant_load_value(&svl)
+            && let Some(f) = v.to_f64()
+        {
+            self.sgnl = f;
+            self.constant_svl_loaded = true;
+        }
+        Ok(())
+    }
+
+    /// The UDF half of the constant-SVL load (`devHistogramSoft.c:44-45`):
+    /// `if (recGblInitConstantLink(...)) prec->udf = FALSE;`. UDF is a common
+    /// field, which `init_record` cannot reach.
+    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+        if self.constant_svl_loaded {
+            *udf = false;
+        }
+        Ok(())
+    }
+
     /// C `histogramRecord.c:384-387` — the simulated SIOL read lands in SGNL,
     /// not in VAL (VAL is the bin-count array):
     ///
@@ -296,6 +401,7 @@ impl Record for HistogramRecord {
             "LLIM" => Some(EpicsValue::Double(self.llim)),
             "WDTH" => Some(EpicsValue::Double(self.wdth)),
             "SGNL" => Some(EpicsValue::Double(self.sgnl)),
+            "SVL" => Some(EpicsValue::String(self.svl.clone().into())),
             "CMD" => Some(EpicsValue::Short(self.cmd)),
             "CSTA" => Some(EpicsValue::Short(if self.csta { 1 } else { 0 })),
             "SDEL" => Some(EpicsValue::Double(self.sdel)),
@@ -341,10 +447,22 @@ impl Record for HistogramRecord {
             },
             "SGNL" => {
                 self.sgnl = value.to_f64().unwrap_or(0.0);
-                // C `special` SPC_MOD on SGNL → add_count.
+                // C `special` SPC_MOD on SGNL → add_count. This is the
+                // `dbPutField` path ONLY — the link/device deliveries of SGNL
+                // (SVL read, SIOL simulation read) write `prec->sgnl` directly
+                // and never run `special()`, so they go through
+                // `put_field_internal` / `land_simulated_value` instead and let
+                // `process()` do the single bin increment.
                 self.add_count();
                 Ok(())
             }
+            "SVL" => match value {
+                EpicsValue::String(s) => {
+                    self.svl = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SVL".into())),
+            },
             "CMD" => match value {
                 EpicsValue::Short(v) => {
                     // C `special` SPC_CALC: cmd<=1 clear, cmd==2 start,

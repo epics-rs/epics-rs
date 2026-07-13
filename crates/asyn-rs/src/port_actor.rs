@@ -396,6 +396,16 @@ impl PortActor {
             return;
         }
 
+        // C :3258 — the callback does not call `pasynCommon->connect`, it posts
+        // a `queueRequest`, so the gate runs. A refusal (`asynDisabled` from
+        // :1541-1546) means `portConnectProcessCallback` never runs, and it is
+        // the *only* thing that re-arms the timer (:3281): `asynEnable(port,0)`
+        // stops the retry loop dead, and a `shutdownPort`ed port never touches
+        // the hardware again. So: no attempt, and no re-arm.
+        if self.connect_gate().is_err() {
+            return;
+        }
+
         let _ = self.driver.connect(&AsynUser::default());
 
         if !self.driver.base().is_connected() {
@@ -409,6 +419,23 @@ impl PortActor {
         while let Ok(msg) = self.rx.try_recv() {
             self.enqueue_message(msg);
         }
+    }
+
+    /// The gate every connect attempt the actor makes *on its own initiative*
+    /// passes — the retry timer and both auto-connect levels. It is the same
+    /// gate a request passes, asked on behalf of the connect user C builds for
+    /// the port (`pport->pconnectUser`, asynManager.c:3231): `addr == -1` at
+    /// Connect priority, so `checkPortConnect` is `FALSE` (:1536-1538) and only
+    /// the unconditional enabled/defunct half binds (:1541-1546).
+    ///
+    /// Nothing in C reaches `pasynCommon->connect` without it — the timer
+    /// callback goes through `queueRequest` (:3258), and `portThread` refuses to
+    /// run anything at all on a disabled port, its own `autoConnectDevice`
+    /// included (:802-805). Routing every attempt through the one gate is what
+    /// makes `asynEnable(port,0)` stop the hardware retries, rather than merely
+    /// stop the reads that ride on them.
+    fn connect_gate(&self) -> AsynResult<()> {
+        self.driver.base().check_queue(-1, ConnectCheck::Waived)
     }
 
     /// The single owner of "how does C perform this operation" — see [`CDispatch`].
@@ -707,8 +734,19 @@ impl PortActor {
     /// window whether it succeeded or failed (`stamp_auto_connect_attempt`,
     /// C :718).
     ///
-    /// Returns whether the port is connected afterwards (C's `:721` bail-out).
+    /// Returns whether the port is connected afterwards (C's `:721` bail-out),
+    /// or `false` outright when [`Self::connect_gate`] refuses — the whole
+    /// device level below hangs off that `false` (:755), so one gate check
+    /// covers both levels.
     fn auto_connect_port(&mut self) -> bool {
+        // C `portThread` re-applies the queue gate's unconditional refusal
+        // before it reaches *either* `autoConnectDevice` call site:
+        // `if(!pport->dpc.enabled) continue;` (:802-805) sits above the
+        // Connect-queue drain, above `autoConnectDevice(pport,0)` (:856-861)
+        // and above the per-request one (:874-880).
+        if self.connect_gate().is_err() {
+            return false;
+        }
         if !self.driver.base().is_connected() && self.driver.base().auto_connect {
             if !self
                 .driver
@@ -2357,6 +2395,108 @@ mod tests {
             "the failed first attempt must re-arm the timer (C asynManager.c:3281), got {} call(s)",
             connect_calls.load(Ordering::SeqCst)
         );
+    }
+
+    /// R14-50: no connect attempt on a port the queue gate would refuse.
+    ///
+    /// C's retry timer does not call `pasynCommon->connect` — it posts a
+    /// `queueRequest` (asynManager.c:3258), which a disabled or defunct port
+    /// refuses with `asynDisabled` (:1541-1546); the process callback that would
+    /// re-arm the timer (:3281) never runs. `portThread` applies the same
+    /// refusal above `autoConnectDevice` (:802-805). So `asynEnable(port,0)` and
+    /// `shutdownPort` stop the hardware retries, not just the reads.
+    ///
+    /// One case per gate boundary: disabled, defunct, and the enabled control
+    /// that must still connect.
+    #[test]
+    fn a_gate_refused_port_makes_no_connect_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+            connect_addr_calls: Arc<AtomicUsize>,
+        }
+        impl PortDriver for CountingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.connect_addr_calls.fetch_add(1, Ordering::SeqCst);
+                self.base.connect_addr(user.addr);
+                Ok(())
+            }
+        }
+
+        // A down, auto-connect, multi-device port with its retry timer due.
+        let actor_with = |enabled: bool, defunct: bool| {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let addr_calls = Arc::new(AtomicUsize::new(0));
+            let mut base = PortDriverBase::new(
+                "gate_test",
+                2,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.auto_connect = true;
+            base.set_connected(false);
+            base.enabled = enabled;
+            base.defunct = defunct;
+            base.connect_retry_at = Some(Instant::now() - Duration::from_millis(1));
+            let drv = CountingDriver {
+                base,
+                connect_calls: calls.clone(),
+                connect_addr_calls: addr_calls.clone(),
+            };
+            let (_tx, rx) = mpsc::channel(1);
+            (PortActor::new(Box::new(drv), rx), calls, addr_calls, _tx)
+        };
+
+        for (label, enabled, defunct) in [("disabled", false, false), ("defunct", true, true)] {
+            let (mut actor, calls, addr_calls, _tx) = actor_with(enabled, defunct);
+
+            actor.service_connect_timer();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{label}: the retry timer must not reach the driver's connect"
+            );
+            assert!(
+                actor.driver.base().connect_retry_at.is_none(),
+                "{label}: a refused queueRequest never re-arms the timer (C :3281)"
+            );
+
+            assert!(!actor.auto_connect_port(), "{label}: no port auto-connect");
+            assert!(
+                !actor.auto_connect_device(1, 0),
+                "{label}: no device auto-connect"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst) + addr_calls.load(Ordering::SeqCst),
+                0,
+                "{label}: auto-connect must not reach the driver either"
+            );
+        }
+
+        // Control: enabled and alive — the same tick connects, as before.
+        let (mut actor, calls, _addr_calls, _tx) = actor_with(true, false);
+        actor.service_connect_timer();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an enabled port's retry timer still connects"
+        );
+        assert!(actor.driver.base().is_connected());
     }
 
     /// Boundary: auto-connect OFF. C arms the timer only when

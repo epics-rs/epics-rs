@@ -47,7 +47,14 @@ async fn transform_db() -> PvDatabase {
     db
 }
 
-/// `CLCA = "1/0"` — a well-formed expression whose result is `+inf`.
+/// `CLCA = "1/0"` — base's engine divides in bare IEEE and hands back `+inf`
+/// with status 0; sCalc's `DIV` refuses the zero divisor and returns -1
+/// (`sCalcPerform.c:1022-1030`), which is what makes this a calc FAILURE.
+///
+/// That -1 comes from inside the evaluator loop, BEFORE the epilogue, so C
+/// never assigns `*pval` — the channel keeps its previous value. (The other -1,
+/// the non-finite tail at `:2056`, writes the cell first; R16-4 and
+/// `transform_non_finite_result_is_kept.rs` cover that half.)
 #[tokio::test]
 async fn r11_c14_divide_by_zero_is_a_calc_failure() {
     let db = transform_db().await;
@@ -62,7 +69,7 @@ async fn r11_c14_divide_by_zero_is_a_calc_failure() {
     assert_eq!(
         g.common.sevr,
         AlarmSeverity::Invalid,
-        "sCalcPerform returns -1 on a non-finite result (sCalcPerform.c:2056) → \
+        "sCalc's DIV returns -1 on a zero divisor (sCalcPerform.c:1022-1030) → \
          recGblSetSevr(CALC_ALARM, INVALID_ALARM) (transformRecord.c:594)"
     );
     assert_eq!(

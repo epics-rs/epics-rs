@@ -796,11 +796,15 @@ impl Record for ScalcoutRecord {
             // overwrite. (PVAL/PSVL are a different pair — see their docs.)
             let mut inputs = self.build_inputs(self.val, &self.sval);
             match scalc_perform(&self.compiled_calc, &mut inputs, self.prec) {
-                Ok(result) => {
+                // C's two `-1`s are ONE failure to this record: `:357-364` tests
+                // the return code alone, so a non-finite result (cells written,
+                // status -1) and an operator refusal (nothing written) both take
+                // the VAL=-1 / SVAL="***ERROR***" branch below.
+                Ok(result) if !result.non_finite => {
                     self.apply_result(&result);
                     false
                 }
-                Err(_) => true,
+                _ => true,
             }
         };
 
@@ -866,7 +870,10 @@ impl Record for ScalcoutRecord {
                 // cycle just computed.
                 let mut inputs = self.build_inputs(self.oval, &self.osv);
                 match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
-                    Ok(result) => {
+                    // As on the CALC side: a non-finite OCAL result is C's -1
+                    // with the cells written, and `execOutput` reads only the
+                    // status — so it takes the OVAL=-1 sentinel branch too.
+                    Ok(result) if !result.non_finite => {
                         // The OCAL-side mirror of `apply_result`: C passes
                         // `&pcalc->oval, pcalc->osv` and the SAME `pcalc->prec`
                         // to the same sCalcPerform (`sCalcoutRecord.c:768-770`),
@@ -874,7 +881,7 @@ impl Record for ScalcoutRecord {
                         self.oval = result.val;
                         self.osv = PvString::from_bytes(result.sval.as_bytes());
                     }
-                    Err(_) => {
+                    _ => {
                         // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
                         // a failed OCAL sCalcPerform forces OVAL=-1 and
                         // OSV="***ERROR***" — the OCAL-side mirror of the

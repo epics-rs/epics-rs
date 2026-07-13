@@ -27,22 +27,115 @@
 #![allow(clippy::all)]
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
 use epics_base_rs::server::record::{AlarmSeverity, FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::EpicsValue;
 
+/// The C `dbCaPutLinkCallback` seam. C issues the put-WITH-completion — the
+/// one a `WAITn` step parks on — only when the link is a `CA_LINK`
+/// (`sseqRecord.c:717/739/763`), so every held put-callback in these tests
+/// arrives over a `ca://` link and lands here.
+///
+/// A [`LinkPutOp::Async`] put (the completion-aware one the sseq's wait path
+/// issues) does not return until the test releases that PV name — the
+/// downstream IOC's callback finally arriving. A [`LinkPutOp::Plain`] put (a
+/// `NoWait` step, or a `WAITn` on a non-CA link, which C cannot wait on)
+/// returns at once.
+#[derive(Default)]
+struct CaHoldState {
+    /// PV names whose held put-callback the test has completed.
+    released: Mutex<HashSet<String>>,
+    /// Every put that arrived, in order: `(pv, value, was_completion_aware)`.
+    puts: Mutex<Vec<(String, EpicsValue, bool)>>,
+}
+
+impl CaHoldState {
+    /// Complete the outstanding put-callback on `pv` (C: the downstream IOC's
+    /// `dbCaPutLinkCallback` callback fires). The analogue of the local
+    /// `complete_async_record` these tests used before, for CA links.
+    fn release(&self, pv: &str) {
+        self.released.lock().unwrap().insert(pv.to_string());
+    }
+    /// How many puts have reached `pv`, and whether any of them was
+    /// completion-aware (`dbCaPutLinkCallback`) rather than plain.
+    fn puts_to(&self, pv: &str) -> Vec<(EpicsValue, bool)> {
+        self.puts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, _)| n == pv)
+            .map(|(_, v, a)| (v.clone(), *a))
+            .collect()
+    }
+}
+
+struct CaHoldLset(Arc<CaHoldState>);
+
+#[epics_base_rs::async_trait]
+impl LinkSet for CaHoldLset {
+    async fn is_connected(&self, _name: &str) -> bool {
+        true
+    }
+    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+        None
+    }
+    async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+        let held = op == LinkPutOp::Async;
+        self.0
+            .puts
+            .lock()
+            .unwrap()
+            .push((name.to_string(), value, held));
+        if held {
+            // The completion-aware put stays outstanding until the test
+            // completes it — this is what keeps the sseq's `WAITn` parked.
+            while !self.0.released.lock().unwrap().contains(name) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        Ok(())
+    }
+    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+        // Connected, DBF_DOUBLE scalar: the destination type sseq's
+        // `processCallback` switch resolves (R16-1) so the step is put at all.
+        Some(LinkMetadata {
+            dbf_type: Some(LinkDbfType::Double),
+            element_count: Some(1),
+            ..Default::default()
+        })
+    }
+}
+
+/// Register the CA hold lset and hand back its state.
+async fn ca_hold(db: &PvDatabase) -> Arc<CaHoldState> {
+    let state = Arc::new(CaHoldState::default());
+    db.register_link_set("ca", Arc::new(CaHoldLset(state.clone())))
+        .await;
+    state
+}
+
+/// A link target must expose a `VAL` field: sseq chooses each step's buffer
+/// from the DESTINATION's DBF type (C `processCallback`'s switch on
+/// `dbGetLinkDBFtype(&lnk)`), and a target whose type does not resolve gets
+/// no put at all (C's `default: break`). C has no field-less record.
+static DOUBLE_VAL_FIELD: &[FieldDesc] = &[FieldDesc {
+    name: "VAL",
+    dbf_type: epics_base_rs::types::DbFieldType::Double,
+    read_only: false,
+}];
+
 /// A target that never finishes its own `process()` — it goes
 /// async-pending and stays there until the test drives
-/// `complete_async_record`. A `WAITn` step writing into it (PP) joins
-/// the sseq's put-notify wait-set and keeps it open, so the sequence
-/// blocks. Models a slow downstream `dbCaPutLinkCallback` target.
+/// `complete_async_record`. Used only where a LOCAL (DB-link) target must
+/// stay pending: C cannot attach a put-callback to a DB link, so a `WAITn`
+/// into this record must NOT block the sequence (R16-3).
 struct AsyncHold {
     val: f64,
 }
@@ -70,7 +163,11 @@ impl Record for AsyncHold {
         }
     }
     fn field_list(&self) -> &'static [FieldDesc] {
-        &[]
+        // A local record ALWAYS names its fields (C has no field-less
+        // record): the link classification resolves `LNKnV` = LOC from the
+        // target field's DBF type, and R16-1's destination switch picks the
+        // step's buffer from it.
+        DOUBLE_VAL_FIELD
     }
 }
 
@@ -95,7 +192,7 @@ impl Record for CountingTarget {
         Ok(())
     }
     fn field_list(&self) -> &'static [FieldDesc] {
-        &[]
+        DOUBLE_VAL_FIELD
     }
 }
 
@@ -186,20 +283,19 @@ fn read_short(db_value: Option<EpicsValue>) -> i16 {
 #[tokio::test]
 async fn sseq_waitn_blocks_until_downstream_completes() {
     let db = PvDatabase::new();
-    // Step-1 target: async — joins the WAIT put-notify set and holds it
-    // open until completed. Step-2 target: a plain sync AO.
-    db.add_record("SSEQ_W_HOLD", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    // Step-1 target: a CA link whose put-callback the lset holds open until
+    // the test completes it (C `dbCaPutLinkCallback`). Step-2 target: a plain
+    // sync AO.
+    let hold = ca_hold(&db).await;
     db.add_record("SSEQ_W_TGT2", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
 
     let mut sseq = SseqRecord::new();
     sseq.selm = 0; // All steps.
-    // Step 1: WAIT (put-with-completion) into the async hold target.
+    // Step 1: WAIT (put-with-completion) into the held CA target.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_W_HOLD PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_W_HOLD".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
     // Step 2: no-wait write into a sync target.
@@ -237,9 +333,17 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
         "WTG1 stays high until the put-callback completes"
     );
 
+    // The put that parked the step was the COMPLETION-AWARE one — C's
+    // `dbCaPutLinkCallback`, not the plain `dbPutLink`.
+    assert_eq!(
+        hold.puts_to("SSEQ_W_HOLD"),
+        vec![(EpicsValue::Double(11.0), true)],
+        "the WAIT step issued exactly one put-with-completion"
+    );
+
     // Complete the downstream — the WAIT put-callback fires, the sequence
     // advances to step 2, runs it, and finishes.
-    db.complete_async_record("SSEQ_W_HOLD").await.unwrap();
+    hold.release("SSEQ_W_HOLD");
 
     poll_double(
         &db,
@@ -405,15 +509,14 @@ async fn sseq_abort_during_delay_finishes_without_dispatch() {
 #[tokio::test]
 async fn sseq_second_abort_escapes_hung_wait_callback() {
     let db = PvDatabase::new();
-    // Async target that never completes — the WAIT step parks forever.
-    db.add_record("SSEQ_HUNG_HOLD", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    // CA target whose put-callback is never completed — the WAIT step parks
+    // forever.
+    let _hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
     sseq.selm = 0;
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_HUNG_HOLD PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_HUNG_HOLD".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
     db.add_record("SSEQ_HUNG", Box::new(sseq)).await.unwrap();
@@ -613,51 +716,123 @@ async fn sseq_link_status_reclassifies_on_special() {
     }
 }
 
-/// Boundary — `WERRn` is REDEFINED from C (sseqRecord.c:915-927). C raises
-/// it for a local DB link with `WAITn` (it cannot `dbCaPutLinkCallback` a
-/// non-CA link); the Rust `WriteDbLinkNotify` seam DOES complete on a local
-/// PP link, so that is not an error here. `WERRn` instead flags `WAITn` set
-/// on a link that can never deliver a completion — a Constant/unset (`CON`)
-/// link. So: WAIT on a local DB link → `WERRn` clears (0); WAIT on an empty
-/// (constant) link → `WERRn` raises (1).
+/// R16-3 boundary — `WERRn` is C `waitConfigErr` (`checkLinks`,
+/// sseqRecord.c:912-933), raised in exactly ONE of the three link-type
+/// branches: the link is a local `DB_LINK` and `WAITn` is not `NoWait` —
+/// the user asked to wait on a link C cannot attach a put-callback to.
+/// It is RESCINDED for a `CA_LINK` (the wait works) and for a
+/// `CONSTANT`/unset link (no put is issued, so there is nothing to wait for).
+///
+/// The pre-fix port had this inverted: it raised `WERRn` on the constant and
+/// never on the local DB link.
 #[tokio::test]
-async fn sseq_werr_wait_on_constant_raises_wait_on_local_clears() {
+async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
     let db = PvDatabase::new();
+    let _hold = ca_hold(&db).await;
     db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
 
     let mut sseq = SseqRecord::new();
-    // Step 1: WAIT on a LOCAL DB link — completable, so no error.
+    // Step 1: WAIT on a LOCAL DB link — C cannot wait on it → WERR1 = 1.
     sseq.put_field("LNK1", EpicsValue::String("SSEQ_WE_TGT".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
-    // Step 2: WAIT on an EMPTY (constant) link — can never complete → error.
+    // Step 2: WAIT on an EMPTY (constant) link — no put at all → not an error.
     sseq.put_field("WAIT2", EpicsValue::Short(1)).unwrap(); // Wait, LNK2 empty
-    // Step 3: control — NoWait on an empty link is not a misconfig.
+    // Step 3: WAIT on a CA link — the wait works → not an error.
+    sseq.put_field("LNK3", EpicsValue::String("ca://SSEQ_WE_REMOTE".into()))
+        .unwrap();
+    sseq.put_field("WAIT3", EpicsValue::Short(1)).unwrap(); // Wait
+    // Step 4: control — NoWait on an empty link is not a misconfig.
     db.add_record("SSEQ_WE", Box::new(sseq)).await.unwrap();
 
-    // The raise is the discriminating transition (default WERR2 == 0).
+    // The raise is the discriminating transition (default WERR1 == 0).
     poll_i16(
         &db,
-        "SSEQ_WE.WERR2",
+        "SSEQ_WE.WERR1",
         1,
-        "WAIT on a constant link raises WERR",
+        "WAIT on a local DB link raises WERR (C: cannot dbCaPutLinkCallback it)",
     )
     .await;
-    // The local-DB step's WAIT must NOT be flagged (the C-inversion).
     poll_i16(&db, "SSEQ_WE.LNK1V", 2, "local LNK → LOC").await;
-    assert_eq!(
-        read_i16(&db, "SSEQ_WE.WERR1").await,
-        0,
-        "WAIT on a local DB link is completable → WERR clears (vs C)"
-    );
     poll_i16(&db, "SSEQ_WE.LNK2V", 3, "empty LNK → CON").await;
+    assert_eq!(
+        read_i16(&db, "SSEQ_WE.WERR2").await,
+        0,
+        "WAIT on a constant link issues no put → C rescinds the error"
+    );
     assert_eq!(
         read_i16(&db, "SSEQ_WE.WERR3").await,
         0,
+        "WAIT on a CA link is exactly what C waits on → no error"
+    );
+    assert_eq!(
+        read_i16(&db, "SSEQ_WE.WERR4").await,
+        0,
         "NoWait on an empty link is not a misconfig → WERR stays 0"
     );
+}
+
+/// R16-3 boundary — the fire-time wait gate. C `processCallback`
+/// (sseqRecord.c:717/739/763) takes the put-WITH-completion only when
+/// `usePutCallback && (lnk.type == CA_LINK)`; a `WAITn` on a DB link falls
+/// through to the plain `dbPutLink` and the step never sets `waiting`.
+///
+/// The target here is a LOCAL record that goes async-pending and never
+/// completes. Pre-fix, the port issued a put-notify into it and the sequence
+/// hung forever on `WTG1`. Under C's rule the step takes the plain put, does
+/// not wait, and the sequence runs straight to the end — while `WERR1` tells
+/// the user the wait they asked for was dropped.
+#[tokio::test]
+async fn sseq_waitn_on_local_db_link_does_not_wait() {
+    let db = PvDatabase::new();
+    // Local target that never finishes its own processing.
+    db.add_record("SSEQ_WDB_HOLD", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_WDB_TGT2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps.
+    // Step 1: WAIT on a LOCAL DB link — C cannot wait, so it must not.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_WDB_HOLD PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
+    // Step 2: proves the sequence advanced past the never-completing step.
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_WDB_TGT2 PP".into()))
+        .unwrap();
+    db.add_record("SSEQ_WDB", Box::new(sseq)).await.unwrap();
+
+    kick(&db, "SSEQ_WDB").await;
+
+    // Step 2 lands and the sequence finishes even though the step-1 target is
+    // still pending — the WAIT was not honoured, exactly as in C.
+    poll_double(
+        &db,
+        "SSEQ_WDB_TGT2",
+        22.0,
+        "step 2 fires: a WAIT on a DB link does not block the sequence",
+    )
+    .await;
+    poll_short(&db, "SSEQ_WDB.BUSY", 0, "sequence finishes without waiting").await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_WDB.WTG1").await.ok()),
+        0,
+        "the step never entered the waiting set (C never sets `waiting` here)"
+    );
+    // ... and the record says so: WERRn is the misconfig report.
+    poll_i16(
+        &db,
+        "SSEQ_WDB.WERR1",
+        1,
+        "WERR1 reports the dropped wait on a DB link",
+    )
+    .await;
 }
 
 /// Concurrency boundary (1) — a `Wait` (full barrier) keeps exactly ONE
@@ -669,23 +844,18 @@ async fn sseq_werr_wait_on_constant_raises_wait_on_local_clears() {
 #[tokio::test]
 async fn sseq_wait_full_barrier_serialises_steps() {
     let db = PvDatabase::new();
-    db.add_record("SSEQ_FB_HOLD1", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
-    db.add_record("SSEQ_FB_HOLD2", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
     sseq.selm = 0; // All steps.
-    // Step 1: Wait → async hold (full barrier for every later step).
+    // Step 1: Wait → held CA put-callback (full barrier for every later step).
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_FB_HOLD1 PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_FB_HOLD1".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
-    // Step 2: also Wait → its own async hold.
+    // Step 2: also Wait → its own held CA put-callback.
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("SSEQ_FB_HOLD2 PP".into()))
+    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_FB_HOLD2".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(1)).unwrap(); // Wait
     db.add_record("SSEQ_FB", Box::new(sseq)).await.unwrap();
@@ -707,7 +877,7 @@ async fn sseq_wait_full_barrier_serialises_steps() {
     );
 
     // Complete step 1 → step 2 now dispatches (and parks on its own hold).
-    db.complete_async_record("SSEQ_FB_HOLD1").await.unwrap();
+    hold.release("SSEQ_FB_HOLD1");
     poll_short(
         &db,
         "SSEQ_FB.WTG2",
@@ -718,7 +888,7 @@ async fn sseq_wait_full_barrier_serialises_steps() {
     poll_short(&db, "SSEQ_FB.WTG1", 0, "step 1 cleared on completion").await;
 
     // Complete step 2 → the sequence drains and finishes.
-    db.complete_async_record("SSEQ_FB_HOLD2").await.unwrap();
+    hold.release("SSEQ_FB_HOLD2");
     poll_short(&db, "SSEQ_FB.BUSY", 0, "sequence finishes after both steps").await;
     poll_short(&db, "SSEQ_FB.WTG2", 0, "step 2 cleared at finish").await;
 }
@@ -739,29 +909,21 @@ async fn sseq_wait_full_barrier_serialises_steps() {
 #[tokio::test]
 async fn sseq_after_n_overlaps_then_barriers() {
     let db = PvDatabase::new();
-    db.add_record("SSEQ_OV_HOLD1", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
-    db.add_record("SSEQ_OV_HOLD2", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
-    db.add_record("SSEQ_OV_HOLD3", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
     sseq.selm = 0; // All steps.
     // After2 = menu index 3 (NoWait=0, Wait=1, After1=2, After2=3).
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_OV_HOLD1 PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_OV_HOLD1".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("SSEQ_OV_HOLD2 PP".into()))
+    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_OV_HOLD2".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO3", EpicsValue::Double(33.0)).unwrap();
-    sseq.put_field("LNK3", EpicsValue::String("SSEQ_OV_HOLD3 PP".into()))
+    sseq.put_field("LNK3", EpicsValue::String("ca://SSEQ_OV_HOLD3".into()))
         .unwrap();
     sseq.put_field("WAIT3", EpicsValue::Short(1)).unwrap(); // Wait
     db.add_record("SSEQ_OV", Box::new(sseq)).await.unwrap();
@@ -784,7 +946,7 @@ async fn sseq_after_n_overlaps_then_barriers() {
     );
 
     // Complete only step 1 → step 3 STILL blocked (step 2's After2 holds it).
-    db.complete_async_record("SSEQ_OV_HOLD1").await.unwrap();
+    hold.release("SSEQ_OV_HOLD1");
     poll_short(&db, "SSEQ_OV.WTG1", 0, "step 1 cleared").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
@@ -799,7 +961,7 @@ async fn sseq_after_n_overlaps_then_barriers() {
     );
 
     // Complete step 2 → both barriers cleared → step 3 dispatches.
-    db.complete_async_record("SSEQ_OV_HOLD2").await.unwrap();
+    hold.release("SSEQ_OV_HOLD2");
     poll_short(
         &db,
         "SSEQ_OV.WTG3",
@@ -810,7 +972,7 @@ async fn sseq_after_n_overlaps_then_barriers() {
     poll_short(&db, "SSEQ_OV.WTG2", 0, "step 2 cleared").await;
 
     // Complete step 3 → finish.
-    db.complete_async_record("SSEQ_OV_HOLD3").await.unwrap();
+    hold.release("SSEQ_OV_HOLD3");
     poll_short(&db, "SSEQ_OV.BUSY", 0, "sequence finishes after step 3").await;
 }
 
@@ -824,23 +986,18 @@ async fn sseq_after_n_overlaps_then_barriers() {
 #[tokio::test]
 async fn sseq_end_drain_waits_for_all_in_flight() {
     let db = PvDatabase::new();
-    db.add_record("SSEQ_DR_HOLD1", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
-    db.add_record("SSEQ_DR_HOLD2", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
     sseq.selm = 0; // All steps.
     // Two After2 steps; no step at index >= 2 exists, so neither barriers the
     // other → both dispatch and overlap, then the sequence end-drains.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DR_HOLD1 PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_DR_HOLD1".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DR_HOLD2 PP".into()))
+    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_DR_HOLD2".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
     db.add_record("SSEQ_DR", Box::new(sseq)).await.unwrap();
@@ -857,7 +1014,7 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
     );
 
     // Complete ONE → drain is not done; BUSY must stay high.
-    db.complete_async_record("SSEQ_DR_HOLD1").await.unwrap();
+    hold.release("SSEQ_DR_HOLD1");
     poll_short(&db, "SSEQ_DR.WTG1", 0, "step 1 drained").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
@@ -872,7 +1029,7 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
     );
 
     // Complete the second → drain finishes.
-    db.complete_async_record("SSEQ_DR_HOLD2").await.unwrap();
+    hold.release("SSEQ_DR_HOLD2");
     poll_short(&db, "SSEQ_DR.BUSY", 0, "drain finishes after both complete").await;
     poll_short(&db, "SSEQ_DR.WTG2", 0, "step 2 cleared at finish").await;
 }
@@ -887,21 +1044,16 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
 #[tokio::test]
 async fn sseq_abort_drains_in_flight_before_finish() {
     let db = PvDatabase::new();
-    db.add_record("SSEQ_ABD_HOLD1", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
-    db.add_record("SSEQ_ABD_HOLD2", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    let hold = ca_hold(&db).await;
 
     let mut sseq = SseqRecord::new();
     sseq.selm = 0; // All steps.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_ABD_HOLD1 PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_ABD_HOLD1".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("SSEQ_ABD_HOLD2 PP".into()))
+    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_ABD_HOLD2".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
     db.add_record("SSEQ_ABD", Box::new(sseq)).await.unwrap();
@@ -923,7 +1075,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
     );
 
     // Complete one → still draining the other.
-    db.complete_async_record("SSEQ_ABD_HOLD1").await.unwrap();
+    hold.release("SSEQ_ABD_HOLD1");
     poll_short(
         &db,
         "SSEQ_ABD.WTG1",
@@ -939,7 +1091,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
     );
 
     // Complete the second → drain finishes; no stranded completion.
-    db.complete_async_record("SSEQ_ABD_HOLD2").await.unwrap();
+    hold.release("SSEQ_ABD_HOLD2");
     poll_short(
         &db,
         "SSEQ_ABD.BUSY",
@@ -971,9 +1123,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
 #[tokio::test]
 async fn sseq_after_n_does_not_block_lower_index_step() {
     let db = PvDatabase::new();
-    db.add_record("SSEQ_NB_HOLD1", Box::new(AsyncHold { val: 0.0 }))
-        .await
-        .unwrap();
+    let hold = ca_hold(&db).await;
     // A sync AO target so step 2's NoWait write lands observably.
     db.add_record("SSEQ_NB_TGT2", Box::new(AoRecord::new(0.0)))
         .await
@@ -983,7 +1133,7 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
     sseq.selm = 0; // All steps.
     // Step 1: After2 (gates index >= 2) into the async hold → in flight.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_NB_HOLD1 PP".into()))
+    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_NB_HOLD1".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     // Step 2 (index 1 < 2): NoWait → sync target; After2 imposes no barrier.
@@ -1016,7 +1166,7 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
     );
 
     // Complete step 1 → the sequence drains and finishes.
-    db.complete_async_record("SSEQ_NB_HOLD1").await.unwrap();
+    hold.release("SSEQ_NB_HOLD1");
     poll_short(
         &db,
         "SSEQ_NB.BUSY",

@@ -997,17 +997,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         Ok([result]) => result,
         Err(_) => return Err(CalcError::StackLeak),
     };
-    // Both of C's evaluator paths end with the same line — `sCalcPerform.c:833`
-    // (no-string) and `:2056` (string):
-    //     return(((isnan(*presult)||isinf(*presult)) ? -1 : 0));
-    // `*presult` is the DOUBLE form of the result: a string result is first
-    // run through `to_double` (:2046-2050). So an expression whose operators
-    // all succeeded still fails the perform when its value is not finite
-    // (`LOG(0)` = -inf, `1e300*1e300` = +inf, `ACOS(2)` = NaN) — the record
-    // then forces VAL=-1 / SVAL="***ERROR***" / CALC_ALARM.
-    if !result.to_double().is_finite() {
-        return Err(CalcError::NonFiniteResult);
-    }
+    // The non-finite tail (`sCalcPerform.c:833`, `:2056`) is NOT this
+    // function's business: C writes `*presult` FIRST and only then returns -1,
+    // so the value survives the failing status and the record decides what to
+    // do with it. That pairing lives in [`ScalcResult`] / [`epilogue`]; an
+    // `Err` here would be C's OTHER -1 — the one an operator raises BEFORE
+    // writing anything.
     Ok(result)
 }
 
@@ -1806,12 +1801,35 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
     out
 }
 
-/// C `sCalcPerform`'s output: the `(*presult, *psresult)` pair, which a record
-/// keeps as `(VAL, SVAL)` or `(OVAL, OSV)`.
+/// C `sCalcPerform`'s output: the `(*presult, *psresult)` pair a record keeps
+/// as `(VAL, SVAL)` or `(OVAL, OSV)`, TOGETHER with the status C returns
+/// beside them.
+///
+/// C has two different `-1`s and they do not mean the same thing:
+///
+/// * an operator refuses (`1/0`, `SQRT(-1)`, a failed `SSCANF`):
+///   `sCalcPerform` returns -1 from inside the loop, BEFORE the epilogue, so
+///   `*presult` is never written and the record's cell keeps its old value.
+///   That is the `Err` from [`eval`] — no result exists.
+/// * every operator succeeds but the result is not finite (`LOG(0)` = -inf,
+///   `1e300*1e300` = +inf, `ACOS(2)` = NaN): the epilogue writes `*presult`
+///   and the LAST line then returns -1
+///   (`return(((isnan(*presult)||isinf(*presult)) ? -1 : 0))`,
+///   `sCalcPerform.c:833`, `:2056`). The cells ARE written. That is this
+///   struct with [`ScalcResult::non_finite`] set.
+///
+/// The two records that consume it read the pair differently, which is why the
+/// value cannot be dropped on the failing status: scalcout replaces it with its
+/// `VAL = -1` / `SVAL = "***ERROR***"` sentinel (sCalcoutRecord.c:361-363),
+/// while transform KEEPS the non-finite value in the channel and merely alarms
+/// (transformRecord.c:593-597) — an `inf` that C then fans out through `OUTA`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScalcResult {
     pub val: f64,
     pub sval: ScalcString,
+    /// C's `-1` from the non-finite tail: the cells above are written, and the
+    /// perform still failed.
+    pub non_finite: bool,
 }
 
 /// C `sCalcPerform`'s epilogue — and there are TWO of them, one per evaluator,
@@ -1848,10 +1866,15 @@ pub struct ScalcResult {
 /// (`lenSresult > 15` always holds: scalcout's buffer is `STRING_SIZE` = 40.)
 pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcResult {
     let val = top.to_double();
+    // C's last line, evaluated on the `*presult` this epilogue just wrote —
+    // for a STRING result that is `to_double(ps)` (`sCalcPerform.c:2046-2050`),
+    // which is exactly `val` here.
+    let non_finite = !val.is_finite();
     if expr.uses_string {
         ScalcResult {
             val,
             sval: top.clone().into_string_value(),
+            non_finite,
         }
     } else {
         let sval = if val.is_nan() {
@@ -1863,7 +1886,11 @@ pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcR
             // and renders in %e. Not clamped to 0; this cast is that conversion.
             ScalcString::from_c(super::cvt::cvt_double_to_string(val, precision as u16))
         };
-        ScalcResult { val, sval }
+        ScalcResult {
+            val,
+            sval,
+            non_finite,
+        }
     }
 }
 

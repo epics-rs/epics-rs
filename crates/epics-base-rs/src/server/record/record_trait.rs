@@ -243,6 +243,21 @@ pub enum ProcessAction {
         value: EpicsValue,
     },
 
+    /// Write an OUT link whose BUFFER the destination picks: the framework
+    /// resolves the target ([`OutTarget`] — C `dbGetLinkDBFtype` /
+    /// `dbGetNelements`) and asks the record for the value through
+    /// [`Record::typed_output_buffer`]. `None` from the record skips the put
+    /// entirely (C `sseqRecord.c::processCallback`'s `default: break`).
+    ///
+    /// The destination-typed sibling of [`Self::WriteDbLink`], which carries
+    /// a buffer the SOURCE already chose. sseq's `LNKn` needs this one: C
+    /// forwards the step's string view or its double view depending on the
+    /// LNKn target's DBF class, decided at fire time, not on what `DOLn`
+    /// delivered.
+    ///
+    /// Executed with (and exactly like) [`Self::WriteDbLink`].
+    WriteDbLinkTyped { link_field: &'static str },
+
     /// Read a value from a DB link into a record field. The framework reads
     /// `link_field` from the record to get the source PV name, reads that PV,
     /// and writes the result into `target_field` via an internal put that
@@ -1892,6 +1907,28 @@ pub trait Record: Send + Sync + 'static {
     ) -> EpicsValue {
         let _ = (link_field, target);
         staged
+    }
+
+    /// The buffer to put on an OUT link the record drives itself, chosen from
+    /// the RESOLVED TARGET — the no-staged-value sibling of
+    /// [`Self::multi_output_buffer`], asked for by
+    /// [`ProcessAction::WriteDbLinkTyped`] and
+    /// [`AsyncDbHandle::put_link_notify_typed`](crate::server::database::AsyncDbHandle::put_link_notify_typed).
+    ///
+    /// C `sseqRecord.c::processCallback` (706-793) is the case: the value a
+    /// step forwards is not one field but a *switch on the destination*
+    /// (`dbGetLinkDBFtype(&lnk)` / `dbGetNelements(&lnk)`), taken at fire
+    /// time — the string view `s` for a string-class target, the double view
+    /// `dov` for a numeric one, `s`'s bytes for a `CHAR`/`UCHAR` array, and
+    /// **no put at all** for a target whose type does not resolve (C's
+    /// `default: break`). `None` is that no-put; the framework skips the
+    /// write and, on the notify path, completes immediately.
+    ///
+    /// Default: `None`. Only a record that emits one of the two typed-write
+    /// seams reaches this, and it must override.
+    fn typed_output_buffer(&self, link_field: &str, target: &OutTarget) -> Option<EpicsValue> {
+        let _ = (link_field, target);
+        None
     }
 
     /// Return the name of the output event (`OEVT`) to post this cycle, or

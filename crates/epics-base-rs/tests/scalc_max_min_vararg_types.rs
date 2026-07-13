@@ -31,11 +31,22 @@
 //! Every expected value below is an output of the compiled upstream
 //! `sCalcPostfix.c` + `sCalcPerform.c`.
 
-use epics_base_rs::calc::{CalcError, StackValue, StringInputs, scalc};
+use epics_base_rs::calc::{
+    CalcError, StackValue, StringInputs, scalc, scalc_compile, scalc_perform,
+};
 
 fn ev(expr: &str) -> Result<StackValue, CalcError> {
     let mut inputs = StringInputs::new();
     scalc(expr, &mut inputs)
+}
+
+/// C `sCalcPerform`'s return code paired with the `*presult` it wrote: a
+/// non-finite result is `st=-1` WITH the value in hand (`sCalcPerform.c:2034-2056`
+/// writes the cell, then `:2056` returns -1).
+fn perform(expr: &str) -> (f64, bool) {
+    let mut inputs = StringInputs::new();
+    let r = scalc_perform(&scalc_compile(expr).unwrap(), &mut inputs, 6).unwrap();
+    (r.val, r.non_finite)
 }
 
 fn num(expr: &str) -> f64 {
@@ -97,8 +108,11 @@ fn strcmp_and_numeric_give_different_answers_and_the_prescan_chooses() {
 /// answer 5.
 #[test]
 fn a_nan_argument_propagates_and_fails_the_perform() {
-    assert_eq!(ev("MAX(NAN,5)"), Err(CalcError::NonFiniteResult));
-    assert_eq!(ev("MAX(5,NAN)"), Err(CalcError::NonFiniteResult));
-    assert_eq!(ev("MIN(NAN,5)"), Err(CalcError::NonFiniteResult));
-    assert_eq!(ev("MIN(5,NAN)"), Err(CalcError::NonFiniteResult));
+    // C writes the NaN into `*presult` and THEN returns -1 (st=-1 d=nan), so
+    // both halves are checked: the value survives the failing status.
+    for expr in ["MAX(NAN,5)", "MAX(5,NAN)", "MIN(NAN,5)", "MIN(5,NAN)"] {
+        let (val, non_finite) = perform(expr);
+        assert!(val.is_nan(), "{expr}: C writes d=nan into *presult");
+        assert!(non_finite, "{expr}: C PERFORM st=-1");
+    }
 }

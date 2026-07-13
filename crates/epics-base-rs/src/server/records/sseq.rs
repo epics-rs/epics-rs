@@ -1,11 +1,12 @@
 use super::link_status::{
-    DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkStatusGen,
-    classify_link,
+    DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_LOC as LNKV_LOC,
+    LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkStatusGen, classify_link, link_is_external,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, LinkType, OutTarget, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -26,6 +27,12 @@ const SSEQ_WAIT_CHOICES: &[&str] = &[
 ];
 
 const NUM_STEPS: usize = 10;
+
+/// Size of a step's string view `STRn` — C `char s[40]` (`MAX_STRING_SIZE`,
+/// sseqRecord.h). The `CHAR`/`UCHAR` destination arm of `processCallback`
+/// clamps its element count to this buffer (`if (n_elements>40) n_elements=40`,
+/// sseqRecord.c:683,766).
+const SSEQ_STRING_SIZE: usize = 40;
 
 /// `SELM` menu indices (C `menu(sseqSELM)`): the step-selection mode.
 const SELM_ALL: i16 = 0;
@@ -64,6 +71,50 @@ const LT_FIELDS: [&str; NUM_STEPS] = [
 ];
 const WERR_FIELDS: [&str; NUM_STEPS] = [
     "WERR1", "WERR2", "WERR3", "WERR4", "WERR5", "WERR6", "WERR7", "WERR8", "WERR9", "WERRA",
+];
+/// C `waitConfigErr` (`checkLinks`, sseqRecord.c:912-933): the user asked to
+/// wait on a link C cannot attach a put-completion callback to.
+///
+/// C raises it in exactly ONE of `checkLinks`'s three link-type branches — the
+/// link is a `DB_LINK` (a local PV, so `LNKnV == LOC`) and `WAITn` is not
+/// `NoWait` — and rescinds it in the other two (`CA_LINK`, and
+/// `CONSTANT`/unset). A `WAITn` on a constant is NOT an error: there is no put
+/// at all, so there is nothing to wait for.
+///
+/// This is the same question [`SseqRecord::lnk_is_ca`] asks for the fire-time
+/// wait gate, from the other side: `fire_current_step` drops the wait on a
+/// non-CA link, and `WERRn` is the record telling the user it was dropped.
+fn wait_config_err(wait: i16, lnk_status: i16) -> i16 {
+    i16::from(wait != 0 && lnk_status == LNKV_LOC)
+}
+
+/// The partner view each half of a step's value pair posts when it is written
+/// (C `special()` posts `s` after a `DOn` put and `dov` after a `STRn` put) —
+/// one single-element slice per step, so `monitor_side_effect_fields` can
+/// return a `&'static [&'static str]`.
+const STR_SIDE_EFFECT: [&[&str]; NUM_STEPS] = [
+    &["STR1"],
+    &["STR2"],
+    &["STR3"],
+    &["STR4"],
+    &["STR5"],
+    &["STR6"],
+    &["STR7"],
+    &["STR8"],
+    &["STR9"],
+    &["STRA"],
+];
+const DO_SIDE_EFFECT: [&[&str]; NUM_STEPS] = [
+    &["DO1"],
+    &["DO2"],
+    &["DO3"],
+    &["DO4"],
+    &["DO5"],
+    &["DO6"],
+    &["DO7"],
+    &["DO8"],
+    &["DO9"],
+    &["DOA"],
 ];
 
 /// State of the sseq async sequence machine.
@@ -122,20 +173,6 @@ struct InFlight {
     done: Arc<AtomicBool>,
 }
 
-/// Which native type the connected `DOLn` link last delivered, so the
-/// `LNKn` write forwards the matching DBR type. C `processCallback` selects
-/// this with `dol_field_type` at the `dbGetLink` — a string-class target is
-/// read with `DBR_STRING` into `s`/`STRn`, a numeric one with `DBR_DOUBLE`
-/// into `dov`/`DOn` (sseqRecord.c:643-705) — and writes `LNKn` with the
-/// matching type (sseqRecord.c:714-756). Captured from the actual value the
-/// `ReadDbLink` read delivered, so it does not depend on the asynchronously
-/// classified `dol_field_type` (`DTn`) being resolved yet.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DolKind {
-    Numeric,
-    String,
-}
-
 /// A single step in the string sequence.
 #[derive(Clone)]
 struct SseqStep {
@@ -144,12 +181,8 @@ struct SseqStep {
     dov: f64,          // Numeric value (DOn)
     lnk: String,       // Output link (LNKn)
     str_val: PvString, // String value (STRn)
-    // Native type the last connected-DOL read delivered (selects the LNKn
-    // forward type). A `DBF_STRING` DOL source must reach `LNKn` as a string,
-    // not collapse through `dov` (Double).
-    dol_kind: DolKind,
-    wait: i16,     // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
-    waiting: bool, // WTGn — an outstanding put-callback for this step
+    wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
+    waiting: bool,     // WTGn — an outstanding put-callback for this step
     // Link-status diagnostics, refreshed by `refresh_link_status` from C
     // `sseqRecord.c:checkLinks` (sseqRecord.c:848-969). Defaulted to the
     // C `init_record` classification of an empty (constant) link.
@@ -160,6 +193,32 @@ struct SseqStep {
     wait_err: i16,       // WERRn — wait-config error (see refresh_link_status)
 }
 
+impl SseqStep {
+    /// Write the step's value FROM its numeric view, re-deriving the string
+    /// view — the single owner of `dov → s` (C `cvtDoubleToString(dov, s,
+    /// pR->prec)`).
+    ///
+    /// `DOn` and `STRn` are two views of ONE value, and C reconciles them at
+    /// every write site: `special()` on a `DOn` put (sseqRecord.c:1108-1116),
+    /// `special()` on a `STRn` put (:1128-1131), `init_record` (:242-249), and
+    /// the `processCallback` link read (:657-661, :676-680). A write that
+    /// updates one view and leaves the other stale is the defect — so no site
+    /// assigns `dov`/`str_val` directly; every one goes through this pair.
+    fn set_numeric(&mut self, dov: f64, prec: i16) {
+        self.dov = dov;
+        self.str_val = PvString::from(crate::types::cvt_double_to_string(dov, prec.max(0) as u16));
+    }
+
+    /// Write the step's value FROM its string view, re-deriving the numeric
+    /// view — the single owner of `s → dov` (C `dov = atof(s)`). The string
+    /// is kept byte-exact; a non-numeric string is `0.0`, exactly as `atof`
+    /// reports it.
+    fn set_string(&mut self, s: PvString) {
+        self.dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+        self.str_val = s;
+    }
+}
+
 impl Default for SseqStep {
     fn default() -> Self {
         Self {
@@ -168,7 +227,6 @@ impl Default for SseqStep {
             dov: 0.0,
             lnk: String::new(),
             str_val: PvString::default(),
-            dol_kind: DolKind::Numeric,
             wait: 0,
             waiting: false,
             // An empty link is a CONSTANT link with no resolvable field type
@@ -318,37 +376,6 @@ impl SseqRecord {
                 (self.seln & (1 << step_idx)) != 0
             }
             _ => false,
-        }
-    }
-
-    /// The value this step forwards to its `LNKn`.
-    ///
-    /// C `processCallback` (sseqRecord.c:643-705) reads `DOLn` typed by
-    /// `dol_field_type` into both a string (`s`/`STRn`) and a double
-    /// (`dov`/`DOn`), then writes `LNKn` with the matching DBR type
-    /// (sseqRecord.c:714-756). A connected `DOLn` whose source is string-class
-    /// must therefore reach `LNKn` as the string, byte-exact — not collapse
-    /// through `DOn` (Double). `pre_process_actions` performs that typed read
-    /// via `ReadDbLink` and `put_field_internal` records which native type the
-    /// link delivered (`dol_kind`).
-    ///
-    /// Precedence: a connected `DOLn` → the type it delivered (`dol_kind`);
-    /// a constant link with a non-empty `STRn` → the string constant;
-    /// otherwise the `DOn` constant.
-    fn step_value(&self, i: usize) -> EpicsValue {
-        let s = &self.steps[i];
-        let forward_string = if s.dol.is_empty() {
-            // Constant link: a configured `STRn` is a string constant,
-            // otherwise the `DOn` numeric constant.
-            !s.str_val.is_empty()
-        } else {
-            // Connected `DOLn`: forward the type the link actually delivered.
-            s.dol_kind == DolKind::String
-        };
-        if forward_string {
-            EpicsValue::String(s.str_val.clone())
-        } else {
-            EpicsValue::Double(s.dov)
         }
     }
 
@@ -530,38 +557,75 @@ impl SseqRecord {
         }
     }
 
+    /// Whether step `i`'s `LNKn` is what C calls a `CA_LINK` — the single
+    /// question C's put-with-completion turns on (`plinkGroup->lnk.type ==
+    /// CA_LINK`, sseqRecord.c:717/739/763) and the one `checkLinks` turns
+    /// `WERRn` on (:912-933).
+    ///
+    /// C decides it at `dbInitLink` by LOCALITY: an explicit `CA` link, or a
+    /// PV name that is not a record of this IOC, is a `CA_LINK`; a name that
+    /// resolves here is a `DB_LINK`; an empty link is `CONSTANT`. Both halves
+    /// are answered here — the scheme from the link string itself, the
+    /// locality from the cached `LNKnV` classification (`checkLinks`'s own
+    /// `lnk_status`, which [`link_is_external`] reads as C's `CA_LINK`).
+    ///
+    /// C's `lnk.type` is likewise a CACHE, set at `init_record` and refreshed
+    /// by `special()`/`checkLinks`. The port's cache is filled by the spawned
+    /// [`Self::refresh_link_status`], so a DB-syntax link whose classification
+    /// has not landed yet reads its `CON` default and is treated as NOT a CA
+    /// link — the local reading, which is what the same link gets in C when
+    /// the name does resolve here.
+    fn lnk_is_ca(&self, i: usize) -> bool {
+        match parse_link_v2(&self.steps[i].lnk).link_type() {
+            // Explicit `ca://` / `pva://`: a CA link whatever it resolves to,
+            // so this needs no classification round-trip.
+            LinkType::Ca | LinkType::Other => true,
+            // DB syntax: a CA link exactly when the name is NOT on this IOC.
+            LinkType::Db => link_is_external(self.steps[i].lnk_status),
+            // Constant / unset: C `CONSTANT`, never a CA link.
+            LinkType::Empty | LinkType::Constant => false,
+        }
+    }
+
     /// Fire `active[cursor]` (C `processCallback`): forward the step value to
     /// `LNKn`, then advance. A `WAITn` step is dispatched WITHOUT blocking the
     /// machine — its put-callback joins `in_flight` and the sequence moves on,
     /// so several callbacks overlap exactly as C runs them.
+    ///
+    /// The forwarded BUFFER is not chosen here: both put seams are the
+    /// destination-typed ones ([`ProcessAction::WriteDbLinkTyped`] /
+    /// `put_link_notify_typed`), so the framework resolves the `LNKn` target
+    /// and asks [`Self::typed_output_buffer`] — C's `processCallback` switch
+    /// on `dbGetLinkDBFtype(&lnk)` (sseqRecord.c:706-793).
     fn fire_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
         let i = self.active[self.cursor];
-        let value = self.step_value(i);
         let has_lnk = !self.steps[i].lnk.is_empty();
         // C `processCallback` (sseqRecord.c:717,739,763) uses the
         // put-WITH-completion (`dbCaPutLinkCallback`, setting `waiting`) only
-        // when `usePutCallback` (`WAITn != NoWait`).
-        let waits = self.steps[i].wait != 0;
+        // when `usePutCallback && (plinkGroup->lnk.type == CA_LINK)`. A
+        // `WAITn` on a DB link takes the plain `dbPutLink` and never waits —
+        // C cannot attach a callback to it, and says so through `WERRn`
+        // (`checkLinks`, :915-927).
+        let waits = self.steps[i].wait != 0 && self.lnk_is_ca(i);
 
         if waits && has_lnk {
             // Non-blocking dispatch: the put-callback goes in flight and the
             // machine advances. C `processCallback` increments `pcb->index`
             // and calls `processNextLink` straight after firing, leaving the
             // just-fired step `waiting` for the barrier scan to honour.
-            self.dispatch_waiting_step(i, value, live);
+            self.dispatch_waiting_step(i, live);
             self.cursor += 1;
             return self.advance_sequence(live);
         }
 
-        // No-wait step: a plain `dbPutLink` (`WriteDbLink`), then advance in
-        // the same cycle. The write rides ahead of the next step's scheduling
-        // action (or the drain / `Complete` tail), so `LNKn` lands before the
-        // sequence moves on.
+        // No-wait step: a plain `dbPutLink` (`WriteDbLinkTyped`), then advance
+        // in the same cycle. The write rides ahead of the next step's
+        // scheduling action (or the drain / `Complete` tail), so `LNKn` lands
+        // before the sequence moves on.
         let mut actions = Vec::new();
         if has_lnk {
-            actions.push(ProcessAction::WriteDbLink {
+            actions.push(ProcessAction::WriteDbLinkTyped {
                 link_field: LNK_FIELDS[i],
-                value,
             });
         }
         self.cursor += 1;
@@ -583,12 +647,7 @@ impl SseqRecord {
     /// sets `done` and notifies — so a waiter abandoned by a double `ABORT`
     /// cannot corrupt a later sequence (C `putCallbackCB`'s `waiting == 0`
     /// guard against abandoned callbacks, sseqRecord.c:540-560).
-    fn dispatch_waiting_step(
-        &mut self,
-        i: usize,
-        value: EpicsValue,
-        live: &mut Vec<(String, EpicsValue)>,
-    ) {
+    fn dispatch_waiting_step(&mut self, i: usize, live: &mut Vec<(String, EpicsValue)>) {
         self.steps[i].waiting = true;
         live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
         let done = Arc::new(AtomicBool::new(false));
@@ -604,7 +663,7 @@ impl SseqRecord {
             let link = self.steps[i].lnk.clone();
             tokio::spawn(async move {
                 if let Some(rx) = handle
-                    .put_link_notify(&name, LNK_FIELDS[i], &link, value)
+                    .put_link_notify_typed(&name, LNK_FIELDS[i], &link)
                     .await
                 {
                     // `Err` means the put vanished without firing — treat it as
@@ -738,14 +797,6 @@ impl SseqRecord {
     ///     external link reports `EXT_NC` and `DTn`/`LTn` = unknown, not C's
     ///     `EXT`/`EXT_NC` connection toggle (sseqRecord.c:862-941). This is
     ///     a cross-crate limitation: epics-base-rs has no CA/PVA client.
-    ///   * `WERRn` is INVERTED from C. C raises it for a local DB link with
-    ///     `WAITn` set, because it cannot `dbCaPutLinkCallback` a non-CA
-    ///     link (sseqRecord.c:915-927). The Rust put-with-completion seam
-    ///     (`put_link_notify`) DOES complete on a local PP link, so that is
-    ///     no longer an error.
-    ///     `WERRn` is redefined for the Rust-meaningful misconfig: `WAITn`
-    ///     set on a link that can never deliver a completion — a
-    ///     Constant/unset (`CON`) link.
     ///   * C's 0.5s connection re-poll timer (sseqRecord.c:957-963) is
     ///     skipped: epics-base-rs surfaces no link connection-change signal
     ///     to drive it. The refresh runs at record init, on `special()` of
@@ -777,14 +828,7 @@ impl SseqRecord {
             for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
                 let (dol_status, dol_ft) = classify_link(&handle, dol).await;
                 let (lnk_status, lnk_ft) = classify_link(&handle, lnk).await;
-                // Redefined `WERRn`: `WAITn` on a link that can never deliver
-                // a completion (a Constant/unset = `CON` link). See the
-                // method doc-comment and sseqRecord.c:915-927.
-                let werr = if *wait != 0 && lnk_status == LNKV_CON {
-                    1
-                } else {
-                    0
-                };
+                let werr = wait_config_err(*wait, lnk_status);
                 fields.push((
                     DOLV_FIELDS[i].to_string(),
                     EpicsValue::Enum(dol_status as u16),
@@ -905,22 +949,41 @@ impl Record for SseqRecord {
     /// are the same rounded number. (C's `db_post_events` here runs during
     /// iocInit, before any client can subscribe, so it has no observable
     /// effect; the rounded field value does.)
+    ///
+    /// The same loop then reconciles each step's value pair
+    /// (sseqRecord.c:242-249): a `.db` file may set `DOn`, `STRn`, or
+    /// neither, and C makes the two views agree before the record can run —
+    /// a configured `STRn` wins (`dov = atof(s)`), otherwise `STRn` is
+    /// rendered from `DOn` at the record's PREC. Without it a
+    /// `field(DO1,"3")` record starts with an empty `STR1`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            let prec = self.prec;
             for step in &mut self.steps {
                 step.dly = crate::runtime::time::quantize_to_sleep_quantum(step.dly);
+                if step.str_val.is_empty() {
+                    step.set_numeric(step.dov, prec);
+                } else {
+                    step.set_string(step.str_val.clone());
+                }
             }
         }
         Ok(())
     }
 
-    /// A put to any `DLYn` re-quantizes and posts DLY1 — see `special()` for
-    /// the C quirk that makes it DLY1 and not the field written.
+    /// The partner view a put to one half of a step's value pair refreshes.
+    ///
+    /// C `special()` writes the other view and posts it: a `DOn` put renders
+    /// `STRn` (sseqRecord.c:1108-1116), a `STRn` put re-reads `DOn`
+    /// (:1128-1131). A put to any `DLYn` re-quantizes and posts DLY1 — see
+    /// `special()` for the C quirk that makes it DLY1 and not the field
+    /// written.
     fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        if Self::step_index_from_suffix(put_field).is_some_and(|(_, p)| p == "DLY") {
-            &["DLY1"]
-        } else {
-            &[]
+        match Self::step_index_from_suffix(put_field) {
+            Some((_, "DLY")) => &["DLY1"],
+            Some((i, "DO")) => STR_SIDE_EFFECT[i],
+            Some((i, "STR")) => DO_SIDE_EFFECT[i],
+            _ => &[],
         }
     }
 
@@ -1115,10 +1178,70 @@ impl Record for SseqRecord {
 
     // `SseqRecord` does NOT implement `Record::multi_output_links`: the
     // per-step `LNKn` writes are driven here, in `process()` — a no-wait step
-    // via `WriteDbLink`, a `WAITn` step via the `put_link_notify` seam
-    // (C `sseqRecord.c::processCallback`) — not by the generic multi-output
-    // block. The retired `dispatch_multi_output` `MultiOut::Sseq` arm was the
-    // old all-at-once path and no longer exists.
+    // via `WriteDbLinkTyped`, a `WAITn` step via the `put_link_notify_typed`
+    // seam (C `sseqRecord.c::processCallback`) — not by the generic
+    // multi-output block. The retired `dispatch_multi_output` `MultiOut::Sseq`
+    // arm was the old all-at-once path and no longer exists.
+
+    /// C `processCallback`'s destination switch (sseqRecord.c:706-793): the
+    /// step forwards the view of its value that the `LNKn` TARGET's DBF class
+    /// asks for, never the one its `DOLn` source happened to deliver.
+    ///
+    /// `DOn`/`STRn` are two views of one value (C `dov` / `s`), so both are
+    /// always available here — which one goes on the wire is the destination's
+    /// choice, exactly as C's `switch (plinkGroup->lnk_field_type)`:
+    ///
+    /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
+    ///   (:714-736) — `DBR_STRING` from `s`/`STRn`. All seven classes are
+    ///   reported by [`OutTarget::puts_as_string`] (the port's `DbFieldType`
+    ///   is a DBR wire type, with no `Menu`/`Device` variant to match on).
+    /// - `DBF_SHORT`/`USHORT`/`LONG`/`ULONG`/`FLOAT`/`DOUBLE` (:738-760) —
+    ///   `DBR_DOUBLE` from `dov`/`DOn`.
+    /// - `DBF_CHAR`/`DBF_UCHAR` (:762-790) — `n_elements > 1` (the long-string
+    ///   idiom: a `CHAR` waveform) puts `min(n_elements, 40)` bytes of the
+    ///   40-byte `s` as a char array; a scalar `CHAR` target takes `DBR_DOUBLE`
+    ///   from `dov`.
+    /// - anything else (:792, `default: break`) — **no put at all**. That
+    ///   covers a `LNKn` whose type does not resolve (constant link,
+    ///   disconnected CA link: `dbGetLinkDBFtype` → `DBF_unknown`) and, in C
+    ///   as here, `DBF_INT64`/`DBF_UINT64`: the switch has no case for the
+    ///   64-bit integer classes, so an `int64out` destination is silently not
+    ///   written. That is C's behaviour, reproduced rather than repaired.
+    fn typed_output_buffer(&self, link_field: &str, target: &OutTarget) -> Option<EpicsValue> {
+        let Some((i, "LNK")) = Self::step_index_from_suffix(link_field) else {
+            return None;
+        };
+        let step = &self.steps[i];
+        if target.puts_as_string {
+            return Some(EpicsValue::String(step.str_val.clone()));
+        }
+        match target.field_type? {
+            DbFieldType::String | DbFieldType::Enum => {
+                Some(EpicsValue::String(step.str_val.clone()))
+            }
+            DbFieldType::Char | DbFieldType::UChar => {
+                if target.element_count > 1 {
+                    // C puts `n` bytes straight out of the 40-byte `s`, so the
+                    // string is NUL-padded out to the requested count.
+                    let n = target.element_count.min(SSEQ_STRING_SIZE as i64) as usize;
+                    let mut buf = step.str_val.as_bytes().to_vec();
+                    buf.resize(n, 0);
+                    Some(EpicsValue::CharArray(buf))
+                } else {
+                    Some(EpicsValue::Double(step.dov))
+                }
+            }
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(EpicsValue::Double(step.dov)),
+            // C's switch has no `DBF_INT64`/`DBF_UINT64` case → `default:
+            // break` → no put.
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+        }
+    }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
@@ -1191,36 +1314,25 @@ impl Record for SseqRecord {
         // (then `dov = atof(s)`), NOT collapsed to a double
         // (sseqRecord.c:643-705). A *client* put to `DOn` (`put_field`) is a
         // plain `DBF_DOUBLE` convert, so this string-preserving capture is
-        // internal-only; it also records which native type the link delivered
-        // so the `LNKn` write forwards the matching DBR type.
+        // internal-only. Which view then reaches `LNKn` is the DESTINATION's
+        // choice, not the source's — see `typed_output_buffer`.
         if let Some((idx, "DO")) = Self::step_index_from_suffix(name) {
             match value {
+                // C `processCallback` string arm (:657-661): the bytes are kept
+                // exactly and `dov` follows as `atof(s)`.
                 EpicsValue::String(s) => {
-                    // Numeric view tracks C's `dov = atof(s)`; `str_val` keeps
-                    // the bytes exactly (no lossy conversion on the value).
-                    let dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
-                    let step = &mut self.steps[idx];
-                    step.dov = dov;
-                    step.str_val = s;
-                    step.dol_kind = DolKind::String;
+                    self.steps[idx].set_string(s);
                     return Ok(());
                 }
+                // C `processCallback` numeric arm (:676-680): after reading
+                // `dov` it renders `s` with `cvtDoubleToString(dov, str, prec)`
+                // rather than leaving the prior string stale.
                 other => {
                     let dov = other
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
-                    // C `processCallback` numeric arm: after reading `dov` it
-                    // runs `cvtDoubleToString(dov, str, prec)` and copies the
-                    // formatted value back into `s`/`STRn`, posting it when it
-                    // changed (sseqRecord.c:676-679). Mirror that so a numeric
-                    // `DOLn` refreshes `STRn` with the record-PREC rendering of
-                    // the value rather than leaving the prior string stale.
-                    let prec = self.prec.max(0) as u16;
-                    let s = crate::types::cvt_double_to_string(dov, prec);
-                    let step = &mut self.steps[idx];
-                    step.dov = dov;
-                    step.str_val = PvString::from(s);
-                    step.dol_kind = DolKind::Numeric;
+                    let prec = self.prec;
+                    self.steps[idx].set_numeric(dov, prec);
                     return Ok(());
                 }
             }
@@ -1339,6 +1451,7 @@ impl Record for SseqRecord {
                     return Ok(());
                 }
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
+                    let prec = self.prec;
                     let step = &mut self.steps[idx];
                     return match prefix {
                         "DLY" => {
@@ -1354,10 +1467,14 @@ impl Record for SseqRecord {
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
+                        // C `special()` on a `DOn` put (sseqRecord.c:1108-1116)
+                        // re-renders `STRn` from the new `DOn` at the record's
+                        // PREC — the two are one value, never independent.
                         "DO" => {
-                            step.dov = value
+                            let dov = value
                                 .to_f64()
                                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                            step.set_numeric(dov, prec);
                             Ok(())
                         }
                         "LNK" => match value {
@@ -1367,9 +1484,11 @@ impl Record for SseqRecord {
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
+                        // C `special()` on a `STRn` put (sseqRecord.c:1128-1131)
+                        // re-reads `DOn` as `atof(s)`.
                         "STR" => match value {
                             EpicsValue::String(s) => {
-                                step.str_val = s;
+                                step.set_string(s);
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1445,6 +1564,7 @@ impl Record for SseqRecord {
 
 #[cfg(test)]
 mod tests {
+    use super::super::link_status::LINK_EXT_NC as LNKV_EXT_NC;
     use super::*;
 
     #[test]
@@ -1486,7 +1606,9 @@ mod tests {
         rec.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
 
         assert_eq!(rec.get_field("DLY1"), Some(EpicsValue::Double(1.5)));
-        assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(42.0)));
+        // DO1/STR1 are ONE value (C `special()`): the later `STR1="hello"` put
+        // re-read DO1 as `atof("hello")` = 0.0, dropping the earlier 42.0.
+        assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(0.0)));
         assert_eq!(
             rec.get_field("STR1"),
             Some(EpicsValue::String("hello".into()))
@@ -1513,7 +1635,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(rec.get_field("DLYA"), Some(EpicsValue::Double(2.0)));
-        assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(99.0)));
+        // As above: the `STRA="step10"` put re-read DOA as `atof` = 0.0.
+        assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(0.0)));
         assert_eq!(
             rec.get_field("STRA"),
             Some(EpicsValue::String("step10".into()))
@@ -1637,22 +1760,143 @@ mod tests {
         assert_eq!(rec.get_field("ABORTING"), Some(EpicsValue::Short(0)));
     }
 
+    /// R16-3 — `WERRn` follows C `checkLinks` (sseqRecord.c:912-933): raised
+    /// ONLY for a local DB link with `WAITn` set, cleared for a CA link and
+    /// for a constant. One case per branch of C's link-type switch, times the
+    /// `WAITn` on/off boundary.
     #[test]
-    fn test_sseq_werr_wait_on_constant_link_default() {
-        // WERRn is redefined (vs C): WAITn set on a link that can never
-        // deliver a completion — a Constant/unset (CON) link. A bare
-        // SseqRecord with no async context still classifies an empty link
-        // as CON, so a WAIT on it reads as a config error once a refresh
-        // posts. Here, with no runtime, the default WERRn stays 0 (the
-        // refresh that raises it needs the async surface); this pins that
-        // the static default is non-erroring. The live raise/clear boundary
-        // is covered by the async integration test.
+    fn test_sseq_wait_config_err_matches_c_check_links() {
+        // DB_LINK (local PV) + wait: the one branch C raises. C cannot
+        // dbCaPutLinkCallback a DB link, so the requested wait is dropped.
+        assert_eq!(wait_config_err(1, LNKV_LOC), 1);
+        // Same link, NoWait: rescinded.
+        assert_eq!(wait_config_err(0, LNKV_LOC), 0);
+        // CA_LINK: the wait works — never an error, wait or not. Both external
+        // statuses ("Ext PV NC" = 0, "Ext PV OK" = 1) are CA links to C.
+        assert_eq!(wait_config_err(1, LNKV_EXT_NC), 0);
+        assert_eq!(wait_config_err(1, 1), 0);
+        // CONSTANT / unset: no put is issued at all, so nothing to wait for.
+        // C's `else` branch rescinds the error here; the pre-fix port RAISED
+        // it, which is the inversion R16-3 names.
+        assert_eq!(wait_config_err(1, LNKV_CON), 0);
+        assert_eq!(wait_config_err(0, LNKV_CON), 0);
+    }
+
+    /// R16-3 — the fire-time wait gate keys on C's `lnk.type == CA_LINK`
+    /// (sseqRecord.c:717/739/763), which `dbInitLink` decides by LOCALITY.
+    /// One case per `LinkType`, plus the DB-syntax local/remote split.
+    #[test]
+    fn test_sseq_lnk_is_ca_matches_c_link_type() {
         let mut rec = SseqRecord::new();
-        rec.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
-        assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(0)));
-        // The internal status post-back path stores what the refresh computes.
-        rec.put_field("WERR1", EpicsValue::Short(1)).unwrap();
-        assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(1)));
+        // Empty / constant → C CONSTANT: never a CA link.
+        assert!(!rec.lnk_is_ca(0));
+        rec.put_field("LNK1", EpicsValue::String("3.14".into()))
+            .unwrap();
+        assert!(!rec.lnk_is_ca(0));
+        // Explicit ca:// → CA_LINK regardless of what it resolves to.
+        rec.put_field("LNK1", EpicsValue::String("ca://other:pv.VAL".into()))
+            .unwrap();
+        assert!(rec.lnk_is_ca(0));
+        // DB syntax naming a record of THIS IOC → DB_LINK.
+        rec.put_field("LNK1", EpicsValue::String("local:pv.VAL PP".into()))
+            .unwrap();
+        rec.steps[0].lnk_status = LNKV_LOC;
+        assert!(!rec.lnk_is_ca(0));
+        // DB syntax naming a PV that is NOT on this IOC → C resolves it
+        // through CA, so it is a CA_LINK.
+        rec.steps[0].lnk_status = LNKV_EXT_NC;
+        assert!(rec.lnk_is_ca(0));
+        // DB syntax not yet classified (the refresh has not landed): read as
+        // the LOCAL case, never as a CA link — a step must never park on a
+        // put-callback the link cannot deliver.
+        rec.steps[0].lnk_status = LNKV_CON;
+        assert!(!rec.lnk_is_ca(0));
+    }
+
+    /// R16-2 — `DOn` and `STRn` are two views of ONE value, reconciled at
+    /// every write. C does it at four sites; the port had only the link-read
+    /// one. Boundaries: numeric put → string view re-rendered at PREC; string
+    /// put → numeric view re-read as `atof`; a non-numeric string → 0.0; the
+    /// pair does not go stale across a put to the other half.
+    #[test]
+    fn test_sseq_do_str_are_one_value() {
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+
+        // C special(DOn): cvtDoubleToString(dov, s, prec).
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(3.7)));
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("3.70".into())),
+            "a DOn put must re-render STRn at the record's PREC"
+        );
+
+        // C special(STRn): dov = atof(s).
+        rec.put_field("STR1", EpicsValue::String("5".into()))
+            .unwrap();
+        assert_eq!(rec.get_field("STR1"), Some(EpicsValue::String("5".into())));
+        assert_eq!(
+            rec.get_field("DO1"),
+            Some(EpicsValue::Double(5.0)),
+            "a STRn put must re-read DOn as atof(STRn)"
+        );
+
+        // A non-numeric string is atof → 0.0, and the string stays byte-exact.
+        rec.put_field("STRA", EpicsValue::String("abc".into()))
+            .unwrap();
+        assert_eq!(rec.get_field("DOA"), Some(EpicsValue::Double(0.0)));
+        assert_eq!(
+            rec.get_field("STRA"),
+            Some(EpicsValue::String("abc".into()))
+        );
+
+        // STRn="abc" then DOn=3.7 → the string follows the LAST write, so the
+        // step forwards "3.70", not the stale "abc".
+        rec.put_field("DOA", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.get_field("STRA"),
+            Some(EpicsValue::String("3.70".into())),
+            "the later DOn put must overwrite the earlier STRn"
+        );
+    }
+
+    /// R16-2, init boundary — C `init_record` (sseqRecord.c:242-249)
+    /// reconciles the pair before the record can run: a `.db`-configured
+    /// `STRn` wins (`dov = atof(s)`), otherwise `STRn` is rendered from `DOn`.
+    #[test]
+    fn test_sseq_init_reconciles_the_value_pair() {
+        // field(DO1,"3") with no STR1 → C renders STR1 = "3.00" at PREC=2.
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+        rec.steps[0].dov = 3.0;
+        rec.init_record(0).unwrap();
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("3.00".into()))
+        );
+
+        // field(STR2,"7.5") with no DO2 → C takes dov = atof(s) = 7.5.
+        let mut rec = SseqRecord::new();
+        rec.steps[1].str_val = PvString::from("7.5");
+        rec.init_record(0).unwrap();
+        assert_eq!(rec.get_field("DO2"), Some(EpicsValue::Double(7.5)));
+        assert_eq!(
+            rec.get_field("STR2"),
+            Some(EpicsValue::String("7.5".into())),
+            "the configured string is kept byte-exact, not re-rendered"
+        );
+    }
+
+    /// R16-2 — a put to one view posts the other (C `special()`'s
+    /// `db_post_events` on the partner field).
+    #[test]
+    fn test_sseq_value_pair_posts_its_partner() {
+        let rec = SseqRecord::new();
+        assert_eq!(rec.monitor_side_effect_fields("DO1"), &["STR1"]);
+        assert_eq!(rec.monitor_side_effect_fields("STRA"), &["DOA"]);
+        assert_eq!(rec.monitor_side_effect_fields("DLY3"), &["DLY1"]);
+        assert!(rec.monitor_side_effect_fields("LNK1").is_empty());
     }
 
     #[test]

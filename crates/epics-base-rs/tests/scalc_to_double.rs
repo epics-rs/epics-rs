@@ -11,7 +11,7 @@
 //! this host. The cases are the edges where the two rules disagree, and where a
 //! strict parse (what the port did) disagrees with both.
 
-use epics_base_rs::calc::{StackValue, StringInputs, scalc};
+use epics_base_rs::calc::{StackValue, StringInputs, scalc, scalc_compile, scalc_perform};
 
 fn dbl(s: &str) -> f64 {
     let mut inp = StringInputs::new();
@@ -92,14 +92,23 @@ fn the_coercion_is_atof_not_the_hunt_and_not_a_strict_parse() {
 /// have let it through.
 #[test]
 fn a_string_result_whose_atof_is_not_finite_fails_the_perform() {
-    let mut inp = StringInputs::new();
-    inp.str_vars[0] = "NaN!".into();
-    assert!(scalc("AA", &mut inp).is_err(), "atof(\"NaN!\") is NaN");
-    inp.str_vars[0] = "inf".into();
-    assert!(scalc("AA", &mut inp).is_err(), "atof(\"inf\") is +inf");
+    // C writes the cells and THEN returns -1 (`sCalcPerform.c:2034-2056`), so the
+    // failing status comes WITH the value — `ScalcResult::non_finite` is that -1.
+    let perform = |sval: &str| {
+        let mut inp = StringInputs::new();
+        inp.str_vars[0] = sval.into();
+        scalc_perform(&scalc_compile("AA").unwrap(), &mut inp, 6).unwrap()
+    };
+    let r = perform("NaN!");
+    assert!(r.val.is_nan() && r.non_finite, "atof(\"NaN!\") is NaN");
+    let r = perform("inf");
+    assert!(
+        r.val == f64::INFINITY && r.non_finite,
+        "atof(\"inf\") is +inf"
+    );
     // Negative control: text with no numeric prefix is 0.0, and 0.0 is finite.
-    inp.str_vars[0] = "xNaN".into();
-    assert!(scalc("AA", &mut inp).is_ok(), "atof(\"xNaN\") is 0");
+    let r = perform("xNaN");
+    assert!(r.val == 0.0 && !r.non_finite, "atof(\"xNaN\") is 0");
 }
 
 /// SSCANF's `%f` is a C conversion, so it is strtod on the input — a prefix, not

@@ -83,6 +83,13 @@ impl ExceptionManager {
         self.callbacks.lock().retain(|e| e.id != id);
     }
 
+    /// How many callbacks are registered — C's `exceptionUsers`, the count
+    /// `asynReport` prints for a port (`ellCount(&pdpc->exceptionUserList)`,
+    /// asynManager.c:1074-1076).
+    pub fn callback_count(&self) -> usize {
+        self.callbacks.lock().len()
+    }
+
     /// Announce an exception event to all registered callbacks.
     ///
     /// The callback list is snapshotted under the lock and the lock is

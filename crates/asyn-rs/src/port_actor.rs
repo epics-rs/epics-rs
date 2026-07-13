@@ -438,6 +438,186 @@ impl PortActor {
         self.driver.base().check_queue(-1, ConnectCheck::Waived)
     }
 
+    /// C `reportPrintPort` (asynManager.c:1018-1122): the *manager's* report of a
+    /// port, printed before the driver's own `pasynCommon->report` (:1120-1122).
+    ///
+    /// The manager block is the manager's to print, not the driver's — in C no
+    /// driver prints its port's queue depth, enable state or trace masks, because
+    /// no driver owns them. Here the actor owns them, so the actor prints them and
+    /// then calls the driver (R14-51). The port used to print only the driver's own
+    /// line, so `asynReport` answered none of the questions it exists for: is the
+    /// port enabled, is anything queued behind a stuck request, is it flapping
+    /// (`numberConnects`), which interposes are stacked on it.
+    ///
+    /// C's shape, kept: a negative `details` suppresses the per-address block
+    /// (:1032-1035); `details >= 1` adds the state / queue / lock / exception /
+    /// trace lines; `details >= 2` adds the interface lists; a destroyed port
+    /// prints one line and nothing else, driver included (:1038-1042) — its
+    /// interfaces are gone. Disabled and disconnected are *not* such states: they
+    /// report, as `enabled:No` / `connected:No`.
+    fn report_port(&self, details: i32) {
+        eprint!("{}", self.manager_report(details));
+        // C ends by calling the port's `asynCommon->report` (:1113-1122) — the
+        // driver's own detail, and only that. A destroyed port's interfaces are
+        // gone, so C never reaches it (:1038-1042).
+        if !self.driver.base().defunct {
+            self.driver.report(details.abs());
+        }
+    }
+
+    /// The text of C's manager block — [`Self::report_port`] is what prints it.
+    /// Split out so the block can be asserted on: every line here is a question an
+    /// operator ran `asynReport` to answer.
+    fn manager_report(&self, details: i32) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let base = self.driver.base();
+        if base.defunct {
+            let _ = writeln!(out, "{} destroyed", base.port_name);
+            return out;
+        }
+
+        let show_devices = details >= 0;
+        let details = details.abs();
+        let yn = |b: bool| if b { "Yes" } else { "No" };
+
+        let _ = writeln!(
+            out,
+            "{} multiDevice:{} canBlock:{} autoConnect:{}",
+            base.port_name,
+            yn(base.flags.multi_device),
+            yn(base.flags.can_block),
+            yn(base.auto_connect)
+        );
+        if details >= 1 {
+            let _ = writeln!(
+                out,
+                "    enabled:{} connected:{} numberConnects {}",
+                yn(base.enabled),
+                yn(base.is_connected()),
+                base.number_connects
+            );
+            // C counts every priority's queue (:1036-1037) and asks whether a
+            // `blockProcessCallback` holder owns the port (:1063). Both are the
+            // actor's state: the heap is the queue, `blocked_by` the holder, and
+            // the requests parked behind the block are queued as much as the ones
+            // in the heap.
+            let _ = writeln!(
+                out,
+                "    nDevices {} nQueued {} blocked:{}",
+                base.device_states.len(),
+                self.heap.len() + self.pending_while_blocked.len(),
+                yn(self.blocked_by.is_some())
+            );
+            // C try-locks the two port mutexes from a *separate* report thread, so
+            // a port thread stuck inside a driver call shows `Yes` (:1049-1070).
+            // The actor model has neither mutex: the driver is reachable only from
+            // the actor thread, and this report *is* the actor's current request —
+            // so if it prints at all, the actor is not inside a driver call. A
+            // wedged driver is visible instead as a report that never prints.
+            let _ = writeln!(out, "    asynManagerLock:No synchronousLock:No");
+            // C's `exceptionActive` is set while `exceptionOccurred` is fanning
+            // out (:2050-2070) and its notify list holds the users waiting on that
+            // fan-out. Rust announces synchronously from the transition owner with
+            // no deferred list, so on the actor thread neither can be pending; the
+            // user count is the real number of registered callbacks.
+            let _ = writeln!(
+                out,
+                "    exceptionActive:No exceptionUsers {} exceptionNotifys 0",
+                base.exception_sink
+                    .as_ref()
+                    .map_or(0, |m| m.callback_count())
+            );
+            let (mask, io_mask, info_mask) = self.trace_masks(None);
+            let _ = writeln!(
+                out,
+                "    traceMask:0x{mask:x} traceIOMask:0x{io_mask:x} traceInfoMask:0x{info_mask:x}"
+            );
+        }
+        if details >= 2 {
+            // C prints the two interface lists by `interfaceType`
+            // (`reportPrintInterfaceList`, :993-1005). The pointers it prints with
+            // them have no Rust analogue; the type names do. Every octet interpose
+            // registers `asynOctet` — that is what makes it an interpose of the
+            // octet interface.
+            if !base.interpose_octet.is_empty() {
+                let _ = writeln!(out, "    interposeInterfaceList");
+                for _ in 0..base.interpose_octet.len() {
+                    let _ = writeln!(out, "        asynOctet");
+                }
+            }
+            let mut ifaces: Vec<&'static str> = self
+                .driver
+                .capabilities()
+                .iter()
+                .map(|c| c.interface_type().asyn_name())
+                .collect();
+            ifaces.sort_unstable();
+            ifaces.dedup();
+            if !ifaces.is_empty() {
+                let _ = writeln!(out, "    interfaceList");
+                for name in ifaces {
+                    let _ = writeln!(out, "        {name}");
+                }
+            }
+        }
+        if show_devices {
+            // C walks the devices it has created and prints the disconnected ones
+            // even at `details == 0` — a down device is what the operator is
+            // looking for (:1081-1094).
+            let mut addrs: Vec<i32> = base.device_states.keys().copied().collect();
+            addrs.sort_unstable();
+            for addr in addrs {
+                let ds = &base.device_states[&addr];
+                if !ds.connected || details >= 1 {
+                    let _ = writeln!(
+                        out,
+                        "    addr {} autoConnect {} enabled {} connected {} exceptionActive {}",
+                        addr,
+                        yn(base.auto_connect),
+                        yn(ds.enabled),
+                        yn(ds.connected),
+                        yn(false)
+                    );
+                }
+                if details >= 1 {
+                    let _ = writeln!(
+                        out,
+                        "        exceptionActive No exceptionUsers 0 exceptionNotifys 0"
+                    );
+                    let _ = writeln!(out, "        blocked No");
+                    let (mask, io_mask, info_mask) = self.trace_masks(Some(addr));
+                    let _ = writeln!(
+                        out,
+                        "        traceMask:0x{mask:x} traceIOMask:0x{io_mask:x} \
+                         traceInfoMask:0x{info_mask:x}"
+                    );
+                }
+            }
+        }
+
+        out
+    }
+
+    /// The port's (or one device's) trace masks, as `reportPrintPort` prints them
+    /// (asynManager.c:1072-1074, :1099-1101). A port registered without a trace
+    /// manager has no masks to print, which is C's zero-initialised `dpCommon.trace`.
+    fn trace_masks(&self, addr: Option<i32>) -> (u32, u32, u32) {
+        let base = self.driver.base();
+        let Some(trace) = base.trace.as_ref() else {
+            return (0, 0, 0);
+        };
+        // `snapshot` is the single owner of C's `findTracePvt` fallback chain —
+        // device, else port, else global (asynManager.c:546-551) — so the report
+        // prints the masks the port actually traces with.
+        let snap = trace.snapshot(&base.port_name, addr);
+        (
+            snap.trace_mask.bits(),
+            snap.io_mask.bits(),
+            snap.info_mask.bits(),
+        )
+    }
+
     /// The single owner of "how does C perform this operation" — see [`CDispatch`].
     /// Exhaustive on purpose; do not add a wildcard arm.
     fn c_dispatch(op: &RequestOp) -> CDispatch {
@@ -1262,23 +1442,13 @@ impl PortActor {
             }
             RequestOp::Report { level } => {
                 // C parity: `asynManager::report` (asynManager.c:1136-1171) walks
-                // every registered port and calls each driver's
-                // `pasynCommon->report` callback. The iocsh wrapper
-                // (`asynReport`) does the per-port loop; here we
-                // dispatch the per-port `report(level)` from the
-                // actor thread so the driver observes its own state
-                // under the actor's serial ownership.
-                //
-                // The one port state C refuses to report on is a destroyed one:
-                // `reportPrintPort` prints "<name> destroyed" and returns without
-                // touching the driver (asynManager.c:1038-1042) — its interfaces
-                // are gone. Disabled and disconnected are *not* such states; they
-                // are reported, as `enabled:No` / `connected:No` (:1112-1115).
-                if self.driver.base().defunct {
-                    eprintln!("{} destroyed", self.driver.base().port_name);
-                } else {
-                    self.driver.report(*level);
-                }
+                // every registered port and hands each to `reportPrintPort`
+                // (:1018-1122), which prints the *manager's* view of the port and
+                // only then calls the driver's `pasynCommon->report` (:1120-1122).
+                // The iocsh wrapper (`asynReport`) does the per-port loop; here we
+                // dispatch the per-port report from the actor thread so the driver
+                // observes its own state under the actor's serial ownership.
+                self.report_port(*level);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetInputEos { eos } => {
@@ -2722,6 +2892,130 @@ mod tests {
                  driver's real reason, not fall back to 0"
             );
         }
+    }
+
+    /// R14-51: `asynReport` prints C's manager block — the port state no driver
+    /// owns and none of them printed.
+    ///
+    /// C `reportPrintPort` (asynManager.c:1018-1122) prints, in order: the
+    /// multiDevice/canBlock/autoConnect header; at `details >= 1` the
+    /// enabled/connected/numberConnects line, the nDevices/nQueued/blocked line,
+    /// the two lock states, the exception counts and the trace masks; at
+    /// `details >= 2` the interpose and interface lists; then the per-address
+    /// block (suppressed by a *negative* `details`, :1032-1035) — and only then
+    /// the driver's own `pasynCommon->report`.
+    ///
+    /// One case per boundary of C's `details` rules: 0, 1, 2, negative, defunct.
+    #[test]
+    fn asyn_report_prints_the_manager_block_c_prints() {
+        struct Plain(PortDriverBase);
+        impl PortDriver for Plain {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                crate::interfaces::octet_transport_capabilities()
+            }
+        }
+
+        let build = || {
+            let mut base = PortDriverBase::new(
+                "rep_block",
+                4,
+                PortFlags {
+                    multi_device: true,
+                    can_block: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.auto_connect = true;
+            base.init_connected(false);
+            base.set_connected(true); // one published connect → numberConnects 1
+            base.device_state(0).connected = true;
+            base.device_state(1).connected = false; // a down device
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+            let (_tx, rx) = mpsc::channel(1);
+            (PortActor::new(Box::new(Plain(base)), rx), _tx)
+        };
+
+        // details = 0: the header, and the down device — nothing else. C prints a
+        // disconnected device even at 0 (:1087), which is what the operator ran
+        // the report for.
+        let (actor, _tx) = build();
+        let r0 = actor.manager_report(0);
+        assert_eq!(
+            r0.lines().next().unwrap(),
+            "rep_block multiDevice:Yes canBlock:Yes autoConnect:Yes",
+            "C's header line (asynManager.c:1043-1047)"
+        );
+        assert!(!r0.contains("enabled:"), "details 0 prints no state line");
+        assert!(
+            r0.contains("addr 1 autoConnect Yes enabled Yes connected No"),
+            "a disconnected device prints at details 0: {r0}"
+        );
+        assert!(
+            !r0.contains("addr 0 "),
+            "…and a connected one does not: {r0}"
+        );
+
+        // details = 1: the state, queue, lock, exception and trace lines.
+        let r1 = actor.manager_report(1);
+        assert!(
+            r1.contains("    enabled:Yes connected:Yes numberConnects 1"),
+            "C :1057-1060 — including the count of connects: {r1}"
+        );
+        assert!(
+            r1.contains("    nDevices 2 nQueued 0 blocked:No"),
+            "C :1061-1064: {r1}"
+        );
+        assert!(
+            r1.contains("    asynManagerLock:No synchronousLock:No"),
+            "C :1065-1067: {r1}"
+        );
+        assert!(
+            r1.contains("    exceptionActive:No exceptionUsers 0 exceptionNotifys 0"),
+            "C :1068-1073: {r1}"
+        );
+        assert!(
+            r1.contains("    traceMask:0x"),
+            "C :1074-1075 prints the port's three trace masks: {r1}"
+        );
+        assert!(
+            r1.contains("addr 0 autoConnect Yes enabled Yes connected Yes"),
+            "at details 1 every device prints, connected or not (C :1087): {r1}"
+        );
+
+        // details = 2: the interpose and interface lists (C :1076-1080).
+        let r2 = actor.manager_report(2);
+        assert!(
+            r2.contains("    interposeInterfaceList\n        asynOctet"),
+            "the installed EOS interpose is an asynOctet interpose: {r2}"
+        );
+        assert!(
+            r2.contains("    interfaceList\n        asynCommon"),
+            "the driver's registered interfaces: {r2}"
+        );
+        assert!(r2.contains("        asynOctet\n"), "…asynOctet among them");
+
+        // A negative details is C's "detail, but no devices" (:1032-1035).
+        let rneg = actor.manager_report(-1);
+        assert!(
+            rneg.contains("    enabled:Yes connected:Yes numberConnects 1"),
+            "a negative details still prints the detail lines: {rneg}"
+        );
+        assert!(
+            !rneg.contains("addr "),
+            "…and suppresses the per-address block: {rneg}"
+        );
+
+        // A destroyed port: one line, and C never reaches the driver (:1038-1042).
+        let (mut actor, _tx) = build();
+        actor.driver.base_mut().flags.destructible = true;
+        actor.driver.base_mut().shutdown_lifecycle().unwrap();
+        assert_eq!(actor.manager_report(2), "rep_block destroyed\n");
     }
 
     /// W10-D6: C's `report` (asynManager.c:1136-1171) spawns a `reportPort` thread

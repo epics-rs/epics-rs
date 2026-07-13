@@ -253,6 +253,12 @@ pub struct PortDriverBase {
     /// `DEFAULT_SECONDS_BETWEEN_PORT_CONNECT` = 20 s (asynManager.c:48, 3249)
     /// and used to re-arm the timer at asynManager.c:3281.
     pub seconds_between_port_connect: Duration,
+    /// How many times this port's link has come up — C `dpCommon.numberConnects`
+    /// (asynManager.c:150), incremented by `exceptionConnect` (:2158) and printed
+    /// by `asynReport` (:1057-1060). Its owner is
+    /// [`Self::sync_connection_edge`], the same edge owner that raises the
+    /// exception, so a connect that was never published is never counted.
+    pub number_connects: u64,
 }
 
 impl PortDriverBase {
@@ -278,6 +284,7 @@ impl PortDriverBase {
             last_connect_disconnect: None,
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
+            number_connects: 0,
         }
     }
 
@@ -405,6 +412,13 @@ impl PortDriverBase {
                 self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
             }
         } else {
+            // C `exceptionConnect` counts the connects it publishes
+            // (`++pdpCommon->numberConnects`, asynManager.c:2158) — the count
+            // `asynReport` prints, and the operator's only way to see a port that
+            // is flapping. It belongs to this owner because C increments it in the
+            // same function that raises the exception, so a connect that never
+            // fanned out is never counted.
+            self.number_connects += 1;
             // The link is up — nothing left to retry. (C leaves the timer
             // running and lets `portConnectTimerCallback` no-op on the
             // `!connected` guard, asynManager.c:3257; disarming here is the
@@ -1243,17 +1257,36 @@ pub trait PortDriver: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The driver's own report — C `asynCommon::report`, which the manager calls
+    /// last (`reportPrintPort`, asynManager.c:1113-1122) after printing the port's
+    /// manager-level state itself.
+    ///
+    /// So this prints only what the *driver* owns. The port's enable / connect /
+    /// queue / lock / exception / trace state is the manager's to print and is
+    /// printed by [`crate::port_actor::PortActor::report_port`]; duplicating it
+    /// here would give the operator two answers to the same question, from two
+    /// owners, with no rule for which one wins.
+    ///
+    /// The default is C++ `asynPortDriver::report` (asynPortDriver.cpp:3677-3694):
+    /// the port name, and at `details >= 1` the EOS terminators and the parameter
+    /// library.
     fn report(&self, level: i32) {
         let base = self.base();
         eprintln!("Port: {}", base.port_name);
-        eprintln!(
-            "  connected: {}, max_addr: {}, params: {}, options: {}",
-            base.is_connected(),
-            base.max_addr,
-            base.params.len(),
-            base.options.len()
-        );
         if level >= 1 {
+            let esc = |eos: &[u8]| {
+                eos.iter()
+                    .map(|b| match b {
+                        b'\r' => "\\r".to_string(),
+                        b'\n' => "\\n".to_string(),
+                        c => (*c as char).to_string(),
+                    })
+                    .collect::<String>()
+            };
+            let input = base.input_eos(0);
+            let output = base.output_eos(0);
+            eprintln!("  Input EOS[{}]: {}", input.len(), esc(input));
+            eprintln!("  Output EOS[{}]: {}", output.len(), esc(output));
             base.report_params(level.saturating_sub(1));
         }
         if level >= 2 {

@@ -2309,7 +2309,7 @@ impl RecordInstance {
         aux_post: AuxPostMask,
         include_val: bool,
     ) -> Vec<(String, EpicsValue, EventMask)> {
-        use crate::server::record::{ValuePostGate, value_gate};
+        use crate::server::record::{CyclePostMask, ValuePostGate, value_gate};
 
         // C's default for a change-detected auxiliary post:
         // `monitor_mask | DBE_VALUE | DBE_LOG` (calcRecord.c:420, subRecord.c:400;
@@ -2378,14 +2378,22 @@ impl RecordInstance {
                     val.clone(),
                     aux_post.mask_for(field, alarm_bits, deadband_mask),
                 ));
-            } else if force_fields.contains(&field.as_str())
-                || cycle_posted.contains(&field.as_str())
-            {
-                // C `monitor()` posts a re-marked field with
-                // `monitor_mask | DBE_VAL_LOG` even when unchanged — whether the
-                // mark is static (`force_posted_fields`) or this cycle's bit mask
-                // (`take_cycle_posted_fields`: aCalcout AMASK/NEWM).
+            } else if force_fields.contains(&field.as_str()) {
+                // C `monitor()` posts a statically re-marked field with
+                // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                 sub_updates.push((field.clone(), val.clone(), aux_mask));
+            } else if cycle_posted.iter().any(|(name, _)| *name == field) {
+                // One event per MARK, each with the mask of the C call site that
+                // made it (`CyclePostMask`) — a field marked twice (aCalcout's
+                // AMASK `afterCalc` post AND its NEWM `monitor()` post) is posted
+                // twice, exactly as C posts it from both loops.
+                for (_, cycle_mask) in cycle_posted.iter().filter(|(name, _)| *name == field) {
+                    let mask = match cycle_mask {
+                        CyclePostMask::ValueLog => EventMask::VALUE | EventMask::LOG,
+                        CyclePostMask::MonitorValueLog => aux_mask,
+                    };
+                    sub_updates.push((field.clone(), val.clone(), mask));
+                }
             } else if alarm_fanout.contains(&field.as_str()) {
                 // C motor `monitor()` (motorRecord.cc:3513-3645) posts every listed
                 // field once `monitor_mask != 0`, so a DBE_ALARM-only subscriber

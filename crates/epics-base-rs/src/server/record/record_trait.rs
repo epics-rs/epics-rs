@@ -37,6 +37,27 @@ pub enum ValuePostGate {
     WithValue,
 }
 
+/// The event mask ONE per-cycle mark posts with
+/// ([`Record::take_cycle_posted_fields`]).
+///
+/// A record can mark the same field from two different C `db_post_events` call
+/// sites in one cycle, and the two need not agree on the mask. aCalcout does
+/// exactly that with its arrays: `afterCalc` posts the AMASK-flagged ones with a
+/// LITERAL `DBE_VALUE|DBE_LOG` (`aCalcoutRecord.c:296`) while `monitor()` posts
+/// the NEWM-flagged ones with `monitor_mask|DBE_VALUE|DBE_LOG` (`:1034`). An
+/// array in BOTH masks gets BOTH events — the record marks it twice, and the
+/// variant carried with each mark is what keeps them distinguishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CyclePostMask {
+    /// A literal `DBE_VALUE | DBE_LOG` — the alarm-transition bits are NOT
+    /// folded in, because this C call site does not have `monitor_mask` in
+    /// scope (aCalcout `afterCalc`, `aCalcoutRecord.c:296`).
+    ValueLog,
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` — C's usual `monitor()` shape
+    /// (aCalcout `monitor()`, `aCalcoutRecord.c:1034`).
+    MonitorValueLog,
+}
+
 /// The [`ValuePostGate`] a record declared for `field`, or `None` when `field`
 /// is not one of its secondary value-mask fields.
 ///
@@ -998,15 +1019,19 @@ pub trait Record: Send + Sync + 'static {
     /// that varies per cycle (twelve arrays, 2^12 combinations) without
     /// over-posting every one of them every cycle.
     ///
+    /// Each entry is ONE C `db_post_events` call, with the mask THAT call site
+    /// uses ([`CyclePostMask`]) — not one entry per field. The two aCalcout call
+    /// sites disagree on the mask (`afterCalc` posts a literal `DBE_VALUE|
+    /// DBE_LOG`, `monitor()` posts `monitor_mask|DBE_VALUE|DBE_LOG`), and an
+    /// array in BOTH masks is posted TWICE by C, once from each. So a field may
+    /// legitimately appear twice, and the framework emits an event per entry.
+    ///
     /// TAKE semantics: called exactly once per process cycle, and the record
     /// clears whatever state it answered from — C's `pcalc->newm = 0` (`:1036`)
-    /// is part of the same step. A field named here is posted with the same
-    /// `monitor_mask | DBE_VALUE | DBE_LOG` a `force_posted_fields` entry gets,
-    /// and only when it did NOT already post through change detection, so the
-    /// two can never double-post.
+    /// is part of the same step.
     ///
     /// Default: empty — and `Vec::new()` does not allocate.
-    fn take_cycle_posted_fields(&mut self) -> Vec<&'static str> {
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
         Vec::new()
     }
 

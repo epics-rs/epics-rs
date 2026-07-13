@@ -90,7 +90,8 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    CyclePostMask, FieldDesc, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -2222,15 +2223,26 @@ impl Record for AcalcoutRecord {
     /// `*amask = 0` at the head of aCalcPerform. NEWM does — it accumulates
     /// across `fetch_values` calls until `monitor()` zeroes it, which is why this
     /// hook TAKES.
-    fn take_cycle_posted_fields(&mut self) -> Vec<&'static str> {
-        let mask = self.amask | self.newm;
+    fn take_cycle_posted_fields(&mut self) -> Vec<(&'static str, CyclePostMask)> {
+        let (amask, newm) = (self.amask, self.newm);
         self.newm = 0;
-        ARR_NAMES
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| mask & (1u32 << i) != 0)
-            .map(|(_, name)| *name)
-            .collect()
+        let mut marks = Vec::new();
+        for (i, name) in ARR_NAMES.iter().enumerate() {
+            let bit = 1u32 << i;
+            // C `afterCalc` (`:296`) runs first, and with a LITERAL mask — the
+            // alarm bits are not in scope there.
+            if amask & bit != 0 {
+                marks.push((*name, CyclePostMask::ValueLog));
+            }
+            // C `monitor()` (`:1034`) runs after, with `monitor_mask` folded in.
+            // An array the expression STORED into and whose input link ALSO
+            // delivered a change is in both masks, and C posts it from both
+            // loops — two events, two masks.
+            if newm & bit != 0 {
+                marks.push((*name, CyclePostMask::MonitorValueLog));
+            }
+        }
+        marks
     }
 
     /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a

@@ -1319,17 +1319,22 @@ pub fn apply_fields(
         // most record types leave to the framework — so ownership is asked of
         // `implements_field()`, not of table membership.
         let owned = record.implements_field(&upper_name);
-        let spec_type = record
+        let spec = record
             .field_list()
             .iter()
-            .find(|f| f.name == upper_name.as_str())
-            .map(|f| f.dbf_type);
+            .find(|f| f.name == upper_name.as_str());
 
         if owned {
-            // The spec's type, or — for a port-internal field the `.dbd` does
-            // not declare — the type the record actually stores it as.
-            let dbf_type = spec_type
-                .or_else(|| record.get_field(&upper_name).map(|v| v.db_field_type()))
+            // Parse to the type the record STORES, exactly as
+            // `put_field_internal_default` coerces to it: `put_field`'s arms
+            // match on what is stored, and a `menu()` field is declared
+            // `DBF_MENU` but stored as a `Short` choice index. The `.dbd` type
+            // is the fallback for a field the record cannot yet produce a value
+            // for.
+            let dbf_type = record
+                .get_field(&upper_name)
+                .map(|v| v.db_field_type())
+                .or_else(|| spec.map(|f| f.dbf_type))
                 .ok_or_else(|| {
                     CaError::InvalidValue(format!("field {upper_name}: no type to parse it as"))
                 })?;
@@ -1338,8 +1343,9 @@ pub fn apply_fields(
             // `dbPutStringNum`. Using the field's choices, not a cross-menu
             // global table, is what keeps a menu-specific label from being
             // dropped or mis-mapped (e.g. `field(SELM,"Specified")`).
-            let value = if let Some(choices) = record
-                .menu_field_choices(&upper_name)
+            let value = if let Some(choices) = spec
+                .and_then(|f| f.menu)
+                .or_else(|| record.menu_field_choices(&upper_name))
                 .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
             {
                 crate::server::record::resolve_menu_field_string_db_load(

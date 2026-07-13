@@ -875,9 +875,25 @@ impl RecordInstance {
     /// ([`Record::menu_field_choices`](super::record_trait::Record::menu_field_choices)),
     /// else a shared menu keyed by field name
     /// ([`shared_menu_choices`](super::menu_choices::shared_menu_choices)).
+    /// The choices a `menu()` field serves as its `DBR_ENUM` labels.
+    ///
+    /// The `.dbd` declaration is the first and best answer: a generated
+    /// [`FieldDesc`] carries the field's own `menu(...)` choices, which is what
+    /// C's `dbGetFieldIndex` -> `pamapdbfType` -> menu lookup resolves. The two
+    /// hand-maintained fallbacks below are for record types still on a
+    /// hand-written table; they go away with the last of them.
+    ///
+    /// `shared_menu_choices` in particular keys on the field NAME alone, across
+    /// every record type — which is only correct while no two record types give
+    /// the same field name different menus. Asking the field's own descriptor
+    /// first removes that assumption.
     fn menu_choices_for(&self, field: &str) -> Option<&'static [&'static str]> {
         self.record
-            .menu_field_choices(field)
+            .field_list()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(field))
+            .and_then(|f| f.menu)
+            .or_else(|| self.record.menu_field_choices(field))
             .or_else(|| super::menu_choices::shared_menu_choices(field))
     }
 

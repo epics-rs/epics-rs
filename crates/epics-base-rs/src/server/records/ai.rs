@@ -1,6 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record, ValuePostGate};
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::server::record::{
+    FieldDesc, MENU_SIMM, ProcessOutcome, Record, ValuePostGate, dbd_generated,
+};
+use crate::types::{EpicsValue, PvString};
 
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
@@ -118,40 +120,6 @@ impl AiRecord {
         }
     }
 }
-
-static FIELDS: &[FieldDesc] = &[
-    FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("EGU", DbFieldType::String, false),
-    FieldDesc::new("HOPR", DbFieldType::Double, false),
-    FieldDesc::new("LOPR", DbFieldType::Double, false),
-    FieldDesc::new("PREC", DbFieldType::Short, false),
-    FieldDesc::new("RVAL", DbFieldType::Long, false),
-    FieldDesc::new("ORAW", DbFieldType::Long, true),
-    FieldDesc::new("LINR", DbFieldType::Short, false),
-    FieldDesc::new("EGUF", DbFieldType::Double, false),
-    FieldDesc::new("EGUL", DbFieldType::Double, false),
-    FieldDesc::new("ESLO", DbFieldType::Double, false),
-    FieldDesc::new("EOFF", DbFieldType::Double, false),
-    FieldDesc::new("ROFF", DbFieldType::Long, false),
-    FieldDesc::new("ASLO", DbFieldType::Double, false),
-    FieldDesc::new("AOFF", DbFieldType::Double, false),
-    FieldDesc::new("SMOO", DbFieldType::Double, false),
-    FieldDesc::new("ADEL", DbFieldType::Double, false),
-    FieldDesc::new("MDEL", DbFieldType::Double, false),
-    FieldDesc::new("AFTC", DbFieldType::Double, false),
-    // aiRecord.dbd.pod: AFVL is special(SPC_NOMOD) — read-only to clients.
-    FieldDesc::new("AFVL", DbFieldType::Double, true),
-    FieldDesc::new("LALM", DbFieldType::Double, true),
-    FieldDesc::new("ALST", DbFieldType::Double, true),
-    FieldDesc::new("MLST", DbFieldType::Double, true),
-    FieldDesc::new("INIT", DbFieldType::Char, true),
-    FieldDesc::new("SIMM", DbFieldType::Short, false),
-    FieldDesc::new("SIML", DbFieldType::String, false),
-    FieldDesc::new("SIOL", DbFieldType::String, false),
-    FieldDesc::new("SIMS", DbFieldType::Short, false),
-    FieldDesc::new("SDLY", DbFieldType::Double, false),
-    FieldDesc::new("SVAL", DbFieldType::Double, false),
-];
 
 impl Record for AiRecord {
     fn record_type(&self) -> &'static str {
@@ -534,7 +502,7 @@ impl Record for AiRecord {
     }
 
     fn field_list(&self) -> &'static [FieldDesc] {
-        FIELDS
+        dbd_generated::AI_FIELDS
     }
 
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`aiRecord.dbd.pod`): the analog

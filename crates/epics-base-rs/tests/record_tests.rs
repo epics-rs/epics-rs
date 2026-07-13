@@ -47,10 +47,25 @@ fn test_ai_string_field() {
 fn test_ai_field_list() {
     let rec = AiRecord::default();
     let fields = rec.field_list();
-    assert!(fields.len() >= 24); // 20 base + 4 sim fields
+
+    // The table is generated from `aiRecord.dbd`, so it is in the spec's
+    // declaration order (C's field order) and carries every field the record
+    // type declares — including the ones the framework, not the record, drives.
     assert_eq!(fields[0].name, "VAL");
     assert_eq!(fields[0].dbf_type, DbFieldType::Double);
-    assert_eq!(fields[1].name, "EGU");
+    for declared in ["INP", "EGU", "PREC", "LINR", "SIMM", "SIML", "SIOL"] {
+        assert!(
+            fields.iter().any(|f| f.name == declared),
+            "ai.{declared} is in aiRecord.dbd but not in field_list()"
+        );
+    }
+
+    // LINR is `DBF_MENU menu(menuConvert)`: served as DBR_ENUM *with* its
+    // choices, which is why `caget ai.LINR` on the C IOC answers
+    // "NO CONVERSION" and not "0".
+    let linr = fields.iter().find(|f| f.name == "LINR").unwrap();
+    assert_eq!(linr.dbf_type, DbFieldType::Enum);
+    assert_eq!(linr.menu.unwrap()[0], "NO CONVERSION");
 }
 
 #[test]

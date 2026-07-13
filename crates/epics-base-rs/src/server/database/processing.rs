@@ -5084,6 +5084,39 @@ fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> 
 /// The body of the init-seed owner, over a locked record — shared by
 /// [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
 pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
+    // 0. The long-string load, C `dbLoadLinkLS` — a lset entry of its own, NOT
+    //    `recGblInitConstantLink`, and the only one that can write a
+    //    long-string VAL: `lso` runs it on DOL (lsoRecord.c:82), `lsi`'s soft
+    //    device support on INP (devLsiSoft.c:24). It replaces the scalar seeds
+    //    below for those records — a long-string VAL takes no scalar put.
+    if let Some(link_field) = instance.record.constant_ls_link() {
+        // C binds `loadLS` to the INP link through the SOFT device support, so
+        // a hardware DTYP loads nothing; DOL is in the record itself and is
+        // never gated.
+        let gated = link_field != "INP"
+            || crate::server::device_support::is_soft_dtyp(&instance.common.dtyp);
+        let text = if link_field == "INP" {
+            instance.common.inp.clone()
+        } else {
+            match instance.record.get_field(link_field) {
+                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                _ => String::new(),
+            }
+        };
+        if gated {
+            if let Some(load) = crate::server::record::load_link_ls(&text) {
+                // C's lso/lsi init tail: `if (prec->len) { … prec->udf = FALSE; }`
+                // — a link that loaded (even the number case, whose LEN is 1
+                // with an empty VAL) DEFINES the record.
+                if instance.record.apply_ls_load(load) != 0 {
+                    instance.common.udf = false;
+                }
+            }
+        }
+        instance.record.seed_deadband_tracking();
+        return;
+    }
+
     // 1. The soft-channel device support's INP → VAL/RVAL load.
     if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp) {
         let inp = crate::server::record::parse_link_v2(&instance.common.inp);

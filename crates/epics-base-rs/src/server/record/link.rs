@@ -554,6 +554,89 @@ pub fn parse_c_double(s: &str) -> Option<f64> {
     crate::runtime::stdlib::epics_parse_double(s).ok()
 }
 
+/// What C's `dbLoadLinkLS` (dbLink.c:244) delivers into a long-string VAL.
+///
+/// `loadLS` is a lset entry of its own — NOT `recGblInitConstantLink` — and only
+/// two lsets implement it, with different results:
+///
+/// * a plain CONSTANT link (`dbConstLink.c:178` `dbConstLoadLS`) runs the link
+///   text through `dbLSConvertJSON`, and
+/// * a JSON `{const:…}` link (`lnkConst.c:419` `lnkConst_loadLS`) copies its
+///   string value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LsLoad {
+    /// The link delivered a string: copy it into VAL (truncated at `SIZV-1`),
+    /// `LEN = strlen + 1`.
+    Text(String),
+    /// C's number case. `dbLSConvertJSON` (dbConvertJSON.c:191-236) never calls
+    /// `yajl_complete_parse`, so a bare number is still a pending token when the
+    /// parse ends: NO callback fires, the destination buffer is untouched, and
+    /// `*plen = pdest - pdest + 1` makes `LEN = 1`. That is what defines an
+    /// `lso` with `field(DOL,"5")` while leaving `VAL` empty (softIoc: VAL "",
+    /// LEN 1, UDF 0).
+    LenOnly,
+}
+
+/// C `dbLoadLinkLS` over a link field's `.db` text — the long-string half of the
+/// init-time constant load. `None` when the link loads nothing: a PV link (no
+/// `loadLS` at init), an empty link, or a JSON `{const:…}` whose value is not a
+/// string (`lnkConst_loadLS` returns `S_db_badField` for the numeric types).
+///
+/// softIoc (EPICS 7.0.10, linux-x86_64), `dbgf` after `iocInit`:
+///
+/// ```text
+/// record(lso,"L1"){field(DOL,"5")}              VAL ""         LEN 1  UDF 0
+/// record(lso,"L2"){field(DOL,{const:"hello"})}  VAL "hello"    LEN 6  UDF 0
+/// record(lsi,"L3"){field(INP,{const:"hi there"})} VAL "hi there" LEN 9 UDF 0
+/// record(lsi,"L4"){field(INP,"5")}              VAL ""         LEN 1  UDF 0
+/// ```
+pub fn load_link_ls(text: &str) -> Option<LsLoad> {
+    let s = text.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // JSON link: only `{const:…}` has a `loadLS`, and only its string forms
+    // (`sc40`, and `ac40`'s first element) deliver text.
+    if s.starts_with('{') && s.ends_with('}') {
+        let value = json_const_value(s)?;
+        return json_string_value(value).map(LsLoad::Text);
+    }
+    // Plain link: `loadLS` exists only on the CONSTANT lset, and a plain link is
+    // CONSTANT iff `epicsParseDouble` accepts it — i.e. iff it is a number, the
+    // one case `dbLSConvertJSON` leaves the buffer untouched.
+    parse_c_double(s).map(|_| LsLoad::LenOnly)
+}
+
+/// The raw (un-dequoted) value text of a `{const: …}` JSON link, or `None` when
+/// `s` is some other JSON link.
+fn json_const_value(s: &str) -> Option<&str> {
+    let inner = s[1..s.len() - 1].trim_start();
+    let (key, rest) = inner.split_once(':')?;
+    let key = key.trim().trim_matches('"').trim_matches('\'');
+    if !key.eq_ignore_ascii_case("const") {
+        return None;
+    }
+    Some(rest.trim().trim_end_matches(',').trim())
+}
+
+/// The JSON string a `{const:…}` link carries, unquoted — `"hi"` and the
+/// string-array shorthand `["hi", …]` (C `ac40`, whose `loadLS` takes element 0).
+/// A numeric value is not a string: `lnkConst_loadLS`'s `default` arm returns
+/// `S_db_badField`, so nothing is loaded and LEN stays 0.
+fn json_string_value(value: &str) -> Option<String> {
+    let v = value.trim();
+    let first = if let Some(rest) = v.strip_prefix('[') {
+        rest.trim_start().split(',').next()?.trim()
+    } else {
+        v
+    };
+    let unquoted = first
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| first.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))?;
+    Some(unquoted.to_string())
+}
+
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {

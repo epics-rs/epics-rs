@@ -9325,13 +9325,30 @@ async fn init_applies_constant_dol_across_record_types() {
         );
     }
 
-    // lso: quoted long-string constant.
+    // lso: the long-string load is `dbLoadLinkLS` (lsoRecord.c:82), NOT
+    // `recGblInitConstantLink`, and only a JSON `{const:"…"}` link carries text
+    // — softIoc: `field(DOL,"\"hello\"")` is a CA_LINK (LEN 0, UDF 1), while
+    // `field(DOL,{const:"hello"})` loads VAL "hello" / LEN 6 / UDF 0. See
+    // tests/long_string_constant_link_load.rs.
     let mut lso = LsoRecord::default();
     lso.omsl = 1;
-    lso.dol = "\"hello\"".to_string();
-    lso.init_record(0).unwrap();
-    assert_eq!(lso.val.as_str_lossy(), "hello", "lso constant DOL → VAL");
-    assert_eq!(lso.len, 6, "lso LEN = strlen+1 (C convention)");
+    lso.dol = r#"{const:"hello"}"#.to_string();
+    db.add_record("LSO_CONST", Box::new(lso)).await.unwrap();
+    {
+        let rec = db.get_record("LSO_CONST").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"hello".to_vec())),
+            "lso JSON const DOL → VAL"
+        );
+        assert_eq!(
+            inst.record.get_field("LEN"),
+            Some(EpicsValue::ULong(6)),
+            "lso LEN = strlen+1 (C convention)"
+        );
+        assert!(!inst.common.udf, "a loaded LS link defines the record");
+    }
 
     // mbbo: constant DOL is the state index; the init tail's convert() maps it
     // to RVAL (no state table defined → RVAL == state index).

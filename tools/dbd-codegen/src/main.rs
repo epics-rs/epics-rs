@@ -161,10 +161,45 @@ fn generate(dbd_dir: &Path) -> Result<String, String> {
         menus.len()
     );
 
-    emit::emit(&emit::Input {
+    let src = emit::emit(&emit::Input {
         menus: &menus,
         records: &records,
         common: &common,
         cvt: &cvt,
-    })
+    })?;
+
+    // `cargo fmt --all` is a mandatory gate and it does not skip generated
+    // files, so raw emitter output would be reformatted the moment anyone runs
+    // it — and `--check` would then report the file as stale forever, on a
+    // perfectly current checkout. Formatting here makes the generator's output
+    // the fixed point rustfmt already agrees with, so `--check` answers the
+    // question it is meant to answer ("is this file current with the .dbd?")
+    // rather than "has anyone run cargo fmt since?".
+    rustfmt(&src)
+}
+
+/// Pipe the emitted source through the toolchain's `rustfmt`.
+fn rustfmt(src: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout", "--quiet"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run rustfmt: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("rustfmt: no stdin")?
+        .write_all(src.as_bytes())
+        .map_err(|e| format!("rustfmt: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("rustfmt: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("rustfmt failed: {}", out.status));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("rustfmt: non-utf8 output: {e}"))
 }

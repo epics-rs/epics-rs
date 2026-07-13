@@ -136,6 +136,23 @@ impl Record for EventRecord {
         "event"
     }
 
+    /// C `eventRecord.c::process` never clears UDF: the record's one
+    /// `prec->udf = FALSE` is inside `readValue`'s simulated SIOL branch
+    /// (`:191`), which the framework's simulation tail already reproduces. A
+    /// plain event record therefore keeps the UDF it was loaded with — softIoc:
+    /// `record(event,"E2"){}` processes to UDF=1, while `field(VAL,"1")` in the
+    /// `.db` defines it at load (UDF=0).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `eventRecord.c` has NO `checkAlarms` either — an event record with UDF=1
+    /// publishes NO_ALARM (softIoc: `record(event,"E2"){}` → UDF 1, SEVR
+    /// NO_ALARM, even with the default `UDFS = INVALID`).
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     fn field_list(&self) -> &'static [FieldDesc] {
         EVENT_FIELDS
     }

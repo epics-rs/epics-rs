@@ -5330,6 +5330,16 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
     );
 }
 
+/// Stand in for a .db `field(VAL,"…")` seed on a programmatically created
+/// record: C's static write of VAL also writes UDF=0
+/// (`dbPutString`, dbStaticLib.c:2653-2660), which is what makes the record
+/// DEFINED for record types whose `process()` never clears UDF (dfanout,
+/// histogram, event).
+async fn define_val(db: &PvDatabase, name: &str) {
+    let rec = db.get_record(name).await.expect("record exists");
+    rec.write().await.common.udf = false;
+}
+
 /// A failed dfanout OUT-link put raises the LINK alarm TWICE in C, and the
 /// stronger one wins:
 ///
@@ -5362,6 +5372,14 @@ async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     db.add_record("DFAN_LINKFAIL", Box::new(dfan))
         .await
         .unwrap();
+    // The seeded VAL is the `field(VAL,"5")` of a .db load, and C's
+    // `dbPutString` writes UDF=0 alongside a static VAL write
+    // (dbStaticLib.c:2653-2660). Without it the record is undefined, and
+    // dfanout's `process()` never clears UDF — softIoc:
+    // `record(dfanout,"DFN"){field(OUTA,"DEST")}` stays UDF=1 / INVALID /
+    // UDF after `dbpf DFN.PROC 1`, while the same record with
+    // `field(VAL,"5")` comes up UDF=0 / NO_ALARM.
+    define_val(&db, "DFAN_LINKFAIL").await;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DFAN_LINKFAIL", &mut visited, 0)
@@ -5401,6 +5419,9 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
     dfan.selm = 0; // All
     dfan.outa = "DFAN_OK_DEST".to_string();
     db.add_record("DFAN_OK", Box::new(dfan)).await.unwrap();
+    // See `test_dfanout_out_link_write_failure_raises_link_alarm`: the
+    // seeded VAL stands for `field(VAL,"5")`, which C loads with UDF=0.
+    define_val(&db, "DFAN_OK").await;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DFAN_OK", &mut visited, 0)

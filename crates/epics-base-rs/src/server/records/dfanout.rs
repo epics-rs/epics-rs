@@ -421,6 +421,21 @@ impl Record for DfanoutRecord {
         self.val.is_nan()
     }
 
+    /// ...and that DOL fetch is the ONLY thing in dfanout's `process()` that
+    /// touches UDF (`dfanoutRecord.c:116-122`). With no DOL — or a constant one,
+    /// which `dbGetLink` never re-delivers — C leaves UDF alone, so a
+    /// `record(dfanout,"DF1")` stays UDF=1 and `checkAlarms` (`:233-234`) raises
+    /// UDF_ALARM at UDFS every single cycle. softIoc: `dbpf DF1.PROC 1` →
+    /// UDF=1, SEVR INVALID, STAT UDF. The port's blanket per-cycle clear made it
+    /// NO_ALARM — an alarm-visible divergence, not a cosmetic one.
+    ///
+    /// The closed-loop DOL read still defines the record: the framework applies
+    /// `udf = value_is_undefined()` at the DOL-apply site, which is exactly
+    /// where C's `:121` sits (softIoc: `DF2` with `DOL="SRC"` → UDF=0).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `dfanoutRecord.c::checkAlarms` — UDF alarm plus analog limit
     /// alarms (HIHI/HIGH/LOW/LOLO) with per-level hysteresis.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {

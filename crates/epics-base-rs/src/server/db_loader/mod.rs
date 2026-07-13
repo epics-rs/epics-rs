@@ -1157,7 +1157,30 @@ pub fn apply_fields(
             }
         } else {
             // Store as common field for RecordInstance to handle
-            common_fields.push((upper_name, EpicsValue::String(value_str.clone().into())));
+            common_fields.push((
+                upper_name.clone(),
+                EpicsValue::String(value_str.clone().into()),
+            ));
+        }
+
+        // C `dbPutString` (`dbStaticLib.c:2653-2660`): writing VAL through the
+        // STATIC library also writes UDF = 0 —
+        //
+        // ```c
+        // if (!status && strcmp(pflddes->name, "VAL") == 0) {
+        //     ...
+        //     if (!dbFindField(&dbentry, "UDF")) dbPutString(&dbentry, "0");
+        // }
+        // ```
+        //
+        // — so `field(VAL,"1")` in a `.db` DEFINES the record at load, on every
+        // record type, whatever its `process()` later does with UDF. The load
+        // owner is the only place this can live: it is the one gate both
+        // `dbLoadRecords` paths (IocBuilder and iocsh) cross. Pushed in file
+        // order, so an explicit `field(UDF,...)` after `field(VAL,...)` still
+        // wins, exactly as it does in C.
+        if upper_name == "VAL" {
+            common_fields.push(("UDF".to_string(), EpicsValue::Char(0)));
         }
     }
     Ok(())

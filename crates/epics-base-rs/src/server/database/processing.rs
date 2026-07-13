@@ -2216,6 +2216,14 @@ impl PvDatabase {
                     // Full: VAL = DOL value
                     let _ = instance.record.set_val(dol_val);
                 }
+                // The closed-loop DOL read DEFINES the record — C sets UDF from
+                // the value it just fetched, in the DOL branch itself:
+                // `prec->udf = isnan(value)` (aoRecord.c:147, dfanoutRecord.c:121)
+                // / `prec->udf = FALSE` (boRecord.c:162). For ao/bo this repeats
+                // what the per-cycle clear below does; for dfanout — whose
+                // `process()` touches UDF nowhere else — it is the ONLY definer,
+                // which is why dfanout can opt out of the per-cycle clear.
+                instance.common.udf = instance.record.value_is_undefined();
             }
 
             // Apply INP value. "Soft Channel" sets VAL directly

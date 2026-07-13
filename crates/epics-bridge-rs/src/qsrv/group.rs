@@ -4024,12 +4024,14 @@ mod tests {
             let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
             let channel = GroupChannel::new(db.clone(), defs.pop().unwrap());
 
-            // ACTIVE (PACT=1) — the async-device boundary.
+            // ACTIVE (PACT=1) — the async-device boundary. Driven through the
+            // PACT owner's API, not by poking the flag: `processing` is private
+            // precisely so no site outside the owner can open or close the
+            // window (the wave-16 regression that stranded a parked put-notify).
             {
                 let rec = db.get_record("PACT:rec").await.unwrap();
                 let inst = rec.write().await;
-                inst.processing
-                    .store(true, std::sync::atomic::Ordering::Release);
+                inst.enter_pact();
             }
             channel
                 .put(&PvStructure::new("structure"))
@@ -4057,8 +4059,10 @@ mod tests {
             {
                 let rec = db.get_record("PACT:rec").await.unwrap();
                 let mut inst = rec.write().await;
-                inst.processing
-                    .store(false, std::sync::atomic::Ordering::Release);
+                // The release carries any put-notify parked on the window; this
+                // test parks none (a group PUT, not a put-callback), so there is
+                // nothing for the token to hand back.
+                let _ = inst.leave_pact();
                 inst.common.rpro = false;
             }
             channel

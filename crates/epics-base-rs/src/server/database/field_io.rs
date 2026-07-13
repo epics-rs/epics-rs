@@ -1407,16 +1407,13 @@ impl PvDatabase {
             // PACT→RPRO deferral as a `pp` field. Both go through the single
             // owner (R19-43).
             //
-            // The gate mode is the CALLER's, not a constant: this function is
-            // entered with `acquire_gate == false` by the already-locked
-            // wrappers (an atomic group PUT owns the gate), and the gate
-            // `Mutex` is not reentrant. Hardcoding either mode here is wrong in
-            // one direction or the other — acquiring would deadlock the
-            // group-PUT path, and not acquiring would leave the ordinary CA
-            // path ungated. So pass the caller's mode straight through.
-            let _ = self
-                .put_driven_process_inner(record_name, acquire_gate)
-                .await;
+            // The ALREADY-LOCKED entry, unconditionally — NOT `acquire_gate`
+            // passed through. By the time control reaches here the record's
+            // advisory gate is held on both paths: this function took it above
+            // when `acquire_gate`, and the caller (an atomic group PUT) holds it
+            // when not. The gate `Mutex` is not reentrant, so acquiring it again
+            // here deadlocks every PROC put.
+            let _ = self.put_driven_process_already_locked(record_name).await;
             // The wait-set fires the oneshot only after the whole
             // FLNK/OUT chain (sync + async) settles. If it has
             // already completed the chain was fully synchronous —

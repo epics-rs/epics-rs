@@ -1031,22 +1031,25 @@ impl BridgeProvider {
     /// populate `+all` triggers into explicit field lists. Mirrors
     /// pvxs `GroupConfigProcessor::resolveGroupTriggerReferences` /
     /// `createGroups`. Idempotent — safe to call after every
-    /// `dbLoadGroup`. Returns the count of groups finalized; logs
-    /// validation warnings via `tracing::warn`.
-    pub fn process_groups(&self) -> usize {
-        let g = self.groups.read();
-        let names: Vec<String> = g.keys().cloned().collect();
-        let mut finalized = 0;
-        for name in names {
-            let def = g.get(&name).cloned().unwrap();
-            let field_names: std::collections::HashSet<String> =
-                def.members.iter().map(|m| m.field_name.clone()).collect();
+    /// `dbLoadGroup`. Returns the count of groups CREATED — a group whose
+    /// `+channel` does not resolve is refused, exactly as pvxs
+    /// `createGroups` catches the `Field`/`Channel` ctor throw and prints
+    /// `"%s: Error Group not created: %s\n"` (groupconfigprocessor.cpp:429-444,
+    /// ioc/field.cpp:23-25, ioc/channel.cpp:37); it is not counted and is
+    /// never served. Trigger references to unknown fields stay a warning
+    /// (pvxs `defineGroupTriggers` prints and continues, :393-398).
+    pub async fn process_groups(&self) -> usize {
+        let defs: Vec<GroupPvDef> = self.groups.read().values().cloned().collect();
+        let mut created = 0;
+        for def in defs {
+            let field_names: std::collections::HashSet<&str> =
+                def.members.iter().map(|m| m.field_name.as_str()).collect();
             for member in &def.members {
                 if let super::group_config::TriggerDef::Fields(refs) = &member.triggers {
                     for r in refs {
-                        if !field_names.contains(r) {
+                        if !field_names.contains(r.as_str()) {
                             tracing::warn!(
-                                group = %name,
+                                group = %def.name,
                                 member = %member.field_name,
                                 trigger = %r,
                                 "group trigger references unknown field"
@@ -1055,9 +1058,42 @@ impl BridgeProvider {
                     }
                 }
             }
-            finalized += 1;
+            // The same admission test the serve gate applies, so the count
+            // this reports and the set `servable_group` will hand out are the
+            // same set by construction.
+            if let Some(err) = self.group_creation_error(&def).await {
+                eprintln!("{}: Error Group not created: {err}", def.name);
+                tracing::error!(group = %def.name, error = %err, "group not created");
+                continue;
+            }
+            created += 1;
         }
-        finalized
+        created
+    }
+
+    /// Why `def` cannot be created, or `None` when every member resolves.
+    ///
+    /// pvxs builds one `dbChannel` per `+channel` while constructing the
+    /// group's fields; a `+channel` that `dbChannelCreate` refuses throws out
+    /// of `Field::Field` (ioc/field.cpp:23-25 → ioc/channel.cpp:37) and
+    /// `createGroups` drops the WHOLE group. This is the port's single
+    /// creation gate: the same answer feeds the `processGroups` report and
+    /// [`Self::servable_group`], so a group with an unresolvable member can
+    /// neither be counted as created nor reach a client — the "half-created
+    /// group that fails every operation" state is not representable behind
+    /// the gate.
+    async fn group_creation_error(&self, def: &GroupPvDef) -> Option<String> {
+        for member in &def.members {
+            if member.channel.is_empty() {
+                // Channel-less members (Structure / Const / Proc mappings) never
+                // bind a dbChannel — pvxs skips them (`if(!def.channel.empty())`).
+                continue;
+            }
+            if let Err(e) = super::channel::resolve_db_channel(&self.db, &member.channel).await {
+                return Some(e);
+            }
+        }
+        None
     }
 
     /// Access the underlying database.
@@ -1122,16 +1158,27 @@ impl BridgeProvider {
     /// single serving owner. Every group lookup on the serve path
     /// (`channel_find`, `create_channel*`, `channel_list`) goes
     /// through this gate, so the dual meaning cannot reach a client.
+    ///
+    /// The gate also applies pvxs's CREATION test: a group whose `+channel`
+    /// does not resolve to a dbChannel is never created by `createGroups`
+    /// (groupconfigprocessor.cpp:429-444), so it must not answer a search
+    /// either — the client gets a clean "PV not found" instead of a group
+    /// that connects and then fails every operation. See
+    /// [`Self::group_creation_error`].
     pub(crate) async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
         let def = self.groups.read().get(name).cloned()?;
         if self.record_exists(name).await {
+            return None;
+        }
+        if self.group_creation_error(&def).await.is_some() {
             return None;
         }
         Some(def)
     }
 
     /// Lean bool form of [`Self::servable_group`]: `name` is served as a
-    /// group iff it is registered AND not shadowed by a backing record.
+    /// group iff it is registered, not shadowed by a backing record, AND
+    /// creatable (every `+channel` resolves).
     ///
     /// The single shadow-aware predicate every group-specific helper
     /// consults so the "a name is a record XOR a group" invariant pvxs
@@ -1141,10 +1188,9 @@ impl BridgeProvider {
     /// `GroupPvDef` when only the existence answer is needed (e.g. the
     /// `is_writable` / `PROCESS` admission checks).
     pub(crate) async fn is_servable_group(&self, name: &str) -> bool {
-        // Read the registry into a bool before any await so the
-        // (non-Send) `parking_lot` guard is not held across `record_exists`.
-        let registered = self.groups.read().contains_key(name);
-        registered && !self.record_exists(name).await
+        // Defined in terms of the gate itself, so the bool answer and the
+        // definition answer can never disagree about what is served.
+        self.servable_group(name).await.is_some()
     }
 
     /// Drop every registered group definition. Mirrors pvxs
@@ -1278,15 +1324,15 @@ impl ChannelProvider for BridgeProvider {
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names().await);
-        // A group name that collides with a record/alias/simple PV is
-        // ignored (the record wins), so list it once — as the record.
-        // Mirrors pvxs: a shadowed name never enters groupMap at
-        // `defineGroups` (ioc/groupconfigprocessor.cpp:177), so
-        // groupsource.cpp:75-89 lists only the surviving groups.
+        // Only groups the serve gate hands out are listed: a name shadowed by
+        // a record is listed once (as the record — the record wins, pvxs
+        // `defineGroups` ioc/groupconfigprocessor.cpp:177), and a group that
+        // `createGroups` would refuse never enters `groupMap`
+        // (:429-444), so groupsource.cpp:75-89 cannot list it.
         let existing: std::collections::HashSet<String> = names.iter().cloned().collect();
         let group_keys: Vec<String> = self.groups.read().keys().cloned().collect();
         for k in group_keys {
-            if !existing.contains(&k) && self.db.find_pv(&k).await.is_none() {
+            if !existing.contains(&k) && self.is_servable_group(&k).await {
                 names.push(k);
             }
         }
@@ -1448,6 +1494,100 @@ pub async fn channel_property_support(
 mod tests {
     use super::*;
 
+    /// The `+channel` admission boundary (pvxs `createGroups`
+    /// groupconfigprocessor.cpp:429-444 catching the `Field`/`Channel` ctor
+    /// throw). One case per boundary of "would `dbChannelCreate` succeed?":
+    ///
+    /// - member record missing              → group NOT created
+    /// - member field missing on a real rec → group NOT created
+    /// - `$` on a `DBF_CHAR` waveform       → group NOT created
+    ///   (`dbChannel.c:500-503` `S_dbLib_fieldNotFound`; the port used to
+    ///   fabricate a `double` leaf for the unresolvable `VAL$` field)
+    /// - `$` on a `DBF_STRING` field        → group NOT created (deviation,
+    ///   see `channel::resolve_db_channel`: the group path has no `$` view,
+    ///   so admitting it yields a group that answers `FieldNotFound` to every
+    ///   GET — refused with a named reason instead)
+    /// - every member resolves              → group created
+    ///
+    /// "Not created" is asserted at the client boundary, not just in the
+    /// count: an uncreatable group must not answer a search, must not build
+    /// a channel, and must not be listed.
+    #[tokio::test]
+    async fn a_group_whose_channel_does_not_resolve_is_not_created() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("G:ai", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("G:si", Box::new(StringinRecord::new("hello")))
+            .await
+            .unwrap();
+        db.add_record("G:wf", Box::new(WaveformRecord::new(40, DbFieldType::Char)))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(BridgeProvider::new(db));
+        provider
+            .load_group_config(
+                r#"{
+                    "G:missingrec":   { "value": { "+channel": "G:nosuch.VAL", "+type": "plain" } },
+                    "G:missingfield": { "value": { "+channel": "G:ai.NOPE",    "+type": "plain" } },
+                    "G:dollarchar":   { "value": { "+channel": "G:wf.VAL$",    "+type": "plain" } },
+                    "G:dollarstr":    { "value": { "+channel": "G:si.VAL$",    "+type": "plain" } },
+                    "G:ok":           { "value": { "+channel": "G:ai.VAL",     "+type": "plain" } }
+                }"#,
+            )
+            .unwrap();
+
+        // All five are configured; only the creatable ones are created.
+        assert_eq!(provider.group_count(), 5, "all five parse into the config");
+        assert_eq!(
+            provider.process_groups().await,
+            1,
+            "only `G:ok` binds a channel this server can serve"
+        );
+
+        for refused in [
+            "G:missingrec",
+            "G:missingfield",
+            "G:dollarchar",
+            "G:dollarstr",
+        ] {
+            assert!(
+                !provider.channel_find(refused).await,
+                "{refused}: an uncreated group must not answer a search"
+            );
+            assert!(
+                provider.create_channel(refused).await.is_err(),
+                "{refused}: an uncreated group must not build a channel"
+            );
+        }
+        assert!(
+            provider.channel_find("G:ok").await,
+            "G:ok: every member resolves; the group is served"
+        );
+        match provider.create_channel("G:ok").await.unwrap() {
+            AnyChannel::Group(_) => {}
+            AnyChannel::Single(_) => panic!("G:ok must build as a group"),
+        }
+
+        let listed = provider.channel_list().await;
+        assert_eq!(
+            listed.iter().filter(|n| n.starts_with("G:")).count(),
+            4,
+            "the three records and the one created group, nothing else: {listed:?}"
+        );
+        assert!(
+            listed.contains(&"G:ok".to_string()),
+            "the created group must be listed: {listed:?}"
+        );
+    }
+
     /// A QSRV group whose name collides with a real record must be
     /// ignored — the record wins, mirroring pvxs `defineGroups`
     /// dbChannelTest (ioc/groupconfigprocessor.cpp:177). A non-colliding
@@ -1459,6 +1599,12 @@ mod tests {
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        // The group's `+channel` must resolve, or the group is never
+        // created (`group_creation_error`) and the shadow rule under test
+        // would never be reached.
+        db.add_record("OTHER", Box::new(AiRecord::new(2.0)))
             .await
             .unwrap();
         let provider = BridgeProvider::new(db);
@@ -1513,6 +1659,11 @@ mod tests {
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("SH:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        // `SH:grp`'s `+channel` must resolve, or the group is refused at
+        // creation and the shadow rule under test is never exercised.
+        db.add_record("OTHER", Box::new(AiRecord::new(2.0)))
             .await
             .unwrap();
         // DISP=1 so the served record is NOT writable; a leaked group

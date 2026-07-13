@@ -1073,7 +1073,7 @@ async fn group_config_parses_and_finalizes() {
     let db = make_db().await;
     let provider = BridgeProvider::new(db);
     provider.load_group_config(GROUP_JSON).expect("load");
-    let n = provider.process_groups();
+    let n = provider.process_groups().await;
     assert_eq!(n, 1);
     let groups = provider.groups();
     let def = groups.get("TEST:grp").expect("registered");

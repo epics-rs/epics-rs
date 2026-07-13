@@ -389,6 +389,58 @@ pub(super) fn resolve_record_field(record_path: &str) -> (&str, String, bool) {
     (record_name, field.to_ascii_uppercase(), string_view)
 }
 
+/// `dbChannelCreate(name)` admission test (C `dbChannel.c:440-530`) for a
+/// QSRV channel name: does `name` name a field of a record in `db`, and — if
+/// it carries the `$` modifier — is that field `$`-eligible?
+///
+/// pvxs runs exactly this test whenever it binds a channel: `Channel::Channel`
+/// throws `Invalid PV: <name>` when `dbChannelCreate` returns NULL
+/// (`ioc/channel.cpp:29-38`). The single-channel path already performs it
+/// implicitly, by resolving the field before it can build a `BridgeChannel`;
+/// the group path had no such gate, so this is the shared owner both use to
+/// answer "would `dbChannelCreate` succeed?" without constructing anything.
+///
+/// Returns the pvxs error text on refusal so the caller can reproduce
+/// `createGroups`' `"%s: Error Group not created: %s\n"` line verbatim.
+///
+/// DEVIATION (Tier 2), stated where it is made: the group value/put/monitor
+/// paths bind `member.channel` field-by-name and have no `$` char-array view,
+/// so a `$` member this port admitted would connect and then answer
+/// `FieldNotFound` to every operation — the very state pvxs's refusal exists
+/// to prevent. Until the group path grows the view, a `$` `+channel` is
+/// refused with a named reason rather than half-served. pvxs would create the
+/// `DBF_STRING` case (it serves the raw `int8_t[]`); it refuses the ineligible
+/// case exactly as we do, with the same `Invalid PV:` text.
+pub(super) async fn resolve_db_channel(db: &PvDatabase, name: &str) -> Result<(), String> {
+    let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
+    let (record_name, field, string_view) = resolve_record_field(&parsed.record_path);
+    let Some(rec) = db.get_record(record_name).await else {
+        return Err(format!("Invalid PV: {name}"));
+    };
+    let instance = rec.read().await;
+    if string_view {
+        // `$` is `S_dbLib_fieldNotFound` on anything but a `DBF_STRING` or
+        // link field (`dbChannel.c:486-505`), which aborts channel creation.
+        // `resolve_string_view_field` is the base's owner of that eligibility
+        // rule — the same one `BridgeChannel::new` consults — so a `$` on a
+        // `DBF_CHAR` waveform is refused here (verbatim pvxs text) instead of
+        // reaching the introspection builder as an unresolvable field it
+        // renders as a fabricated `double` leaf.
+        return if instance.resolve_string_view_field(&field).is_none() {
+            Err(format!("Invalid PV: {name}"))
+        } else {
+            Err(format!(
+                "long-string '$' channel is not supported in a group: {name}"
+            ))
+        };
+    }
+    if instance.resolve_field(&field).is_some() {
+        Ok(())
+    } else {
+        Err(format!("Invalid PV: {name}"))
+    }
+}
+
 /// `dbIsValueField(dbChannelFldDes(chan))` for a QSRV channel name (single
 /// channel) or a group member's `+channel` — the fact QSRV's
 /// `IOCSource::initialize` gates `display.form.index` on

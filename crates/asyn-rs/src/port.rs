@@ -1525,11 +1525,13 @@ pub trait PortDriver: Send + Sync + 'static {
             // C hands its own level straight to `reportParams` (:3692).
             base.report_params(out, level);
         }
-        if level >= 2 {
-            for (k, v) in &base.options {
-                let _ = writeln!(out, "  option: {k} = {v}");
-            }
-        }
+        // There is no options block: `asynPortDriver::report` never prints one
+        // (asynPortDriver.cpp:3677-3710), and it could not — `asynOption` is a
+        // get/set pair keyed by a string the *driver* defines, with nothing to
+        // enumerate. The `option: k = v` lines this printed at `details >= 2` had
+        // no C source and no fixed key set to be complete over: they listed
+        // whatever happened to have been written through `setOption`, which is not
+        // the port's option state (R16-49).
         if level >= 3 {
             report_interrupt_clients(out, base);
         }
@@ -3572,5 +3574,42 @@ mod tests {
             out.contains("  Output EOS[2]: \\t\\a\n"),
             "BEL is `\\a` in C's table, not `\\x07` (epicsString.c:245): {out}"
         );
+    }
+
+    /// R16-49: the report has no options block, at any level.
+    ///
+    /// C `asynPortDriver::report` (asynPortDriver.cpp:3677-3710) prints the port
+    /// name, the timestamp, the EOS pair, the parameter lists and — at
+    /// `details >= 3` — the interrupt clients. It never prints options, and it
+    /// could not: `asynOption` is a `getOption`/`setOption` pair keyed by a
+    /// driver-defined string, with no enumeration to walk.
+    #[test]
+    fn report_prints_no_options_block() {
+        struct Drv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for Drv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut drv = Drv {
+            base: PortDriverBase::new("opt_rep", 1, PortFlags::default()),
+        };
+        drv.set_option(&mut AsynUser::default(), "baud", "9600")
+            .unwrap();
+
+        for level in 0..=4 {
+            let mut out = String::new();
+            drv.report(&mut out, level);
+            assert!(
+                !out.contains("option") && !out.contains("baud"),
+                "asynReport {level} must print no options block: {out}"
+            );
+        }
     }
 }

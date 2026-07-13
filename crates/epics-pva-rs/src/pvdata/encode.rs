@@ -1519,6 +1519,40 @@ pub fn marked_changed_bitset(desc: &FieldDesc, marked_paths: &[String]) -> crate
     out
 }
 
+/// The wire changed-bitset a `marked_paths` post actually frames: the
+/// marked subtrees intersected with the request `mask`, canonicalized to
+/// leaf bits ([`canonical_changed_bitset`]).
+///
+/// **Single owner for both the enqueue gate and the wire.** pvxs decides
+/// whether a post is `real` with `testmask` (`pvrequest.cpp:73-92`), which
+/// scans `store[idx].valid && mask[idx]` — and only *leaves* ever carry
+/// `valid` (`Value::mark`, `data.cpp:256-270`), so its gate ranges over
+/// exactly the bits `to_wire_valid` would emit. Computing the gate from the
+/// raw [`marked_changed_bitset`] instead would test STRUCTURE bits too: a
+/// request such as `field(timeStamp.bogus)` yields a mask holding the
+/// `timeStamp` structure bit and no leaf under it (`request2mask`
+/// `pvrequest.cpp:33-40` sets the matched structure's bit; the non-existent
+/// child selects nothing), so a `timeStamp` post would pass a structure-bit
+/// gate and then frame an EMPTY changed-bitset — full-rate empty MONITOR
+/// DATA where pvxs posts nothing at all.
+///
+/// So: gate on `!result.is_empty()`, frame `result`. One computation, so the
+/// two can never disagree.
+pub fn marked_wire_changed_bitset(
+    desc: &FieldDesc,
+    marked_paths: &[String],
+    mask: &crate::proto::BitSet,
+) -> crate::proto::BitSet {
+    let target = marked_changed_bitset(desc, marked_paths);
+    let mut selected = crate::proto::BitSet::new();
+    for bit in target.iter() {
+        if mask.get(bit) {
+            selected.set(bit);
+        }
+    }
+    canonical_changed_bitset(desc, &selected)
+}
+
 /// Inverse of [`marked_changed_bitset`]: collect the dot-separated field
 /// paths whose bit is set in `changed`, respecting pvData parent-bit
 /// compression — a node whose OWN bit is set yields that node's path and

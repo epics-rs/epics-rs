@@ -520,7 +520,13 @@ impl PortActor {
     fn queue_gate(op: &RequestOp, user: &AsynUser) -> Option<ConnectCheck> {
         match Self::c_dispatch(op) {
             CDispatch::Direct => None,
-            CDispatch::ConnectQueue => Some(ConnectCheck::Waived),
+            // The op fixes the priority at Connect (every C call site passes
+            // `asynQueuePriorityConnect`), but the WAIVER is still the user's:
+            // C waives `checkPortConnect` only for a port-level user
+            // (`addr == -1`) or the explicit sentinel (asynManager.c:1536-1538).
+            // A device-addressed CNCT put without either is refused on a
+            // disconnected port — the C wart W10-D1, reproduced by decision.
+            CDispatch::ConnectQueue => Some(user.connect_check_at_connect_priority()),
             CDispatch::Queued => Some(user.connect_check()),
         }
     }
@@ -2513,7 +2519,12 @@ mod tests {
             // saw (`set_params_and_notify` drops the reply channel).
             let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
             send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user).unwrap();
-            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            // Port-level user (addr == -1): the Connect-queue waiver holds on
+            // the disconnected port (a device-addressed connect would be
+            // refused — W10-D1).
+            let user = AsynUser::new(0)
+                .with_addr(-1)
+                .with_timeout(Duration::from_secs(1));
             send_and_wait(&tx, RequestOp::Connect, user).unwrap();
 
             let user = AsynUser::new(val).with_timeout(Duration::from_secs(1));
@@ -2721,8 +2732,23 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user).unwrap();
 
-        // …and once enabled, the same CNCT=1 put connects.
+        // …but a device-addressed CNCT=1 put is still refused: the port is
+        // enabled yet disconnected, and C's `checkPortConnect` waiver covers
+        // only `addr == -1` or the sentinel (asynManager.c:1536-1538) — the
+        // W10-D1 wart, reproduced.
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The route that DOES bring the enabled port up is the port-level
+        // user — C `connectDevice(port, -1)`, whose waiver holds.
+        let user = AsynUser::new(0)
+            .with_addr(-1)
+            .with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Connect, user).unwrap();
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -2738,13 +2764,59 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Disconnect, user).unwrap();
 
-        // Port is now disconnected, auto_connect is true by default
-        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        // Port is now disconnected. A device-addressed reconnect is refused
+        // (C's checkPortConnect, W10-D1) — the port-level user (addr == -1,
+        // C `connectDevice(port, -1)`) is the route back up.
+        let user = AsynUser::new(0)
+            .with_addr(-1)
+            .with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Connect, user).unwrap();
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
         assert!(result.is_ok());
+    }
+
+    /// W10-D1 boundaries of C's Connect-queue waiver (asynManager.c:1536-1538):
+    /// on a disconnected, non-autoconnect port a Connect-priority request runs
+    /// iff the user is port-level (`addr == -1`) or carries the sentinel. The
+    /// device-addressed CNCT put (asynRecord's special user at the record's
+    /// ADDR, no sentinel) is refused `asynDisconnected` — the C wart, kept by
+    /// decision.
+    #[test]
+    fn device_addressed_connect_is_refused_on_a_disconnected_port() {
+        let mut drv = TestDriver::new();
+        drv.base.auto_connect = false;
+        drv.base.set_connected(false);
+        let tx = spawn_actor(drv);
+
+        // Boundary 1: addr >= 0, no sentinel → refused (C checkPortConnect).
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let err = send_and_wait(&tx, RequestOp::Connect, user).unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disconnected),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+
+        // Boundary 2: addr >= 0 WITH the sentinel → waived, runs.
+        let user = AsynUser::new(0)
+            .with_timeout(Duration::from_secs(1))
+            .queue_even_if_not_connected();
+        send_and_wait(&tx, RequestOp::Connect, user)
+            .expect("the sentinel waives the connected refusal at any addr");
+
+        // Reset for boundary 3.
+        let user = AsynUser::new(0)
+            .with_addr(-1)
+            .with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Disconnect, user).unwrap();
+
+        // Boundary 3: addr == -1, no sentinel → waived, runs.
+        let user = AsynUser::new(0)
+            .with_addr(-1)
+            .with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::Connect, user)
+            .expect("a port-level user is waived on the Connect queue");
     }
 
     #[test]

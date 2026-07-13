@@ -1016,15 +1016,22 @@ impl PortHandle {
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
-    /// Connect the port's transport (blocking) — C `pasynCommon->connect`.
+    /// Connect the port's transport (blocking) — C `pasynCommon->connect`
+    /// reached through a PORT-level user (`connectDevice(port, -1)`), so the
+    /// Connect-queue waiver applies (asynManager.c:1536-1538) and the request
+    /// runs on a disconnected port — this is the route that brings a down
+    /// line up. A device-addressed connect (asynRecord CNCT at the record's
+    /// ADDR) goes through [`Self::submit_blocking`] with the caller's own
+    /// user and is refused on a disconnected port, as C refuses it (W10-D1).
     pub fn connect_blocking(&self) -> AsynResult<()> {
-        self.submit_blocking(RequestOp::Connect, AsynUser::new(0))?;
+        self.submit_blocking(RequestOp::Connect, AsynUser::new(0).with_addr(-1))?;
         Ok(())
     }
 
-    /// Disconnect the port's transport (blocking) — C `pasynCommon->disconnect`.
+    /// Disconnect the port's transport (blocking) — C `pasynCommon->disconnect`
+    /// through a PORT-level user; see [`Self::connect_blocking`].
     pub fn disconnect_blocking(&self) -> AsynResult<()> {
-        self.submit_blocking(RequestOp::Disconnect, AsynUser::new(0))?;
+        self.submit_blocking(RequestOp::Disconnect, AsynUser::new(0).with_addr(-1))?;
         Ok(())
     }
 

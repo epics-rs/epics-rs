@@ -203,9 +203,24 @@ impl AsynUser {
     /// *only* producer of a [`ConnectCheck`], so the connected refusal is waived
     /// exactly where C waives it and the enabled refusal is waived nowhere.
     pub fn connect_check(&self) -> ConnectCheck {
-        if self.priority == QueuePriority::Connect
-            && (self.addr < 0 || self.reason == ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED)
-        {
+        if self.priority == QueuePriority::Connect {
+            self.connect_check_at_connect_priority()
+        } else {
+            ConnectCheck::Required
+        }
+    }
+
+    /// [`Self::connect_check`] for a request that rides the Connect-priority
+    /// queue *by construction* — the `asynCommon` connect/disconnect callbacks,
+    /// whose C call sites always pass `asynQueuePriorityConnect`
+    /// (asynRecord.c:561-563, asynShellCommands.c). Priority being given, only
+    /// the second half of C's `checkPortConnect` waiver remains (:1536-1538):
+    /// a port-level user (`addr == -1`) or the explicit sentinel. A
+    /// device-addressed user with neither — asynRecord's CNCT put, whose
+    /// special user is connected at the record's ADDR — is refused
+    /// `asynDisconnected` on a disconnected port (W10-D1): a C wart, kept.
+    pub fn connect_check_at_connect_priority(&self) -> ConnectCheck {
+        if self.addr < 0 || self.reason == ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED {
             ConnectCheck::Waived
         } else {
             ConnectCheck::Required

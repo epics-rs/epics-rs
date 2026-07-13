@@ -4117,25 +4117,38 @@ impl Record for AsynRecord {
                 match this.port_entry {
                     Some(ref entry) => {
                         let handle = entry.handle.clone();
-                        match handle.is_connected_blocking() {
-                            Ok(is_connected) => {
-                                let res = match (want, is_connected) {
-                                    (true, false) => Some(("connect", handle.connect_blocking())),
-                                    (false, true) => {
-                                        Some(("disconnect", handle.disconnect_blocking()))
-                                    }
-                                    // Already in the requested state: C issues
-                                    // no driver call at all.
-                                    _ => None,
-                                };
-                                if let Some((what, Err(e))) = res {
-                                    this.errs =
-                                        format!("asynCallbackSpecial callbackConnect {what}: {e}");
-                                }
-                            }
-                            Err(e) => {
+                        // The special user is the record's own — connected at
+                        // the record's ADDR (C `duplicateAsynUser` of a user
+                        // `connectDevice`d at pasynRec->addr). No sentinel, so
+                        // on a disconnected port a device-addressed (ADDR>=0)
+                        // CNCT put is refused `asynDisconnected` exactly as
+                        // C's `checkPortConnect` refuses it (W10-D1); the
+                        // refusal lands in ERRS and monitorStatus snaps CNCT
+                        // back below.
+                        let cnct_user = || AsynUser::new(0).with_addr(this.addr);
+                        let res = match (want, handle.is_connected_blocking()) {
+                            (true, Ok(false)) => Some((
+                                "connect",
+                                handle
+                                    .submit_blocking(RequestOp::Connect, cnct_user())
+                                    .map(|_| ()),
+                            )),
+                            (false, Ok(true)) => Some((
+                                "disconnect",
+                                handle
+                                    .submit_blocking(RequestOp::Disconnect, cnct_user())
+                                    .map(|_| ()),
+                            )),
+                            // Already in the requested state: C issues
+                            // no driver call at all.
+                            (_, Ok(_)) => None,
+                            (_, Err(e)) => {
                                 this.errs = format!("asynCallbackSpecial isConnected error: {e}");
+                                None
                             }
+                        };
+                        if let Some((what, Err(e))) = res {
+                            this.errs = format!("asynCallbackSpecial callbackConnect {what}: {e}");
                         }
                     }
                     None => {
@@ -6798,14 +6811,37 @@ mod tests {
             "CNCT must not drop the port binding"
         );
 
-        // CNCT=1 on a disconnected port → pasynCommon->connect.
+        // CNCT=1 on the disconnected port is REFUSED: the record's special
+        // user rides the Connect queue at the record's ADDR (0) with no
+        // sentinel, and C's `checkPortConnect` waiver covers only addr == -1
+        // or the sentinel (asynManager.c:1520,1536-1538) — the W10-D1 wart,
+        // reproduced by decision. The refusal lands in ERRS and monitorStatus
+        // snaps CNCT back to the wire's state.
         rec.cnct = 1;
         rec.special("CNCT", true).unwrap();
         assert_eq!(
             connects.load(Ordering::SeqCst),
-            base_connects + 1,
-            "CNCT=1 must connect the driver's transport"
+            base_connects,
+            "a device-addressed CNCT=1 put must be refused on a disconnected \
+             port (C checkPortConnect)"
         );
+        assert!(
+            rec.errs.contains("callbackConnect connect"),
+            "the refusal reaches ERRS: {}",
+            rec.errs
+        );
+        assert_eq!(rec.cnct, 0, "monitorStatus snaps CNCT back to the wire");
+
+        // The port-level route (C `connectDevice(port, -1)`) brings the line
+        // back up; CNCT reads it back on the next status cycle.
+        rec.port_entry
+            .as_ref()
+            .unwrap()
+            .handle
+            .connect_blocking()
+            .unwrap();
+        rec.cnct = 1;
+        rec.special("CNCT", true).unwrap();
         assert_eq!(rec.cnct, 1);
 
         // C's isConnected gate: re-putting the state the port is already in

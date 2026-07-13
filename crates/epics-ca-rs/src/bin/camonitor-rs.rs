@@ -592,7 +592,7 @@ fn parse_timestamp_spec(scan: &mut copt::Scan, id: &str) -> TimestampSpec {
     // EVERY occurrence re-runs the case (both sources reset to 0 first), so the
     // last one decides — and each is scanned, which is what makes its warnings
     // appear at its own position.
-    for (_at, k) in scan
+    for (at, k) in scan
         .occurrences(id)
         .into_iter()
         .map(|(at, s)| (at, s.to_string()))
@@ -607,10 +607,20 @@ fn parse_timestamp_spec(scan: &mut copt::Scan, id: &str) -> TimestampSpec {
             match c {
                 's' => spec.server = true,
                 'c' => spec.client = true,
+                // `case 'n': break;` — the ONLY letter C accepts silently
+                // without acting on it (`camonitor.c:246`).
+                'n' => {}
                 'r' => spec.kind = TimestampKind::Relative,
                 'i' => spec.kind = TimestampKind::IncrAll,
                 'I' => spec.kind = TimestampKind::IncrChan,
-                _ => {} // 'n' and unknown letters: no-op (matches C)
+                // C's `default:` inside the per-character switch
+                // (`camonitor.c:249-251`): every letter it does not know warns
+                // and is skipped — the scan continues, so `-t xsy` still selects
+                // the server source and warns twice.
+                _ => scan.warn(
+                    at,
+                    format!("Invalid argument '{c}' for option '-t' - ignored."),
+                ),
             }
         }
     }
@@ -839,6 +849,63 @@ mod tests {
         // last one decides — `-t c -t s` is server-only, not both.
         let s = spec_of(&["-t", "c", "-t", "s"]);
         assert!(s.server && !s.client, "the last -t resets and re-sets");
+    }
+
+    /// R13-18: `case 't'` switches on EVERY character of `optarg` and its
+    /// `default:` warns for each letter it does not know
+    /// (`camonitor.c:249-251`, `"Invalid argument '%c' for option '-t' -
+    /// ignored."`). Only `n` is accepted silently (`case 'n': break;`,
+    /// `camonitor.c:246`). The scan does not stop at a bad letter — unlike
+    /// `-m`, which warns once with the whole string and gives up
+    /// (`camonitor.c:296-300`) — so the good letters around it still apply.
+    #[test]
+    fn every_bad_t_character_warns_and_the_good_ones_still_apply() {
+        fn warnings(argv: &[&str]) -> Vec<String> {
+            let m = matches_of(argv);
+            let mut scan = TOOL.scan(&m);
+            let _ = parse_timestamp_spec(&mut scan, "timestamp_key");
+            scan.ordered_warnings()
+        }
+
+        assert_eq!(
+            warnings(&["-t", "x"]),
+            vec!["Invalid argument 'x' for option '-t' - ignored."]
+        );
+        assert_eq!(
+            warnings(&["-t", "xy"]),
+            vec![
+                "Invalid argument 'x' for option '-t' - ignored.",
+                "Invalid argument 'y' for option '-t' - ignored.",
+            ],
+            "one warning per unknown character, in the order they appear"
+        );
+        assert!(
+            warnings(&["-t", "n"]).is_empty(),
+            "`case 'n'` is the one letter C accepts without a warning"
+        );
+        assert!(
+            warnings(&["-t", "scriI"]).is_empty(),
+            "every letter with a case of its own is silent"
+        );
+
+        // The bad letter is skipped, not fatal: 's' before it and 'r' after it
+        // both still take effect.
+        let s = spec_of(&["-t", "sxr"]);
+        assert!(
+            s.server && matches!(s.kind, TimestampKind::Relative),
+            "C's per-character switch carries on past the `default:` arm"
+        );
+        assert_eq!(
+            warnings(&["-t", "sxr"]),
+            vec!["Invalid argument 'x' for option '-t' - ignored."]
+        );
+
+        // Each occurrence re-runs the case, so a bad letter in an occurrence
+        // that later loses still warns at its own position (R13-26).
+        assert_eq!(
+            warnings(&["-t", "x", "-t", "s"]),
+            vec!["Invalid argument 'x' for option '-t' - ignored."]
+        );
     }
 
     /// Build a fresh `TimestampState` over caller-owned slots so each

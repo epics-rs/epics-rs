@@ -625,7 +625,8 @@ impl IocApplication {
         // `dbLoadRecords` calls. Records created in it queue their link-status
         // classification instead of running it against a database that is still
         // being built (R18-92).
-        db.begin_load();
+        db.begin_load()
+            .expect("a database created a line ago has not run iocInit");
         let handle = tokio::runtime::Handle::current();
 
         let Self {

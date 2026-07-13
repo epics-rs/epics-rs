@@ -701,11 +701,24 @@ fn cmd_dirs() -> CommandDef {
     )
 }
 
-/// `dbCreateRecord <type> <name>` — create a new record at runtime.
+/// `dbCreateRecord <type> <name>` — create a record BEFORE `iocInit`.
 ///
 /// Mirrors epics-base PR #812. Validates the name with the same rules
 /// as `parse_db` (PR #78), refuses duplicate names, and routes the
 /// instantiation through the same factory registry as `dbLoadRecords`.
+///
+/// "At runtime" it is not: C's `dbCreateRecordCallFunc`
+/// (`dbStaticIocRegister.c:288`) refuses the command outright once
+/// `getIocState() != iocVoid`, with `S_dbLib_postInitRecRegister` (R19-63) —
+/// the same gate `dbReadCOM` puts on a `.db` read:
+///
+/// ```text
+/// epics> iocInit
+/// epics> dbCreateRecord(pdbbase,"ai","NEWREC")
+/// ERROR: 33554463 IOC already initialized - No new records can be added
+/// epics> dbl
+/// CO
+/// ```
 fn cmd_db_create_record() -> CommandDef {
     CommandDef::new(
         "dbCreateRecord",
@@ -721,8 +734,14 @@ fn cmd_db_create_record() -> CommandDef {
                 optional: false,
             },
         ],
-        "dbCreateRecord <type> <name> — Create a new record of <type> at runtime",
+        "dbCreateRecord <type> <name> — Create a new record of <type> (before iocInit)",
         |args: &[ArgValue], ctx: &CommandContext| {
+            // Creating a record IS entering the load phase — the record's links
+            // are classified by `iocInit`, with the rest of the database. Once
+            // `iocInit` has run there is no phase to enter and C refuses.
+            if let Err(e) = ctx.db().begin_load() {
+                return Err(e.to_string());
+            }
             let rec_type = match &args[0] {
                 ArgValue::String(s) => s.clone(),
                 _ => {
@@ -967,6 +986,30 @@ fn cmd_db_load_records() -> CommandDef {
                 _ => "",
             };
 
+            // `dbLoadRecords` OPENS the load phase; it does not close it — the
+            // boundary a record's links are classified against is `iocInit`,
+            // after EVERY `dbLoadRecords` in the `st.cmd`, so a forward
+            // reference to a record loaded by a later file is still a local PV
+            // (R18-92). Idempotent across the several loads one script issues.
+            //
+            // And once `iocInit` has run there is no load phase to open: C's
+            // `dbReadCOM` (dbLexRoutines.c:236) fails the read with -2 before it
+            // even opens the file, and `dbLoadRecords` (dbAccess.c:808-812)
+            // prints exactly this (R19-63). So this is asked BEFORE the file is
+            // read, and a refusal creates nothing.
+            //
+            // ```text
+            // epics> iocInit
+            // epics> dbLoadRecords("b.db")
+            // ERROR: Failed to load 'b.db'
+            //     Records cannot be loaded after iocInit!
+            // ```
+            if ctx.db().begin_load().is_err() {
+                return Err(format!(
+                    "Failed to load '{path}'\n    Records cannot be loaded after iocInit!"
+                ));
+            }
+
             let macros = parse_macro_string(macros_str);
 
             // Build include config from EPICS_DB_INCLUDE_PATH
@@ -1019,13 +1062,6 @@ fn cmd_db_load_records() -> CommandDef {
                 ctx.block_on(async { ctx.db().add_breaktables(breaktables).await });
 
             let count = defs.len();
-
-            // `dbLoadRecords` OPENS the load phase; it does not close it. The
-            // boundary a record's links are classified against is `iocInit` —
-            // after EVERY `dbLoadRecords` in the `st.cmd` — so a forward
-            // reference to a record loaded by a later file is still a local PV
-            // (R18-92). Idempotent across the several loads one script issues.
-            ctx.db().begin_load();
 
             for mut def in defs {
                 // Resolve a `LINR` field naming a loaded breakpoint table to its
@@ -2156,6 +2192,100 @@ record(mbbo, "DUP:CM") {{
             ),
             Ok(_) => panic!("different-type duplicate must error, but call succeeded"),
         }
+    }
+
+    // R19-63 — the two record-creating iocsh commands, on either side of the
+    // `iocInit` boundary. C gates both on `getIocState() != iocVoid`
+    // (`dbLexRoutines.c:236` for every `.db` read, `dbStaticIocRegister.c:288`
+    // for `dbCreateRecord`) and creates NOTHING once the IOC is running.
+    //
+    // softIoc 7.0.10.1-DEV — `a.db` holds `CO`, `b.db` holds two records:
+    //
+    //     epics> dbLoadRecords("a.db")
+    //     epics> iocInit
+    //     epics> dbLoadRecords("b.db")
+    //     ERROR: Failed to load 'b.db'
+    //         Records cannot be loaded after iocInit!
+    //     epics> dbCreateRecord(pdbbase,"ai","NEWREC")
+    //     ERROR: 33554463 IOC already initialized - No new records can be added
+    //     epics> dbl
+    //     CO
+    fn load_records(ctx: &CommandContext, body: &str) -> Result<(), String> {
+        use std::io::Write;
+        let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+        write!(tmp.as_file(), "{body}").unwrap();
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        cmd.handler.call(&args, ctx).map(|_| ())
+    }
+
+    fn create_record(ctx: &CommandContext, name: &str) -> Result<(), String> {
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbCreateRecord").unwrap();
+        let args = parse_args(&["ai".to_string(), name.to_string()], &cmd.args).unwrap();
+        cmd.handler.call(&args, ctx).map(|_| ())
+    }
+
+    fn exists(db: &PvDatabase, ctx: &CommandContext, name: &str) -> bool {
+        ctx.block_on(async { db.get_record(name).await.is_some() })
+    }
+
+    /// Boundary: LOAD phase (pre-`iocInit`). Both creators work — the control
+    /// case, so the gate below is not vacuous.
+    #[test]
+    fn record_creation_before_ioc_init_is_allowed() {
+        let (db, ctx) = make_ctx();
+
+        load_records(&ctx, r#"record(ai, "PRE") { field(VAL, "1") }"#).expect("pre-init load");
+        create_record(&ctx, "PRE2").expect("pre-init dbCreateRecord");
+
+        assert!(exists(&db, &ctx, "PRE"));
+        assert!(exists(&db, &ctx, "PRE2"));
+    }
+
+    /// Boundary: RUNNING phase. `dbLoadRecords` is refused with C's diagnostic
+    /// and loads NO record from the file — not even the first one. The port used
+    /// to load them all and print "Loaded 2 record(s)"; because that also
+    /// re-opened the load phase, every later link classification was stranded
+    /// (R19-62 — this command is its enabling condition).
+    #[test]
+    fn db_load_records_after_ioc_init_is_refused_and_creates_nothing() {
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, r#"record(ai, "CO") { field(VAL, "1") }"#).expect("pre-init load");
+        ctx.block_on(db.ioc_init());
+
+        let err = load_records(
+            &ctx,
+            r#"
+record(ai, "LATER") { field(VAL, "1") }
+record(ai, "LATER2") { field(VAL, "2") }
+"#,
+        )
+        .expect_err("C refuses a .db read once the IOC is running");
+
+        assert!(
+            err.contains("Records cannot be loaded after iocInit!"),
+            "expected C's dbLoadRecords diagnostic; got {err}"
+        );
+        assert!(!exists(&db, &ctx, "LATER"), "no record may be created");
+        assert!(!exists(&db, &ctx, "LATER2"));
+        assert!(exists(&db, &ctx, "CO"), "the loaded database is untouched");
+    }
+
+    /// The same boundary for the other creator (C `dbCreateRecordCallFunc`).
+    #[test]
+    fn db_create_record_after_ioc_init_is_refused_and_creates_nothing() {
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, r#"record(ai, "CO") { field(VAL, "1") }"#).expect("pre-init load");
+        ctx.block_on(db.ioc_init());
+
+        let err = create_record(&ctx, "NEWREC").expect_err("C refuses dbCreateRecord once running");
+
+        assert_eq!(err, "IOC already initialized - No new records can be added");
+        assert!(!exists(&db, &ctx, "NEWREC"));
     }
 
     #[test]

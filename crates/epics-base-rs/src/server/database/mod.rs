@@ -365,6 +365,27 @@ enum DbInitPhase {
     Running,
 }
 
+/// [`PvDatabase::begin_load`] was called on a database whose `iocInit` has
+/// already run — C's `getIocState() != iocVoid` (R19-63).
+///
+/// The `Display` text is C's `errSymMsg(S_dbLib_postInitRecRegister)` verbatim
+/// (`dbStaticLib.h:269`), which is what `dbCreateRecord` prints:
+///
+/// ```text
+/// epics> dbCreateRecord(pdbbase,"ai","NEWREC")
+/// ERROR: 33554463 IOC already initialized - No new records can be added
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IocAlreadyInitialized;
+
+impl std::fmt::Display for IocAlreadyInitialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IOC already initialized - No new records can be added")
+    }
+}
+
+impl std::error::Error for IocAlreadyInitialized {}
+
 /// Which record kind a SELM link selection is being computed for.
 /// The Specified/Mask base differs between record types in C, so the
 /// shared selector must know the caller.
@@ -1094,28 +1115,40 @@ impl PvDatabase {
     /// Enter the LOAD phase: records are being created and the database is not
     /// yet the one C would classify links against. Called by every path that
     /// begins creating records for an IOC — an `IocBuilder` build, an iocsh
-    /// `dbLoadRecords`, `IocApp::run` — and idempotent, because an `st.cmd`
-    /// issues several loads and they are all one `iocInit` (R18-92).
+    /// `dbLoadRecords` / `dbCreateRecord`, `IocApp::run` — and idempotent within
+    /// the phase, because an `st.cmd` issues several loads and they are all one
+    /// `iocInit` (R18-92).
+    ///
+    /// # Refused once the IOC is running (R19-63)
+    ///
+    /// C admits no record creation after `iocInit`: `dbReadCOM`
+    /// (`dbLexRoutines.c:236`) fails every `.db`/`.dbd` read with `-2` once
+    /// `getIocState() != iocVoid`, and `dbCreateRecordCallFunc`
+    /// (`dbStaticIocRegister.c:288`) fails with `S_dbLib_postInitRecRegister`.
+    /// Asking to create records IS asking to enter the load phase, so the answer
+    /// lives here and is a `Result` the caller cannot ignore — a creator that
+    /// never asked cannot be written by accident, and one that asked cannot
+    /// proceed on a refusal.
     ///
     /// The phase is left ONLY by [`Self::ioc_init`], and once left it is
-    /// TERMINAL: this cannot re-open it (R19-62). The queue is drained by
-    /// exactly one `ioc_init`, so nothing can be pushed into it afterwards and
-    /// stranded. A load that fails halfway leaves the phase open, which strands
-    /// nothing: a queued classification blocks no caller, and it is dropped with
-    /// the database.
-    pub fn begin_load(&self) {
+    /// TERMINAL (R19-62): the queue is drained by exactly one `ioc_init`, so
+    /// nothing can be pushed into it afterwards and stranded. A load that fails
+    /// halfway leaves the phase open, which strands nothing: a queued
+    /// classification blocks no caller, and it is dropped with the database.
+    #[must_use = "C refuses a load after iocInit (dbReadCOM, dbLexRoutines.c:236); \
+                  the refusal must be reported and no record created"]
+    pub fn begin_load(&self) -> Result<(), IocAlreadyInitialized> {
         let mut phase = self.inner.init_phase.lock().unwrap();
         match *phase {
             // The only producer of `Loading`.
-            DbInitPhase::Unloaded => *phase = DbInitPhase::Loading(Vec::new()),
+            DbInitPhase::Unloaded => {
+                *phase = DbInitPhase::Loading(Vec::new());
+                Ok(())
+            }
             // An `st.cmd` issues several loads; they are all one `iocInit`.
-            DbInitPhase::Loading(_) => {}
-            // Post-`iocInit`. The database is already final, so there is no load
-            // phase to enter and nothing to queue for a barrier that has been
-            // and gone — classifications issued from here run immediately (see
-            // `schedule_record_init`). C refuses the load outright
-            // (`dbLexRoutines.c:236`), which `cmd_db_load_records` now does too.
-            DbInitPhase::Running => {}
+            DbInitPhase::Loading(_) => Ok(()),
+            // Post-`iocInit`: terminal. Refused, as C refuses it.
+            DbInitPhase::Running => Err(IocAlreadyInitialized),
         }
     }
 

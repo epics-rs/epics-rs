@@ -64,7 +64,7 @@ async fn forward_reference_across_two_loads_is_local() {
     let db = Arc::new(PvDatabase::new());
 
     // First `dbLoadRecords`.
-    db.begin_load();
+    db.begin_load().unwrap();
     add_calcout(&db, "CO", "LATER.VAL").await;
 
     // Between the two loads the pre-fix code had already closed its load group
@@ -73,7 +73,7 @@ async fn forward_reference_across_two_loads_is_local() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Second `dbLoadRecords`.
-    db.begin_load();
+    db.begin_load().unwrap();
     db.add_record("LATER", Box::new(AiRecord::new(1.0)))
         .await
         .unwrap();
@@ -92,7 +92,7 @@ async fn forward_reference_across_two_loads_is_local() {
 #[tokio::test]
 async fn link_status_is_final_when_ioc_init_returns() {
     let db = Arc::new(PvDatabase::new());
-    db.begin_load();
+    db.begin_load().unwrap();
     add_calcout(&db, "CO", "TARGET.VAL").await;
     db.add_record("TARGET", Box::new(AiRecord::new(1.0)))
         .await
@@ -110,7 +110,7 @@ async fn link_status_is_final_when_ioc_init_returns() {
 #[tokio::test]
 async fn forward_referenced_local_link_classifies_as_local() {
     let db = Arc::new(PvDatabase::new());
-    db.begin_load();
+    db.begin_load().unwrap();
 
     add_calcout(&db, "CO", "TARGET.VAL").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -128,7 +128,7 @@ async fn forward_referenced_local_link_classifies_as_local() {
 #[tokio::test]
 async fn unresolvable_link_still_classifies_as_ext_nc() {
     let db = Arc::new(PvDatabase::new());
-    db.begin_load();
+    db.begin_load().unwrap();
     add_calcout(&db, "CO", "NOSUCH.VAL").await;
     db.ioc_init().await;
 
@@ -159,7 +159,7 @@ async fn no_load_in_progress_classifies_immediately() {
 #[tokio::test]
 async fn record_added_after_ioc_init_classifies_immediately() {
     let db = Arc::new(PvDatabase::new());
-    db.begin_load();
+    db.begin_load().unwrap();
     db.add_record("TARGET", Box::new(AiRecord::new(1.0)))
         .await
         .unwrap();
@@ -182,14 +182,16 @@ async fn record_added_after_ioc_init_classifies_immediately() {
 #[tokio::test]
 async fn begin_load_after_ioc_init_does_not_re_open_the_load_phase() {
     let db = Arc::new(PvDatabase::new());
-    db.begin_load();
+    db.begin_load().unwrap();
     db.add_record("TARGET", Box::new(AiRecord::new(1.0)))
         .await
         .unwrap();
     db.ioc_init().await;
 
-    // A `dbLoadRecords` typed at the running iocsh prompt.
-    db.begin_load();
+    // A `dbLoadRecords` typed at the running iocsh prompt. C refuses it
+    // (R19-63) — and even if a caller ignores the refusal, the phase is
+    // terminal.
+    assert!(db.begin_load().is_err());
 
     // Anything classified from here on must still run: the phase is terminal, so
     // this is a spawn, not a push into a queue nothing drains.
@@ -210,7 +212,7 @@ async fn begin_load_after_ioc_init_does_not_re_open_the_load_phase() {
 #[tokio::test]
 async fn runtime_link_re_point_still_classifies_after_a_post_init_load() {
     let db = Arc::new(PvDatabase::new());
-    db.begin_load();
+    db.begin_load().unwrap();
     add_calcout(&db, "CO", "TARGET.VAL").await;
     db.add_record("TARGET", Box::new(AiRecord::new(1.0)))
         .await
@@ -218,7 +220,7 @@ async fn runtime_link_re_point_still_classifies_after_a_post_init_load() {
     db.ioc_init().await;
     assert_eq!(inav(&db, "CO").await, LINK_LOC);
 
-    db.begin_load();
+    assert!(db.begin_load().is_err());
 
     // `dbpf CO.INPA "9.5"` — the link becomes a CONSTANT.
     db.put_pv("CO.INPA", EpicsValue::String("9.5".into()))

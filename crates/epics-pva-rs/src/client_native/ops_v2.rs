@@ -590,17 +590,25 @@ async fn op_get_inner(
     let (rx_init, rx_data) = server.register_ioid_twoshot(sid, ioid, Command::Get.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
 
-    // Pipeline: combine INIT + GET frames into a single buffer and
-    // send as one channel message. The writer task writes both in one
-    // TCP write_all (they're contiguous bytes). The server parses them
-    // as two PVA messages by header length. This reduces writer channel
-    // hops from 2 to 1 and guarantees both frames land in the same
-    // TCP segment (no Nagle delay between them).
-    let mut combined = codec.build_get_init(sid, ioid, &pv_req);
-    combined.extend_from_slice(&codec.build_get(sid, ioid));
+    // INIT alone. The EXEC goes out only after the INIT reply lands (below)
+    // — never pipelined into the same write.
+    //
+    // A pvxs server dispatches every complete message in the receive buffer in
+    // ONE pass (`ConnBase::bevRead`, `while(bev && remaining >= 8)`,
+    // conn.cpp:152-153), so two frames in one TCP segment are handled
+    // back-to-back with nothing running between them. If the op's Source has
+    // not connected inline — a gateway, an un-`open()`ed `SharedPV`
+    // (sharedpv.cpp:243) — the op is still `ServerOp::Creating` when the EXEC
+    // is dispatched, and `ServerConn::handle_GPR`'s EXEC branch answers that
+    // with `bev.reset()` (serverget.cpp:429-434): the whole TCP circuit dies,
+    // taking every channel on it, with no MESSAGE and no Status. Sending the
+    // EXEC after the INIT reply makes the race unconstructible — the reply IS
+    // the proof the op left `Creating`. MONITOR already does this (its START
+    // is sent after the INIT reply); GET was the only pipelined op.
+    //
     // Sync send into the unbounded writer queue — no scheduler hop,
     // mirrors CA's `DirectServerWriter::send_frame`.
-    server.send_for_channel_sync(sid, combined)?;
+    server.send_for_channel_sync(sid, codec.build_get_init(sid, ioid, &pv_req))?;
 
     // Receive INIT response
     let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
@@ -626,7 +634,11 @@ async fn op_get_inner(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    // Receive DATA response (already sent, just waiting for the reply)
+    // The INIT reply proves the server left `ServerOp::Creating`; only now is
+    // the EXEC legal (see the INIT send above).
+    server.send_for_channel_sync(sid, codec.build_get(sid, ioid))?;
+
+    // Receive DATA response
     let data_frame = await_oneshot_frame(rx_data, op_timeout).await?;
     let intro_arc = Arc::new(intro);
     let result = match decode_op_or_reset(&server, &data_frame, Some(&intro_arc))? {

@@ -198,15 +198,31 @@ impl Record for BiRecord {
     /// subsequent RVAL→VAL conversion.
     fn apply_raw_input(&mut self, value: EpicsValue) -> CaResult<()> {
         // C `devBiSoftRaw` reads the link with `dbGetLink(.., DBR_ULONG,
-        // &prec->rval, ..)`: `getDoubleUlong`'s bare cast, owned by `c_cast`
-        // (RVAL is epicsUInt32, so it is the 64-bit-convert-then-truncate
-        // rule, not the signed i32 one).
-        let rval = value
-            .to_f64()
-            .map(crate::types::c_cast::f64_to_u32)
-            .ok_or_else(|| {
-                CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
-            })?;
+        // &prec->rval, ..)`, which lands in a conversion routine chosen by the
+        // SOURCE type: an integer source reaches `getLongUlong` and wraps
+        // modulo 2^32 (DEFINED in C — 6.3.1.3p2, so `0xdeadbeef` read as a
+        // signed `DBF_LONG` still lands in RVAL as `0xdeadbeef`), a float
+        // source reaches `getDoubleUlong` and hits the UB cast that CBUG-E2
+        // saturates. `convert_to` is the owner of that split; calling
+        // `c_cast::f64_to_u32(value.to_f64())` here bypassed it and applied
+        // the float rule to integer sources, zeroing every negative RVAL.
+        //
+        // `convert_to` coerces rather than fails, so the not-numeric rejection
+        // stays explicit: without this gate a non-numeric source would land in
+        // RVAL as a silent 0.
+        if value.to_f64().is_none() {
+            return Err(CaError::TypeMismatch(
+                "bi Raw Soft Channel: INP value not numeric".into(),
+            ));
+        }
+        let rval = match value.convert_to(crate::types::DbFieldType::ULong) {
+            EpicsValue::ULong(v) => v,
+            other => {
+                return Err(CaError::TypeMismatch(
+                    format!("bi Raw Soft Channel: INP value not a scalar ({other:?})").into(),
+                ));
+            }
+        };
         self.rval = rval;
         if self.mask != 0 {
             self.rval &= self.mask;

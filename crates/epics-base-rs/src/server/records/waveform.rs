@@ -1151,15 +1151,23 @@ impl Record for WaveformRecord {
                         )));
                     }
                     if matches!(self.kind, ArrayKind::SubArray) {
-                        // subArray: NELM is the slice length; the buffer is
-                        // re-derived from the source on `set_val`, so a fresh
-                        // zeroed allocation here is correct. NO MALM clamp here
-                        // — C clamps NELM->MALM at init_record and at process
-                        // (subArrayRecord.c:103-104, 310-311), never at field
-                        // put, so the .db load order of NELM vs MALM cannot
-                        // matter. `init_record` and `set_val` apply the clamp.
+                        // subArray: NELM is the SLICE LENGTH, not the buffer
+                        // size — the buffer is MALM wide (`val_capacity`) and a
+                        // NELM put does not touch it. C's NELM is a plain
+                        // `epicsUInt32` field: `dbPutField` stores it, the
+                        // `pp(TRUE)` process re-slices, and `bptr` (allocated
+                        // once at `init_record`) keeps its contents throughout.
+                        // Reallocating a zeroed buffer here EMPTIED VAL on every
+                        // NELM put: C `caput SA.NELM 2` on an `INP="[1,2,3,4]"`
+                        // subArray reads back `VAL=[1,2] NORD=2`; the port read
+                        // back an empty VAL with NORD=0.
+                        //
+                        // NO MALM clamp here either — C clamps NELM->MALM at
+                        // init_record and at process (subArrayRecord.c:103-104,
+                        // 310-311), never at field put, so the .db load order of
+                        // NELM vs MALM cannot matter. `init_record` and
+                        // `sa_clamp_bounds` (the readValue equivalent) apply it.
                         self.nelm = n;
-                        self.reallocate_val();
                     } else {
                         // waveform/aai/aao: preserve the existing
                         // element data instead of wiping VAL.

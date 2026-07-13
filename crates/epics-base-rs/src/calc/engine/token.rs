@@ -242,6 +242,19 @@ struct ElementTable {
     literal_words: &'static [&'static str],
     /// Which C compiler's literal reader this table belongs to.
     literals: LiteralReader,
+    /// The evaluator's value-stack size, which is also the compile-time ceiling
+    /// on `runtime_depth`: each compiler rejects an expression whose peak depth
+    /// would overrun the stack its OWN `*Perform` allocates —
+    /// `if (runtime_depth >= <SIZE>) *perror = CALC_ERR_OVERFLOW`
+    /// (`postfix.c:469`, `sCalcPostfix.c:825`, `aCalcPostfix.c:755`).
+    ///
+    /// The three sizes differ (`CALCPERFORM_STACK` 80, `SCALC_STACKSIZE` 30,
+    /// `ACALC_STACKSIZE` 20), so the limit belongs to the FLAVOUR, next to the
+    /// table that spells its elements — not to the shared compiler, where one
+    /// literal 30 rejected base expressions C accepts (a depth-35 CALC is a
+    /// database-load failure on the port, `VAL=35` in C) and accepted aCalc
+    /// expressions C rejects.
+    stack_size: i32,
 }
 
 /// The `LITERAL_OPERAND` words shared by base and sCalc. aCalc's table has no
@@ -354,6 +367,8 @@ static BASE_TABLE: ElementTable = ElementTable {
     string_literals: false,
     literal_words: INF_NAN,
     literals: LiteralReader::ParseDouble,
+    // `postfix.h:31` — `#define CALCPERFORM_STACK 80`.
+    stack_size: 80,
 };
 
 /// synApps `sCalcPostfix.c:97-215`.
@@ -484,6 +499,8 @@ static SCALC_TABLE: ElementTable = ElementTable {
     string_literals: true,
     literal_words: INF_NAN,
     literals: LiteralReader::Strtod,
+    // `sCalcPostfixPvt.h:21` — `#define SCALC_STACKSIZE 30`.
+    stack_size: 30,
 };
 
 /// synApps `aCalcPostfix.c:99-224`.
@@ -612,6 +629,8 @@ static ACALC_TABLE: ElementTable = ElementTable {
     // digits. It has no `INF` and no `NAN` element.
     literal_words: &[],
     literals: LiteralReader::Strtod,
+    // `aCalcPostfixPvt.h:22` — `#define ACALC_STACKSIZE 20`.
+    stack_size: 20,
 };
 
 fn table_for(kind: &ExprKind) -> &'static ElementTable {
@@ -620,6 +639,17 @@ fn table_for(kind: &ExprKind) -> &'static ElementTable {
         ExprKind::String => &SCALC_TABLE,
         ExprKind::Array => &ACALC_TABLE,
     }
+}
+
+/// The peak `runtime_depth` this flavour's compiler will accept — C's
+/// `if (runtime_depth >= <its stack size>) *perror = CALC_ERR_OVERFLOW`.
+///
+/// Read from the flavour's own [`ElementTable`], because that is where the C
+/// difference lives: `postfix.c` compiles against an 80-deep `calcPerform`
+/// stack, `sCalcPostfix.c` against a 30-deep one, `aCalcPostfix.c` against a
+/// 20-deep one.
+pub(crate) fn runtime_stack_size(kind: ExprKind) -> i32 {
+    table_for(&kind).stack_size
 }
 
 struct Tokenizer<'a> {

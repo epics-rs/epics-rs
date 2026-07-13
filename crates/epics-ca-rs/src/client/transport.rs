@@ -145,11 +145,16 @@ fn drained_socket_probe() -> OsRecvQueueProbe {
 /// instead of falling back to the default. Match C: keep as
 /// `Duration` with full sub-second precision; only `parse error`
 /// or `value <= 0.0` falls back to the default.
+///
+/// Parsing is C's `envGetDoubleConfigParam` → `epicsScanDouble`
+/// (`crate::estdlib`), so `0x10` is 16 s and `1e400` is an ERANGE
+/// failure, and the conversion is the saturating one — an explicit
+/// `inf` is C's never-expiring deadline, not a panic.
 pub(crate) fn connection_timeout() -> Duration {
-    epics_base_rs::runtime::env::get("EPICS_CA_CONN_TMO")
-        .and_then(|s| s.parse::<f64>().ok())
+    crate::estdlib::env_double("EPICS_CA_CONN_TMO")
+        .ok()
         .filter(|v| *v > 0.0)
-        .map(Duration::from_secs_f64)
+        .map(crate::estdlib::duration_from_secs)
         .unwrap_or(Duration::from_secs(30))
 }
 /// Legacy seconds accessor kept for call sites that need a coarse
@@ -981,9 +986,9 @@ async fn connect_server(
         // forever. Pairs with the existing TCP-connect timeout above.
         // 10s default — long enough for a normal cert exchange, short
         // enough to fall through to the next NAME_SERVER candidate.
-        let hs_timeout = epics_base_rs::runtime::env::get("EPICS_CA_TLS_HANDSHAKE_TMO")
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|v| Duration::from_secs_f64(v.max(1.0)))
+        let hs_timeout = crate::estdlib::env_double("EPICS_CA_TLS_HANDSHAKE_TMO")
+            .ok()
+            .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
             .unwrap_or(Duration::from_secs(10));
         let tls_stream =
             match tokio::time::timeout(hs_timeout, connector.connect(server_name, stream)).await {
@@ -4057,5 +4062,73 @@ mod priority_circuit_tests {
             "surviving priority-5 circuit must still carry frames after the sibling closed"
         );
         let _ = s5.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod conn_tmo_env_tests {
+    //! Per-boundary coverage of `EPICS_CA_CONN_TMO` resolution (R15-16).
+    //!
+    //! Every row was probed against the compiled C `caget`: the values C
+    //! accepts must yield a working timeout here (no panic), and the ones
+    //! `epicsScanDouble` rejects must fall back to the 30 s default.
+    use super::connection_timeout;
+    use std::time::Duration;
+
+    /// SAFETY: gated by `serial_test::serial`; restored before return.
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        let saved = std::env::var("EPICS_CA_CONN_TMO").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("EPICS_CA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_CA_CONN_TMO"),
+            }
+        }
+        f();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("EPICS_CA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_CA_CONN_TMO"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn conn_tmo_boundaries() {
+        let default = Duration::from_secs(30);
+        let cases: &[(Option<&str>, Duration)] = &[
+            // Unset and empty are both "use the compiled default" in C
+            // (`envGetConfigParamPtr` folds "" back to unset).
+            (None, default),
+            (Some(""), default),
+            // Valid, including sub-second and whitespace padding.
+            (Some("10.5"), Duration::from_millis(10_500)),
+            (Some(" 10.5 "), Duration::from_millis(10_500)),
+            (Some("0.5"), Duration::from_millis(500)),
+            // strtod takes C99 hex floats.
+            (Some("0x10"), Duration::from_secs(16)),
+            // `inf` is a value C accepts (errno stays clear): a deadline
+            // that never fires. Used to panic the client.
+            (Some("inf"), Duration::MAX),
+            // ERANGE / no-conversion / extraneous → C's default branch.
+            (Some("1e400"), default),
+            (Some("abc"), default),
+            (Some("10x"), default),
+            (Some("   "), default),
+            // NaN and non-positive values fail the `> 0.0` gate.
+            (Some("nan"), default),
+            (Some("0"), default),
+            (Some("-5"), default),
+        ];
+        for (raw, want) in cases {
+            with_env(*raw, || {
+                assert_eq!(
+                    connection_timeout(),
+                    *want,
+                    "EPICS_CA_CONN_TMO={raw:?} must resolve to {want:?}"
+                );
+            });
+        }
     }
 }

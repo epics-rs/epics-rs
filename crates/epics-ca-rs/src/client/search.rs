@@ -171,15 +171,12 @@ const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
 /// are caught by the `< 60` lower-limit clamp — so this mirrors C by
 /// clamping rather than filtering.
 fn max_search_period_secs() -> f64 {
-    match epics_base_rs::runtime::env::get("EPICS_CA_MAX_SEARCH_PERIOD") {
-        Some(raw) => match raw.parse::<f64>() {
-            // Parsed: honour it, clamped up to C's 60 s lower limit.
-            Ok(v) => v.max(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS),
-            // Not a real number: C keeps the default, no clamp.
-            Err(_) => MAX_SEARCH_PERIOD_DEFAULT_SECS,
-        },
+    match crate::estdlib::env_double("EPICS_CA_MAX_SEARCH_PERIOD") {
+        // Parsed: honour it, clamped up to C's 60 s lower limit.
+        Ok(v) => v.max(MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS),
+        // Not a real number: C keeps the default, no clamp.
         // Unset: documented C default.
-        None => MAX_SEARCH_PERIOD_DEFAULT_SECS,
+        Err(_) => MAX_SEARCH_PERIOD_DEFAULT_SECS,
     }
 }
 
@@ -215,7 +212,7 @@ fn max_search_period_secs() -> f64 {
 /// `Initial` searches, not a change to this normal-cadence tick.
 fn normal_tick() -> Duration {
     let period_secs = max_search_period_secs();
-    Duration::from_secs_f64(period_secs / N_SEARCH_BUCKETS as f64)
+    crate::estdlib::duration_from_secs(period_secs / N_SEARCH_BUCKETS as f64)
 }
 
 /// Fast-mode tick cadence after a beacon poke. One full bucket

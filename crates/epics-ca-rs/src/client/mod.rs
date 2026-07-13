@@ -1235,7 +1235,10 @@ impl CaClient {
         timeout_secs: f64,
     ) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
-        let timeout = Duration::from_secs_f64(timeout_secs);
+        // Caller-supplied seconds: a non-finite or negative value is a
+        // panic for `Duration::from_secs_f64`, so go through the same
+        // saturating conversion the env-derived timeouts use.
+        let timeout = crate::estdlib::duration_from_secs(timeout_secs);
         ch.wait_connected(timeout).await?;
 
         let snap = ch.snapshot()?;
@@ -1416,6 +1419,19 @@ pub(crate) struct CachedRead {
 /// reject asynchronously (callback path) or accept past its array
 /// bound (nowait path). Validate client-side so the call fails
 /// synchronously the way libca does.
+/// Default deadline for a `CA_PROTO_WRITE_NOTIFY` that the caller did not
+/// time-box itself, overridable via `EPICS_CA_PUT_TIMEOUT` (seconds).
+///
+/// Port-specific knob (libca leaves the deadline to `ca_pend_io`), but it
+/// resolves through the same C primitives as every other env-derived
+/// double — `epicsScanDouble` plus the saturating `Duration` conversion —
+/// so no environment string can panic a `put`.
+fn put_timeout() -> Duration {
+    crate::estdlib::env_double("EPICS_CA_PUT_TIMEOUT")
+        .map(crate::estdlib::duration_from_secs)
+        .unwrap_or(Duration::from_secs(30))
+}
+
 fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
     if count > snap.element_count {
         return Err(CaError::Protocol(format!(
@@ -2514,11 +2530,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        // Default put timeout configurable via EPICS_CA_PUT_TIMEOUT (seconds).
-        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(30.0);
-        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2654,10 +2666,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(30.0);
-        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2705,10 +2714,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let default_secs = epics_base_rs::runtime::env::get("EPICS_CA_PUT_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(30.0);
-        let result = tokio::time::timeout(Duration::from_secs_f64(default_secs), reply_rx).await;
+        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?

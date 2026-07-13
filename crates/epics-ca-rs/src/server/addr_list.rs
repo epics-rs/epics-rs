@@ -238,11 +238,22 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     // in a soak test) gets raised against the operator's wishes.
     // Match C: accept any strictly-positive parsed value as-is;
     // fall back to default for parse-failure or non-positive.
-    let raw_period = epics_base_rs::runtime::env::get("EPICS_CAS_BEACON_PERIOD")
-        .or_else(|| epics_base_rs::runtime::env::get("EPICS_CA_BEACON_PERIOD"));
-    if let Some(period) = raw_period.and_then(|s| s.parse::<f64>().ok()) {
-        if period > 0.0 && period.is_finite() {
-            cfg.beacon_period = Duration::from_secs_f64(period);
+    //
+    // The fallback is C's `envGetConfigParamPtr` PRESENCE test, not a
+    // parse-success test: an invalid `EPICS_CAS_BEACON_PERIOD` does not
+    // silently promote the legacy var. Parsing and the `Duration`
+    // conversion are `crate::estdlib` (C `epicsScanDouble`), so `inf` is
+    // an accepted — never-firing — period rather than a panic, and NaN
+    // (which fails `> 0.0`, like every C comparison against it) keeps
+    // the default.
+    let name = if crate::estdlib::env_raw("EPICS_CAS_BEACON_PERIOD").is_some() {
+        "EPICS_CAS_BEACON_PERIOD"
+    } else {
+        "EPICS_CA_BEACON_PERIOD"
+    };
+    if let Ok(period) = crate::estdlib::env_double(name) {
+        if period > 0.0 {
+            cfg.beacon_period = crate::estdlib::duration_from_secs(period);
         }
         // else: keep default (15s) — matches C's `maxPeriod <= 0.0` branch.
     }

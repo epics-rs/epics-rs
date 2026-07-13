@@ -43,10 +43,10 @@ fn max_accumulated() -> usize {
 /// unreliable) can set `EPICS_CAS_INACTIVITY_TMO` to a positive value;
 /// values < 30 are clamped to 30 to avoid pathological short timeouts.
 fn inactivity_timeout() -> Option<Duration> {
-    epics_base_rs::runtime::env::get("EPICS_CAS_INACTIVITY_TMO")
-        .and_then(|s| s.parse::<f64>().ok())
+    crate::estdlib::env_double("EPICS_CAS_INACTIVITY_TMO")
+        .ok()
         .filter(|v| *v > 0.0)
-        .map(|v| Duration::from_secs_f64(v.max(30.0)))
+        .map(|v| crate::estdlib::duration_from_secs(v.max(30.0)))
 }
 
 /// Read into `buf` with an optional idle cap. If `cap` is `None`, the read
@@ -135,9 +135,9 @@ mod cap_parse_tests {
 /// SO_SNDTIMEO to 5 s; we honour the same default and let
 /// `EPICS_CAS_SEND_TMO` override.
 fn send_timeout() -> Duration {
-    epics_base_rs::runtime::env::get("EPICS_CAS_SEND_TMO")
-        .and_then(|s| s.parse::<f64>().ok())
-        .map(|v| Duration::from_secs_f64(v.max(0.1)))
+    crate::estdlib::env_double("EPICS_CAS_SEND_TMO")
+        .ok()
+        .map(|v| crate::estdlib::duration_from_secs(v.max(0.1)))
         .unwrap_or(Duration::from_secs(5))
 }
 
@@ -148,9 +148,9 @@ fn send_timeout() -> Duration {
 /// 10 s, override via `EPICS_CAS_TLS_HANDSHAKE_TMO`. Floored at 1s.
 #[cfg(feature = "experimental-rust-tls")]
 fn tls_handshake_timeout() -> Duration {
-    epics_base_rs::runtime::env::get("EPICS_CAS_TLS_HANDSHAKE_TMO")
-        .and_then(|s| s.parse::<f64>().ok())
-        .map(|v| Duration::from_secs_f64(v.max(1.0)))
+    crate::estdlib::env_double("EPICS_CAS_TLS_HANDSHAKE_TMO")
+        .ok()
+        .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
         .unwrap_or(Duration::from_secs(10))
 }
 
@@ -9247,5 +9247,96 @@ mod r46_zero_mask_event_add_tests {
             res.is_err(),
             "bad-type READ must close the connection with Err (C RSRV_ERROR), got {res:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_tmo_env_tests {
+    //! Per-boundary coverage of the server's env-derived timeouts (R15-16).
+    //!
+    //! `EPICS_CAS_SEND_TMO=inf` used to panic `send_timeout()` on the
+    //! FIRST client connect, taking the whole server down — a remotely
+    //! triggerable DoS on a misconfigured host.
+    use super::{inactivity_timeout, send_timeout};
+    use std::time::Duration;
+
+    /// SAFETY: gated by `serial_test::serial`; restored before return.
+    fn with_env(name: &str, value: Option<&str>, f: impl FnOnce()) {
+        let saved = std::env::var(name).ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        f();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn send_tmo_boundaries() {
+        let default = Duration::from_secs(5);
+        let cases: &[(Option<&str>, Duration)] = &[
+            (None, default),
+            (Some(""), default),
+            (Some("2.5"), Duration::from_millis(2500)),
+            (Some(" 2.5 "), Duration::from_millis(2500)),
+            (Some("0x10"), Duration::from_secs(16)),
+            // Never-expiring send deadline instead of an abort.
+            (Some("inf"), Duration::MAX),
+            // Rejected by `epicsScanDouble` → default.
+            (Some("1e400"), default),
+            (Some("abc"), default),
+            (Some("2x"), default),
+            // Floor: sub-0.1 s (and NaN, which `f64::max` discards) clamp up.
+            (Some("0.01"), Duration::from_millis(100)),
+            (Some("0"), Duration::from_millis(100)),
+            (Some("nan"), Duration::from_millis(100)),
+        ];
+        for (raw, want) in cases {
+            with_env("EPICS_CAS_SEND_TMO", *raw, || {
+                assert_eq!(
+                    send_timeout(),
+                    *want,
+                    "EPICS_CAS_SEND_TMO={raw:?} must resolve to {want:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inactivity_tmo_boundaries() {
+        let cases: &[(Option<&str>, Option<Duration>)] = &[
+            // Disabled by default; an unparseable value keeps it disabled.
+            (None, None),
+            (Some(""), None),
+            (Some("abc"), None),
+            (Some("1e400"), None),
+            // NaN fails the `> 0.0` gate, as every C comparison against it does.
+            (Some("nan"), None),
+            (Some("0"), None),
+            (Some("-1"), None),
+            // Positive values are honoured, floored at 30 s.
+            (Some("60"), Some(Duration::from_secs(60))),
+            (Some("1"), Some(Duration::from_secs(30))),
+            (Some("0x40"), Some(Duration::from_secs(64))),
+            (Some("inf"), Some(Duration::MAX)),
+        ];
+        for (raw, want) in cases {
+            with_env("EPICS_CAS_INACTIVITY_TMO", *raw, || {
+                assert_eq!(
+                    inactivity_timeout(),
+                    *want,
+                    "EPICS_CAS_INACTIVITY_TMO={raw:?} must resolve to {want:?}"
+                );
+            });
+        }
     }
 }

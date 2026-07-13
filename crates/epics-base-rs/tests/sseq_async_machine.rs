@@ -80,6 +80,16 @@ struct CountingTarget {
     process_count: Arc<AtomicU32>,
 }
 
+/// A link target must expose a `VAL` field: sseq chooses each step's buffer
+/// from the DESTINATION's DBF type (C `processCallback`'s switch on
+/// `dbGetLinkDBFtype(&lnk)`), and a target whose type does not resolve gets
+/// no put at all (C's `default: break`). C has no field-less record.
+static COUNTING_TARGET_FIELDS: &[FieldDesc] = &[FieldDesc {
+    name: "VAL",
+    dbf_type: epics_base_rs::types::DbFieldType::Double,
+    read_only: false,
+}];
+
 impl Record for CountingTarget {
     fn record_type(&self) -> &'static str {
         "counting_target"
@@ -95,7 +105,7 @@ impl Record for CountingTarget {
         Ok(())
     }
     fn field_list(&self) -> &'static [FieldDesc] {
-        &[]
+        COUNTING_TARGET_FIELDS
     }
 }
 

@@ -290,6 +290,24 @@ impl AsyncDbHandle {
             None => None,
         }
     }
+
+    /// Issue a non-blocking put-with-completion whose BUFFER the destination
+    /// picks — see [`PvDatabase::put_link_notify_typed`]. `None` if the
+    /// database is gone or the source record is missing.
+    pub async fn put_link_notify_typed(
+        &self,
+        record_name: &str,
+        link_field: &'static str,
+        link_str: &str,
+    ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        match self.db() {
+            Some(db) => {
+                db.put_link_notify_typed(record_name, link_field, link_str)
+                    .await
+            }
+            None => None,
+        }
+    }
 }
 
 /// C `dbNotifyAdd`: a will-process PP target (FLNK / OUT) joins the active
@@ -1053,6 +1071,47 @@ impl PvDatabase {
         // when the link was empty / the target completed synchronously.
         waitset.leave();
         Some(completion)
+    }
+
+    /// [`Self::put_link_notify`] with the buffer chosen by the DESTINATION
+    /// instead of by the caller — the put-with-completion sibling of
+    /// [`ProcessAction::WriteDbLinkTyped`](crate::server::record::ProcessAction::WriteDbLinkTyped).
+    ///
+    /// C `sseqRecord.c::processCallback` runs the SAME destination switch on
+    /// both of its put branches (`dbCaPutLinkCallback` and `dbPutLink`,
+    /// :714-793), so the two seams must agree on the buffer. `None` from the
+    /// record ([`Record::typed_output_buffer`]) is C's `default: break`: no
+    /// put is issued, and the returned receiver fires immediately so the
+    /// caller's step is never stranded.
+    pub async fn put_link_notify_typed(
+        &self,
+        record_name: &str,
+        link_field: &'static str,
+        link_str: &str,
+    ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        let value = if link_str.is_empty() {
+            None
+        } else {
+            let parsed = crate::server::record::parse_output_link_v2(link_str);
+            let target = self.resolve_out_target(&parsed).await;
+            let rec = {
+                let records = self.inner.records.read().await;
+                records.get(record_name)?.clone()
+            };
+            let instance = rec.read().await;
+            instance.record.typed_output_buffer(link_field, &target)
+        };
+        match value {
+            Some(value) => {
+                self.put_link_notify(record_name, link_field, link_str, value)
+                    .await
+            }
+            None => {
+                let (waitset, completion) = Self::new_put_notify();
+                waitset.leave();
+                Some(completion)
+            }
+        }
     }
 
     /// aSub LFLG=READ: read the subroutine name from the SUBL link and, when
@@ -2629,6 +2688,7 @@ impl PvDatabase {
                         matches!(
                             a,
                             crate::server::record::ProcessAction::WriteDbLink { .. }
+                                | crate::server::record::ProcessAction::WriteDbLinkTyped { .. }
                                 | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
                         )
                     });
@@ -3104,6 +3164,7 @@ impl PvDatabase {
                     matches!(
                         a,
                         crate::server::record::ProcessAction::WriteDbLink { .. }
+                            | crate::server::record::ProcessAction::WriteDbLinkTyped { .. }
                             | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
                     )
                 });
@@ -3806,6 +3867,66 @@ impl PvDatabase {
                     let parsed = crate::server::record::parse_output_link_v2(
                         link_str.as_str_lossy().as_ref(),
                     );
+                    self.write_out_link_value(
+                        rec,
+                        &parsed,
+                        value,
+                        super::links::OutLinkSrc {
+                            putf: src_putf,
+                            notify: src_notify.as_ref(),
+                            alarm: &src_alarm,
+                            field: link_field,
+                        },
+                        visited,
+                        depth,
+                    )
+                    .await;
+                }
+                ProcessAction::WriteDbLinkTyped { link_field } => {
+                    // C `sseqRecord.c::processCallback` (706-793): the buffer
+                    // is chosen from the DESTINATION, at fire time —
+                    // `dbGetLinkDBFtype(&lnk)` / `dbGetNelements(&lnk)`, then
+                    // a switch that puts the string view, the double view, the
+                    // string's bytes as a CHAR array, or NOTHING (`default:
+                    // break`). The framework owns the resolution (it is the
+                    // side that can address the target); the record owns the
+                    // switch ([`Record::typed_output_buffer`]).
+                    let (link_str, src_putf, src_notify, src_alarm) = {
+                        let instance = rec.read().await;
+                        let link = instance
+                            .resolve_field(link_field)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        (
+                            link,
+                            instance.common.putf,
+                            instance.notify.clone(),
+                            super::links::LinkAlarm::pending(&instance.common),
+                        )
+                    };
+                    if link_str.is_empty() {
+                        continue;
+                    }
+                    let parsed = crate::server::record::parse_output_link_v2(
+                        link_str.as_str_lossy().as_ref(),
+                    );
+                    // Target resolved with NO record lock held — a
+                    // self-referencing OUT link would re-enter this record's
+                    // own gate (same rule as `multi_out_buffer_choice`).
+                    let target = self.resolve_out_target(&parsed).await;
+                    let value = {
+                        let instance = rec.read().await;
+                        instance.record.typed_output_buffer(link_field, &target)
+                    };
+                    // C's `default:` arm: an unresolvable destination gets no
+                    // put at all — not a fallback numeric write.
+                    let Some(value) = value else { continue };
                     self.write_out_link_value(
                         rec,
                         &parsed,

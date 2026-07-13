@@ -5475,3 +5475,194 @@ sseq VAL-per-completion (R18-9): C's monitor() bodies encode per-record
 posting contracts the generic change loop cannot infer. Next-round
 leads: E's load-boundary redesign (R18-92) wants an explicit iocInit
 primitive; D ranks R18-57 before any further trace work.
+
+---
+
+## Fix wave 16 — dispositions (merged 2026-07-13 onto `review/parity-r6`)
+
+**38 findings assigned, 38 fixed, one commit per finding**, across six
+worktree fixers (A calc/sseq/links, B CA tools/server, C pva/qsrv/gateway,
+D asyn, E links/db/records, F arrays/compress/histogram). Every fixer
+merged `review/parity-r6` into its branch before starting; all six
+branches git-verified (commits present, worktree clean, no
+`doc/c-parity-review-*.md`, `doc/upstream-c-bugs.md`, or
+`crates/epics-pva-rs/tests/stability.rs` in any diff) before merge.
+
+**The three BROKEN wave-15 commits are reworked and closed:**
+
+- **R18-28** (`ac864e46`) — the gateway monitor seed. `c05a56f6`'s
+  moncache.cpp:142 citation was the *update* path; the seed is pva2pva's
+  root-bit set (`moncache.cpp:304-312`). The port now declares the whole
+  structure changed on seed (canonical full leaf bitset, since the encoder
+  cannot emit bit 0) and keeps the correct no-data ⟹ no-seed half.
+- **R18-26** (`a8944381`) — `52fe221b`'s plain-long-string group member
+  shipped a descriptor that disagreed with its value. Descriptor and value
+  are now one decision.
+- **R18-92** (`980990a8`) — `dd5e0af3`'s `DbLoadGuard` bounded one load
+  group; C's boundary is `iocInit`. Replaced by an explicit
+  `PvDatabase::ioc_init()` barrier: link classification is queued during
+  load and polled only at the barrier, so a half-built database is
+  unobservable *by construction* and link status is final when iocInit
+  returns. The multi-`dbLoadRecords` race (9-in-15 pre-fix) is closed.
+
+**The three false-cleans are closed:** R18-91 (`bd1273df`, `.db` lexer now
+splits escape-translating JSON strings from raw names/paths, porting
+`epicsStrnRawFromEscaped`; iocsh `cmd_echo` was the adjacent same-defect
+site), R18-93 (`91477fce`, one `process_target()` owner with C's Passive
+gate inside it — five cloned blocks collapsed), R18-94 (`21c041c5`, the
+`.PROC` arm of a DB link carries no scan test, `dbDbLink.c:387`).
+
+### Fixed, by category
+
+**A — calc/sseq/links (7):** R18-2 `a827efeb` (CONSTANT link delivers
+nothing at process, on every reader — one `empty_read_fetch` classifier
+through the executor) · R18-1 `980e33b0` (`:=` writes back A..U on
+calc/calcout/scalcout/swait/transform) · R18-3 `633fac00` (runtime stack
+ceiling moves into the flavour's `ElementTable`: 80/30/20) · R18-4
+`27c93350` (OOPT `Never` and every unnamed index drive no output) · R18-5
+`58d1e8ad` (scalcout joins the shared `AnalogAlarmConfig` slot — widened:
+the HYST defect reached calc/calcout/ai/ao too) · R18-6 `ee4f6bff` (CRC16
+reproduces compiled C's sign-extension; **adjudicated REPRODUCE**, filed
+as CBUG-F8, deviation-from-Modbus-standard documented at the function) ·
+R18-7 `f1ac8739` (one `my_nint` for both dialects, narrowing through
+`types::c_cast` — widened: aCalc's second copy of the macro).
+
+**B — CA tools/server (7):** R18-18 `777c86c1` (an unresponsive circuit
+IS a disconnect) · R18-19 `34f3801e` (a dead circuit raises ECA_DISCONN on
+the exception hook) · R18-20 `f9f166d6` (exception blocks carry C's
+Context and Source File line) · R18-21 `c361550d` (camonitor prints no
+per-PV line for a non-normal status) · R18-16 `6e881a65` (every address
+list dedups and reports what it drops) · R18-17 `1a83d40c` (a bad
+address-list token is reported, not swallowed) · R18-22 `ab115c16` (a TCP
+port fallback is announced, and RSRV_SERVER_PORT is set).
+
+**C — pva/qsrv/gateway (7):** R18-28 `ac864e46` (above) · R18-26
+`a8944381` (above) · R18-24 `6efcd0c7` (GET sends EXEC only after the INIT
+reply, never pipelined) · R18-25 `1ee0a5d2` (a downstream monitor never
+throttles the shared upstream) · R18-27 `b197a249` (a failed op's Status
+crosses the wire as itself, never as text) · R18-30 `c41264f8` (a
+`+type:"proc"` member processes through doPostProcessing's gate, one
+owner) · R17-37 `b831f62e` (one classifier for a group PUT member —
+Write / ProcessOnly / Skip; this closes the wave-15 meta-member residue).
+
+**D — asyn (7):** R18-57 `259e4329` (a port cannot be built without its
+trace config and exception list — `PortServices` bound by
+`create_port_runtime`, C `registerPort`/`tracePvtInit`; this is the fix
+that makes the whole trace/exception subsystem reachable from an st.cmd) ·
+R18-58 `f06f881e` (the IP server port accepts — an `Acceptor` listener
+thread started at bind; `drvAsynIPServerPortConfigure` registered with
+iocsh) · R18-59 `d5ec7b78` (an octet read fans out to the port's interrupt
+users) · R18-60 `cc8e5ba2` (the interpose chain is the port's, not each
+driver's — FTDI's installed-but-never-dispatched EOS layer now runs) ·
+R18-61 `8c10e6a3` (an auto-connect port connects at registration, and
+registration waits for it) · R18-62 `68f4ba85` (SO_REUSEPORT on the fresh
+socket, before bind/connect — `new_socket` is the single factory) · R18-83
+`6c558660` (a BOUT array put sets NOWT — `put_array_field` is the single
+writer of buffer *and* count).
+
+**E — links/db/records (8):** R18-92 `980990a8` (above) · R18-91
+`bd1273df` (above) · R18-93 `91477fce` (above) · R18-94 `21c041c5` (above)
+· R18-95 `814fd3a6` (a put-notify landing on a PACT record writes nothing
+and the whole put is replayed by the async-completion owner) · R18-96
+`121623d0` (stringin/stringout gate VAL on `strncmp` + MPST/APST, not the
+analog deadband) · R18-97 `5fd7b203` (ai/ao `SPC_LINCONV`: the `eoff =
+egul` rebase belongs to the dset's `special_linconv`, which no soft dset
+provides — removed from all six put arms) · R18-90 `1beb456e` (one
+`RecordInstance::is_no_mod()` owner consumed by both `check_no_mod` and
+`compute_access`, so ACCESS_RIGHTS advertises no-write like
+`rsrvCheckPut`).
+
+**F — arrays/compress/histogram (5):** R18-105 `e6a0f1c3` (a DBR_STRING
+array put is element-wise — `as_f64_array` gained the `StringArray` arm;
+`caput -a WF 3 7 8 9` no longer collapses the record to `[0.0]`) · R18-106
+`682ecc13` (compress ingests only through a *connected* INP; the private
+`inp` field shadowing dbCommon's `.INP` deleted) · R18-107 `643a6930`
+(histogram MDEL is a COUNT deadband and the post zeroes MCNT) · R18-108
+`9251819f` (the count/index/offset declaration family → `ULong`; the
+consumer half was serving waveform channels an element count of 0, which
+rejected **every** CA array put with ECA_BADCOUNT) · R18-109 `585c61f4`
+(NORD is posted by the put, not by the put route — one
+`array_nord_before_put`/`post_array_info` owner for all three `dbPut`
+bodies).
+
+### Merge conflicts resolved (F into A+E)
+
+`field_io.rs` — union of E's `NotifyRequest` (the put-notify deferral
+type) and F's NORD-post helpers; independent additions, both kept.
+`processing.rs` + `record_trait.rs` + `compress.rs` — A and F had
+independently introduced the *same* predicate under two names
+(`Record::input_read_by_device_support` vs
+`Record::soft_dset_loads_inp_at_init`), both gating the constant-INP seed
+on "does this record have a soft dset". Collapsed onto A's name: one
+owner, one trait method, F's duplicate and its compress override removed.
+
+### Semantic changes flagged
+
+- **R18-6 CRC16 diverges from the Modbus standard, deliberately**, exactly
+  as compiled C does (CBUG-F8). ASCII payloads are unaffected; a payload
+  byte ≥ 0x80 now produces C's CRC, not the standard one. This is the
+  wire-compatibility choice: standards-correct would be incompatible with
+  every existing C IOC.
+- **R18-95 sub-deviation:** C tests PACT *above* the DISP/putDisabled
+  check, so a put-notify to a `DISP=1` PACT record defers and reports the
+  error at restart. The port keeps DISP/NOMOD errors synchronous — same
+  error, earlier timing — because the completion oneshot carries `()`, not
+  a `Result`.
+- **R18-108 changed field types** (waveform/aai/aao NELM+NORD, subArray
+  MALM/NELM/INDX, compress NSAM/N/OFF/NUSE/OUSE/INX → `ULong`; histogram
+  NELM `UShort`, MDEL/MCNT `Short`). subArray NORD and compress INPN stay
+  signed, per C. CA clients see the corrected native types.
+- **R18-97 removed the `eoff = egul` rebase from all six ai/ao put arms.**
+  The two `init_record` rebases are C's own legacy-compat and stay. A port
+  test (`egul_put_under_linear_rebases_eoff`) had *asserted the defect* and
+  was corrected against the compiled oracle.
+
+### UNFIXED (carried)
+
+1. **`process_record_with_notify` does not defer on PACT** (E). C's
+   `processNotifyCommon` PACT arm covers process-only requests too, so
+   QSRV `record[process=true,block=true]` on a busy record should go on the
+   restart list; the port joins the in-flight cycle. Closing it properly
+   means making the bridge's put+process pair one deferrable unit — a
+   bridge-crate change beyond R18-95's scope.
+2. **R18-105 residue: C rejects the whole put when a string element is
+   unparsable** (F). `caput -a WV 2 abc 5` → C: "Channel write request
+   failed"; port parses `abc` as 0.0 and accepts. Closing it needs
+   `EpicsValue::convert_to` to return a status rather than a value — a
+   signature change across every caller.
+3. **`put_pv`'s value-field post is still absent** (F). C's `dbPut` posts
+   the value field for a non-`pp` value field on the dbPutLink route too.
+   Pre-existing wider design (link writes rely on the process cycle),
+   outside R18-109's family.
+4. **The octet interrupt payload is `ParamValue::Octet(String)`** (D), so
+   non-UTF-8 device bytes are replacement-charactered on the R18-59 fan-out
+   path. Needs a byte-typed octet value; separate finding.
+5. **aCalc's `my_nint` fix is not observable today** (A) — all four aCalc
+   call sites use the value as a subscript and both the old saturating
+   `INT32_MAX` and C's `INT32_MIN` are out of range. Unified because C has
+   one macro, not because a divergence could be constructed.
+6. Carried from earlier waves: **R17-81** INPN capacity (needs ReadDbLink
+   capacity plumbing) · **upstream.rs `free_port` rename** (the AddrInUse
+   family is closed for it — dead-upstream address, no server bound — but
+   the name still advertises the banned idiom) · **R17-85 user sign-off**
+   still pending · **the unnamed gateway flake** (did not reproduce in 5
+   bare runs; stays open).
+7. **~76 Medium/Low R18 findings not in this wave:** R18-8..15,
+   R18-29/31..56 subset, R18-63..82 subset, R18-84..89, R18-98..104,
+   R18-110..114.
+
+### Gate (post-merge, full workspace)
+
+- `cargo fmt --all` — clean, no diff
+- `cargo clippy --workspace --all-targets -- -D warnings` — pass
+- `cargo nextest run --workspace --no-fail-fast` — **8990 run, 8990
+  passed, 2 skipped** (bare, never piped)
+- `cargo clippy -p epics-bridge-rs --features pva-gateway --all-targets --
+  -D warnings` — pass
+- `cargo nextest run -p epics-bridge-rs --features pva-gateway` — **781
+  run, 781 passed** (includes the new
+  `r18_28_gateway_monitor_seed_declares_whole_structure`)
+- doctests `-p epics-base-rs -p asyn-rs -p epics-pva-rs -p
+  epics-bridge-rs` — pass (1 passed, 26 ignored)
+
+Nothing pushed.

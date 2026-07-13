@@ -640,7 +640,13 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                     })?
                 }
                 ArrayOp::NSmooth => {
-                    let n = pop_f64(&mut stack)? as usize;
+                    // C `int j; ... j = ps->d;` (`aCalcPerform.c:581`) — an
+                    // implicit `(int)` conversion, i.e. [`c_int`], and the pass
+                    // loop `for (k=firstEl; k<j+firstEl; k++)` then runs `max(j,0)`
+                    // times. Rust's `as usize` instead SATURATES: `NSMOO(AA,1e30)`
+                    // asked for `usize::MAX` passes and hung the engine, where C
+                    // gets `INT32_MIN` and makes zero.
+                    let n = c_int(pop_f64(&mut stack)?).max(0) as usize;
                     // NSMOOTH is NOT in C's unary switch — it is its own case
                     // (`aCalcPerform.c:579-592`) and it indexes `ps->a[]` with no
                     // `toArray` first, so a scalar operand dereferences a NULL array
@@ -1620,11 +1626,16 @@ fn shift_elements(a: &mut [f64], e: f64) {
 
 /// Pop the two bounds of an aCalc subrange. C `toDouble`s both
 /// (`aCalcPerform.c:1526,1530`) — so an ARRAY bound collapses to its first
-/// element — and casts each with a truncating `(int)`, not `myNINT`. The rest of
-/// the rule is [`super::subrange_bounds`], shared with sCalc.
+/// element — and casts each into an `int` with a truncating `(int)`, not
+/// `myNINT`. That cast is [`c_int`], NOT Rust's `as`: the two agree only inside
+/// the 32-bit range. `AA[2,3e9]` is C's `j = INT32_MIN`, which wraps far
+/// negative and selects NOTHING; Rust's saturating `as i64` made it `3e9`, which
+/// clamps to `arraySize` and selects the whole tail — the opposite answer.
+///
+/// The rest of the rule is [`super::subrange_bounds`], shared with sCalc.
 fn pop_subrange_bounds(stack: &mut Vec<Cell>, array_size: i64) -> Result<(i64, i64), CalcError> {
-    let j = pop_f64(stack)? as i64;
-    let i = pop_f64(stack)? as i64;
+    let j = i64::from(c_int(pop_f64(stack)?));
+    let i = i64::from(c_int(pop_f64(stack)?));
     Ok(super::subrange_bounds(i, j, array_size))
 }
 

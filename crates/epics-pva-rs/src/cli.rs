@@ -23,7 +23,20 @@ pub fn timeout_duration(secs: f64) -> Duration {
     } else {
         DEFAULT_CLI_TIMEOUT_SECS
     };
-    Duration::from_secs_f64(s)
+    secs_to_duration(s)
+}
+
+/// The single owner of every `-w` second → [`Duration`] conversion in the
+/// CLI helpers. `Duration::from_secs_f64` panics above `u64::MAX` seconds,
+/// and the `is_finite() && > 0.0` guards each helper applies do not exclude
+/// that range — `pvget -w 1e300` passed every guard and then aborted the
+/// tool. pvxs's tools hand `-w` to `epicsEvent::wait(double)`, which simply
+/// blocks for a duration no run will outlive, so an out-of-range `-w`
+/// saturates to [`TimeoutPolicy::FOREVER_SENTINEL`] (~10 years) here rather
+/// than panicking. Values the callers have already rejected (NaN, negative)
+/// never reach this function.
+fn secs_to_duration(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs).unwrap_or(TimeoutPolicy::FOREVER_SENTINEL)
 }
 
 /// CLI `-w` timeout policy for tools whose pvxs semantics treat a
@@ -66,7 +79,7 @@ impl TimeoutPolicy {
     /// ([`timeout_duration`]).
     pub fn wait_or_forever(secs: f64) -> Self {
         if secs.is_finite() && secs > 0.0 {
-            TimeoutPolicy::Finite(Duration::from_secs_f64(secs))
+            TimeoutPolicy::Finite(secs_to_duration(secs))
         } else {
             TimeoutPolicy::Forever
         }
@@ -113,7 +126,7 @@ impl TimeoutPolicy {
 /// timeout — the `tryWait()` analogue.
 pub fn wait_timeout_duration(secs: f64) -> Duration {
     if secs.is_finite() && secs > 0.0 {
-        Duration::from_secs_f64(secs)
+        secs_to_duration(secs)
     } else {
         Duration::ZERO
     }
@@ -521,6 +534,24 @@ mod tests {
     #[test]
     fn wait_timeout_duration_preserves_positive_finite() {
         assert_eq!(wait_timeout_duration(2.5), Duration::from_secs_f64(2.5));
+    }
+
+    /// R16-32 (same panic family as the env doubles): a huge-but-finite
+    /// `-w` passed every helper's `is_finite() && > 0.0` guard and then
+    /// panicked in `Duration::from_secs_f64` ("cannot convert float seconds
+    /// to Duration"), aborting the tool. pvxs's `epicsEvent::wait(1e300)`
+    /// just blocks; the port now saturates to the forever sentinel.
+    #[test]
+    fn out_of_range_w_saturates_instead_of_panicking() {
+        let huge = 1e300;
+        assert_eq!(timeout_duration(huge), TimeoutPolicy::FOREVER_SENTINEL);
+        assert_eq!(wait_timeout_duration(huge), TimeoutPolicy::FOREVER_SENTINEL);
+        assert_eq!(
+            TimeoutPolicy::wait_or_forever(huge),
+            TimeoutPolicy::Finite(TimeoutPolicy::FOREVER_SENTINEL)
+        );
+        // Just below the u64::MAX-seconds panic edge, the real value stands.
+        assert_eq!(timeout_duration(1e18), Duration::from_secs_f64(1e18));
     }
 
     /// The shared `-v` verbose path emits the pvxs `Effective config`

@@ -56,15 +56,21 @@ pub fn is_internal(f: &Field) -> bool {
     f.dbf == "DBF_NOACCESS" && f.special.as_deref() != Some("SPC_DBADDR")
 }
 
-/// The type of one `special(SPC_DBADDR)` field, from `dbd/cvt_dbaddr.types`.
+/// What C's `cvt_dbaddr` makes of one `special(SPC_DBADDR)` field —
+/// `dbd/cvt_dbaddr.types`.
 pub struct CvtDbAddr {
     pub dbf: String,
+    /// The `special` C leaves on the DBADDR. Usually still `SPC_DBADDR`, but
+    /// `lsi`/`lso`/`asyn` raise `SPC_NOMOD` (making the field unwritable over
+    /// CA — `rsrv/camessage.c:2545`) or `SPC_MOD` inside `cvt_dbaddr` itself.
+    pub special: String,
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.
     pub selector: Option<String>,
 }
 
-/// Parse `dbd/cvt_dbaddr.types`: `record.FIELD  DBF_TYPE  selector|-  cite`.
+/// Parse `dbd/cvt_dbaddr.types`:
+/// `record.FIELD  DBF_TYPE  SPC_xxx  selector|-  cite`.
 pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAddr>, String> {
     let mut out = BTreeMap::new();
     for (n, line) in src.lines().enumerate() {
@@ -73,10 +79,12 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
             continue;
         }
         let mut it = line.split_whitespace();
-        let (key, dbf, sel) = (it.next(), it.next(), it.next());
-        let (Some(key), Some(dbf), Some(sel)) = (key, dbf, sel) else {
+        let (Some(key), Some(dbf), Some(spc), Some(sel)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
             return Err(format!(
-                "cvt_dbaddr.types:{}: expected `record.FIELD DBF_TYPE selector`, got `{line}`",
+                "cvt_dbaddr.types:{}: expected \
+                 `record.FIELD DBF_TYPE SPC_xxx selector`, got `{line}`",
                 n + 1
             ));
         };
@@ -86,10 +94,12 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
         if dbf_to_rust(dbf).is_none() {
             return Err(format!("cvt_dbaddr.types:{}: unknown type `{dbf}`", n + 1));
         }
+        special_variant(spc).map_err(|e| format!("cvt_dbaddr.types:{}: {e}", n + 1))?;
         let prev = out.insert(
             (rec.to_string(), field.to_string()),
             CvtDbAddr {
                 dbf: dbf.to_string(),
+                special: spc.to_string(),
                 selector: (sel != "-").then(|| sel.to_string()),
             },
         );
@@ -168,20 +178,24 @@ pub struct Input<'a> {
 /// A missing entry is an error, not a fallback. That is what makes SPC_DBADDR a
 /// *closed* exception: a `.dbd` cannot introduce a dynamically-typed field that
 /// silently lands with the wrong width, because the generator will not build.
+/// Resolves BOTH, because C's `cvt_dbaddr` overwrites both: `lsi.OVAL` is
+/// `SPC_DBADDR` in the `.dbd` but `SPC_NOMOD` by the time a client sees it, and
+/// SPC_NOMOD is what makes a field unwritable over CA.
 fn field_dbf<'a>(
     record: &str,
     f: &'a Field,
     cvt: &'a BTreeMap<(String, String), CvtDbAddr>,
-) -> Result<&'a str, String> {
-    if f.special.as_deref() != Some("SPC_DBADDR") {
-        return Ok(&f.dbf);
+) -> Result<(&'a str, &'a str), String> {
+    let declared = f.special.as_deref().unwrap_or("");
+    if declared != "SPC_DBADDR" {
+        return Ok((&f.dbf, declared));
     }
     cvt.get(&(record.to_string(), f.name.clone()))
-        .map(|c| c.dbf.as_str())
+        .map(|c| (c.dbf.as_str(), c.special.as_str()))
         .ok_or_else(|| {
             format!(
-                "{record}.{}: special(SPC_DBADDR) — its type comes from the record's \
-                 cvt_dbaddr, which the .dbd does not carry. Add a line to \
+                "{record}.{}: special(SPC_DBADDR) — its type and special come from the \
+                 record's cvt_dbaddr, which the .dbd does not carry. Add a line to \
                  crates/epics-base-rs/dbd/cvt_dbaddr.types citing the C source.",
                 f.name
             )
@@ -378,11 +392,12 @@ fn emit_field(
     menus: &BTreeMap<String, String>,
     cvt: &BTreeMap<(String, String), CvtDbAddr>,
 ) -> Result<String, String> {
-    let dbf = field_dbf(record, f, cvt)?;
+    let (dbf, spc) = field_dbf(record, f, cvt)?;
     let ty = dbf_to_rust(dbf).ok_or_else(|| format!("{record}.{}: unknown {dbf}", f.name))?;
-    let special = match &f.special {
-        Some(s) => format!("Special::{}", special_variant(s)?),
-        None => "Special::None".to_string(),
+    let special = if spc.is_empty() {
+        "Special::None".to_string()
+    } else {
+        format!("Special::{}", special_variant(spc)?)
     };
     // C's `.dbd` default is ASL1 (`dbLexRoutines.c:570`); `asl(ASL0)` lowers it.
     let asl = match f.asl.as_deref() {
@@ -417,17 +432,13 @@ fn emit_field(
             None => writeln!(s, "    // {dbf} from cvt_dbaddr.types.").unwrap(),
         }
     }
+    // `read_only` is `special(SPC_NOMOD)` — its own bit because it is the one
+    // attribute the runtime put gate reads on every write.
+    let read_only = spc == "SPC_NOMOD";
     writeln!(s, "    FieldDesc {{").unwrap();
     writeln!(s, "        name: {},", rust_str(&f.name)).unwrap();
     writeln!(s, "        dbf_type: DbFieldType::{ty},").unwrap();
-    // `read_only` is `special(SPC_NOMOD)`, kept as its own bit because it is
-    // the one attribute the runtime put gate reads on every write.
-    writeln!(
-        s,
-        "        read_only: {},",
-        f.special.as_deref() == Some("SPC_NOMOD")
-    )
-    .unwrap();
+    writeln!(s, "        read_only: {read_only},").unwrap();
     writeln!(s, "        special: {special},").unwrap();
     writeln!(s, "        pp: {},", f.pp).unwrap();
     writeln!(s, "        asl: {asl},").unwrap();

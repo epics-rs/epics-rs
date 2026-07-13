@@ -215,6 +215,20 @@ const ASYN_FMT_BINARY: i32 = 2;
 /// `IMAX`-sized `BINP` buffer.
 const AINP_SIZE: usize = 40;
 
+/// Capacity of the `TINP` translated-input string, in bytes —
+/// `sizeof(pasynRec->tinp)`, a `DBF_STRING` like `AINP`. C passes exactly this
+/// as the `epicsStrSnPrintEscaped` destination length on both TINP writers
+/// (`asynRecord.c:725` I/O-Intr, `:1629` polled read), so an escaped form longer
+/// than 39 characters is cut there — mid escape pair if that is where the count
+/// runs out.
+pub(super) const TINP_SIZE: usize = 40;
+
+/// C `EOS_SIZE` (asynRecord.c:68) — the size of the `inputEosTranslate` /
+/// `outputEosTranslate` buffers `getEos` escapes the driver's terminators into
+/// (`:1990-1991`, `:2005`, `:2012`) before posting them to IEOS/OEOS. A driver
+/// EOS whose escaped form exceeds 9 characters reaches the record truncated.
+pub(super) const EOS_SIZE: usize = 10;
+
 /// Decode a C-style backslash-escaped string into the raw bytes the
 /// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
 /// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
@@ -1058,8 +1072,10 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             // C stores the device bytes into the single IFMT-selected
             // field (ASCII -> AINP, Binary/Hybrid -> BINP,
             // asynRecord.c:1503-1509) and posts TINP (escaped) for
-            // every read mode.
-            out.tinp = Some(crate::trace::format_io_data(&data, TraceIoMask::ESCAPE));
+            // every read mode. The escape is `epicsStrSnPrintEscaped` into the
+            // 40-byte TINP field (`:1629`), so a long or escape-heavy read
+            // reaches TINP cut at 39 characters.
+            out.tinp = Some(crate::escape::escaped_from_raw(&data, TINP_SIZE));
             if plan.ifmt == ASYN_FMT_ASCII {
                 // On overflow C terminates AINP at the buffer end
                 // (`inptr[sizeof(ainp)-1] = '\0'`, :1608) — drop the
@@ -2602,9 +2618,10 @@ impl AsynRecord {
     /// the corresponding `getInputEos`/`getOutputEos` succeeds *and* returns a
     /// non-empty EOS, so a port with no asynOctet interface, a failing get, or
     /// a driver holding no EOS all land as an empty field. The escaping is
-    /// `epicsStrSnPrintEscaped`, the same transform TINP uses
-    /// (`format_io_data` with `TraceIoMask::ESCAPE`) and the exact inverse of
-    /// the `translate_escape` the put path applies.
+    /// `epicsStrSnPrintEscaped` into an [`EOS_SIZE`]-byte buffer (`:1990-1991`,
+    /// `:2005`, `:2012`) — the same transform TINP uses, under a *tighter*
+    /// bound, and the exact inverse of the `translate_escape` the put path
+    /// applies.
     fn read_eos_from_driver(&mut self, handle: &PortHandle) {
         let mut ieos = String::new();
         let mut oeos = String::new();
@@ -2615,7 +2632,7 @@ impl AsynRecord {
             let read = |res: AsynResult<Vec<u8>>| -> Result<String, bool> {
                 match res {
                     Ok(bytes) if !bytes.is_empty() => {
-                        Ok(crate::trace::format_io_data(&bytes, TraceIoMask::ESCAPE))
+                        Ok(crate::escape::escaped_from_raw(&bytes, EOS_SIZE))
                     }
                     Ok(_) => Ok(String::new()),
                     Err(e) if e.is_queue_timeout() => Err(true),
@@ -6191,6 +6208,101 @@ mod tests {
         assert_eq!(binary.nord, PAYLOAD.len() as i32);
         assert_eq!(binary.binp, PAYLOAD.to_vec());
         assert_eq!(binary.ainp, "SENTINEL", "Binary read must not touch AINP");
+    }
+
+    /// R17-48. Every escaped record field is `epicsStrSnPrintEscaped` into a
+    /// *sized* C buffer, and the size is the field's own: TINP is
+    /// `sizeof(pasynRec->tinp)` = 40 (asynRecord.c:725,:1629), IEOS/OEOS are
+    /// `EOS_SIZE` = 10 (`:68`, `:1990-1991`). What does not fit is cut at
+    /// `dstlen - 1` *characters* — inside an escape pair if that is where the
+    /// count lands, which is why C's own TINP can end in a lone backslash.
+    /// Verified against compiled libCom (`epicsStrnEscapedFromRaw`: 200 raw CRLF
+    /// bytes, `dstlen = 40` → 39 chars ending `\r\n\r\`).
+    #[test]
+    fn escaped_record_fields_are_cut_at_their_c_buffer_size() {
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        struct LongDriver(PortDriverBase);
+        impl PortDriver for LongDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                // 100 CRLF pairs: 400 escaped characters into a 40-byte TINP.
+                let payload: Vec<u8> = b"\r\n".repeat(100);
+                let n = payload.len().min(buf.len());
+                buf[..n].copy_from_slice(&payload[..n]);
+                Ok((n, EomReason::END))
+            }
+            fn set_input_eos(
+                &mut self,
+                _user: &AsynUser,
+                _eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
+                Ok(())
+            }
+            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
+                // 12 escaped characters into a 10-byte inputEosTranslate.
+                b"\r\n\r\n\r\n".to_vec()
+            }
+        }
+
+        let port_name = "r17_48_escape_bounds";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(LongDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        let _ = rec.connect_device();
+        rec.iface = InterfaceType::Octet as i32;
+        rec.tmod = TransferMode::Read as i32;
+        rec.ifmt = ASYN_FMT_BINARY;
+        rec.imax = 256;
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "");
+        assert_eq!(rec.nord, 200, "NORD is the raw transfer count, unbounded");
+        assert_eq!(
+            rec.tinp.len(),
+            TINP_SIZE - 1,
+            "TINP is a 40-byte DBF_STRING"
+        );
+        assert!(
+            rec.tinp.ends_with(r"\r\n\r\"),
+            "C cuts mid escape pair and leaves the backslash: {}",
+            rec.tinp
+        );
+
+        // The EOS readback runs through the same escape with the tighter
+        // EOS_SIZE bound: six raw bytes escape to twelve characters, nine fit.
+        rec.ieos = r"\r".to_string();
+        rec.special("IEOS", true).unwrap();
+        assert_eq!(rec.errs, "");
+        assert_eq!(rec.ieos, r"\r\n\r\n\", "IEOS is cut at EOS_SIZE - 1");
+        assert_eq!(rec.ieos.len(), EOS_SIZE - 1);
     }
 
     /// C parity for `performOctetIO` on an I/O *error* (asynRecord.c:1547,

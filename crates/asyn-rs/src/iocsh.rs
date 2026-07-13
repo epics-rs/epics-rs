@@ -160,6 +160,13 @@ fn raw_from_escaped(src: &str) -> Vec<u8> {
 // `epicsStrPrintEscaped` form lives. The two differ on the NUL byte alone, and a
 // second copy of the table is how they came to differ on more (R16-48).
 
+/// C `asynShowEos`'s destination: `char cbuf[4 * sizeof eosargs.eos + 2]`
+/// (asynShellCommands.c:304) over a 10-byte `eos` (:189) — 42 bytes, sized so
+/// that even an all-`\xNN` terminator (4 chars per byte) escapes whole. Stated
+/// because `epicsStrnEscapedFromRaw` has no unbounded form, not because this
+/// call site can overflow.
+const SHOW_EOS_BUF_SIZE: usize = 4 * 10 + 2;
+
 /// The I/O deadline every asyn *shell* command puts on the `asynUser` it
 /// builds: C sets `pasynUser->timeout = 2` in `asynSetOption`
 /// (asynShellCommands.c:119), `asynSetEos` (:239) and `asynShowEos` (:288),
@@ -258,7 +265,10 @@ fn asyn_show_eos(
             };
             match res {
                 // C `printf("\"%s\"\n", cbuf)` over the escaped terminator.
-                Ok(eos) => ctx.println(&format!("\"{}\"", escaped_from_raw(&eos))),
+                Ok(eos) => ctx.println(&format!(
+                    "\"{}\"",
+                    escaped_from_raw(&eos, SHOW_EOS_BUF_SIZE)
+                )),
                 Err(e) => ctx.println(&format!("Get EOS failed: {e}")),
             }
         }
@@ -1498,17 +1508,22 @@ mod tests {
     /// `"\r\n"` reads back as `"\r\n"`, not as two invisible control bytes.
     #[test]
     fn escaped_from_raw_is_the_inverse_of_raw_from_escaped() {
-        assert_eq!(escaped_from_raw(b"\r\n"), r"\r\n");
-        assert_eq!(escaped_from_raw(b"\x01"), r"\x01");
-        assert_eq!(escaped_from_raw(b"ab"), "ab");
-        assert_eq!(escaped_from_raw(b""), "");
+        let n = SHOW_EOS_BUF_SIZE;
+        assert_eq!(escaped_from_raw(b"\r\n", n), r"\r\n");
+        assert_eq!(escaped_from_raw(b"\x01", n), r"\x01");
+        assert_eq!(escaped_from_raw(b"ab", n), "ab");
+        assert_eq!(escaped_from_raw(b"", n), "");
         for s in [r"\r\n", r"\t", r"\x1b", "ab"] {
             assert_eq!(
-                escaped_from_raw(&raw_from_escaped(s)),
+                escaped_from_raw(&raw_from_escaped(s), n),
                 s,
                 "escape/unescape must round-trip"
             );
         }
+        // C sizes `cbuf` at 4 * sizeof(eos) + 2 precisely so the widest
+        // terminator — 10 bytes, every one of them `\xNN` — still escapes whole
+        // (40 chars, one under the bound).
+        assert_eq!(escaped_from_raw(&[0x01; 10], n).len(), 40);
     }
 
     /// R8-49: C registers `asynInterposeEcho` with iocsh

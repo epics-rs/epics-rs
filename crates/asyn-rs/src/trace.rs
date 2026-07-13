@@ -193,13 +193,24 @@ fn parse_numeric(tok: &str) -> Option<u32> {
 }
 
 bitflags! {
-    /// How to format I/O data.
+    /// How to format I/O data — `asynDriver.h:219-222`.
+    ///
+    /// A **bitfield**, not a choice: C's `traceVprintIOSource` runs one
+    /// independent `if` block per set bit (asynManager.c:3146/:3153/:3167), so
+    /// `ASCII|HEX` prints the payload twice, in C's order. No bit set
+    /// ([`TraceIoMask::NODATA`], `ASYN_TRACEIO_NODATA`) prints no data at all —
+    /// just the bare newline of :3186-3190 — and it is what a port starts with.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct TraceIoMask: u32 {
         const ASCII  = 0x0001;
         const ESCAPE = 0x0002;
         const HEX    = 0x0004;
     }
+}
+
+impl TraceIoMask {
+    /// C `ASYN_TRACEIO_NODATA` (asynDriver.h:219) — the empty mask.
+    pub const NODATA: Self = Self::empty();
 }
 
 bitflags! {
@@ -250,16 +261,23 @@ impl TraceFile {
 
     /// Write a complete line atomically (single write_all call under lock).
     pub fn write_line(&self, line: &str) {
+        self.write_bytes(line.as_bytes());
+    }
+
+    /// The byte form. A trace I/O line is not text: C's ASCII block is
+    /// `fprintf(fp, "%.*s\n", ...)` over the raw device bytes (asynManager.c:
+    /// 3148), which carries control bytes and invalid UTF-8 through untouched.
+    pub fn write_bytes(&self, line: &[u8]) {
         match self {
             TraceFile::Stderr | TraceFile::Errlog => {
-                let _ = std::io::stderr().write_all(line.as_bytes());
+                let _ = std::io::stderr().write_all(line);
             }
             TraceFile::Stdout => {
-                let _ = std::io::stdout().write_all(line.as_bytes());
+                let _ = std::io::stdout().write_all(line);
             }
             TraceFile::File(f) => {
                 if let Ok(mut f) = f.lock() {
-                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.write_all(line);
                 }
             }
         }
@@ -284,12 +302,22 @@ pub struct TraceSnapshot {
     pub file_id: usize,
 }
 
+/// C `DEFAULT_TRACE_BUFFER_SIZE` (asynManager.c:47) — the size `tracePvtInit`
+/// (:451) allocates `tracePvt.traceBuffer` with. That buffer is the destination
+/// `epicsStrSnPrintEscaped` writes the ESCAPE form into on the errlog branch
+/// (:3159), so it is the bound that truncates an errlog trace line.
+const DEFAULT_TRACE_BUFFER_SIZE: usize = 80;
+
 /// Per-port (or global) trace configuration.
 pub struct TraceConfig {
     pub trace_mask: TraceMask,
     pub trace_io_mask: TraceIoMask,
     pub trace_info_mask: TraceInfoMask,
     pub io_truncate_size: usize,
+    /// C `tracePvt.traceBufferSize`. Starts at [`DEFAULT_TRACE_BUFFER_SIZE`] and
+    /// is grown — never shrunk — by `setTraceIOTruncateSize` when the new
+    /// truncate size exceeds it (asynManager.c:2947-2953).
+    pub trace_buffer_size: usize,
     pub file: TraceFile,
 }
 
@@ -303,9 +331,16 @@ impl Default for TraceConfig {
             // NDPluginDriver's "no input array cached") spam stderr at
             // iocInit, which C keeps silent.
             trace_mask: TraceMask::ERROR,
-            trace_io_mask: TraceIoMask::ASCII,
+            // C `tracePvtInit` (asynManager.c:449-459) never assigns
+            // `traceIOMask`, and `callocMustSucceed` zeroed the `tracePvt` —
+            // so a port starts with NO I/O-data bit set, and `asynPrintIO`
+            // prints its message and a bare newline until `asynSetTraceIOMask`
+            // turns a form on (:3186-3190). ASCII is a value an operator asks
+            // for, not one a port is born with.
+            trace_io_mask: TraceIoMask::NODATA,
             trace_info_mask: TraceInfoMask::TIME | TraceInfoMask::PORT,
             io_truncate_size: 80,
+            trace_buffer_size: DEFAULT_TRACE_BUFFER_SIZE,
             file: TraceFile::default(),
         }
     }
@@ -523,6 +558,11 @@ impl TraceManager {
     /// C parity: `tracePrintIO` (asynManager.c:3090-3099). The `addr`
     /// participates in both config resolution AND the `[port,addr,reason]`
     /// `printPort` prefix.
+    ///
+    /// The message line is the port's stand-in for C's `vfprintf(fp, pformat,
+    /// pvar)` — whose format string ends in `\n` at every asyn driver call site
+    /// — and the *data section* follows it, one block per enabled
+    /// [`TraceIoMask`] bit ([`append_io_data`]).
     pub fn output_device_io(
         &self,
         port: &str,
@@ -533,20 +573,9 @@ impl TraceManager {
     ) {
         self.with_effective_config(port, addr, |cfg| {
             let prefix = format_prefix_addr(port, addr, mask, cfg);
-            let truncate = if cfg.io_truncate_size > 0 {
-                cfg.io_truncate_size
-            } else {
-                usize::MAX
-            };
-            let data = if data.len() > truncate {
-                &data[..truncate]
-            } else {
-                data
-            };
-
-            let formatted = format_io_data(data, cfg.trace_io_mask);
-            let line = format!("{prefix}{label} {formatted}\n");
-            cfg.file.write_line(&line);
+            let mut line = format!("{prefix}{label}\n").into_bytes();
+            append_io_data(&mut line, data, cfg);
+            cfg.file.write_bytes(&line);
         });
     }
 
@@ -715,19 +744,25 @@ impl TraceManager {
 
     /// C parity: asynManager.c:2956 fires
     /// `asynExceptionTraceIOTruncateSize` after the mutation.
+    ///
+    /// C also re-allocates `traceBuffer` to `size` when the new truncate size
+    /// exceeds the current buffer (asynManager.c:2947-2953) — see
+    /// [`TraceConfig::trace_buffer_size`], which bounds the errlog ESCAPE form.
     pub fn set_io_truncate_size(&self, port: Option<&str>, size: usize) {
         match port {
             Some(name) => {
                 if let Ok(mut configs) = self.port_configs.lock() {
-                    configs
+                    let cfg = configs
                         .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default)
-                        .io_truncate_size = size;
+                        .or_insert_with(TraceConfig::default);
+                    cfg.io_truncate_size = size;
+                    cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
                 }
             }
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.io_truncate_size = size;
+                    cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
                 }
             }
         }
@@ -746,10 +781,11 @@ impl TraceManager {
     /// `asynExceptionTraceIOTruncateSize` per device.
     pub fn set_device_io_truncate_size(&self, port: &str, addr: i32, size: usize) {
         if let Ok(mut configs) = self.device_configs.lock() {
-            configs
+            let cfg = configs
                 .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default)
-                .io_truncate_size = size;
+                .or_insert_with(TraceConfig::default);
+            cfg.io_truncate_size = size;
+            cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
         }
         let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
         if let Some(sink) = sink {
@@ -903,44 +939,87 @@ fn mask_label(mask: TraceMask) -> &'static str {
     }
 }
 
-/// Format I/O data according to the trace I/O mask.
-pub fn format_io_data(data: &[u8], mask: TraceIoMask) -> String {
-    if mask.contains(TraceIoMask::HEX) {
-        format_hex(data)
-    } else if mask.contains(TraceIoMask::ESCAPE) {
-        format_escape(data)
-    } else {
-        // ASCII (default)
-        format_ascii(data)
+/// The data section of one `asynPrintIO` line — C `traceVprintIOSource`
+/// (asynManager.c:3143-3190), appended to the message line.
+///
+/// The I/O mask is a **bitfield** and C tests each bit in its own `if`, so the
+/// blocks are independent and appear in C's order — ASCII (:3146), ESCAPE
+/// (:3153), HEX (:3167). `ASCII|HEX` prints the payload twice; no bit prints no
+/// data at all. The port's if/else chain instead picked one form, which meant a
+/// two-bit mask silently dropped a block and the empty mask printed ASCII.
+///
+/// The two gates come straight from C and are not the same gate:
+///
+/// - ASCII and ESCAPE print only when `nBytes > 0`.
+/// - HEX prints when `traceTruncateSize > 0` — including its trailing newline
+///   on an empty payload.
+/// - A zero mask *or* a zero truncate size emits the bare newline of :3186-3190.
+fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
+    use std::fmt::Write as _;
+
+    // C: `nBytes = (len < traceTruncateSize) ? len : traceTruncateSize` — a
+    // truncate size of 0 yields no bytes, it does not mean "unlimited".
+    let data = &data[..data.len().min(cfg.io_truncate_size)];
+    let mask = cfg.trace_io_mask;
+
+    if mask.contains(TraceIoMask::ASCII) && !data.is_empty() {
+        // C `fprintf(fp, "%.*s\n", (int)nBytes, buffer)` — the raw bytes, not a
+        // printable-only rendering: a control byte reaches the terminal as
+        // itself.
+        out.extend_from_slice(data);
+        out.push(b'\n');
+    }
+
+    if mask.contains(TraceIoMask::ESCAPE) && !data.is_empty() {
+        let escaped = format_escape(data, &cfg.file, cfg.trace_buffer_size);
+        out.extend_from_slice(escaped.as_bytes());
+        out.push(b'\n');
+    }
+
+    if mask.contains(TraceIoMask::HEX) && cfg.io_truncate_size > 0 {
+        // C `"%2.2x "` per byte, a newline before every 20th byte (so the block
+        // opens with one) and a newline after the last.
+        let mut hex = String::with_capacity(data.len() * 3 + data.len() / 20 + 2);
+        for (i, b) in data.iter().enumerate() {
+            if i % 20 == 0 {
+                hex.push('\n');
+            }
+            let _ = write!(hex, "{b:02x} ");
+        }
+        hex.push('\n');
+        out.extend_from_slice(hex.as_bytes());
+    }
+
+    if mask.is_empty() || cfg.io_truncate_size == 0 {
+        out.push(b'\n');
     }
 }
 
-fn format_ascii(data: &[u8]) -> String {
-    data.iter()
-        .map(|&b| {
-            if b >= 0x20 && b < 0x7f {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
-}
-
-/// `ASYN_TRACEIO_ESCAPE`, which C prints with the libCom escape table
-/// (`epicsStrSnPrintEscaped`, asynManager.c:3159) — the same table `asynRecord`
-/// builds TINP with (asynRecord.c:725,1629) and `asynInterposeEcho` reports a
-/// mismatch with. Its own four-case table left `\a`, `\b`, `\f`, `\v`, `'` and
-/// `"` unescaped or hexed, which none of those three C callers do (R16-48).
-fn format_escape(data: &[u8]) -> String {
-    crate::escape::escaped_from_raw(data)
-}
-
-fn format_hex(data: &[u8]) -> String {
-    data.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// `ASYN_TRACEIO_ESCAPE`. Which of libCom's *two* escape entry points runs is a
+/// property of the trace **destination**, not of the mask
+/// (`traceVprintIOSource`, asynManager.c:3153-3165):
+///
+/// ```text
+/// fp != NULL   epicsStrPrintEscaped(fp, buffer, nBytes)   stdout/stderr/file
+/// fp == NULL   epicsStrSnPrintEscaped(traceBuffer, ...)   errlog
+/// ```
+///
+/// and `getTraceFile` (:2928-2941) returns `NULL` for `traceFileErrlog` alone —
+/// every other sink, including the `traceFileStderr` a port is born with
+/// (`tracePvtInit`, :458), takes the `FILE *` branch. The two differ: the stream
+/// form has no destination bound and no `case '\0'`, so a NUL prints as `\x00`
+/// (and a first-byte NUL prints nothing at all — R17-49). Hardwiring
+/// `escaped_from_raw` gave every sink the errlog form.
+///
+/// The table itself is one table: its own four-case copy left `\a`, `\b`, `\f`,
+/// `\v`, `'` and `"` unescaped or hexed, which no C caller does (R16-48).
+fn format_escape(data: &[u8], dest: &TraceFile, buf_size: usize) -> String {
+    match dest {
+        TraceFile::Errlog => crate::escape::escaped_from_raw(data, buf_size),
+        TraceFile::Stderr | TraceFile::Stdout | TraceFile::File(_) => {
+            crate::escape::print_escaped(data)
+        }
+    }
 }
 
 /// Log a trace message (checks `is_enabled` first for short-circuit).
@@ -1194,41 +1273,201 @@ mod tests {
         assert!(!mgr.is_enabled("other", TraceMask::FLOW));
     }
 
+    /// The data section C's `traceVprintIOSource` appends to one `asynPrintIO`
+    /// message, for a config that differs from the default only in the I/O mask
+    /// and the truncate size.
+    fn blocks(data: &[u8], mask: TraceIoMask, io_truncate_size: usize) -> Vec<u8> {
+        let cfg = TraceConfig {
+            trace_io_mask: mask,
+            io_truncate_size,
+            ..TraceConfig::default()
+        };
+        let mut out = Vec::new();
+        append_io_data(&mut out, data, &cfg);
+        out
+    }
+
+    /// R17-47. `traceIOMask` is a bitfield: C runs one independent `if` block
+    /// per set bit, in the order ASCII (asynManager.c:3146), ESCAPE (:3153),
+    /// HEX (:3167). Two bits print the payload twice; the port's if/else chain
+    /// printed one form and silently dropped the other.
     #[test]
-    fn test_format_ascii() {
-        assert_eq!(format_ascii(b"hello"), "hello");
-        assert_eq!(format_ascii(b"hi\r\n"), "hi..");
-        assert_eq!(format_ascii(&[0x00, 0x7f, 0x41]), "..A");
+    fn every_enabled_io_mask_bit_emits_its_own_block_in_c_s_order() {
+        let data = b"OK\r\n";
+
+        assert_eq!(blocks(data, TraceIoMask::ASCII, 80), b"OK\r\n\n");
+        assert_eq!(blocks(data, TraceIoMask::ESCAPE, 80), b"OK\\r\\n\n");
+        assert_eq!(blocks(data, TraceIoMask::HEX, 80), b"\n4f 4b 0d 0a \n");
+
+        // Two bits — both blocks, ASCII first.
+        assert_eq!(
+            blocks(data, TraceIoMask::ASCII | TraceIoMask::HEX, 80),
+            b"OK\r\n\n\n4f 4b 0d 0a \n"
+        );
+        // All three.
+        assert_eq!(
+            blocks(data, TraceIoMask::all(), 80),
+            b"OK\r\n\nOK\\r\\n\n\n4f 4b 0d 0a \n"
+        );
+    }
+
+    /// C's ASCII block is `fprintf(fp, "%.*s\n", (int)nBytes, buffer)`
+    /// (asynManager.c:3148) — the device bytes, verbatim. The port substituted
+    /// `.` for every non-printable byte, which is a rendering C never does (and
+    /// is what ASYN_TRACEIO_ESCAPE exists for).
+    #[test]
+    fn the_ascii_block_is_the_raw_bytes_not_a_printable_rendering() {
+        assert_eq!(blocks(b"hi\r\n", TraceIoMask::ASCII, 80), b"hi\r\n\n");
+        assert_eq!(
+            blocks(&[0x00, 0x7f, 0x41], TraceIoMask::ASCII, 80),
+            &[0x00, 0x7f, 0x41, b'\n']
+        );
+        // Invalid UTF-8 reaches the sink as itself.
+        assert_eq!(
+            blocks(&[0xff, 0xfe], TraceIoMask::ASCII, 80),
+            &[0xff, 0xfe, b'\n']
+        );
+    }
+
+    /// C's HEX block: a newline before every 20th byte — so the block opens with
+    /// one — `"%2.2x "` per byte, and a closing newline (asynManager.c:3167-3186).
+    /// The port emitted one unwrapped space-joined run with no newlines at all.
+    #[test]
+    fn the_hex_block_wraps_every_twenty_bytes_and_is_newline_wrapped() {
+        let data: Vec<u8> = (0..25).collect();
+        let out = String::from_utf8(blocks(&data, TraceIoMask::HEX, 80)).unwrap();
+
+        let mut want = String::from("\n");
+        for b in 0..20u8 {
+            want.push_str(&format!("{b:02x} "));
+        }
+        want.push('\n');
+        for b in 20..25u8 {
+            want.push_str(&format!("{b:02x} "));
+        }
+        want.push('\n');
+        assert_eq!(out, want);
+
+        // An empty payload still prints the trailing newline: C gates the HEX
+        // block on traceTruncateSize, not on nBytes (:3167).
+        assert_eq!(blocks(b"", TraceIoMask::HEX, 80), b"\n");
+    }
+
+    /// C's two no-data paths (asynManager.c:3186-3190): a zero mask, or a zero
+    /// truncate size, emits a bare newline and nothing else. The port defaulted
+    /// to ASCII on an empty mask and read a zero truncate size as "unlimited".
+    #[test]
+    fn a_zero_mask_or_a_zero_truncate_size_emits_a_bare_newline() {
+        assert_eq!(blocks(b"OK", TraceIoMask::NODATA, 80), b"\n");
+        assert_eq!(blocks(b"OK", TraceIoMask::ASCII, 0), b"\n");
+        assert_eq!(blocks(b"OK", TraceIoMask::all(), 0), b"\n");
+
+        // And NODATA is what a port starts with — `tracePvtInit` leaves
+        // traceIOMask at the calloc zero (asynManager.c:449-459).
+        assert_eq!(TraceConfig::default().trace_io_mask, TraceIoMask::NODATA);
+        assert_eq!(
+            TraceManager::new().get_trace_io_mask(None),
+            TraceIoMask::NODATA
+        );
+    }
+
+    /// C truncates the *payload* at traceTruncateSize before any block runs
+    /// (`nBytes = min(len, traceTruncateSize)`), so every enabled form shows the
+    /// same prefix of the data.
+    #[test]
+    fn the_truncate_size_bounds_every_block() {
+        assert_eq!(blocks(b"hello world", TraceIoMask::ASCII, 4), b"hell\n");
+        assert_eq!(blocks(b"hello world", TraceIoMask::ESCAPE, 4), b"hell\n");
+        assert_eq!(
+            blocks(b"hello world", TraceIoMask::HEX, 4),
+            b"\n68 65 6c 6c \n"
+        );
+    }
+
+    /// R17-49 on the trace line. The ESCAPE block runs (C gates it on
+    /// `nBytes > 0`, asynManager.c:3153) but `epicsStrPrintEscaped` writes
+    /// nothing for a payload whose first byte is NUL (epicsString.c:236-237),
+    /// so a `FILE *` sink gets an *empty* data line — the block's newline and
+    /// no bytes. The errlog sink escapes it as `\0…` instead.
+    #[test]
+    fn a_first_byte_nul_payload_escapes_to_an_empty_data_line_on_a_file_sink() {
+        assert_eq!(blocks(b"\0ab", TraceIoMask::ESCAPE, 80), b"\n");
+
+        let cfg = TraceConfig {
+            trace_io_mask: TraceIoMask::ESCAPE,
+            file: TraceFile::Errlog,
+            ..TraceConfig::default()
+        };
+        let mut out = Vec::new();
+        append_io_data(&mut out, b"\0ab", &cfg);
+        assert_eq!(out, b"\\0ab\n");
     }
 
     #[test]
     fn test_format_escape() {
-        assert_eq!(format_escape(b"OK\r\n"), "OK\\r\\n");
-        assert_eq!(format_escape(b"\t\\"), "\\t\\\\");
-        assert_eq!(format_escape(&[0x01]), "\\x01");
-        assert_eq!(format_escape(b"hi"), "hi");
+        let n = DEFAULT_TRACE_BUFFER_SIZE;
+        let errlog = TraceFile::Errlog;
+        assert_eq!(format_escape(b"OK\r\n", &errlog, n), "OK\\r\\n");
+        assert_eq!(format_escape(b"\t\\", &errlog, n), "\\t\\\\");
+        assert_eq!(format_escape(&[0x01], &errlog, n), "\\x01");
+        assert_eq!(format_escape(b"hi", &errlog, n), "hi");
     }
 
+    /// The ESCAPE form's destination is C's `tracePvt.traceBuffer`
+    /// (asynManager.c:3159), 80 bytes until `setTraceIOTruncateSize` grows it
+    /// (:2947-2953) — so an escape-heavy errlog line is cut at
+    /// `traceBufferSize - 1`. The stream branch has no such buffer.
     #[test]
-    fn test_format_hex() {
-        assert_eq!(format_hex(b"AB"), "41 42");
-        assert_eq!(format_hex(b"\r\n"), "0d 0a");
-        assert_eq!(format_hex(b""), "");
+    fn format_escape_is_bounded_by_the_trace_buffer_on_the_errlog_branch_only() {
+        let crlf: Vec<u8> = b"\r\n".repeat(50);
+        let out = format_escape(&crlf, &TraceFile::Errlog, DEFAULT_TRACE_BUFFER_SIZE);
+        assert_eq!(out.len(), DEFAULT_TRACE_BUFFER_SIZE - 1);
+        assert!(out.ends_with(r"\r\n\r\"), "cut mid-pair, as C does: {out}");
+
+        let out = format_escape(&crlf, &TraceFile::Stderr, DEFAULT_TRACE_BUFFER_SIZE);
+        assert_eq!(out.len(), 200, "epicsStrPrintEscaped writes to a stream");
     }
 
+    /// R17-46. C picks the escape entry point by *destination*
+    /// (asynManager.c:3153-3165): `fp != NULL` → `epicsStrPrintEscaped`,
+    /// errlog → `epicsStrSnPrintEscaped`. `getTraceFile` (:2928-2941) hands back
+    /// `NULL` for errlog alone, and a port's default sink is stderr
+    /// (`tracePvtInit`, :458) — so the *default* trace line takes the stream
+    /// form, which prints a NUL as `\x00` where the errlog form prints `\0`.
     #[test]
-    fn test_io_truncate() {
-        let data = b"hello world";
-        let truncated = &data[..4];
-        assert_eq!(format_ascii(truncated), "hell");
+    fn the_escape_entry_point_is_chosen_by_the_trace_destination() {
+        let n = DEFAULT_TRACE_BUFFER_SIZE;
+        let data = b"a\0b";
+
+        // errlog: epicsStrSnPrintEscaped — has `case '\0'` (epicsString.c:145).
+        assert_eq!(format_escape(data, &TraceFile::Errlog, n), r"a\0b");
+
+        // Every FILE* sink, the stderr default included: epicsStrPrintEscaped,
+        // whose switch has no NUL case (:255-260).
+        assert_eq!(format_escape(data, &TraceFile::Stderr, n), r"a\x00b");
+        assert_eq!(format_escape(data, &TraceFile::Stdout, n), r"a\x00b");
+        let f = TraceFile::File(Arc::new(Mutex::new(
+            std::fs::File::create(std::env::temp_dir().join("asyn_r17_46.txt")).unwrap(),
+        )));
+        assert_eq!(format_escape(data, &f, n), r"a\x00b");
+        let _ = std::fs::remove_file(std::env::temp_dir().join("asyn_r17_46.txt"));
+
+        // And the default TraceConfig is one of the FILE* sinks, not errlog.
+        assert!(matches!(TraceConfig::default().file, TraceFile::Stderr));
     }
 
+    /// C `setTraceIOTruncateSize` reallocates `traceBuffer` to the new size when
+    /// it exceeds the current one, and never shrinks it back
+    /// (asynManager.c:2947-2953) — so a bigger truncate size widens the ESCAPE
+    /// bound, and a smaller one afterwards does not narrow it.
     #[test]
-    fn test_format_io_data_dispatch() {
-        let data = b"OK\r\n";
-        assert_eq!(format_io_data(data, TraceIoMask::ASCII), "OK..");
-        assert_eq!(format_io_data(data, TraceIoMask::ESCAPE), "OK\\r\\n");
-        assert_eq!(format_io_data(data, TraceIoMask::HEX), "4f 4b 0d 0a");
+    fn a_bigger_truncate_size_grows_the_trace_buffer_and_a_smaller_one_does_not_shrink_it() {
+        let mgr = TraceManager::new();
+        mgr.set_io_truncate_size(None, 400);
+        assert_eq!(mgr.global_config.lock().unwrap().trace_buffer_size, 400);
+        mgr.set_io_truncate_size(None, 8);
+        assert_eq!(mgr.global_config.lock().unwrap().io_truncate_size, 8);
+        assert_eq!(mgr.global_config.lock().unwrap().trace_buffer_size, 400);
     }
 
     #[test]
@@ -1276,9 +1515,10 @@ mod tests {
     #[test]
     fn test_get_masks() {
         let mgr = TraceManager::new();
-        // Default global mask is ERROR-only (asynManager.c:454).
+        // Default global mask is ERROR-only (asynManager.c:454), and the I/O
+        // mask is the calloc zero `tracePvtInit` leaves behind (:449-459).
         assert_eq!(mgr.get_trace_mask(None), TraceMask::ERROR);
-        assert_eq!(mgr.get_trace_io_mask(None), TraceIoMask::ASCII);
+        assert_eq!(mgr.get_trace_io_mask(None), TraceIoMask::NODATA);
 
         mgr.set_trace_mask(Some("p1"), TraceMask::FLOW);
         assert_eq!(mgr.get_trace_mask(Some("p1")), TraceMask::FLOW);
@@ -1299,6 +1539,8 @@ mod tests {
         let mgr = TraceManager::new();
         mgr.set_trace_mask(None, TraceMask::IO_DRIVER);
         mgr.set_trace_info_mask(None, TraceInfoMask::PORT);
+        // An I/O form is an operator's choice — a port has none by default.
+        mgr.set_trace_io_mask(None, TraceIoMask::ASCII);
         mgr.set_io_truncate_size(None, 3);
 
         let temp = std::env::temp_dir().join("asyn_trace_trunc_test.txt");
@@ -1554,6 +1796,7 @@ mod tests {
             if let Some(c) = cfgs.get_mut(&("p".to_string(), 0)) {
                 c.io_truncate_size = 3;
                 c.trace_info_mask = TraceInfoMask::PORT;
+                c.trace_io_mask = TraceIoMask::ASCII;
             }
         }
 

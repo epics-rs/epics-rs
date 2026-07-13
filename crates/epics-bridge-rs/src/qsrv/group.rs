@@ -657,6 +657,68 @@ async fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Group PUT member classification
+// ---------------------------------------------------------------------------
+
+/// What a group PUT does with one member — pvxs `putGroupField`
+/// (`groupsource.cpp:554-573`), whose two predicates are INDEPENDENT:
+///
+/// ```text
+/// putable  = putOrder != int64_t::min()          // an explicit +putorder
+/// marked   = leafNode.isMarked(true,true) && field.value   // client sent it,
+///                                                          // and it has a channel
+/// changing = marked && putable
+///
+/// if (changing)                    { doFieldPreProcessing(); IOCSource::put(); }
+/// if (changing || type == Proc)    { doPostProcessing(); return true; }
+/// ```
+///
+/// `IOCSource::put` (`iocsource.cpp:576-598`) writes for Scalar/Plain/Any and
+/// returns without writing for Meta/Proc/Structure/Const. The port used to fuse
+/// "has no writable leaf" with "does not participate" and skipped a `changing`
+/// Meta member outright — so a Meta member with an explicit `+putorder`
+/// processed its record in pvxs and did nothing here (R17-37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberPutAction {
+    /// `changing`, and `IOCSource::put` has a leaf to write.
+    Write,
+    /// Post-process only, no database write. `acf_checked` is C's
+    /// `doFieldPreProcessing` (the `canWrite` gate), which runs for every
+    /// `changing` field — including a Meta member that writes nothing — and
+    /// never for a `proc` trigger, which is not `changing`.
+    ProcessOnly { acf_checked: bool },
+    /// Unmarked, or marked without `+putorder` (the not-putable sentinel), or
+    /// no backing channel (Structure / Const).
+    Skip,
+}
+
+/// The one classifier. Both PUT loops (atomic and non-atomic) and the
+/// per-member ACF pass ask it; none of them re-derives "is this member
+/// writable / marked / participating" on its own.
+fn member_put_action(m: &GroupMember, value: &PvStructure) -> MemberPutAction {
+    // `field.value` — a Structure/Const member has no dbChannel, so pvxs's
+    // `marked` is false for it whatever the client sent.
+    let marked = !m.channel.is_empty() && get_nested_field(value, &m.field_name).is_some();
+    let putable = m.put_order.is_some();
+    let changing = marked && putable;
+
+    if changing && m.mapping.is_client_writable() {
+        MemberPutAction::Write
+    } else if changing {
+        // Marked, putable, but `IOCSource::put` writes nothing for this mapping
+        // (Meta). C still runs the write-ACF gate and still post-processes.
+        MemberPutAction::ProcessOnly { acf_checked: true }
+    } else if m.mapping == FieldMapping::Proc {
+        // A `proc` trigger runs on every group PUT regardless of marks and of
+        // `+putorder` (`changing || type==Proc`), and C never asks `canWrite`
+        // for it — `dbProcess` is not a `dbPutField`.
+        MemberPutAction::ProcessOnly { acf_checked: false }
+    } else {
+        MemberPutAction::Skip
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GroupChannel
 // ---------------------------------------------------------------------------
 
@@ -1518,27 +1580,16 @@ impl GroupChannel {
         ordered.sort_by_key(|(_, po)| *po);
         let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
 
-        // A member participates in *this* PUT iff it is a proc hook
-        // (runs on every group PUT, allowProc — pvxs
-        // groupsource.cpp:547-573) or a value member whose field is
-        // present in the incoming value. On the native PVA path the
-        // value is pruned to the client's marked members (presence ==
-        // marked), so this mirrors pvxs writing only marked members
-        // (`marked = leafNode.isMarked(true,true) && field.value`,
-        // groupsource.cpp:547-567). An absent (unmarked) value member
-        // must not be link-rejected, access-checked, or written — the
-        // up-front per-member pre-checks otherwise let an unmarked,
-        // unwritable, or link-targeting member reject a partial PUT to
-        // an unrelated marked member. Whole-value callers (in-process
-        // put()) supply every member, so all stay active — same rule,
-        // no special case.
-        let member_is_active = |m: &GroupMember| -> bool {
-            match m.mapping {
-                FieldMapping::Proc => true,
-                FieldMapping::Structure | FieldMapping::Const => false,
-                _ => get_nested_field(value, &m.field_name).is_some(),
-            }
-        };
+        // What this PUT does with each member — one classifier, both loops.
+        //
+        // On the native PVA path the value is pruned to the client's marked
+        // members, so presence == marked; a whole-value in-process caller
+        // supplies every member and marks them all. An absent (unmarked) value
+        // member must not be link-rejected, access-checked, or written — the
+        // up-front per-member pre-checks would otherwise let an unmarked,
+        // unwritable or link-targeting member reject a partial PUT to an
+        // unrelated marked member.
+        let classify = |m: &GroupMember| -> MemberPutAction { member_put_action(m, value) };
 
         // pvxs's group PUT preparation pass (groupsource.cpp:596-609)
         // iterates EVERY backing field — before any marked/putable
@@ -1602,30 +1653,23 @@ impl GroupChannel {
         // field (groupsource.cpp:594-602). Resolve it once here and key
         // it by the member's backing channel so the write phase emits
         // without re-deriving the trap flag.
+        //
+        // Which members get the check is the classifier's call, not a second
+        // hand-rolled predicate: C runs `doFieldPreProcessing` inside
+        // `if (changing)` (groupsource.cpp:564), so every changing member is
+        // checked — INCLUDING a Meta member that writes nothing — and a `proc`
+        // trigger never is (it is not changing; `dbProcess` is not a
+        // `dbPutField`, so gating it on write access is a category error). A
+        // proc member's DISP/read-only prep gate (`doPreProcessing`) still ran
+        // in the precondition pass above.
         let mut member_grants: HashMap<String, super::provider::WriteGrant> = HashMap::new();
         for m in &ordered {
-            if !member_is_active(m) {
-                continue;
-            }
-            // A `proc` member is a processing TRIGGER, not a value write:
-            // pvxs runs the write-ACF gate `doFieldPreProcessing`
-            // (`canWrite`, iocsource.cpp:382) only for a `changing` field —
-            // `marked && putable` with a `field.value`
-            // (groupsource.cpp:557,564) — and a proc member has no value
-            // field, so it is never `changing` and `canWrite` is never
-            // checked for it, while its record is still processed
-            // unconditionally (`doPostProcessing`, :568). Gating a proc
-            // trigger on write access is a category error (`dbProcess` is not
-            // a `dbPutField`); skip the per-member write-ACF check for proc,
-            // matching pvxs. Its DISP/read-only prep gate (`doPreProcessing`)
-            // still ran in the precondition pass above.
-            if m.mapping == FieldMapping::Proc {
-                continue;
-            }
-            if m.channel.is_empty() {
-                // Structure / Const members have no backing channel
-                // to security-check; pvxs skips these in the
-                // SecurityClient list as well.
+            let acf_checked = match classify(m) {
+                MemberPutAction::Write => true,
+                MemberPutAction::ProcessOnly { acf_checked } => acf_checked,
+                MemberPutAction::Skip => false,
+            };
+            if !acf_checked {
                 continue;
             }
             let grant = self.access.write_grant(&m.channel).await;
@@ -1681,91 +1725,92 @@ impl GroupChannel {
             let _atomic_guard = self.def.atomic_write_lock.lock().await;
 
             // Convert all values up-front (DBF-typed), then perform the
-            // actual writes in order.
-            let mut writes: Vec<(&GroupMember, Option<epics_base_rs::types::EpicsValue>)> =
-                Vec::new();
+            // actual writes in order. A member that only post-processes
+            // (`proc` trigger, or a changing member with no writable leaf)
+            // carries no value.
+            let mut writes: Vec<(
+                &GroupMember,
+                MemberPutAction,
+                Option<epics_base_rs::types::EpicsValue>,
+            )> = Vec::new();
 
             for member in &ordered {
-                if member.mapping == FieldMapping::Proc {
-                    // Proc has no value — write entry stays None,
-                    // process_record() runs in the apply phase
-                    writes.push((member, None));
-                    continue;
-                }
-                if !member.mapping.is_client_writable() {
-                    // pvxs `IOCSource::put` returns without writing for
-                    // Meta/Structure/Const ("can't write", iocsource.cpp:
-                    // 577-580,595): a const member's value comes from the
-                    // config and a meta/structure member has no writable
-                    // leaf. Skipping is what pvxs does — rejecting the whole
-                    // PUT (as the pre-R17-35 converter did for a supplied
-                    // meta member) is not.
-                    continue;
-                }
-
-                // Use nested lookup so members with dotted field paths
-                // (e.g., "axis.position") resolve correctly. The read
-                // path uses set_nested_field — put must use the same
-                // path semantics.
-                // A supplied-but-unconvertible value is a conversion error,
-                // not a "field absent" no-op (see the non-atomic path for the
-                // pvxs IOCSource::put/groupsource.cpp parity rationale). Fail
-                // the whole atomic PUT here, in the pre-write conversion phase,
-                // before any member record is touched — nothing has been
-                // applied yet, so the all-or-nothing guarantee holds.
-                let epics_val = match get_nested_field(value, &member.field_name) {
-                    Some(pv_field) => match self.convert_member_value(member, &pv_field).await {
-                        Some(v) => Some(v),
-                        None => {
-                            return Err(BridgeError::PutRejected(format!(
-                                "group {} PUT: member '{}' value is not convertible \
-                                 to backing field '{}'",
-                                self.def.name, member.field_name, member.channel
-                            )));
+                let action = classify(member);
+                let epics_val = match action {
+                    MemberPutAction::Skip => continue,
+                    MemberPutAction::ProcessOnly { .. } => None,
+                    MemberPutAction::Write => {
+                        // Use nested lookup so members with dotted field paths
+                        // (e.g., "axis.position") resolve correctly. The read
+                        // path uses set_nested_field — put must use the same
+                        // path semantics. The classifier proved the field is
+                        // present, so a missing one here cannot happen.
+                        //
+                        // A supplied-but-unconvertible value is a conversion
+                        // error, not a no-op: pvxs's `IOCSource::put` throws on
+                        // an unsupported conversion (iocsource.cpp:114) and the
+                        // group put handler turns that into a remote error
+                        // (groupsource.cpp:665). Fail the whole atomic PUT here,
+                        // in the pre-write conversion phase, before any member
+                        // record is touched — nothing has been applied yet, so
+                        // the all-or-nothing guarantee holds.
+                        let pv_field = get_nested_field(value, &member.field_name)
+                            .expect("classifier returned Write only for a supplied field");
+                        match self.convert_member_value(member, &pv_field).await {
+                            Some(v) => Some(v),
+                            None => {
+                                return Err(BridgeError::PutRejected(format!(
+                                    "group {} PUT: member '{}' value is not convertible \
+                                     to backing field '{}'",
+                                    self.def.name, member.field_name, member.channel
+                                )));
+                            }
                         }
-                    },
-                    None => None, // field not supplied by client → legitimate skip
+                    }
                 };
-                writes.push((member, epics_val));
+                writes.push((member, action, epics_val));
             }
 
-            for (member, val) in writes {
+            for (member, action, val) in writes {
                 let (record_name, field_name) =
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
-                if member.mapping == FieldMapping::Proc {
-                    // A `+proc` member is a processing TRIGGER with no value:
-                    // pvxs skips `IOCSource::put` for it and goes straight to
-                    // `doPostProcessing` (groupsource.cpp:568), which decides
-                    // whether the record actually processes. The gate lives in
-                    // one owner — never inline here.
-                    self.post_process_member(member, opts.process, true).await?;
-                    // `didSomething` is set by pvxs for `changing ||
-                    // type==Proc` (groupsource.cpp:568-571) — the RETURN of
-                    // doPostProcessing, not the outcome of its gate. A proc
-                    // member whose record declined to process still counts as
-                    // participation, so the PUT does not fail "No fields
-                    // changed".
-                    did_something = true;
-                } else if let Some(epics_val) = val {
-                    // `_already_locked` — this atomic PUT owns every
-                    // member-record gate via `lock_records`. The member's
-                    // trap grant (resolved in the per-member ACF pass)
-                    // gates `asTrapWrite` emission for this write.
-                    self.apply_member_value(
-                        record_name,
-                        field_name,
-                        epics_val,
-                        opts.process,
-                        true,
-                        member_grants
-                            .get(member.channel.as_str())
-                            .copied()
-                            .unwrap_or_default(),
-                    )
-                    .await?;
-                    did_something = true;
+                match action {
+                    MemberPutAction::ProcessOnly { .. } => {
+                        // pvxs skips `IOCSource::put` for this member and goes
+                        // straight to `doPostProcessing` (groupsource.cpp:568),
+                        // which decides whether the record actually processes.
+                        // The gate lives in one owner — never inline here.
+                        self.post_process_member(member, opts.process, true).await?;
+                    }
+                    MemberPutAction::Write => {
+                        // `_already_locked` — this atomic PUT owns every
+                        // member-record gate via `lock_records`. The member's
+                        // trap grant (resolved in the per-member ACF pass)
+                        // gates `asTrapWrite` emission for this write.
+                        let epics_val =
+                            val.expect("classifier returned Write, so a value was converted");
+                        self.apply_member_value(
+                            record_name,
+                            field_name,
+                            epics_val,
+                            opts.process,
+                            true,
+                            member_grants
+                                .get(member.channel.as_str())
+                                .copied()
+                                .unwrap_or_default(),
+                        )
+                        .await?;
+                    }
+                    MemberPutAction::Skip => continue,
                 }
+                // pvxs sets `didSomething` from `putGroupField` RETURNING true
+                // — `changing || type==Proc` (groupsource.cpp:568-571) — not
+                // from a write having landed or doPostProcessing's gate having
+                // fired. A participating member that wrote nothing still keeps
+                // the PUT out of "No fields changed".
+                did_something = true;
             }
         } else {
             // Non-atomic put: write each member individually.
@@ -1777,70 +1822,61 @@ impl GroupChannel {
                 let (record_name, field_name) =
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
 
-                if member.mapping != FieldMapping::Proc && !member.mapping.is_client_writable() {
-                    // pvxs `IOCSource::put` returns without writing for
-                    // Meta/Structure/Const ("can't write", iocsource.cpp:
-                    // 577-580,595): a const member's value comes from the
-                    // config and a meta/structure member has no writable
-                    // leaf. Skipping is what pvxs does — rejecting the whole
-                    // PUT (as the pre-R17-35 converter did for a supplied
-                    // meta member) is not. `Proc` is not client-writable
-                    // either, but it is routed to record processing just
-                    // below, so it must not be skipped here.
-                    continue;
-                }
-
-                if member.mapping == FieldMapping::Proc {
-                    // Same owner as the atomic loop — the gate is C's
-                    // `doPostProcessing` (iocsource.cpp:397-403), not "a proc
-                    // member always processes". The non-atomic path holds no
-                    // member gate, so the owner takes the gate-acquiring entry.
-                    self.post_process_member(member, opts.process, false)
-                        .await?;
-                    did_something = true;
-                    continue;
-                }
-
-                // Nested-aware lookup (matches read-side set_nested_field)
-                let pv_field = match get_nested_field(value, &member.field_name) {
-                    Some(f) => f,
-                    None => continue,
-                };
-
-                // The field WAS supplied by the client; failing to convert
-                // it is a conversion error, not a no-op. pvxs's
-                // `IOCSource::put` throws on an unsupported conversion
-                // (iocsource.cpp:114) and the group put handler turns that
-                // into a remote error (groupsource.cpp:665), distinct from
-                // the "No fields changed" reply (:656) which fires only when
-                // nothing putable was marked. Mirror that: surface the
-                // failure instead of silently dropping the member's write.
-                let epics_val = match self.convert_member_value(member, &pv_field).await {
-                    Some(v) => v,
-                    None => {
-                        return Err(BridgeError::PutRejected(format!(
-                            "group {} PUT: member '{}' value is not convertible \
-                             to backing field '{}'",
-                            self.def.name, member.field_name, member.channel
-                        )));
+                // Same classifier as the atomic loop, same three outcomes.
+                let action = classify(member);
+                match action {
+                    MemberPutAction::Skip => continue,
+                    MemberPutAction::ProcessOnly { .. } => {
+                        // Same owner as the atomic loop — the gate is C's
+                        // `doPostProcessing` (iocsource.cpp:397-403), not "this
+                        // member always processes". The non-atomic path holds no
+                        // member gate, so the owner takes the gate-acquiring
+                        // entry.
+                        self.post_process_member(member, opts.process, false)
+                            .await?;
                     }
-                };
+                    MemberPutAction::Write => {
+                        // Nested-aware lookup (matches read-side
+                        // set_nested_field); the classifier proved the field is
+                        // present.
+                        let pv_field = get_nested_field(value, &member.field_name)
+                            .expect("classifier returned Write only for a supplied field");
 
-                // non-atomic per-member write — gate-acquiring variants.
-                // The member's trap grant (resolved in the per-member ACF
-                // pass) gates `asTrapWrite` emission for this write.
-                self.apply_member_value(
-                    record_name,
-                    field_name,
-                    epics_val,
-                    opts.process,
-                    false,
-                    member_grants
-                        .get(member.channel.as_str())
-                        .copied()
-                        .unwrap_or_default(),
-                )
-                .await?;
+                        // The field WAS supplied by the client; failing to
+                        // convert it is a conversion error, not a no-op. pvxs's
+                        // `IOCSource::put` throws on an unsupported conversion
+                        // (iocsource.cpp:114) and the group put handler turns
+                        // that into a remote error (groupsource.cpp:665),
+                        // distinct from the "No fields changed" reply (:656)
+                        // which fires only when nothing putable was marked.
+                        let epics_val = match self.convert_member_value(member, &pv_field).await {
+                            Some(v) => v,
+                            None => {
+                                return Err(BridgeError::PutRejected(format!(
+                                    "group {} PUT: member '{}' value is not convertible \
+                                     to backing field '{}'",
+                                    self.def.name, member.field_name, member.channel
+                                )));
+                            }
+                        };
+
+                        // non-atomic per-member write — gate-acquiring variants.
+                        // The member's trap grant (resolved in the per-member
+                        // ACF pass) gates `asTrapWrite` emission for this write.
+                        self.apply_member_value(
+                            record_name,
+                            field_name,
+                            epics_val,
+                            opts.process,
+                            false,
+                            member_grants
+                                .get(member.channel.as_str())
+                                .copied()
+                                .unwrap_or_default(),
+                        )
+                        .await?;
+                    }
+                }
                 did_something = true;
             }
         }
@@ -3981,6 +4017,119 @@ mod tests {
                  processed={processed}, expected {expect_processed}"
             );
         }
+    }
+
+    /// R17-37: a MARKED Meta member with an explicit `+putorder` is `changing`
+    /// in pvxs (`changing = marked && putable`, groupsource.cpp:557) — so even
+    /// though `IOCSource::put` writes nothing for a Meta mapping
+    /// (iocsource.cpp:579-582, "can't write"), `doPostProcessing` runs and the
+    /// backing record is processed (groupsource.cpp:568-571).
+    ///
+    /// The port fused "has no writable leaf" with "does not participate" and
+    /// skipped the member outright, so the record never processed and — with no
+    /// other member marked — the PUT failed "No fields changed". Both are
+    /// asserted here: the record processes, and its VAL is untouched (this is a
+    /// post-process, not a write).
+    #[tokio::test]
+    async fn r17_37_marked_meta_member_with_putorder_post_processes_its_record() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        for atomic in [false, true] {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("META:rec", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+
+            let cfg = format!(
+                r#"{{ "META:GRP": {{ "+atomic": {atomic},
+                    "m": {{ "+type": "meta", "+channel": "META:rec.VAL",
+                            "+putorder": 0 }} }} }}"#
+            );
+            let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+            let def = defs.pop().unwrap();
+            let channel = GroupChannel::new(db.clone(), def);
+
+            // The client marks the meta member (alarm/timeStamp leaves — a Meta
+            // mapping carries no value leaf).
+            let mut root = PvStructure::new("structure");
+            let mut meta = PvStructure::new("structure");
+            meta.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+            root.set("m", PvField::Structure(meta));
+
+            channel
+                .put(&root)
+                .await
+                .expect("a marked, putable meta member participates: PUT must not fail");
+
+            let init = match db.get_pv("META:rec.INIT").await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            };
+            assert_eq!(
+                init, 1,
+                "a changing meta member must post-process its record \
+                 (groupsource.cpp:568, atomic={atomic})"
+            );
+            let val = match db.get_pv("META:rec.VAL").await.unwrap() {
+                EpicsValue::Double(d) => d,
+                other => panic!("unexpected VAL type: {other:?}"),
+            };
+            assert_eq!(
+                val, 0.0,
+                "IOCSource::put writes nothing for a Meta mapping \
+                 (iocsource.cpp:579-582, atomic={atomic})"
+            );
+        }
+    }
+
+    /// R17-37, the other predicate: a marked Meta member WITHOUT `+putorder` is
+    /// not putable, so it is not `changing` and nothing happens — no write, no
+    /// post-processing. With no other member participating, the PUT then fails
+    /// "No fields changed" (groupsource.cpp:657-659), exactly as in pvxs.
+    #[tokio::test]
+    async fn r17_37_marked_meta_member_without_putorder_does_nothing() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("META2:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+
+        let cfg = r#"{ "META2:GRP": {
+            "m": { "+type": "meta", "+channel": "META2:rec.VAL" }
+        } }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        let mut root = PvStructure::new("structure");
+        let mut meta = PvStructure::new("structure");
+        meta.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+        root.set("m", PvField::Structure(meta));
+
+        let err = channel
+            .put(&root)
+            .await
+            .expect_err("a marked but not-putable member changes nothing");
+        assert!(
+            err.to_string().contains("No fields changed"),
+            "expected pvxs's No-fields-changed reply, got: {err}"
+        );
+
+        let init = match db.get_pv("META2:rec.INIT").await.unwrap() {
+            EpicsValue::Char(c) => c as i64,
+            EpicsValue::Long(v) => v as i64,
+            other => panic!("unexpected INIT type: {other:?}"),
+        };
+        assert_eq!(
+            init, 0,
+            "a member without +putorder is not putable, so it never post-processes"
+        );
     }
 
     /// A group member

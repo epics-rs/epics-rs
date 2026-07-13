@@ -856,10 +856,10 @@ impl PortActor {
                 // and restore it on every exit path so a configured OEOS does
                 // not append terminator bytes to a binary payload. The actor
                 // owns the bracket atomically under its serial dispatch.
-                let saved = self.driver.get_output_eos();
-                self.driver.set_output_eos(&[])?;
+                let saved = self.driver.get_output_eos(user);
+                self.driver.set_output_eos(user, &[])?;
                 let res = self.driver.io_write_octet(user, data);
-                let _ = self.driver.set_output_eos(&saved);
+                let _ = self.driver.set_output_eos(user, &saved);
                 let n = res?;
                 Ok(RequestResult::write_n(n))
             }
@@ -869,11 +869,11 @@ impl PortActor {
                 // restore it on every exit path so a configured IEOS does not
                 // stop the read early or strip bytes belonging to the binary
                 // payload.
-                let saved = self.driver.get_input_eos();
-                self.driver.set_input_eos(&[])?;
+                let saved = self.driver.get_input_eos(user);
+                self.driver.set_input_eos(user, &[])?;
                 let mut buf = vec![0u8; *buf_size];
                 let res = self.driver.io_read_octet_eom(user, &mut buf);
-                let _ = self.driver.set_input_eos(&saved);
+                let _ = self.driver.set_input_eos(user, &saved);
                 let (n, eom) = res?;
                 buf.truncate(n);
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
@@ -1287,21 +1287,22 @@ impl PortActor {
                 // Route through the driver trait so the EOS interpose
                 // layer (interpose/eos.rs) reads from a single source
                 // of truth (`PortDriverBase::input_eos`) rather than
-                // the orphaned options HashMap.
-                self.driver.set_input_eos(eos)?;
+                // the orphaned options HashMap. The terminator belongs to the
+                // device the request addressed, so the user goes with it.
+                self.driver.set_input_eos(user, eos)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetOutputEos { eos } => {
-                self.driver.set_output_eos(eos)?;
+                self.driver.set_output_eos(user, eos)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetInputEos => {
-                let eos = self.driver.get_input_eos();
+                let eos = self.driver.get_input_eos(user);
                 let n = eos.len();
                 Ok(RequestResult::octet_read(eos, n))
             }
             RequestOp::GetOutputEos => {
-                let eos = self.driver.get_output_eos();
+                let eos = self.driver.get_output_eos(user);
                 let n = eos.len();
                 Ok(RequestResult::octet_read(eos, n))
             }
@@ -1595,11 +1596,11 @@ mod tests {
                 &mut self.base
             }
             fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-                *self.write_eos.lock() = self.base().output_eos.clone();
+                *self.write_eos.lock() = self.base().output_eos(_user.addr).to_vec();
                 Ok(data.len())
             }
             fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-                *self.read_eos.lock() = self.base().input_eos.clone();
+                *self.read_eos.lock() = self.base().input_eos(_user.addr).to_vec();
                 let resp = [0x01u8, 0x02];
                 let n = resp.len().min(buf.len());
                 buf[..n].copy_from_slice(&resp[..n]);

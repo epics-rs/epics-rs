@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn test_delay_writes_per_char() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(DelayInterpose::new(Duration::from_nanos(1))));
 
         let mut base = RecordingBase::new();
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_delay_zero_passthrough() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(DelayInterpose::new(Duration::ZERO)));
 
         let mut base = RecordingBase::new();
@@ -152,7 +152,7 @@ mod tests {
     fn test_single_char_incurs_delay() {
         // C writeIt sleeps after every char, including a lone one; the
         // old `data.len() <= 1` short-circuit skipped the delay entirely.
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         let delay = Duration::from_millis(5);
         stack.install(Box::new(DelayInterpose::new(delay)));
 
@@ -175,7 +175,7 @@ mod tests {
     fn test_trailing_delay_after_last_char() {
         // N chars => N delays (incl. the trailing one after the last
         // char). The old `if i > 0` guard produced only N-1 delays.
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         let delay = Duration::from_millis(5);
         stack.install(Box::new(DelayInterpose::new(delay)));
 

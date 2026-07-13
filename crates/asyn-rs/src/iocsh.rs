@@ -1228,11 +1228,11 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+            fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
                 *self.rec.input.lock().unwrap() = Some(eos.to_vec());
                 Ok(())
             }
-            fn set_output_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+            fn set_output_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
                 *self.rec.output.lock().unwrap() = Some(eos.to_vec());
                 Ok(())
             }

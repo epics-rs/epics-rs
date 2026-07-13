@@ -99,15 +99,28 @@ pub trait OctetInterpose: Send + Sync {
 
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()>;
 
-    /// Notify the layer of an input end-of-string change. Default no-op;
-    /// only EOS-aware layers (`eos::EosInterpose`) act on it. C asyn routes
-    /// `setInputEos` through every interpose via `pasynOctet->setInputEos`;
-    /// this is the Rust equivalent so a runtime IEOS change reaches the
-    /// installed EOS interpose.
-    fn set_input_eos(&mut self, _eos: &[u8]) {}
+    /// Told the port's device model when the layer is installed. Default no-op;
+    /// only a layer that holds per-device state needs it.
+    ///
+    /// C creates one interpose instance per (port, addr) — the addr is an
+    /// argument of `asynInterposeEosConfig` (asynInterposeEos.c:84-110) — so a
+    /// layer's state is per device by construction. A Rust stack is per port, so
+    /// a layer with device state keys it by the `asynUser`'s addr instead, and
+    /// [`crate::port::eos_device_key`] needs this flag to know whether the port
+    /// has devices to key by at all.
+    fn attach_port(&mut self, _multi_device: bool) {}
 
-    /// Notify the layer of an output end-of-string change. Default no-op.
-    fn set_output_eos(&mut self, _eos: &[u8]) {}
+    /// Notify the layer of an input end-of-string change *for the device the
+    /// `asynUser` addressed*. Default no-op; only EOS-aware layers
+    /// (`eos::EosInterpose`) act on it. C asyn routes `setInputEos` through
+    /// every interpose via `pasynOctet->setInputEos`, `asynUser` and all
+    /// (asynInterposeEos.c:288); this is the Rust equivalent so a runtime IEOS
+    /// change reaches the installed EOS interpose on the right device.
+    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) {}
+
+    /// Notify the layer of an output end-of-string change (see
+    /// [`Self::set_input_eos`]). Default no-op.
+    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) {}
 
     /// Drop every piece of state scoped to the *current* link, because the
     /// port's connection state just changed (connected → disconnected or
@@ -127,11 +140,17 @@ pub trait OctetInterpose: Send + Sync {
 /// A stack of octet interpose layers.
 pub struct OctetInterposeStack {
     layers: Vec<Box<dyn OctetInterpose>>,
+    /// The port's device model, handed to every layer at install time
+    /// ([`OctetInterpose::attach_port`]).
+    multi_device: bool,
 }
 
 impl OctetInterposeStack {
-    pub fn new() -> Self {
-        Self { layers: Vec::new() }
+    pub fn new(multi_device: bool) -> Self {
+        Self {
+            layers: Vec::new(),
+            multi_device,
+        }
     }
 
     /// Install an interpose layer — C `interposeInterface`
@@ -148,7 +167,8 @@ impl OctetInterposeStack {
     /// `asynInterposeEcho` installed from iocsh after the driver's configure-time
     /// EOS layer therefore sits *above* EOS, exactly as in C. Dispatch walks index
     /// 0 first, so the new layer goes to the front.
-    pub fn install(&mut self, layer: Box<dyn OctetInterpose>) {
+    pub fn install(&mut self, mut layer: Box<dyn OctetInterpose>) {
+        layer.attach_port(self.multi_device);
         self.layers.insert(0, layer);
     }
 
@@ -161,19 +181,20 @@ impl OctetInterposeStack {
         self.layers.is_empty()
     }
 
-    /// Forward an input EOS change to every layer. EOS-aware layers update
-    /// their terminator; others ignore it (trait default). Mirrors C asyn
-    /// propagating `setInputEos` down the interpose chain.
-    pub fn set_input_eos(&mut self, eos: &[u8]) {
+    /// Forward an input EOS change for the addressed device to every layer.
+    /// EOS-aware layers update that device's terminator; others ignore it
+    /// (trait default). Mirrors C asyn propagating `setInputEos` down the
+    /// interpose chain.
+    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) {
         for layer in &mut self.layers {
-            layer.set_input_eos(eos);
+            layer.set_input_eos(addr, eos);
         }
     }
 
-    /// Forward an output EOS change to every layer.
-    pub fn set_output_eos(&mut self, eos: &[u8]) {
+    /// Forward an output EOS change for the addressed device to every layer.
+    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) {
         for layer in &mut self.layers {
-            layer.set_output_eos(eos);
+            layer.set_output_eos(addr, eos);
         }
     }
 
@@ -241,8 +262,10 @@ impl OctetInterposeStack {
 }
 
 impl Default for OctetInterposeStack {
+    /// A stack on a single-device port — the common case, and the one where
+    /// every addr collapses onto one EOS entry.
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -386,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_empty_stack_passthrough() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         let mut base = MockBase::new(b"hello");
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
@@ -398,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_single_passthrough_layer() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(PassthroughInterpose));
 
         let mut base = MockBase::new(b"world");
@@ -412,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_uppercase_interpose_write() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(UppercaseInterpose));
 
         let mut base = MockBase::new(b"");
@@ -427,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_multi_layer_chain() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(PassthroughInterpose));
         stack.install(Box::new(UppercaseInterpose));
         assert_eq!(stack.len(), 2);
@@ -442,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_flush_dispatch() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(PassthroughInterpose));
 
         let mut base = MockBase::new(b"");
@@ -488,7 +511,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(Tag(b'A')));
         stack.install(Box::new(Tag(b'B')));
         stack.install(Box::new(Tag(b'C')));

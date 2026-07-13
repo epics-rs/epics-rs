@@ -5060,7 +5060,11 @@ mod tests {
                     }),
                 }
             }
-            fn set_input_eos(&mut self, eos: &[u8]) -> crate::error::AsynResult<()> {
+            fn set_input_eos(
+                &mut self,
+                _user: &AsynUser,
+                eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
                 self.log.lock().unwrap().eos_sets.push(eos.to_vec());
                 Ok(())
             }
@@ -6235,10 +6239,18 @@ mod tests {
             ) -> crate::error::AsynResult<()> {
                 Err(boom("opt"))
             }
-            fn set_input_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+            fn set_input_eos(
+                &mut self,
+                _user: &AsynUser,
+                _eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
                 Err(boom("ieos"))
             }
-            fn set_output_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+            fn set_output_eos(
+                &mut self,
+                _user: &AsynUser,
+                _eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
                 Err(boom("oeos"))
             }
         }
@@ -6365,22 +6377,30 @@ mod tests {
                     }),
                 }
             }
-            fn set_input_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+            fn set_input_eos(
+                &mut self,
+                _user: &AsynUser,
+                _eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
                 Err(AsynError::Status {
                     status: AsynStatus::Error,
                     message: "ieos boom".to_string(),
                 })
             }
-            fn get_input_eos(&self) -> Vec<u8> {
+            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
                 b"\r\n".to_vec()
             }
-            fn set_output_eos(&mut self, _eos: &[u8]) -> crate::error::AsynResult<()> {
+            fn set_output_eos(
+                &mut self,
+                _user: &AsynUser,
+                _eos: &[u8],
+            ) -> crate::error::AsynResult<()> {
                 Err(AsynError::Status {
                     status: AsynStatus::Error,
                     message: "oeos boom".to_string(),
                 })
             }
-            fn get_output_eos(&self) -> Vec<u8> {
+            fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
                 b"\n".to_vec()
             }
         }
@@ -9053,12 +9073,13 @@ mod tests {
 
         for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
             let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
-            // The driver already holds an EOS — st.cmd's `asynOctetSetInputEos`.
-            base.input_eos = b"\r\n".to_vec();
-            base.output_eos = b"\n".to_vec();
             base.auto_connect = false;
             base.init_connected(connected);
-            let (rt, jh) = create_port_runtime(EosPort(base), RuntimeConfig::default());
+            // The driver already holds an EOS — st.cmd's `asynOctetSetInputEos`.
+            let mut drv = EosPort(base);
+            drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
+            drv.set_output_eos(&AsynUser::default(), b"\n").unwrap();
+            let (rt, jh) = create_port_runtime(drv, RuntimeConfig::default());
             std::mem::forget(jh);
             register_port(
                 port_name,

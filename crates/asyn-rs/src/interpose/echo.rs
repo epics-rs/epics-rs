@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_echo_success() {
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
 
         let mut base = EchoBase::new();
@@ -209,7 +209,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
 
         let mut base = BadEchoBase;
@@ -246,7 +246,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
 
         let mut base = NoEchoBase;
@@ -295,7 +295,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
 
         let mut base = EchoesOnlyTheFirst { written: 0 };
@@ -331,7 +331,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
 
         let mut base = BrokenReadBase;
@@ -366,7 +366,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
         let mut base = ShortEchoBase;
         let mut user = AsynUser::default();
@@ -395,7 +395,7 @@ mod tests {
             }
         }
 
-        let mut stack = OctetInterposeStack::new();
+        let mut stack = OctetInterposeStack::new(false);
         stack.install(Box::new(EchoInterpose::new()));
         let mut base = ShortWriteBase;
         let mut user = AsynUser::default();

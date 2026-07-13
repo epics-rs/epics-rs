@@ -63,6 +63,31 @@ impl Default for DeviceState {
     }
 }
 
+/// One device's end-of-string terminators — C's `eosPvt.eosIn` / `eosPvt.eosOut`
+/// (asynInterposeEos.c:44-52), which exist once per (port, addr).
+#[derive(Debug, Clone, Default)]
+pub struct DeviceEos {
+    /// Input EOS sequence (max 2 bytes). Empty = no input EOS detection.
+    pub input: Vec<u8>,
+    /// Output EOS sequence (max 2 bytes). Empty = no output EOS append.
+    pub output: Vec<u8>,
+}
+
+/// The device an EOS hook's `asynUser` selects — the single owner of the rule,
+/// shared by [`PortDriverBase`] and the EOS interpose so the terminator a
+/// `setInputEos` writes is the one the next `read` on that user applies.
+///
+/// C creates the EOS interpose per (port, addr) and every hook takes the
+/// `asynUser` (asynInterposeEos.c:288-296), so on a multi-device port the addr
+/// picks the instance. On a port that never declared `ASYN_MULTIDEVICE` there
+/// are no devices to pick from: `findDpCommon` (asynManager.c:496-509) and
+/// `findInterface` resolve *every* addr to the port itself, so `asynSetEos`
+/// with addr 0 and with addr -1 must reach the same terminator. That collapse
+/// is what the `-1` key below is.
+pub fn eos_device_key(multi_device: bool, addr: i32) -> i32 {
+    if multi_device { addr } else { -1 }
+}
+
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
@@ -192,10 +217,16 @@ pub struct PortDriverBase {
     /// Exception sink injected by [`crate::manager::PortManager`] on registration.
     pub exception_sink: Option<Arc<ExceptionManager>>,
     pub options: HashMap<String, String>,
-    /// Input EOS sequence (max 2 bytes). Used by EOS interpose and drivers.
-    pub input_eos: Vec<u8>,
-    /// Output EOS sequence (max 2 bytes). Used by EOS interpose and drivers.
-    pub output_eos: Vec<u8>,
+    /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
+    /// is created per `asynInterposeEosConfig(portName, addr, ...)`
+    /// (asynInterposeEos.c:84-120), and every EOS hook takes the `asynUser`
+    /// that selects it (:288-296). Two devices on one multi-device port hold
+    /// two different terminators — a single port-wide pair could not.
+    ///
+    /// Keyed by [`eos_device_key`], so a port that never declared
+    /// `ASYN_MULTIDEVICE` collapses every addr onto one entry (C's
+    /// `findDpCommon`/`findInterface` resolve any addr to the port itself).
+    eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
     pub trace: Option<Arc<TraceManager>>,
     /// Per-address device state for multi-device ports.
@@ -239,9 +270,8 @@ impl PortDriverBase {
             defunct: false,
             exception_sink: None,
             options: HashMap::new(),
-            input_eos: Vec::new(),
-            output_eos: Vec::new(),
-            interpose_octet: OctetInterposeStack::new(),
+            eos: HashMap::new(),
+            interpose_octet: OctetInterposeStack::new(flags.multi_device),
             trace: None,
             device_states: HashMap::new(),
             timestamp_source: None,
@@ -249,6 +279,35 @@ impl PortDriverBase {
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
         }
+    }
+
+    /// The EOS entry the given `asynUser` addr selects — see [`eos_device_key`].
+    pub fn eos_key(&self, addr: i32) -> i32 {
+        eos_device_key(self.flags.multi_device, addr)
+    }
+
+    /// This device's input EOS. An addr that has never been configured has an
+    /// empty terminator, C's zero-initialised `eosPvt.eosInLen`.
+    pub fn input_eos(&self, addr: i32) -> &[u8] {
+        self.eos
+            .get(&self.eos_key(addr))
+            .map_or(&[][..], |e| &e.input)
+    }
+
+    /// This device's output EOS (see [`Self::input_eos`]).
+    pub fn output_eos(&self, addr: i32) -> &[u8] {
+        self.eos
+            .get(&self.eos_key(addr))
+            .map_or(&[][..], |e| &e.output)
+    }
+
+    /// The write owner for this device's terminators — the queryable cache the
+    /// EOS readback (`get_input_eos`, the binary-suppress save/restore) reads.
+    /// The forward to the interpose stack lives in the `PortDriver` hook, which
+    /// is the only caller.
+    fn eos_entry(&mut self, addr: i32) -> &mut DeviceEos {
+        let key = self.eos_key(addr);
+        self.eos.entry(key).or_default()
     }
 
     /// Announce an exception through the global exception manager (if injected).
@@ -1558,46 +1617,53 @@ pub trait PortDriver: Send + Sync + 'static {
     // resource), authors MUST keep the wait optional / bounded so
     // the connect-wait failure mode doesn't return.
 
-    fn set_input_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+    // Every hook takes the `asynUser`, because in C every one of them does
+    // (`asynOctet::setInputEos(void *ppvt, asynUser *pasynUser, ...)`,
+    // asynOctetBase.h; asynInterposeEos.c:288-296) and the addr it carries is
+    // what picks the device's terminator. A port-wide EOS could not hold two.
+
+    fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
         if eos.len() > 2 {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        // Single write owner for input EOS: `base.input_eos` is the
-        // queryable cache (`get_input_eos`, binary-suppress save/restore),
-        // and the same value is forwarded to the interpose stack so an
-        // installed `EosInterpose` actually terminates reads on it. Empty
+        // Single write owner for input EOS: the per-device cache is what
+        // `get_input_eos` and the binary-suppress save/restore read, and the
+        // same value is forwarded to the interpose stack so an installed
+        // `EosInterpose` actually terminates *this device's* reads on it. Empty
         // stack = no-op forward; C routes `setInputEos` the same way.
+        let addr = user.addr;
         let base = self.base_mut();
-        base.input_eos = eos.to_vec();
-        base.interpose_octet.set_input_eos(eos);
+        base.eos_entry(addr).input = eos.to_vec();
+        base.interpose_octet.set_input_eos(addr, eos);
         Ok(())
     }
 
-    fn get_input_eos(&self) -> Vec<u8> {
-        self.base().input_eos.clone()
+    fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
+        self.base().input_eos(user.addr).to_vec()
     }
 
-    fn set_output_eos(&mut self, eos: &[u8]) -> AsynResult<()> {
+    fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
         if eos.len() > 2 {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("illegal eoslen {}", eos.len()),
             });
         }
-        // Single write owner for output EOS (see `set_input_eos`): cache in
-        // base and forward to the interpose stack so `EosInterpose` appends
-        // the terminator on write.
+        // Single write owner for output EOS (see `set_input_eos`): cache per
+        // device and forward to the interpose stack so `EosInterpose` appends
+        // the terminator on that device's writes.
+        let addr = user.addr;
         let base = self.base_mut();
-        base.output_eos = eos.to_vec();
-        base.interpose_octet.set_output_eos(eos);
+        base.eos_entry(addr).output = eos.to_vec();
+        base.interpose_octet.set_output_eos(addr, eos);
         Ok(())
     }
 
-    fn get_output_eos(&self) -> Vec<u8> {
-        self.base().output_eos.clone()
+    fn get_output_eos(&self, user: &AsynUser) -> Vec<u8> {
+        self.base().output_eos(user.addr).to_vec()
     }
 
     // --- asynGpib (IEEE-488 bus control) ---
@@ -2213,8 +2279,8 @@ mod tests {
 
         // Set IEOS through the driver trait: caches in base AND must reach
         // the interpose.
-        drv.set_input_eos(b"\n").unwrap();
-        assert_eq!(drv.base().input_eos, b"\n");
+        drv.set_input_eos(&AsynUser::default(), b"\n").unwrap();
+        assert_eq!(drv.base().input_eos(0), b"\n");
 
         let user = AsynUser::default();
         // "ab\n" exactly: the EOS read returns "ab" and leaves no read-ahead
@@ -2235,8 +2301,8 @@ mod tests {
 
         // Clearing IEOS (binary-suppress path) must also reach the interpose:
         // the read then passes through with no EOS termination.
-        drv.set_input_eos(b"").unwrap();
-        assert_eq!(drv.base().input_eos, b"");
+        drv.set_input_eos(&AsynUser::default(), b"").unwrap();
+        assert_eq!(drv.base().input_eos(0), b"");
         let mut src2 = RawSource {
             data: b"xy\nz".to_vec(),
             pos: 0,
@@ -2249,6 +2315,67 @@ mod tests {
             .unwrap();
         assert_eq!(&buf2[..r2.nbytes_transferred], b"xy\nz");
         assert!(!r2.eom_reason.contains(EomReason::EOS));
+    }
+
+    /// R14-49: the EOS hooks take the `asynUser`, so a multi-device port holds
+    /// one terminator per device — C's `eosPvt` is created per (port, addr)
+    /// (asynInterposeEos.c:84-120) and every hook takes the user that selects it
+    /// (:288-296). A port-wide pair could not answer two devices.
+    #[test]
+    fn each_device_on_a_multi_device_port_holds_its_own_eos() {
+        struct MultiDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for MultiDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+        let mut drv = MultiDriver {
+            base: PortDriverBase::new(
+                "eos_multi",
+                4,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            ),
+        };
+
+        let dev1 = AsynUser::default().with_addr(1);
+        let dev2 = AsynUser::default().with_addr(2);
+        drv.set_input_eos(&dev1, b"\n").unwrap();
+        drv.set_output_eos(&dev1, b"\r\n").unwrap();
+        drv.set_input_eos(&dev2, b";").unwrap();
+
+        assert_eq!(drv.get_input_eos(&dev1), b"\n");
+        assert_eq!(drv.get_input_eos(&dev2), b";");
+        assert_eq!(drv.get_output_eos(&dev1), b"\r\n");
+        // A device that was never configured has no terminator — C's
+        // zero-initialised `eosInLen`.
+        assert!(
+            drv.get_input_eos(&AsynUser::default().with_addr(3))
+                .is_empty()
+        );
+        assert!(drv.get_output_eos(&dev2).is_empty());
+    }
+
+    /// The other boundary: a port that never declared `ASYN_MULTIDEVICE` has no
+    /// devices to key by — C's `findDpCommon` (asynManager.c:496-509) and
+    /// `findInterface` resolve *every* addr to the port itself, so
+    /// `asynSetEos(port, -1, ...)` and a record at ADDR 0 must reach the same
+    /// terminator. Splitting them by raw addr would leave the record reading
+    /// with no EOS at all.
+    #[test]
+    fn a_single_device_port_collapses_every_addr_onto_one_eos() {
+        let mut drv = TestDriver::new();
+        drv.set_input_eos(&AsynUser::default().with_addr(-1), b"\n")
+            .unwrap();
+        assert_eq!(drv.get_input_eos(&AsynUser::default().with_addr(0)), b"\n");
+        assert_eq!(drv.get_input_eos(&AsynUser::default().with_addr(7)), b"\n");
     }
 
     /// R6-46 owner path: `set_connected` is the single transition owner, so

@@ -1094,11 +1094,21 @@ impl Record for ScalerRecord {
             // C scalerRecord.c:690-693 — RATE clamped to [0, 60].
             "RATE" => {
                 self.rate = self.rate.clamp(0.0, 60.0);
-                // C:692 — the case ends `db_post_events(pscal, &(pscal->tp),
-                // DBE_VALUE)`: a copy-paste that posts TP, a field this write
-                // never touched. `caput scaler.RATE` therefore fires a spurious
-                // TP monitor on C, and C's observed behavior is the contract.
-                self.side_effect_posts = &["TP"];
+                // DEVIATION from C, deliberate — CBUG-B18. C's case is
+                // `pscal->rate = MIN(60.,MAX(0.,pscal->rate));
+                //  db_post_events(pscal,&(pscal->tp),DBE_VALUE);` — the clamp
+                // writes RATE, the post passes `&pscal->tp`, a field this write
+                // never touched. A slip, not a convention: it is a copy-paste of
+                // the TP case's post two cases up, and every `special()` post in
+                // this file exists to announce the OTHER fields a case changed
+                // (`:672-676` TP→PR1/D1/G1, `:681-686`, `:703-706`, `:717-719`).
+                // The clamp changes RATE and nothing else, and the written field
+                // is already posted by `dbPut` itself — `db_post_events(precord,
+                // pfieldsave, DBE_VALUE|DBE_LOG)` at dbAccess.c:1455-1459, which
+                // runs AFTER `dbPutSpecial(paddr, 1)` and so carries the CLAMPED
+                // value. So the correct side-effect list is empty, and C's post
+                // is pure noise: a no-change TP event on every RATE write.
+                self.side_effect_posts = &[];
             }
             _ => {
                 if field == "PR1" {
@@ -1428,12 +1438,16 @@ impl Record for ScalerRecord {
     }
 
     /// The `db_post_events` calls C's `special()` makes inline, for the put that
-    /// just ran. `special()` is their single owner: it knows which posts C made
-    /// (including `RATE`'s copy-paste post of an untouched `TP`) and records
-    /// them; this hook only hands the list to the framework, which posts each
-    /// one. The list cannot be re-derived from record state here — C posts `PRn`
-    /// on a `Gn` write only when that write is what defaulted it to 1000, which
-    /// the post-put state no longer distinguishes.
+    /// just ran. `special()` is their single owner: it knows which posts each
+    /// case made and records them; this hook only hands the list to the
+    /// framework, which posts each one. The list cannot be re-derived from record
+    /// state here — C posts `PRn` on a `Gn` write only when that write is what
+    /// defaulted it to 1000, which the post-put state no longer distinguishes.
+    ///
+    /// These lists carry the OTHER fields a case changed — the written field is
+    /// posted by the put itself (C `dbPut`, dbAccess.c:1455-1459). So `RATE`,
+    /// whose clamp changes only `RATE`, contributes nothing; C posts an untouched
+    /// `TP` there, which is CBUG-B18 (see the deviation note at that case).
     fn monitor_side_effect_fields(&self, _put_field: &str) -> &'static [&'static str] {
         self.side_effect_posts
     }

@@ -19,14 +19,21 @@
 //!     break;
 //! ```
 //!
-//! The RATE case posts **TP** — a field the write never touched. It is a
-//! copy-paste of the TP case's post, and it is what a `caput scaler.RATE`
-//! observably does on a C IOC, so it is the contract (R10-62).
+//! These posts announce the OTHER fields a case changed; the WRITTEN field is
+//! posted by the put itself (C `dbPut` ends with `db_post_events(precord,
+//! pfieldsave, DBE_VALUE|DBE_LOG)`, dbAccess.c:1455-1459, after `special(TRUE)`
+//! — so it carries the clamped/derived value).
 //!
-//! The port's `special()` performed each case's field mutations but declared no
-//! `monitor_side_effect_fields`, so NONE of these posts fired: a `camonitor
-//! scaler.PR1` saw nothing when TP was written, and a `camonitor scaler.TP` saw
-//! nothing when RATE was written.
+//! DEVIATION from C, deliberate — CBUG-B18. The RATE case changes only RATE, so
+//! it owes no side-effect post at all; C posts **TP** there, a field the write
+//! never touched. It is a copy-paste of the TP case's post two cases up, and a
+//! slip rather than a convention. On a C IOC every `caput scaler.RATE` therefore
+//! fires a spurious no-change event at every .TP subscriber. Here it fires none.
+//!
+//! (The port's `special()` originally performed each case's field mutations but
+//! declared no `monitor_side_effect_fields`, so NONE of these posts fired:
+//! a `camonitor scaler.PR1` saw nothing when TP was written. That is R10-62, and
+//! the other cases below still pin it.)
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
@@ -66,36 +73,40 @@ async fn caput(db: &PvDatabase, field: &str, value: EpicsValue) {
         .unwrap();
 }
 
-/// The cited case: writing RATE posts TP, which the write did not change.
+/// CBUG-B18 — a RATE write posts no TP.
+///
+/// This test was `r10_62_a_rate_write_posts_tp` and pinned C's copy-paste: it
+/// required a TP event carrying TP's UNCHANGED value. Its sibling,
+/// `r10_62_a_rate_write_posts_tp_with_dbe_value_only`, pinned that the same
+/// spurious event carried no LOG bit; both TP masks are checked here instead.
+///
+/// The RATE write still reaches .RATE subscribers — through the put's own post
+/// (C `dbPut`, dbAccess.c:1455-1459), which runs after the clamp and so carries
+/// the clamped value. That is C's behaviour too, and it is why the RATE case
+/// owes no side-effect post of its own.
 #[tokio::test]
-async fn r10_62_a_rate_write_posts_tp() {
+async fn b18_a_rate_write_posts_no_tp() {
     let db = scaler_db().await;
-    let mut tp_rx = watch(&db, "TP", 1, DbFieldType::Double, EventMask::VALUE).await;
-
-    caput(&db, "RATE", EpicsValue::Float(5.0)).await;
-
-    let event = tp_rx
-        .try_recv()
-        .expect("scalerRecord.c:692 posts TP on every RATE write");
-    assert_eq!(
-        event.snapshot.value.to_f64(),
-        Some(1.0),
-        "the event carries TP's UNCHANGED value — C posts the field it never wrote"
-    );
-}
-
-/// C's post is a literal `DBE_VALUE`, so a `DBE_LOG`-only (archiver) subscriber
-/// gets nothing from a RATE write.
-#[tokio::test]
-async fn r10_62_a_rate_write_posts_tp_with_dbe_value_only() {
-    let db = scaler_db().await;
+    let mut tp_value_rx = watch(&db, "TP", 1, DbFieldType::Double, EventMask::VALUE).await;
     let mut tp_log_rx = watch(&db, "TP", 2, DbFieldType::Double, EventMask::LOG).await;
+    let mut rate_rx = watch(&db, "RATE", 3, DbFieldType::Float, EventMask::VALUE).await;
 
-    caput(&db, "RATE", EpicsValue::Float(5.0)).await;
+    // Above the [0, 60] clamp: the stored value is not the value written.
+    caput(&db, "RATE", EpicsValue::Float(100.0)).await;
 
     assert!(
-        tp_log_rx.try_recv().is_err(),
-        "db_post_events(&pscal->tp, DBE_VALUE) carries no LOG bit (:692)"
+        tp_value_rx.try_recv().is_err(),
+        "TP was not written, so it must not be posted (C posts it — CBUG-B18)"
+    );
+    assert!(tp_log_rx.try_recv().is_err(), "nor to a LOG subscriber");
+
+    let event = rate_rx
+        .try_recv()
+        .expect("the put's own post announces the field that was written");
+    assert_eq!(
+        event.snapshot.value.to_f64(),
+        Some(60.0),
+        "and it carries the CLAMPED value, not the 100 that was written"
     );
 }
 

@@ -4662,10 +4662,10 @@ estdlib subnormal-exact (documented deviation, Round-17 adjudication).
 
 **Per-finding dispositions:**
 
-- R17-1 `bf677a8c` FIXED — typed DOLn READ seam (ReadDbLinkTyped mirror
-  of R16-1's write side); a silent `let _ =` discard closed with it.
-- R17-2 `061e9849` FIXED — `prec as u16` at sseq::set_numeric AND the
+- R17-1 `061e9849` FIXED — `prec as u16` at sseq::set_numeric AND the
   same defect at types/codec.rs:98 (rg-widened).
+- R17-2 `bf677a8c` FIXED — typed DOLn READ seam (ReadDbLinkTyped mirror
+  of R16-1's write side); a silent `let _ =` discard closed with it.
 - R17-3 `e74637d0` FIXED (structural) — ResolveOutTarget resolves the
   destination BEFORE process, so "no put" ⟹ "no wait" by construction.
 - R17-4 `2c04a643` FIXED — CyclePostMask::Value: the WRITER decides the

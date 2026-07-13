@@ -1183,3 +1183,55 @@ Impact: `EPICS_CA_MAX_SEARCH_PERIOD=inf` crashes every C CA client at startup;
 comparison is false — resolver cadence undefined.
 Proof: the compiled caget on this host aborts in malloc for `inf` (recorded at the port
 site during the R15 wave); the NaN-blind gate (`:77`) and the UB cast (`:99`) quoted.
+
+---
+
+### Batch E (appended 2026-07-13, from the Round-17 dispositions — 2 entries: 1 REPRODUCED, 1 NOT-REPRODUCED)
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-E1 | base db | a scalar `dbPut` into a FIFO compress VAL writes through `get_array_info`'s READ offset, rewriting one slot instead of appending | Medium | NOT-REPRODUCED |
+| CBUG-E2 | base db | `dbConvert`'s double→integer PUT/GET is a bare C cast — UB out of range, x86-64 gives `INT_MIN`/truncation garbage | Medium | REPRODUCED |
+
+### CBUG-E1: scalar `dbPut` into a FIFO compress VAL writes at the READ start — every put during initial fill rewrites the same slot
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `epics-base modules/database/src/ioc/db/dbAccess.c:1350-1362` — for a field with
+`special == SPC_DBADDR`, even a scalar put (`nRequest == 1`) fetches its write offset from
+`prset->get_array_info`. `compressRecord.c:409-431`'s `get_array_info` returns the *read*
+start — in FIFO mode `(off + nsam - nuse) % nsam`, "the index of the first valid element"
+per its own comment — because it exists to serve `dbGet`. `dbPut` then hands that offset to
+the put-convert routine, so a client put lands on the oldest element, not at the write
+cursor `off`.
+Defect: one `get_array_info` serves both `dbGet` (wants the read start) and `dbPut` (wants
+the write cursor); `dbPut` consumes the read answer.
+Port: `crates/epics-base-rs/src/server/records/compress.rs:283` (`push_value`) — a client
+VAL put routes through the same ingest as INP data (`:784-787`), appending at the write
+cursor and bumping `nuse`, so three puts into an empty NSAM=3 FIFO give `[1,2,3]`.
+Impact: on a C IOC, `caput CMP.VAL 1; caput CMP.VAL 2; caput CMP.VAL 3` into an empty
+NSAM=3 FIFO compress leaves `[3,0,0]` with `NUSE` still 0 — the puts silently overwrite one
+another in a slot `dbGet` may not even serve — where the port yields `[1,2,3]`.
+Proof: the offset hand-off (`dbAccess.c:1350-1362`) and the read-start computation
+(`compressRecord.c:420-426`, with its "first valid element" comment) quoted; port behavior
+pinned by the compress ingest tests. Filed as the R17-85 documented deviation
+(`doc/c-parity-review-2026-07-10.md`), flagged for user sign-off.
+
+### CBUG-E2: `dbConvert`'s double→integer conversion is a bare C cast — undefined behaviour out of range; compiled x86-64 yields `INT_MIN` / truncation garbage
+Bucket: REPRODUCED · Severity: Medium
+C: `epics-base modules/database/src/ioc/db/dbConvert.c:96-113` — the PUT macro body is
+`*pdst = (typeb) *psrc;`, instantiated for every integer destination at `:1631-1638`
+(`putDoubleShort`, `putDoubleLong`, `putDoubleUlong`, ...); the GET twin (`:63-70`) is the
+same cast in the read direction. A double outside the destination's range is undefined
+behaviour (C17 6.3.1.4p1) — no diagnostic, no clamp.
+Defect: an unguarded float→integer cast on client-supplied data, on every numeric put/get
+path in the IOC database.
+Port: `crates/epics-base-rs/src/types/c_cast.rs` (R17-79, merged `51435dc8`) — the single
+owner of the cast, emulating what gcc/clang actually emit on x86-64 (`cvttsd2si` integer-
+indefinite semantics) with defined Rust arithmetic: `70000.9 → i16 4464`,
+`3.0e9 → i32 -2147483648`, NaN → 0/INT_MIN by width. Rust's saturating `as` (the pre-fix
+behavior, `3.0e9 → 2147483647`) was a silent divergence from every compiled IOC.
+Impact: any CA/PVA client writing an out-of-range double to an integer field gets a
+compiler-dependent value — `-2147483648` on x86-64 today, but the C standard permits
+anything, so an upstream compiler upgrade or a new target silently changes stored values.
+Proof: compiled softIoc on this host: `calcout` 3.0e9 → `-2147483648`; `aao` DOL
+`[1.7, 2.2, -3.9, 70000, 5, 6]` into an `FTVL=SHORT` waveform → `[1, 2, -3, 4464]`
+(fixer-f oracle probes, wave 15); port pinned by `c_cast::matches_compiled_c_x86_64`.

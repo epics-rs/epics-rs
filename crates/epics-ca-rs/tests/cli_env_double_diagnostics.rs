@@ -100,6 +100,32 @@ fn max_search_period_reject_prints_cs_lines() {
     }
 }
 
+/// C `getNTimers` (`udpiiu.cpp:96-111`): a period past the 18-rung search-timer
+/// ladder is named and clamped to `(1 << 17) * 32e-3` seconds. The compiled
+/// `caget` prints exactly these two lines for `=100000`.
+#[test]
+fn max_search_period_above_the_timer_ladder_is_named() {
+    let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "100000");
+    for line in [
+        "\"EPICS_CA_MAX_SEARCH_PERIOD\" out of range (high)",
+        "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 4194.304000 seconds",
+    ] {
+        assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}
+
+/// The rung below the boundary: `8388.607 < 0.032 * 2^18`, so the ladder still
+/// holds it and the compiled `caget` says nothing. One tick under the boundary
+/// must not gain a diagnostic C does not print.
+#[test]
+fn max_search_period_just_inside_the_ladder_is_silent() {
+    let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "8388.607");
+    assert!(
+        !err.contains("out of range"),
+        "8388.607 s fits C's 18-rung ladder; no diagnostic is due:\n{err}"
+    );
+}
+
 /// C `udpiiu.cpp:78-83`: a value under the 60 s lower limit is named and
 /// clamped, not silently raised.
 #[test]

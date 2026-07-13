@@ -23,6 +23,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
 use epics_ca_rs::server::{AccessRightsNotifier, CaServer, ServerConnectionEvent, ServerStats};
 use tokio::sync::Mutex;
@@ -301,13 +302,18 @@ struct ReplayState {
 impl DownstreamServer {
     /// Create a new downstream server bound to `port`, serving from
     /// the given shadow database.
-    pub fn new(shadow_db: Arc<PvDatabase>, port: u16) -> Self {
-        let server = CaServer::from_parts(shadow_db.clone(), port, None, None, None, None);
-        Self {
+    ///
+    /// The CA listener is bound here — a client may connect as soon as
+    /// this returns, before [`Self::run`] is spawned. A port that
+    /// cannot be bound is reported now rather than from inside the
+    /// gateway's server task.
+    pub async fn new(shadow_db: Arc<PvDatabase>, port: u16) -> CaResult<Self> {
+        let server = CaServer::from_parts(shadow_db.clone(), port, None, None, None, None).await?;
+        Ok(Self {
             server: Mutex::new(Some(server)),
             shadow_db,
             replay_state: Mutex::new(None),
-        }
+        })
     }
 
     /// Variant of [`Self::new`] that also wraps every accepted
@@ -317,18 +323,19 @@ impl DownstreamServer {
     /// `UpstreamManager::new`. Available with the `ca-gateway-tls`
     /// feature.
     #[cfg(feature = "ca-gateway-tls")]
-    pub fn new_with_tls(
+    pub async fn new_with_tls(
         shadow_db: Arc<PvDatabase>,
         port: u16,
         tls: std::sync::Arc<epics_ca_rs::tls::ServerConfig>,
-    ) -> Self {
-        let mut server = CaServer::from_parts(shadow_db.clone(), port, None, None, None, None);
+    ) -> CaResult<Self> {
+        let mut server =
+            CaServer::from_parts(shadow_db.clone(), port, None, None, None, None).await?;
         server.set_tls(tls);
-        Self {
+        Ok(Self {
             server: Mutex::new(Some(server)),
             shadow_db,
             replay_state: Mutex::new(None),
-        }
+        })
     }
 
     /// Get the underlying shadow database.
@@ -540,7 +547,9 @@ mod tests {
     #[tokio::test]
     async fn construct_downstream() {
         let db = Arc::new(PvDatabase::new());
-        let downstream = DownstreamServer::new(db.clone(), 0);
+        let downstream = DownstreamServer::new(db.clone(), 0)
+            .await
+            .expect("bind downstream");
         // Just verify it constructs without panicking
         assert!(Arc::ptr_eq(downstream.database(), &db));
     }
@@ -548,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn connection_events_subscribe() {
         let db = Arc::new(PvDatabase::new());
-        let downstream = DownstreamServer::new(db, 0);
+        let downstream = DownstreamServer::new(db, 0).await.expect("bind downstream");
         let rx = downstream.connection_events().await;
         assert!(rx.is_some(), "expected receiver");
         downstream.stop_connection_events().await;
@@ -760,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn connection_events_seeds_late_subscriber_from_high_water() {
         let db = Arc::new(PvDatabase::new());
-        let downstream = DownstreamServer::new(db, 0);
+        let downstream = DownstreamServer::new(db, 0).await.expect("bind downstream");
 
         // First subscriber installs the forwarder + replay state.
         let _first = downstream

@@ -173,7 +173,14 @@ async fn main() -> ExitCode {
     let ca_handle = if args.no_ca {
         None
     } else {
-        let server = CaServer::from_parts(db.clone(), args.ca_port, None, None, None, None);
+        let server =
+            match CaServer::from_parts(db.clone(), args.ca_port, None, None, None, None).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error binding CA server on port {}: {e}", args.ca_port);
+                    return ExitCode::FAILURE;
+                }
+            };
         Some(tokio::spawn(async move {
             tracing::info!(port = args.ca_port, "CA listener starting");
             server.run().await

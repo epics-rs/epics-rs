@@ -11,7 +11,6 @@ use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServer;
 use epics_ca_rs::tls;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 fn fresh_cert_and_key() -> (
     Vec<rustls_pki_types::CertificateDer<'static>>,
@@ -48,33 +47,23 @@ async fn rust_client_tls_to_rust_server() {
     let roots = tls::load_root_store(cert_file.path()).unwrap();
     let client_tls = tls::TlsConfig::client_from_roots(roots);
 
-    // Pick a free port for the IOC.
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
-    // Bring up the IOC with TLS enabled.
+    // Bring up the IOC with TLS enabled on a kernel-assigned port.
     let server = CaServer::builder()
         .pv("TLS:VAL", epics_base_rs::types::EpicsValue::Long(7777))
-        .port(port)
+        .port(0)
         .with_tls(server_tls)
         .build()
         .await
         .expect("build");
 
+    // `build()` bound the listener, so the server is accepting TLS
+    // connections already — nothing to wait for.
+    let port = server.udp_port();
     let server_arc = std::sync::Arc::new(server);
     let server_clone = server_arc.clone();
-    let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let server_task = tokio::spawn(async move {
-        // Give caller a chance to know the listener is up
-        let _ = ready_tx.send(());
         let _ = server_clone.run().await;
     });
-    let _ = ready_rx.await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Set up the client to talk to that port over TLS.
     unsafe {

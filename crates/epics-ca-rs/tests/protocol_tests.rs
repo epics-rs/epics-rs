@@ -352,25 +352,15 @@ async fn server_get_nonexistent_pv_returns_error() {
 async fn server_stats_bytes_in_out_track_real_traffic() {
     use std::time::Duration;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("STATS:BYTES", EpicsValue::Double(7.5))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let stats = server.stats();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-
-    // Let the listener bind + accept loop spin up.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Drive a real CA caget through the local TCP listener. Tell the
     // client exactly where to find this server so it skips UDP search.
@@ -426,23 +416,15 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
 async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     use std::time::Duration;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("STATS:SUB:PV", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let stats = server.stats();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
@@ -812,22 +794,14 @@ async fn server_echo_round_trips_request_header_and_payload() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("ECHO:PV", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -937,22 +911,14 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("BADMONID:PV", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect a raw TCP socket and complete the CA handshake.
     let mut sock = TcpStream::connect(("127.0.0.1", port))
@@ -1069,22 +1035,14 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("BAD:CMD", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -1181,22 +1139,14 @@ async fn server_tcp_version_below_minimum_drops_connection() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("VER:OLD", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -1256,22 +1206,14 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("WRBAD:PV", EpicsValue::Double(0.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -1436,22 +1378,14 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     // literal to match this file's wire-level convention (no types import).
     const DBR_CLASS_NAME: u16 = 38;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("CLSNM:PV", EpicsValue::Double(0.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -1657,25 +1591,17 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
     // DBR_STRING = 0 (epics_base_rs::types::DBR_STRING).
     const DBR_STRING: u16 = 0;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     // STR:SHORT = "OK"; STR:LONG = 40 'A's (encoder clamps to 39 chars +
     // a NUL at byte 39, so epicsStrnLen == 39 and the trimmed size is 40).
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("STR:SHORT", EpicsValue::String("OK".into()))
         .pv("STR:LONG", EpicsValue::String("A".repeat(40).into()))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -1857,21 +1783,16 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
-    let port = {
-        let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("reserve free CA UDP port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("MR7:PV", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    // This test speaks UDP SEARCH straight at the responder, so it needs
+    // the UDP port, not the TCP one.
+    let port = server.udp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Build a CA_PROTO_SEARCH UDP datagram for MR7:PV. The server's
     // SEARCH reply echoes `m_available` (the client cid), so a unique
@@ -2028,22 +1949,14 @@ async fn server_read_notify_bad_type_closes_silently() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("RDBAD:PV", EpicsValue::Double(0.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -2162,22 +2075,14 @@ async fn server_read_sync_echoes_request_header() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("SYNC:PV", EpicsValue::Double(0.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.tcp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -2253,22 +2158,14 @@ async fn first_connect_does_not_emit_native_type_changed() {
 
     use epics_ca_rs::client::{CaClient, ConnectionEvent};
 
-    let port = {
-        let probe =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-        let p = probe.local_addr().unwrap().port();
-        drop(probe);
-        p
-    };
-
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("NTC:FIRST:PV", EpicsValue::Double(1.0))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _server_handle = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Target the in-process server directly (no process-global env mutation),
     // so this test needs no `#[serial]` and cannot race the env other tests set.

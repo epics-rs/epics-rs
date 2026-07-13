@@ -136,8 +136,10 @@ impl DefaultExt for Option<(String, String, String)> {
 // well-known-but-unlikely ports avoids the issue at the cost of
 // requiring `--test-threads=1` (already documented in the module
 // header).
-fn free_port_pair() -> (u16, u16) {
-    (49997, 49998)
+/// Port for the C `softIoc` side. The Rust server no longer needs one
+/// chosen up front — it binds port 0 and reports what it got.
+fn c_softioc_port() -> u16 {
+    49998
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -149,21 +151,17 @@ async fn caget_double_matches_libca() {
         eprintln!("skipping: libca not on PATH");
         return;
     };
-    let (rs_port, c_port) = free_port_pair();
+    let c_port = c_softioc_port();
 
     // Rust side
     let server = epics_ca_rs::server::CaServer::builder()
-        .port(rs_port)
+        .port(0)
         .pv("DIFF:VAL", epics_base_rs::types::EpicsValue::Double(3.14))
         .build()
         .await
         .expect("rust server");
+    let rs_port = server.udp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    // Give the listener time to bind and become reachable. cold-start
-    // races with cargo build noise can stretch this — 3 s is the
-    // safer floor for #[ignore] tests that occasionally run against
-    // a freshly-rebuilt softioc binary.
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // C side
     let mut c_child = start_c_softioc(
@@ -195,20 +193,16 @@ async fn caput_then_caget_matches_libca() {
         eprintln!("skipping: libca not on PATH");
         return;
     };
-    let (rs_port, c_port) = free_port_pair();
+    let c_port = c_softioc_port();
 
     let server = epics_ca_rs::server::CaServer::builder()
-        .port(rs_port)
+        .port(0)
         .pv("DIFF:WRITE", epics_base_rs::types::EpicsValue::Double(0.0))
         .build()
         .await
         .expect("rust server");
+    let rs_port = server.udp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
-    // Give the listener time to bind and become reachable. cold-start
-    // races with cargo build noise can stretch this — 3 s is the
-    // safer floor for #[ignore] tests that occasionally run against
-    // a freshly-rebuilt softioc binary.
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let mut c_child = start_c_softioc(
         c_port,

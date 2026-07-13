@@ -30,15 +30,6 @@ use epics_ca_rs::client::{CaClient, EnumReadback};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-/// Reserve and immediately release a free localhost TCP port so the
-/// `CaServer` can bind it.
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
-
 /// Point a soon-to-be-constructed `CaClient` at exactly this server so
 /// it skips UDP search.
 ///
@@ -59,16 +50,15 @@ async fn server_with_double_waveform(
     pv: &'static str,
     seed: Vec<f64>,
 ) -> (CaClient, epics_ca_rs::client::CaChannel) {
-    let port = free_port();
     let len = seed.len() as i32;
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, WaveformRecord::new(len, DbFieldType::Double))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -90,18 +80,17 @@ async fn server_with_bi(
     znam: &str,
     onam: &str,
 ) -> (CaClient, epics_ca_rs::client::CaChannel) {
-    let port = free_port();
     let mut rec = BiRecord::new(val);
     rec.znam = znam.into();
     rec.onam = onam.into();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, rec)
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -325,15 +314,14 @@ async fn caget_dbr_type_reaches_class_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn long_string_autosize_returns_40_nul_padded() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("R55:LS:AUTO", StringinRecord::new("hello"))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -375,15 +363,14 @@ async fn long_string_autosize_returns_40_nul_padded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn long_string_count_clamp_trims_char_array() {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("R55:LS:CLAMP", StringinRecord::new("hello"))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -422,17 +409,16 @@ async fn long_string_count_clamp_trims_char_array() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn printf_val_native_type_is_scalar_dbr_string() {
-    let port = free_port();
     let mut rec = PrintfRecord::default();
     rec.val = "log: 42".to_string();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("R3C2:PF:VAL", rec)
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
@@ -473,17 +459,16 @@ async fn printf_val_native_type_is_scalar_dbr_string() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
-    let port = free_port();
     // 45 chars: longer than MAX_STRING_SIZE (40) so the DBR_STRING slot clips.
     let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI";
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("R3C2:LSI:VAL", LsiRecord::new(long))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     point_client_at(port);
     let client = CaClient::new().await.expect("client");

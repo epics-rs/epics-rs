@@ -109,9 +109,11 @@ impl RegressionIoc {
         // Arm motor polling after iocInit (C arms the poller post-PINI).
         let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
 
-        // CA server on a reserved free port; run() spawns the SCAN scheduler.
-        let ca_port = free_loopback_port();
-        let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None);
+        // CA server on a kernel-assigned port: `from_parts` binds the
+        // sockets and reports the port it got, so nothing can take the
+        // number in between. run() spawns the SCAN scheduler.
+        let ca_server = CaServer::from_parts(db.clone(), 0, None, None, None, None).await?;
+        let ca_port = ca_server.udp_port();
         let _ca_task = tokio::spawn(async move { ca_server.run().await });
 
         // Native PVA server on an ephemeral loopback port; serves the same db.
@@ -148,17 +150,6 @@ impl RegressionIoc {
             .server_addr(self.pva_addr)
             .build()
     }
-}
-
-/// Reserve then release a free loopback TCP port, returning its number.
-///
-/// `CaServer` cannot read back a kernel-assigned port-0 binding, so the
-/// verified idiom is reserve-then-bind-that-number.
-pub fn free_loopback_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free port");
-    let port = probe.local_addr().expect("local_addr").port();
-    drop(probe);
-    port
 }
 
 /// Point the next `CaClient::new()` at exactly `127.0.0.1:port`.

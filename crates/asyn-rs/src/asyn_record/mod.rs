@@ -2244,7 +2244,7 @@ impl AsynRecord {
             Err(_) => {
                 // C reports the path alone — `fopen` leaves no message to splice
                 // (asynRecord.c:465-466).
-                self.errs = format!("Error opening trace file: {tfil}");
+                self.report_error(format!("Error opening trace file: {tfil}"));
                 return;
             }
         };
@@ -2748,7 +2748,7 @@ impl AsynRecord {
             if e.never_ran() {
                 return self.report_special_never_ran(&e);
             }
-            self.errs = format!("Error setting option, {}", e.message());
+            self.report_error(format!("Error setting option, {}", e.message()));
         }
         // The re-read runs *inside* the request the put queued (C's `setOption`
         // callback falls through to `getOptions`, asynRecord.c:845-849), so it
@@ -2789,8 +2789,30 @@ impl AsynRecord {
         }
     }
 
+    /// C `reportError` (asynRecord.c:2028-2049): **the** single owner of every
+    /// ERRS write.
+    ///
+    /// C's shape, and the whole point of it: write the field, then
+    /// `db_post_events(errs, DBE_VALUE|DBE_LOG)` iff the text actually changed
+    /// (:2044-2048). ERRS is not `pp(TRUE)` (asynRecord.dbd:366-370), and the
+    /// record's own writes are not puts, so nothing else posts it — a diagnostic
+    /// written straight into the field reached the operator's screen only if some
+    /// *other* field happened to be posted for an unrelated reason. Every refusal,
+    /// option error, EOS error, connect error and trace-file error was invisible
+    /// to a CA client monitoring ERRS (R15-49).
+    ///
+    /// The change guard is C's, not an optimisation: an unchanged ERRS must not
+    /// re-post, or a record retrying a down port every second would fire a monitor
+    /// every second with text the client already has.
+    fn report_error(&mut self, msg: impl Into<String>) {
+        let before = self.field_snapshot(&["ERRS"]);
+        self.errs = msg.into();
+        self.post_if_new(&before);
+    }
+
     /// C `resetError` (asynRecord.c:2050-2060): clear ERRS and post it if the
-    /// operator was looking at a message that is now gone.
+    /// operator was looking at a message that is now gone — the same write-then-
+    /// post-if-changed shape as [`Self::report_error`], with the empty string.
     ///
     /// The single owner of "the record starts this operation with a clean ERRS".
     /// C calls it at the entry of every operation that can report — `process()`
@@ -2800,9 +2822,7 @@ impl AsynRecord {
     /// entry is what makes ERRS "the last operation's message", not "the last
     /// message any operation left".
     fn reset_error(&mut self) {
-        let before = self.field_snapshot(&["ERRS"]);
-        self.errs.clear();
-        self.post_if_new(&before);
+        self.report_error(String::new());
     }
 
     /// C's `state == stateNoDevice` refusal (asynRecord.c:356-357): a record with
@@ -2817,7 +2837,7 @@ impl AsynRecord {
     /// STATE/MINOR rather than NO_ALARM. Staged in `io_alarm` and committed by
     /// `check_alarms` on this cycle, like every other record alarm.
     fn report_not_connected(&mut self) {
-        self.errs = "Not connect to a port".to_string();
+        self.report_error("Not connect to a port");
         self.io_alarm = Some((alarm_status::STATE_ALARM, AlarmSeverity::Minor));
     }
 
@@ -2830,7 +2850,7 @@ impl AsynRecord {
     /// The severity is staged in `io_alarm` and committed by `check_alarms` on
     /// this cycle, like every other record alarm.
     fn report_no_interface(&mut self, asyn_name: &str) {
-        self.errs = format!("No {asyn_name} interface");
+        self.report_error(format!("No {asyn_name} interface"));
         self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
     }
 
@@ -2843,7 +2863,7 @@ impl AsynRecord {
     /// The single owner of that outcome for every request the record's
     /// [`Self::option_user`] builds.
     fn report_special_queue_timeout(&mut self) {
-        self.errs = SPECIAL_QUEUE_TIMEOUT_MSG.to_string();
+        self.report_error(SPECIAL_QUEUE_TIMEOUT_MSG);
     }
 
     /// The outcome of a special request that **never ran** — the single owner of
@@ -2867,7 +2887,7 @@ impl AsynRecord {
             // C splices `pasynUser->errorMessage` — the gate's own text, e.g.
             // "port X not connected" — into ERRS (:575). No severity: C's
             // `reportError` raises none.
-            self.errs = e.message();
+            self.report_error(e.message());
         } else {
             self.report_special_queue_timeout();
         }
@@ -2899,7 +2919,7 @@ impl AsynRecord {
             ui32mask: self.ui32mask,
         });
         if let Err(msg) = self.io_intr.rebind(binding) {
-            self.errs = msg;
+            self.report_error(msg);
         }
     }
 
@@ -3014,7 +3034,7 @@ impl AsynRecord {
                 return self.report_special_never_ran(&e);
             }
             let which = if output { "output" } else { "input" };
-            self.errs = format!("Error setting {which} eos, {}", e.message());
+            self.report_error(format!("Error setting {which} eos, {}", e.message()));
         }
         self.posting(EOS_READBACK_FIELDS, |this| {
             this.read_eos_from_driver(&entry.handle);
@@ -3137,7 +3157,7 @@ impl AsynRecord {
                                 // C reports the bare literal — the driver's own text
                                 // reaches the operator through the trace file, not
                                 // ERRS (asynRecord.c:1255).
-                                self.errs = "Error in asynDrvUser->create()".to_string();
+                                self.report_error("Error in asynDrvUser->create()");
                                 self.resolved_reason = 0;
                             }
                         }
@@ -3155,7 +3175,7 @@ impl AsynRecord {
                     self.reason = 0;
                     self.resolved_reason = 0;
                     if !self.drvinfo.is_empty() {
-                        self.errs = "asynDrvUser not supported but drvInfo not blank".to_string();
+                        self.report_error("asynDrvUser not supported but drvInfo not blank");
                     }
                 }
 
@@ -3260,10 +3280,10 @@ impl AsynRecord {
     /// asynManager.c:1331-1345). Returns the manager-level message so the
     /// caller can splice it into its own text.
     fn report_connect_error(&mut self, manager_message: String) -> String {
-        self.errs = format!(
+        self.report_error(format!(
             "Connect error, status={}, {manager_message}",
             AsynStatus::Error as i32
-        );
+        ));
         manager_message
     }
 
@@ -3544,7 +3564,7 @@ impl AsynRecord {
             self.spr = v;
         }
         if let Some(v) = out.errs {
-            self.errs = v;
+            self.report_error(v);
         }
         // The I/O cycle's record alarm (C `recGblSetSevr` in `performIO`).
         // `check_alarms` — invoked by the framework on this same completion
@@ -4118,7 +4138,7 @@ impl Record for AsynRecord {
             // "connectDevice failed: <pasynUser->errorMessage>".
             "PORT" | "ADDR" | "DRVINFO" => {
                 if let Err(manager_message) = self.connect_device() {
-                    self.errs = format!("connectDevice failed: {manager_message}");
+                    self.report_error(format!("connectDevice failed: {manager_message}"));
                 }
             }
 
@@ -4244,7 +4264,9 @@ impl Record for AsynRecord {
                             // no driver call at all.
                             (_, Ok(_)) => None,
                             (_, Err(e)) => {
-                                this.errs = format!("asynCallbackSpecial isConnected error: {e}");
+                                this.report_error(format!(
+                                    "asynCallbackSpecial isConnected error: {e}"
+                                ));
                                 None
                             }
                         };
@@ -4260,11 +4282,13 @@ impl Record for AsynRecord {
                             if e.never_ran() {
                                 return this.report_special_never_ran(&e);
                             }
-                            this.errs = format!("asynCallbackSpecial callbackConnect {what}: {e}");
+                            this.report_error(format!(
+                                "asynCallbackSpecial callbackConnect {what}: {e}"
+                            ));
                         }
                     }
                     None => {
-                        this.errs = "asynCallbackSpecial isConnected error".to_string();
+                        this.report_error("asynCallbackSpecial isConnected error");
                     }
                 }
                 // Every one of those paths — including each error `break` — falls
@@ -4528,7 +4552,7 @@ impl Record for AsynRecord {
     /// `reportError` puts it there (:617,:627,:637,:647).
     fn set_io_intr_scan(&mut self, active: bool) {
         if let Err(msg) = self.io_intr.set_active(active) {
-            self.errs = msg;
+            self.report_error(msg);
         }
     }
 
@@ -8667,6 +8691,150 @@ mod tests {
         assert!(
             reposted.is_err(),
             "unchanged TMSK must not be re-posted on an IO-mask-only change, got {reposted:?}"
+        );
+    }
+
+    /// R15-49: every ERRS write posts, and an unchanged one does not.
+    ///
+    /// C `reportError` (asynRecord.c:2028-2049) writes the field and then
+    /// `db_post_events(errs, DBE_VALUE|DBE_LOG)` iff the text changed. ERRS is
+    /// not `pp(TRUE)` (asynRecord.dbd:366-370), so nothing else posts it: the
+    /// record's diagnostics — the queue-gate refusal, an option/EOS error, a
+    /// connect error — were written into the field and never reached a CA client
+    /// monitoring it. Only `resetError`'s clear posted.
+    ///
+    /// One case per boundary: a real refusal posts its text; the same text
+    /// written again does not re-post; the clear posts.
+    #[tokio::test]
+    async fn every_errs_write_posts_and_an_unchanged_one_does_not() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::database::db_access::DbSubscription;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        struct DownDriver(PortDriverBase);
+        impl PortDriver for DownDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        // A port whose link is down and will not come back: every option put the
+        // record makes is refused by the queue gate ("port X not connected").
+        let port_name = "test_errs_post";
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.init_connected(false);
+        base.auto_connect = false;
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(Box::new(DownDriver(base)), rx);
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_id,
+        );
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(Arc::new(ExceptionManager::new()));
+        super::registry::register_port(port_name, handle, trace).unwrap();
+
+        let db = PvDatabase::new();
+        let rec_name = "ERRS_POST_REC";
+        db.add_record(rec_name, Box::new(AsynRecord::default()))
+            .await
+            .unwrap();
+        {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let mut g = inst.write().await;
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            rec.port = port_name.to_string();
+            rec.special("PORT", true).unwrap();
+            rec.report_error(String::new()); // start from a clean, quiet ERRS
+        }
+
+        let mut errs_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.ERRS"))
+            .await
+            .expect("subscribe ERRS");
+
+        // Boundary 1 — a refused put. C's `special()` writes the gate's own
+        // `pasynUser->errorMessage` to ERRS and frees the user (:571-576); the
+        // operator's ERRS monitor must fire with it.
+        {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let mut g = inst.write().await;
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            rec.baud = 9600;
+            rec.special("BAUD", true).unwrap();
+            assert_eq!(
+                rec.errs,
+                format!("port {port_name} not connected"),
+                "precondition: the queue gate refused the option put"
+            );
+        }
+        assert_eq!(
+            errs_sub.recv().await,
+            Some(EpicsValue::String(
+                format!("port {port_name} not connected").into()
+            )),
+            "a refused put must fire the ERRS monitor with the refusal text"
+        );
+
+        // Boundary 2 — the same text again. C guards the post on
+        // `strncmp(errs, old.errs)` (:2044): a record retrying a down port must
+        // not fire a monitor per retry with text the client already has.
+        {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let mut g = inst.write().await;
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            rec.report_error(format!("port {port_name} not connected"));
+        }
+        let reposted = tokio::time::timeout(Duration::from_millis(300), errs_sub.recv()).await;
+        assert!(
+            reposted.is_err(),
+            "an unchanged ERRS must not re-post, got {reposted:?}"
+        );
+
+        // Boundary 3 — the clear. C `resetError` (:2050-2060) posts the empty
+        // string, so the operator's screen loses the stale message.
+        {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let mut g = inst.write().await;
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            rec.reset_error();
+        }
+        assert_eq!(
+            errs_sub.recv().await,
+            Some(EpicsValue::String(String::new().into())),
+            "resetError's clear must post"
         );
     }
 

@@ -456,6 +456,24 @@ impl InterruptManager {
         )
     }
 
+    /// The filter of every live interrupt client, for `asynReport` — C's
+    /// `reportInterrupt` walks each interface's `interruptList` and prints one
+    /// line per registered client (asynPortDriver.cpp:1870-1894), which is the
+    /// `details >= 3` block of `asynPortDriver::report` (:3695-3708).
+    ///
+    /// Rust keeps one list, with the interface as a field of the filter rather
+    /// than as the identity of the list, so one walk answers what C's twelve
+    /// `reportInterrupt` calls answer.
+    pub fn clients(&self) -> Vec<InterruptFilter> {
+        self.state
+            .mailboxes
+            .lock()
+            .iter()
+            .filter(|m| m.active.load(Ordering::Acquire))
+            .map(|m| m.filter.clone())
+            .collect()
+    }
+
     /// True if any active mailbox subscription would receive a value fired for
     /// `(reason, addr, iface)`.
     ///

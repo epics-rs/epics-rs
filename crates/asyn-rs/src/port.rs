@@ -208,12 +208,22 @@ pub struct PortDriverBase {
     last_announced: bool,
     pub enabled: bool,
     pub auto_connect: bool,
-    /// `defunct` — set by [`Self::shutdown_lifecycle`] when a
-    /// destructible port is torn down via `shutdown_port`. Once true,
-    /// the port refuses every new request through [`Self::check_ready`].
-    /// Mirrors the `dpCommon.defunct` flag at C asynManager.c:2284
-    /// — once defunct, the port cannot be re-enabled.
-    pub defunct: bool,
+    /// C `dpCommon.defunct` (asynManager.c:2284) — the port was torn down via
+    /// `shutdownPort` and is gone for good. Read it with [`Self::is_defunct`].
+    ///
+    /// **Invariant: `defunct ⟹ !enabled`.** C establishes it in `shutdownPort`,
+    /// which clears `enabled` *and* sets `defunct` in the same breath (:2282-2283)
+    /// with the comment that disabling is what short-circuits `queueRequest` —
+    /// and indeed `queueRequest` has no defunct branch at all (:1539-1552): a
+    /// defunct port is refused as a *disabled* one, "port %s disabled". `defunct`
+    /// itself is only ever asked by `enable` (:2236, so the port cannot be
+    /// re-enabled) and by `findInterface` (:1487).
+    ///
+    /// The field is private so [`Self::shutdown_lifecycle`] is the only way to
+    /// set it, which is what makes the invariant hold by construction: nothing can
+    /// build a port that is defunct but still enabled, so no gate needs to ask
+    /// about defunct to refuse it (R15-50).
+    defunct: bool,
     /// Exception sink injected by [`crate::manager::PortManager`] on registration.
     pub exception_sink: Option<Arc<ExceptionManager>>,
     pub options: HashMap<String, String>,
@@ -546,10 +556,7 @@ impl PortDriverBase {
     /// the transition.
     pub fn set_enabled(&mut self, enabled: bool) -> AsynResult<()> {
         if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+            return Err(Self::shut_down_error());
         }
         self.enabled = enabled;
         self.announce_exception(AsynException::Enable, -1);
@@ -562,10 +569,7 @@ impl PortDriverBase {
     /// too, matching C's `dpCommon.defunct` check on the resolved device.
     pub fn set_addr_enabled(&mut self, addr: i32, enabled: bool) -> AsynResult<()> {
         if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+            return Err(Self::shut_down_error());
         }
         self.device_state(addr).enabled = enabled;
         self.announce_exception(AsynException::Enable, addr);
@@ -606,6 +610,16 @@ impl PortDriverBase {
         self.defunct
     }
 
+    /// The one place a shut-down port is named in an error message, and the
+    /// only one C has: `enable` on a defunct device (asynManager.c:2236-2241).
+    /// Every other gate refuses a defunct port as a disabled one.
+    fn shut_down_error() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Disabled,
+            message: "asynManager:enable: port has been shut down".to_string(),
+        }
+    }
+
     /// C `queueRequest`'s gate (asynManager.c:1539-1552), and the single owner
     /// of the two refusals it is built from.
     ///
@@ -628,32 +642,54 @@ impl PortDriverBase {
     /// callback's readback and `monitorStatus` tail (asynRecord.c:571-576 vs
     /// :788-900). This is the only place that stamps it.
     pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
-        self.check_enabled()
-            .and_then(|()| match connect {
-                // C `checkPortConnect == FALSE`: neither the port's nor the
-                // device's connected flag is read — the port thread drains the
-                // Connect queue before it ever calls `autoConnectDevice`
-                // (asynManager.c:812-856), and the device-level checks live in
-                // the lower-priority loop it has not reached yet (:864-874).
-                ConnectCheck::Waived => Ok(()),
-                ConnectCheck::Required => self.check_ready_addr(addr),
-            })
+        self.check_queue_inner(addr, connect)
             .map_err(AsynError::into_queue_refusal)
     }
 
-    /// The unconditional half of the queue gate: a defunct or disabled port
-    /// refuses every request (asynManager.c:1541-1546).
-    pub fn check_enabled(&self) -> AsynResult<()> {
-        // C asyn parity: a defunct port short-circuits queueRequest
-        // (asynManager.c:2283 comment). Reject *before* the enabled
-        // check so the error message names the lifecycle phase, not
-        // just "disabled".
-        if self.defunct {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disabled,
-                message: format!("port {} has been shut down (defunct)", self.port_name),
-            });
+    /// The gate's body, before the refusal is stamped as a queue refusal.
+    ///
+    /// Three blocks, in C's order:
+    ///
+    /// 1. `!pport->dpc.enabled → asynDisabled` (:1541-1546) — port level,
+    ///    unconditional, reached by every request.
+    /// 2. `checkPortConnect && !pport->dpc.connected → asynDisconnected`
+    ///    (:1547-1552) — port level, waived by the request's own user. (C's
+    ///    `checkPortConnect == FALSE` reads *no* connected flag: the port thread
+    ///    drains the Connect queue before it ever calls `autoConnectDevice`,
+    ///    :812-856.)
+    /// 3. The **device** block (:1553-1575), which C runs only for a
+    ///    *synchronous* port: it sits bodily inside
+    ///    `if(!(pport->attributes & ASYN_CANBLOCK))` at :1553. A CANBLOCK port's
+    ///    device-level enabled/connected checks belong to the port THREAD
+    ///    (:874-884), which does something else entirely with them — a disabled
+    ///    device's request *waits in the queue* (`continue`), it is not refused
+    ///    — so applying them here refused requests C parks (R15-47). Every real
+    ///    transport port is CANBLOCK.
+    fn check_queue_inner(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
+        self.check_enabled()?;
+        if connect == ConnectCheck::Required {
+            self.check_port_connected()?;
         }
+        if !self.flags.can_block {
+            // C :1561-1567 — the device-enabled refusal in the synchronous block
+            // is *not* conditioned on `checkPortConnect`; only the connected one
+            // below is (:1568).
+            self.check_device_enabled(addr)?;
+            if connect == ConnectCheck::Required {
+                self.check_device_connected(addr)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The unconditional half of the queue gate: a disabled port refuses every
+    /// request (asynManager.c:1541-1546).
+    ///
+    /// There is no defunct branch here, and there is none in C's `queueRequest`
+    /// either: `shutdownPort` clears `enabled` alongside setting `defunct`
+    /// (:2282-2283) precisely so this one check answers for both. The invariant
+    /// `defunct ⟹ !enabled` (see the field doc) is what makes that sound.
+    pub fn check_enabled(&self) -> AsynResult<()> {
         if !self.enabled {
             return Err(AsynError::Status {
                 status: AsynStatus::Disabled,
@@ -663,11 +699,8 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// Check that the port is enabled, connected, and not defunct.
-    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
-    /// (defunct => permanently disabled) otherwise.
-    pub fn check_ready(&self) -> AsynResult<()> {
-        self.check_enabled()?;
+    /// The port-level connected refusal (asynManager.c:1547-1552).
+    pub fn check_port_connected(&self) -> AsynResult<()> {
         if !self.is_connected() {
             return Err(AsynError::Status {
                 status: AsynStatus::Disconnected,
@@ -675,6 +708,62 @@ impl PortDriverBase {
             });
         }
         Ok(())
+    }
+
+    /// The device-level enabled refusal, C's text verbatim
+    /// (asynManager.c:1561-1567). Its *use* differs by port class, which is why
+    /// it is a check and not a gate: `queueRequest` returns it on a synchronous
+    /// port, while on a CANBLOCK port the same condition makes `portThread` park
+    /// the request instead (:875). Both callers ask this one function.
+    ///
+    /// A port that is not `ASYN_MULTIDEVICE`, or an address with no device state,
+    /// resolves to the port's own `dpCommon` in C's `findDpCommon` — already
+    /// checked above — so there is nothing device-level left to refuse.
+    pub fn check_device_enabled(&self, addr: i32) -> AsynResult<()> {
+        if let Some(ds) = self.device(addr) {
+            if !ds.enabled {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disabled,
+                    // C's double space is verbatim (asynManager.c:1564).
+                    message: format!("port {}  or device {} not enabled", self.port_name, addr),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The device-level connected refusal (asynManager.c:1568-1575). Same
+    /// split as [`Self::check_device_enabled`]: `queueRequest` returns it on a
+    /// synchronous port; on a CANBLOCK port `portThread` answers the same
+    /// condition with the request's timeout callback (:884-885).
+    pub fn check_device_connected(&self, addr: i32) -> AsynResult<()> {
+        if let Some(ds) = self.device(addr) {
+            if !ds.connected {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: format!("port {} or device {} not connected", self.port_name, addr),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The device `addr` resolves to, or `None` when C's `findDpCommon` would
+    /// resolve it to the port's own `dpCommon` (not multi-device, or no device
+    /// created at that address).
+    fn device(&self, addr: i32) -> Option<&DeviceState> {
+        if !self.flags.multi_device {
+            return None;
+        }
+        self.device_states.get(&addr)
+    }
+
+    /// Check that the port is enabled, connected, and not defunct.
+    /// Returns `Err(Disabled)`, `Err(Disconnected)`, or `Err(Disabled)`
+    /// (defunct => permanently disabled) otherwise.
+    pub fn check_ready(&self) -> AsynResult<()> {
+        self.check_enabled()?;
+        self.check_port_connected()
     }
 
     /// Run the C `shutdownPort` lifecycle (asynManager.c:2251-2308):
@@ -712,36 +801,32 @@ impl PortDriverBase {
         Ok(())
     }
 
-    /// Check that port + device address are both ready.
-    /// For multi-device ports, checks per-address state in addition to port-level state.
+    /// Check that port + device address are both ready — the whole of C's
+    /// synchronous-port gate (asynManager.c:1539-1575) in one call. Drivers that
+    /// re-check inside their own I/O use it; the queue gate reaches the same
+    /// checks through [`Self::check_queue`], which splits them by port class.
     pub fn check_ready_addr(&self, addr: i32) -> AsynResult<()> {
         self.check_ready()?;
-        if self.flags.multi_device {
-            if let Some(ds) = self.device_states.get(&addr) {
-                if !ds.enabled {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disabled,
-                        // C's double space is verbatim (asynManager.c:1564).
-                        message: format!("port {}  or device {} not enabled", self.port_name, addr),
-                    });
-                }
-                if !ds.connected {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        message: format!(
-                            "port {} or device {} not connected",
-                            self.port_name, addr
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
+        self.check_device_enabled(addr)?;
+        self.check_device_connected(addr)
     }
 
     /// Get or create a device state for the given address.
+    ///
+    /// A device created here inherits the port's `auto_connect`, as C's
+    /// `locateDevice` does: `dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`
+    /// (asynManager.c:584). Defaulting it to `true` on a manual-connect port
+    /// would make `asynReport`'s per-device `autoConnect Yes` a lie, and would
+    /// hand `autoConnectDevice` a device it may reconnect on a port whose
+    /// operator turned auto-connect off.
     pub fn device_state(&mut self, addr: i32) -> &mut DeviceState {
-        self.device_states.entry(addr).or_default()
+        let port_auto_connect = self.auto_connect;
+        self.device_states
+            .entry(addr)
+            .or_insert_with(|| DeviceState {
+                auto_connect: port_auto_connect,
+                ..DeviceState::default()
+            })
     }
 
     /// Check if a specific device address is connected.
@@ -954,9 +1039,11 @@ impl PortDriverBase {
         self.params.get_param_status(index, addr)
     }
 
-    /// Detailed parameter report matching C asynPortDriver::reportParams.
-    pub fn report_params(&self, level: i32) {
-        eprintln!("  Number of parameters is {}", self.params.len());
+    /// Detailed parameter report matching C asynPortDriver::reportParams, written
+    /// to the stream the caller names (C's `FILE *fp`).
+    pub fn report_params(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "  Number of parameters is {}", self.params.len());
         if level < 1 {
             return;
         }
@@ -978,23 +1065,35 @@ impl PortDriverBase {
                         .params
                         .get_param_status(i, addr as i32)
                         .unwrap_or((AsynStatus::Success, 0, 0));
-                    eprintln!(
+                    let _ = writeln!(
+                        out,
                         "  param[{i}] name={name} type={ptype} addr={addr} val={val} status={status:?} alarm=({alarm_st},{alarm_sev})"
                     );
                 }
             } else {
-                eprintln!("  param[{i}] name={name} type={ptype}");
+                let _ = writeln!(out, "  param[{i}] name={name} type={ptype}");
             }
         }
     }
 
-    /// Push an interpose layer onto the octet I/O stack.
+    /// Push an interpose layer onto the **port's** octet I/O stack — C
+    /// `interposeInterface(portName, -1, ...)`, which every driver's own
+    /// configure-time install is (the layer serves every device on the port).
     ///
     /// **Concurrency**: requires `&mut self`, which means the caller must hold
     /// the port lock (`Arc<Mutex<dyn PortDriver>>`). This ensures
     /// interpose modifications are serialized with I/O dispatch.
     pub fn install_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
-        self.interpose_octet.install(layer);
+        self.install_octet_interpose_addr(crate::interpose::PORT_CHAIN, layer);
+    }
+
+    /// Push an interpose layer onto the stack of the device `addr` names — C
+    /// `interposeInterface(portName, addr, ...)` (asynManager.c:2190-2220), which
+    /// is what the `asynInterposeEcho` / `asynInterposeDelay` iocsh commands call
+    /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187,200). On a port that is
+    /// not multi-device every addr resolves to the port itself.
+    pub fn install_octet_interpose_addr(&mut self, addr: i32, layer: Box<dyn OctetInterpose>) {
+        self.interpose_octet.install(addr, layer);
     }
 
     /// Flush changed parameters as interrupt notifications.
@@ -1193,6 +1292,42 @@ impl DrvUserInfo {
 /// the port is always behind `Arc<Mutex<dyn PortDriver>>`, so callers hold the
 /// parking_lot mutex directly. For multi-request exclusive access, use
 /// `BlockProcess`/`UnblockProcess` via the worker queue.
+/// C `epicsTimeToStrftime(buff, ..., "%Y/%m/%d %H:%M:%S.%03f", &timeStamp)` —
+/// the port timestamp line of `asynPortDriver::report` (asynPortDriver.cpp:3682-3684).
+/// Local time, as `epicsTimeToStrftime` renders it.
+fn format_timestamp(ts: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(ts)
+        .format("%Y/%m/%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+/// C's `details >= 3` block: one line per registered interrupt client
+/// (`reportInterrupt`, asynPortDriver.cpp:1870-1894, called once per interface at
+/// :3695-3708). C prints the callback and userPvt pointers with each client; Rust
+/// mailboxes have no such pointers, so the line carries what identifies a client
+/// here — the interface it bound, the address and reason it filtered on, and the
+/// uint32 mask when it set one.
+fn report_interrupt_clients(out: &mut dyn std::fmt::Write, base: &PortDriverBase) {
+    use std::fmt::Write as _;
+    for f in base.interrupts.clients() {
+        let iface = f
+            .iface
+            .map_or("any", |i: crate::interfaces::InterfaceType| {
+                i.interrupt_label()
+            });
+        let addr = f.addr.map_or("any".to_string(), |a| a.to_string());
+        let reason = f.reason.map_or("any".to_string(), |r| r.to_string());
+        let _ = write!(
+            out,
+            "    {iface} callback client addr={addr}, reason={reason}"
+        );
+        if let Some(mask) = f.uint32_mask {
+            let _ = write!(out, ", mask=0x{mask:x}");
+        }
+        let _ = writeln!(out);
+    }
+}
+
 pub trait PortDriver: Send + Sync + 'static {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
@@ -1271,33 +1406,64 @@ pub trait PortDriver: Send + Sync + 'static {
     /// here would give the operator two answers to the same question, from two
     /// owners, with no rule for which one wins.
     ///
-    /// The default is C++ `asynPortDriver::report` (asynPortDriver.cpp:3677-3694):
-    /// the port name, and at `details >= 1` the EOS terminators and the parameter
-    /// library.
-    fn report(&self, level: i32) {
+    /// The default is C++ `asynPortDriver::report` (asynPortDriver.cpp:3676-3710):
+    /// the port name; at `details >= 1` the timestamp, the EOS terminators *if the
+    /// driver registered the octet interface* (`pasynStdInterfaces->octet.pinterface`,
+    /// :3685) and the parameter library; at `details >= 3` the interrupt clients
+    /// (:3695-3708).
+    ///
+    /// The report goes to `out`, C's `FILE *fp` — the driver never picks the
+    /// stream. [`crate::port_actor::PortActor::report_port`] is the one owner that
+    /// does, and it picks stdout, as `asynReport` does (asynShellCommands.c:589).
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
         let base = self.base();
-        eprintln!("Port: {}", base.port_name);
+        let _ = writeln!(out, "Port: {}", base.port_name);
         if level >= 1 {
-            let esc = |eos: &[u8]| {
-                eos.iter()
-                    .map(|b| match b {
-                        b'\r' => "\\r".to_string(),
-                        b'\n' => "\\n".to_string(),
-                        c => (*c as char).to_string(),
-                    })
-                    .collect::<String>()
-            };
-            let input = base.input_eos(0);
-            let output = base.output_eos(0);
-            eprintln!("  Input EOS[{}]: {}", input.len(), esc(input));
-            eprintln!("  Output EOS[{}]: {}", output.len(), esc(output));
-            base.report_params(level.saturating_sub(1));
+            let _ = writeln!(
+                out,
+                "  Timestamp: {}",
+                format_timestamp(base.current_timestamp())
+            );
+            // C prints the EOS pair only when the driver registered `asynOctet`
+            // (:3685) — on a port with no octet interface the two terminators are
+            // the constructor's zeroed fields, and reporting them invents an EOS
+            // the port cannot have.
+            if self.has_octet_interface() {
+                let esc = |eos: &[u8]| {
+                    eos.iter()
+                        .map(|b| match b {
+                            b'\r' => "\\r".to_string(),
+                            b'\n' => "\\n".to_string(),
+                            c => (*c as char).to_string(),
+                        })
+                        .collect::<String>()
+                };
+                let input = base.input_eos(0);
+                let output = base.output_eos(0);
+                let _ = writeln!(out, "  Input EOS[{}]: {}", input.len(), esc(input));
+                let _ = writeln!(out, "  Output EOS[{}]: {}", output.len(), esc(output));
+            }
+            base.report_params(out, level.saturating_sub(1));
         }
         if level >= 2 {
             for (k, v) in &base.options {
-                eprintln!("  option: {k} = {v}");
+                let _ = writeln!(out, "  option: {k} = {v}");
             }
         }
+        if level >= 3 {
+            report_interrupt_clients(out, base);
+        }
+    }
+
+    /// Whether this driver registered `asynOctet` — C's
+    /// `pasynStdInterfaces->octet.pinterface != NULL`, which is set from the
+    /// constructor's `interfaceMask` (asynPortDriver.cpp:1990). The Rust analogue
+    /// of that mask is [`Self::capabilities`].
+    fn has_octet_interface(&self) -> bool {
+        self.capabilities()
+            .iter()
+            .any(|c| c.interface_type() == crate::interfaces::InterfaceType::Octet)
     }
 
     // --- Scalar I/O (cache-based defaults, timeout not applicable) ---
@@ -2088,7 +2254,8 @@ mod tests {
             .unwrap();
         drv.base_mut().set_int32_param(0, 0, 42).unwrap();
         for level in 0..=3 {
-            drv.report(level);
+            let mut out = String::new();
+            drv.report(&mut out, level);
         }
     }
 
@@ -2670,12 +2837,24 @@ mod tests {
         // Idempotent — second call is Ok and leaves state unchanged.
         base.shutdown_lifecycle().unwrap();
         assert!(base.is_defunct());
-        // check_ready surfaces the defunct state for every request.
+        // A shut-down port is refused by the queue gate as a *disabled* one:
+        // C's `queueRequest` has no defunct branch (asynManager.c:1539-1552),
+        // it only sees the `enabled=FALSE` that `shutdownPort` left behind
+        // (:2282-2283). "port %s disabled" is the message an operator gets.
         match base.check_ready() {
-            Err(AsynError::Status { message, .. }) => {
-                assert!(message.contains("defunct"), "msg={message}");
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "port p_destr disabled");
             }
-            other => panic!("expected defunct error, got {other:?}"),
+            other => panic!("expected the disabled refusal, got {other:?}"),
+        }
+        // The one place C names the shutdown is `enable` (:2236-2241).
+        match base.set_enabled(true) {
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "asynManager:enable: port has been shut down");
+            }
+            other => panic!("expected the shut-down refusal, got {other:?}"),
         }
     }
 

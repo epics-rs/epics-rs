@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn test_delay_writes_per_char() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(DelayInterpose::new(Duration::from_nanos(1))));
+        stack.install(-1, Box::new(DelayInterpose::new(Duration::from_nanos(1))));
 
         let mut base = RecordingBase::new();
         let mut user = AsynUser::default();
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn test_delay_zero_passthrough() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(DelayInterpose::new(Duration::ZERO)));
+        stack.install(-1, Box::new(DelayInterpose::new(Duration::ZERO)));
 
         let mut base = RecordingBase::new();
         let mut user = AsynUser::default();
@@ -154,7 +154,7 @@ mod tests {
         // old `data.len() <= 1` short-circuit skipped the delay entirely.
         let mut stack = OctetInterposeStack::new(false);
         let delay = Duration::from_millis(5);
-        stack.install(Box::new(DelayInterpose::new(delay)));
+        stack.install(-1, Box::new(DelayInterpose::new(delay)));
 
         let mut base = RecordingBase::new();
         let mut user = AsynUser::default();
@@ -177,7 +177,7 @@ mod tests {
         // char). The old `if i > 0` guard produced only N-1 delays.
         let mut stack = OctetInterposeStack::new(false);
         let delay = Duration::from_millis(5);
-        stack.install(Box::new(DelayInterpose::new(delay)));
+        stack.install(-1, Box::new(DelayInterpose::new(delay)));
 
         let mut base = RecordingBase::new();
         let mut user = AsynUser::default();

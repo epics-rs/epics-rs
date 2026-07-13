@@ -214,6 +214,7 @@ name = "asyn-rs"
 version = "0.23.0"
 dependencies = [
  "bitflags",
+ "chrono",
  "criterion",
  "epics-base-rs",
  "epics-ca-rs",

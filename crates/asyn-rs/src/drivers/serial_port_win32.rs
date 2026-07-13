@@ -589,8 +589,10 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn report(&self, level: i32) {
-        eprintln!(
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
             "Serial line {}: {}",
             self.config.device,
             if self.base.is_connected() {
@@ -600,13 +602,14 @@ impl PortDriver for DrvAsynSerialPort {
             }
         );
         if level >= 1 {
-            eprintln!(
+            let _ = writeln!(
+                out,
                 "                commHandle: {:?}",
                 self.io.handle().unwrap_or(std::ptr::null_mut())
             );
-            eprintln!("    Characters written: {}", self.io.n_written);
-            eprintln!("       Characters read: {}", self.io.n_read);
-            self.base.report_params(level.saturating_sub(1));
+            let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
+            let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
+            self.base.report_params(out, level.saturating_sub(1));
         }
     }
 

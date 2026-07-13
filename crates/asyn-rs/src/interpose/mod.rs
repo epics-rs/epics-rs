@@ -137,127 +137,190 @@ pub trait OctetInterpose: Send + Sync {
     fn connection_changed(&mut self) {}
 }
 
-/// A stack of octet interpose layers.
+/// The key of the port's own interpose chain — C's `pport->dpc`, the
+/// `dpCommon` every addr that names no device resolves to
+/// (`findDpCommon`/`findInterface`, asynManager.c:536-551, 1493-1501).
+pub const PORT_CHAIN: i32 = -1;
+
+/// The octet interpose layers of one port — C's `dpCommon.interposeInterfaceList`,
+/// which exists once per *device* as well as once per port.
+///
+/// `interposeInterface` takes an `addr` (asynManager.c:2190-2220): `addr >= 0` on
+/// a multi-device port puts the layer on that DEVICE's list (:2202-2206), and
+/// `findInterface` resolves a request device-first, port-second (:1493-1501). So
+/// `asynInterposeDelay("gpib", 4, 0.01)` slows device 4 and nothing else — a
+/// single port-wide chain slowed every device on the bus (R15-48).
+///
+/// A device's chain **shadows** the port's rather than extending it, because
+/// that is what C builds: a layer installed on a device whose list was empty
+/// takes its `pPrev` from the *driver's* `interfaceList` (:2211-2215), not from
+/// the port's interposes, so it delegates straight down to the driver.
 pub struct OctetInterposeStack {
-    layers: Vec<Box<dyn OctetInterpose>>,
+    /// [`PORT_CHAIN`] plus one entry per device that has an interpose of its own.
+    chains: std::collections::BTreeMap<i32, Vec<Box<dyn OctetInterpose>>>,
     /// The port's device model, handed to every layer at install time
-    /// ([`OctetInterpose::attach_port`]).
+    /// ([`OctetInterpose::attach_port`]) and what decides whether an addr can
+    /// name a device at all — C `locateDevice` returns none for a port that is
+    /// not `ASYN_MULTIDEVICE` (asynManager.c:574).
     multi_device: bool,
 }
 
 impl OctetInterposeStack {
     pub fn new(multi_device: bool) -> Self {
         Self {
-            layers: Vec::new(),
+            chains: std::collections::BTreeMap::new(),
             multi_device,
         }
     }
 
-    /// Install an interpose layer — C `interposeInterface`
-    /// (asynManager.c:2190-2220).
+    /// Install an interpose layer on the device `addr` names — C
+    /// `interposeInterface` (asynManager.c:2190-2220). `addr < 0`, or any addr on
+    /// a port that is not multi-device, installs on the port itself
+    /// ([`crate::port::eos_device_key`], C's `locateDevice` at :574).
     ///
-    /// The new layer *becomes* the port's octet interface (C overwrites the
+    /// The new layer *becomes* that `dpCommon`'s octet interface (C overwrites the
     /// interpose node's `pasynInterface` with it, :2217) and the interface it
-    /// displaced — the previously installed interpose, or the driver's own
-    /// interface when there was none — becomes the one it delegates down to
-    /// (C hands it back as `pPrev`, :2209-2215).
+    /// displaced — the previously installed interpose at the same level, or the
+    /// driver's own interface when there was none — becomes the one it delegates
+    /// down to (C hands it back as `pPrev`, :2209-2215).
     ///
     /// So the **last layer installed is the outermost**: a caller enters it first,
     /// and it calls down through the earlier layers to the driver. An
     /// `asynInterposeEcho` installed from iocsh after the driver's configure-time
     /// EOS layer therefore sits *above* EOS, exactly as in C. Dispatch walks index
     /// 0 first, so the new layer goes to the front.
-    pub fn install(&mut self, mut layer: Box<dyn OctetInterpose>) {
+    pub fn install(&mut self, addr: i32, mut layer: Box<dyn OctetInterpose>) {
         layer.attach_port(self.multi_device);
-        self.layers.insert(0, layer);
+        self.chains
+            .entry(crate::port::eos_device_key(self.multi_device, addr))
+            .or_default()
+            .insert(0, layer);
     }
 
-    /// Number of interpose layers.
+    /// The chain a request on `addr` runs through — C `findInterface`
+    /// (asynManager.c:1493-1501): the device's own interposes if it has any,
+    /// otherwise the port's.
+    fn chain_key(&self, addr: i32) -> i32 {
+        let key = crate::port::eos_device_key(self.multi_device, addr);
+        if key != PORT_CHAIN && self.chains.get(&key).is_some_and(|c| !c.is_empty()) {
+            key
+        } else {
+            PORT_CHAIN
+        }
+    }
+
+    fn chain_mut(&mut self, addr: i32) -> Option<&mut Vec<Box<dyn OctetInterpose>>> {
+        let key = self.chain_key(addr);
+        self.chains.get_mut(&key).filter(|c| !c.is_empty())
+    }
+
+    /// Total number of interpose layers on the port, across every device's chain
+    /// — what `asynReport` counts (asynManager.c:993-1005 walks each `dpCommon`'s
+    /// list).
     pub fn len(&self) -> usize {
-        self.layers.len()
+        self.chains.values().map(Vec::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.layers.is_empty()
+        self.len() == 0
     }
 
-    /// Forward an input EOS change for the addressed device to every layer.
-    /// EOS-aware layers update that device's terminator; others ignore it
-    /// (trait default). Mirrors C asyn propagating `setInputEos` down the
-    /// interpose chain.
+    /// Number of layers on the chain the given addr resolves to.
+    pub fn len_for(&self, addr: i32) -> usize {
+        self.chains
+            .get(&self.chain_key(addr))
+            .map_or(0, |c| c.len())
+    }
+
+    /// Forward an input EOS change to the chain the addressed device resolves to.
+    /// EOS-aware layers update that device's terminator; others ignore it (trait
+    /// default). C routes `setInputEos` through the `asynOctet` interface
+    /// `findInterface` returned for that `asynUser`, so it reaches exactly the
+    /// layers that will serve the device's reads.
     pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) {
-        for layer in &mut self.layers {
-            layer.set_input_eos(addr, eos);
+        if let Some(chain) = self.chain_mut(addr) {
+            for layer in chain {
+                layer.set_input_eos(addr, eos);
+            }
         }
     }
 
-    /// Forward an output EOS change for the addressed device to every layer.
+    /// Forward an output EOS change (see [`Self::set_input_eos`]).
     pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) {
-        for layer in &mut self.layers {
-            layer.set_output_eos(addr, eos);
+        if let Some(chain) = self.chain_mut(addr) {
+            for layer in chain {
+                layer.set_output_eos(addr, eos);
+            }
         }
     }
 
-    /// Tell every layer the port's connection state changed, so any
-    /// link-scoped state (read-ahead buffers, partial-terminator match
-    /// position) is dropped before the new link delivers its first byte.
-    /// Mirrors C's per-interpose `asynExceptionConnect` handlers
-    /// (`asynInterposeEos.c:142-151`); the only caller is the transition
-    /// owner [`crate::port::PortDriverBase::set_connected`].
+    /// Tell every layer, on every device's chain, that the port's connection
+    /// state changed, so any link-scoped state (read-ahead buffers, partial
+    /// terminator match position) is dropped before the new link delivers its
+    /// first byte. Mirrors C's per-interpose `asynExceptionConnect` handlers
+    /// (`asynInterposeEos.c:142-151`); the only caller is the transition owner
+    /// [`crate::port::PortDriverBase::set_connected`], and the link it moved is
+    /// the one under *all* of them.
     pub fn connection_changed(&mut self) {
-        for layer in &mut self.layers {
-            layer.connection_changed();
+        for chain in self.chains.values_mut() {
+            for layer in chain {
+                layer.connection_changed();
+            }
         }
     }
 
-    /// Dispatch a read through the interpose chain, ending at `base`.
+    /// Dispatch a read through the addressed device's interpose chain, ending at
+    /// `base`.
     pub fn dispatch_read(
         &mut self,
         user: &AsynUser,
         buf: &mut [u8],
         base: &mut dyn OctetNext,
     ) -> AsynResult<OctetReadResult> {
-        if self.layers.is_empty() {
+        let addr = user.addr;
+        let Some(layers) = self.chain_mut(addr) else {
             return base.read(user, buf);
-        }
-        let mut chain = InterposeChain {
-            layers: &mut self.layers,
-            base,
         };
-        chain.read(user, buf)
+        InterposeChain {
+            layers: layers.as_mut_slice(),
+            base,
+        }
+        .read(user, buf)
     }
 
-    /// Dispatch a write through the interpose chain, ending at `base`.
+    /// Dispatch a write through the addressed device's interpose chain.
     pub fn dispatch_write(
         &mut self,
         user: &mut AsynUser,
         data: &[u8],
         base: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
-        if self.layers.is_empty() {
+        let addr = user.addr;
+        let Some(layers) = self.chain_mut(addr) else {
             return base.write(user, data);
-        }
-        let mut chain = InterposeChain {
-            layers: &mut self.layers,
-            base,
         };
-        chain.write(user, data)
+        InterposeChain {
+            layers: layers.as_mut_slice(),
+            base,
+        }
+        .write(user, data)
     }
 
-    /// Dispatch a flush through the interpose chain, ending at `base`.
+    /// Dispatch a flush through the addressed device's interpose chain.
     pub fn dispatch_flush(
         &mut self,
         user: &mut AsynUser,
         base: &mut dyn OctetNext,
     ) -> AsynResult<()> {
-        if self.layers.is_empty() {
+        let addr = user.addr;
+        let Some(layers) = self.chain_mut(addr) else {
             return base.flush(user);
-        }
-        let mut chain = InterposeChain {
-            layers: &mut self.layers,
-            base,
         };
-        chain.flush(user)
+        InterposeChain {
+            layers: layers.as_mut_slice(),
+            base,
+        }
+        .flush(user)
     }
 }
 
@@ -422,7 +485,7 @@ mod tests {
     #[test]
     fn test_single_passthrough_layer() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(PassthroughInterpose));
+        stack.install(-1, Box::new(PassthroughInterpose));
 
         let mut base = MockBase::new(b"world");
         let user = AsynUser::default();
@@ -436,7 +499,7 @@ mod tests {
     #[test]
     fn test_uppercase_interpose_write() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(UppercaseInterpose));
+        stack.install(-1, Box::new(UppercaseInterpose));
 
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
@@ -451,8 +514,8 @@ mod tests {
     #[test]
     fn test_multi_layer_chain() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(PassthroughInterpose));
-        stack.install(Box::new(UppercaseInterpose));
+        stack.install(-1, Box::new(PassthroughInterpose));
+        stack.install(-1, Box::new(UppercaseInterpose));
         assert_eq!(stack.len(), 2);
 
         let mut base = MockBase::new(b"");
@@ -466,7 +529,7 @@ mod tests {
     #[test]
     fn test_flush_dispatch() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(PassthroughInterpose));
+        stack.install(-1, Box::new(PassthroughInterpose));
 
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
@@ -512,9 +575,9 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(Tag(b'A')));
-        stack.install(Box::new(Tag(b'B')));
-        stack.install(Box::new(Tag(b'C')));
+        stack.install(-1, Box::new(Tag(b'A')));
+        stack.install(-1, Box::new(Tag(b'B')));
+        stack.install(-1, Box::new(Tag(b'C')));
 
         let mut base = MockBase::new(b"");
         let mut user = AsynUser::default();
@@ -525,5 +588,103 @@ mod tests {
         // driver sees the tags in install order. The inverted stack ran A first
         // and delivered b"CBAx".
         assert_eq!(&base.written, b"ABCx");
+    }
+
+    /// R15-48: an interpose installed with an `addr` serves that DEVICE, not the
+    /// whole port.
+    ///
+    /// C `interposeInterface(portName, addr, ...)` puts the layer on the device's
+    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2202-2206),
+    /// and `findInterface` resolves a request device-first, port-second
+    /// (:1493-1501). Both iocsh interposes pass their addr
+    /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187) — so
+    /// `asynInterposeDelay("gpib",4,0.01)` slows device 4 and nothing else. The
+    /// stack was one port-wide chain, so it slowed every device on the bus.
+    ///
+    /// One case per boundary: the addressed device, an unaddressed sibling, the
+    /// port-level chain as fallback, and the single-device port that collapses
+    /// every addr onto one chain.
+    #[test]
+    fn a_device_addressed_interpose_serves_only_that_device() {
+        struct Tag(u8);
+        impl OctetInterpose for Tag {
+            fn read(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<OctetReadResult> {
+                next.read(user, buf)
+            }
+            fn write(
+                &mut self,
+                user: &mut AsynUser,
+                data: &[u8],
+                next: &mut dyn OctetNext,
+            ) -> AsynResult<usize> {
+                let mut tagged = vec![self.0];
+                tagged.extend_from_slice(data);
+                next.write(user, &tagged)
+            }
+            fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
+                next.flush(user)
+            }
+        }
+
+        let write_from = |stack: &mut OctetInterposeStack, addr: i32| {
+            let mut base = MockBase::new(b"");
+            let mut user = AsynUser::new(0).with_addr(addr);
+            stack.dispatch_write(&mut user, b"x", &mut base).unwrap();
+            base.written
+        };
+
+        // A multi-device port: a layer on device 4, another on device 2.
+        let mut stack = OctetInterposeStack::new(true);
+        stack.install(4, Box::new(Tag(b'D')));
+        stack.install(2, Box::new(Tag(b'E')));
+
+        assert_eq!(
+            write_from(&mut stack, 4),
+            b"Dx",
+            "device 4 runs its own layer"
+        );
+        assert_eq!(
+            write_from(&mut stack, 2),
+            b"Ex",
+            "device 2 runs its own layer"
+        );
+        assert_eq!(
+            write_from(&mut stack, 7),
+            b"x",
+            "a device with no interpose of its own runs none — C's findInterface \
+             falls back to the port's list, which is empty here"
+        );
+        assert_eq!(stack.len(), 2, "two layers on the port, one per device");
+        assert_eq!(stack.len_for(4), 1);
+        assert_eq!(stack.len_for(7), 0);
+
+        // The port's own chain (addr < 0) is what every unaddressed device falls
+        // back to — C `findInterface`'s second lookup (:1499-1501).
+        stack.install(PORT_CHAIN, Box::new(Tag(b'P')));
+        assert_eq!(
+            write_from(&mut stack, 7),
+            b"Px",
+            "a device with no chain of its own falls back to the port's"
+        );
+        assert_eq!(
+            write_from(&mut stack, 4),
+            b"Dx",
+            "...and a device WITH one keeps running only its own: C gives it the \
+             driver's interface as pPrev, not the port's interposes (:2211-2215)"
+        );
+
+        // A port that never declared ASYN_MULTIDEVICE has no devices to key by:
+        // C's `locateDevice` returns none for it (:574), so every addr — the
+        // iocsh default 0 included — lands on the port itself.
+        let mut single = OctetInterposeStack::new(false);
+        single.install(0, Box::new(Tag(b'S')));
+        assert_eq!(write_from(&mut single, 0), b"Sx");
+        assert_eq!(write_from(&mut single, 4), b"Sx");
+        assert_eq!(write_from(&mut single, -1), b"Sx");
     }
 }

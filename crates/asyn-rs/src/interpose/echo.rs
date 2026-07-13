@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn test_echo_success() {
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
 
         let mut base = EchoBase::new();
         let mut user = AsynUser::default();
@@ -210,7 +210,7 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
 
         let mut base = BadEchoBase;
         let mut user = AsynUser::default();
@@ -247,7 +247,7 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
 
         let mut base = NoEchoBase;
         let mut user = AsynUser::default();
@@ -296,7 +296,7 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
 
         let mut base = EchoesOnlyTheFirst { written: 0 };
         let mut user = AsynUser::default();
@@ -332,7 +332,7 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
 
         let mut base = BrokenReadBase;
         let mut user = AsynUser::default();
@@ -367,7 +367,7 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
         let mut base = ShortEchoBase;
         let mut user = AsynUser::default();
         let err = stack
@@ -396,7 +396,7 @@ mod tests {
         }
 
         let mut stack = OctetInterposeStack::new(false);
-        stack.install(Box::new(EchoInterpose::new()));
+        stack.install(-1, Box::new(EchoInterpose::new()));
         let mut base = ShortWriteBase;
         let mut user = AsynUser::default();
         let err = stack

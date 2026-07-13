@@ -4235,3 +4235,117 @@ C's documented exception, filed as R16-76).
   structural seam waves 12-13 worked. The link classifier (R16-78), the
   init-seed owner (R16-77/76/83), and the dbPut owner (R16-79) are the
   three primitives to close.
+
+## Fix wave 14 — dispositions (2026-07-13)
+
+Scope: all 24 Round-16 findings plus R16-33 (assigned mid-wave when the
+`pva-gateway` feature turned out not to compile at HEAD). Six opus fixer
+panels, one worktree each; main merged and verified every commit with git.
+Merge commits: `080bfd8c`/`da16471b` lineage (waves A/B/C/D/F, 17 findings)
+then `44dadde0` (R16-33) and `402aacb2` (E links cluster, 7 findings).
+
+**Per-finding dispositions (25):**
+
+- R16-1 `26266c5a` FIXED — WriteDbLinkTyped + typed_output_buffer: sseq LNKn
+  routes on the destination's DBF type, not the source's.
+- R16-2 `d1cbd5fb` FIXED. R16-3 `c2554616` FIXED.
+- R16-4 `2109120e` FIXED (structural) — ScalcResult::non_finite;
+  CalcError::NonFiniteResult deleted, "failing status, value lost" is
+  unrepresentable.
+- R16-16 `9750afae` FIXED (structural) — shared runtime::stdlib::
+  HexSignificand closes BOTH strtod ports' subnormal hex-float collapse.
+- R16-17 `0d3f7090` FIXED — getNTimers ladder exact vs compiled caget.
+- R16-18 `02dc3fc9` FIXED — addr_list OnceLock, resolved once per process.
+- R16-19 `994a2f94` DOCUMENTED DEVIATION — non-positive EPICS_CA_CONN_TMO is
+  refused out loud (C floods 177,182 stderr lines/3 s; filed as CBUG-D3 in
+  `doc/upstream-c-bugs.md`).
+- R16-31 `9c42a06f` FIXED — Q:form VAL-only gate.
+- R16-32 `2c664fb2` FIXED — config::env::parse_timeout_env, pvxs semantics
+  (REJECT out-of-range to default, not saturate).
+- R16-33 `03ca4a4a` FIXED, WIDENED — the 8 compile errors were half the
+  finding: the gateway middleware layers (ReadOnly/Acl/Audit) overrode
+  get_value_checked without read_checked, so the trait default re-derived
+  values and returned marked:None — every gateway read dropped upstream
+  marks. Structural: client_native::ops_v2 returns MarkedRead with the
+  reply's changed bitset decoded to leaf paths; layers forward, none
+  fabricates. Monitor seed keeps marked:None deliberately (cache snapshot
+  is wholly assigned). Regression test
+  gateway_get_frames_upstream_marks_not_a_full_mask fails pre-fix.
+- R16-46 `6f24725e` FIXED (+ `06b1adae` fixer's own test deflake, barrier
+  read) — PortActor::woken + exceptions_announced model C notifyPortThread's
+  5 signal sites.
+- R16-47 `3b3ab909` FIXED — C report detail levels.
+- R16-48 `e0a71007` FIXED — one crate::escape table; C's two entry points
+  differ only on NUL and the port reproduces each per-path (filed as
+  CBUG-D4).
+- R16-49 `6bebdde2` FIXED — options lines retired.
+- R16-61 + R16-62 `8440fafa` FIXED, ONE COMMIT FOR TWO FINDINGS — both are
+  the same C statement (dbDbLink.c:228-232 tail of dbDbGetValue);
+  input_link_inheritance is the single owner of MS/MSI/MSS inheritance and
+  the self-record guard. The fixer offered a split; main judged the change
+  atomic (one owner, one C statement) and accepted it combined.
+- R16-76 `a9fda800` FIXED — Record::read_constant_inp hook (only
+  ArrayKind::SubArray overrides); val_capacity() single owner returns MALM.
+- R16-77 `a5c7aebf` FIXED — constant links deliver nothing at process
+  (dbConstGetValue); seed_constant_links is the single init-seed owner.
+- R16-78 `c0551b16` FIXED — parse_link_field runs C's constant test
+  (epicsParseDouble on the whole string, dbStaticLib.c:2346-2349) before
+  the modifier split; "5 PP" is a PV link, SDIS="3 NPP" no longer disables.
+- R16-79 `f11710ef` FIXED (invariant) — no put route may modify a NOMOD
+  field; only the .db load path may. Owner: field_io::check_no_mod; bypass
+  audit routed put_pv_inner / put_pv_and_post_with_origin /
+  put_record_field_from_ca / check_external_put_preconditions.
+- R16-80 `598e9b3a` HALF NOT-REAL — pp routing for subArray NELM/INDX
+  already existed; the real defect was the NELM put arm calling
+  reallocate_val() and wiping VAL. Fixed the narrower defect; the existing
+  test assertion that encoded the pre-fix bug was corrected against softIoc.
+- R16-81 `8986d51f` FIXED — histogram SVL; INP refused.
+- R16-82 `00c56fec` FIXED — RecordInstance::run_init_passes applies C's
+  doInitRecord0 prologue (iocInit.c:521-523): STAT=UDF, SEVR=UDFS.
+- R16-83 `b23ccb24` FIXED — constant-DOL seed defines the record (NaN-aware
+  UDF clear), six ad-hoc init_record DOL parses folded into the owner, C's
+  init tail (oval/pval/mlst/alst/lalm/oraw/orbv, bo/mbbo convert) runs as
+  the owner's step 3; parse_c_double owns "link text → number" per
+  dbConstLink.c:34. Two pre-existing tests encoded the pre-fix state and
+  were corrected against softIoc, not silenced.
+
+**Gate (merged tree):** cargo fmt no-change; workspace clippy -D warnings
+clean; workspace nextest 8809/8809 (2 skipped); doctests 22 crates ok;
+AND the new permanent gate members: clippy + nextest with
+`-p epics-bridge-rs --features pva-gateway` (771/771). GATE CHANGE: the
+pva-gateway feature is now part of every pre-push gate — the default-feature
+gate was blind to the R15-33 regression that R16-33 fixed.
+
+**Catalogue extraction:** the upstream-C bug catalogue moved to
+`doc/upstream-c-bugs.md` (`f2585411`) with new Batch D (CBUG-D1..D5).
+
+**Open leads for Round 17** (from the wave-14 fixer reports; none yet
+adjudicated):
+
+1. histogram UDF divergence — C's link-driven histogram stays UDF=1
+   forever; the port framework clears UDF at process. (E)
+2. asyn trace escape call-site mapping — escape.rs reproduces both C
+   renderings; verify each asyn call site picks the same entry point as its
+   C counterpart (the wave-14 D report claimed the port matches only 2 of
+   3 C paths). (D)
+3. sseq DOn/STRn partner post mask — port posts DBE_VALUE|DBE_LOG where C
+   posts DBE_VALUE only. (A)
+4. refresh_link_status init-window race — a DB-syntax remote PV inside init
+   takes a plain put. (E)
+5. classify_link EXT_NC for absent-field local targets. (E)
+6. estdlib decimal ERANGE subnormal-exact — needs a ~750-digit literal to
+   matter. (B)
+7. dbCommon's real SPC_NOMOD set is larger than the R16-79 gate enforces —
+   C marks NAME/STAT/SEVR/AMSG/NSTA/NSEV/NAMSG/ACKS/ACKT/RPRO/UTAG; the
+   gate covers PACT/LCNT/PUTF + per-record read_only flags, so a client can
+   still write STAT/SEVR. ACKT/ACKS are handled by dbrType BEFORE the gate
+   in C. (E)
+8. the iocsh dbLoadRecords path never calls post_init_finalize_undef — the
+   .db builder path does; mbboDirect's bit-fold-into-VAL only happens for
+   IocBuilder-loaded records. (E)
+9. lso seeds a constant DOL though C's lsoRecord::init_record uses
+   dbLoadLinkLS and leaves UDF set (softIoc: DOL:"abc" → VAL empty, UDF=1).
+   (E)
+
+**Flakes this cycle:** none in the merged-tree runs (8809/8809 first try;
+the previously listed CLI/stability flakes did not recur).

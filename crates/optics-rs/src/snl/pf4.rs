@@ -911,11 +911,23 @@ mod tests {
         );
     }
 
+    /// CBUG-B1 — the "Other" blade's transmission now comes from the interval
+    /// containing the energy. This test used to pin C's backwards extrapolation:
+    /// `absLen(Cu, 10 keV) = 5.28411457133 um -> exp(-1/5.28411457133) =
+    /// 0.827582511947`. The correct absorption length is 1e4/(rho * mu) with
+    /// `mu = 215.521099278` (the value C's own `calcTrans` gives at 10 keV).
     #[test]
-    fn test_r6_63_other_in_range_matches_c_xmit() {
-        // C: absLen(Cu, 10 keV) = 5.28411457133 um -> exp(-1/5.28411457133).
+    fn test_b1_other_in_range_uses_the_containing_interval() {
+        let cu = crate::data::chantler::find_material("Cu").unwrap();
+        let abs_len_um = 1.0e4 / (cu.density * 215.521099278);
+        let want = (-1.0 / abs_len_um).exp();
         let t = calc_blade_transmission(10.0, 0.001, MAT_OTHER, "Cu");
-        assert!((t - 0.827582511947).abs() < 1e-9, "Cu 1um at 10 keV: t={t}");
+        assert!(
+            (t - want).abs() < 1e-9,
+            "Cu 1um at 10 keV: t={t}, want={want}"
+        );
+        // C's answer is a different number: it read the interval ABOVE 10 keV.
+        assert!((t - 0.827582511947).abs() > 1e-3);
     }
 
     #[test]

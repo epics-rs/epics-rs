@@ -1212,18 +1212,6 @@ fn first_energy_above(kev: &[f32], energy_kev: f64) -> usize {
         .unwrap_or(kev.len())
 }
 
-/// Read a table cell past `numEntries`.
-///
-/// C declares `float keV[NUM_ENTRIES]`/`float mu[NUM_ENTRIES]` (`chantler.h:14-15`)
-/// with brace initializers shorter than `NUM_ENTRIES`, so every cell from
-/// `numEntries` up to `NUM_ENTRIES-1` is a zero. `pf4.st:642-643` reads index
-/// `j+1`, which lands on that padding in the top bin. (For Pb, whose table fills
-/// all 274 slots, C reads past the array — undefined behaviour with no defined
-/// contract to port; we return the same zero as every other material.)
-fn table_cell(table: &[f32], i: usize) -> f64 {
-    table.get(i).map(|&v| v as f64).unwrap_or(0.0)
-}
-
 /// Linearly interpolate the mass-attenuation coefficient at a given energy.
 ///
 /// Reproduces C `calcTrans` (`filterDrive.st:286-298`): `j` is the first node
@@ -1259,33 +1247,40 @@ pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) ->
     Some((-mu * rho * thickness_cm).exp())
 }
 
-/// Absorption length in microns, as pf4's `OtherAbsorptionLength` computes it.
+/// Absorption length in microns, for pf4's `OtherAbsorptionLength`.
 ///
-/// C `pf4.st:622-646`. This is *not* [`interpolate_mu`]'s interpolation: the
-/// loop breaks at the first node **above** `keV` and C then interpolates on
-/// `[j, j+1]` (`:642-643`) rather than `[j-1, j]`, so `frac` is negative and the
-/// slope comes from the interval above the energy — a backwards extrapolation.
-/// In the top bin `j+1` reads the zero padding past `numEntries` (see
-/// [`table_cell`]). Both quirks are C's observable behaviour and are replicated
-/// deliberately.
+/// **DEVIATION from C, deliberate — CBUG-B1.** C (`pf4.st:634-643`) runs the same
+/// bracketing loop as [`interpolate_mu`], leaving `j` at the first node *strictly
+/// above* the energy, and then interpolates on `[j, j+1]` instead of `[j-1, j]`:
 ///
-/// Returns `0.0` when no tabulated energy is above `keV` (C `:637-639`,
-/// `return 0.`); `RecalcFilters` (`:696`) then evaluates `exp(-x*1000./0.)` =
-/// `exp(-inf)` = 0, i.e. a fully opaque blade.
+/// ```c
+/// for (j=0; j<numEntries; j++) if (keV < filtermat[i].keV[j]) break;
+/// ...
+/// frac = (keV - filtermat[i].keV[j]) / (filtermat[i].keV[j+1] - filtermat[i].keV[j]);
+/// ```
+///
+/// Since `keV < keV[j]` by construction, `frac` is always **negative** — a
+/// backwards extrapolation off the interval *above* the energy, not an
+/// interpolation on the interval containing it. It also drops the `j < 1` guard
+/// its sibling has, and its `j+1` reads one cell past `numEntries` in the top bin
+/// (for Pb, whose table fills every slot, past the array itself — CBUG-B2).
+///
+/// The same module contains the correct version of the same computation over the
+/// same table: `filterDrive.st:288-298` (`calcTrans`) — which is
+/// [`interpolate_mu`]. There is only one interpolation here now, so the `[j, j+1]`
+/// bracket and the out-of-bounds `j+1` are both unrepresentable.
+///
+/// Measured against the shipped Chantler table, C's version is +0.7% to +3.5% off
+/// at ordinary energies and +7.4% just below a Pb absorption edge.
+///
+/// Returns `0.0` when the energy is outside the tabulated range, as C does
+/// (`:637-639`, `return 0.`) — see CBUG-B4 for what the caller makes of that.
 pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> f64 {
-    let j = first_energy_above(mat.kev, energy_kev);
-    // C pf4.st:637-639 — energy at or above the last tabulated node.
-    if j >= mat.kev.len() {
-        return 0.0;
+    match interpolate_mu(mat, energy_kev) {
+        // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
+        Some(mu) => (1.0 / (mat.density * mu)) * 1.0e4,
+        None => 0.0,
     }
-    let x0 = table_cell(mat.kev, j);
-    let x1 = table_cell(mat.kev, j + 1);
-    let y0 = table_cell(mat.mu, j);
-    let y1 = table_cell(mat.mu, j + 1);
-    let frac = (energy_kev - x0) / (x1 - x0);
-    let mu = y0 + frac * (y1 - y0);
-    // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
-    (1.0 / (mat.density * mu)) * 1.0e4
 }
 
 #[cfg(test)]
@@ -1339,14 +1334,7 @@ mod tests {
     #[test]
     fn test_r6_73_absorption_length_uses_double_density() {
         let mo = find_material("Mo").unwrap();
-        let mu = {
-            let j = first_energy_above(mo.kev, 20.0);
-            let x0 = table_cell(mo.kev, j);
-            let x1 = table_cell(mo.kev, j + 1);
-            let y0 = table_cell(mo.mu, j);
-            let y1 = table_cell(mo.mu, j + 1);
-            y0 + ((20.0 - x0) / (x1 - x0)) * (y1 - y0)
-        };
+        let mu = interpolate_mu(mo, 20.0).expect("20 keV is in range for Mo");
         let expected = (1.0 / (10.22_f64 * mu)) * 1.0e4;
         assert_eq!(other_absorption_length_um(mo, 20.0), expected);
         // The pre-fix value (f32 density widened) is a *different* double.
@@ -1452,59 +1440,66 @@ mod tests {
         );
     }
 
-    // R6-67: pf4's `OtherAbsorptionLength` (pf4.st:634-645) brackets on
-    // `[j, j+1]` instead — expected values from that C function.
+    /// CBUG-B1 — the absorption length interpolates on the interval CONTAINING
+    /// the energy, `[j-1, j]`, exactly as `filterDrive.st`'s `calcTrans` does over
+    /// the same table.
+    ///
+    /// This test used to pin C `pf4.st`'s `[j, j+1]` bracket, whose `frac` is
+    /// always negative: `22.5089808743` at 8 keV and `5.28411457133` at 10 keV,
+    /// vs the correct values below (C is 2.5% and 3.6% high).
     #[test]
-    fn test_r6_67_other_absorption_length_extrapolates_off_the_upper_interval() {
+    fn test_b1_other_absorption_length_interpolates_the_containing_interval() {
         let cu = find_material("Cu").unwrap();
-        assert_close(
-            other_absorption_length_um(cu, 8.0),
-            22.5089808743,
-            "Cu 8 keV absLen",
-        );
-        assert_close(
-            other_absorption_length_um(cu, 10.0),
-            5.28411457133,
-            "Cu 10 keV absLen",
+        let rho = cu.density;
+        for (kev, mu) in [(8.0, 50.8490020989), (10.0, 215.521099278)] {
+            // `mu` is the value C's own `calcTrans` produces at this energy.
+            assert_close(
+                other_absorption_length_um(cu, kev),
+                1.0e4 / (rho * mu),
+                "Cu absLen",
+            );
+        }
+    }
+
+    /// CBUG-B1 — below the first tabulated node there is no interval to
+    /// interpolate on, and the `j < 1` guard `calcTrans` has (and `pf4.st` lacks)
+    /// rejects it. C extrapolated backwards instead and returned a length:
+    /// `0.0069425196228` at 0.001 keV, `0.00744181852859` at 0.005 keV. Both were
+    /// pinned here.
+    #[test]
+    fn test_b1_other_absorption_length_below_the_first_node_is_out_of_range() {
+        let cu = find_material("Cu").unwrap();
+        assert_eq!(other_absorption_length_um(cu, 0.001), 0.0);
+        assert_eq!(other_absorption_length_um(cu, 0.005), 0.0);
+        assert_eq!(
+            other_absorption_length_um(cu, (cu.kev[0] as f64) - 1e-9),
+            0.0
         );
     }
 
+    /// CBUG-B1/B2 — the top bin interpolates on `[n-2, n-1]` like every other
+    /// bin. C read `keV[j+1]`/`mu[j+1]` there, i.e. the zero padding past
+    /// `numEntries` (and, for Pb, past the array), and this test pinned the
+    /// resulting `12821.1207067`. There is no `j+1` access left to make.
     #[test]
-    fn test_r6_67_other_absorption_length_below_the_first_node_uses_negative_frac() {
-        let cu = find_material("Cu").unwrap();
-        // j == 0, so frac = (keV - kev[0]) / (kev[1] - kev[0]) is large and
-        // negative. C still returns a length (it never rejects j < 1 here).
-        assert_close(
-            other_absorption_length_um(cu, 0.001),
-            0.0069425196228,
-            "Cu 0.001 keV absLen",
-        );
-        assert_close(
-            other_absorption_length_um(cu, 0.005),
-            0.00744181852859,
-            "Cu 0.005 keV absLen",
-        );
-    }
-
-    #[test]
-    fn test_r6_67_other_absorption_length_top_bin_reads_the_zero_padding() {
+    fn test_b1_other_absorption_length_top_bin_uses_the_real_nodes() {
         let cu = find_material("Cu").unwrap();
         let n = cu.kev.len();
-        // j == n-1, so `keV[j+1]`/`mu[j+1]` are the zeros past numEntries.
         let e = (cu.kev[n - 2] as f64 + cu.kev[n - 1] as f64) / 2.0;
+        // `interpolate_mu`'s own C-verified top-bin value (0.0916539989412).
         assert_close(
             other_absorption_length_um(cu, e),
-            12821.1207067,
+            1.0e4 / (cu.density * 0.0916539989412),
             "Cu top-bin absLen",
         );
     }
 
     #[test]
-    fn test_r6_67_other_absorption_length_at_or_above_the_last_node_is_zero() {
+    fn test_other_absorption_length_at_or_above_the_last_node_is_zero() {
         let cu = find_material("Cu").unwrap();
         let n = cu.kev.len();
-        // C pf4.st:637-639 — `j >= numEntries` -> `return 0.`, which the caller
-        // turns into exp(-x/0) = 0 (opaque).
+        // C pf4.st:637-639 — `j >= numEntries` -> `return 0.`. What the CALLER
+        // does with that 0 is CBUG-B4; the 0 itself is C's and is kept here.
         assert_eq!(other_absorption_length_um(cu, cu.kev[n - 1] as f64), 0.0);
         assert_eq!(other_absorption_length_um(cu, 500.0), 0.0);
     }

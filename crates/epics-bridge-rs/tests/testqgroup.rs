@@ -297,13 +297,22 @@ async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
 }
 
 /// a `DBE_LOG`-only post against a backing record (archive
-/// deadband fires without a value change) wakes the group monitor,
+/// deadband fires without a value change) reaches the group monitor,
 /// matching pvxs `groupsource.cpp:389` which subscribes group value
 /// events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
 ///
 /// Regression: the prior Rust mask was `VALUE|ALARM` only, so log
 /// posts dropped silently on group monitors and archiver-like
 /// clients tracking a group PV missed samples.
+///
+/// What the delivered event carries is decided downstream, and the two
+/// outcomes are the boundaries pinned here. pvxs refreshes a *triggered*
+/// target with `Value | Alarm` unconditionally, but the *self*-triggered
+/// field with `pDbFieldLog->mask & UpdateType::Everything`
+/// (`groupsource.cpp:327-337`) — and `Everything` excludes DBE_ARCHIVE, so
+/// a LOG-only post assigns nothing on itself. `subscriptionPost` then sees
+/// an unmarked value and returns without posting (`if(empty && !first)`,
+/// `groupsource.cpp:266-275`).
 #[tokio::test]
 async fn group_monitor_subscribes_archive_log_events() {
     use epics_base_rs::server::recgbl::EventMask;
@@ -314,35 +323,62 @@ async fn group_monitor_subscribes_archive_log_events() {
     let db = make_db().await;
     let provider = Arc::new(BridgeProvider::new(db.clone()));
     provider.load_group_config(GROUP_JSON).expect("load");
+    provider
+        .load_group_config(GROUP_JSON_NAMED_TRIGGER)
+        .expect("load trigger group");
+
+    // `level` triggers `count`: the LOG post carries no self leaves, but the
+    // triggered target refreshes with Value|Alarm, so the group posts with
+    // `count` marked. If the bridge had subscribed only with VALUE|ALARM the
+    // event would never arrive and this poll would time out.
+    let def = provider
+        .groups()
+        .get("TEST:grp_trig")
+        .cloned()
+        .expect("grp_trig registered");
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        rec.write().await.notify_field("VAL", EventMask::LOG);
+    }
+    let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+        .await
+        .expect("LOG event must reach the group monitor within 500ms")
+        .expect("snapshot delivered");
+    assert_eq!(
+        snap.marked,
+        Some(vec!["count".to_string()]),
+        "a DBE_ARCHIVE post refreshes the triggered target with Value|Alarm; \
+         the self field contributes nothing"
+    );
+    assert!(
+        !snap.value.fields.is_empty(),
+        "the posted value is the full group structure, got {snap:?}"
+    );
+    mon.stop().await;
+
+    // Self-trigger boundary: the same LOG-only post on the DEFAULT group
+    // (`level` triggers only itself) assigns nothing at all, so pvxs posts
+    // nothing — poll must stay parked.
     let def = provider
         .groups()
         .get("TEST:grp")
         .cloned()
         .expect("grp registered");
-
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
-
-    // Post a LOG-ONLY event on `level.VAL`. No VALUE / ALARM bit set;
-    // if the bridge had subscribed only with VALUE|ALARM the event
-    // would silently drop and the following poll would time out. The
-    // group monitor is purely delta-driven (the wire layer owns the
-    // initial frame), so this delta must wake poll() directly.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
-        let mut inst = rec.write().await;
-        inst.notify_field("VAL", EventMask::LOG);
+        rec.write().await.notify_field("VAL", EventMask::LOG);
     }
-
-    let polled = tokio::time::timeout(Duration::from_millis(500), mon.poll()).await;
-    let snap = polled
-        .expect("LOG event must wake group poll within 500ms")
-        .expect("snapshot delivered");
     assert!(
-        !snap.value.fields.is_empty(),
-        "log-event group snapshot must carry the full group structure, got {snap:?}"
+        tokio::time::timeout(Duration::from_millis(200), mon.poll())
+            .await
+            .is_err(),
+        "an ARCHIVE-only self-trigger event marks nothing — pvxs's \
+         subscriptionPost returns on `empty && !first`"
     );
-
     mon.stop().await;
 }
 
@@ -930,13 +966,15 @@ async fn br_fr12_named_trigger_marks_only_target() {
     mon.stop().await;
 }
 
-/// A pure self-trigger group keeps the
-/// value-diff path — every member defaults `+trigger`, so the monitor
-/// derives the changed-bitset (`marked: None`) instead of carrying an
-/// explicit set. This guards that the new marked-set path does not
-/// regress the existing self-trigger narrowing.
+/// R14-32 — a pure self-trigger group (the DEFAULT `+trigger` shape) marks
+/// its self member like any other trigger target. pvxs seeds
+/// `field.triggers` with the field itself
+/// (`groupconfigprocessor.cpp:317-339`) and runs the identical
+/// `IOCSource::get` mark loop, so there is no derive/diff special case: a
+/// `level` post marks `level` (a `+type:plain` member IS its value node)
+/// and nothing else.
 #[tokio::test]
-async fn br_fr12_pure_self_trigger_derives_bitset() {
+async fn r14_32_pure_self_trigger_marks_the_self_member() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::group::GroupMonitor;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
@@ -958,9 +996,10 @@ async fn br_fr12_pure_self_trigger_derives_bitset() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
 
-    // Delta-driven monitor: a single `level` post yields one delta. A
-    // pure self-trigger group derives its changed-bitset (marked: None)
-    // rather than carrying an explicit marked set.
+    // Delta-driven monitor: a single `level` post yields one delta carrying
+    // the self member's leaves — assigned-not-changed, so it is a pure
+    // function of the DBE mask and the mapping, never of what the snapshot
+    // diff happened to see move.
     {
         let rec = db.get_record("TEST:level").await.expect("rec exists");
         rec.write().await.notify_field("VAL", EventMask::VALUE);
@@ -969,10 +1008,10 @@ async fn br_fr12_pure_self_trigger_derives_bitset() {
         .await
         .expect("level event wakes poll within 500ms")
         .expect("snapshot");
-    assert!(
-        ev.marked.is_none(),
-        "a pure self-trigger group must derive its bitset (marked: None), got {:?}",
-        ev.marked
+    assert_eq!(
+        ev.marked,
+        Some(vec!["level".to_string()]),
+        "a self-triggered `level` post marks `level` and nothing else"
     );
 
     mon.stop().await;

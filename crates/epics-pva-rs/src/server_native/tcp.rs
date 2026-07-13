@@ -1742,6 +1742,14 @@ impl<'a> MonitorQueue<'a> {
     /// `Value` is: `testmask` finds a marked bit in any non-empty `pvMask`, so
     /// it always passes. `request2mask` cannot produce an empty mask (it
     /// throws instead), so there is no case where such a post is dropped.
+    ///
+    /// The gate is the frame's own changed-bitset
+    /// ([`crate::pvdata::encode::marked_wire_changed_bitset`], the same call
+    /// [`build_monitor_payload_marked`] frames with): pvxs's `testmask` scans
+    /// the `store[idx].valid` leaves, which are exactly the bits
+    /// `to_wire_valid` emits. Gating on the pre-canonical marked set would
+    /// admit a post on a STRUCTURE bit alone and then frame an empty
+    /// changed-bitset.
     fn real(&self, ev: &crate::server_native::MonitorUpdate) -> bool {
         if self.first || ev.type_changed {
             return true;
@@ -1749,9 +1757,7 @@ impl<'a> MonitorQueue<'a> {
         let Some(paths) = ev.marked.as_ref() else {
             return true;
         };
-        crate::pvdata::encode::marked_changed_bitset(self.intro, paths)
-            .iter()
-            .any(|bit| self.mask.get(bit))
+        !crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask).is_empty()
     }
 
     fn is_empty(&self) -> bool {
@@ -8035,22 +8041,14 @@ fn build_monitor_payload_marked(
     mask: &BitSet,
     order: ByteOrder,
 ) -> Vec<u8> {
-    // Selection = every leaf under each marked target path.
-    let target = crate::pvdata::encode::marked_changed_bitset(intro, marked_paths);
-    // Intersect with the request mask so a client that subscribed to a
-    // field subset never sees leaves outside it (pvxs intersects with
-    // `pvMask`).
-    let mut selected = BitSet::new();
-    for bit in target.iter() {
-        if mask.get(bit) {
-            selected.set(bit);
-        }
-    }
+    // The marked targets intersected with the request mask, canonicalized to
+    // leaf bits — the same call `MonitorQueue::real` gates on, so an admitted
+    // post can never frame an empty changed-bitset.
+    let changed = crate::pvdata::encode::marked_wire_changed_bitset(intro, marked_paths, mask);
 
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let changed = crate::pvdata::encode::canonical_changed_bitset(intro, &selected);
     changed.write_into(order, &mut payload);
     crate::pvdata::encode::encode_pv_field_with_bitset(
         value,
@@ -9087,6 +9085,122 @@ mod tests {
             tags(&q),
             vec![tag(0), tag(3)],
             "a masked-out post must not squash a real update out of the tail"
+        );
+    }
+
+    /// R14-31 — the enqueue gate and the wire changed-bitset must be ONE
+    /// computation. pvxs's `testmask` (`pvrequest.cpp:73-92`) scans
+    /// `store[idx].valid && mask[idx]`, and only leaves ever carry `valid`,
+    /// so its gate ranges over exactly the bits `to_wire_valid` emits. A
+    /// mask can hold a STRUCTURE bit with no leaf under it — `field(
+    /// timeStamp.bogus)`, a client typo: `request2mask` marks the matched
+    /// `timeStamp` structure and the non-existent child selects nothing.
+    /// Gating on the raw marked bitset (which carries structure bits) admits
+    /// such a post and then frames an EMPTY changed-bitset at full event
+    /// rate, where pvxs sends nothing at all.
+    ///
+    /// Tested per boundary: mask with a structure bit but no leaf (drop, and
+    /// the frame that was avoided is provably empty), and the same marked
+    /// path against a mask that does select a leaf below it (admit, and the
+    /// frame carries exactly that leaf).
+    #[test]
+    fn monitor_queue_drops_a_post_whose_wire_bitset_would_be_empty() {
+        // { value, timeStamp { secondsPastEpoch, nanoseconds } } — bits:
+        // 0 root, 1 value, 2 timeStamp, 3 secondsPastEpoch, 4 nanoseconds.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "timeStamp".into(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: vec![
+                            (
+                                "secondsPastEpoch".into(),
+                                FieldDesc::Scalar(ScalarType::Long),
+                            ),
+                            ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let empty_struct = || FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        };
+        // pvRequest `field(timeStamp.<leaf>)`, built as the wire type is.
+        let request = |leaf: &str| FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "field".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![(
+                        "timeStamp".into(),
+                        FieldDesc::Structure {
+                            struct_id: String::new(),
+                            fields: vec![(leaf.into(), empty_struct())],
+                        },
+                    )],
+                },
+            )],
+        };
+        let post = || crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(1)),
+            marked: Some(vec!["timeStamp".to_string()]),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let seed = PvField::Scalar(ScalarValue::Int(0));
+
+        // The typo: `field(timeStamp.bogus)` selects the `timeStamp`
+        // STRUCTURE bit and no leaf.
+        let bogus = crate::pv_request::request_to_mask(&intro, Some(&request("bogus")))
+            .expect("a matched structure keeps request2mask's foundrequested");
+        assert!(bogus.get(2), "the matched timeStamp structure bit is set");
+        assert!(
+            !bogus.get(3) && !bogus.get(4),
+            "no leaf below it is selected"
+        );
+
+        let mut q = MonitorQueue::new(4, &intro, &bogus);
+        q.seed(seed.clone());
+        assert!(
+            !q.push(post()),
+            "a post marking only a structure bit inside pvMask carries no wire \
+             leaf — pvxs's testmask drops it"
+        );
+        assert!(
+            crate::pvdata::encode::marked_wire_changed_bitset(
+                &intro,
+                &["timeStamp".to_string()],
+                &bogus,
+            )
+            .is_empty(),
+            "the frame the gate refused would have had an empty changed-bitset"
+        );
+
+        // Same marked path, but the request names a real leaf: admitted, and
+        // the wire bitset is exactly that leaf.
+        let real = crate::pv_request::request_to_mask(&intro, Some(&request("secondsPastEpoch")))
+            .expect("a matched leaf selects it");
+        let mut q = MonitorQueue::new(4, &intro, &real);
+        q.seed(seed);
+        assert!(
+            q.push(post()),
+            "a marked subtree with a selected leaf posts"
+        );
+        let changed = crate::pvdata::encode::marked_wire_changed_bitset(
+            &intro,
+            &["timeStamp".to_string()],
+            &real,
+        );
+        assert_eq!(
+            changed.iter().collect::<Vec<usize>>(),
+            vec![3],
+            "the frame carries the one selected leaf, not the structure bit"
         );
     }
 

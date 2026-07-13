@@ -1957,8 +1957,11 @@ enum EventMark {
     /// Post the group, marking exactly these group field paths
     /// (the resolved `+trigger` target set, assigned-not-changed).
     Marked(Vec<String>),
-    /// Post the group; the server derives the changed-bitset (full
-    /// request mask, or diff for a pure self-trigger group).
+    /// Post the group and let the server derive the changed-bitset (the
+    /// snapshot diff for a partial-emitting source, else the full request
+    /// mask). Reached ONLY when a marked target has no addressable field
+    /// path — a root-flattened member (`field_name == ""`), whose leaves
+    /// cannot be named — where marking nothing would under-mark the post.
     Derive,
     /// No post — `TriggerDef::None`, or every named target dropped
     /// (pvxs `subscriptionPost` `if(empty && !first) return`).
@@ -2035,11 +2038,17 @@ impl GroupMonitor {
     /// event from `source_idx`, mirroring pvxs `groupsource.cpp:283`
     /// iterating `field.triggers` and marking each target.
     ///
-    /// A *pure self-trigger* group keeps the existing path
-    /// ([`EventMark::Derive`]) so the value-diff narrowing and its
-    /// tests are untouched — this finding is about explicit `+trigger`
-    /// graphs, where `SelfOnly`, `All`, and named `Fields` must stay
-    /// distinct instead of all re-reading the full group.
+    /// A *pure self-trigger* group — the DEFAULT `+trigger` shape — is not
+    /// special: pvxs seeds `field.triggers` with the field itself
+    /// (`groupconfigprocessor.cpp:317-339`), so the self-triggered member
+    /// runs the very same `IOCSource::get` + mark loop as an explicit
+    /// `+trigger` target. Routing it through `leaves_or_derive` like every
+    /// other trigger shape is what gives it the same leaf narrowing; the
+    /// snapshot-diff path it used to take was two-sided divergence — WIDER
+    /// (a property event diffed timeStamp/alarm leaves that pvxs's
+    /// `UpdateType::Property` never assigns) and NARROWER (a value event
+    /// whose limits did not change diffed to nothing, where pvxs carries
+    /// them assigned-not-changed).
     ///
     /// Takes `&GroupPvDef` (not `&self`) so `poll` can call it while
     /// holding the `&mut self.event_rx` borrow — `def` is a disjoint
@@ -2059,12 +2068,6 @@ impl GroupMonitor {
         let Some(source) = def.members.get(source_idx) else {
             return EventMark::Skip;
         };
-        if def.is_pure_self_trigger() {
-            return match source.triggers {
-                TriggerDef::None => EventMark::Skip,
-                _ => EventMark::Derive,
-            };
-        }
         let trigger_change = DbeMask::VALUE | DbeMask::ALARM;
         let everything = DbeMask::VALUE | DbeMask::ALARM | DbeMask::PROPERTY;
         let self_change = if event_mask.is_empty() {
@@ -2115,15 +2118,16 @@ impl GroupMonitor {
     /// a *property* event marks only the source field's
     /// own mapping and never its triggers — pvxs `groupsource.cpp:325`
     /// ("we (may) only post changes to the field mapping in question.
-    /// But never the triggered fields."). A pure self-trigger group
-    /// keeps the diff path.
+    /// But never the triggered fields."). The trigger graph is not
+    /// consulted at all, so a pure self-trigger group takes this path like
+    /// any other: `UpdateType::Property` assigns only the property leaves,
+    /// and marking timeStamp/alarm here (as the snapshot diff did) is
+    /// exactly the divergence `getTimeAlarm`'s `change & (Value | Alarm)`
+    /// gate rules out (`iocsource.cpp:330-332`).
     fn property_event_mark(def: &GroupPvDef, source_idx: usize) -> EventMark {
         let Some(source) = def.members.get(source_idx) else {
             return EventMark::Skip;
         };
-        if def.is_pure_self_trigger() {
-            return EventMark::Derive;
-        }
         // pvxs passes `UpdateType::Property` unconditionally for a
         // property event (`groupsource.cpp:378`) — the event's own DBE
         // mask is not consulted.
@@ -2805,8 +2809,8 @@ mod tests {
     fn event_marks_narrow_to_update_type_leaves() {
         use crate::qsrv::group_config::parse_group_config;
 
-        // Mixed-trigger group (a `*` member) so the marks are explicit
-        // `Marked`, not the pure-self-trigger `Derive` diff path.
+        // Mixed-trigger group (a `*` member) so a value event marks the
+        // triggered member `b` as well as the source.
         let json = r#"{ "GRP": {
             "a": { "+channel": "R:a", "+trigger": "*" },
             "b": { "+channel": "R:b" }
@@ -2894,6 +2898,95 @@ mod tests {
             !p.iter().any(|leaf| leaf.starts_with("b.")),
             "property event must never mark triggered members: {p:?}"
         );
+    }
+
+    /// R14-32 — a PURE self-trigger group (no member declares `+trigger`:
+    /// the default shape, and the common one) marks leaves through the
+    /// same path as every explicit trigger graph. pvxs seeds
+    /// `field.triggers` with the field itself
+    /// (`groupconfigprocessor.cpp:317-339`) and then runs the identical
+    /// `IOCSource::get` mark loop (`groupsource.cpp:327-345`), so there is
+    /// no snapshot-diff special case to take.
+    ///
+    /// The diff path it used to take diverged on BOTH sides, so both are
+    /// pinned here as boundaries:
+    ///
+    /// * WIDER — a property event: the diff marked whatever leaves changed,
+    ///   including `timeStamp` (a record's property post restamps it). pvxs
+    ///   passes `UpdateType::Property` (`groupsource.cpp:378`), and
+    ///   `getTimeAlarm` is gated on `change & (Value | Alarm)`
+    ///   (`iocsource.cpp:330-332`), so timeStamp/alarm/value are NEVER
+    ///   assigned on a property event.
+    /// * NARROWER — a value event whose bytes did not change (a re-post at
+    ///   the same value, or metadata leaves the record rewrote identically)
+    ///   diffed to nothing, framing an empty changed-bitset. pvxs marks
+    ///   every leaf its UpdateType assigns, changed or not, so the mark set
+    ///   is a pure function of the DBE mask and the mapping.
+    #[test]
+    fn pure_self_trigger_group_marks_leaves_like_every_other_trigger() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        // No `+trigger` anywhere → every channeled member is self-triggered.
+        let json = r#"{ "GRP": {
+            "a": { "+channel": "R:a" },
+            "b": { "+channel": "R:b" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        assert!(
+            def.is_pure_self_trigger(),
+            "the default +trigger shape is a pure self-trigger group"
+        );
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "a")
+            .unwrap();
+
+        // Property boundary: exactly the `getProperties` leaves of the
+        // source member — no timeStamp, no alarm, no value, no other member.
+        let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, src) else {
+            panic!("a pure self-trigger property event must mark leaves, not derive");
+        };
+        assert!(
+            p.contains(&"a.display.limitLow".to_string())
+                && p.contains(&"a.valueAlarm.highAlarmLimit".to_string()),
+            "the property leaves getProperties assigns: {p:?}"
+        );
+        assert!(
+            !p.iter()
+                .any(|leaf| leaf == "a.timeStamp" || leaf == "a.alarm" || leaf == "a.value"),
+            "UpdateType::Property never reaches getTimeAlarm: {p:?}"
+        );
+        assert!(
+            !p.iter().any(|leaf| leaf.starts_with("b.")),
+            "a property event marks only the source's own mapping: {p:?}"
+        );
+
+        // Value boundary: the leaves the DBE mask assigns on the SELF member,
+        // marked assigned-not-changed — carried whether or not they differ
+        // from the last snapshot. Property leaves stay out (getProperties is
+        // gated on `change & Property`).
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
+        else {
+            panic!("a pure self-trigger value event must mark leaves, not derive");
+        };
+        assert_eq!(
+            v,
+            vec!["a.timeStamp", "a.alarm", "a.value"],
+            "Value|Alarm assigns timeStamp + alarm + value on the self member"
+        );
+
+        // An ALARM-only self post carries no value leaf; a VALUE-only one
+        // carries no alarm leaf (`getTimeAlarm`'s `change & Alarm` gate).
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::ALARM) else {
+            panic!("expected Marked from an alarm-only event");
+        };
+        assert_eq!(v, vec!["a.timeStamp", "a.alarm"], "no value leaf: {v:?}");
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE) else {
+            panic!("expected Marked from a value-only event");
+        };
+        assert_eq!(v, vec!["a.timeStamp", "a.value"], "no alarm leaf: {v:?}");
     }
 
     /// a `+type:meta` member marks alarm/timeStamp (no

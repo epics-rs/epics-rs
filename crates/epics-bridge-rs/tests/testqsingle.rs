@@ -1317,7 +1317,7 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
     };
     assert_eq!(
         nord,
-        EpicsValue::Long(12),
+        EpicsValue::ULong(12),
         "putLongString writes strlen+1 CHAR elements (the NUL counts)"
     );
 }

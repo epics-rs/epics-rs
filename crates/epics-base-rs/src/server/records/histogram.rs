@@ -196,8 +196,10 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(NELM,DBF_USHORT)` (histogramRecord.dbd.pod:163) — histogram's
+        // bin count is USHORT, not the ULONG the array records use.
         name: "NELM",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
@@ -253,13 +255,16 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(MDEL,DBF_SHORT)` (histogramRecord.dbd.pod:229) — the COUNT
+        // deadband, and `field(MCNT,DBF_SHORT)` (:234), counts since the last
+        // posted VAL. Both are SHORT, not LONG.
         name: "MDEL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Short,
         read_only: false,
     },
     FieldDesc {
         name: "MCNT",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::Short,
         read_only: true,
     },
     FieldDesc {
@@ -559,7 +564,11 @@ impl Record for HistogramRecord {
         match name {
             // C's epicsUInt32 counters (DBF_ULONG), surfaced as-is.
             "VAL" => Some(EpicsValue::ULongArray(self.val.clone())),
-            "NELM" => Some(EpicsValue::Long(self.nelm)),
+            // The DBF types are the `.dbd.pod`'s: NELM is DBF_USHORT (:163),
+            // MDEL/MCNT are DBF_SHORT (:229,:234). The value variant is what CA
+            // and PVA project the native type from, so it must agree with the
+            // `FieldDesc` — as VAL's ULongArray does.
+            "NELM" => Some(EpicsValue::UShort(self.nelm as u16)),
             "ULIM" => Some(EpicsValue::Double(self.ulim)),
             "LLIM" => Some(EpicsValue::Double(self.llim)),
             "WDTH" => Some(EpicsValue::Double(self.wdth)),
@@ -568,8 +577,8 @@ impl Record for HistogramRecord {
             "CMD" => Some(EpicsValue::Short(self.cmd)),
             "CSTA" => Some(EpicsValue::Short(if self.csta { 1 } else { 0 })),
             "SDEL" => Some(EpicsValue::Double(self.sdel)),
-            "MDEL" => Some(EpicsValue::Long(self.mdel)),
-            "MCNT" => Some(EpicsValue::Long(self.mcnt)),
+            "MDEL" => Some(EpicsValue::Short(self.mdel as i16)),
+            "MCNT" => Some(EpicsValue::Short(self.mcnt as i16)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SVAL" => Some(EpicsValue::Double(self.sval)),
@@ -659,12 +668,12 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SDEL".into())),
             },
-            "MDEL" => match value {
-                EpicsValue::Long(v) => {
+            "MDEL" => match crate::server::records::count_put(&value) {
+                Some(v) => {
                     self.mdel = v;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("MDEL".into())),
+                None => Err(CaError::TypeMismatch("MDEL".into())),
             },
             "SIMM" => match value {
                 EpicsValue::Short(v) => {
@@ -714,15 +723,15 @@ impl Record for HistogramRecord {
             // FieldDesc carries `read_only: true`), so a CA/PVA caput is still
             // rejected; this arm serves only the load path (`apply_fields`),
             // sizing the bin array exactly like `new()`.
-            "NELM" => match value {
-                EpicsValue::Long(n) => {
+            "NELM" => match crate::server::records::count_put(&value) {
+                Some(n) => {
                     let n = n.max(1);
                     self.nelm = n as i32;
                     self.val = vec![0; n as usize];
                     self.recompute_wdth();
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("NELM".into())),
+                None => Err(CaError::TypeMismatch("NELM".into())),
             },
             // WDTH/MCNT are computed runtime fields (no promptgroup) — never
             // client-writable, even at load. (OLDSIMM is the SPC_NOMOD saved
@@ -765,7 +774,8 @@ mod tests {
         let rec = HistogramRecord::default();
         assert_eq!(rec.nelm, 1);
         assert_eq!(rec.val.len(), 1, "VAL is sized by NELM");
-        assert_eq!(rec.get_field("NELM"), Some(EpicsValue::Long(1)));
+        // NELM is C's DBF_USHORT (histogramRecord.dbd.pod:163).
+        assert_eq!(rec.get_field("NELM"), Some(EpicsValue::UShort(1)));
     }
 
     #[test]

@@ -2503,12 +2503,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     // NORD elements (valid data) but the channel's
                                     // native count must be NELM (max capacity) so
                                     // clients allocate the right buffer.
+                                    // NELM is DBF_ULONG (waveformRecord.dbd.pod), so read
+                                    // it through the numeric view rather than one variant.
                                     let nelm = instance
                                         .resolve_field("NELM")
-                                        .and_then(|n| match n {
-                                            EpicsValue::Long(n) => Some(n.max(0) as u32),
-                                            _ => None,
-                                        })
+                                        .and_then(|n| n.to_f64())
+                                        .map(|n| n.max(0.0) as u32)
                                         .unwrap_or(v.count() as u32);
                                     (v.dbr_type(), nelm, LongStringMode::Plain)
                                 } else {

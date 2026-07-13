@@ -1,5 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Compress record — circular buffer with compression algorithms.
@@ -523,8 +524,9 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(NSAM,DBF_ULONG)` (compressRecord.dbd.pod:424).
         name: "NSAM",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
@@ -533,18 +535,21 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(N,DBF_ULONG)` (compressRecord.dbd.pod:431).
         name: "N",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
+        // C `field(OFF,DBF_ULONG)` (compressRecord.dbd.pod:473).
         name: "OFF",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
+        // C `field(NUSE,DBF_ULONG)` (compressRecord.dbd.pod:477).
         name: "NUSE",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     // C `field(OUSE,DBF_ULONG){ special(SPC_NOMOD) }`
@@ -552,7 +557,7 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
     // gates C `monitor()`'s NUSE post. Record-owned runtime state.
     FieldDesc {
         name: "OUSE",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     // C `field(INPN,DBF_LONG){ special(SPC_NOMOD) }`
@@ -589,8 +594,9 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        // C `field(INX,DBF_ULONG)` (compressRecord.dbd.pod:513).
         name: "INX",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
@@ -740,19 +746,25 @@ impl Record for CompressRecord {
                 // client sees on read.
                 Some(EpicsValue::DoubleArray(self.linearise_val()))
             }
-            "NSAM" => Some(EpicsValue::Long(self.nsam)),
-            "NUSE" => Some(EpicsValue::Long(self.nuse)),
-            "OUSE" => Some(EpicsValue::Long(self.ouse)),
+            // NSAM/N/OFF/NUSE/OUSE/INX are C's DBF_ULONG (INPN alone is
+            // DBF_LONG, :503). The value variant is what CA and PVA project the
+            // native type from — CA promotes DBF_ULONG to DBR_DOUBLE
+            // (db_convert.h), PVA serves uint32 — so it must agree with the
+            // `FieldDesc`. The counters are stored `i32` (the ring arithmetic is
+            // signed) and every writer floors them at 0, so `as u32` is exact.
+            "NSAM" => Some(EpicsValue::ULong(self.nsam as u32)),
+            "NUSE" => Some(EpicsValue::ULong(self.nuse as u32)),
+            "OUSE" => Some(EpicsValue::ULong(self.ouse as u32)),
             "INPN" => Some(EpicsValue::Long(self.inpn as i32)),
             "RES" => Some(EpicsValue::Short(self.res)),
             "BALG" => Some(EpicsValue::Short(self.balg)),
             "ALG" => Some(EpicsValue::Short(self.alg)),
-            "N" => Some(EpicsValue::Long(self.n)),
-            "OFF" => Some(EpicsValue::Long(self.off)),
+            "N" => Some(EpicsValue::ULong(self.n as u32)),
+            "OFF" => Some(EpicsValue::ULong(self.off as u32)),
             "PBUF" => Some(EpicsValue::Short(self.pbuf)),
             "ILIL" => Some(EpicsValue::Double(self.ilil)),
             "IHIL" => Some(EpicsValue::Double(self.ihil)),
-            "INX" => Some(EpicsValue::Long(self.inx)),
+            "INX" => Some(EpicsValue::ULong(self.inx as u32)),
             "CVB" => Some(EpicsValue::Double(self.cvb)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
@@ -791,12 +803,12 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("ALG".into())),
             },
-            "N" => match value {
-                EpicsValue::Long(v) => {
+            "N" => match count_put(&value) {
+                Some(v) => {
                     self.n = v;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("N".into())),
+                None => Err(CaError::TypeMismatch("N".into())),
             },
             // The four SPC_RESET arms below (RES/ALG/N/BALG/PBUF) STORE ONLY.
             // The reset is `special()`'s — C stores the value in `dbPut` and
@@ -852,8 +864,8 @@ impl Record for CompressRecord {
             // `read_only` gate; the FieldDesc carries `read_only: true`). This
             // arm serves only the load path, sizing the sample buffer like
             // `new()`.
-            "NSAM" => match value {
-                EpicsValue::Long(n) => {
+            "NSAM" => match count_put(&value) {
+                Some(n) => {
                     let n = n.max(1);
                     self.nsam = n as i32;
                     self.val = vec![0.0; n as usize];
@@ -862,7 +874,7 @@ impl Record for CompressRecord {
                     self.off = 0;
                     Ok(())
                 }
-                _ => Err(CaError::TypeMismatch("NSAM".into())),
+                None => Err(CaError::TypeMismatch("NSAM".into())),
             },
             // OFF/NUSE/OUSE/INPN/INX/CVB are `special(SPC_NOMOD)` runtime buffer
             // state — never client-writable, and (unlike NSAM) not settable at
@@ -1039,7 +1051,8 @@ mod pbuf_tests {
         let rec = CompressRecord::default();
         assert_eq!(rec.nsam, 1);
         assert_eq!(rec.val.len(), 1, "VAL is the NSAM-length buffer");
-        assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::Long(1)));
+        // NSAM is C's DBF_ULONG (compressRecord.dbd.pod:424).
+        assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::ULong(1)));
     }
 
     #[test]

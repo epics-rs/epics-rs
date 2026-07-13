@@ -845,6 +845,83 @@ impl PvDatabase {
         });
     }
 
+    /// (Re)arm a record's monitor watchdog — the single owner of the
+    /// [`Record::watchdog_interval`] / [`Record::watchdog_fire`] tick, and the
+    /// port of C `histogramRecord.c::wdogInit` + `wdogCallback` (:102-152).
+    ///
+    /// Called from exactly two places, C's own two `wdogInit` call sites: once
+    /// per record at `iocInit` (C `init_record` pass 1, `:168`) and from
+    /// [`ProcessAction::ArmWatchdog`], which a record's `special()` emits when
+    /// a put changed the period (histogram SDEL, `:266-268`).
+    ///
+    /// Arming bumps the record's `watchdog_generation`, so a tick already in
+    /// flight is superseded and simply exits — C's `callbackRequestDelayed`
+    /// replacing an outstanding delayed callback. The task re-reads the
+    /// interval on every iteration, so an SDEL put to 0 stops the watchdog at
+    /// its next fire without a separate cancel path.
+    ///
+    /// The tick is NOT a process cycle: it takes the record lock (C
+    /// `dbScanLock`), lets the record perform its own state change, stamps the
+    /// record (C `recGblGetTimeStamp`) and posts `DBE_VALUE | DBE_LOG` monitors
+    /// for the fields the record named — no `add_count`, no alarm tail, no
+    /// FLNK. A record with no watchdog (`watchdog_interval() == None`) spawns
+    /// nothing.
+    pub(crate) async fn arm_watchdog(&self, name: &str) {
+        let (rec, generation, epoch) = {
+            let records = self.inner.records.read().await;
+            let Some(rec) = records.get(name) else { return };
+            let instance = rec.read().await;
+            if instance.record.watchdog_interval().is_none() {
+                // Bumping the generation still cancels a watchdog left running
+                // by an earlier arm — an SDEL put to 0 comes through here.
+                instance
+                    .watchdog_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                return;
+            }
+            let generation = instance.watchdog_generation.clone();
+            let epoch = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            (rec.clone(), generation, epoch)
+        };
+
+        let is_soft = {
+            let instance = rec.read().await;
+            instance.device.is_none()
+        };
+        tokio::spawn(async move {
+            loop {
+                let interval = {
+                    let instance = rec.read().await;
+                    match instance.record.watchdog_interval() {
+                        Some(d) => d,
+                        // C: `if (prec->sdel > 0)` fails -> no re-arm.
+                        None => return,
+                    }
+                };
+                tokio::time::sleep(interval).await;
+                // A newer arm superseded this task while it slept.
+                if generation.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                    return;
+                }
+                let mut instance = rec.write().await;
+                let fields = instance.record.watchdog_fire();
+                if fields.is_empty() {
+                    // C `wdogCallback`: `mcnt == 0` -> no stamp, no post; the
+                    // timer still re-arms.
+                    continue;
+                }
+                super::apply_timestamp(&mut instance.common, is_soft);
+                for field in fields {
+                    instance.notify_field(
+                        field,
+                        crate::server::recgbl::EventMask::VALUE
+                            | crate::server::recgbl::EventMask::LOG,
+                    );
+                }
+            }
+        });
+    }
+
     /// Post an async-side field update for `name` — the C `db_post_events`
     /// analogue called from device-support / async-callback context.
     ///
@@ -4008,6 +4085,12 @@ impl PvDatabase {
                     // `schedule_delayed_reprocess` owner, shared with the
                     // SDLY async-simulation defer.
                     self.schedule_delayed_reprocess(record_name, delay).await;
+                }
+                ProcessAction::ArmWatchdog => {
+                    // C `wdogInit` from `special()` (histogram SDEL,
+                    // histogramRecord.c:266-268). The arm owner supersedes any
+                    // tick already in flight.
+                    self.arm_watchdog(record_name).await;
                 }
                 ProcessAction::ScanOnce => {
                     // C `scanOnce(precord)`. The `if (precord->scan)` guard C

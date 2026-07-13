@@ -410,6 +410,21 @@ pub enum ProcessAction {
         value: EpicsValue,
     },
 
+    /// (Re)arm this record's monitor watchdog — C `histogramRecord.c::wdogInit`
+    /// (:126-152), whose `callbackRequestDelayed(&pcallback->callback,
+    /// prec->sdel)` starts (or restarts) the periodic
+    /// [`Record::watchdog_fire`] tick.
+    ///
+    /// Emitted from a record's `special()` when the put changed the watchdog's
+    /// period (histogram SDEL is `special(SPC_RESET)` precisely so it can
+    /// re-arm, `histogramRecord.c:266-268`). The framework also arms every
+    /// record's watchdog once at `iocInit`, which is C's other `wdogInit` call
+    /// site (`init_record` pass 1, `:168`).
+    ///
+    /// Arming supersedes any tick already pending for the record, exactly as
+    /// C's `callbackRequestDelayed` replaces an outstanding delayed callback.
+    ArmWatchdog,
+
     /// Cancel this record's outstanding async re-entry (C
     /// `callbackCancelDelayed`): the framework advances the record's
     /// re-entry generation so any pending `ReprocessAfter` timer or
@@ -1569,6 +1584,50 @@ pub trait Record: Send + Sync + 'static {
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())
+    }
+
+    /// The period of this record's monitor watchdog, or `None` when it has
+    /// none — C `histogramRecord.c::wdogInit` (:126-152):
+    ///
+    /// ```c
+    /// static void wdogInit(histogramRecord *prec) {
+    ///     if (prec->sdel > 0) { ... callbackRequestDelayed(&pcallback->callback, prec->sdel); }
+    /// }
+    /// ```
+    ///
+    /// A watchdog is NOT a process cycle: it posts monitors for a record whose
+    /// value is changing but whose deadband (histogram MDEL) is holding the
+    /// posts back, so a slow accumulation still reaches a display. The
+    /// framework re-reads this on every tick, so clearing SDEL stops the
+    /// watchdog at the next fire without any separate cancel.
+    ///
+    /// histogram is the only base record with one. Default: no watchdog.
+    fn watchdog_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// One watchdog tick — C `histogramRecord.c::wdogCallback` (:102-124):
+    ///
+    /// ```c
+    /// if (prec->mcnt > 0) {
+    ///     dbScanLock(prec);
+    ///     recGblGetTimeStamp(prec);
+    ///     db_post_events(prec, &prec->val, DBE_VALUE | DBE_LOG);
+    ///     prec->mcnt = 0;
+    ///     dbScanUnlock(prec);
+    /// }
+    /// ```
+    ///
+    /// The record performs its own state change (histogram: zero MCNT) and
+    /// returns the fields whose monitors the framework must post — the
+    /// `db_post_events` half, which a record cannot do itself. An empty slice
+    /// means "nothing changed since the last tick": no timestamp, no post. The
+    /// framework holds the record lock across the call (C `dbScanLock`) and
+    /// re-arms afterwards from [`Self::watchdog_interval`].
+    ///
+    /// Default: nothing to post.
+    fn watchdog_fire(&mut self) -> &'static [&'static str] {
+        &[]
     }
 
     /// Whether this record type's support reads SIML through the `recGbl`

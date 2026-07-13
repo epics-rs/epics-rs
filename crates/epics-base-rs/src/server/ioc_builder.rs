@@ -225,6 +225,10 @@ impl IocBuilder {
                 // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
                 // &sval)`, run from every SIML-bearing `init_record` (pass 1).
                 db.rec_gbl_init_simm(&rec_arc).await;
+                // C `wdogInit(prec)` from `init_record` pass 1
+                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
+                // No-op for every record type without one.
+                db.arm_watchdog(&name).await;
             }
         }
 
@@ -351,6 +355,9 @@ impl IocBuilder {
                 // only site allowed to load a constant SIML/SIOL.
                 drop(instance);
                 db.rec_gbl_init_simm(&rec_arc).await;
+                // C `wdogInit(prec)` from `init_record` pass 1
+                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
+                db.arm_watchdog(&def.name).await;
                 let mut instance = rec_arc.write().await;
 
                 // Device support based on DTYP

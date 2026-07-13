@@ -62,6 +62,12 @@ pub struct HistogramRecord {
     /// reach, so the outcome is carried here and folded in by
     /// `post_init_finalize_undef` (the same shape aao uses for its constant DOL).
     constant_svl_loaded: bool,
+    /// A `special(SPC_RESET)` write to SDEL asked for `wdogInit`
+    /// (`histogramRecord.c:266-268`). `special()` has no database handle, so
+    /// the request is latched here and drained by `take_special_actions` as a
+    /// [`crate::server::record::ProcessAction::ArmWatchdog`] — the same shape
+    /// the scaler uses for the `dbPutLink` its `special()` performs.
+    rearm_watchdog: bool,
 }
 
 impl Default for HistogramRecord {
@@ -99,6 +105,7 @@ impl Default for HistogramRecord {
             sims: 0,
             sdly: -1.0,
             constant_svl_loaded: false,
+            rearm_watchdog: false,
         }
     }
 }
@@ -300,6 +307,74 @@ impl Record for HistogramRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// C `histogramRecord.c::special` (:226-274), SPC_RESET arm:
+    ///
+    /// ```c
+    /// case SPC_RESET:
+    ///     if (dbGetFieldIndex(paddr) == histogramRecordSDEL) {
+    ///         wdogInit(prec);                       /* re-arm the monitor watchdog */
+    ///     } else {                                  /* ULIM / LLIM */
+    ///         prec->wdth = (prec->ulim - prec->llim) / prec->nelm;
+    ///         clear_histogram(prec);
+    ///     }
+    /// ```
+    ///
+    /// One owner for the record's three SPC_RESET fields
+    /// (`histogramRecord.dbd.pod`: ULIM :183-189, LLIM :190-196, SDEL
+    /// :239-244). The SDEL arm re-arms the watchdog through
+    /// [`ProcessAction::ArmWatchdog`] — `special()` has no database handle, so
+    /// the framework performs the `wdogInit` on its behalf, drained
+    /// immediately after this returns (`take_special_actions`).
+    ///
+    /// (SIMM's SPC_MOD pass is the framework's `recGblSaveSimm`/`CheckSimm`
+    /// owner; SGNL's SPC_MOD `add_count` stays on the `put_field` arm, which is
+    /// the only route C's `dbPutField` takes to it.)
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        match field {
+            "SDEL" => self.rearm_watchdog = true,
+            "ULIM" | "LLIM" => {
+                self.recompute_wdth();
+                self.clear_histogram();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn take_special_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        if std::mem::take(&mut self.rearm_watchdog) {
+            vec![crate::server::record::ProcessAction::ArmWatchdog]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// C `wdogInit` (:126-152): `if (prec->sdel > 0)` arm a delayed callback of
+    /// SDEL seconds. A non-positive SDEL means no watchdog at all.
+    fn watchdog_interval(&self) -> Option<std::time::Duration> {
+        (self.sdel > 0.0).then(|| std::time::Duration::from_secs_f64(self.sdel))
+    }
+
+    /// C `wdogCallback` (:102-124): when counts have accumulated since the last
+    /// post (`mcnt > 0`), force a VAL post and zero MCNT. MDEL can hold every
+    /// process-time post back indefinitely (`monitor()` posts only when
+    /// `mcnt > mdel`, :283-291) — the watchdog is what makes a slow
+    /// accumulation still reach a display, every SDEL seconds.
+    ///
+    /// The framework stamps the record (`recGblGetTimeStamp`) and posts
+    /// `DBE_VALUE | DBE_LOG` for the returned field, then re-arms.
+    fn watchdog_fire(&mut self) -> &'static [&'static str] {
+        if self.mcnt > 0 {
+            self.mcnt = 0;
+            &["VAL"]
+        } else {
+            &[]
+        }
+    }
+
     /// `histogramRecord.dbd.pod` declares NO `INP` — the record's DBF_INLINK is
     /// `SVL` (:212), read into SGNL by `devHistogramSoft.c`. C's dbd rejects
     /// `field(INP,...)` on a histogram ("field not found"), and so does the
@@ -354,6 +429,20 @@ impl Record for HistogramRecord {
     /// and the record is then DEFINED. No bin increment: `add_count` runs only
     /// from `process()` and from the SGNL `special()`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            // C `init_record` pass 0 (histogramRecord.c:149-161): size the bin
+            // array, then `prec->wdth = (prec->ulim - prec->llim) / prec->nelm`.
+            // This is WDTH's owner at load — the ULIM/LLIM `put_field` arms
+            // only store, so a `.db` may declare NELM/ULIM/LLIM in any order.
+            if self.nelm <= 0 {
+                self.nelm = 1;
+            }
+            if self.val.len() != self.nelm as usize {
+                self.val = vec![0; self.nelm as usize];
+            }
+            self.recompute_wdth();
+            return Ok(());
+        }
         if pass != 1 {
             return Ok(());
         }
@@ -434,12 +523,15 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // ULIM/LLIM/SDEL are `special(SPC_RESET)` — the arms STORE ONLY.
+            // The side effects belong to `special()` (C runs them in
+            // `dbPutSpecial(paddr, 1)`, after `dbPut` stored the value), which
+            // is also what keeps the load path C-faithful: dbStaticLib never
+            // calls `special()`, and `init_record` pass 0 derives WDTH from the
+            // fields as loaded, in either order.
             "ULIM" => match value {
                 EpicsValue::Double(v) => {
                     self.ulim = v;
-                    // C SPC_RESET: recompute width and clear.
-                    self.recompute_wdth();
-                    self.clear_histogram();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("ULIM".into())),
@@ -447,8 +539,6 @@ impl Record for HistogramRecord {
             "LLIM" => match value {
                 EpicsValue::Double(v) => {
                     self.llim = v;
-                    self.recompute_wdth();
-                    self.clear_histogram();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("LLIM".into())),

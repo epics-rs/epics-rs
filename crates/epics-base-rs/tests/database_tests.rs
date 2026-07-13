@@ -7627,6 +7627,88 @@ async fn test_double_to_int_narrowing_matches_compiled_c() {
     }
 }
 
+/// C `histogramRecord.c::wdogCallback` (:102-124), armed by `wdogInit`
+/// (:126-152) from `init_record` pass 1 (:168) and from the SDEL
+/// `special(SPC_RESET)` (:266-268):
+///
+/// ```c
+/// if (prec->mcnt > 0) {
+///     dbScanLock(prec);
+///     recGblGetTimeStamp(prec);
+///     db_post_events(prec, &prec->val, DBE_VALUE | DBE_LOG);
+///     prec->mcnt = 0;
+///     dbScanUnlock(prec);
+/// }
+/// if (prec->sdel > 0) callbackRequestDelayed(&pcallback->callback, prec->sdel);
+/// ```
+///
+/// MDEL can hold every process-time post back indefinitely (`monitor()` posts
+/// only when `mcnt > mdel`), so without the watchdog a slow accumulation never
+/// reaches a display. Pre-fix an SDEL put stored the number and nothing else.
+#[tokio::test]
+async fn test_histogram_sdel_watchdog_posts_val() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::histogram::HistogramRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    let mut hist = HistogramRecord::new(2, 0.0, 10.0);
+    // MDEL far above the counts we will take: the process-time `monitor()`
+    // post is suppressed, so ONLY the watchdog can publish.
+    hist.mdel = 1000;
+    db.add_record("HI_WDOG", Box::new(hist)).await.unwrap();
+
+    let rec = db.get_record("HI_WDOG").await.unwrap();
+    let mut val_rx = rec
+        .write()
+        .await
+        .add_subscriber("VAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+        .expect("VAL subscription accepted");
+
+    // Accumulate a count (MCNT=1, well under MDEL — nothing is posted).
+    db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    while val_rx.try_recv().is_ok() {}
+
+    // Arm the watchdog: SDEL is special(SPC_RESET) -> wdogInit.
+    db.put_record_field_from_ca("HI_WDOG", "SDEL", EpicsValue::Double(0.05))
+        .await
+        .unwrap();
+
+    // The tick must post VAL and zero MCNT.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), val_rx.recv())
+        .await
+        .expect("SDEL watchdog must post VAL within one period")
+        .expect("subscription alive");
+    match &event.snapshot.value {
+        EpicsValue::LongArray(v) => assert_eq!(
+            v,
+            &vec![1, 0],
+            "the watchdog posts the accumulated bin counts"
+        ),
+        other => panic!("VAL must be LongArray, got {other:?}"),
+    }
+    assert_eq!(
+        rec.read().await.record.get_field("MCNT"),
+        Some(EpicsValue::Long(0)),
+        "wdogCallback zeroes MCNT after the post"
+    );
+
+    // It re-arms: a further count is posted on the next tick.
+    db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(6.0))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), val_rx.recv())
+        .await
+        .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
+        .expect("subscription alive");
+    match &event.snapshot.value {
+        EpicsValue::LongArray(v) => assert_eq!(v, &vec![1, 1]),
+        other => panic!("VAL must be LongArray, got {other:?}"),
+    }
+}
+
 /// epics-base PR `dabcf89` (2021) regression: when an mbboDirect
 /// record initialises with no VAL set (UDF=true on the framework
 /// side) but with at least one B0..B1F bit set in the .db file,

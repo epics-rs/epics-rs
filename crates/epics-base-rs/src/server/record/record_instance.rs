@@ -357,6 +357,14 @@ pub struct RecordInstance {
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
     pub reprocess_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Generation counter for the monitor watchdog
+    /// ([`Record::watchdog_interval`] / [`Record::watchdog_fire`]), bumped by
+    /// each `PvDatabase::arm_watchdog` so a re-arm supersedes the tick already
+    /// in flight — C `callbackRequestDelayed` replacing an outstanding delayed
+    /// callback. Deliberately NOT `reprocess_generation`: C's histogram wdog is
+    /// its own `epicsCallback`, independent of the record's SDLY/async
+    /// re-entry, so an SDLY defer must not cancel the watchdog nor vice versa.
+    pub watchdog_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Per-record info tags from `info("key", "value")` directives in
     /// the .db file (epics-base info(...) grammar). Consumers include
     /// asyn (`asyn:READBACK`), record-as-PV bridge tags
@@ -474,6 +482,7 @@ impl RecordInstance {
             array_hash_changed: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            watchdog_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             info: HashMap::new(),
             metadata_cache: StdMutex::new(None),
         }

@@ -57,12 +57,14 @@ pub fn heartbeat_interval() -> Duration {
 }
 
 /// Maximum time we'll wait between any incoming bytes before declaring
-/// the connection dead. pvxs effective timeout = configured × 4/3
-/// (config.cpp:187 tmoScale) — without the margin a healthy client
-/// races with its second ECHO. Floored at 2 s like pvxs `enforceTimeout`.
+/// the connection dead. The effective timeout is configured CONN_TMO ×
+/// 4/3 (`tmoScale`) put through pvxs `enforceTimeout` — the 2 s floor AND
+/// the `>= double(time_t::max)` → 40 s reset. Both come from the single
+/// owner `config::env::effective_tcp_timeout_secs`, so client and server
+/// cannot drift apart on the same CONN_TMO.
 pub fn heartbeat_timeout() -> Duration {
     let configured = crate::config::env::conn_timeout_secs();
-    Duration::from_secs_f64((configured * 4.0 / 3.0).max(2.0))
+    Duration::from_secs_f64(crate::config::env::effective_tcp_timeout_secs(configured))
 }
 
 /// Per-connection timeouts and limits threaded from the client builder
@@ -1602,6 +1604,33 @@ mod tests {
             "anonymous",
             "must fall back to anonymous when no methods are advertised"
         );
+    }
+
+    /// pvxs `enforceTimeout` (config.cpp:373-391) runs on the SCALED
+    /// tcpTimeout, so its upper reset fires for configured values that
+    /// `parse_timeout` accepts (<= time_t::max) but whose 4/3-scaled form
+    /// crosses time_t::max: 7e18 × 4/3 ≈ 9.33e18 >= 9.22e18 → 40 s.
+    /// Pre-fix this site applied only the 2 s floor and handed a ~9.33e18 s
+    /// (≈ 3e11 years) window to the dead-connection detector, i.e. the
+    /// client never timed out a dead server (R17-34).
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn heartbeat_timeout_resets_out_of_range_conn_tmo_to_40s() {
+        let prev = std::env::var("EPICS_PVA_CONN_TMO").ok();
+
+        unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "7e18") };
+        assert_eq!(
+            heartbeat_timeout(),
+            Duration::from_secs_f64(40.0),
+            "scaled CONN_TMO >= time_t::max must reset to pvxs's 40s default"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EPICS_PVA_CONN_TMO", v),
+                None => std::env::remove_var("EPICS_PVA_CONN_TMO"),
+            }
+        }
     }
 
     /// `heartbeat_timeout` is the effective TCP idle-timeout owner: it

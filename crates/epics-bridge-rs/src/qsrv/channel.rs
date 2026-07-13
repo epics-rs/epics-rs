@@ -564,23 +564,14 @@ impl BridgeChannel {
             (Some(v), NtType::LongString)
         } else {
             let resolved = instance.resolve_field(&field_upper);
-            // A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) is a
-            // `DBF_CHAR` array that semantically holds a NUL-terminated
-            // string. Serve it as a scalar-string NTScalar (pvxs's
-            // `form = "String"` view), not the byte scalar the `DBF_CHAR`
-            // type would otherwise select. The record declares these fields
-            // via `Record::long_string_fields`, so the bridge does not have
-            // to hard-code record-type names.
-            let nt_type = if instance
-                .record
-                .long_string_fields()
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(&field_upper))
-            {
-                NtType::LongString
-            } else {
-                pvif::nt_type_for_field(resolved.as_ref())
-            };
+            // `pvif::nt_type_for_channel` is the single owner of the NT
+            // choice (the port's `getChannelValueType`): a record-declared
+            // long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) AND a
+            // `DBF_CHAR` array VAL carrying `info(Q:form, "String")` — the
+            // QSRV long-string idiom — both resolve to the scalar-string
+            // NTScalar, not the byte array the `DBF_CHAR` type alone would
+            // select.
+            let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, resolved.as_ref());
             (resolved, nt_type)
         };
 
@@ -694,21 +685,26 @@ impl BridgeChannel {
         })?;
 
         let epics_val = if self.nt_type == NtType::LongString {
-            // Long-string channel: the QSRV value is a scalar string. The
-            // backing record's `put_field` accepts `EpicsValue::String`
-            // (and a legacy `CharArray`) directly and applies its own
-            // SIZV bound. Do NOT retype the string to the bound
-            // `DBF_CHAR` storage, which would try to parse the whole
-            // string as a single integer and reject the PUT.
-            match raw_val {
-                EpicsValue::String(_) | EpicsValue::CharArray(_) => raw_val,
-                // A non-string scalar PUT into a long-string field is
-                // rendered to its textual form (pvxs string conversion);
-                // the record then stores it.
-                other => EpicsValue::String(match crate::convert::epics_to_scalar(&other) {
-                    ScalarValue::String(s) => s,
-                    sv => sv.to_string().into(),
-                }),
+            // Long-string channel: the QSRV value is a scalar string
+            // (`value.as<std::string>()` in pvxs, which renders a non-string
+            // scalar to its textual form). Never retype it to the bound
+            // `DBF_CHAR` storage — that would parse the whole string as one
+            // integer and reject the PUT.
+            let text = pvif::long_string_value(&raw_val);
+            if self.value_dbf == DbFieldType::Char {
+                // The field's storage IS a `DBR_CHAR` array, so this is
+                // pvxs's `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`,
+                // i.e. the bytes plus the NUL. Writing the char image (not
+                // an `EpicsValue::String`) is what puts the record on C's
+                // long-string put path — bounded by SIZV / NELM, with
+                // `LEN`/`NORD` = strlen+1 — rather than the DBR_STRING path,
+                // which is capped at MAX_STRING_SIZE.
+                pvif::long_string_put_image(&text)
+            } else {
+                // String-backed storage (a `$` view of a DBF_STRING or link
+                // field): the record's own String put is the equivalent of
+                // C's re-viewed put.
+                EpicsValue::String(text)
             }
         } else {
             // Use typed conversion to match the bound field's actual DBF

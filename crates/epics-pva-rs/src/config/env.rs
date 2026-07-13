@@ -1409,6 +1409,27 @@ fn enforce_timeout(tmo: &mut f64) {
     }
 }
 
+/// The EFFECTIVE TCP inactivity timeout for a *configured*
+/// `EPICS_PVA_CONN_TMO` value: the `tmoScale` (4/3) followed by pvxs
+/// `enforceTimeout` (`config.cpp:373-391`), which C applies to the SCALED
+/// `tcpTimeout` (`config.cpp:527`/`:650`, after `parse_timeout` already
+/// multiplied by the scale).
+///
+/// SINGLE OWNER of "configured CONN_TMO → effective idle timeout". Both
+/// ends derive their window here — the native server's `idle_timeout` and
+/// the client's `heartbeat_timeout` — so neither can reproduce half the
+/// rule. The rule has BOTH bounds: `>= double(time_t::max)` (or
+/// non-finite / non-positive) resets to 40 s, and only then is the 2 s
+/// floor applied. Reproducing the floor alone left `CONN_TMO` in
+/// `[6.92e18, 9.22e18]` — values `parse_timeout` accepts, whose scaled
+/// form crosses `time_t::max` — running with a ~1.2e19 s window where
+/// pvxs falls back to 40 s (R17-34).
+pub fn effective_tcp_timeout_secs(configured: f64) -> f64 {
+    let mut tmo = configured * TMO_SCALE;
+    enforce_timeout(&mut tmo);
+    tmo
+}
+
 /// Wrap interface IPs as modifier-less [`Endpoint`]s (port 0 — a bind
 /// interface carries no destination port). Bridges the `Vec<IpAddr>`
 /// interface parsers to [`Config`]'s endpoint-typed `interfaces` field.
@@ -2989,6 +3010,39 @@ mod tests {
         nan.tcp_timeout = f64::NAN;
         nan.expand();
         assert_eq!(nan.tcp_timeout, 40.0);
+    }
+
+    /// `effective_tcp_timeout_secs` is the single owner of "configured
+    /// CONN_TMO → effective idle window": `tmoScale` (4/3) then pvxs
+    /// `enforceTimeout` (config.cpp:373-391), which has BOTH an upper
+    /// reset and a lower floor. Boundaries, one per case.
+    #[test]
+    fn effective_tcp_timeout_applies_both_enforce_timeout_bounds() {
+        // Default: 30 × 4/3 = 40 s, pvxs's documented effective timeout.
+        assert_eq!(effective_tcp_timeout_secs(30.0), 40.0);
+
+        // Lower floor: 1.0 × 4/3 = 1.333 < 2 → 2 s.
+        assert_eq!(effective_tcp_timeout_secs(1.0), 2.0);
+        // Exactly at the floor after scaling.
+        assert_eq!(effective_tcp_timeout_secs(1.5), 2.0);
+        // Above the floor: the scaled double survives verbatim.
+        assert_eq!(effective_tcp_timeout_secs(2.5), 2.5 * TMO_SCALE);
+
+        // Upper reset. `parse_timeout` ACCEPTS a configured value up to
+        // `time_t::max` (~9.22e18), and `enforceTimeout` then runs on the
+        // SCALED value — so any configured value above 3/4 of that (here
+        // 7e18 × 4/3 ≈ 9.33e18 ≥ time_t::max) resets to 40 s. Pre-fix the
+        // scale-then-floor sites kept the ~9.33e18 s window.
+        let accepted = 7e18_f64.min(TIMEOUT_SECS_MAX);
+        assert_eq!(accepted, 7e18, "7e18 must be an ACCEPTED CONN_TMO");
+        assert_eq!(effective_tcp_timeout_secs(accepted), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(TIMEOUT_SECS_MAX), 40.0);
+
+        // Non-positive / non-finite also reset to 40 s.
+        assert_eq!(effective_tcp_timeout_secs(0.0), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(-1.0), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(f64::INFINITY), 40.0);
+        assert_eq!(effective_tcp_timeout_secs(f64::NAN), 40.0);
     }
 
     /// `from_client_env` reads `EPICS_PVA_*`, scaling `CONN_TMO` by 4/3 and

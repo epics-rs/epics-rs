@@ -470,16 +470,15 @@ impl PvaServerConfig {
         if let Some(v) = env::tls_handshake_timeout_secs_opt() {
             self.tls_handshake_timeout = Duration::from_secs_f64(v);
         }
-        // Effective inactivity timeout = configured CONN_TMO × 4/3.
-        // pvxs config.cpp:187 applies the same scaling so a client
-        // sending ECHO every CONN_TMO/2 (the protocol convention)
-        // gets a margin against scheduling jitter — without it, a
-        // server with idle_timeout = exactly CONN_TMO would race
-        // with a healthy client's second ECHO and disconnect it.
-        // Floor at 2s mirrors pvxs `enforceTimeout`.
+        // Effective inactivity timeout = configured CONN_TMO × 4/3, then
+        // pvxs `enforceTimeout` — BOTH bounds, via the single owner
+        // `env::effective_tcp_timeout_secs`. The scaling gives a client
+        // sending ECHO every CONN_TMO/2 (the protocol convention) a margin
+        // against scheduling jitter; the 2 s floor and the
+        // `>= double(time_t::max)` → 40 s reset are the `enforceTimeout`
+        // halves the server must not reproduce partially.
         if let Some(c) = env::conn_timeout_secs_opt() {
-            let scaled = (c * 4.0 / 3.0).max(2.0);
-            self.idle_timeout = Duration::from_secs_f64(scaled);
+            self.idle_timeout = Duration::from_secs_f64(env::effective_tcp_timeout_secs(c));
         }
         // PVX-82 (IGNORE sibling): same all-unresolvable gate as INTF —
         // a non-blank IGNORE list that resolves to nothing means the
@@ -1995,6 +1994,52 @@ mod with_env_preserve_tests {
             assert_eq!(
                 cfg.udp_port, 11111,
                 "absent broadcast-port var must leave udp_port"
+            );
+        });
+    }
+
+    /// `with_env` derives `idle_timeout` from `EPICS_PVA_CONN_TMO` through
+    /// the same owner as the client (`env::effective_tcp_timeout_secs`):
+    /// the 4/3 scale, then pvxs `enforceTimeout` — floor AND upper reset.
+    /// A configured 7e18 is ACCEPTED by `parse_timeout` (<= time_t::max)
+    /// but its scaled form (≈9.33e18) crosses time_t::max, so pvxs falls
+    /// back to 40 s. Pre-fix this site applied only the floor and armed the
+    /// inactivity reaper with a ~3e11-year window (R17-34).
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn with_env_idle_timeout_applies_both_enforce_timeout_bounds() {
+        with_cleared_env(&["EPICS_PVA_CONN_TMO"], || {
+            let base = PvaServerConfig {
+                idle_timeout: Duration::from_secs(45),
+                ..Default::default()
+            };
+
+            // Absent → caller value preserved.
+            assert_eq!(
+                base.clone().with_env().idle_timeout,
+                Duration::from_secs(45)
+            );
+
+            // Default-shaped value: 30 × 4/3 = 40 s.
+            unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "30") };
+            assert_eq!(
+                base.clone().with_env().idle_timeout,
+                Duration::from_secs_f64(40.0)
+            );
+
+            // Below the floor: 1.0 × 4/3 = 1.333 → 2 s.
+            unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "1.0") };
+            assert_eq!(
+                base.clone().with_env().idle_timeout,
+                Duration::from_secs_f64(2.0)
+            );
+
+            // Upper reset: scaled >= time_t::max → 40 s.
+            unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "7e18") };
+            assert_eq!(
+                base.with_env().idle_timeout,
+                Duration::from_secs_f64(40.0),
+                "scaled CONN_TMO >= time_t::max must reset to pvxs's 40s default"
             );
         });
     }

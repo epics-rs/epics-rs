@@ -971,7 +971,11 @@ impl GroupChannel {
                 // enum choices (e.g. `.SCAN`). Matches the single-record
                 // path and pvxs's per-channel `getChannelValueType`
                 // (groupconfigprocessor.cpp:960-974).
-                let nt_type = pvif::nt_type_for_field(Some(&snapshot.value));
+                let nt_type = pvif::nt_type_for_channel(
+                    instance,
+                    &field_name.to_ascii_uppercase(),
+                    Some(&snapshot.value),
+                );
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
@@ -1051,7 +1055,7 @@ impl GroupChannel {
         let instance = rec.read().await;
         let field_upper = field_name.to_ascii_uppercase();
         let resolved = instance.resolve_field(&field_upper);
-        let nt_type = pvif::nt_type_for_field(resolved.as_ref());
+        let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, resolved.as_ref());
         let value_dbf = resolved
             .as_ref()
             .map(|v| v.db_field_type())

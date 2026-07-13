@@ -43,28 +43,47 @@ pub const INDEFINITE_TIMEOUT: std::time::Duration =
 /// "expired" a state a reader can see, rather than a magic zero.
 pub const EXPIRED_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
 
-/// Read `EPICS_CLI_TIMEOUT` from the environment, falling back to
-/// [`DEFAULT_CLI_TIMEOUT_SECS`] when unset, unparsable, or non-finite.
-/// Mirrors C `tool_lib.c:use_ca_timeout_env` (commit 1d056c6): it sets
-/// the timeout to any value `epicsScanDouble` accepts and only falls
-/// back to the default on a parse failure — the env var is consulted
-/// only when the caller did not pass `-w`/`--wait`. A value of `0` is a
-/// valid timeout meaning "wait forever" (see [`INDEFINITE_TIMEOUT`]), so
-/// it is passed through here and resolved by [`timeout_duration`], and so is
-/// a NEGATIVE value, which C treats as an already-expired deadline
-/// ([`EXPIRED_TIMEOUT`], W10-B1). Only the non-finite values stay clamped to
-/// the default.
+/// C `tool_lib.c:646-660` `use_ca_timeout_env`, which every tool calls BEFORE
+/// its getopt loop (`caget.c:396`, `camonitor.c:222`, `caput.c:288`,
+/// `cainfo.c:144`): `EPICS_CLI_TIMEOUT` sets `caTimeout` to whatever
+/// `epicsScanDouble` accepts, and a value it REJECTS both warns on stderr and
+/// falls back to `DEFAULT_TIMEOUT` (`tool_lib.h:51`, 1.0 s).
+///
+/// The scan is [`crate::copt::scan_double`] — the single owner of C's
+/// `epicsScanDouble` semantics, the very scanner `-w` goes through. A second,
+/// bare `str::parse` here read the env var STRICTLY where C is lenient:
+/// `EPICS_CLI_TIMEOUT=" -1 "` scans as -1 in C (`epicsParseDouble` skips
+/// leading and trailing whitespace) and made the tool exit 1 on an expired
+/// deadline, while the port silently took the 1 s default and connected — a
+/// flipped exit status from a value C accepts (R14-17). A rejected value was
+/// silently defaulted too, where C names the variable on stderr.
+///
+/// The warning is printed HERE, not buffered into [`crate::copt::Scan`], because
+/// C prints it before the getopt loop starts: it precedes every option warning
+/// and the `-h` usage block, whatever the command line says.
+///
+/// A value of `0` means "wait forever" (see [`INDEFINITE_TIMEOUT`]) and a
+/// NEGATIVE value is an already-expired deadline ([`EXPIRED_TIMEOUT`], W10-B1);
+/// both are passed through to [`timeout_duration`]. Only the non-finite values
+/// stay held back to the default — the deliberate deviation `timeout_duration`
+/// documents (C's `nan` hangs forever), and C's own scan accepts them silently,
+/// so no warning is raised for them either.
 pub fn env_default_timeout() -> f64 {
-    std::env::var("EPICS_CLI_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        // C `use_ca_timeout_env` accepts ANY value `epicsScanDouble` parses,
-        // negatives included — `EPICS_CLI_TIMEOUT=-1 caget TST:AO` reports a
-        // connect timeout and exits 1, exactly as `-w -1` does. Clamping the
-        // negative here hid the same defect [`timeout_duration`] had (W10-B1).
-        // Only the non-finite values are held back (see `timeout_duration`).
-        .filter(|v| v.is_finite())
-        .unwrap_or(DEFAULT_CLI_TIMEOUT_SECS)
+    let Ok(raw) = std::env::var("EPICS_CLI_TIMEOUT") else {
+        return DEFAULT_CLI_TIMEOUT_SECS;
+    };
+    let Some(secs) = crate::copt::scan_double(&raw) else {
+        eprintln!(
+            "'{raw}' is not a valid timeout value (from 'EPICS_CLI_TIMEOUT' in the \
+             environment) - ignored. (use '-h' for help.)"
+        );
+        return DEFAULT_CLI_TIMEOUT_SECS;
+    };
+    if secs.is_finite() {
+        secs
+    } else {
+        DEFAULT_CLI_TIMEOUT_SECS
+    }
 }
 
 /// Convert a user-supplied timeout (CLI `-w` or env var) into a
@@ -1557,6 +1576,36 @@ mod tests {
         );
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "2.5") };
         assert!((env_default_timeout() - 2.5).abs() < 1e-9);
+        unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
+    }
+
+    /// R14-17. The env var is scanned by `epicsScanDouble`, the same scanner
+    /// `-w` uses, so it accepts exactly what `-w` accepts and rejects exactly
+    /// what `-w` rejects — the boundaries of [`crate::copt::scan_double`], not
+    /// those of `str::parse::<f64>`:
+    ///
+    /// * surrounding whitespace is skipped (`epicsParseDouble`), so `" -1 "`
+    ///   is the expired deadline -1 and NOT the 1 s default;
+    /// * a trailing character is extraneous (`S_stdlib_extraneous`), so `"3x"`
+    ///   is rejected and the default stands.
+    #[serial_test::serial]
+    #[test]
+    fn env_timeout_scans_with_epics_scan_double_not_str_parse() {
+        let env = |v: &str| {
+            // SAFETY: serial_test::serial guarantees no concurrent env access.
+            unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", v) };
+            env_default_timeout()
+        };
+        assert_eq!(env(" -1 "), -1.0, "epicsParseDouble skips the whitespace");
+        assert_eq!(
+            timeout_duration(env(" -1 ")),
+            EXPIRED_TIMEOUT,
+            "so it is the same expired deadline `-w -1` is, exit 1 and all"
+        );
+        assert_eq!(env(" 2.5\t"), 2.5);
+        assert_eq!(env("3x"), DEFAULT_CLI_TIMEOUT_SECS, "extraneous character");
+        assert_eq!(env("abc"), DEFAULT_CLI_TIMEOUT_SECS);
+        assert_eq!(env(""), DEFAULT_CLI_TIMEOUT_SECS);
         unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
     }
 

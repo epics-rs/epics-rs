@@ -761,8 +761,9 @@ async fn main() {
     // order of `-t`/`-a`/`-d` is recoverable for the C mutual-exclusion
     // rule (`resolve_format`).
     let cmd = Args::command();
-    let matches = TOOL.get_matches(cmd.clone());
-    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
     // C's ENTIRE getopt loop runs before any post-loop check, so every option
     // argument is scanned — and every warning raised — while `nPvs` is still
@@ -773,7 +774,7 @@ async fn main() {
     // `value_format` is what scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`,
     // and `resolve_format` is what scans `-t`/`-a`/`-d`; between them and the
     // two below, every C-scanned argument in this tool is resolved here, once.
-    let mut scan = TOOL.scan(&matches);
+    let mut scan = parsed.scan();
     let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
     let priority = scan.priority("priority");
     // Folded ONCE: C's `-0` case scans the base and, on success only, forces

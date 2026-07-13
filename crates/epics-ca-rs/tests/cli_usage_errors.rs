@@ -13,8 +13,13 @@
 //!
 //! No C CA tool exits 2, and none has a *required* positional — getopt
 //! parses, then `main` validates. Verified against the compiled C tools
-//! (EPICS 7 base): all sixteen invocations below were run head-to-head and
-//! are byte-identical, exit status included.
+//! (EPICS 7 base): the invocations below were run head-to-head and are
+//! byte-identical, exit status included.
+//!
+//! Those three arms are arms of the LOOP, reached in argv order like every
+//! other case — so a warning from an option BEFORE the offending token is
+//! already on stderr when the diagnostic prints, and an option after it is
+//! never scanned at all (R14-18).
 
 use std::process::Command;
 
@@ -79,8 +84,9 @@ fn unknown_option_is_status_1_with_the_c_diagnostic() {
 /// that `-n` prints the whole block.
 ///
 /// (The block's wording is clap's, not C's — a standing divergence of this port,
-/// pinned by `help_and_version_still_exit_0` below. What this test pins is the
-/// ARM: usage block, status 1, and no `case '?'` diagnostic.)
+/// pinned by `help_goes_to_stderr_and_version_to_stdout_both_exit_0` below. What
+/// this test pins is the ARM: usage block, status 1, and no `case '?'`
+/// diagnostic.)
 #[test]
 fn cainfo_dash_n_is_the_c_default_arm_not_an_unknown_option() {
     let (code, stdout, stderr) = run(env!("CARGO_BIN_EXE_cainfo-rs"), &["-n", "PV"]);
@@ -129,6 +135,91 @@ fn long_form_missing_value_still_reports_the_c_short_letter() {
     );
 }
 
+/// R14-18. `case '?'` is an arm of the getopt LOOP, not a pre-pass: the
+/// options before the offending token have already been scanned, so each of
+/// their warnings is on stderr before the diagnostic. `caget -w abc -X` is TWO
+/// lines in C — the `-w` warning, then the `-X` line — where the port printed
+/// only the second.
+#[test]
+fn a_warning_before_the_offending_option_prints_first() {
+    for (bin, tool) in TOOLS {
+        let (code, _, stderr) = run(bin, &["-w", "abc", "-X"]);
+        assert_eq!(code, 1, "{tool}: status");
+        assert_eq!(
+            stderr,
+            format!(
+                "'abc' is not a valid timeout value - ignored, using '1.0'. \
+                 ('{tool} -h' for help.)\n\
+                 Unrecognized option: '-X'. ('{tool} -h' for help.)\n"
+            ),
+            "{tool}: stderr"
+        );
+    }
+}
+
+/// The same fact from the other side: `case '?'` `return`s 1 where it stands,
+/// so an option AFTER the offending token is never scanned and never warns.
+#[test]
+fn an_option_after_the_offending_one_is_never_scanned() {
+    for (bin, tool) in TOOLS {
+        let (code, _, stderr) = run(bin, &["-X", "-w", "abc"]);
+        assert_eq!(code, 1, "{tool}: status");
+        assert_eq!(
+            stderr,
+            format!("Unrecognized option: '-X'. ('{tool} -h' for help.)\n"),
+            "{tool}: stderr"
+        );
+    }
+}
+
+/// `case ':'` cuts the loop the same way — a warning raised before the option
+/// whose argument is missing still prints.
+#[test]
+fn a_warning_before_a_missing_argument_prints_first() {
+    let (code, _, stderr) = run(env!("CARGO_BIN_EXE_caget-rs"), &["-p", "zz", "-w"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        "'zz' is not a valid CA priority - ignored. ('caget -h' for help.)\n\
+         Option '-w' requires an argument. ('caget -h' for help.)\n"
+    );
+}
+
+/// `-h` and the error are both exits from the one loop, so the EARLIER token
+/// wins: `-h` before the offending option returns 0 with the usage block and
+/// no diagnostic; after it, the loop never reaches the `-h`.
+#[test]
+fn the_earlier_of_help_and_the_error_ends_the_loop() {
+    let bin = env!("CARGO_BIN_EXE_caget-rs");
+
+    let (code, _, stderr) = run(bin, &["-h", "-X"]);
+    assert_eq!(code, 0, "`case 'h'` returns 0 before the loop meets '-X'");
+    assert!(
+        !stderr.contains("Unrecognized option"),
+        "stderr was:\n{stderr}"
+    );
+    assert!(stderr.contains("Usage:"), "stderr was:\n{stderr}");
+
+    let (code, _, stderr) = run(bin, &["-X", "-h"]);
+    assert_eq!(code, 1, "`case '?'` returns 1 before the loop meets '-h'");
+    assert_eq!(
+        stderr, "Unrecognized option: '-X'. ('caget -h' for help.)\n",
+        "no usage block: C's `case '?'` prints one line"
+    );
+}
+
+/// getopt blames the FIRST unknown option and returns there, so a second one
+/// further along the command line is never reported.
+#[test]
+fn the_first_offending_option_is_the_one_reported() {
+    let (code, _, stderr) = run(env!("CARGO_BIN_EXE_caget-rs"), &["-X", "-Y"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        "Unrecognized option: '-X'. ('caget -h' for help.)\n"
+    );
+}
+
 /// C `caput.c:462-465` `if (nPvs < 2)` — the PV-name check comes first, so
 /// a PV with no value is a *value* error, not a PV error.
 #[test]
@@ -138,15 +229,35 @@ fn caput_without_a_value_reports_no_value_specified() {
     assert_eq!(stderr, "No value specified. ('caput -h' for help.)\n");
 }
 
-/// `-h`/`-V` are not usage errors: clap owns them and they exit 0, like C's
-/// `usage()` / version paths. The exit-1 mapping must not swallow them.
+/// `-h`/`-V` are not usage errors: they exit 0, like C's `usage()` / version
+/// paths. The exit-1 mapping must not swallow them.
+///
+/// The STREAMS differ, and C picks them per call: `usage()` is one
+/// `fprintf(stderr, ...)` (`caget.c:55-58`, `camonitor.c:45-47`,
+/// `caput.c:60-62`, `cainfo.c:37-39`), while `case 'V'` is a `printf`
+/// (`caget.c:403`). So `-h` writes stderr and `-V` writes stdout — R14-16;
+/// the port used to send the exit-0 help block to stdout because that is
+/// clap's stream.
 #[test]
-fn help_and_version_still_exit_0() {
+fn help_goes_to_stderr_and_version_to_stdout_both_exit_0() {
     for (bin, tool) in TOOLS {
-        for flag in ["-h", "-V"] {
-            let (code, stdout, _) = run(bin, &[flag]);
-            assert_eq!(code, 0, "{tool} {flag}: status");
-            assert!(!stdout.is_empty(), "{tool} {flag}: stdout");
-        }
+        let (code, stdout, stderr) = run(bin, &["-h"]);
+        assert_eq!(code, 0, "{tool} -h: status");
+        assert!(
+            stderr.contains("Usage:"),
+            "{tool} -h: C's usage() writes stderr; stderr was:\n{stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "{tool} -h: nothing goes to stdout; stdout was:\n{stdout}"
+        );
+
+        let (code, stdout, stderr) = run(bin, &["-V"]);
+        assert_eq!(code, 0, "{tool} -V: status");
+        assert!(!stdout.is_empty(), "{tool} -V: the banner is a printf");
+        assert!(
+            stderr.is_empty(),
+            "{tool} -V: nothing goes to stderr; stderr was:\n{stderr}"
+        );
     }
 }

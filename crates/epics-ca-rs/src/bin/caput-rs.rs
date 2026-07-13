@@ -313,19 +313,20 @@ fn last_of_pair(matches: &clap::ArgMatches, this_id: &str, that_id: &str) -> (bo
 #[tokio::main]
 async fn main() {
     let cmd = Args::command();
-    let matches = TOOL.get_matches(cmd.clone());
-    let args = Args::from_arg_matches(&matches).expect("clap validated the arguments");
+    let parsed = TOOL.get_matches(cmd.clone());
+    let matches = parsed.matches();
+    let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
     // The two mutually-clearing pairs, resolved in command-line order.
-    let (force_numeric, force_string) = last_of_pair(&matches, "force_numeric", "force_string");
-    let (long_string, array_mode) = last_of_pair(&matches, "long_string", "array_mode");
+    let (force_numeric, force_string) = last_of_pair(matches, "force_numeric", "force_string");
+    let (long_string, array_mode) = last_of_pair(matches, "long_string", "array_mode");
     let terse = args.terse > 0;
     let callback = args.callback > 0;
 
     // C's ENTIRE getopt loop runs before the `nPvs < 1` / `nPvs < 2` checks
     // (`caput.c:290-455`, then `:457`), so every option argument is scanned —
     // and every warning raised — even when no PV name or value follows.
-    let mut scan = TOOL.scan(&matches);
+    let mut scan = parsed.scan();
     Args::scan_dead_element_count(&mut scan);
     let ca_timeout = scan.timeout("timeout", epics_ca_rs::cli::env_default_timeout());
     let priority = scan.priority("priority");

@@ -55,6 +55,14 @@
 //! ([`assert_repeatable`] now rejects clap's Help/Version actions outright), and
 //! no resolver may write to stderr directly.
 //!
+//! The loop's THIRD exit is the getopt error — `case '?'` / `case ':'` — and it
+//! is a case like any other: it stands at a position, the options before it
+//! have already warned, the ones after it are never scanned. clap cannot
+//! express that (it fails the whole parse and hands back no `ArgMatches`), so
+//! [`CTool::get_matches`] cuts the command line where getopt cuts it and
+//! returns a [`Parsed`] over the prefix, carrying the diagnostic for
+//! [`Scan::finish`] to print in its place (R14-18).
+//!
 //! # Long-form options (DELIBERATE deviation — kept by user decision, wave 11)
 //!
 //! C parses SHORT options only: `getopt(3)` treats `caget --wait 5` as the
@@ -146,12 +154,15 @@ pub enum Terminal {
     /// `default:` arm that a declared-but-unhandled option letter falls into
     /// returns 1.
     ///
-    /// C writes the block to stderr in both cases. This port writes the
-    /// exit-0 (help was ASKED for) block to stdout, which is where clap has
-    /// always put it and what the tools' own tests pin; the exit-1 (the user
-    /// got it wrong) block goes to stderr, as every other diagnostic here
-    /// does. The block's WORDING is clap's, not C's — a standing, separate
-    /// divergence.
+    /// The block goes to STDERR at either status, because that is the only
+    /// stream C's `usage()` ever writes: all four tools open it with
+    /// `fprintf (stderr, "\nUsage: ...")` (`caget.c:55-58`, `camonitor.c:45-47`,
+    /// `caput.c:60-62`, `cainfo.c:37-39`), and the `-h` case just calls that
+    /// same function. One block, one stream, both statuses — the port used to
+    /// split it, sending the exit-0 half to stdout because that is where clap
+    /// puts help. The block's WORDING is still clap's, not C's — a standing,
+    /// separate divergence. `-V` keeps stdout: C prints the version banner with
+    /// `printf` (`caget.c:403`).
     Usage(i32),
     /// C `case 'V'`: the version banner on stdout, `return 0`.
     Version,
@@ -169,6 +180,11 @@ pub struct Scan<'m> {
     tool: CTool,
     matches: &'m clap::ArgMatches,
     warnings: Vec<(usize, String)>,
+    /// The `'?'` / `':'` diagnostic the loop is heading for, if the command
+    /// line has one ([`Parsed`]) — already rendered, newline included. It ends
+    /// the loop at the offending token, AFTER every option before it, which is
+    /// why it cannot be printed at parse time (R14-18).
+    error: Option<&'m str>,
 }
 
 impl<'m> Scan<'m> {
@@ -258,9 +274,21 @@ impl<'m> Scan<'m> {
     /// option the whole buffer prints and the caller carries on into the
     /// post-loop checks (`nPvs < 1`, …), exactly where C goes next.
     ///
+    /// A getopt ERROR (`'?'` / `':'`) is a third way out, and it is performed
+    /// here for the same reason the other two are: it ends the loop where the
+    /// offending token stands, so every warning BEFORE that token has already
+    /// printed (`caget -w abc -X` is two stderr lines in C, the `-w` warning
+    /// and the `-X` diagnostic) and every option after it is never scanned.
+    /// [`Parsed`] holds the error back for exactly this moment; an `-h` that
+    /// precedes the offending token still wins, because C's loop reaches it
+    /// first and `return`s 0 (R14-18).
+    ///
     /// `cmd` renders the usage block; `version_info` is the tool's `-V` banner.
     pub fn finish(self, cmd: &clap::Command, version_info: &str, terminals: &[(&str, Terminal)]) {
         let terminal = self.terminal(terminals);
+        // The error sits at the offending token, which is past every option in
+        // `matches` — [`Parsed`] parsed only the argv PREFIX before it — so any
+        // terminal option there is came first and takes the loop's exit.
         let cutoff = terminal.map(|(i, _)| i);
 
         let mut warnings = self.warnings;
@@ -279,18 +307,21 @@ impl<'m> Scan<'m> {
         }
 
         match terminal {
-            None => {}
+            None => {
+                if let Some(diagnostic) = self.error {
+                    // C's `case '?'` / `case ':'`: the one line, then `return 1`.
+                    let _ = std::io::stderr().write_all(diagnostic.as_bytes());
+                    std::process::exit(1)
+                }
+            }
             Some((_, Terminal::Version)) => {
                 println!("{version_info}");
                 std::process::exit(0)
             }
             Some((_, Terminal::Usage(status))) => {
-                let mut cmd = cmd.clone();
-                if status == 0 {
-                    let _ = cmd.print_help();
-                } else {
-                    let _ = cmd.write_help(&mut std::io::stderr());
-                }
+                // C's `usage()` writes to stderr whatever brought it here —
+                // `-h`, or the `default:` arm's exit-1 path.
+                let _ = cmd.clone().write_help(&mut std::io::stderr());
                 std::process::exit(status)
             }
         }
@@ -408,11 +439,62 @@ impl CTool {
     /// Begin C's getopt loop over an already-parsed command line. Every option
     /// this tool scans must be resolved through the returned [`Scan`], so that
     /// every warning it raises is ordered against the rest of the loop.
+    ///
+    /// A command line with a getopt ERROR in it must be scanned through
+    /// [`Parsed::scan`] instead — that is what carries the error into
+    /// [`Scan::finish`]. This entry point is for a command line that has none
+    /// (the crate's own tests build their `ArgMatches` directly).
     pub fn scan(self, matches: &clap::ArgMatches) -> Scan<'_> {
         Scan {
             tool: self,
             matches,
             warnings: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+/// One tool's command line after clap, and the getopt error it is heading for.
+///
+/// C's `'?'` / `':'` cases are ordinary arms of the loop: getopt hands the loop
+/// the options BEFORE the offending token first — each scanned, each warning
+/// printed — and only then the error, which prints its own line and `return`s 1
+/// (`caget.c:509-518`). clap has no loop: it fails the whole parse at the
+/// offending token and yields no `ArgMatches` at all, so the port used to exit
+/// on the error with the preceding warnings never raised (`caget -w abc -X`
+/// printed ONE line where C prints two — R14-18).
+///
+/// So the parse is cut where getopt cuts it: on a usage error, the longest argv
+/// PREFIX that parses is what the loop reached, and it is parsed on its own.
+/// The tool then runs its resolvers over that prefix exactly as it would over a
+/// clean command line — same code path, no replay of a second kind — and
+/// [`Scan::finish`], the single owner of the loop's exit, performs the error
+/// after the warnings. An option after the offending token is not in the
+/// prefix, so it is never scanned and never warns, which is also C
+/// (`caget -X -w abc` prints only the `-X` line).
+pub struct Parsed {
+    tool: CTool,
+    matches: clap::ArgMatches,
+    /// C's diagnostic for the offending token, rendered at parse time and
+    /// PRINTED by [`Scan::finish`] — never before the warnings that precede it.
+    error: Option<String>,
+}
+
+impl Parsed {
+    /// The parsed options — of the whole command line, or of the prefix before
+    /// the offending token when there is a getopt error.
+    pub fn matches(&self) -> &clap::ArgMatches {
+        &self.matches
+    }
+
+    /// Begin the getopt loop over this command line, carrying its error (if
+    /// any) to [`Scan::finish`].
+    pub fn scan(&self) -> Scan<'_> {
+        Scan {
+            tool: self.tool,
+            matches: &self.matches,
+            warnings: Vec::new(),
+            error: self.error.as_deref(),
         }
     }
 }
@@ -691,8 +773,13 @@ impl CTool {
     /// `cainfo.c:202-205`, plus the getopt `'?'`/`':'` cases). No C CA tool
     /// exits 2, and none dumps its usage block on an error.
     pub fn usage_error(self, what: &str) -> ! {
-        eprintln!("{what}. ('{tool} -h' for help.)", tool = self.0);
+        let _ = std::io::stderr().write_all(self.diagnostic(what).as_bytes());
         std::process::exit(1)
+    }
+
+    /// That one line, rendered — newline included.
+    fn diagnostic(self, what: &str) -> String {
+        format!("{what}. ('{tool} -h' for help.)\n", tool = self.0)
     }
 
     /// C `if (nPvs < 1)` after the getopt loop. The C tools have NO required
@@ -711,24 +798,70 @@ impl CTool {
     /// getopt loop does: every error path exits 1 with C's diagnostic, never
     /// clap's exit 2.
     ///
-    /// clap never TERMINATES the parse here — `-h`/`-V` are ordinary options
-    /// ([`assert_repeatable`] rejects the Help/Version actions), performed by
-    /// [`Scan::finish`] at their place in the getopt order so the warnings C
-    /// prints ahead of them survive (R13-26).
+    /// clap TERMINATES nothing here. `-h`/`-V` are ordinary options
+    /// ([`assert_repeatable`] rejects the Help/Version actions) and a usage
+    /// error is held in the returned [`Parsed`]; both are performed by
+    /// [`Scan::finish`] at their place in the getopt order, so the warnings C
+    /// prints ahead of them survive (R13-26, R14-18).
     ///
     /// This is the only entry point the binaries use, so a new option cannot
     /// re-introduce an exit-2 path by being declared through the derive — nor
     /// a non-repeatable option, which [`assert_repeatable`] rejects here.
-    pub fn get_matches(self, cmd: clap::Command) -> clap::ArgMatches {
-        assert_repeatable(&cmd);
-        let spec = cmd.clone();
-        match cmd.try_get_matches() {
-            Ok(m) => m,
-            Err(e) => self.usage_exit(&spec, e),
-        }
+    pub fn get_matches(self, cmd: clap::Command) -> Parsed {
+        self.get_matches_from(cmd, std::env::args_os())
     }
 
-    fn usage_exit(self, spec: &clap::Command, e: clap::Error) -> ! {
+    /// [`CTool::get_matches`] over an explicit `argv` — the whole command line,
+    /// program name included, as `getopt` sees it.
+    pub fn get_matches_from<I, T>(self, cmd: clap::Command, argv: I) -> Parsed
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        assert_repeatable(&cmd);
+        let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
+        let error = match cmd.clone().try_get_matches_from(&argv) {
+            Ok(matches) => {
+                return Parsed {
+                    tool: self,
+                    matches,
+                    error: None,
+                };
+            }
+            Err(e) => e,
+        };
+
+        // getopt stops AT the offending token: the options before it were all
+        // processed, the ones after it never are. The longest argv prefix clap
+        // accepts is exactly that "before" — parse it on its own, and take the
+        // error from the shortest prefix that FAILS, so the diagnostic names
+        // the FIRST offending token even when the command line has several.
+        for k in (1..argv.len()).rev() {
+            let Ok(matches) = cmd.clone().try_get_matches_from(&argv[..k]) else {
+                continue;
+            };
+            let error = cmd
+                .clone()
+                .try_get_matches_from(&argv[..=k])
+                .err()
+                .unwrap_or(error);
+            return Parsed {
+                tool: self,
+                matches,
+                error: Some(self.usage_diagnostic(&cmd, error)),
+            };
+        }
+        // No prefix parses, so no option preceded the offending token and there
+        // is nothing to warn about first.
+        let _ = std::io::stderr().write_all(self.usage_diagnostic(&cmd, error).as_bytes());
+        std::process::exit(1)
+    }
+
+    /// What C's getopt loop prints for the offending token — rendered, never
+    /// printed here: it is [`Scan::finish`] that puts it on stderr, after the
+    /// warnings of the options that preceded it (R14-18). Newline included, so
+    /// the caller writes it verbatim.
+    fn usage_diagnostic(self, spec: &clap::Command, e: clap::Error) -> String {
         use clap::error::{ContextKind, ErrorKind};
 
         match e.kind() {
@@ -737,7 +870,7 @@ impl CTool {
             // long-form token it never supports collapses to `'--'`).
             ErrorKind::UnknownArgument => {
                 let arg = context_arg(&e, ContextKind::InvalidArg);
-                self.usage_error(&format!("Unrecognized option: '{arg}'"))
+                self.diagnostic(&format!("Unrecognized option: '{arg}'"))
             }
 
             // getopt `':'`: `"Option '-%c' requires an argument."` clap
@@ -750,15 +883,18 @@ impl CTool {
             {
                 let arg = context_arg(&e, ContextKind::InvalidArg);
                 let flag = short_flag_of(spec, &arg);
-                self.usage_error(&format!("Option '{flag}' requires an argument"))
+                self.diagnostic(&format!("Option '{flag}' requires an argument"))
             }
 
             // No other usage error exists in C. Keep clap's message (we have
             // nothing truer to say) but not its exit code: 2 is not a status
             // any CA tool returns.
             _ => {
-                let _ = e.print();
-                std::process::exit(1)
+                let mut rendered = e.render().to_string();
+                if !rendered.ends_with('\n') {
+                    rendered.push('\n');
+                }
+                rendered
             }
         }
     }
@@ -1200,6 +1336,46 @@ mod tests {
         assert_eq!(raised.len(), 2, "both options were scanned by clap");
         assert!(raised[0] < at, "-w abc precedes -h: it prints");
         assert!(raised[1] > at, "-p zz follows -h: C never reaches it");
+    }
+
+    /// R14-18. A getopt error is an arm of the LOOP, so the options before the
+    /// offending token were all scanned (and warned) and the ones after it
+    /// never were. clap fails the whole parse instead, which is why the parse
+    /// is cut at the offending token: what [`CTool::get_matches_from`] returns
+    /// is the prefix, and the resolvers see exactly the options C's loop
+    /// reached.
+    #[test]
+    fn a_getopt_error_leaves_the_options_before_it_scanned() {
+        let warnings = |argv: &[&str]| {
+            let p = CAGET.get_matches_from(caget_spec(), argv);
+            let mut s = p.scan();
+            let _ = s.timeout("timeout", 1.0);
+            let _ = s.priority("priority");
+            s.ordered_warnings()
+        };
+
+        assert_eq!(
+            warnings(&["caget", "-w", "abc", "-X"]),
+            vec![
+                "'abc' is not a valid timeout value - ignored, using '1.0'. ('caget -h' for help.)"
+            ],
+            "the '-w' before the unknown option was scanned and warned"
+        );
+        assert!(
+            warnings(&["caget", "-X", "-w", "abc"]).is_empty(),
+            "the '-w' after it is never reached"
+        );
+        assert_eq!(
+            warnings(&["caget", "-w", "abc", "-p", "zz", "-X", "PV"]).len(),
+            2,
+            "every option before the offending token warns, in order"
+        );
+        // `':'` — the option-argument the last token never got — cuts the loop
+        // the same way.
+        assert_eq!(
+            warnings(&["caget", "-p", "zz", "-w"]),
+            vec!["'zz' is not a valid CA priority - ignored. ('caget -h' for help.)"]
+        );
     }
 
     /// `-V` is a plain option now; declaring it (or `-h`) with clap's

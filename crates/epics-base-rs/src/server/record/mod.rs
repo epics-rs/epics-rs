@@ -14,9 +14,10 @@ pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use link::{
     CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkFieldType,
-    LinkProcessPolicy, LinkType, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink,
-    link_field_type, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link,
-    parse_link_field, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
+    LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink,
+    PvaJsonLink, link_field_type, load_link_ls, out_link_discards_cp, parse_c_double,
+    parse_forward_link_v2, parse_link, parse_link_field, parse_link_v2, parse_output_link_v2,
+    pvajson_identity_key,
 };
 pub use menu_choices::{
     MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_PINI,
@@ -25,7 +26,7 @@ pub use menu_choices::{
 };
 pub use pini::PiniMode;
 pub(crate) use record_instance::value_as_dbr_string;
-pub use record_instance::{NotifyWaitSet, RecordInstance};
+pub use record_instance::{AlarmAck, NotifyWaitSet, RecordInstance};
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, LinkReadAs,

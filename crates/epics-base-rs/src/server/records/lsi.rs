@@ -205,6 +205,30 @@ impl Record for LsiRecord {
         false
     }
 
+    /// C `devLsiSoft.c:24` — the soft input support's
+    /// `dbLoadLinkLS(&prec->inp, prec->val, prec->sizv, &prec->len)`. The
+    /// load runs in the init-seed owner, which gates it on the soft DTYP the
+    /// way C gates it on which device support is bound.
+    fn constant_ls_link(&self) -> Option<&'static str> {
+        Some("INP")
+    }
+
+    /// The `dbLoadLinkLS` sink plus C's init tail (`lsiRecord.c:85-88`).
+    fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
+        match load {
+            crate::server::record::LsLoad::Text(s) => {
+                let max = (self.sizv as usize).saturating_sub(1);
+                self.val = truncate_bytes(PvString::from(s), max);
+                self.len = (self.val.len() + 1) as u32;
+            }
+            // C's number case: the buffer is untouched, LEN comes out 1.
+            crate::server::record::LsLoad::LenOnly => self.len = 1,
+        }
+        self.oval = self.val.clone();
+        self.olen = self.len;
+        self.len
+    }
+
     fn monitor_value_changed(&self) -> Option<bool> {
         Some(self.value_changed)
     }

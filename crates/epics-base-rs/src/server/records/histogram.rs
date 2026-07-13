@@ -305,6 +305,23 @@ impl Record for HistogramRecord {
         "histogram"
     }
 
+    /// C `histogramRecord.c::process` NEVER clears UDF. The record's only two
+    /// `prec->udf = FALSE` sites are `clear_histogram` (the CSTA/RESET special,
+    /// `:361`) and the simulated SIOL read (`:387`) — so a histogram that has
+    /// been counting for hours still reports UDF=1 (softIoc: `dbpf H1.PROC 1`
+    /// → `H1.UDF` = 1, SEVR NO_ALARM, because histogram's `checkAlarms` has no
+    /// UDF test either).
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// `histogramRecord.c` has NO `checkAlarms` at all — its `process` goes
+    /// straight from `readValue` to `monitor`, so the UDF=1 it carries raises
+    /// nothing (softIoc: UDF=1, SEVR NO_ALARM, STAT NO_ALARM).
+    fn raises_udf_alarm(&self) -> bool {
+        false
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `process` → `add_count(prec)` then `monitor`. The signal
         // is read from the input link by the framework before

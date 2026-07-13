@@ -189,6 +189,12 @@ impl IocBuilder {
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
         let db = Arc::new(PvDatabase::new());
 
+        // This whole build is ONE database load — C's `iocInit` classifies a
+        // record's links only after every record exists, so the link-status
+        // refreshes issued while records are being created wait for the guard
+        // to drop (at every exit path, including an early `?`).
+        let _load = db.begin_load();
+
         // Breakpoint-table registry (C `bptList`): merge every loaded
         // `breaktable(...)` into the database's shared registry (the single
         // owner — also grown later by runtime `dbLoadRecords`) and take a
@@ -322,16 +328,6 @@ impl IocBuilder {
                     let inst = &mut *instance;
                     inst.record.init_links(&inst.common);
                 }
-                // epics-base PR dabcf89 (mbboDirect): after both init
-                // passes, give the record a chance to finalise UDF —
-                // e.g. fold initialised B0..B1F bits into VAL and
-                // clear UDF when no DOL/initial-VAL was provided.
-                let mut udf = instance.common.udf;
-                if let Err(e) = instance.record.post_init_finalize_undef(&mut udf) {
-                    eprintln!("post_init_finalize_undef failed for {}: {e}", def.name);
-                }
-                instance.common.udf = udf;
-
                 // C: a soft-channel INPUT dev support's `init_record` loads a
                 // CONSTANT INP into the record's value
                 // (`recGblInitConstantLink` / `dbLoadLinkArray`) — and it runs

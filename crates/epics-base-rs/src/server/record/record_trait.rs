@@ -1961,6 +1961,27 @@ pub trait Record: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// The link field this record loads into its long-string VAL at init through
+    /// C's `dbLoadLinkLS` — `"DOL"` for `lso` (`lsoRecord.c:82`), `"INP"` for
+    /// `lsi` (its soft device support, `devLsiSoft.c:24`). `loadLS` is a lset
+    /// entry of its own, so this is a SEPARATE table from
+    /// [`Self::constant_init_links`], not a variant of it; the same init-seed
+    /// owner runs both.
+    ///
+    /// Default: none — a record with no long-string VAL has no `loadLS` seed.
+    fn constant_ls_link(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Apply the [`Self::constant_ls_link`] load, and return the resulting LEN.
+    /// The record clamps the text at its own `SIZV` and runs C's init tail
+    /// (`if (prec->len) { strcpy(prec->oval, prec->val); prec->olen = prec->len; }`,
+    /// lsoRecord.c:92-95 / lsiRecord.c:85-88); the owner turns a non-zero LEN
+    /// into `udf = FALSE`.
+    fn apply_ls_load(&mut self, _load: crate::server::record::LsLoad) -> u32 {
+        0
+    }
+
     /// Whether this record's CONSTANT input links deliver their value on
     /// EVERY process cycle instead of only at init.
     ///

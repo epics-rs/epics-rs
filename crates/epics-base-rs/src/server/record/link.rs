@@ -529,27 +529,112 @@ fn constant_array_value(inner: &str) -> EpicsValue {
 /// It is `strtod` under the hood, which accepts a HEX literal — `dbConstLink.c:34`:
 /// *"constants may contain hex numbers, whereas database conversions can't"*.
 /// softIoc: `field(DOL,"0x1f")` reports `DOL : CONSTANT 0x1f` and comes up at
-/// VAL=31; `field(INP,"0x10")` on an ai loads VAL=16. Rust's `f64::from_str` has
-/// no hex form, so the hex branch is explicit here. Trailing text is rejected
+/// VAL=31; `field(INP,"0x10")` on an ai loads VAL=16. Trailing text is rejected
 /// (C passes a NULL units pointer → `S_stdlib_extraneous`), which is what keeps
 /// `"5 PP"` a PV link rather than a constant.
+///
+/// So this is [`epics_parse_double`] and nothing else — C's ONE
+/// `epicsParseDouble`, shared with the CA env-knob parser. A hand-rolled
+/// re-implementation drifted from it on three families, all probed on softIoc
+/// 7.0.10:
+///
+/// ```text
+/// field(INP,"0x1p4")                -> CONSTANT, VAL=16               (hex float)
+/// field(INP,"0xffffffffffffffffff") -> CONSTANT, VAL=4.72236648e+21   (wide hex)
+/// field(INP,"1e400")                -> CA_LINK, UDF=1                 (ERANGE)
+/// field(INP,"1e-320")               -> CA_LINK, UDF=1                 (ERANGE)
+/// ```
+///
+/// The ERANGE half is what makes the difference structural rather than
+/// cosmetic: `epicsParseDouble` returns a NON-ZERO status for `1e400`, so C's
+/// `dbParseLink` (`dbStaticLib.c:2346-2349`) never reaches CONSTANT — the
+/// literal becomes a PV link, and the record stays UDF. The pre-fix port made
+/// it a defined record holding `inf`.
 pub fn parse_c_double(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() {
+    crate::runtime::stdlib::epics_parse_double(s).ok()
+}
+
+/// What C's `dbLoadLinkLS` (dbLink.c:244) delivers into a long-string VAL.
+///
+/// `loadLS` is a lset entry of its own — NOT `recGblInitConstantLink` — and only
+/// two lsets implement it, with different results:
+///
+/// * a plain CONSTANT link (`dbConstLink.c:178` `dbConstLoadLS`) runs the link
+///   text through `dbLSConvertJSON`, and
+/// * a JSON `{const:…}` link (`lnkConst.c:419` `lnkConst_loadLS`) copies its
+///   string value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LsLoad {
+    /// The link delivered a string: copy it into VAL (truncated at `SIZV-1`),
+    /// `LEN = strlen + 1`.
+    Text(String),
+    /// C's number case. `dbLSConvertJSON` (dbConvertJSON.c:191-236) never calls
+    /// `yajl_complete_parse`, so a bare number is still a pending token when the
+    /// parse ends: NO callback fires, the destination buffer is untouched, and
+    /// `*plen = pdest - pdest + 1` makes `LEN = 1`. That is what defines an
+    /// `lso` with `field(DOL,"5")` while leaving `VAL` empty (softIoc: VAL "",
+    /// LEN 1, UDF 0).
+    LenOnly,
+}
+
+/// C `dbLoadLinkLS` over a link field's `.db` text — the long-string half of the
+/// init-time constant load. `None` when the link loads nothing: a PV link (no
+/// `loadLS` at init), an empty link, or a JSON `{const:…}` whose value is not a
+/// string (`lnkConst_loadLS` returns `S_db_badField` for the numeric types).
+///
+/// softIoc (EPICS 7.0.10, linux-x86_64), `dbgf` after `iocInit`:
+///
+/// ```text
+/// record(lso,"L1"){field(DOL,"5")}              VAL ""         LEN 1  UDF 0
+/// record(lso,"L2"){field(DOL,{const:"hello"})}  VAL "hello"    LEN 6  UDF 0
+/// record(lsi,"L3"){field(INP,{const:"hi there"})} VAL "hi there" LEN 9 UDF 0
+/// record(lsi,"L4"){field(INP,"5")}              VAL ""         LEN 1  UDF 0
+/// ```
+pub fn load_link_ls(text: &str) -> Option<LsLoad> {
+    let s = text.trim();
+    if s.is_empty() {
         return None;
     }
-    let (negative, magnitude) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    if let Some(hex) = magnitude
-        .strip_prefix("0x")
-        .or_else(|| magnitude.strip_prefix("0X"))
-    {
-        let v = u64::from_str_radix(hex, 16).ok()? as f64;
-        return Some(if negative { -v } else { v });
+    // JSON link: only `{const:…}` has a `loadLS`, and only its string forms
+    // (`sc40`, and `ac40`'s first element) deliver text.
+    if s.starts_with('{') && s.ends_with('}') {
+        let value = json_const_value(s)?;
+        return json_string_value(value).map(LsLoad::Text);
     }
-    t.parse::<f64>().ok()
+    // Plain link: `loadLS` exists only on the CONSTANT lset, and a plain link is
+    // CONSTANT iff `epicsParseDouble` accepts it — i.e. iff it is a number, the
+    // one case `dbLSConvertJSON` leaves the buffer untouched.
+    parse_c_double(s).map(|_| LsLoad::LenOnly)
+}
+
+/// The raw (un-dequoted) value text of a `{const: …}` JSON link, or `None` when
+/// `s` is some other JSON link.
+fn json_const_value(s: &str) -> Option<&str> {
+    let inner = s[1..s.len() - 1].trim_start();
+    let (key, rest) = inner.split_once(':')?;
+    let key = key.trim().trim_matches('"').trim_matches('\'');
+    if !key.eq_ignore_ascii_case("const") {
+        return None;
+    }
+    Some(rest.trim().trim_end_matches(',').trim())
+}
+
+/// The JSON string a `{const:…}` link carries, unquoted — `"hi"` and the
+/// string-array shorthand `["hi", …]` (C `ac40`, whose `loadLS` takes element 0).
+/// A numeric value is not a string: `lnkConst_loadLS`'s `default` arm returns
+/// `S_db_badField`, so nothing is loaded and LEN stays 0.
+fn json_string_value(value: &str) -> Option<String> {
+    let v = value.trim();
+    let first = if let Some(rest) = v.strip_prefix('[') {
+        rest.trim_start().split(',').next()?.trim()
+    } else {
+        v
+    };
+    let unquoted = first
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| first.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))?;
+    Some(unquoted.to_string())
 }
 
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
@@ -1065,22 +1150,23 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
         return ParsedLink::Pva(rest.to_string());
     }
 
-    // Quoted string constant. Resolved BEFORE the modifier split because a
-    // quoted constant may legitimately contain a space (`"hello world"`), and
-    // the split isolates the target at the first one. C reaches the modifier
-    // scan only after its own constant tests (`dbStaticLib.c:2346-2356`).
+    // There is NO quoted-string constant. C's `dbParseLink` has exactly three
+    // tests — braces => JSON, `epicsParseDouble` => CONSTANT, otherwise PV link
+    // (`dbStaticLib.c:2280-2356`) — and a quote is not a number, so link text
+    // that still carries quotes after the .db lexer is a PV NAME with quotes in
+    // it. softIoc (EPICS 7.0.10), `dbpr X 2` after `iocInit`:
     //
-    // C parity (3b484f5): an empty quoted string `""` is equivalent to an
-    // unset link — dbConstLoadScalar/Array reject `""` the same as NULL with
-    // S_db_badField. Treat it as None here so callers don't see a meaningless
-    // empty Constant.
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        let inner = &s[1..s.len() - 1];
-        if inner.is_empty() {
-            return ParsedLink::None;
-        }
-        return ParsedLink::Constant(inner.to_string());
-    }
+    // ```text
+    // record(ai,"QA"){field(INP,"\"hello\"")}        INP: CA_LINK "hello" NPP NMS
+    // record(stringin,"QS"){field(INP,"\"hello\"")}  INP: CA_LINK "hello" NPP NMS
+    // record(lso,"LQ"){field(DOL,"\"hello\"")}       DOL: CA_LINK "hello" NPP NMS
+    // record(ai,"QE"){field(INP,"\"\"")}             INP: CA_LINK "" NPP NMS
+    // record(ai,"QN"){field(INP,"")}                 INP: CONSTANT
+    // ```
+    //
+    // — a never-connected CA link, so the record stays UDF=1. Only the EMPTY
+    // text is an unset CONSTANT link. The string constant a long-string record
+    // takes is the JSON `{const:"hello"}` handled above ([`load_link_ls`]).
 
     // Scalar numeric constant. C `dbParseLink` (`dbStaticLib.c:2346-2349`):
     //
@@ -1508,16 +1594,21 @@ mod json_link_tests {
         assert_eq!(link_field_type("{const: 7}"), LinkType::Constant);
     }
 
+    /// A quoted string is NOT a constant: C's `dbParseLink` tests braces then
+    /// `epicsParseDouble`, and a quote is neither — softIoc makes
+    /// `field(INP,"\"hello\"")` a `CA_LINK "hello" NPP NMS`, and even
+    /// `field(INP,"\"\"")` a `CA_LINK ""`. Only the empty text is an unset
+    /// CONSTANT link.
     #[test]
-    fn link_type_constant_quoted_string() {
-        assert_eq!(link_field_type(r#""hello""#), LinkType::Constant);
+    fn link_type_quoted_string_is_a_pv_link() {
+        assert_eq!(link_field_type(r#""hello""#), LinkType::Db);
+        assert_eq!(link_field_type(r#""""#), LinkType::Db);
     }
 
     #[test]
     fn link_type_empty_is_empty() {
         assert_eq!(link_field_type(""), LinkType::Empty);
         assert_eq!(link_field_type("   "), LinkType::Empty);
-        assert_eq!(link_field_type(r#""""#), LinkType::Empty);
     }
 
     #[test]

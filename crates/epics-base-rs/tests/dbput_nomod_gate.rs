@@ -132,3 +132,133 @@ async fn the_load_path_still_sets_nelm() {
         EpicsValue::Long(7)
     );
 }
+
+/// R17-62: the gate's DECLARATION must be C's whole `dbCommon.dbd` `SPC_NOMOD`
+/// set, not the PACT/LCNT/PUTF triple. Every one of these was client-writable —
+/// alarm state (STAT/SEVR/NSEV/ACKS) was forgeable, and on a Passive record the
+/// forged alarm is permanent.
+///
+/// softIoc (EPICS 7.0.10, `record(ai,"N1")`), every put silently refused, field
+/// unchanged:
+///
+/// ```text
+/// dbpf N1.SEVR 2  -> "NO_ALARM"   dbpf N1.STAT 3   -> "UDF"
+/// dbpf N1.NSEV 2  -> "NO_ALARM"   dbpf N1.NSTA 3   -> "NO_ALARM"
+/// dbpf N1.ACKS 2  -> "NO_ALARM"   dbpf N1.ACKT 0   -> "YES"
+/// dbpf N1.RPRO 1  -> 0            dbpf N1.UTAG 7   -> 0
+/// dbpf N1.NAME XX -> "N1"         dbpf N1.AMSG hi  -> ""
+/// dbpf N1.NAMSG hi-> ""           dbpf N1.LCNT 3   -> 0
+/// caput N1.SEVR 2 -> ERROR from put operation: Write access denied
+/// ```
+#[tokio::test]
+async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
+    let db = PvDatabase::new();
+    db.add_record("AO2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let (stat0, sevr0) = {
+        let rec = db.get_record("AO2").await.unwrap();
+        let inst = rec.read().await;
+        (inst.common.stat, inst.common.sevr)
+    };
+
+    let fields: [(&str, EpicsValue); 13] = [
+        ("NAME", EpicsValue::String("XX".into())),
+        ("STAT", EpicsValue::Short(3)),
+        ("SEVR", EpicsValue::Short(2)),
+        ("AMSG", EpicsValue::String("hi".into())),
+        ("NSTA", EpicsValue::Short(3)),
+        ("NSEV", EpicsValue::Short(2)),
+        ("NAMSG", EpicsValue::String("hi".into())),
+        ("ACKS", EpicsValue::Short(2)),
+        ("ACKT", EpicsValue::Short(0)),
+        ("LCNT", EpicsValue::Short(3)),
+        ("RPRO", EpicsValue::Char(1)),
+        ("UTAG", EpicsValue::Double(7.0)),
+        ("TIME", EpicsValue::Double(3.0)),
+    ];
+
+    for (field, value) in fields {
+        for res in [
+            db.put_record_field_from_ca_no_notify("AO2", field, value.clone())
+                .await,
+            db.put_pv(&format!("AO2.{field}"), value.clone()).await,
+            db.put_pv_and_post(&format!("AO2.{field}"), value.clone())
+                .await,
+            db.check_external_put_preconditions("AO2", field).await,
+        ] {
+            assert!(
+                matches!(res, Err(CaError::ReadOnlyField(_))),
+                "{field}: C refuses with S_db_noMod on every route, got {res:?}"
+            );
+        }
+    }
+
+    // Nothing landed: the alarm state a client tried to forge is still clean.
+    let rec = db.get_record("AO2").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.sevr, sevr0, "forged SEVR never landed");
+    assert_eq!(inst.common.stat, stat0, "forged STAT never landed");
+    assert_eq!(inst.common.acks, AlarmSeverity::NoAlarm);
+    assert!(
+        inst.common.ackt,
+        "ACKT default YES survives the refused put"
+    );
+    assert!(!inst.common.rpro);
+    assert_eq!(inst.common.utag, 0);
+    assert_eq!(inst.name, "AO2");
+}
+
+/// The other half of R17-62: refusing the ACKS/ACKT *fields* must not break
+/// alarm acknowledgement, because C never acknowledged through those fields.
+/// `dbPut` dispatches on the DBR request type ABOVE the gate
+/// (`dbAccess.c:1331-1335`), so the ack route stays open.
+///
+/// softIoc (`record(ai,"N1"){field(HIGH,"1") field(HSV,"MAJOR")}`, VAL=5 →
+/// SEVR=MAJOR, ACKS=MAJOR):
+///
+/// ```text
+/// ca_put(DBR_PUT_ACKS, "N1", 2) -> Normal successful completion
+/// caget N1.ACKS                 -> NO_ALARM      (acknowledged)
+/// caget N1.SEVR                 -> MAJOR         (the alarm itself stays)
+/// caput N1.ACKS 2               -> ERROR: Write access denied
+/// ```
+#[tokio::test]
+async fn alarm_acknowledge_travels_the_dbr_type_route_not_the_field() {
+    use epics_base_rs::server::record::AlarmAck;
+
+    let db = PvDatabase::new();
+    db.add_record("ACK:AI", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("ACK:AI").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.acks = AlarmSeverity::Major;
+    }
+
+    // The field put is refused (S_db_noMod) — ACKS is unchanged.
+    assert!(matches!(
+        db.put_record_field_from_ca_no_notify("ACK:AI", "ACKS", EpicsValue::Short(2))
+            .await,
+        Err(CaError::ReadOnlyField(_))
+    ));
+    let rec = db.get_record("ACK:AI").await.unwrap();
+    assert_eq!(rec.read().await.common.acks, AlarmSeverity::Major);
+
+    // A MINOR acknowledgement is too low: C's `*psev >= precord->acks` fails.
+    db.put_alarm_ack_from_ca("ACK:AI", "VAL", AlarmAck::Severity, 1)
+        .await
+        .unwrap();
+    assert_eq!(rec.read().await.common.acks, AlarmSeverity::Major);
+
+    // A MAJOR acknowledgement clears ACKS and leaves SEVR alone.
+    db.put_alarm_ack_from_ca("ACK:AI", "VAL", AlarmAck::Severity, 2)
+        .await
+        .unwrap();
+    let inst = rec.read().await;
+    assert_eq!(inst.common.acks, AlarmSeverity::NoAlarm);
+    assert_eq!(inst.common.sevr, AlarmSeverity::Major);
+}

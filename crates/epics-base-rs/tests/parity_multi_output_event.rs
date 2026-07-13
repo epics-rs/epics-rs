@@ -114,6 +114,17 @@ async fn dfanout_specified_out_of_range_raises_invalid() {
     df.put_field("SELM", EpicsValue::Short(1)).unwrap(); // Specified
     df.put_field("SELN", EpicsValue::Short(99)).unwrap(); // > 16 → INVALID
     db.add_record("DF_BAD", Box::new(df)).await.unwrap();
+    // VAL=1 is a `field(VAL,"1")` seed, which C loads with UDF=0
+    // (`dbPutString`). dfanout never clears UDF in `process()`, and its
+    // `checkAlarms` would otherwise raise INVALID/UDF first — softIoc gives
+    // STAT=UDF for the undefined record and STAT=SOFT for this one.
+    db.get_record("DF_BAD")
+        .await
+        .unwrap()
+        .write()
+        .await
+        .common
+        .udf = false;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DF_BAD", &mut visited, 0)

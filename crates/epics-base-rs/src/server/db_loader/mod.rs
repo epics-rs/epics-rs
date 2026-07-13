@@ -898,6 +898,62 @@ fn read_quoted_string(
     Ok(s)
 }
 
+/// A brace-delimited JSON field value, returned verbatim (braces included).
+/// Braces inside a JSON string do not nest the value, and a `\` escapes the
+/// next character inside a string.
+fn read_json_value(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<String> {
+    let start_line = *line;
+    let mut s = String::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        s.push(c);
+        *pos += 1;
+        if c == '\n' {
+            *line += 1;
+            *col = 0;
+        } else {
+            *col += 1;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(CaError::DbParseError {
+        line: start_line,
+        column: *col,
+        message: "unterminated JSON value (missing '}')".into(),
+    })
+}
+
 fn read_field_value(
     chars: &[char],
     pos: &mut usize,
@@ -906,6 +962,15 @@ fn read_field_value(
 ) -> CaResult<String> {
     if *pos < chars.len() && chars[*pos] == '"' {
         return read_quoted_string(chars, pos, line, col);
+    }
+
+    // JSON value: C's dbLex tokenizes a brace-delimited field value as JSON
+    // (`field(DOL, {const:"hello"})`, `field(INP, {pva:"PV"})`) and hands the
+    // raw text to `dbParseLink`, which sees the braces and calls
+    // `dbJLinkParse` (dbStaticLib.c:2280-2285). Keep the text verbatim — the
+    // link parser is the one that interprets it.
+    if *pos < chars.len() && chars[*pos] == '{' {
+        return read_json_value(chars, pos, line, col);
     }
 
     // Unquoted value: a C `bareword` (dbLex.l:21) —
@@ -1157,7 +1222,30 @@ pub fn apply_fields(
             }
         } else {
             // Store as common field for RecordInstance to handle
-            common_fields.push((upper_name, EpicsValue::String(value_str.clone().into())));
+            common_fields.push((
+                upper_name.clone(),
+                EpicsValue::String(value_str.clone().into()),
+            ));
+        }
+
+        // C `dbPutString` (`dbStaticLib.c:2653-2660`): writing VAL through the
+        // STATIC library also writes UDF = 0 —
+        //
+        // ```c
+        // if (!status && strcmp(pflddes->name, "VAL") == 0) {
+        //     ...
+        //     if (!dbFindField(&dbentry, "UDF")) dbPutString(&dbentry, "0");
+        // }
+        // ```
+        //
+        // — so `field(VAL,"1")` in a `.db` DEFINES the record at load, on every
+        // record type, whatever its `process()` later does with UDF. The load
+        // owner is the only place this can live: it is the one gate both
+        // `dbLoadRecords` paths (IocBuilder and iocsh) cross. Pushed in file
+        // order, so an explicit `field(UDF,...)` after `field(VAL,...)` still
+        // wins, exactly as it does in C.
+        if upper_name == "VAL" {
+            common_fields.push(("UDF".to_string(), EpicsValue::Char(0)));
         }
     }
     Ok(())

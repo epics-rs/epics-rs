@@ -255,6 +255,23 @@ struct PvDatabaseInner {
     /// scan-index race, and lets `remove_*` purge dangling aliases
     /// without a second pass.
     registration_mutex: tokio::sync::Mutex<()>,
+    /// Open while a database LOAD is in progress — a `.db` file (or an
+    /// `IocBuilder`) is still creating records.
+    ///
+    /// C classifies a record's links in `init_record`, which `iocInit` runs
+    /// only AFTER every `dbLoadRecords` block has been read, so a link that
+    /// forward-references a record defined later in the file still resolves to
+    /// a LOCAL link. The port creates records one at a time, so a link-status
+    /// classification issued at creation would see a half-built database and
+    /// call the forward reference an external PV. This gate is the port's
+    /// `iocInit` boundary: the classification primitives
+    /// ([`crate::server::records::link_status::classify_link`] and
+    /// `classify_swait_pv`) await it, so every classification — whenever it was
+    /// issued — reads the COMPLETED database, deterministically and without a
+    /// timed re-poll.
+    loading: std::sync::atomic::AtomicUsize,
+    /// Woken when [`Self::loading`] drops back to zero.
+    load_done: tokio::sync::Notify,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
@@ -311,6 +328,28 @@ struct PvDatabaseInner {
 #[derive(Clone)]
 pub struct PvDatabase {
     inner: Arc<PvDatabaseInner>,
+}
+
+/// Holds the database's LOAD phase open — see [`PvDatabase::begin_load`].
+/// Dropping it closes this load and wakes everything waiting for the database
+/// to be complete, on every exit path (including an early `?` out of a failed
+/// `.db` load).
+pub struct DbLoadGuard {
+    inner: std::sync::Weak<PvDatabaseInner>,
+}
+
+impl Drop for DbLoadGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            if inner
+                .loading
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                == 1
+            {
+                inner.load_done.notify_waiters();
+            }
+        }
+    }
 }
 
 /// Which record kind a SELM link selection is being computed for.
@@ -469,6 +508,8 @@ impl PvDatabase {
                 external_cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
+                loading: std::sync::atomic::AtomicUsize::new(0),
+                load_done: tokio::sync::Notify::new(),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -1038,6 +1079,53 @@ impl PvDatabase {
         self.inner.simple_pvs.write().await.remove(name)
     }
 
+    /// Open the database's LOAD phase — the port's `iocInit` boundary.
+    ///
+    /// Every path that creates a GROUP of records (an `IocBuilder` build, an
+    /// iocsh `dbLoadRecords`) holds the returned guard for the whole group, so
+    /// a link-status classification issued by any record in it waits for the
+    /// last one: a `.db` file's forward reference classifies against the
+    /// finished database, exactly as C's `iocInit`-time `init_record` does.
+    /// Nested/concurrent loads are counted, and the guard releases on EVERY
+    /// exit path including an early `?` — the classification would otherwise
+    /// wait forever on a load that failed halfway.
+    #[must_use = "the load phase stays open until the guard is dropped"]
+    pub fn begin_load(&self) -> DbLoadGuard {
+        self.inner
+            .loading
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        DbLoadGuard {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// Await the end of the LOAD phase; returns immediately when no load is in
+    /// progress (a programmatically built database never opens one).
+    pub(crate) async fn wait_for_load(&self) {
+        loop {
+            if self
+                .inner
+                .loading
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                return;
+            }
+            // Register for the wakeup BEFORE re-checking, so a load that ends
+            // between the check and the await cannot be missed.
+            let notified = self.inner.load_done.notified();
+            if self
+                .inner
+                .loading
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Add a record (accepts a boxed Record to avoid double-boxing).
     ///
     /// Returns `Err` when `name` collides with an existing record,
@@ -1077,6 +1165,17 @@ impl PvDatabase {
                 instance.record.install_breaktable_registry(snapshot);
             }
         }
+
+        // C's `iocInit` init passes, through their owner (the `doInitRecord0`
+        // prologue — `pact = FALSE` plus the initial UDF severity — then
+        // `init_record(0)`, `init_record(1)`, and the UDF tail). `add_record`
+        // is the creation sink every path funnels through, so a record built
+        // programmatically or by iocsh `dbCreateRecord` is initialised exactly
+        // like a `.db`-loaded one instead of skipping the passes the seed below
+        // assumes have run. The `.db` paths run the passes again once their
+        // field set is applied — C's own ordering, since `iocInit` sees the
+        // final merged fields — which is why the owner is idempotent.
+        instance.run_init_passes(name);
 
         // The init-seed owner: every CONSTANT link the record declares
         // (`Record::constant_init_links`) is loaded into its value field ONCE,

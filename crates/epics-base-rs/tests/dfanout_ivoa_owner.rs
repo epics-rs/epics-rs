@@ -60,6 +60,15 @@ async fn add_dfanout(db: &PvDatabase, ivoa: i16, invalid: bool, outa: &str) {
             .unwrap();
     }
     db.add_record("DF", Box::new(df)).await.unwrap();
+    // VAL=200 stands for a `.db` `field(VAL,"200")`, and C's static write of
+    // VAL also writes UDF=0 (`dbPutString`, dbStaticLib.c:2653-2660). dfanout's
+    // `process()` never clears UDF, so without the seed the record would be
+    // INVALID/UDF from `checkAlarms` on every cycle and the IVOA switch would
+    // key on THAT — softIoc:
+    // `record(dfanout,"DFBU"){field(SELM,"Specified") field(SELN,"99")}`
+    // reports INVALID/UDF, while the same record with `field(VAL,"1")` reports
+    // INVALID/SOFT.
+    db.get_record("DF").await.unwrap().write().await.common.udf = false;
 }
 
 /// Boundary 1 — INVALID cycle, IVOA=Set_output_to_IVOV: the targets get IVOV,

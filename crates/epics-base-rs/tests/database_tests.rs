@@ -1590,7 +1590,13 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
     co.ivov = 17.5;
     co.val = 99.9;
     co.oval = 99.9;
-    co.calc = "A".to_string();
+    // The CALC has to PRODUCE the alarming value: `process()` recalculates VAL
+    // before `checkAlarms`, so a `CALC="A"` with no INPA lands VAL=0 and trips
+    // no HIHI — softIoc:
+    //   CALC="99.9" HIHI=1 HHSV=INVALID IVOA="Set output to IVOV" IVOV=17.5
+    //     -> SEVR INVALID, OUT target 17.5
+    //   CALC="A"    (same fields)      -> SEVR NO_ALARM, OUT target 0
+    co.calc = "99.9".to_string();
     db.add_record("CO_SRC", Box::new(co)).await.unwrap();
     if let Some(rec) = db.get_record("CO_SRC").await {
         let mut inst = rec.write().await;
@@ -3153,6 +3159,21 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     db.add_record("ASYNC_PACT", Box::new(AsyncRecord { val: 0.0 }))
         .await
         .unwrap();
+    // C's guard is `if ((precord->stat == SCAN_ALARM) || (precord->lcnt++ <
+    // MAX_LOCK) || (precord->sevr >= INVALID_ALARM)) goto all_done`
+    // (dbAccess.c:544-547): the SCAN alarm is for a record that HAS completed a
+    // process (SEVR below INVALID) and then hangs mid-async. A never-processed
+    // record still carries the init UDF severity (SEVR=INVALID, softIoc reads
+    // that on every record right after `iocInit`) and C never alarms it. This
+    // mock never completes a cycle, so put it in the state a completed process
+    // leaves behind: defined, NO_ALARM.
+    {
+        let rec = db.get_record("ASYNC_PACT").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.udf = false;
+        inst.common.sevr = AlarmSeverity::NoAlarm;
+        inst.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
+    }
 
     // Drive ASYNC_PACT into PACT=true (async pending, lock released).
     let mut visited = HashSet::new();
@@ -5330,6 +5351,16 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
     );
 }
 
+/// Stand in for a .db `field(VAL,"…")` seed on a programmatically created
+/// record: C's static write of VAL also writes UDF=0
+/// (`dbPutString`, dbStaticLib.c:2653-2660), which is what makes the record
+/// DEFINED for record types whose `process()` never clears UDF (dfanout,
+/// histogram, event).
+async fn define_val(db: &PvDatabase, name: &str) {
+    let rec = db.get_record(name).await.expect("record exists");
+    rec.write().await.common.udf = false;
+}
+
 /// A failed dfanout OUT-link put raises the LINK alarm TWICE in C, and the
 /// stronger one wins:
 ///
@@ -5362,6 +5393,14 @@ async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     db.add_record("DFAN_LINKFAIL", Box::new(dfan))
         .await
         .unwrap();
+    // The seeded VAL is the `field(VAL,"5")` of a .db load, and C's
+    // `dbPutString` writes UDF=0 alongside a static VAL write
+    // (dbStaticLib.c:2653-2660). Without it the record is undefined, and
+    // dfanout's `process()` never clears UDF — softIoc:
+    // `record(dfanout,"DFN"){field(OUTA,"DEST")}` stays UDF=1 / INVALID /
+    // UDF after `dbpf DFN.PROC 1`, while the same record with
+    // `field(VAL,"5")` comes up UDF=0 / NO_ALARM.
+    define_val(&db, "DFAN_LINKFAIL").await;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DFAN_LINKFAIL", &mut visited, 0)
@@ -5401,6 +5440,9 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
     dfan.selm = 0; // All
     dfan.outa = "DFAN_OK_DEST".to_string();
     db.add_record("DFAN_OK", Box::new(dfan)).await.unwrap();
+    // See `test_dfanout_out_link_write_failure_raises_link_alarm`: the
+    // seeded VAL stands for `field(VAL,"5")`, which C loads with UDF=0.
+    define_val(&db, "DFAN_OK").await;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DFAN_OK", &mut visited, 0)
@@ -8381,6 +8423,13 @@ async fn test_fanout_dfanout_seq_seln_default_is_one() {
 /// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)
 /// lowers `acks` down to `sevr` when ACKT is set false and
 /// `acks > sevr`.
+///
+/// R17-62 corrected the ROUTE this test drives: acknowledgement is a DBR
+/// request type (`DBR_PUT_ACKS`/`ACKT`) that `dbPut` intercepts above the
+/// `SPC_NOMOD` gate (`dbAccess.c:1331-1335`), not a put to the ACKS/ACKT
+/// fields — softIoc refuses `caput N1.ACKS 2` with "Write access denied".
+/// The handlers moved to `RecordInstance::put_acks` / `put_ackt`; the
+/// semantics asserted here are unchanged.
 #[tokio::test]
 async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
     // putAcks: acks must be cleared when the written severity is >=
@@ -8393,7 +8442,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
         // Acknowledge at MAJOR — written sev (2) >= acks (2) -> clear.
-        inst.put_common_field("ACKS", EpicsValue::Short(2)).unwrap();
+        inst.put_acks(2);
         assert_eq!(
             inst.common.acks,
             AlarmSeverity::NoAlarm,
@@ -8409,9 +8458,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
         inst2.common.acks = AlarmSeverity::Major;
         inst2.common.sevr = AlarmSeverity::Minor;
-        inst2
-            .put_common_field("ACKS", EpicsValue::Short(1))
-            .unwrap();
+        inst2.put_acks(1);
         assert_eq!(
             inst2.common.acks,
             AlarmSeverity::Major,
@@ -8427,7 +8474,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.ackt = true;
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
-        inst.put_common_field("ACKT", EpicsValue::Short(0)).unwrap();
+        inst.put_ackt(0);
         assert!(!inst.common.ackt, "ACKT must be cleared");
         assert_eq!(
             inst.common.acks,
@@ -9660,24 +9707,29 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     );
 }
 
-/// The string path. A quoted constant DOL (`field(DOL,"\"hi\"")`) on a
-/// `stringout` is copied into VAL once at init (C
-/// `recGblInitConstantLink(..., DBF_STRING, ...)`); the gate keeps it out of
+/// The string path. A CONSTANT DOL on a `stringout` is copied into VAL once at
+/// init as TEXT (C `recGblInitConstantLink(..., DBF_STRING, ...)` →
+/// `cvt_st_st`, a plain `strncpy` of the link text); the gate keeps it out of
 /// process so a caput survives.
+///
+/// The link text has to be a NUMBER — that is what makes a plain link CONSTANT
+/// (`dbParseLink`, dbStaticLib.c:2346-2349). A quoted `"hi"` is not: softIoc
+/// makes `field(DOL,"\"hi\"")` a `CA_LINK "hi" NPP NMS` and leaves VAL empty /
+/// UDF=1, so this test used to encode a link type C does not have.
 #[tokio::test]
 async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     use epics_base_rs::server::records::stringout::StringoutRecord;
     let db = PvDatabase::new();
     let mut so = StringoutRecord::new("");
     so.omsl = 1; // closed_loop
-    so.dol = "\"hi\"".to_string(); // quoted string constant
+    so.dol = "1.50".to_string(); // CONSTANT — softIoc seeds VAL="1.50", UDF=0
     so.init_record(0).unwrap();
     db.add_record("SO_CONST", Box::new(so)).await.unwrap();
 
     let v0 = db.get_pv("SO_CONST").await.unwrap();
     assert!(
-        matches!(&v0, EpicsValue::String(s) if s.as_str_lossy() == "hi"),
-        "quoted constant DOL must seed VAL=\"hi\" at init, got {v0:?}"
+        matches!(&v0, EpicsValue::String(s) if s.as_str_lossy() == "1.50"),
+        "constant DOL must seed VAL=\"1.50\" at init (cvt_st_st copies the text), got {v0:?}"
     );
 
     {
@@ -9749,13 +9801,30 @@ async fn init_applies_constant_dol_across_record_types() {
         );
     }
 
-    // lso: quoted long-string constant.
+    // lso: the long-string load is `dbLoadLinkLS` (lsoRecord.c:82), NOT
+    // `recGblInitConstantLink`, and only a JSON `{const:"…"}` link carries text
+    // — softIoc: `field(DOL,"\"hello\"")` is a CA_LINK (LEN 0, UDF 1), while
+    // `field(DOL,{const:"hello"})` loads VAL "hello" / LEN 6 / UDF 0. See
+    // tests/long_string_constant_link_load.rs.
     let mut lso = LsoRecord::default();
     lso.omsl = 1;
-    lso.dol = "\"hello\"".to_string();
-    lso.init_record(0).unwrap();
-    assert_eq!(lso.val.as_str_lossy(), "hello", "lso constant DOL → VAL");
-    assert_eq!(lso.len, 6, "lso LEN = strlen+1 (C convention)");
+    lso.dol = r#"{const:"hello"}"#.to_string();
+    db.add_record("LSO_CONST", Box::new(lso)).await.unwrap();
+    {
+        let rec = db.get_record("LSO_CONST").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"hello".to_vec())),
+            "lso JSON const DOL → VAL"
+        );
+        assert_eq!(
+            inst.record.get_field("LEN"),
+            Some(EpicsValue::ULong(6)),
+            "lso LEN = strlen+1 (C convention)"
+        );
+        assert!(!inst.common.udf, "a loaded LS link defines the record");
+    }
 
     // mbbo: constant DOL is the state index; the init tail's convert() maps it
     // to RVAL (no state table defined → RVAL == state index).

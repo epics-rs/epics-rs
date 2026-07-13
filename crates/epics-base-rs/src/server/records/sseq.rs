@@ -207,9 +207,16 @@ impl SseqStep {
     /// the `processCallback` link read (:657-661, :676-680). A write that
     /// updates one view and leaves the other stale is the defect — so no site
     /// assigns `dov`/`str_val` directly; every one goes through this pair.
+    ///
+    /// `PREC` is `DBF_SHORT` and reaches C's
+    /// `cvtDoubleToString(double, char*, epicsUInt16 prec)` by implicit
+    /// conversion, which REINTERPRETS a negative value rather than clamping it:
+    /// `PREC=-1` arrives as 65535, takes `cvtFast.c:111`'s `precision > 8`
+    /// branch, caps at 17 and renders `%*.*e` — `STRn` of 3.7 becomes
+    /// ` 3.70000000000000018e+00`, not `4`. `as u16` is that reinterpretation.
     fn set_numeric(&mut self, dov: f64, prec: i16) {
         self.dov = dov;
-        self.str_val = PvString::from(crate::types::cvt_double_to_string(dov, prec.max(0) as u16));
+        self.str_val = PvString::from(crate::types::cvt_double_to_string(dov, prec as u16));
     }
 
     /// Write the step's value FROM its string view, re-deriving the numeric
@@ -2014,5 +2021,30 @@ mod tests {
             let f = fields.iter().find(|f| f.name == rw_name).unwrap();
             assert!(!f.read_only, "{rw_name} stays writable");
         }
+    }
+
+    /// R17-1: a NEGATIVE `PREC` reaches C's
+    /// `cvtDoubleToString(dov, s, epicsUInt16 prec)` REINTERPRETED, not clamped
+    /// — `PREC=-1` is 65535, so `STRn` is the 17-digit `%*.*e` rendering.
+    /// Ground truth, compiled libCom: `cvtDoubleToString(3.7, b, (short)-1)` →
+    /// ` 3.70000000000000018e+00`.
+    #[test]
+    fn negative_prec_renders_strn_as_seventeen_digit_exponential() {
+        let mut rec = SseqRecord::new();
+        rec.put_field("PREC", EpicsValue::Short(-1)).unwrap();
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String(" 3.70000000000000018e+00".into())),
+            "PREC=-1 is epicsUInt16 65535, not a clamp to 0 (which printed \"4\")"
+        );
+
+        // A non-negative PREC is untouched.
+        rec.put_field("PREC", EpicsValue::Short(2)).unwrap();
+        rec.put_field("DO1", EpicsValue::Double(3.7)).unwrap();
+        assert_eq!(
+            rec.get_field("STR1"),
+            Some(EpicsValue::String("3.70".into()))
+        );
     }
 }

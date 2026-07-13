@@ -223,6 +223,36 @@ pub(crate) struct OutLinkSrc<'a> {
     pub field: &'a str,
 }
 
+/// Which of C's two gates a `processTarget` call is coming through — the two
+/// are NOT the same test (R18-94).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProcessTargetGate {
+    /// C `dbScanPassive` (dbDbLink.c:427-434): `if (pto->scan != 0) return 0;`
+    /// A Passive target only. This is FLNK (`dbDbScanFwdLink`), fanout `LNKn`,
+    /// and the `pvlOptPP` arm of `dbDbPutValue` (:388, `pdest->scan == 0`).
+    ScanPassive,
+    /// C `dbDbPutValue`'s FIRST arm (dbDbLink.c:387): `dbChannelField(chan) ==
+    /// &pdest->proc` — the link addresses the target's `.PROC` field. It
+    /// carries NO scan test, so a DB link writing `TARGET.PROC` processes the
+    /// target on ANY scan, and is independent of the `PP` flag.
+    ///
+    /// softIoc: `SRCO.OUT="TGT.PROC"` with `TGT` on `SCAN="10 second"` —
+    /// each `dbpf SRCO.PROC 1` advances `TGT.VAL` immediately (0 → 1 → 2).
+    /// The port's CA put route already honours this (field_io.rs `.PROC`
+    /// handling); this makes the DB-link route agree with it.
+    ProcField,
+}
+
+impl ProcessTargetGate {
+    /// Does a target with this SCAN reach `processTarget` through this gate?
+    fn admits(self, target_scan: ScanType) -> bool {
+        match self {
+            Self::ScanPassive => target_scan == ScanType::Passive,
+            Self::ProcField => true,
+        }
+    }
+}
+
 /// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
 #[derive(Clone, Debug)]
 pub(crate) struct SeqGroup {
@@ -1079,6 +1109,75 @@ impl PvDatabase {
         }
     }
 
+    /// C `processTarget` (dbDbLink.c:474-528) — and the gate that is the ONLY
+    /// way to reach it. The single owner of the link-side `PUTF`/`RPRO`
+    /// transition.
+    ///
+    /// **Invariant:** `PUTF`/`RPRO` on a link target are written only by
+    /// `processTarget`, and `processTarget` is reachable only for a PASSIVE
+    /// target or a `.PROC` write. C reaches it through exactly two gates, both
+    /// of which return BEFORE it otherwise — see [`ProcessTargetGate`].
+    ///
+    /// The port had five clones of the body, each applying the Passive test to
+    /// the *process* call only and mutating PUTF/RPRO above it. So an FLNK to a
+    /// busy periodic record got `RPRO = 1`, and its async completion fired an
+    /// extra unscheduled cycle — an extra device write and an extra FLNK chain
+    /// (R18-93). The gate now lives inside the owner, where it cannot be
+    /// forgotten.
+    ///
+    /// The body is C's, in order:
+    ///
+    /// * target not PACT — normal propagation, `target.putf = src_putf`, and
+    ///   the put-notify join (C `dbNotifyAdd`, dbDbLink.c:460);
+    /// * target PACT, `src_putf`, and the target is not already on this process
+    ///   chain (C `claim_dst`) — `target.rpro = true`, `target.putf = false`, so
+    ///   the in-flight cycle reprocesses on completion and attributes the put to
+    ///   the originator;
+    /// * otherwise nothing: the target is being processed recursively by us, or
+    ///   this was not a `dbPutField`.
+    ///
+    /// A PACT target is not processed (C `dbProcess` on an active record
+    /// returns without running the record, dbAccess.c:536-557).
+    pub(crate) async fn process_target(
+        &self,
+        target_name: &str,
+        gate: ProcessTargetGate,
+        src_putf: bool,
+        src_notify: Option<&Arc<NotifyWaitSet>>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        let Some(target_rec) = self.get_record(target_name).await else {
+            return;
+        };
+        let process = {
+            let mut tg = target_rec.write().await;
+            // The gate. A target that does not pass it never reaches
+            // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
+            // join — the join in particular would `enter` the wait-set without
+            // ever `leave`ing it.
+            if !gate.admits(tg.common.scan) {
+                return;
+            }
+            let pact = tg.is_processing();
+            if !pact {
+                tg.common.putf = src_putf;
+                join_put_notify(&mut tg, src_notify);
+            } else if src_putf && !visited.contains(target_name) {
+                tg.common.rpro = true;
+                tg.common.putf = false;
+            }
+            !pact
+        };
+        if process {
+            // Recursive target processing within one chain — the gate is
+            // already held by the foreign entry record.
+            let _ = self
+                .process_record_with_links_recursive(target_name, visited, depth + 1)
+                .await;
+        }
+    }
+
     /// Write a value through a DbLink, optionally processing the target if PP and Passive.
     ///
     /// Returns `true` when the write failed — C `dbPutLink` status `!= 0`:
@@ -1182,56 +1281,28 @@ impl PvDatabase {
             return true;
         }
 
-        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target
-        // when the destination field is `.PROC` **or** the link carries
-        // `pvlOptPP` (an explicit ` PP` token → `ProcessPassive`). The
-        // `.PROC` arm is independent of the PP flag, so it is checked
-        // here in the write path rather than encoded as a parse-time
-        // policy: a modifier-less link now defaults to `NoProcess`
-        // uniformly (INPUT and OUTPUT alike), and writing a value into a
-        // record's `.PROC` field still forces a process.
-        if link.field == "PROC"
-            || link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive
-        {
-            // Alias-aware lookup: the link's target may be the alias
-            // form. `process_record_with_links` itself also resolves
-            // aliases at entry, so passing `link.record` raw is safe.
-            if let Some(target_rec) = self.get_record(&link.record).await {
-                // Apply C `processTarget` PUTF propagation rules before
-                // dispatching the target's process cycle.
-                let (target_scan, should_process) = {
-                    let mut tg = target_rec.write().await;
-                    let pact = tg.is_processing();
-                    let on_chain = visited.contains(&link.record);
-                    let scan = tg.common.scan;
-                    if !pact {
-                        tg.common.putf = src.putf;
-                        // C `dbNotifyAdd` (dbDbLink.c:460) lives inside
-                        // `processTarget`, which `dbDbPutValue` reaches
-                        // for a `.PROC` write or a `PP` link to a passive
-                        // target (dbDbLink.c:387-389). This Rust port only
-                        // processes the target on the passive branch
-                        // below, so gate the join on the same condition:
-                        // a target that will not be processed must NOT
-                        // join, or it would `enter` the wait-set without
-                        // ever `leave`ing it and hang the completion.
-                        if scan == ScanType::Passive {
-                            join_put_notify(&mut tg, src.notify);
-                        }
-                    } else if src.putf && !on_chain {
-                        tg.common.rpro = true;
-                        tg.common.putf = false;
-                    }
-                    (scan, !pact)
-                };
-                if should_process && target_scan == ScanType::Passive {
-                    // recursive OUT-link target processing within
-                    // one chain — gate held by the foreign entry record.
-                    let _ = self
-                        .process_record_with_links_recursive(&link.record, visited, depth + 1)
-                        .await;
-                }
-            }
+        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target when the
+        // destination field is `.PROC` **or** the link carries `pvlOptPP` (an
+        // explicit ` PP` token → `ProcessPassive`) and the target is Passive.
+        // The two arms are different gates, not one: the `.PROC` arm is
+        // independent of both the PP flag and the target's SCAN (R18-94). It is
+        // therefore checked here in the write path rather than encoded as a
+        // parse-time policy: a modifier-less link defaults to `NoProcess`
+        // uniformly (INPUT and OUTPUT alike), and writing into a record's
+        // `.PROC` field still forces a process.
+        let gate = if link.field == "PROC" {
+            Some(ProcessTargetGate::ProcField)
+        } else if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
+            Some(ProcessTargetGate::ScanPassive)
+        } else {
+            None
+        };
+        if let Some(gate) = gate {
+            // Through the single `processTarget` owner, which holds the gate.
+            // Alias-aware: `process_target` resolves the name, as
+            // `process_record_with_links` does at entry.
+            self.process_target(&link.record, gate, src.putf, src.notify, visited, depth)
+                .await;
         }
         // Successful local write (C `dbPutLink` status 0).
         false
@@ -2028,35 +2099,17 @@ impl PvDatabase {
                         // record runs on its own scan. `dbScanPassive`
                         // then calls `processTarget`, which propagates
                         // PUTF (and sets RPRO on a busy target) exactly
-                        // like the explicit FLNK path — so mirror that
-                        // gate here instead of the previous
-                        // unconditional `process_record_with_links`.
-                        if let Some(target_rec) = self.get_record(&db.record).await {
-                            let (target_scan, should_process) = {
-                                let mut tg = target_rec.write().await;
-                                let pact = tg.is_processing();
-                                let on_chain = visited.contains(&db.record);
-                                if !pact {
-                                    tg.common.putf = src_putf;
-                                } else if src_putf && !on_chain {
-                                    tg.common.rpro = true;
-                                    tg.common.putf = false;
-                                }
-                                (tg.common.scan, !pact)
-                            };
-                            if should_process && target_scan == ScanType::Passive {
-                                // recursive link-target processing
-                                // within one chain — gate held by the
-                                // foreign entry record.
-                                let _ = self
-                                    .process_record_with_links_recursive(
-                                        &db.record,
-                                        visited,
-                                        depth + 1,
-                                    )
-                                    .await;
-                            }
-                        }
+                        // like the explicit FLNK path — so this goes
+                        // through the same single owner.
+                        self.process_target(
+                            &db.record,
+                            ProcessTargetGate::ScanPassive,
+                            src_putf,
+                            src_notify.as_ref(),
+                            visited,
+                            depth,
+                        )
+                        .await;
                     }
                 }
             }

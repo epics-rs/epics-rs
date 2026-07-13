@@ -1020,11 +1020,12 @@ fn cmd_db_load_records() -> CommandDef {
 
             let count = defs.len();
 
-            // One `dbLoadRecords` file is ONE database load: a record's link
-            // status is classified against the file's FINAL record set, so a
-            // link that forward-references a record defined further down still
-            // resolves to a local PV — C's `iocInit`-time `init_record`.
-            let _load = ctx.db().begin_load();
+            // `dbLoadRecords` OPENS the load phase; it does not close it. The
+            // boundary a record's links are classified against is `iocInit` —
+            // after EVERY `dbLoadRecords` in the `st.cmd` — so a forward
+            // reference to a record loaded by a later file is still a local PV
+            // (R18-92). Idempotent across the several loads one script issues.
+            ctx.db().begin_load();
 
             for mut def in defs {
                 // Resolve a `LINR` field naming a loaded breakpoint table to its
@@ -1261,9 +1262,18 @@ fn cmd_ioc_init() -> CommandDef {
     CommandDef::new(
         "iocInit",
         vec![],
-        "iocInit - Initialize the IOC (handled automatically by IocApplication)",
+        "iocInit - Initialize the IOC (record init here; the rest is run by IocApplication)",
         |_args: &[ArgValue], ctx: &CommandContext| {
-            ctx.println("iocInit: skipped (handled automatically after script execution)");
+            // The record-initialisation half of C's `iocInit` runs HERE, not at
+            // each `dbLoadRecords`: a link that forward-references a record
+            // loaded by a LATER `dbLoadRecords` in the same `st.cmd` must still
+            // classify as a local PV (R18-92). `PvDatabase::ioc_init` closes the
+            // load phase and runs every classification the loads queued; it is
+            // idempotent, so the `IocApplication`'s own call after the script is
+            // a no-op when the script spells `iocInit` out. Device support,
+            // scanning and PINI remain the application's, hence the note.
+            ctx.block_on(async { ctx.db().ioc_init().await });
+            ctx.println("iocInit: record initialization complete (scan/device init follows)");
             Ok(CommandOutcome::Continue)
         },
     )

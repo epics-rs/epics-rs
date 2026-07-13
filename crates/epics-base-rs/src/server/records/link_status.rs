@@ -122,16 +122,14 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// Returns `(status, field_type)`. An external (CA/PVA) link is reported as
 /// not-connected: epics-base-rs has no client to confirm a remote field's
 /// connection state or type.
+/// The database this reads is always the COMPLETE one: a classification issued
+/// while records are still being created is queued by
+/// [`AsyncDbHandle::schedule_record_init`] and only polled by `iocInit`, so a
+/// forward reference — within one `.db` or across two `dbLoadRecords` calls —
+/// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
+/// no gate to observe here because there is no way to run this against a
+/// half-built database.
 pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
-    // C classifies links in `init_record`, which `iocInit` runs only after the
-    // WHOLE database is loaded — so a link that forward-references a record
-    // defined later in the same `.db` is still a LOCAL link. Records here are
-    // created one at a time, and a refresh spawned at creation would otherwise
-    // read a half-built database and call that forward reference an external
-    // PV (nondeterministically, depending on when the task got scheduled).
-    // Waiting for the load to finish puts every classification on C's side of
-    // the boundary, by construction rather than by a timed re-poll.
-    handle.wait_for_load().await;
     match parse_link_v2(link).link_type() {
         // Empty / constant link: C → CON, no resolvable field type.
         LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),
@@ -177,10 +175,8 @@ pub async fn classify_swait_pv(handle: &AsyncDbHandle, name: &str) -> i16 {
     if name.trim().is_empty() {
         return SWAIT_NO_PV;
     }
-    // Same load boundary as `classify_link`: the PV search must see the
-    // completed database, or a forward-referenced local record reads back as an
-    // unconnected PV.
-    handle.wait_for_load().await;
+    // Same `iocInit` boundary as `classify_link`: this only ever runs against
+    // the completed database, so a forward-referenced local record is PV_OK.
     match parse_link_v2(name).link_type() {
         LinkType::Db => match handle.link_target_field_type(name).await {
             Some(_) => SWAIT_PV_OK,

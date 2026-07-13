@@ -404,7 +404,12 @@ impl CalcoutRecord {
         // it cannot clobber the newer classification (e.g. an init-time
         // snapshot finishing after a runtime INP re-point).
         let token = link_gen.next();
-        tokio::spawn(async move {
+        let sched = handle.clone();
+        // Through the database's `iocInit` owner: queued while records are
+        // still loading (so a forward-referenced target is LOCAL, and the
+        // status is final when `iocInit` returns), spawned at once once the
+        // database is complete.
+        sched.schedule_record_init(async move {
             // Let `add_record` finish registering this record before the init
             // post (this task may be spawned from `set_async_context`, which
             // runs just before the record is inserted into the map).

@@ -36,7 +36,14 @@ pub struct StringinRecord {
     pub mpst: i16,
     /// `menu(stringinPOST)` Post Archive Monitors (0=On Change, 1=Always).
     pub apst: i16,
+    /// C `monitor()`'s `strncmp(oval, val)` verdict for THIS cycle, captured
+    /// in `process()` before OVAL is committed — the framework reads it
+    /// afterwards, by which time `oval == val`.
+    value_changed: bool,
 }
+
+/// `menu(stringinPOST)` — `stringinRecord.dbd.pod`: 0 = On Change, 1 = Always.
+const MENU_POST_ALWAYS: i16 = 1;
 
 impl Default for StringinRecord {
     fn default() -> Self {
@@ -50,6 +57,7 @@ impl Default for StringinRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            value_changed: false,
         }
     }
 }
@@ -134,9 +142,37 @@ impl Record for StringinRecord {
         }
     }
 
+    /// C `stringinRecord.c::monitor` (:176-188) has no MDEL/ADEL deadband: the
+    /// VAL post is gated on `strncmp(oval, val)` plus the MPST/APST "Always"
+    /// override. Without this the record fell into the analog deadband owner,
+    /// which posts everything a `to_f64()` cannot measure — one VAL event per
+    /// subscriber per cycle on an unchanging string — and put a *numeric-looking*
+    /// string ("12") through the MDEL comparison, where C's `strncmp` sees
+    /// "12" → "12.0" as a change.
+    fn uses_monitor_deadband(&self) -> bool {
+        false
+    }
+
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
+    /// C: `if (mpst == stringinPOST_Always) monitor_mask |= DBE_VALUE;`
+    /// `if (apst == stringinPOST_Always) monitor_mask |= DBE_LOG;`
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `stringinRecord.c::monitor` copies VAL into OVAL.
-        self.oval = self.val.clone();
+        // C `stringinRecord.c::monitor` copies VAL into OVAL — but only on the
+        // `strncmp` mismatch that also raises DBE_VALUE|DBE_LOG. Capture the
+        // verdict here: the framework's monitor gate reads
+        // `monitor_value_changed()` after `process()` returns, by which point
+        // an unconditional copy would have erased it.
+        self.value_changed = self.oval != self.val;
+        if self.value_changed {
+            self.oval = self.val.clone();
+        }
         Ok(ProcessOutcome::complete())
     }
 

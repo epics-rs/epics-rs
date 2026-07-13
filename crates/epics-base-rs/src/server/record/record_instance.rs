@@ -22,6 +22,23 @@ use super::record_trait::{
 };
 use super::scan::{ScanType, SimModeScan};
 
+/// Every client-visible `special(SPC_NOMOD)` field of `dbCommon.dbd:13-190`.
+///
+/// These are common fields — no record's `field_list` declares them — so the
+/// declaration names them here. The remaining `SPC_NOMOD` entries in
+/// `dbCommon.dbd` (MLOK, MLIS, BKLNK, ASP, PPN, PPNR, SPVT, RSET, DSET, DPVT,
+/// RDES, LSET, BKPT) are `DBF_NOACCESS`: they have no field API in this port at
+/// all, and C refuses them one level earlier, at `dbNameToAddr`.
+///
+/// TIME is `DBF_NOACCESS` in C too (`dbpf REC.TIME` → "failed"), but this port
+/// resolves `.TIME`, so the declaration must cover it.
+///
+/// Read only through [`RecordInstance::is_no_mod`].
+const DBCOMMON_NOMOD: &[&str] = &[
+    "NAME", "STAT", "SEVR", "AMSG", "NSTA", "NSEV", "NAMSG", "ACKS", "ACKT", "LCNT", "PACT",
+    "PUTF", "RPRO", "TIME", "UTAG",
+];
+
 /// Put-notify completion wait-set — the C `dbNotify.c` `processNotify`
 /// waitList analogue (`dbNotifyAdd` / `dbNotifyCompletion`).
 ///
@@ -78,6 +95,37 @@ impl NotifyWaitSet {
     pub fn completed(&self) -> bool {
         self.pending.load(Ordering::Acquire) == 0
     }
+}
+
+/// A put-notify (`dbPutNotify` — CA WRITE_NOTIFY, `caput -c`) that landed on a
+/// PACT record and was therefore deferred WHOLE.
+///
+/// C `processNotifyCommon` (dbNotify.c:225-231) tests `precord->pact` above
+/// `ppn->putCallback`, so nothing is written and nothing is marked: the record
+/// joins the notify's wait list in state `notifyRestartInProgress`, and when the
+/// async cycle completes the put is replayed against a record that is no longer
+/// active — value written, record processed, callback fired only after THAT
+/// process finishes. So a client's "callback returned" still means "the value I
+/// sent has been processed".
+///
+/// softIoc 7.0.10.1-DEV, `ASY` (calcout, `ODLY=4`, `A=5`), `caput -c ASY.A 7`
+/// issued 1 s into the async cycle:
+///
+/// ```text
+/// t=1s  A=5  PACT=1                      <- cycle in flight
+/// t=2s  A=5  PACT=1  RPRO=0              <- put-notify pending: nothing written
+/// t=4s  A=7  PACT=1                      <- cycle done; the put is replayed
+/// callback returns at t=6.9s: A=7 VAL=7  <- after the RESTARTED process
+/// ```
+pub struct DeferredNotifyPut {
+    /// The field the client wrote (already upper-cased).
+    pub field: String,
+    /// The value it wrote — held here, unwritten, until the restart.
+    pub value: crate::types::EpicsValue,
+    /// The client's completion channel. The replayed put builds its wait-set
+    /// around this sender, so the callback fires on the restarted process, not
+    /// on the in-flight cycle.
+    pub completion: crate::runtime::sync::oneshot::Sender<()>,
 }
 
 /// Cached metadata for a record.
@@ -328,6 +376,15 @@ pub struct RecordInstance {
     // taken + `leave`d when the record's processing completes. `None`
     // outside any put-notify. See [`NotifyWaitSet`].
     pub notify: Option<Arc<NotifyWaitSet>>,
+    /// A put-notify that arrived while this record was PACT, deferred WHOLE —
+    /// C `processNotifyCommon` (dbNotify.c:225-231) tests `precord->pact`
+    /// ABOVE `putCallback`, so a `dbPutNotify` onto a busy record writes
+    /// nothing: no value, no RPRO. The record is parked on the notify's wait
+    /// list and the entire put — value, process, callback — is restarted once
+    /// the async cycle completes. See [`DeferredNotifyPut`] and
+    /// `PvDatabase::restart_deferred_notify_put`, the single owner that applies
+    /// it. `None` outside that window.
+    pub deferred_notify_put: Option<DeferredNotifyPut>,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -536,6 +593,7 @@ impl RecordInstance {
             subroutine: None,
             processing: AtomicBool::new(false),
             notify: None,
+            deferred_notify_put: None,
             last_posted: HashMap::new(),
             array_hash_changed: false,
             suppress_subroutine_run: false,
@@ -725,6 +783,51 @@ impl RecordInstance {
             *guard = Some(meta.clone());
         }
         meta
+    }
+
+    /// C `dbChannelSpecial(chan) == SPC_NOMOD` — **the single owner of the
+    /// no-modify declaration**, for every consumer that needs to know whether a
+    /// field can be written.
+    ///
+    /// C declares it once, in the `.dbd`, and reads it in two unrelated places:
+    ///
+    /// * `dbPut` (`dbAccess.c:123-126`, via `dbPutSpecial(paddr, 0)`) refuses
+    ///   the write — the port's `check_no_mod` gate;
+    /// * `rsrvCheckPut` (`rsrv/camessage.c:2540-2551`) — `if
+    ///   (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;` — which feeds
+    ///   the CA `ACCESS_RIGHTS` write bit (`camessage.c:1123-1124`) as well as
+    ///   both put paths, so a client sees `Access: read, no write` and never
+    ///   sends the doomed write.
+    ///
+    /// Only the first consumer existed in the port, so every dbCommon NOMOD
+    /// field advertised WRITE on the wire (`caput N1.SEVR 2` was refused
+    /// server-side, after the client had already sent it, with an async
+    /// exception instead of C's clean client-side "Write access denied").
+    ///
+    /// Three sources, one answer:
+    ///
+    /// 1. the dbCommon `SPC_NOMOD` set below — common fields, so no record's
+    ///    `field_list` declares them;
+    /// 2. [`FieldDesc::read_only`] — a record field its `.dbd` marks SPC_NOMOD;
+    /// 3. [`Record::field_no_mod`] — an SPC_NOMOD a record's `cvt_dbaddr`
+    ///    raises from its own state (compress VAL under BALG=LIFO,
+    ///    `compressRecord.c:398-407`), which a static `FieldDesc` cannot
+    ///    express.
+    ///
+    /// `field` may be any case.
+    pub fn is_no_mod(&self, field: &str) -> bool {
+        if DBCOMMON_NOMOD.iter().any(|f| f.eq_ignore_ascii_case(field)) {
+            return true;
+        }
+        if self
+            .record
+            .field_list()
+            .iter()
+            .any(|f| f.name.eq_ignore_ascii_case(field) && f.read_only)
+        {
+            return true;
+        }
+        self.record.field_no_mod(field)
     }
 
     /// Check if the record is currently processing (PACT equivalent).

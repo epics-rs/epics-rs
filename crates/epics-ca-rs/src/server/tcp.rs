@@ -863,13 +863,21 @@ impl ClientState {
                 // same lock.
                 let (is_ro, asg, asl) = {
                     let instance = record.read().await;
-                    let is_ro = instance
-                        .record
-                        .field_list()
-                        .iter()
-                        .find(|fd| fd.name == f.as_str())
-                        .map(|fd| fd.read_only)
-                        .unwrap_or(false);
+                    // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
+                    //
+                    //     /* SPC_NOMOD fields are always unwritable */
+                    //     if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;
+                    //
+                    // and its `0` clears the ACCESS_RIGHTS write bit at
+                    // camessage.c:1123-1124. The declaration has one owner
+                    // (`RecordInstance::is_no_mod`), shared with the `dbPut`
+                    // gate — reading `field_list().read_only` alone here saw
+                    // neither the dbCommon NOMOD set (NAME/STAT/SEVR/ACKS/…,
+                    // which no record's field_list declares) nor the
+                    // state-raised NOMOD of `Record::field_no_mod` (compress
+                    // VAL under BALG=LIFO), so the server advertised WRITE on
+                    // fields it would then refuse.
+                    let is_ro = instance.is_no_mod(f.as_str());
                     (is_ro, instance.common.asg.clone(), instance.common.asl)
                 };
                 // Read-only field-ness must AND

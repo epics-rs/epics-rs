@@ -934,7 +934,9 @@ impl SseqRecord {
         // sees its token is stale and drops its post so an init-time snapshot
         // finishing late cannot clobber the newer classification.
         let token = link_gen.next();
-        tokio::spawn(async move {
+        let sched = handle.clone();
+        // Through the database's `iocInit` owner — see `schedule_record_init`.
+        sched.schedule_record_init(async move {
             // Let `add_record` finish registering this record before the
             // init post (this task may be spawned from `set_async_context`,
             // which runs just before the record is inserted into the map).

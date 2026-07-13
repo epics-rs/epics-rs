@@ -620,6 +620,12 @@ impl IocApplication {
         Fut: std::future::Future<Output = CaResult<()>> + Send,
     {
         let db = Arc::new(PvDatabase::new());
+        // Everything from here to the `db.ioc_init()` barrier below is C's
+        // pre-`iocInit` load: inline records, then the `st.cmd`'s
+        // `dbLoadRecords` calls. Records created in it queue their link-status
+        // classification instead of running it against a database that is still
+        // being built (R18-92).
+        db.begin_load();
         let handle = tokio::runtime::Handle::current();
 
         let Self {
@@ -897,6 +903,12 @@ impl IocApplication {
         // C: initDatabase() then initHookAfterInitDatabase (autosave
         // pass 1). The registered hook performs pass-1 + SaveSetConfig
         // restore.
+        //
+        // The `iocInit` barrier runs as part of initDatabase: every record the
+        // startup script loaded now exists, so the link-status classifications
+        // queued during the load run here, against the complete database. A
+        // no-op when the script already spelled `iocInit` out.
+        db.ioc_init().await;
         announce!(InitHookState::AfterInitDatabase);
         announce!(InitHookState::AfterFinishDevSup);
         announce!(InitHookState::AfterScanInit);

@@ -341,10 +341,16 @@ pub fn parse_db_with_breaktables(
                 // tokens. Base's dbStaticLib parser tolerates either
                 // form and ad-core templates rely on the unquoted
                 // shape (`info(asyn:READBACK, "1")`).
+                //
+                // C `info(tokenSTRING, json_value)` (dbYacc.y:262-267): the tag
+                // is a `tokenSTRING` — the same raw, untranslated token a record
+                // NAME is — and only the value is a `jsonSTRING` that
+                // `dbRecordInfo` runs `dbTranslateEscape` over
+                // (dbLexRoutines.c:1435-1440). Hence the two different readers.
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, '(', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let tag = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                let tag = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ',', line)?;
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
@@ -841,20 +847,22 @@ fn read_quoted_string(
     *pos += 1;
     *col += 1;
 
-    // C dbStatic lexer parity (dbLex.l:90-93): a quoted `tokenSTRING`
-    // matches `{doublequote}({dqschar}|{escape})*{doublequote}` where
-    // `escape = {backslash}.`. The lexer keeps the **raw bytes** of the
-    // string body — `dbmfStrdup(yytext+1)` then NUL-terminates one byte
-    // early, so only the surrounding quotes are stripped; escape
-    // sequences are NOT translated. Escape translation
-    // (`dbTranslateEscape`) runs in `dbGetFieldValue`/`dbRecordInfo`
-    // ONLY when the value still carries quotes, which a plain
-    // `tokenSTRING` never does (dbLexRoutines.c:1398). So for `.db`
-    // field/name/info values a `\n` stays the literal 2 chars `\n`.
+    // C dbStatic lexer parity (dbLex.l:88-92): a quoted `tokenSTRING` matches
+    // `{doublequote}({dqschar}|{escape})*{doublequote}` where `escape =
+    // {backslash}.`. The lexer keeps the **raw bytes** of the string body —
+    // `dbmfStrdup(yytext+1)` then NUL-terminates one byte early, so only the
+    // surrounding quotes are stripped; escape sequences are NOT translated.
     //
-    // The escape sequence still consumes its following char for
-    // delimiter purposes — `\"` does not terminate the string — but
-    // both bytes are emitted verbatim.
+    // This rule reads NAMES ONLY (record/alias/breaktable names, `path` and
+    // `include` arguments, the `info` tag) — every `tokenSTRING` in the C
+    // grammar. Field and info VALUES are a different token from a different
+    // start condition (`jsonSTRING`, dbLex.l:111-114) and DO get translated;
+    // they go through [`read_json_string`]. Do not merge the two: unescaping
+    // here would corrupt every record name (R18-91).
+    //
+    // The escape sequence still consumes its following char for delimiter
+    // purposes — `\"` does not terminate the string — but both bytes are
+    // emitted verbatim.
     let mut s = String::new();
     while *pos < chars.len() && chars[*pos] != '"' {
         if chars[*pos] == '\\' && *pos + 1 < chars.len() && chars[*pos + 1] != '\n' {
@@ -896,6 +904,124 @@ fn read_quoted_string(
     *pos += 1; // skip closing "
     *col += 1;
     Ok(s)
+}
+
+/// A quoted field/info VALUE — C's `jsonSTRING` (dbLex.l:111-114, matched in
+/// the `JSON` start condition the `field(`/`info(` rules switch into,
+/// dbYacc.y:256-267), followed by the translation `dbLexRoutines.c:1398-1403`
+/// and `:1435-1440` run on it.
+///
+/// C keeps the quotes on a `jsonSTRING` — they are precisely the marker that
+/// the translation is still owed — and `dbGetFieldValue`/`dbRecordInfo` then
+/// strip them and call `dbTranslateEscape(value, value)` before `dbPutString`.
+/// So `field(DESC,"hex\x41end")` stores `hexAend`, and a link field's
+/// `"@drvUser(\"chan1\")"` reaches device support with real quotes in it, not
+/// backslashes. This is the half [`read_quoted_string`] (names, raw) must NOT
+/// do, and the whole of R18-91.
+///
+/// The accepted grammar is C's (dbLex.l:23-33), which is STRICTER than a raw
+/// read: a literal control character and the escapes `\1`..`\9` are syntax
+/// errors, `\x` demands exactly two hex digits and `\u` exactly four. Single
+/// quotes delimit a value string as well as double (`jsonsqstr`), and the other
+/// quote character is then an ordinary character. C accepts `\uHHHH` in the
+/// lexer but implements no `\u` in the translation, so it comes out as the
+/// literal text `uHHHH` — reproduced, because a `.db` in the field may rely on
+/// what C actually stores.
+fn read_json_string(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<String> {
+    let quote = match chars.get(*pos) {
+        Some(&c @ ('"' | '\'')) => c,
+        _ => {
+            return Err(CaError::DbParseError {
+                line: *line,
+                column: *col,
+                message: "expected a quoted value".into(),
+            });
+        }
+    };
+    *pos += 1;
+    *col += 1;
+
+    let err = |line: usize, col: usize, message: &str| CaError::DbParseError {
+        line,
+        column: col,
+        message: message.into(),
+    };
+
+    // The escaped source text, quotes stripped — C's `yytext`, minus the two
+    // quote characters `dbGetFieldValue` steps over.
+    let mut escaped = String::new();
+    loop {
+        let Some(&c) = chars.get(*pos) else {
+            return Err(err(*line, *col, "unterminated string"));
+        };
+        if c == quote {
+            *pos += 1;
+            *col += 1;
+            break;
+        }
+        if c == '\n' {
+            // dbLex.l:131-133 — the JSON string rule cannot match a newline
+            // (`normalchar` excludes every control character), and the
+            // catch-all reports the missing quote.
+            return Err(err(*line, *col, "Newline in string, closing quote missing"));
+        }
+        if c == '\\' {
+            let Some(&esc) = chars.get(*pos + 1) else {
+                return Err(err(*line, *col, "unterminated string"));
+            };
+            // `escapedchar` is `{backslash}[^ux1-9]`; `x` and `u` introduce the
+            // fixed-width `latinchar`/`unicodechar` forms, and `\1`..`\9` are
+            // not escapes at all (C has no octal here).
+            let hex = |n: usize| {
+                chars
+                    .get(*pos + 2..*pos + 2 + n)
+                    .is_some_and(|ds| ds.iter().all(|d| d.is_ascii_hexdigit()))
+            };
+            let width = match esc {
+                'x' if hex(2) => 4,
+                'u' if hex(4) => 6,
+                'x' | 'u' | '1'..='9' => {
+                    return Err(err(
+                        *line,
+                        *col,
+                        "invalid escape sequence (\\x needs 2 hex digits, \
+                         \\u needs 4, and \\1..\\9 are not escapes)",
+                    ));
+                }
+                _ => 2,
+            };
+            // `\<newline>` is a legal escape here (the class `[^ux1-9]` matches
+            // a newline where the name rule's `.` does not), so the line
+            // counter has to follow it.
+            let consumed = &chars[*pos..*pos + width];
+            escaped.extend(consumed);
+            *pos += width;
+            if consumed.contains(&'\n') {
+                *line += 1;
+                *col = 0;
+            } else {
+                *col += width;
+            }
+            continue;
+        }
+        if (c as u32) < 0x20 {
+            return Err(err(
+                *line,
+                *col,
+                "a control character must be escaped inside a quoted value",
+            ));
+        }
+        escaped.push(c);
+        *pos += 1;
+        *col += 1;
+    }
+
+    Ok(crate::runtime::epics_string::raw_from_escaped(&escaped))
 }
 
 /// A brace-delimited JSON field value, returned verbatim (braces included).
@@ -954,14 +1080,34 @@ fn read_json_value(
     })
 }
 
+/// A C `tokenSTRING` in a position that also allows a bareword — the `info`
+/// tag. Quoted: RAW, escapes untranslated, exactly as a record name is read
+/// ([`read_quoted_string`]). Unquoted: the bareword itself.
+fn read_token_string(
+    chars: &[char],
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<String> {
+    if matches!(chars.get(*pos), Some('"')) {
+        return read_quoted_string(chars, pos, line, col);
+    }
+    read_field_value(chars, pos, line, col)
+}
+
+/// A field or info VALUE — C's `json_value` (dbYacc.y:256-267): the parser
+/// switches into the `JSON` start condition for it, so a quoted value is a
+/// `jsonSTRING` and its escapes are translated ([`read_json_string`]). The
+/// unquoted forms (`jsonBARE`, `jsonNUMBER`) carry no escapes and are taken
+/// verbatim, as C does.
 fn read_field_value(
     chars: &[char],
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
 ) -> CaResult<String> {
-    if *pos < chars.len() && chars[*pos] == '"' {
-        return read_quoted_string(chars, pos, line, col);
+    if matches!(chars.get(*pos), Some('"' | '\'')) {
+        return read_json_string(chars, pos, line, col);
     }
 
     // JSON value: C's dbLex tokenizes a brace-delimited field value as JSON
@@ -1327,33 +1473,108 @@ mod tests {
 
     #[test]
     fn test_quoted_string_escape() {
-        // C dbStatic parity: a quoted `tokenSTRING` keeps escape
-        // bytes RAW — only the surrounding quotes are stripped. A `.db`
-        // field value `"hello \"world\""` therefore stores the literal
-        // 15 chars `hello \"world\"`, NOT `hello "world"`. The `\"`
-        // still does not terminate the string.
+        // R18-91: a quoted field VALUE is a `jsonSTRING`, and
+        // `dbGetFieldValue` runs `dbTranslateEscape` over it — so
+        // `"hello \"world\""` stores the 13 chars `hello "world"`, with real
+        // quotes. (This test previously pinned the defect, asserting the raw
+        // 15-char form.) The `\"` still does not terminate the string.
+        //
+        // softIoc: field(VAL,"a \"b\" c") -> dbgf prints "a \"b\" c", i.e. it
+        // re-escapes on print (dbTest.c:1007), so the stored bytes are 9.
         let input = r#"
     record(stringin, "TEST") {
     field(VAL, "hello \"world\"")
     }
     "#;
         let records = parse_db(input, &HashMap::new()).unwrap();
-        assert_eq!(records[0].fields[0].1, r#"hello \"world\""#);
+        assert_eq!(records[0].fields[0].1, r#"hello "world""#);
     }
 
     #[test]
-    fn test_quoted_string_keeps_escapes_raw() {
-        // `\n`, `\t`, `\\` are all kept verbatim for `.db` field
-        // values — a C IOC stores the literal backslash sequences.
+    fn test_quoted_value_translates_escapes() {
+        // R18-91: `\n`, `\t`, `\\` and `\xHH` are all TRANSLATED in a field
+        // value — softIoc `field(DESC,"hex\x41end")` -> `dbgf E2.DESC` =
+        // "hexAend". (This test previously pinned the defect under the name
+        // `test_quoted_string_keeps_escapes_raw`.)
         let input = r#"
     record(stringin, "TEST") {
     field(DESC, "line1\nline2")
     field(OUT, "a\\b\tc")
+    field(SIOL, "hex\x41end")
     }
     "#;
         let records = parse_db(input, &HashMap::new()).unwrap();
-        assert_eq!(records[0].fields[0].1, r"line1\nline2");
-        assert_eq!(records[0].fields[1].1, r"a\\b\tc");
+        assert_eq!(records[0].fields[0].1, "line1\nline2");
+        assert_eq!(records[0].fields[1].1, "a\\b\tc");
+        assert_eq!(records[0].fields[2].1, "hexAend");
+    }
+
+    /// The other half of the split: a record/alias NAME is a `tokenSTRING`
+    /// (dbLex.l:88-92) and keeps its escape bytes RAW. Unescaping the shared
+    /// helper would have broken every name.
+    #[test]
+    fn test_record_name_keeps_escapes_raw() {
+        let input = r#"
+    record(stringin, "T\tEST") {
+    field(VAL, "x")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].name, r"T\tEST");
+    }
+
+    /// An `info` VALUE is translated (`dbRecordInfo`, dbLexRoutines.c:1435-1440);
+    /// the info TAG is a `tokenSTRING` and is not.
+    #[test]
+    fn test_info_value_translates_escapes() {
+        let input = r#"
+    record(stringin, "TEST") {
+    info("Q:group", "tab\there")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].info_tags[0].0, "Q:group");
+        assert_eq!(records[0].info_tags[0].1, "tab\there");
+    }
+
+    /// A single-quoted value is a `jsonsqstr` (dbLex.l:31-33) and is translated
+    /// the same way — softIoc: `field(VAL,'sq:\tx')` stores `sq:<TAB>x`.
+    #[test]
+    fn test_single_quoted_value_translates_escapes() {
+        let input = "record(stringin, \"TEST\") {\n field(VAL, 'sq:\\tx')\n}\n";
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, "sq:\tx");
+    }
+
+    /// C's value grammar is STRICTER than a raw read: `\1`..`\9` is not an
+    /// escape (`escapedchar` = `{backslash}[^ux1-9]`, dbLex.l:25), so a `.db`
+    /// carrying an octal escape is a syntax error — softIoc rejects
+    /// `field(VAL,"octal\101x")` with `ERROR: syntax error`, and the port must
+    /// not silently start up with different data.
+    #[test]
+    fn test_octal_escape_in_value_is_rejected() {
+        let input = r#"
+    record(stringin, "TEST") {
+    field(VAL, "octal\101x")
+    }
+    "#;
+        assert!(matches!(
+            parse_db(input, &HashMap::new()),
+            Err(CaError::DbParseError { .. })
+        ));
+    }
+
+    /// A link field rides the same path: the escaped quotes reach device
+    /// support as real quotes, not backslashes (R18-91's headline impact).
+    #[test]
+    fn test_link_field_value_is_translated() {
+        let input = r#"
+    record(stringin, "TEST") {
+    field(INP, "@drvUser(\"chan1\")")
+    }
+    "#;
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, r#"@drvUser("chan1")"#);
     }
 
     #[test]
@@ -1371,18 +1592,35 @@ mod tests {
 
     #[test]
     fn test_quoted_string_backslash_before_newline_aborts() {
-        // C `{escape}` is `{backslash}.` and flex `.` never matches a
-        // newline (`{dqschar}` is `[^"\n\\]`), so a backslash
-        // immediately before a newline is NOT an escape: the string
-        // stays unterminated and aborts with the same newline-in-string
-        // error (dbLex.l:131-133). The `\` must not swallow the newline.
-        let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\\\nline2\")\n}\n";
+        // The NAME rule (dbLex.l:88-92): `{escape}` is `{backslash}.` and flex
+        // `.` never matches a newline (`{dqschar}` is `[^"\n\\]`), so a
+        // backslash immediately before a newline is NOT an escape — the string
+        // stays unterminated and aborts (dbLex.l:131-133).
+        //
+        // softIoc, `record(stringin,"BN2\<newline>X")`:
+        //   ERROR: Invalid character '"' / Invalid character '\' / syntax error
+        let input = "record(stringin, \"TE\\\nST\") {\n    field(DESC, \"x\")\n}\n";
         let res = parse_db(input, &HashMap::new());
         assert!(
             matches!(res, Err(CaError::DbParseError { ref message, .. })
                 if message.contains("Newline in string")),
             "expected newline-in-string abort, got {res:?}"
         );
+    }
+
+    /// The VALUE rule is the other start condition and disagrees on exactly
+    /// this character: `escapedchar` is `{backslash}[^ux1-9]` (dbLex.l:25), a
+    /// character CLASS, which does match a newline. So a backslash before a
+    /// newline is a valid escape in a value, and the translation's default arm
+    /// yields the newline itself.
+    ///
+    /// softIoc, `field(DESC, "line1\<newline>line2")` → `dbgf BN.DESC` prints
+    /// `"line1\nline2"` — i.e. a real newline, re-escaped for display.
+    #[test]
+    fn test_value_backslash_before_newline_is_a_newline() {
+        let input = "record(stringin, \"TEST\") {\n    field(DESC, \"line1\\\nline2\")\n}\n";
+        let records = parse_db(input, &HashMap::new()).unwrap();
+        assert_eq!(records[0].fields[0].1, "line1\nline2");
     }
 
     #[test]

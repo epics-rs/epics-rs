@@ -43,7 +43,14 @@ pub struct StringoutRecord {
     pub mpst: i16,
     /// `menu(stringoutPOST)` Post Archive Monitors (0=On Change, 1=Always).
     pub apst: i16,
+    /// C `monitor()`'s `strncmp(oval, val)` verdict for THIS cycle, captured
+    /// in `process()` before OVAL is committed — the framework reads it
+    /// afterwards, by which time `oval == val`.
+    value_changed: bool,
 }
+
+/// `menu(stringoutPOST)` — `stringoutRecord.dbd.pod`: 0 = On Change, 1 = Always.
+const MENU_POST_ALWAYS: i16 = 1;
 
 impl Default for StringoutRecord {
     fn default() -> Self {
@@ -61,6 +68,7 @@ impl Default for StringoutRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            value_changed: false,
         }
     }
 }
@@ -184,9 +192,33 @@ impl Record for StringoutRecord {
         )]
     }
 
+    /// C `stringoutRecord.c::monitor` (:211-227) has no MDEL/ADEL deadband: the
+    /// VAL post is gated on `strncmp(oval, val)` plus the MPST/APST "Always"
+    /// override — identical to `stringin`. See `stringin.rs` for the analog
+    /// deadband owner this replaces.
+    fn uses_monitor_deadband(&self) -> bool {
+        false
+    }
+
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
+    /// C: `if (mpst == stringoutPOST_Always) monitor_mask |= DBE_VALUE;`
+    /// `if (apst == stringoutPOST_Always) monitor_mask |= DBE_LOG;`
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `stringoutRecord.c::monitor` copies VAL into OVAL.
-        self.oval = self.val.clone();
+        // C `stringoutRecord.c::monitor` copies VAL into OVAL only on the
+        // `strncmp` mismatch that raises DBE_VALUE|DBE_LOG. Capture the verdict
+        // before the copy erases it — the framework reads
+        // `monitor_value_changed()` after `process()` returns.
+        self.value_changed = self.oval != self.val;
+        if self.value_changed {
+            self.oval = self.val.clone();
+        }
         Ok(ProcessOutcome::complete())
     }
 

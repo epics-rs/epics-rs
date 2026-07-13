@@ -254,6 +254,90 @@ impl WaveformRecord {
         }
     }
 
+    /// The element type of the VAL buffer for the current FTVL — the C
+    /// `dbValueSize(prec->ftvl)` element `bptr` is typed with. Kept in lockstep
+    /// with [`Self::reallocate_val`] (the storage owner): both map USHORT onto
+    /// the SHORT buffer and ULONG onto the LONG one, and both fall back to
+    /// DOUBLE for the element types the port has no array storage for.
+    fn ftvl_element_type(&self) -> DbFieldType {
+        match self.ftvl {
+            1 => DbFieldType::Char,
+            2 => DbFieldType::UChar,
+            3 | 4 => DbFieldType::Short,
+            5 | 6 => DbFieldType::Long,
+            7 => DbFieldType::Int64,
+            8 => DbFieldType::UInt64,
+            9 => DbFieldType::Float,
+            _ => DbFieldType::Double,
+        }
+    }
+
+    /// Land a VAL source in the FTVL-typed buffer — the single owner of the
+    /// "what does a VAL put do" rule, so VAL is an FTVL-typed ARRAY of NELM
+    /// elements on every path, by construction.
+    ///
+    /// C never replaces the buffer, whatever the source's shape: every write
+    /// hands `dbGetLink`/`dbPutField` a pointer to the FTVL-typed `bptr` with
+    /// `nRequest = NELM` (`aaoRecord.c:366`, `devWfSoft.c::readLocked`), the
+    /// conversion runs INTO that buffer, and NORD becomes the element count
+    /// actually written. So:
+    ///
+    /// * an ARRAY source fills the head of the buffer — `NORD = min(len, NELM)`;
+    /// * a SCALAR source is ONE element (`nReq = 1`) landing in `bptr[0]`, with
+    ///   `NORD = 1`.
+    ///
+    /// The pre-fix port's fallback arm (`other => { nord = 1; val = other }`)
+    /// stored the SCALAR VARIANT in VAL instead, breaking that invariant on the
+    /// everyday `DOL="SETPOINT"` closed-loop aao (a scalar ao feeding an array
+    /// output): `array_content_bytes` has no scalar arm, so the On-Change hash
+    /// went empty and MPST/APST posting silently died; `resize_val_preserving`
+    /// found no array variant and reallocated, wiping the data; and the scalar
+    /// propagated on to the OUT target as a scalar. The same arm swallowed the
+    /// array variants the buffer does not use (USHORT/ULONG/ENUM/STRING
+    /// element types), which likewise ended up stored verbatim with NORD=1.
+    ///
+    /// Conversion goes through [`EpicsValue::convert_to`], the single
+    /// value-coercion owner, against the FTVL element type — C's
+    /// `dbFastConvert` into `bptr`.
+    fn land_val_in_buffer(&mut self, value: EpicsValue) -> CaResult<()> {
+        let nelm = self.nelm.max(0) as usize;
+        let converted = value.convert_to(self.ftvl_element_type());
+        // NORD is capped at NELM (a VAL buffer holds at most NELM elements; C
+        // bounds every request to NELM, so NORD <= NELM by construction) and the
+        // buffer is resized to NELM to preserve the CA channel element count.
+        macro_rules! land {
+            ($src:expr, $variant:ident, $zero:expr) => {{
+                let mut arr = $src;
+                self.nord = arr.len().min(nelm) as i32;
+                arr.resize(nelm, $zero);
+                self.val = EpicsValue::$variant(arr);
+                Ok(())
+            }};
+        }
+        match converted {
+            EpicsValue::CharArray(a) => land!(a, CharArray, 0),
+            EpicsValue::UCharArray(a) => land!(a, UCharArray, 0),
+            EpicsValue::ShortArray(a) => land!(a, ShortArray, 0),
+            EpicsValue::LongArray(a) => land!(a, LongArray, 0),
+            EpicsValue::Int64Array(a) => land!(a, Int64Array, 0),
+            EpicsValue::UInt64Array(a) => land!(a, UInt64Array, 0),
+            EpicsValue::FloatArray(a) => land!(a, FloatArray, 0.0),
+            EpicsValue::DoubleArray(a) => land!(a, DoubleArray, 0.0),
+            // Scalar source: one element, into bptr[0].
+            EpicsValue::Char(x) => land!(vec![x], CharArray, 0),
+            EpicsValue::UChar(x) => land!(vec![x], UCharArray, 0),
+            EpicsValue::Short(x) => land!(vec![x], ShortArray, 0),
+            EpicsValue::Long(x) => land!(vec![x], LongArray, 0),
+            EpicsValue::Int64(x) => land!(vec![x], Int64Array, 0),
+            EpicsValue::UInt64(x) => land!(vec![x], UInt64Array, 0),
+            EpicsValue::Float(x) => land!(vec![x], FloatArray, 0.0),
+            EpicsValue::Double(x) => land!(vec![x], DoubleArray, 0.0),
+            other => Err(CaError::TypeMismatch(format!(
+                "VAL: {other:?} does not convert to the FTVL element type"
+            ))),
+        }
+    }
+
     /// Reallocate VAL buffer to match current FTVL and NELM.
     ///
     /// menuFtype indices: STRING=0, CHAR=1, UCHAR=2, SHORT=3, USHORT=4,
@@ -810,65 +894,15 @@ impl Record for WaveformRecord {
         match name {
             "VAL" => {
                 // Coerce value to match FTVL (e.g. String → CharArray for
-                // FTVL=CHAR, String → UCharArray for FTVL=UCHAR).
+                // FTVL=CHAR, String → UCharArray for FTVL=UCHAR): a text source
+                // into a char-element buffer is the string's BYTES, not a
+                // numeric parse of it.
                 let value = match (&value, self.ftvl) {
                     (EpicsValue::String(s), 1) => EpicsValue::CharArray(s.as_bytes().to_vec()),
                     (EpicsValue::String(s), 2) => EpicsValue::UCharArray(s.as_bytes().to_vec()),
                     _ => value,
                 };
-                // Update NORD based on actual data length, capped at NELM
-                // (a VAL buffer holds at most NELM elements; C dbPutField and
-                // dbGetLink both bound the request to NELM, so NORD <= NELM by
-                // construction). The buffer itself is resized to NELM to
-                // preserve the CA channel element count.
-                let nelm = self.nelm.max(0) as usize;
-                match value {
-                    EpicsValue::CharArray(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0);
-                        self.val = EpicsValue::CharArray(arr);
-                    }
-                    EpicsValue::UCharArray(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0);
-                        self.val = EpicsValue::UCharArray(arr);
-                    }
-                    EpicsValue::ShortArray(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0);
-                        self.val = EpicsValue::ShortArray(arr);
-                    }
-                    EpicsValue::LongArray(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0);
-                        self.val = EpicsValue::LongArray(arr);
-                    }
-                    EpicsValue::Int64Array(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0);
-                        self.val = EpicsValue::Int64Array(arr);
-                    }
-                    EpicsValue::UInt64Array(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0);
-                        self.val = EpicsValue::UInt64Array(arr);
-                    }
-                    EpicsValue::FloatArray(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0.0);
-                        self.val = EpicsValue::FloatArray(arr);
-                    }
-                    EpicsValue::DoubleArray(mut arr) => {
-                        self.nord = arr.len().min(nelm) as i32;
-                        arr.resize(nelm, 0.0);
-                        self.val = EpicsValue::DoubleArray(arr);
-                    }
-                    other => {
-                        self.nord = 1;
-                        self.val = other;
-                    }
-                }
-                Ok(())
+                self.land_val_in_buffer(value)
             }
             "NELM" => {
                 if let EpicsValue::Long(n) = value {
@@ -1495,8 +1529,11 @@ mod array_kind_tests {
     /// arm, so it covers aao DOL pulls and every other internal delivery.
     #[test]
     fn put_val_caps_nord_at_nelm() {
-        let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
-        wf.nelm = 4;
+        // FTVL=LONG: the buffer's element type is what the source converts INTO
+        // (C `bptr` is `dbValueSize(ftvl)`-typed), so a LONG-element record is
+        // what keeps a LongArray source a LongArray.
+        let mut wf = WaveformRecord::new(4, DbFieldType::Long);
+        wf.kind = ArrayKind::Waveform;
 
         // source < NELM
         wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2]))

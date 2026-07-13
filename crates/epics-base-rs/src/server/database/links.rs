@@ -28,6 +28,21 @@ fn link_dbf_to_field_type(t: LinkDbfType) -> DbFieldType {
     }
 }
 
+/// dfanout output-link fields, index-aligned with `MultiOut::Dfanout`
+/// (`dfanoutRecord.c:39` — OUTA..OUTP). Named so a failed OUTn put can
+/// report WHICH link failed in the record's AMSG, as C `setLinkAlarm` does.
+pub(crate) const DFANOUT_LINK_FIELDS: [&str; 16] = [
+    "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI", "OUTJ", "OUTK", "OUTL",
+    "OUTM", "OUTN", "OUTO", "OUTP",
+];
+
+/// seq / fanout link fields, index-aligned with `MultiOut::Seq` /
+/// `MultiOut::Fanout` (`seqRecord.c:86`, `fanoutRecord.c:39` — LNK0..LNKF).
+pub(crate) const LNK_LINK_FIELDS: [&str; 16] = [
+    "LNK0", "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA", "LNKB",
+    "LNKC", "LNKD", "LNKE", "LNKF",
+];
+
 /// Record-specific input link fields that may carry a CP/CPP modifier:
 /// DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16 groups), DOL1-DOLA
 /// (sseq — legacy 10 groups), NVL (sel), SELL (sseq), SGNL (histogram).
@@ -101,11 +116,15 @@ pub(crate) fn inherit_sevr_msg(
 ///
 /// * `putf` / `notify` — the PUTF bit and put-notify wait-set that C
 ///   `processTarget` carries to each target (dbDbLink.c:460-474).
-/// * `alarm` — the committed alarm that C `recGblInheritSevrMsg` folds
-///   into the dest per the link's MS-class switch (dbDbLink.c:382-383).
+/// * `alarm` — the PENDING alarm that C `recGblInheritSevrMsg` folds
+///   into the dest per the link's MS-class switch (dbDbLink.c:382-383
+///   reads `psrce->nsta`/`nsev`/`namsg`, before the source commits them).
+/// * `field` — the source's link FIELD name (`OUT`, `SIOL`, `OUTA`, …),
+///   which C `setLinkAlarm` puts in the source's alarm message on a failed
+///   put (`dbLink.c:319-323`: `"field %s", dbLinkFieldName(plink)`).
 ///
 /// Bundled so the OUT-link write path threads one snapshot instead of
-/// three positional arguments. The FLNK process-trigger path keeps the
+/// four positional arguments. The FLNK process-trigger path keeps the
 /// lighter `PutNotifyCtx` (a forward link propagates no value and thus
 /// no alarm).
 #[derive(Clone, Copy)]
@@ -113,6 +132,7 @@ pub(crate) struct OutLinkSrc<'a> {
     pub putf: bool,
     pub notify: Option<&'a Arc<NotifyWaitSet>>,
     pub alarm: &'a LinkAlarm,
+    pub field: &'a str,
 }
 
 /// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
@@ -1117,32 +1137,150 @@ impl PvDatabase {
             .multi_output_buffer(link_field, staged, &target)
     }
 
-    /// Write a value through a parsed OUT link, dispatching DB links
-    /// to [`Self::write_db_link_value`] and external (`ca://`/`pva://`)
-    /// links to [`Self::write_external_pv`].
+    /// The record's generic multi-output OUT writes — scalcout / acalcout
+    /// `OUT`->`OVAL`, the pairs a record declares through
+    /// [`Record::multi_output_links`]. C's soft device support performs these
+    /// from `writeValue`, i.e. inside `process()` and BEFORE `monitor()`
+    /// commits the cycle's alarm, so this runs pre-commit: a failed put's
+    /// `LINK_ALARM`/`INVALID` (raised inside [`Self::write_out_link_value`])
+    /// lands in the SAME cycle's committed SEVR and monitor posts.
     ///
-    /// This is the OUTPUT-side counterpart of [`Self::read_link_value`]'s
+    /// SINGLE-OWNER INVARIANT: a record type whose link groups are dispatched
+    /// by [`Self::dispatch_multi_output`] (fanout/dfanout/seq) MUST be skipped
+    /// here — otherwise its `LNKn`/`OUTn` would be written twice per cycle.
+    /// `sseq` once implemented `Record::multi_output_links` as well and was
+    /// double-dispatched; the `multi_output_dispatch_owned` gate makes that
+    /// structurally impossible rather than fixed at the record.
+    pub(crate) async fn dispatch_multi_output_values(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+        src: OutLinkSrc<'_>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        let pairs = {
+            let instance = rec.read().await;
+            // Framework IVOA=Don't_drive veto for the multi-output OUT path,
+            // mirroring the single-OUT `skip_out` gate: on an INVALID cycle
+            // with IVOA=Don't_drive the OUT write is suppressed (execOutput
+            // `nsev >= INVALID` → Don't_drive `break`, sCalcoutRecord.c:794).
+            // The severity C tests there is the PENDING `nsev` — this dispatch
+            // runs before the commit, so `nsev` is what it reads.
+            let ivoa_dont_drive = instance.common.nsev
+                == crate::server::record::AlarmSeverity::Invalid
+                && matches!(
+                    instance.record.get_field("IVOA"),
+                    Some(EpicsValue::Short(1))
+                );
+            let links =
+                if ivoa_dont_drive || multi_output_dispatch_owned(instance.record.record_type()) {
+                    &[][..]
+                } else {
+                    instance.record.multi_output_links()
+                };
+            let mut pairs = Vec::new();
+            for &(link_field, val_field) in links {
+                let link_str = match instance.record.get_field(link_field) {
+                    Some(EpicsValue::String(s)) => s,
+                    _ => continue,
+                };
+                if link_str.is_empty() {
+                    continue;
+                }
+                if let Some(val) = instance.record.get_field(val_field) {
+                    pairs.push((link_field, link_str, val));
+                }
+            }
+            pairs
+        };
+        for (link_field, link_str, val) in pairs {
+            // `multi_output_links` carries record OUT links (scalcout /
+            // acalcout `OUT` — `DBF_OUTLINK`) driven via `dbPutLink` →
+            // `dbDbPutValue` (`dbDbLink.c:388`): a bare DB link is NPP, the
+            // value is written but the target is NOT processed.
+            // `parse_output_link_v2` applies that OUT-link-correct NPP default;
+            // `parse_link_v2` would wrongly default a bare link to
+            // ProcessPassive and re-process the target. An external
+            // `ca://`/`pva://` OUT link routes through the link set's
+            // `putValue` (C `dbLink.c::dbPutLink`, dbLink.c:434-448).
+            let parsed =
+                crate::server::record::parse_output_link_v2(link_str.as_str_lossy().as_ref());
+            // Device-support write-buffer switch: the resolved target's DBF
+            // type / element count decides which of the record's buffers C
+            // would actually put (`devsCalcoutSoft.c:66-144`,
+            // `devaCalcoutSoft.c:75-87`).
+            let val = self
+                .multi_out_buffer_choice(rec, link_field, &parsed, val)
+                .await;
+            self.write_out_link_value(
+                rec,
+                &parsed,
+                val,
+                OutLinkSrc {
+                    field: link_field,
+                    ..src
+                },
+                visited,
+                depth,
+            )
+            .await;
+        }
+    }
+
+    /// **The put owner** — C `dbLink.c::dbPutLink` (434-448). Writes a value
+    /// through a parsed OUT link, dispatching DB links to
+    /// [`Self::write_db_link_value`] and external (`ca://`/`pva://`) links to
+    /// [`Self::write_external_pv`], and — this is the part no caller may skip
+    /// — raising the source record's `LINK_ALARM`/`INVALID` when the put
+    /// fails:
+    ///
+    /// ```c
+    /// status = plset->putValue(plink, dbrType, pbuffer, nRequest);
+    /// if (status) {
+    ///     setLinkAlarm(plink);        /* LINK_ALARM / INVALID_ALARM */
+    /// }
+    /// ```
+    ///
+    /// INVARIANT: *every* failing OUT-link put alarms the writing record, and
+    /// the alarm is raised HERE, inside the put — not by each caller. C puts
+    /// it inside `dbPutLink` for exactly that reason (the async twin
+    /// `dbPutLinkAsync`, `:469-471`, repeats it), so a record whose OUT/`OUTn`
+    /// target is down goes INVALID no matter which code path issued the write.
+    /// The alarm lands in the record's PENDING alarm, so the cycle's
+    /// `rec_gbl_reset_alarms` — which C runs from `monitor()`, AFTER the
+    /// record's output writes — commits it in the SAME cycle.
+    ///
+    /// `src.field` names the link field for the alarm message, as C's
+    /// `setLinkAlarm` does (`"field %s"`, `dbLinkFieldName(plink)`).
+    ///
+    /// This is also the OUTPUT-side counterpart of [`Self::read_link_value`]'s
     /// scheme dispatch: the OUT-link write stage in `processing.rs`
     /// must route a `ParsedLink::Ca`/`Pva` through the link set, not
-    /// only handle `ParsedLink::Db`. An external link with no
-    /// registered lset fails gracefully — the error is logged and the
-    /// record is left to its alarm state, never a panic.
+    /// only handle `ParsedLink::Db`.
     ///
     /// `Constant`/`Hw`/`Calc`/`None` OUT links are not writable
     /// targets and are silently skipped (C `dbPutLink` returns
-    /// `S_db_noLSET` for a link with no lset — the same no-op).
+    /// `S_db_noLSET` for a link with no lset — the same no-op, and C does NOT
+    /// alarm on `S_db_noLSET`: `dbGetLink` explicitly maps it to a plain `-1`
+    /// with no `setLinkAlarm`).
+    ///
+    /// Returns C's `dbPutLink` status as a bool — `true` when the put failed.
+    /// A caller needs it only to reproduce a record-specific alarm C raises ON
+    /// TOP of the put's own (dfanout's `LINK_ALARM`/`MAJOR`); the INVALID that
+    /// every failing put owes the record is already raised here.
     pub(crate) async fn write_out_link_value(
         &self,
+        src_rec: &Arc<RwLock<RecordInstance>>,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
         src: OutLinkSrc<'_>,
         visited: &mut HashSet<String>,
         depth: usize,
-    ) {
-        match link {
+    ) -> bool {
+        let failed = match link {
             crate::server::record::ParsedLink::Db(db) => {
                 self.write_db_link_value(db, value, src, visited, depth)
-                    .await;
+                    .await
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
@@ -1151,14 +1289,23 @@ impl PvDatabase {
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 let op = Self::external_put_op(src.notify);
-                if let Err(e) = self.write_external_pv(&name, value, op).await {
-                    eprintln!("OUT-link write to external PV '{name}' failed: {e}");
+                match self.write_external_pv(&name, value, op).await {
+                    Ok(()) => false,
+                    Err(e) => {
+                        eprintln!("OUT-link write to external PV '{name}' failed: {e}");
+                        true
+                    }
                 }
             }
             // Constant / Hw / Calc / None are not writable OUT-link
             // targets — no-op (C `dbPutLink` → `S_db_noLSET`).
-            _ => {}
+            _ => false,
+        };
+        if failed {
+            let mut inst = src_rec.write().await;
+            crate::server::recgbl::rec_gbl_set_link_alarm(&mut inst.common, src.field);
         }
+        failed
     }
 
     /// Read a record String field, defaulting to empty.
@@ -1291,11 +1438,14 @@ impl PvDatabase {
                 },
             )
         };
-        // One snapshot threaded to every OUT-link write below.
+        // One snapshot threaded to every OUT-link write below; each arm
+        // overrides `field` with the link field it is driving (OUTn / LNKn),
+        // which C `setLinkAlarm` reports in the record's AMSG.
         let out_src = OutLinkSrc {
             putf: src_putf,
             notify: src_notify.as_ref(),
             alarm: &src_alarm,
+            field: "",
         };
 
         // Resolve the SELL link into SELN before SELN is read below.
@@ -1366,13 +1516,10 @@ impl PvDatabase {
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (fanoutRecord.c:39): 16 forward links
                     // LNK0..LNKF. LNK0 is the natural first slot.
-                    let links: Vec<String> = [
-                        "LNK0", "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8",
-                        "LNK9", "LNKA", "LNKB", "LNKC", "LNKD", "LNKE", "LNKF",
-                    ]
-                    .iter()
-                    .map(|f| Self::field_str(&instance, f))
-                    .collect();
+                    let links: Vec<String> = LNK_LINK_FIELDS
+                        .iter()
+                        .map(|f| Self::field_str(&instance, f))
+                        .collect();
                     // SELM resolution with OFFS/SHFT bias (fanoutRecord.c).
                     let sel = select_link_indices_ex(
                         SelmKind::FanoutSeq,
@@ -1423,13 +1570,10 @@ impl PvDatabase {
                     } else {
                         raw_val
                     };
-                    let links: Vec<String> = [
-                        "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI",
-                        "OUTJ", "OUTK", "OUTL", "OUTM", "OUTN", "OUTO", "OUTP",
-                    ]
-                    .iter()
-                    .map(|f| Self::field_str(&instance, f))
-                    .collect();
+                    let links: Vec<String> = DFANOUT_LINK_FIELDS
+                        .iter()
+                        .map(|f| Self::field_str(&instance, f))
+                        .collect();
                     // dfanout Specified is 1-based; Mask has no SHFT
                     // (dfanoutRecord.c:307-339).
                     let sel =
@@ -1447,10 +1591,7 @@ impl PvDatabase {
                         "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8",
                         "DOL9", "DOLA", "DOLB", "DOLC", "DOLD", "DOLE", "DOLF",
                     ];
-                    let lnk_names = [
-                        "LNK0", "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8",
-                        "LNK9", "LNKA", "LNKB", "LNKC", "LNKD", "LNKE", "LNKF",
-                    ];
+                    let lnk_names = LNK_LINK_FIELDS;
                     let dly_names = [
                         "DLY0", "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8",
                         "DLY9", "DLYA", "DLYB", "DLYC", "DLYD", "DLYE", "DLYF",
@@ -1599,44 +1740,30 @@ impl PvDatabase {
                         // `write_db_link_value` (write-path target
                         // processing), so no per-call downgrade is needed.
                         let parsed = crate::server::record::parse_output_link_v2(link_str);
-                        match parsed {
-                            crate::server::record::ParsedLink::Db(ref db) => {
-                                // C `dfanoutRecord.c:311-312`: a failed
-                                // dbPutLink raises LINK_ALARM/MAJOR.
-                                if self
-                                    .write_db_link_value(db, val.clone(), out_src, visited, depth)
-                                    .await
-                                {
-                                    link_failed = true;
-                                }
-                            }
-                            // External `ca://`/`pva://` OUTn — C
-                            // `dbPutLink` routes a CA-link write through
-                            // the link set's `putValue` identically to a
-                            // DB link (dbLink.c:434-448). PP has no
-                            // meaning for an external write (the remote
-                            // record processes on its own IOC), so route
-                            // straight through the link set.
-                            crate::server::record::ParsedLink::Ca(_)
-                            | crate::server::record::ParsedLink::Pva(_)
-                            | crate::server::record::ParsedLink::PvaJson(_) => {
-                                let name = parsed
-                                    .external_pv_name()
-                                    .expect("Ca/Pva/PvaJson link carries a PV name");
-                                let op = Self::external_put_op(src_notify.as_ref());
-                                if let Err(e) = self.write_external_pv(&name, val.clone(), op).await
-                                {
-                                    eprintln!(
-                                        "dfanout OUT-link write to external PV '{name}' failed: {e}"
-                                    );
-                                    // C `dfanoutRecord.c:312` routes a CA OUT
-                                    // link through dbPutLink identically — a
-                                    // disconnected/rejected remote write
-                                    // returns nonzero → LINK_ALARM/MAJOR.
-                                    link_failed = true;
-                                }
-                            }
-                            _ => {}
+                        // Through the put owner, so a failed OUTn raises the
+                        // record's LINK_ALARM/INVALID from inside the put (C
+                        // `dbPutLink`'s `setLinkAlarm`) — an external
+                        // `ca://`/`pva://` OUTn goes through the link set's
+                        // `putValue` exactly as a DB link does
+                        // (dbLink.c:434-448). `link_failed` additionally
+                        // carries dfanout's OWN LINK_ALARM/MAJOR
+                        // (`dfanoutRecord.c:311-312`), which C raises on top of
+                        // (and is subsumed by) the put's INVALID.
+                        if self
+                            .write_out_link_value(
+                                rec,
+                                &parsed,
+                                val.clone(),
+                                OutLinkSrc {
+                                    field: DFANOUT_LINK_FIELDS[idx],
+                                    ..out_src
+                                },
+                                visited,
+                                depth,
+                            )
+                            .await
+                        {
+                            link_failed = true;
                         }
                     }
                 }
@@ -1704,10 +1831,17 @@ impl PvDatabase {
                     // anything; a constant LNK is a no-op.
                     if lnk_real {
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
+                        // Through the put owner: a failed LNKn `dbPutLink`
+                        // raises the seq record's LINK_ALARM/INVALID from
+                        // inside the put (C `dbLink.c:444-446`).
                         self.write_out_link_value(
+                            rec,
                             &lnk_parsed,
                             EpicsValue::Double(new_dov),
-                            out_src,
+                            OutLinkSrc {
+                                field: LNK_LINK_FIELDS[idx],
+                                ..out_src
+                            },
                             visited,
                             depth,
                         )
@@ -2113,6 +2247,7 @@ mod out_link_put_fail_tests {
             putf: false,
             notify: None,
             alarm: &alarm,
+            field: "OUT",
         };
         let mut visited = HashSet::new();
 
@@ -2166,6 +2301,7 @@ mod out_link_put_fail_tests {
             putf: false,
             notify: None,
             alarm: &alarm,
+            field: "OUT",
         };
         let mut visited = HashSet::new();
 
@@ -2226,6 +2362,7 @@ mod nonlocal_db_link_write_tests {
             putf: false,
             notify: None,
             alarm,
+            field: "OUT",
         }
     }
 

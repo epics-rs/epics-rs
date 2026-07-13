@@ -5241,18 +5241,24 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
     );
 }
 
-/// C `dfanoutRecord.c:308-339` `push_values` raises
-/// `recGblSetSevr(LINK_ALARM, MAJOR_ALARM)` on every failed `dbPutLink`,
-/// and `process()` (127-147) runs `push_values` between `checkAlarms` and
+/// A failed dfanout OUT-link put raises the LINK alarm TWICE in C, and the
+/// stronger one wins:
+///
+/// * `dbPutLink` itself calls `setLinkAlarm` on a nonzero putValue status —
+///   `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)` (dbLink.c:318-323,
+///   434-448); an OUT link naming no local record is a (never-connected) CA
+///   link, whose put fails exactly this way;
+/// * `push_values` then adds its own `recGblSetSevr(LINK_ALARM, MAJOR_ALARM)`
+///   (dfanoutRecord.c:311-312), which `recGblSetSevr` drops because the
+///   pending severity is already INVALID.
+///
+/// `process()` (127-147) runs `push_values` between `checkAlarms` and
 /// `recGblResetAlarms`, so the write-failure alarm folds into the SAME
-/// cycle's committed SEVR and the VAL monitor post. The Rust dispatch
-/// previously only logged the failure (no alarm), and drove the OUT links
-/// in the post-commit forward-link tail where any alarm could not fold
-/// into this cycle. After ONE process, a broken OUT link must leave
-/// SEVR=MAJOR / STAT=LINK — proving the same-cycle fold (a one-cycle-late
-/// latch would read NO_ALARM here).
+/// cycle's committed SEVR and the VAL monitor post. After ONE process, a
+/// broken OUT link must leave SEVR=INVALID / STAT=LINK — proving the
+/// same-cycle fold (a one-cycle-late latch would read NO_ALARM here).
 #[tokio::test]
-async fn test_dfanout_out_link_write_failure_raises_link_major() {
+async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
 
@@ -5277,8 +5283,9 @@ async fn test_dfanout_out_link_write_failure_raises_link_major() {
     let inst = rec.read().await;
     assert_eq!(
         inst.common.sevr,
-        AlarmSeverity::Major,
-        "failed dfanout OUT-link write must raise SEVR=MAJOR this cycle, got {:?}",
+        AlarmSeverity::Invalid,
+        "failed dfanout OUT-link write must raise SEVR=INVALID this cycle \
+         (dbPutLink's setLinkAlarm), got {:?}",
         inst.common.sevr
     );
     assert_eq!(

@@ -603,7 +603,10 @@ impl SseqRecord {
             let wake = wake.clone();
             let link = self.steps[i].lnk.clone();
             tokio::spawn(async move {
-                if let Some(rx) = handle.put_link_notify(&name, &link, value).await {
+                if let Some(rx) = handle
+                    .put_link_notify(&name, LNK_FIELDS[i], &link, value)
+                    .await
+                {
                     // `Err` means the put vanished without firing — treat it as
                     // completion so the step is never stranded.
                     let _ = rx.await;

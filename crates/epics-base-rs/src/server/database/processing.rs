@@ -5503,9 +5503,14 @@ fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
     use crate::server::recgbl::EventMask;
 
     apply_timestamp(&mut instance.common, true);
-    // C clears UDF only on a `status == 0` SIOL read (`longinRecord.c:418`,
-    // `waveformRecord.c:352`) — a failed read leaves the record undefined.
-    if clear_udf {
+    // C clears UDF only on a `status == 0` SIOL read (`longinRecord.c:418`) —
+    // for most records a failed read leaves the record undefined. The array
+    // records are the exception: their `process()` clears UDF itself, after
+    // `readValue` returns and whatever its status (waveformRecord.c:144,
+    // aaiRecord.c:174, aaoRecord.c:165). They declare that with
+    // `clears_udf_unconditionally`, which is the record's own C, not a
+    // framework choice.
+    if clear_udf || instance.record.clears_udf_unconditionally() {
         instance.common.udf = false;
     }
 

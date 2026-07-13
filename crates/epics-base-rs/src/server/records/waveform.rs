@@ -823,6 +823,33 @@ impl Record for WaveformRecord {
         Ok(())
     }
 
+    /// waveform/aai/aao clear UDF in `process()` itself, on the line after
+    /// `readValue` returns and whatever status it returned —
+    /// `prec->pact = TRUE; prec->udf = FALSE;` (waveformRecord.c:143-144,
+    /// aaiRecord.c:173-174) and `if (!pact) { prec->udf = FALSE; ... }`
+    /// (aaoRecord.c:164-165). A failed SIOL read, or an illegal SIMM (whose
+    /// `readValue` returns -1), still leaves the record DEFINED; the framework's
+    /// simulation tail otherwise gates the clear on the read status.
+    ///
+    /// subArray does the opposite — `prec->udf = !!status`
+    /// (subArrayRecord.c:148) — so it keeps the default.
+    fn clears_udf_unconditionally(&self) -> bool {
+        !matches!(self.kind, ArrayKind::SubArray)
+    }
+
+    /// waveform/aai/aao have NO `checkAlarms` and never name UDF_ALARM: grep
+    /// the three record sources and the only severities they raise are
+    /// SIMM_ALARM and SOFT_ALARM (aaiRecord.c:364,381; aaoRecord.c:395,421;
+    /// waveformRecord.c:349,376). So UDF, whatever it says, never becomes an
+    /// alarm on these three — the framework's central `rec_gbl_check_udf` must
+    /// not raise one for them.
+    ///
+    /// subArray is again the exception: `if (status) recGblSetSevr(prec,
+    /// UDF_ALARM, prec->udfs);` (subArrayRecord.c:149-150).
+    fn raises_udf_alarm(&self) -> bool {
+        matches!(self.kind, ArrayKind::SubArray)
+    }
+
     /// C `fetchValue(prec, 1)`'s `if (!status) { prec->nord = nReq;
     /// prec->udf = FALSE; }` (aaoRecord.c:371-374) — the UDF half of the
     /// constant-DOL load, which `init_record` cannot apply itself (UDF is a

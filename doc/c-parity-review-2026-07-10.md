@@ -4822,3 +4822,110 @@ doctests clean.
   ioc_app::IocApplication, tcp::ClientState, stat_to_str.
 - epics-ca-rs cainfo_prints_the_resolved_host_name flaked once in E's
   full-workspace run (passes isolated; joins the known flake list).
+
+---
+
+## Round 15 re-audit (2026-07-13)
+
+Same five reused auditor panels (round `01KXCX4MCJJ920KPRETTHJQ979`).
+Methods: A re-ran the ~1500-case compiled corpus plus new compiled
+drivers at each C caller's real arg counts (scalcout 12/12, transform
+16/0, aCalc 12/12); B rebuilt EPICS base linux-x86_64 and ran ~120
+head-to-head tool invocations plus a compiled envGetDoubleConfigParam
+probe over 19 inputs; C used pvxs's own regression expectations
+(testqsingle.cpp delta assertions) as the compiled record plus an
+out-of-tree mask/bitset probe; D compiled an enable/disable/re-enable
+connect-attempt counter probe; E enumerated every LinkAlarm construction
+site by rg and surveyed process() ordering across 10 output record types.
+
+### Wave-12 fix verification
+
+- R14-1/2/3/5/6/8, R14-16/18/19, R14-48/49/50/46/47, R14-61/63 +
+  dd4f00d2 all HOLD (R14-1: base draws identical to compiled C at 17
+  significant digits; R14-18: 16 adversarial probes byte-identical;
+  R14-5: 36-case shift matrix zero diffs, negative-count UB deviation
+  re-confirmed by observing C's out-of-bounds read).
+- R14-4 INCOMPLETE — store semantics right, upper bound wrong → R15-1.
+- R14-7 REGRESSED (client path) — the fix over-narrowed: C bounds dbPut
+  at NELM under the default SIZE=NELM → R15-2.
+- R14-17 INCOMPLETE — whitespace half fixed; scan_double is still not
+  epicsParseDouble (hex-float, ERANGE) → R15-18.
+- R14-31 INCOMPLETE — marked:Some half holds; marked:None admits
+  everything → R15-32.
+- R14-32 PARTIAL — ARCHIVE-drop exact; retained Derive for
+  root-flattened members is NOT pvxs behaviour → R15-31.
+- R14-51 INCOMPLETE — block content line-exact, but stderr vs C's
+  stdout + per-device autoConnect line → R15-51.
+- 459ecb34 INCOMPLETE — four texts byte-exact; defunct message C never
+  produces → R15-50; the device-level texts belong to C's non-CANBLOCK
+  branch only → R15-47.
+- R14-62 INCOMPLETE + one adjacent regression → R15-61 (MS inheritance
+  reads committed alarm pre-commit), R15-62 (seq LNKn still
+  post-commit). What holds: single put owner + same-cycle LINK_ALARM on
+  OUT/multi-out/SIOL/WriteDbLink; IVOA pending-nsev read verified as
+  C's exact call-site semantics; write-guard drop introduces no
+  ordering C lacks; C ordering survey confirms checkAlarms → writes →
+  monitor/reset uniform across 10 record types (seq async but still
+  writes-before-commit).
+
+### Lead adjudications
+- env-double leniency lead — REAL but premise INVERTED: compiled C
+  refutes "300x → 300" for envGetDoubleConfigParam (it REJECTS,
+  S_stdlib_extraneous; the lenient sscanf belongs to
+  envGetLongConfigParam). 6 of 10 cited sites are Rust-only knobs with
+  no C counterpart. Real divergences → R15-16 (crash), R15-17
+  (diagnostics/hex).
+- Echo/Delay interpose addr — REAL → R15-48.
+- SIOL bare put path — REAL → R15-63.
+- pvxs root-flattened member — pvxs HAS the case (+type:meta only,
+  enforced both sides) and marks it with NO special case → R15-31.
+- NOT-REAL (A): transform AA segfault (numSArgs guard at
+  sCalcPerform.c:871/:891); negative shift count (C UB confirmed by
+  observation); PRINTF missing vararg (run-to-run garbage); LRC("")
+  (CBUG-C6 territory). 1500-case corpus: no new divergence from wave 12.
+- NOT-REAL (C): coalesce mark union (pvxs assign leaves prior marks
+  valid); push_squash terminal past limit (servermon.cpp:273); empty
+  overrun bitset on wire (servermon.cpp:174-176); TriggerDef::None →
+  Skip (empty triggers iterate nothing).
+
+### Open Findings — Round 15 (21 findings)
+
+Category A (calc):
+### R15-1: engines ignore the caller's argument counts — Medium, compiled repro. mod.rs:214 (CALC_NARGS=21, no count in StringInputs/ArrayInputs) vs sCalcPerform.c:444/:902/:914/:871/:891/:732, aCalcPerform.c:499/:510 — counts are CALLER-supplied (scalcout 12/12, transform 16/0 via transformRecord.c:593, acalcout 12/12). Out-of-range access: C silent no-op / 0 / ""; port reads/writes phantom slots (proof: @12:=5;@12 → C 0, port 5; transform AA:="x";LEN(AA) → C 0, port 1). R14-4 made this expression-reachable. Structural: the bound belongs in the input structs as num_args/num_sargs — five access sites currently each have to remember.
+### R15-2: acalcout client/db-link put bounded at the NUSE window; C bounds dbPut at no_elements = NELM under the default SIZE=NELM — Medium. acalcout.rs:410-417 vs dbAccess.c:1322,:1361-1362 + aCalcoutRecord.c:627-631 (cvt_dbaddr: no_elements = SIZE==NUSE ? numElements : nelm; SIZE defaults to NELM). Mirror image of R14-7: hidden tail [window, NELM) became unwritable by client/db-link puts. Two bounds by writer identity: link ⇒ numElements (correct today); dbPut ⇒ no_elements. Zero-fill stays.
+
+Category B (CA tools):
+### R15-16: a non-finite env timeout panics Duration::from_secs_f64 — client crash, server remote-DoS — **High**, live repro. 7 of 9 env-derived from_secs_f64 sites unguarded: transport.rs:152, search.rs:218, server/tcp.rs:49,:140 (+TLS tcp.rs:153, transport.rs:986; put-notify trio mod.rs:2521/2660/2711 same-anchor-unverified). EPICS_CA_CONN_TMO=inf: C exit 0 reads PV; port panics, read fails. EPICS_CAS_SEND_TMO=inf: first client connect kills the whole server. Structural: one env::get_double resolver mirroring envGetDoubleConfigParam (reject non-finite/ERANGE, C diagnostic, default) instead of nine parse().filter().map() chains.
+### R15-17: the four C-backed env-double sites are silent where C prints three named diagnostics, and reject hex floats C accepts — Low. transport.rs:150, search.rs:175, addr_list.rs:243 vs cac.cpp:192-193, udpiiu.cpp:86-89, online_notify.c:60-63; epicsStrtod accepts 0x10=16.
+### R15-18: copt::scan_double is not epicsParseDouble — hex-float rejected (caget -w 0x10: C 16 s, port 1 s + spurious warning), ERANGE accepted (1e400: C warns, port silent via the is_finite guard) — Medium. copt.rs:396-402; residual half of R14-17; unit test never probes hex/ERANGE.
+
+Category C (PVA):
+### R15-31: a root-flattened +type:meta member forces EVERY post onto Derive — **High**. group.rs:2161-2163 (leaves_or_derive bails on any empty field_name; justification false — change_leaf_paths("",Meta,change) returns addressable ["timeStamp","alarm"]) vs field.cpp:56-81 + iocsource.cpp:312-352 (pvxs marks root members with NO special case; +type:meta is the only legal root mapping, enforced both sides). Impact: DBE_PROPERTY on root-meta → pvxs posts nothing, port sends a FULL-value frame; one root-meta member poisons the whole group's trigger narrowing; in pure-self-trigger groups routes to build_monitor_payload_partial which can frame empty bitsets. Fix: mark root-meta via the normal leaf path; Derive then has no remaining producer (retire it).
+### R15-32: MonitorQueue::real admits every marked:None post; pvxs testmask requires a leaf bit — Medium. tcp.rs:1757-1759 vs pvrequest.cpp:74-93 + data.cpp:256-270 (valid set on leaves only). Probe: field(alarm.bogus) mask=[0,2] → pvxs false, port true → full-rate empty-bitset frames for a request naming a nonexistent nested field. Gate = !canonical_changed_bitset(intro, mask).is_empty() — gate==wire on all three builders. The false comment at tcp.rs:1740-1744 is the standing justification.
+### R15-33: monitor seed and GET reply mark leaves pvxs never assigns — Medium. tcp.rs:7931,:6939,:7071 frame canonical_changed_bitset(intro, mask) = every mask leaf; pvxs frames only what IOCSource::get marked (serverget.cpp:104, groupsource.cpp:484). getProperties never assigns control.minStep, valueAlarm.active/*Severity/hysteresis (7 leaves) — pinned by pvxs's own testqsingle.cpp:129-149 delta. Structural cause: DynSource::get hands up a bare PvField with no mark set.
+### R15-34: array-subscript group members are unmarkable — every monitor update dropped — **High**. encode.rs:1491-1516 (walk never descends StructureArray, candidate paths use FieldDesc names so "a[0].x" matches nothing → empty bitset → real()=false → post dropped) vs data.cpp:264-269 (pvxs marks the ENCLOSING StructA field's valid — one bit, whole array serialized). All-array-member group (testqgroup.rs:1392 shape): client receives nothing after the seed, ever. Correct marked path for "a[0].x" is "a" — the mark producer is the only thing that does not know it.
+### R15-35: three comments assert behaviour the code does not have — Low. tcp.rs:1740-1744 (request2mask "cannot produce an empty mask" — disproven, R15-32); tcp.rs:8086-8089 (claims cooked builders encode the overrun set — all three hard-write empty, which IS pvxs's form; comment invites a parity-breaking "fix"); pvif.rs:118-123 (getTimeAlarm "writes userTag" — only under DBR_UTAG, iocsource.cpp:243-250).
+
+Category D (asyn):
+### R15-46: no port auto-connect on the enable exception — asynEnable(port,1) never brings the link back up — **High**, compiled repro. port_actor.rs:384-415 + port.rs:547-557 vs asynManager.c:635-636 (EVERY exception announcement signals notifyPortThread) + :856-861 (woken thread runs throttled autoConnectDevice when down). Probe: 6 attempts enabled → 0 disabled (correct) → 0 after RE-ENABLE (C: ≥1); only traffic revives the port and the retry loop stays dead. Structural: actor treats exception announcements as C's notifyPortThread — one throttled auto_connect_port() on every wake with the port down; no ad-hoc SetEnable re-arm.
+### R15-47: device-level enabled/connected refusals applied to queued ports — C checks them only on synchronous (non-CANBLOCK) ports — Medium. port.rs:630-641 vs asynManager.c:1551 (device block inside !ASYN_CANBLOCK) + :874-884 (portThread PARKS a disabled device's request — continue, not refuse; disconnected device → autoConnectDevice then timeout callback). Every real port is CANBLOCK. C parks or times out (5 s, "queueRequest timeout" STATE/MINOR); port refuses instantly with a text from a branch this port class cannot take.
+### R15-48: asynInterposeEcho/Delay are port-wide and drop their iocsh addr — Medium. iocsh.rs:539-635, request.rs:276-283, port.rs:230 (one interpose_octet per port) vs interposeInterface addr>=0 → device's interposeInterfaceList; findInterface resolves device-first (asynManager.c:1493-1501). asynInterposeDelay("gpib",4,0.01) slows EVERY bus device. Same structural cause R14-49 closed for EOS state: the STACK has no address dimension — key it by eos_device_key.
+### R15-49: ERRS is written by every diagnostic path and posted by NONE — only resetError's clear reaches a CA client — **High**. mod.rs:2802-2806 (the only post_if_new(["ERRS"])) vs asynRecord.c:2028-2049 (reportError: strncpy THEN db_post_events on change). Every errs write (refusal :2870, option :2751, EOS :3017, connectDevice :4121, CNCT :4247/:4263, trace-file :2247) sets the field silently; no special field is pp(TRUE) so no generic post covers the put path. Operator's medm ERRS widget shows the blank resetError posted at put-start — the diagnostic channel wave 12 made C-exact is invisible. Structural: one ERRS setter that does C's db_post_events; not per-list additions.
+### R15-50: the defunct refusal message does not exist in C — Low. port.rs:651-656 vs asynManager.c:2282-2283 (shutdownPort clears enabled precisely so queueRequest answers "port X disabled"; no defunct branch in the gate). After R14-46 the invented text lands verbatim in ERRS. Retire the special message (keep the internal defunct state).
+### R15-51: asynReport writes to stderr where C writes stdout; driver block still diverges from asynPortDriver::report — Low. port_actor.rs:459, port.rs:1277-1295,:958-959 vs asynShellCommands.c:589 (report(stdout,…)); asynPortDriver.cpp:3677-3700 (EOS lines gated on octet interface, Timestamp line, details≥3 interrupt-client block); per-address line prints port's autoConnect vs C's pdpc->autoConnect.
+
+Category E (records/framework):
+### R15-61: MS-class alarm inheritance on pre-commit OUT writes carries the PREVIOUS cycle's severity — **High**, regression from 9ab4fd2a. processing.rs:3732 (WriteDbLink — transform/scaler/epid/sseq), :3845 (WriteDbLinkNotify), links.rs:1434 (dispatch_multi_output — dfanout/seq) snapshot committed stat/sevr/amsg; C dbDbLink.c:381-383 inherits the PENDING nsta/nsev/namsg (dbPutLink runs inside process before reset). The main OUT stage was correctly updated (processing.rs:3102-3105); these three were not, and all three now run pre-commit. First INVALID cycle propagates NO_ALARM; inheritance permanently one cycle stale. Comments at :3714/:1426 still say "the committed alarm" — the tell.
+### R15-62: a failed seq LNKn put alarms one cycle late — the seq value writes are still dispatched from the post-commit forward-link tail — **High**. processing.rs:3457,:4307 → links.rs:1839 vs seqRecord.c:264 (puts in processCallback) + :227 (asyncFinish commits AFTER) — C's async seq still writes-before-commit. Phase gate correct for fanout (FWDLINKs, no put); seq genuinely writes values. One-shot passive seq: the alarm never appears at all.
+### R15-63: the SIOL simulation write bypasses the put owner — no processTarget, no MS inheritance, no PUTF/put-notify — Medium. processing.rs:4521-4560 (put_pv_already_locked direct) vs dbDbLink.c:372-393 (SIOL is DBF_OUTLINK; C writes via the identical dbDbPutValue: inherit + PP/proc processTarget). Secondary: the caller raises the SIOL LINK_ALARM (:4630), violating write_out_link_value's own "raised HERE, not by each caller" invariant (links.rs:1247-1253). Route SIOL through write_out_link_value — closes both halves.
+### R15-64: scalcout OUT buffer choice misses C's DBF_MENU/DBF_DEVICE target classes — Low. scalcout.rs:1235-1251 vs devsCalcoutSoft.c:128-130 (seven types route to OSV). Port's DbFieldType has no menu/device variants: PRIO/ACKT/STAT/SEVR/DISS map to Short, DTYP falls through numeric → OVAL as double where C sends the OSV string. The exact class R14-61 was about, one enum granularity short.
+### R15-65: dfanout IVOA=Set_output_to_IVOV pushes IVOV but never writes VAL — Medium. links.rs:1556-1570 (pushed value = get_field("IVOV") from a read guard; VAL untouched) vs dfanoutRecord.c:136-139 (prec->val = prec->ivov; push_values) — C then posts VAL=IVOV in monitor(). caget DFAN disagrees with what was pushed; no VAL monitor fires. The generic single-OUT path does this correctly via apply_invalid_output_value (processing.rs:2866); the dfanout dispatch is the one output path that skips it.
+
+### Notes
+- Scoped aai/aao audit (W10-E7 resolution, user-approved) running on a
+  dedicated panel; findings will file as R15-76+ in a follow-up doc
+  commit.
+- B-panel: all three known-flaky epics-ca-rs tests passed this round's
+  single run (not evidence of resolution).
+- Comment-only nit (not filed): beacon.rs cites online_notify.c:68 for
+  delay=0.02; actual line 66.

@@ -355,10 +355,13 @@ fn test_r2d() {
 
 #[test]
 fn test_rndm_range() {
+    // base `calcRandom` is `seed / 65535.0` (calcPerform.c:518-523), so its
+    // range is the CLOSED [0, 1]: zero is a legal draw. sCalc/aCalc exclude it
+    // ((seed+1)/65536, because NRNDM takes a log); base has no NRNDM.
     let mut inputs = NumericInputs::new();
     for _ in 0..100 {
         let r = calc("RNDM", &mut inputs).unwrap();
-        assert!(r > 0.0 && r <= 1.0, "RNDM out of range: {}", r);
+        assert!((0.0..=1.0).contains(&r), "RNDM out of range: {}", r);
     }
 }
 

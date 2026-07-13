@@ -86,10 +86,15 @@ async fn a_constant_dol_clears_udf_for_every_out_record() {
             !udf(&db, rec).await,
             "{rec}: a successful constant-DOL load DEFINES the record (C sets udf = FALSE)"
         );
+        // The seed clears UDF, but C's `doInitRecord0` prologue ran BEFORE
+        // `init_record` and already latched the initial UDF severity, and
+        // nothing lowers it until the record's first `recGblResetAlarms` —
+        // softIoc, right after `iocInit`:
+        //   record(ao,"AO"){field(DOL,"5")}  UDF 0  SEVR INVALID  STAT UDF
         assert_eq!(
             sevr(&db, rec).await,
-            AlarmSeverity::NoAlarm,
-            "{rec}: a defined record does not carry the initial UDF severity"
+            AlarmSeverity::Invalid,
+            "{rec}: the init UDF severity survives the seed until the first process"
         );
     }
 

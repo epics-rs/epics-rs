@@ -1072,6 +1072,17 @@ impl PvDatabase {
             }
         }
 
+        // C's `iocInit` init passes, through their owner (the `doInitRecord0`
+        // prologue — `pact = FALSE` plus the initial UDF severity — then
+        // `init_record(0)`, `init_record(1)`, and the UDF tail). `add_record`
+        // is the creation sink every path funnels through, so a record built
+        // programmatically or by iocsh `dbCreateRecord` is initialised exactly
+        // like a `.db`-loaded one instead of skipping the passes the seed below
+        // assumes have run. The `.db` paths run the passes again once their
+        // field set is applied — C's own ordering, since `iocInit` sees the
+        // final merged fields — which is why the owner is idempotent.
+        instance.run_init_passes(name);
+
         // The init-seed owner: every CONSTANT link the record declares
         // (`Record::constant_init_links`) is loaded into its value field ONCE,
         // here — a constant delivers NOTHING at process time

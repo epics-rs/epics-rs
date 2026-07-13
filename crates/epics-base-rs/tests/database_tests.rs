@@ -1590,7 +1590,13 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
     co.ivov = 17.5;
     co.val = 99.9;
     co.oval = 99.9;
-    co.calc = "A".to_string();
+    // The CALC has to PRODUCE the alarming value: `process()` recalculates VAL
+    // before `checkAlarms`, so a `CALC="A"` with no INPA lands VAL=0 and trips
+    // no HIHI — softIoc:
+    //   CALC="99.9" HIHI=1 HHSV=INVALID IVOA="Set output to IVOV" IVOV=17.5
+    //     -> SEVR INVALID, OUT target 17.5
+    //   CALC="A"    (same fields)      -> SEVR NO_ALARM, OUT target 0
+    co.calc = "99.9".to_string();
     db.add_record("CO_SRC", Box::new(co)).await.unwrap();
     if let Some(rec) = db.get_record("CO_SRC").await {
         let mut inst = rec.write().await;
@@ -3153,6 +3159,21 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     db.add_record("ASYNC_PACT", Box::new(AsyncRecord { val: 0.0 }))
         .await
         .unwrap();
+    // C's guard is `if ((precord->stat == SCAN_ALARM) || (precord->lcnt++ <
+    // MAX_LOCK) || (precord->sevr >= INVALID_ALARM)) goto all_done`
+    // (dbAccess.c:544-547): the SCAN alarm is for a record that HAS completed a
+    // process (SEVR below INVALID) and then hangs mid-async. A never-processed
+    // record still carries the init UDF severity (SEVR=INVALID, softIoc reads
+    // that on every record right after `iocInit`) and C never alarms it. This
+    // mock never completes a cycle, so put it in the state a completed process
+    // leaves behind: defined, NO_ALARM.
+    {
+        let rec = db.get_record("ASYNC_PACT").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.udf = false;
+        inst.common.sevr = AlarmSeverity::NoAlarm;
+        inst.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
+    }
 
     // Drive ASYNC_PACT into PACT=true (async pending, lock released).
     let mut visited = HashSet::new();

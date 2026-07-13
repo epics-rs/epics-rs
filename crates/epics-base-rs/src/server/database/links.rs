@@ -69,6 +69,43 @@ pub(crate) struct LinkAlarm {
     pub amsg: String,
 }
 
+impl LinkAlarm {
+    /// The record's PENDING alarm (`nsta`/`nsev`/`namsg`) — what an OUT-link
+    /// put inherits into its target. C `dbDbPutValue` calls
+    /// `recGblInheritSevrMsg(..., pdest, psrce->nsta, psrce->nsev,
+    /// psrce->namsg)` (dbDbLink.c:382-383): `dbPutLink` runs from inside the
+    /// source's `process()`, BEFORE `recGblResetAlarms` commits the cycle, so
+    /// the alarm the source raised THIS cycle is still only pending. Reading
+    /// the committed `stat`/`sevr` here would carry the PREVIOUS cycle's
+    /// severity to every MS-class target.
+    ///
+    /// EVERY OUT-link put site uses this: the record's own OUT, the generic
+    /// multi-output pairs, the fanout/dfanout/seq dispatch, the `WriteDbLink`
+    /// / `WriteDbLinkNotify` process actions, and sseq's `put_link_notify`
+    /// (sseqRecord.c: `dbPutLink` in `processCallback`, `recGblResetAlarms` in
+    /// `asyncFinish` — the puts still precede the commit).
+    pub(crate) fn pending(common: &crate::server::record::CommonFields) -> Self {
+        LinkAlarm {
+            stat: common.nsta,
+            sevr: common.nsev,
+            amsg: common.namsg.clone(),
+        }
+    }
+
+    /// The record's COMMITTED alarm (`stat`/`sevr`/`amsg`) — what an INPUT
+    /// link read inherits from the record it read. C `dbDbGetValue` calls
+    /// `recGblInheritSevrMsg(..., dbChannelRecord(chan)->stat, ->sevr,
+    /// ->amsg)` (dbDbLink.c:229-232): the source there is a foreign record
+    /// that finished its own cycle, so its alarm is the committed one.
+    pub(crate) fn committed(common: &crate::server::record::CommonFields) -> Self {
+        LinkAlarm {
+            stat: common.stat,
+            sevr: common.sevr,
+            amsg: common.amsg.clone(),
+        }
+    }
+}
+
 /// Apply C `recGblInheritSevrMsg` (recGbl.c:263-281) for one MS-class
 /// link: fold the link source's alarm (`src`) into the destination
 /// record's PENDING alarm (`dest`) per the maximize-severity mode `ms`.
@@ -438,11 +475,7 @@ impl PvDatabase {
                 // an alias still propagates MS/NMS alarm correctly.
                 let alarm = if let Some(rec) = self.get_record(&db.record).await {
                     let inst = rec.read().await;
-                    Some(LinkAlarm {
-                        stat: inst.common.stat,
-                        sevr: inst.common.sevr,
-                        amsg: inst.common.amsg.clone(),
-                    })
+                    Some(LinkAlarm::committed(&inst.common))
                 } else {
                     None
                 };
@@ -797,12 +830,13 @@ impl PvDatabase {
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
         // record's alarm into the destination via `recGblInheritSevrMsg`,
-        // AFTER the `dbPut` and BEFORE `processTarget`. In this port the
-        // source's per-cycle alarm has already been committed by
-        // `rec_gbl_reset_alarms` before the OUT link dispatches, so
-        // `src_alarm` carries the source's *committed* stat/sevr/amsg —
-        // the same values C reads from the still-pending nsta/nsev/namsg
-        // at its (earlier) synchronous `writeValue` point. The inherited
+        // AFTER the `dbPut` and BEFORE `processTarget`. The fields C reads
+        // there are `psrce->nsta/nsev/namsg` — the source's PENDING alarm,
+        // because the put runs inside the source's `process()`, before its
+        // `recGblResetAlarms`. Every OUT-put site in this port drives its
+        // writes in that same pre-commit window and hands them
+        // [`LinkAlarm::pending`]; a committed snapshot would carry the
+        // PREVIOUS cycle's severity. The inherited
         // severity lands in the dest's PENDING nsev/nsta(/namsg for MSS);
         // the dest commits it on its next `rec_gbl_reset_alarms` — its
         // own process cycle, reached below for a `.PROC`/`PP` link, or a
@@ -1423,19 +1457,17 @@ impl PvDatabase {
         // Snapshot the source record's PUTF bit + put-notify wait-set so
         // every write_db_link_value call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
-        // wait-set invariants (see write_db_link_value doc). The
-        // committed alarm travels the same way for `recGblInheritSevrMsg`
-        // MS-class propagation into each OUT-link target.
+        // wait-set invariants (see write_db_link_value doc). The PENDING
+        // alarm travels the same way for `recGblInheritSevrMsg` MS-class
+        // propagation into each OUT-link target: the OUTn/LNKn puts precede
+        // the source's `recGblResetAlarms`, so C reads `psrce->nsta/nsev`
+        // here ([`LinkAlarm::pending`], dbDbLink.c:382-383).
         let (src_putf, src_notify, src_alarm) = {
             let guard = rec.read().await;
             (
                 guard.common.putf,
                 guard.notify.clone(),
-                LinkAlarm {
-                    stat: guard.common.stat,
-                    sevr: guard.common.sevr,
-                    amsg: guard.common.amsg.clone(),
-                },
+                LinkAlarm::pending(&guard.common),
             )
         };
         // One snapshot threaded to every OUT-link write below; each arm

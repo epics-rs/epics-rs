@@ -1010,13 +1010,14 @@ impl PvDatabase {
         };
         let (src_putf, src_alarm) = {
             let instance = rec.read().await;
+            // sseq's WAITn puts run from its async machine while the record
+            // is still PACT — C `sseqRecord.c` issues `dbPutLink` in
+            // `processCallback` (:734/756/787) and commits the alarm only in
+            // `asyncFinish` (`recGblResetAlarms`, :471). The put therefore
+            // inherits the source's PENDING alarm.
             (
                 instance.common.putf,
-                super::links::LinkAlarm {
-                    stat: instance.common.stat,
-                    sevr: instance.common.sevr,
-                    amsg: instance.common.amsg.clone(),
-                },
+                super::links::LinkAlarm::pending(&instance.common),
             )
         };
         let (waitset, completion) = Self::new_put_notify();
@@ -3099,11 +3100,7 @@ impl PvDatabase {
                 // is the point in the cycle C reads them, before the commit.
                 let src_putf = instance.common.putf;
                 let src_notify = instance.notify.clone();
-                let src_alarm = super::links::LinkAlarm {
-                    stat: instance.common.nsta,
-                    sevr: instance.common.nsev,
-                    amsg: instance.common.namsg.clone(),
-                };
+                let src_alarm = super::links::LinkAlarm::pending(&instance.common);
                 drop(instance);
                 let src = super::links::OutLinkSrc {
                     putf: src_putf,
@@ -3711,8 +3708,11 @@ impl PvDatabase {
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
                     // and the source PUTF for processTarget propagation,
-                    // plus the committed alarm for `recGblInheritSevrMsg`
-                    // MS-class propagation into the OUT-link target.
+                    // plus the PENDING alarm for `recGblInheritSevrMsg`
+                    // MS-class propagation into the OUT-link target — this
+                    // write stage runs before the cycle's
+                    // `rec_gbl_reset_alarms`, exactly where C reads
+                    // `psrce->nsta/nsev/namsg` ([`LinkAlarm::pending`]).
                     let (link_str, src_putf, src_notify, src_alarm) = {
                         let instance = rec.read().await;
                         let link = instance
@@ -3729,11 +3729,7 @@ impl PvDatabase {
                             link,
                             instance.common.putf,
                             instance.notify.clone(),
-                            super::links::LinkAlarm {
-                                stat: instance.common.stat,
-                                sevr: instance.common.sevr,
-                                amsg: instance.common.amsg.clone(),
-                            },
+                            super::links::LinkAlarm::pending(&instance.common),
                         )
                     };
                     if link_str.is_empty() {
@@ -3842,11 +3838,7 @@ impl PvDatabase {
                         (
                             link,
                             instance.common.putf,
-                            super::links::LinkAlarm {
-                                stat: instance.common.stat,
-                                sevr: instance.common.sevr,
-                                amsg: instance.common.amsg.clone(),
-                            },
+                            super::links::LinkAlarm::pending(&instance.common),
                         )
                     };
                     // Mint the re-entry token BEFORE issuing the put so a
@@ -4101,11 +4093,7 @@ impl PvDatabase {
                 // the non-reentrant gate) and re-taken for the commit.
                 let src_putf = instance.common.putf;
                 let src_notify = instance.notify.clone();
-                let src_alarm = super::links::LinkAlarm {
-                    stat: instance.common.nsta,
-                    sevr: instance.common.nsev,
-                    amsg: instance.common.namsg.clone(),
-                };
+                let src_alarm = super::links::LinkAlarm::pending(&instance.common);
                 drop(instance);
                 let src = super::links::OutLinkSrc {
                     putf: src_putf,

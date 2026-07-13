@@ -166,22 +166,24 @@ impl CompiledExpr {
     }
 }
 
-/// C `isinf` — the value the ISINF operator pushes in all three engines
-/// (`calcPerform.c:277`, `sCalcPerform.c:1407`, `aCalcPerform.c:826,1084`,
-/// each of which assigns the macro's result straight into a `double`).
+/// The value the ISINF operator pushes in all three engines — a BOOLEAN
+/// predicate: 1 for either infinity, 0 for anything else (finite or NaN).
 ///
-/// It is a SIGN, not a predicate: glibc expands `isinf` to
-/// `__builtin_isinf_sign`, so `-inf` is `-1`, `+inf` is `+1`, everything else
-/// (finite, NaN) is `0`. Verified on this host by compiling the macro.
+/// DEVIATION from C, deliberate — CBUG-A3. All three C engines assign the
+/// `isinf` macro's result straight into a double (`calcPerform.c:277`,
+/// `sCalcPerform.c:703,1407`, `aCalcPerform.c:826,1084`), and on glibc `isinf`
+/// expands to `__builtin_isinf_sign`, which returns the SIGN: `-inf` yields
+/// **-1**. So `ISINF(A)` stores -1 for a negative infinity, and a downstream
+/// `ISINF(A) == 1` test misfires. That is not what the record documents —
+/// `calcRecord.dbd.pod:263` defines `ISINF (arg)` as "returns non-zero if any
+/// argument is Inf", a predicate — and it is not portable either: an IOC whose
+/// `isinf` resolves to the C99 macro gets +1 for -Inf, so C's own answer here
+/// depends on the libc it was built against. The intended value is the boolean.
 ///
-/// The three engines share this one definition so the sign cannot drift back to
-/// a boolean in one of them.
-pub(crate) fn c_isinf(v: f64) -> f64 {
-    if v.is_infinite() {
-        if v.is_sign_negative() { -1.0 } else { 1.0 }
-    } else {
-        0.0
-    }
+/// The three engines share this one definition so the answer cannot drift apart
+/// between them.
+pub(crate) fn isinf(v: f64) -> f64 {
+    if v.is_infinite() { 1.0 } else { 0.0 }
 }
 
 /// C's subrange bound rule for a pair of NUMERIC bounds over a container of

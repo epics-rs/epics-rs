@@ -414,7 +414,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 // operators (`aCalcPerform.c:826` in the isArray branch, :1085 in
                 // the scalar one), so an array operand yields an ARRAY result with
                 // the operator applied per element.
-                CoreOp::IsInf => unary_op(&mut stack, |a| a.map(super::c_isinf))?,
+                CoreOp::IsInf => unary_op(&mut stack, |a| a.map(super::isinf))?,
 
                 CoreOp::Atan2 => binary(&mut stack, |a, b| zip_map(a, b, |x, y| y.atan2(x)))?,
                 CoreOp::Fmod => binary(&mut stack, |a, b| zip_map(a, b, |x, y| x % y))?,

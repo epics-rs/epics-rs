@@ -486,7 +486,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::IsInf => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(super::c_isinf(a)));
+                    stack.push(StackValue::Double(super::isinf(a)));
                 }
                 CoreOp::Finite(nargs) => {
                     let n = *nargs as usize;

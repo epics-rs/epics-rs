@@ -46,7 +46,7 @@ use asyn_rs::interpose::EomReason;
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::sync_io::SyncIOHandle;
 use asyn_rs::trace::TraceManager;
 use asyn_rs::user::AsynUser;
@@ -1407,9 +1407,6 @@ impl Default for InterposeSettings {
 /// name, consumed by `drvModbusAsynConfigure`.
 static PENDING_LINKS: Mutex<Option<HashMap<String, InterposeSettings>>> = Mutex::new(None);
 
-/// Port runtime handles — dropping one shuts the actor down, so they are kept.
-static PORT_RUNTIMES: Mutex<Option<Vec<PortRuntimeHandle>>> = Mutex::new(None);
-
 fn record_interpose(octet_port: &str, settings: InterposeSettings) {
     let mut g = PENDING_LINKS.lock().unwrap();
     g.get_or_insert_with(HashMap::new)
@@ -1423,11 +1420,6 @@ fn take_interpose(octet_port: &str) -> InterposeSettings {
         .as_ref()
         .and_then(|m| m.get(octet_port).copied())
         .unwrap_or_default()
-}
-
-fn keep_runtime(handle: PortRuntimeHandle) {
-    let mut g = PORT_RUNTIMES.lock().unwrap();
-    g.get_or_insert_with(Vec::new).push(handle);
 }
 
 /// `modbusInterposeConfig portName linkType timeoutMsec writeDelayMsec` — port
@@ -1660,11 +1652,16 @@ impl CommandHandler for ModbusConfigHandler {
 
         let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime.port_handle().clone();
-        // On a duplicate port name the runtime handle drops here, shutting
-        // the just-spawned actor down.
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
-            .map_err(|e| e.to_string())?;
-        keep_runtime(runtime);
+        if let Err(e) =
+            asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
+        {
+            // Nothing published this port, so ask the actor to stop.
+            runtime.shutdown();
+            return Err(e.to_string());
+        }
+        // The registry above holds a live `PortHandle` for this port, which is
+        // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+        drop(runtime);
 
         println!("drvModbusAsynConfigure: port='{port_name}' octet='{octet_port}' link={link:?}");
 

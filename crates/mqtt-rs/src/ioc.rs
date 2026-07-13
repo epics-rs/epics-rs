@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::server::iocsh::registry::*;
 
@@ -21,16 +21,6 @@ use crate::event_loop::mqtt_event_loop;
 /// on-demand creation. Populated by [`register_pending_topic`] (the Z2M
 /// builders), drained once by [`take_pending_topics`] at driver creation.
 static PENDING_TOPICS: Mutex<Option<HashMap<String, Vec<TopicAddress>>>> = Mutex::new(None);
-
-/// Global storage for port runtime handles.
-/// Dropping a PortRuntimeHandle shuts down the actor, so we must keep them alive.
-static PORT_RUNTIMES: Mutex<Option<Vec<PortRuntimeHandle>>> = Mutex::new(None);
-
-fn keep_runtime(handle: PortRuntimeHandle) {
-    let mut guard = PORT_RUNTIMES.lock().unwrap();
-    let vec = guard.get_or_insert_with(Vec::new);
-    vec.push(handle);
-}
 
 pub(crate) fn register_pending_topic(port_name: &str, addr: TopicAddress) {
     let mut guard = PENDING_TOPICS.lock().unwrap();
@@ -161,13 +151,16 @@ impl CommandHandler for MqttConfigHandler {
         let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
         let port_handle = runtime_handle.port_handle().clone();
 
-        // On a duplicate port name the runtime handle drops here, shutting
-        // the just-spawned actor down.
-        asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
-            .map_err(|e| e.to_string())?;
-
-        // Keep the runtime handle alive — dropping it shuts down the actor
-        keep_runtime(runtime_handle);
+        if let Err(e) =
+            asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
+        {
+            // Nothing published this port, so ask the actor to stop.
+            runtime_handle.shutdown();
+            return Err(e.to_string());
+        }
+        // The registry above holds a live `PortHandle` for this port, which is
+        // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
+        drop(runtime_handle);
 
         // Create Connected PV if name was provided
         if let Some(pv_name) = conn_pv_name {

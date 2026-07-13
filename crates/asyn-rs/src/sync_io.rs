@@ -188,10 +188,11 @@ impl SyncIOHandle {
     }
 
     pub fn drv_user_create(&self, drv_info: &str) -> AsynResult<usize> {
-        // Synchronous I/O binds at the port level (no per-record asyn addr); use
-        // addr 0 (C `getAddr` default) and surface only the shared reason.
+        // Synchronous I/O binds at the port level: no per-record asyn addr (use
+        // addr 0, C `getAddr` default) and no record interface behind the bind.
+        // Surface only the shared reason.
         self.handle
-            .drv_user_create_blocking(drv_info, 0)
+            .drv_user_create_blocking(&crate::port::DrvUserRequest::new(drv_info, 0))
             .map(|info| info.reason)
     }
 }

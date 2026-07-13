@@ -30,19 +30,10 @@
 //! is what makes them a negative control that survives an API change.
 
 use std::process::Command;
-use std::time::Duration;
 
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
-
-/// Reserve and immediately release a free localhost TCP port.
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
 
 /// Run `caget-rs` against the server on `port`, returning its stdout.
 ///
@@ -84,16 +75,18 @@ async fn value(port: u16, args: &[&str]) -> String {
 }
 
 /// One `ao` holding 1.5, the record the C observations above were taken on.
+///
+/// The server TAKES its port by binding it (`.port(0)` → read back
+/// `udp_port()`); nothing probes a port and hands the number on.
 async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, AoRecord::new(val))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
     port
 }
 

@@ -26,13 +26,6 @@ use epics_ca_rs::cli::{INDEFINITE_TIMEOUT, timeout_duration};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
-
 /// (stdout, stderr, exit code) of the real `caget-rs`.
 async fn caget(port: u16, args: &[&str]) -> (String, String, i32) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -54,16 +47,17 @@ async fn caget(port: u16, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// The server TAKES its port by binding it (`.port(0)` → read back
+/// `udp_port()`); nothing probes a port and hands the number on.
 async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
-    let port = free_port();
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record(pv, AoRecord::new(val))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
     port
 }
 

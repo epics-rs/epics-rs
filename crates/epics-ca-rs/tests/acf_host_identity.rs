@@ -18,13 +18,6 @@ use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
-
 fn point_client_at(port: u16) {
     // SAFETY: the tests in this file are `#[serial]` and set the env before
     // `CaClient::new()` snapshots its resolver configuration.
@@ -45,17 +38,23 @@ ASG(DEFAULT) {
 }
 "#;
 
-async fn serve_with_acf(port: u16, acf_path: &std::path::Path) {
+/// Serve `SEC:VAL` under `acf_path` and return the port the server BOUND.
+///
+/// The port is taken by binding it (`.port(0)` → read back `udp_port()`),
+/// never by probing one and handing the number on: a probed port is free
+/// only until the next socket in the process claims it.
+async fn serve_with_acf(acf_path: &std::path::Path) -> u16 {
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .pv("SEC:VAL", EpicsValue::Long(0))
         .acf_file(acf_path.to_str().unwrap())
         .expect("load acf")
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    port
 }
 
 /// The client claims the hostname the HAG names → C grants WRITE, so the
@@ -67,8 +66,7 @@ async fn claimed_host_name_matches_a_host_hag_and_grants_write() {
     let acf_path = dir.path().join("host.acf");
     std::fs::write(&acf_path, ACF).expect("write acf");
 
-    let port = free_port();
-    serve_with_acf(port, &acf_path).await;
+    let port = serve_with_acf(&acf_path).await;
     point_client_at(port);
 
     let client = CaClient::new().await.expect("client");
@@ -103,8 +101,7 @@ async fn unlisted_host_name_is_denied_write() {
     let acf_path = dir.path().join("host.acf");
     std::fs::write(&acf_path, ACF).expect("write acf");
 
-    let port = free_port();
-    serve_with_acf(port, &acf_path).await;
+    let port = serve_with_acf(&acf_path).await;
     point_client_at(port);
 
     let client = CaClient::new().await.expect("client");

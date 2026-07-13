@@ -15,31 +15,27 @@
 //! resolvable IOC differed from C on the field operators grep most.
 
 use std::process::Command;
-use std::time::Duration;
 
 use epics_base_rs::server::records::longout::LongoutRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
-    let p = probe.local_addr().unwrap().port();
-    drop(probe);
-    p
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn cainfo_prints_the_resolved_host_name() {
-    let port = free_port();
+    // The server TAKES its port by binding it (`.port(0)` → read back
+    // `udp_port()`); nothing probes a port and hands the number on.
     let server = CaServer::builder()
-        .port(port)
+        .port(0)
         .record("TST:INFO", LongoutRecord::new(7))
         .build()
         .await
         .expect("build CA server");
+    let port = server.udp_port();
+    // `Host:` names the CIRCUIT peer, so it carries the TCP port — a separate
+    // ephemeral from the search port when the server binds `.port(0)`.
+    let tcp_port = server.tcp_port();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_cainfo-rs"))
@@ -62,7 +58,7 @@ async fn cainfo_prints_the_resolved_host_name() {
 
     // The port is still there — `ipAddrToA` appends `:%hu` to the NAME.
     let (name, p) = host.rsplit_once(':').expect("`<host>:<port>`");
-    assert_eq!(p, port.to_string(), "{stdout:?}");
+    assert_eq!(p, tcp_port.to_string(), "{stdout:?}");
     // …and what precedes it is the name the resolver gave for 127.0.0.1, which
     // is the whole finding. Not pinned to the literal `localhost`: the PTR for
     // the loopback comes from the machine's own `/etc/hosts`.

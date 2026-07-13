@@ -16,14 +16,6 @@ use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServer;
 use tokio::net::UdpSocket;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Drive TCP connect/disconnect churn against the server while counting the
 /// beacons it emits. The ramp doubles 20 ms → 40 → 80 … up to the configured
 /// max period, so after ~1 s of warm-up the next beacon is at least ~0.5 s
@@ -35,7 +27,6 @@ fn free_port() -> u16 {
 async fn r6_30_tcp_connect_disconnect_does_not_restart_the_beacon_ramp() {
     let sink = UdpSocket::bind("127.0.0.1:0").await.expect("beacon sink");
     let sink_port = sink.local_addr().unwrap().port();
-    let server_port = free_port();
 
     // SAFETY: nextest runs each test in its own process, so no other test
     // mutates the environment concurrently; both vars are read when the
@@ -50,12 +41,17 @@ async fn r6_30_tcp_connect_disconnect_does_not_restart_the_beacon_ramp() {
         std::env::set_var("EPICS_CA_BEACON_PERIOD", "10");
     }
 
+    // The server TAKES its port by binding it (`.port(0)` → read back the
+    // bound TCP port); nothing probes a port and hands the number on. The
+    // churn below connects to the TCP listener, which under `.port(0)` is a
+    // different ephemeral from the UDP search port.
     let server = CaServer::builder()
-        .port(server_port)
+        .port(0)
         .pv("R6:30:PV", EpicsValue::Long(0))
         .build()
         .await
         .expect("build CA server");
+    let server_port = server.tcp_port();
     let _h = tokio::spawn(async move { server.run().await });
 
     // Warm-up: let the ramp climb out of its fast phase (20+40+80+160+320 ms

@@ -30,7 +30,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
 
-fn free_port() -> u16 {
+/// A port number for the test's OWN proxy, which needs the same number on
+/// UDP and TCP and so cannot use the `.port(0)` + read-back pattern.
+///
+/// Never use this for a `CaServer`: a server TAKES its port by binding it
+/// (`.port(0)` → `udp_port()`), because a probed port is free only until
+/// the next socket in this process claims it.
+fn free_proxy_port() -> u16 {
     let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free port");
     let p = probe.local_addr().expect("addr").port();
     drop(probe);
@@ -73,12 +79,17 @@ async fn relay(
     }
 }
 
-/// Search-and-relay proxy: UDP searches are forwarded and their replies
-/// re-pointed at the proxy's TCP port; the TCP circuit is relayed with every
-/// read reply denied.
-async fn read_denying_proxy(server_port: u16) -> u16 {
-    let proxy_port = free_port();
-    let server: SocketAddr = ([127, 0, 0, 1], server_port).into();
+/// Search-and-relay proxy: UDP searches are forwarded to `server_udp` and
+/// their replies re-pointed at the proxy's TCP port; the circuit to
+/// `server_tcp` is relayed with every read reply denied.
+///
+/// The two server ports are distinct: the server bound them itself from
+/// `.port(0)`, so the UDP search port and the TCP data port are separate
+/// ephemerals.
+async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
+    let proxy_port = free_proxy_port();
+    let search: SocketAddr = ([127, 0, 0, 1], server_udp).into();
+    let circuit: SocketAddr = ([127, 0, 0, 1], server_tcp).into();
 
     let udp = UdpSocket::bind(("127.0.0.1", proxy_port))
         .await
@@ -92,7 +103,7 @@ async fn read_denying_proxy(server_port: u16) -> u16 {
             let Ok((n, client)) = udp.recv_from(&mut buf).await else {
                 return;
             };
-            if upstream.send_to(&buf[..n], server).await.is_err() {
+            if upstream.send_to(&buf[..n], search).await.is_err() {
                 continue;
             }
             let mut reply = [0u8; 4096];
@@ -122,7 +133,7 @@ async fn read_denying_proxy(server_port: u16) -> u16 {
             let Ok((client, _)) = tcp.accept().await else {
                 return;
             };
-            let Ok(upstream) = TcpStream::connect(server).await else {
+            let Ok(upstream) = TcpStream::connect(circuit).await else {
                 continue;
             };
             let (cr, cw) = client.into_split();
@@ -139,18 +150,17 @@ async fn read_denying_proxy(server_port: u16) -> u16 {
 /// access` marker on BOTH readback lines, still writes, and exits 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn caput_writes_a_read_denied_pv_and_exits_zero() {
-    let server_port = free_port();
     let server = CaServer::builder()
-        .port(server_port)
+        .port(0)
         .record("R921:WRITEONLY", AiRecord::new(1.0))
         .build()
         .await
         .expect("build CA server");
+    let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
     let db = server.database().clone();
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let proxy_port = read_denying_proxy(server_port).await;
+    let proxy_port = read_denying_proxy(server_udp, server_tcp).await;
 
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
         .args(["-w", "2", "R921:WRITEONLY", "42"])
@@ -202,17 +212,16 @@ async fn caput_writes_a_read_denied_pv_and_exits_zero() {
 /// reported the write as if it had been read back and confirmed.
 #[tokio::test(flavor = "multi_thread")]
 async fn caput_new_read_error_prints_the_marker_not_the_submitted_value() {
-    let server_port = free_port();
     let server = CaServer::builder()
-        .port(server_port)
+        .port(0)
         .record("R923:NOREAD", AiRecord::new(1.0))
         .build()
         .await
         .expect("build CA server");
+    let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
     tokio::spawn(async move { server.run().await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let proxy_port = read_denying_proxy(server_port).await;
+    let proxy_port = read_denying_proxy(server_udp, server_tcp).await;
 
     let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
         .args(["-w", "2", "R923:NOREAD", "42"])

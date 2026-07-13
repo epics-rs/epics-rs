@@ -929,12 +929,11 @@ impl AdIoc {
 
         asyn_rs::asyn_record::register_asyn_record_type();
 
-        let mut app = IocApplication::new().port(
-            std::env::var("EPICS_CA_SERVER_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5064),
-        );
+        // `IocApplication::new()` already resolves the server port through
+        // C `envGetInetPortConfigParam` (`runtime::net::cas_server_port`);
+        // re-reading EPICS_CA_SERVER_PORT here with a strict parse dropped
+        // that parity (no 5000 floor, no sscanf leniency, no diagnostics).
+        let mut app = IocApplication::new();
 
         // `$(ADCORE)` resolves `$(ADCORE)/ioc/commonPlugins.cmd` and the
         // `$(ADCORE)/db` templates. Take the path from ad-core-rs itself rather

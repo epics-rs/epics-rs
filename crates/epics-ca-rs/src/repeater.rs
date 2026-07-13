@@ -509,8 +509,11 @@ fn register_client(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, 
 /// Try to register with an existing repeater. If none is running, spawn one
 /// as a background process using the current executable's `ca-repeater` binary,
 /// then register again.
-pub async fn ensure_repeater() {
-    if try_register().await.is_ok() {
+/// `repeater_port` is the client's single resolution of
+/// `EPICS_CA_REPEATER_PORT` (C `udpiiu::repeaterPort`, `udpiiu.cpp:168`) —
+/// both the pre-spawn and the post-spawn attempt reuse it.
+pub async fn ensure_repeater(repeater_port: u16) {
+    if try_register(repeater_port).await.is_ok() {
         return;
     }
 
@@ -519,11 +522,11 @@ pub async fn ensure_repeater() {
 
     // Give it a moment to start, then register
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
-    let _ = try_register().await;
+    let _ = try_register(repeater_port).await;
 }
 
 /// Send a REPEATER_REGISTER to localhost:5065 and wait for CONFIRM.
-async fn try_register() -> Result<(), ()> {
+async fn try_register(repeater_port: u16) -> Result<(), ()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|_| ())?;
     // SO_RXQ_OVFL opt-in for diagnostic parity with the long-running
     // repeater; the brief CONFIRM wait below ignores the counter
@@ -540,11 +543,11 @@ async fn try_register() -> Result<(), ()> {
     let mut hdr = CaHeader::new(CA_PROTO_REPEATER_REGISTER);
     hdr.available = u32::from_be_bytes(local_ip.octets());
 
-    // Client REGISTER target: same env override as the daemon bind
-    // above, so a non-default repeater port stays consistent on both
-    // ends. C libca `udpiiu.cpp:168` reads the same env var via
-    // `envGetInetPortConfigParam`.
-    let repeater_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port());
+    // Client REGISTER target: the port the caller resolved once (C
+    // `udpiiu::repeaterPort`, `udpiiu.cpp:168`), so the register attempt
+    // and the daemon bind agree and a misconfigured value is diagnosed
+    // once per process rather than once per attempt.
+    let repeater_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, repeater_port);
     socket
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await

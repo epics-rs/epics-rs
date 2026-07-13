@@ -220,13 +220,19 @@ const REPEATER_SUBSCRIBE_PERIOD: Duration = Duration::from_secs(1);
 /// unconfirmed attempts libca prints a one-shot diagnostic and keeps trying.
 const REPEATER_TRIES_TO_MSG: u32 = 50;
 
+/// `repeater_port` is the client's single resolution of
+/// `EPICS_CA_REPEATER_PORT` — C `udpiiu` resolves it once in its
+/// constructor (`udpiiu.cpp:168`) and every registration retry sends to
+/// that stored member.
 pub(crate) async fn run_beacon_monitor(
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     control_rx: mpsc::UnboundedReceiver<BeaconControl>,
+    repeater_port: u16,
 ) {
     run_beacon_monitor_inner(
         coord_tx,
         control_rx,
+        repeater_port,
         #[cfg(feature = "cap-tokens")]
         None,
     )
@@ -244,14 +250,16 @@ pub(crate) async fn run_beacon_monitor(
 pub(crate) async fn run_beacon_monitor_with_verifier(
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     control_rx: mpsc::UnboundedReceiver<BeaconControl>,
+    repeater_port: u16,
     verifier: std::sync::Arc<crate::server::signed_beacon::SignedBeaconVerifier>,
 ) {
-    run_beacon_monitor_inner(coord_tx, control_rx, Some(verifier)).await;
+    run_beacon_monitor_inner(coord_tx, control_rx, repeater_port, Some(verifier)).await;
 }
 
 async fn run_beacon_monitor_inner(
     coord_tx: mpsc::UnboundedSender<CoordRequest>,
     mut control_rx: mpsc::UnboundedReceiver<BeaconControl>,
+    repeater_port: u16,
     #[cfg(feature = "cap-tokens")] verifier: Option<
         std::sync::Arc<crate::server::signed_beacon::SignedBeaconVerifier>,
     >,
@@ -361,7 +369,7 @@ async fn run_beacon_monitor_inner(
                 // C passes the attempt number into the registration
                 // (`repeaterSubscribeTimer.cpp:83` `repeaterRegistrationMessage
                 // (this->attempts)`) — it selects the odd/even address form.
-                let _ = send_repeater_registration(&socket, attempts).await;
+                let _ = send_repeater_registration(&socket, attempts, repeater_port).await;
                 attempts = attempts.saturating_add(1);
                 continue;
             }
@@ -708,9 +716,7 @@ fn handle_beacon(
     let server_port = if hdr.count != 0 {
         hdr.count
     } else {
-        epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(CA_SERVER_PORT)
+        epics_base_rs::runtime::net::ca_server_port()
     };
     let beacon_id = hdr.cid;
 
@@ -937,7 +943,15 @@ fn handle_beacon(
 /// means one of every two attempts is always acceptable to any repeater vintage
 /// (`udpiiu.cpp:476-493`). Both the C repeater (`repeater.cpp:115-117`) and this
 /// port's (`repeater.rs:103`) bind `INADDR_ANY`, so both destinations reach it.
-async fn send_repeater_registration(socket: &AsyncUdpV4, attempt: u32) -> Result<(), ()> {
+///
+/// `repeater_port` is the value the caller resolved once via
+/// `envGetInetPortConfigParam` — C's `udpiiu::repeaterPort` member, not a
+/// fresh env read per attempt.
+async fn send_repeater_registration(
+    socket: &AsyncUdpV4,
+    attempt: u32,
+    repeater_port: u16,
+) -> Result<(), ()> {
     let addr = if attempt & 1 == 1 {
         crate::server::addr_list::osi_local_addr()
     } else {
@@ -947,12 +961,7 @@ async fn send_repeater_registration(socket: &AsyncUdpV4, attempt: u32) -> Result
     let mut hdr = CaHeader::new(CA_PROTO_REPEATER_REGISTER);
     hdr.available = u32::from_be_bytes(addr.octets());
 
-    // Honour `EPICS_CA_REPEATER_PORT` so the beacon monitor and the
-    // daemon agree when operators override the default — without this
-    // the monitor would silently fail to re-register every 5 min
-    // against a non-default repeater. libca `udpiiu.cpp:168` resolves
-    // the same env var.
-    let repeater_addr = SocketAddr::V4(SocketAddrV4::new(addr, repeater_port()));
+    let repeater_addr = SocketAddr::V4(SocketAddrV4::new(addr, repeater_port));
     socket
         .send_to(&hdr.to_bytes(), repeater_addr)
         .await
@@ -1015,7 +1024,11 @@ mod repeater_registration_tests {
 
         let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
         let (_ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let monitor = tokio::spawn(run_beacon_monitor(coord_tx, ctrl_rx));
+        let monitor = tokio::spawn(run_beacon_monitor(
+            coord_tx,
+            ctrl_rx,
+            crate::protocol::repeater_port(),
+        ));
 
         // ~3.5 s of an unresponsive repeater: C would have sent one
         // registration per second, so at least 4 (t ≈ 0, 1, 2, 3). The old
@@ -1085,7 +1098,11 @@ mod repeater_registration_tests {
 
         let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
         let (_ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let monitor = tokio::spawn(run_beacon_monitor(coord_tx, ctrl_rx));
+        let monitor = tokio::spawn(run_beacon_monitor(
+            coord_tx,
+            ctrl_rx,
+            crate::protocol::repeater_port(),
+        ));
 
         // Attempts 0..=3 at ~1 s apart (the repeater never CONFIRMs).
         let mut announced: Vec<Ipv4Addr> = Vec::new();

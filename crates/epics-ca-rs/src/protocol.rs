@@ -32,17 +32,16 @@ pub const CA_REPEATER_PORT: u16 = 5065;
 
 /// Resolved CA repeater UDP port. Mirrors libca
 /// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` (e.g.
-/// `repeater.cpp:511`, `udpiiu.cpp:168`, `casw.cpp:103`): the env var
-/// `EPICS_CA_REPEATER_PORT` takes precedence; otherwise the compiled
-/// default [`CA_REPEATER_PORT`] (5065) is used. Returning a value
-/// outside u16 (or a non-numeric value) falls back to the default;
-/// C `envGetInetPortConfigParam` similarly clamps. Centralizing this
+/// `repeater.cpp:511`, `udpiiu.cpp:168`, `casw.cpp:103`) by delegating to
+/// the one owner of that C function,
+/// [`epics_base_rs::runtime::net::ca_repeater_port`]: the env var takes
+/// precedence, a value that fails to parse or falls outside
+/// `(IPPORT_USERRESERVED, USHRT_MAX]` is diagnosed and rejected back to
+/// the compiled default [`CA_REPEATER_PORT`] (5065). Centralizing this
 /// keeps the repeater daemon bind, the client REGISTER target, and
 /// the beacon-monitor REGISTER target in lockstep with operator env.
 pub fn repeater_port() -> u16 {
-    epics_base_rs::runtime::env::get("EPICS_CA_REPEATER_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(CA_REPEATER_PORT)
+    epics_base_rs::runtime::net::ca_repeater_port()
 }
 
 // CA protocol version

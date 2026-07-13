@@ -644,8 +644,18 @@ impl CaClient {
         // the diagnostic for a client that never connects to anything.
         transport::prime_connection_timeout();
 
+        // C `udpiiu` resolves EPICS_CA_REPEATER_PORT once, in its constructor
+        // (`udpiiu.cpp:168`), and hands the stored `repeaterPort` to every
+        // registration it later sends. One resolution per client here too:
+        // the registration helper and the beacon monitor's 1 s retry loop both
+        // take this value, so a misconfigured port is diagnosed once — not on
+        // every attempt.
+        let repeater_port = crate::protocol::repeater_port();
+
         // Run repeater registration in background — don't block client startup.
-        epics_base_rs::runtime::task::spawn(async { repeater::ensure_repeater().await });
+        epics_base_rs::runtime::task::spawn(async move {
+            repeater::ensure_repeater(repeater_port).await
+        });
 
         // Build the address list with hostname
         // info preserved so the search-engine refresh task can
@@ -870,6 +880,7 @@ impl CaClient {
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
             coord_tx.clone(),
             beacon_ctrl_rx,
+            repeater_port,
         ));
 
         Ok(Self {
@@ -4768,9 +4779,7 @@ impl AddrEntry {
 /// epics-base#488.
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
-    let default_port = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(CA_SERVER_PORT);
+    let default_port = epics_base_rs::runtime::net::ca_server_port();
     // EPICS_RS_CLIENT_IGNORE — Rust-only client-side IP quarantine
     // (NOT the C EPICS_IOC_IGNORE_SERVERS, which is server-side and
     // operates on server NAMES, not IPs — see epics_rs_client_ignore
@@ -5328,9 +5337,7 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     // `EPICS_CA_SERVER_PORT=5066` to coexist with parallel C
     // deployments. The `host:port` branch already honours the
     // explicit port; only the bare-hostname default changes here.
-    let default_server_port: u16 = epics_base_rs::runtime::env::get("EPICS_CA_SERVER_PORT")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(CA_SERVER_PORT);
+    let default_server_port: u16 = epics_base_rs::runtime::net::ca_server_port();
     let mut out = Vec::new();
     for entry in list.split_whitespace() {
         if entry.contains(':') {

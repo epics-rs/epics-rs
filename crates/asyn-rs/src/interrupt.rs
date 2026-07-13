@@ -70,6 +70,29 @@ impl InterruptFilter {
         true
     }
 
+    /// Whether an OCTET interrupt fired under `rule` reaches this subscriber.
+    ///
+    /// C's octet interrupt list is not keyed by `reason` **at all**:
+    /// `asynOctetBase::callInterruptUsers` tests `if (addr == pinterrupt->addr)`
+    /// and consults `reason` nowhere (asynOctetBase.c:203-215). The only thing
+    /// that varies between C's two octet fan-outs is whether the addr test runs
+    /// — see [`OctetFanOut`]. So this gate is the addr rule plus the
+    /// per-interface routing every path shares; the `reason` and
+    /// `uint32_mask` gates of [`matches`](Self::matches) do not apply to octet.
+    ///
+    /// [`matches`]: Self::matches
+    fn accepts_octet(&self, rule: OctetFanOut) -> bool {
+        if let OctetFanOut::ByAddr(addr) = rule {
+            if let Some(a) = self.addr {
+                if addr != a {
+                    return false;
+                }
+            }
+        }
+        // A subscriber bound to a different interface never receives octet.
+        !matches!(self.iface, Some(want) if want != InterfaceType::Octet)
+    }
+
     /// Whether a value fired for `(reason, addr, iface)` could reach this
     /// subscriber, ignoring the UInt32Digital changed-bit gate. This is the
     /// *presence* predicate (would a fire ever land here), not the per-value
@@ -96,6 +119,32 @@ impl InterruptFilter {
         }
         true
     }
+}
+
+/// Which subscribers an **octet** interrupt reaches.
+///
+/// C has exactly two octet fan-out rules, and they are different on purpose:
+///
+/// - [`ByAddr`](Self::ByAddr) — `asynOctetBase::callInterruptUsers`
+///   (asynOctetBase.c:203-215): deliver to every registered octet user whose
+///   `addr` equals the read's. This is the rule for a device read.
+/// - [`EveryUser`](Self::EveryUser) — `drvAsynIPServerPort`'s listener thread
+///   (drvAsynIPServerPort.c:372-383 for a new connection, :309-322 for a UDP
+///   datagram): walk the interrupt list and call EVERY node, with no test at
+///   all.
+///
+/// Neither consults `reason`. The rule therefore belongs to the **emitter**, not
+/// to the subscriber's filter — a port that applies one filter to both fan-outs
+/// announces a new connection only to the record registered on that slot's addr
+/// (R19-109) and drops octet values for any record whose REASON is non-zero
+/// (R19-113). Naming the rule at the fire site makes the third, invented rule
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OctetFanOut {
+    /// The device-read rule: `addr` must match.
+    ByAddr(i32),
+    /// The IP-server listener rule: no filter at all.
+    EveryUser,
 }
 
 /// Value delivered through the interrupt system.
@@ -165,12 +214,6 @@ struct SubscriptionMailbox {
     wakeup: tokio::sync::Notify,
     /// Set to false when the subscription is dropped.
     active: AtomicBool,
-}
-
-impl SubscriptionMailbox {
-    fn matches(&self, iv: &InterruptValue) -> bool {
-        self.filter.matches(iv)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,8 +425,32 @@ impl InterruptManager {
         }
     }
 
-    /// Send an interrupt to all subscribers (both broadcast and mailbox).
+    /// Send an interrupt to all subscribers (both broadcast and mailbox),
+    /// filtered by reason + addr + interface + UInt32Digital changed-bit mask.
+    ///
+    /// This is the rule for the **typed scalar / array** interfaces, whose C
+    /// interrupt lists are keyed by reason. The octet interfaces are not: they
+    /// go through [`notify_octet`](Self::notify_octet), which names its fan-out
+    /// rule explicitly.
     pub fn notify(&self, value: InterruptValue) {
+        self.dispatch(value, |f, v| f.matches(v));
+    }
+
+    /// Send an **octet** interrupt under one of C's two octet fan-out rules
+    /// (see [`OctetFanOut`]). Neither rule consults `reason`.
+    pub fn notify_octet(&self, rule: OctetFanOut, value: InterruptValue) {
+        self.dispatch(value, |f, _| f.accepts_octet(rule));
+    }
+
+    /// The single delivery path — sync callbacks, then mailboxes, then the
+    /// legacy broadcast — with the caller's fan-out rule as the only variable.
+    /// Every emitter routes through here, so a new rule cannot come with its own
+    /// half-implemented delivery.
+    fn dispatch(
+        &self,
+        value: InterruptValue,
+        pass: impl Fn(&InterruptFilter, &InterruptValue) -> bool,
+    ) {
         self.state.notify_count.fetch_add(1, Ordering::Relaxed);
 
         // Synchronous callbacks (averaging device support): invoke inline for
@@ -400,7 +467,7 @@ impl InterruptManager {
                 .collect()
         };
         for cb in &sync_cbs {
-            if cb.filter.matches(&value) {
+            if pass(&cb.filter, &value) {
                 (cb.callback)(&value);
             }
         }
@@ -411,7 +478,7 @@ impl InterruptManager {
             if !sub.active.load(Ordering::Relaxed) {
                 continue;
             }
-            if !sub.matches(&value) {
+            if !pass(&sub.filter, &value) {
                 continue;
             }
             let mut slot = sub.latest.lock();
@@ -986,6 +1053,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(vi.value, ParamValue::Int32(99)));
+    }
+
+    /// The two octet fan-out rules, at their boundaries. C's octet interrupt
+    /// list is keyed by `addr` alone (asynOctetBase.c:203-215) — `reason` is
+    /// never consulted — and the IP-server listener applies no key at all
+    /// (drvAsynIPServerPort.c:372-383).
+    ///
+    /// Boundaries: reason-matches vs reason-differs (must not decide anything);
+    /// addr-matches vs addr-differs under each rule; and a subscriber bound to a
+    /// non-octet interface (never receives either).
+    #[tokio::test]
+    async fn octet_fan_out_ignores_reason_and_honours_the_emitter_rule() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new(16);
+
+        let octet_sub = |reason: usize, addr: i32| {
+            im.register_interrupt_user(InterruptFilter {
+                reason: Some(reason),
+                addr: Some(addr),
+                iface: Some(InterfaceType::Octet),
+                ..Default::default()
+            })
+        };
+        // Same addr as the read, but a REASON the read does not carry — C
+        // delivers to it; the port used to drop it.
+        let (_s_other_reason, mut rx_other_reason) = octet_sub(7, 0);
+        // Same addr, same reason.
+        let (_s_same, mut rx_same) = octet_sub(0, 0);
+        // A different addr.
+        let (_s_other_addr, mut rx_other_addr) = octet_sub(0, 3);
+        // A non-octet interface never sees an octet value.
+        let (_s_int32, mut rx_int32) = im.register_interrupt_user(InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            iface: Some(InterfaceType::Int32),
+            ..Default::default()
+        });
+
+        let octet = |addr: i32, s: &str| InterruptValue {
+            reason: 0,
+            addr,
+            value: ParamValue::Octet(s.to_string()),
+            iface: Some(InterfaceType::Octet),
+            ..Default::default()
+        };
+        let dur = std::time::Duration::from_millis(100);
+        let short = std::time::Duration::from_millis(30);
+
+        // --- ByAddr(0): the device-read rule.
+        im.notify_octet(OctetFanOut::ByAddr(0), octet(0, "read"));
+        for rx in [&mut rx_same, &mut rx_other_reason] {
+            let v = tokio::time::timeout(dur, rx.recv()).await.unwrap().unwrap();
+            assert!(matches!(v.value, ParamValue::Octet(ref s) if s == "read"));
+        }
+        assert!(
+            tokio::time::timeout(short, rx_other_addr.recv())
+                .await
+                .is_err(),
+            "ByAddr must not reach a subscriber on another addr"
+        );
+        assert!(
+            tokio::time::timeout(short, rx_int32.recv()).await.is_err(),
+            "an octet value must not reach an Int32 subscriber"
+        );
+
+        // --- EveryUser: the IP-server listener rule. Every octet user, whatever
+        // its addr — this is how a maxClients>1 server announces slot 3 to a
+        // record registered on slot 0.
+        im.notify_octet(OctetFanOut::EveryUser, octet(3, "srv:3"));
+        for rx in [&mut rx_same, &mut rx_other_reason, &mut rx_other_addr] {
+            let v = tokio::time::timeout(dur, rx.recv()).await.unwrap().unwrap();
+            assert!(matches!(v.value, ParamValue::Octet(ref s) if s == "srv:3"));
+        }
+        assert!(
+            tokio::time::timeout(short, rx_int32.recv()).await.is_err(),
+            "EveryUser is every OCTET user, not every subscriber"
+        );
     }
 
     /// The subscriber-presence gate a polling driver uses to skip an interface

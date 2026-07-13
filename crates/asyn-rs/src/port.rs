@@ -94,7 +94,7 @@ use crate::interfaces::InterfaceType;
 use crate::interpose::{
     EomReason, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
 };
-use crate::interrupt::{InterruptManager, InterruptValue};
+use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
 use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, ConnectCheck};
@@ -2170,14 +2170,21 @@ impl OctetNext for DriverOctetLink<'_> {
         let (nbytes_transferred, eom_reason) = self.driver.io_read_octet_eom(user, buf)?;
         if self.driver.base().octet_interrupt_process {
             let raw = &buf[..nbytes_transferred];
-            self.driver.base().interrupts.notify(InterruptValue {
-                reason: user.reason,
-                addr: user.addr,
-                value: ParamValue::Octet(String::from_utf8_lossy(raw).into_owned()),
-                timestamp: SystemTime::now(),
-                iface: Some(InterfaceType::Octet),
-                ..Default::default()
-            });
+            // C's rule for a device read: `addr` decides, `reason` is never
+            // consulted (asynOctetBase.c:203-215). `reason` still rides on the
+            // value — C leaves `pasynUser->reason` on the callback's user — but
+            // it selects nobody.
+            self.driver.base().interrupts.notify_octet(
+                OctetFanOut::ByAddr(user.addr),
+                InterruptValue {
+                    reason: user.reason,
+                    addr: user.addr,
+                    value: ParamValue::Octet(String::from_utf8_lossy(raw).into_owned()),
+                    timestamp: SystemTime::now(),
+                    iface: Some(InterfaceType::Octet),
+                    ..Default::default()
+                },
+            );
         }
         Ok(OctetReadResult {
             nbytes_transferred,

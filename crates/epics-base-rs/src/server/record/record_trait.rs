@@ -1585,6 +1585,26 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Whether this record's C `process()` clears UDF regardless of the read's
+    /// status — i.e. even when `readValue` failed.
+    ///
+    /// Most records gate the clear on the read: `if (status == 0) prec->udf =
+    /// FALSE;` inside `readValue`'s SIOL branch (`longinRecord.c:418`), so a
+    /// failed simulation read leaves the record undefined. The array records do
+    /// NOT: their `process()` clears UDF itself, unconditionally, on the line
+    /// after `readValue` returns — `prec->pact = TRUE; prec->udf = FALSE;`
+    /// (`waveformRecord.c:143-144`, `aaiRecord.c:173-174`) and
+    /// `if (!pact) { prec->udf = FALSE; ... }` (`aaoRecord.c:164-165`) — whatever
+    /// status came back, including the `-1` of an illegal SIMM. (waveform's
+    /// readValue also clears UDF on a good SIOL read, `:353`, but the
+    /// process-level clear runs after it and dominates.)
+    ///
+    /// Consulted by the simulation tail, which otherwise gates the clear on the
+    /// SIOL fetch status. Default `false` — the status-gated majority.
+    fn clears_udf_unconditionally(&self) -> bool {
+        false
+    }
+
     /// Whether this record type raises UDF_ALARM at all.
     ///
     /// C has no framework-level UDF alarm: every record that reports one does

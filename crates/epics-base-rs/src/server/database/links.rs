@@ -790,7 +790,24 @@ impl PvDatabase {
         depth: usize,
     ) -> Option<EpicsValue> {
         match link {
-            crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
+            // A CONSTANT input link delivers NOTHING at process time. C
+            // `dbConstGetValue` (`dbConstLink.c:219-225`) returns status 0
+            // having written nothing to the buffer, so `read_ai`'s
+            // `dbGetLink(&prec->inp, ...)` leaves VAL exactly as it was; the
+            // array/soft-callback dev supports state the same rule outright
+            // (`devWfSoft.c::read_wf` and `devAaiSoft.c::read_aai`:
+            // `if (dbLinkIsConstant(pinp)) return 0;`). The constant reaches
+            // the record ONCE, at init, through the
+            // `recGblInitConstantLink`/`dbLoadLinkArray` owner
+            // (`rec_gbl_init_constant_inp`).
+            //
+            // Re-delivering it every cycle — as this arm did — made a constant
+            // INP overwrite the record's VAL on every process, so a client
+            // caput to a `field(INP, "5")` ai (or the data a client pushed
+            // into an aai/waveform whose INP is an unset/constant link, which
+            // is how EVERY device-fed and client-fed array record is
+            // configured) was clobbered on the next scan.
+            crate::server::record::ParsedLink::Constant(_) => None,
             crate::server::record::ParsedLink::Db(db) if is_soft => {
                 // PP: process source record if Passive before reading
                 self.process_passive_db_source(db, visited, depth).await;

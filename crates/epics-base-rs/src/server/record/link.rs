@@ -358,9 +358,25 @@ impl ParsedLink {
         }
     }
 
-    /// Extract the constant as an EpicsValue (Double if numeric, else String).
+    /// Extract the constant as an EpicsValue — the C `dbConstLoadScalar` /
+    /// `dbConstLoadArray` pair (`dbConstLink.c:152-199`), which is what a
+    /// record's `init_record` gets out of a constant link through `dbLoadLink`
+    /// / `dbLoadLinkArray`.
+    ///
+    /// A bracketed constant (`[1, 2, 3]`) is an ARRAY: C hands the text to
+    /// `dbPutConvertJSON`, which yields `nRequest` elements. Yielding the
+    /// bracket text as a String instead left every array-valued constant link
+    /// (`field(INP, "[1,2,3]")` on an aai/waveform, a constant closed-loop aao
+    /// DOL) delivering a nonsense string to a typed array buffer.
     pub fn constant_value(&self) -> Option<EpicsValue> {
         if let ParsedLink::Constant(s) = self {
+            if let Some(inner) = s
+                .trim()
+                .strip_prefix('[')
+                .and_then(|body| body.strip_suffix(']'))
+            {
+                return Some(constant_array_value(inner));
+            }
             if let Ok(v) = s.parse::<f64>() {
                 Some(EpicsValue::Double(v))
             } else {
@@ -479,6 +495,31 @@ fn classify_pva_root_value(value: &str) -> Option<PvaRootValue<'_>> {
 ///
 /// Returns `Some(parsed)` when the string is a recognized JSON link;
 /// `None` lets the caller fall through to legacy plain-text parsing.
+/// The elements of a bracketed constant link, C `dbPutConvertJSON` on the
+/// text `dbConstLoadArray` hands it (`dbConstLink.c:177-199`).
+///
+/// Numeric elements produce a `DoubleArray` — the record lands it in its own
+/// typed buffer afterwards (C converts INTO `bptr` with `dbFastConvert`, so
+/// the element type is the record's FTVL, never the link's). Any non-numeric
+/// element makes the whole literal a string array (a `CHAR` waveform seeded
+/// with names, `["one","two"]`). An empty `[]` is zero elements — C yields
+/// `nRequest = 0`, i.e. NORD stays 0.
+fn constant_array_value(inner: &str) -> EpicsValue {
+    let body = inner.trim();
+    if body.is_empty() {
+        return EpicsValue::DoubleArray(Vec::new());
+    }
+    let elements: Vec<&str> = body
+        .split(',')
+        .map(|e| e.trim().trim_matches('"').trim_matches('\''))
+        .collect();
+    let numbers: Option<Vec<f64>> = elements.iter().map(|e| e.parse::<f64>().ok()).collect();
+    match numbers {
+        Some(nums) => EpicsValue::DoubleArray(nums),
+        None => EpicsValue::StringArray(elements.into_iter().map(|e| e.into()).collect()),
+    }
+}
+
 fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
@@ -1007,6 +1048,26 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
             return ParsedLink::None;
         }
         return ParsedLink::Constant(inner.to_string());
+    }
+
+    // Array constant. C `dbParseLink` (`dbStaticLib.c:2354-2357`), right after
+    // the scalar-constant test:
+    //
+    //     /* Link may be an array constant */
+    //     if (pstr[0] == '[' && pstr[len-1] == ']') {
+    //         pinfo->ltype = CONSTANT;
+    //         return 0;
+    //     }
+    //
+    // The bracketed text is handed verbatim to `dbPutConvertJSON`
+    // (`dbConstLink.c::dbConstLoadArray`) when the record loads the link at
+    // init. Resolved BEFORE the modifier split for the same reason as the
+    // quoted constant: `[1, 2, 3]` legitimately contains spaces, and C reaches
+    // the modifier scan only after both constant tests. Note the one form that
+    // is NOT a constant: `"1 2 3"` — `epicsParseDouble` rejects the trailing
+    // garbage, so C parses it as a PV_LINK to a record named `1`.
+    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+        return ParsedLink::Constant(s.to_string());
     }
 
     // Isolate the target from its modifiers — see [`split_link_modifiers`].

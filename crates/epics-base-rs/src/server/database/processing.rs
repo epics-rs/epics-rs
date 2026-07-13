@@ -3842,11 +3842,18 @@ impl PvDatabase {
         // class, so `dbGetLink` is never called: nothing is attempted, and the
         // untouched `status` raises no link alarm.
         let read_as = read_as?;
+        use crate::server::recgbl::simm::LinkFetch;
         match self
             .read_link_value_as(&parsed, read_as, visited, depth)
             .await
         {
-            Some(value) => {
+            // C `dbConstGetValue`: SUCCESS with nothing written. The target
+            // field keeps what it holds (a client's `caput SELN 5` survives a
+            // `field(SELL,"3")`), no LINK alarm is raised, and the link did NOT
+            // deliver — so it is not reported as resolved. The constant reached
+            // the record once, at init, via `rec_gbl_init_constant_links`.
+            LinkFetch::NoData => None,
+            LinkFetch::Value(value) => {
                 // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
                 // folds the SOURCE's committed alarm into the READER per the
                 // link's MS class. The source has already been processed above
@@ -3876,7 +3883,7 @@ impl PvDatabase {
                 }
                 Some(true)
             }
-            None => {
+            LinkFetch::Failed => {
                 let mut instance = rec.write().await;
                 crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
                 Some(false)
@@ -5167,8 +5174,14 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         return;
     }
 
-    // 1. The soft-channel device support's INP → VAL/RVAL load.
-    if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp) {
+    // 1. The soft-channel device support's INP → VAL/RVAL load. It is DEVICE
+    //    SUPPORT's `init_record` (`devAiSoft.c` &c), so it runs only on records
+    //    that HAVE a DSET — `Record::input_read_by_device_support`. A record
+    //    that reads its own INP (compress) gets no init load in C, and its
+    //    constant therefore never reaches the record at all.
+    if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp)
+        && instance.record.input_read_by_device_support()
+    {
         let inp = crate::server::record::parse_link_v2(&instance.common.inp);
         if let Some(value) = crate::server::recgbl::simm::constant_load_value(&inp) {
             // Same sink the per-cycle soft-input apply uses, so the constant

@@ -1387,9 +1387,20 @@ impl Record for SseqRecord {
     /// The per-cycle read never sees a constant again — C pins its
     /// `dol_field_type` to `DBF_NOACCESS`, which falls to `processCallback`'s
     /// `default: break` ([`Self::input_link_read_as`]).
+    ///
+    /// `SELL → SELN` is the other seed C declares (`sseqRecord.c:186-191`,
+    /// `recGblInitConstantLink(&pR->sell, DBF_USHORT, &pR->seln)` — the same one
+    /// `dfanout`/`seq` declare). Without it a constant `SELL` reached `SELN`
+    /// only through the per-cycle `ReadDbLink`, which re-applied it on every
+    /// process and stomped a client's `caput SELN`; now that the link layer
+    /// delivers nothing for a constant at process time, init is the only path
+    /// left — and it is C's.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
         (0..NUM_STEPS)
             .map(|i| crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i]))
+            .chain(std::iter::once(
+                crate::server::record::ConstantInitLink::new("SELL", "SELN"),
+            ))
             .collect()
     }
 

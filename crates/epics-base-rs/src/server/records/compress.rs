@@ -929,6 +929,13 @@ impl Record for CompressRecord {
     ///
     /// softIoc: with BALG="LIFO Buffer", `dbpf CMP.VAL 7` →
     /// `recGblDbaddrError: dbPut Attempt to modify noMod field PV: CMP.VAL`.
+    /// `compressRecord.c` declares no `dset` — the record reads its own `INP`
+    /// (`process`: `dbGetLink(&prec->inp, …)`), so there is no soft device
+    /// support to run `recGblInitConstantLink` on it at init.
+    fn input_read_by_device_support(&self) -> bool {
+        false
+    }
+
     fn field_no_mod(&self, field: &str) -> bool {
         field == "VAL" && self.balg == 1
     }

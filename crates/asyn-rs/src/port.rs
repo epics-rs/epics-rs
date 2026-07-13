@@ -91,7 +91,9 @@ pub fn eos_device_key(multi_device: bool, addr: i32) -> i32 {
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
-use crate::interpose::{EomReason, OctetInterpose, OctetInterposeStack};
+use crate::interpose::{
+    EomReason, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
+};
 use crate::interrupt::{InterruptManager, InterruptValue};
 use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
 use crate::trace::TraceManager;
@@ -2135,6 +2137,104 @@ pub trait PortDriver: Send + Sync + 'static {
     fn init(&mut self) -> AsynResult<()> {
         Ok(())
     }
+}
+
+/// The driver sitting at the **bottom** of a port's octet interpose chain — C's
+/// driver-registered `asynOctet` interface, the one `interposeInterface` keeps
+/// as `pPrev` when it pushes a layer on top (asynManager.c:2190-2220).
+///
+/// A driver never knows it is being interposed in C: `findInterface` hands the
+/// caller the topmost layer, and the layer calls down. The Rust equivalent of
+/// "the caller" is the port actor, so the chain runs there
+/// ([`octet_read_chain`] and friends) and the driver's `io_*_octet` are the raw
+/// device transfer, nothing more.
+struct DriverOctetLink<'a> {
+    driver: &'a mut dyn PortDriver,
+}
+
+impl OctetNext for DriverOctetLink<'_> {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        let (nbytes_transferred, eom_reason) = self.driver.io_read_octet_eom(user, buf)?;
+        Ok(OctetReadResult {
+            nbytes_transferred,
+            eom_reason,
+        })
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.driver.io_write_octet(user, data)
+    }
+
+    fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        self.driver.io_flush(user)
+    }
+}
+
+/// Run `f` with the port's chain and the driver below it, both borrowed at once.
+///
+/// The chain lives inside the driver (`base.interpose_octet`) while the driver
+/// is the chain's base, so the two are lifted apart for the duration of one
+/// transfer and the chain is put straight back. The actor owns the driver and is
+/// the only caller, so no other code can observe the port between the take and
+/// the restore.
+fn with_octet_chain<T>(
+    driver: &mut dyn PortDriver,
+    f: impl FnOnce(&mut OctetInterposeStack, &mut DriverOctetLink<'_>) -> T,
+) -> T {
+    let multi_device = driver.base().flags.multi_device;
+    let mut chain = std::mem::replace(
+        &mut driver.base_mut().interpose_octet,
+        OctetInterposeStack::new(multi_device),
+    );
+    let result = {
+        let mut link = DriverOctetLink {
+            driver: &mut *driver,
+        };
+        f(&mut chain, &mut link)
+    };
+    driver.base_mut().interpose_octet = chain;
+    result
+}
+
+/// One octet read on the port: through every interpose layer installed on the
+/// addressed device, ending at the driver.
+///
+/// C `asynOctet::read` on the interface `findInterface` resolves — which is the
+/// outermost interpose whenever one is installed. The chain belongs to the
+/// **port**, not to the driver: `asynInterposeEos` / `asynInterposeEcho` /
+/// `asynInterposeDelay` are pushed by the manager (asynManager.c:2190-2220) and
+/// the driver below is not consulted and cannot opt out. Dispatching inside each
+/// driver instead — as this crate did — made the chain per-driver opt-in, so the
+/// EOS layer `drvAsynFTDIPortConfigure` installs (drvAsynFTDIPort.cpp:622-623,
+/// ftdi.rs) was never run by anything.
+pub(crate) fn octet_read_chain(
+    driver: &mut dyn PortDriver,
+    user: &AsynUser,
+    buf: &mut [u8],
+) -> AsynResult<(usize, EomReason)> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_read(user, buf, link))
+        .map(|r| (r.nbytes_transferred, r.eom_reason))
+}
+
+/// One octet write on the port, through the addressed device's chain
+/// (see [`octet_read_chain`]).
+pub(crate) fn octet_write_chain(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+    data: &[u8],
+) -> AsynResult<usize> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_write(user, data, link))
+}
+
+/// One octet flush on the port, through the addressed device's chain — C
+/// `asynInterposeEos::flushIt` resets the layer's read-ahead buffer and then
+/// flushes the layer below (asynInterposeEos.c:259-274), which only happens if
+/// the flush enters the chain at the top (see [`octet_read_chain`]).
+pub(crate) fn octet_flush_chain(
+    driver: &mut dyn PortDriver,
+    user: &mut AsynUser,
+) -> AsynResult<()> {
+    with_octet_chain(driver, |chain, link| chain.dispatch_flush(user, link))
 }
 
 #[cfg(test)]

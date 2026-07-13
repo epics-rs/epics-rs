@@ -823,12 +823,21 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.io_read_octet_eom(user, buf).map(|(n, _eom)| n)
+    }
+
+    /// The raw device read — the **bottom** of the port's octet chain, C
+    /// `drvAsynSerialPort.c::readIt` below the interposes the manager installed
+    /// on top of it. The interpose chain is run by the port
+    /// ([`crate::port::octet_read_chain`]), not from here: a driver that
+    /// dispatched its own chain gave every other driver a chain that never ran.
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
         self.base.check_ready()?;
-        let result = match self
-            .base
-            .interpose_octet
-            .dispatch_read(user, buf, &mut self.io)
-        {
+        let result = match self.io.read(user, buf) {
             Ok(r) => r,
             Err(e) => {
                 // C parity: drvAsynSerialPort.c::closeConnection on a fatal
@@ -854,7 +863,7 @@ impl PortDriver for DrvAsynSerialPort {
             &buf[..result.nbytes_transferred],
             "read"
         );
-        Ok(result.nbytes_transferred)
+        Ok((result.nbytes_transferred, result.eom_reason))
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -866,11 +875,7 @@ impl PortDriver for DrvAsynSerialPort {
             data,
             "write"
         );
-        match self
-            .base
-            .interpose_octet
-            .dispatch_write(user, data, &mut self.io)
-        {
+        match self.io.write(user, data) {
             Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: closeConnection on a fatal write error so the
@@ -891,7 +896,7 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
-        self.base.interpose_octet.dispatch_flush(user, &mut self.io)
+        self.io.flush(user)
     }
 
     /// C `setOption` (drvAsynSerialPort.c:335-618): every supported key
@@ -2180,7 +2185,10 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        // The EOS layer is the port's, not the driver's: a caller enters the
+        // chain at the top and the driver is its base (C findInterface,
+        // asynManager.c:1493-1501). `PortActor` does exactly this.
+        let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf).unwrap();
         // EOS should strip the terminator
         assert_eq!(&buf[..n], b"OK");
     }

@@ -867,7 +867,7 @@ impl DrvAsynIPPort {
             self.connect(&AsynUser::default())?;
         }
         self.base.check_ready()?;
-        let result = self.with_base_link(|stack, link| stack.dispatch_read(user, buf, link));
+        let result = self.with_base_link(|link| link.read(user, buf));
         match result {
             Ok(r) => {
                 asyn_trace_io!(
@@ -971,27 +971,25 @@ impl DrvAsynIPPort {
         })
     }
 
-    /// Dispatch through the interpose stack onto the port's base octet link.
+    /// Run one transfer against the port's raw octet link — the **bottom** of
+    /// the port's interpose chain, which the port itself runs on top of this
+    /// driver ([`crate::port::octet_read_chain`], C asynManager.c:2190-2220).
     ///
-    /// Single owner of what the chain terminates at: the raw socket, or — for a
+    /// Single owner of what that chain terminates at: the raw socket, or — for a
     /// COM port — the socket wrapped in the IAC layer, which is what puts COM
     /// beneath every stack layer by construction (see [`ComState::octet`]). Every
     /// octet path goes through here, so read, write and flush cannot disagree
     /// about where the chain ends.
-    fn with_base_link<T>(
-        &mut self,
-        f: impl FnOnce(&mut crate::interpose::OctetInterposeStack, &mut dyn OctetNext) -> T,
-    ) -> T {
-        let stack = &mut self.base.interpose_octet;
+    fn with_base_link<T>(&mut self, f: impl FnOnce(&mut dyn OctetNext) -> T) -> T {
         match self.com.as_mut() {
             Some(com) => {
                 let mut link = ComLink {
                     io: &mut self.io,
                     com: &mut com.octet,
                 };
-                f(stack, &mut link)
+                f(&mut link)
             }
-            None => f(stack, &mut self.io),
+            None => f(&mut self.io),
         }
     }
 
@@ -1376,7 +1374,7 @@ impl PortDriver for DrvAsynIPPort {
             data,
             "write"
         );
-        match self.with_base_link(|stack, link| stack.dispatch_write(user, data, link)) {
+        match self.with_base_link(|link| link.write(user, data)) {
             Ok(n) => Ok(n),
             Err(e) => {
                 // C parity: drvAsynIPPort.c::writeIt closes the connection
@@ -1400,25 +1398,14 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
-        // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:~250)
-        // calls flushIt before write+read so the post-write read
-        // returns only the response to *this* command.
-        //
-        // The flush MUST traverse the interpose chain, not just the OS
-        // socket. C `asynInterposeEos.c::flushIt` resets the EOS
-        // interpose's persistent input buffer
-        // (`inBufHead/inBufTail/eosInMatch`) and then calls the
-        // lower-level `flush`. An earlier Rust version drained the OS
-        // socket directly and never reset the `EosInterpose`'s
-        // `in_buf` — so bytes already buffered *inside* the interpose
-        // from a prior read leaked into the next response after an
-        // `OctetWriteRead`.
-        //
-        // Routing through `dispatch_flush` runs every interpose layer's
-        // `flush` (resetting `EosInterpose::in_buf` etc.) and finally
-        // reaches `IpIoState::flush`, which drains the OS socket's
-        // receive buffer.
-        self.with_base_link(|stack, link| stack.dispatch_flush(user, link))
+        // The driver end of the flush: drain the OS socket's receive buffer
+        // (C `drvAsynIPPort.c::flushIt`). The layers above — the EOS interpose's
+        // read-ahead buffer among them, C `asynInterposeEos.c::flushIt` resetting
+        // `inBufHead`/`inBufTail`/`eosInMatch` — are flushed by the port before
+        // it reaches here ([`crate::port::octet_flush_chain`]), which is what
+        // stops a byte buffered *inside* the interpose from leaking into the next
+        // `OctetWriteRead` response.
+        self.with_base_link(|link| link.flush(user))
     }
 
     fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
@@ -1565,6 +1552,28 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// Enter the port's octet interface the way a caller does — through the
+    /// interpose chain, with the driver at the bottom of it. C `findInterface`
+    /// hands the caller the *topmost* interpose (asynManager.c:1493-1501,
+    /// 2190-2220); the driver's own `read`/`write`/`flush` are the base the chain
+    /// ends at, so a test that wants the EOS layer must enter above it, exactly
+    /// as `PortActor` does.
+    fn chain_read(drv: &mut DrvAsynIPPort, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        crate::port::octet_read_chain(drv, user, buf).map(|(n, _eom)| n)
+    }
+
+    fn chain_read_eom(
+        drv: &mut DrvAsynIPPort,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        crate::port::octet_read_chain(drv, user, buf)
+    }
+
+    fn chain_flush(drv: &mut DrvAsynIPPort, user: &mut AsynUser) -> AsynResult<()> {
+        crate::port::octet_flush_chain(drv, user)
+    }
 
     // --- Config parsing tests ---
 
@@ -2148,7 +2157,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
-        let n = drv.read_octet(&user, &mut buf).unwrap();
+        let n = chain_read(&mut drv, &user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"OK");
 
         handle.join().unwrap();
@@ -3083,7 +3092,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 3];
-        let (n, _eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
+        let (n, _eom) = chain_read_eom(&mut drv, &user, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             &[b'A', IAC, b'B'],
@@ -3280,12 +3289,12 @@ mod tests {
         // interpose.
         let ruser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut small = [0u8; 4];
-        let n = drv.read_octet(&ruser, &mut small).unwrap();
+        let n = chain_read(&mut drv, &ruser, &mut small).unwrap();
         assert_eq!(&small[..n], b"OLD_");
 
         // Flush must clear BOTH the socket AND the interpose buffer.
         let mut fuser = AsynUser::new(0).with_timeout(Duration::from_secs(2));
-        drv.io_flush(&mut fuser).unwrap();
+        chain_flush(&mut drv, &mut fuser).unwrap();
 
         // Command + response cycle. If the interpose buffer was not
         // reset, this read returns the leftover "LINE" instead of "NEW".
@@ -3293,7 +3302,7 @@ mod tests {
         drv.write_octet(&mut wuser, b"CMD").unwrap();
         let ruser2 = AsynUser::new(0).with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 64];
-        let n = drv.read_octet(&ruser2, &mut buf).unwrap();
+        let n = chain_read(&mut drv, &ruser2, &mut buf).unwrap();
         assert_eq!(
             &buf[..n],
             b"NEW",

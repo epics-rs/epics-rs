@@ -1303,7 +1303,7 @@ impl PortActor {
         buf_size: usize,
     ) -> AsynResult<(Vec<u8>, usize, EomReason)> {
         let mut buf = vec![0u8; buf_size];
-        let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
+        let (n, eom) = crate::port::octet_read_chain(&mut *self.driver, user, &mut buf)?;
         buf.truncate(n);
         if self.driver.base().octet_interrupt_process {
             // C filters the list by addr (:203-215); `InterruptFilter` does that
@@ -1321,6 +1321,18 @@ impl PortActor {
             });
         }
         Ok((buf, n, eom))
+    }
+
+    /// The port's octet write: through the interpose chain, ending at the driver
+    /// (C `asynOctet::write` on the interface `findInterface` resolves —
+    /// [`crate::port::octet_write_chain`]).
+    fn octet_write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        crate::port::octet_write_chain(&mut *self.driver, user, data)
+    }
+
+    /// The port's octet flush, through the same chain (C `asynOctet::flush`).
+    fn octet_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        crate::port::octet_flush_chain(&mut *self.driver, user)
     }
 
     fn dispatch_io(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
@@ -1344,7 +1356,7 @@ impl PortActor {
 
         let result = match op {
             RequestOp::OctetWrite { data } => {
-                let n = self.driver.io_write_octet(user, data)?;
+                let n = self.octet_write(user, data)?;
                 Ok(RequestResult::write_n(n))
             }
             RequestOp::OctetRead { buf_size } => {
@@ -1359,7 +1371,7 @@ impl PortActor {
                 // owns the bracket atomically under its serial dispatch.
                 let saved = self.driver.get_output_eos(user);
                 self.driver.set_output_eos(user, &[])?;
-                let res = self.driver.io_write_octet(user, data);
+                let res = self.octet_write(user, data);
                 let _ = self.driver.set_output_eos(user, &saved);
                 let n = res?;
                 Ok(RequestResult::write_n(n))
@@ -1397,9 +1409,9 @@ impl PortActor {
                 // Both run atomically here: the actor owns the port for the whole
                 // op, the queueLockPort equivalent.
                 if *flush {
-                    self.driver.io_flush(user)?;
+                    self.octet_flush(user)?;
                 }
-                self.driver.io_write_octet(user, data)?;
+                self.octet_write(user, data)?;
                 let (buf, n, eom) = self.octet_read(user, *buf_size)?;
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
@@ -1436,7 +1448,7 @@ impl PortActor {
                 Ok(RequestResult::uint32_read(v))
             }
             RequestOp::Flush => {
-                self.driver.io_flush(user)?;
+                self.octet_flush(user)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::Connect => {

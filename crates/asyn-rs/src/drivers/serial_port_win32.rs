@@ -621,12 +621,20 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.io_read_octet_eom(user, buf).map(|(n, _eom)| n)
+    }
+
+    /// The raw device read — the **bottom** of the port's octet chain, C
+    /// `drvAsynSerialPortWin32.c::readIt` below the interposes the manager
+    /// installed on top of it. The chain is run by the port
+    /// ([`crate::port::octet_read_chain`]), not from here.
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
         self.base.check_ready()?;
-        let result = match self
-            .base
-            .interpose_octet
-            .dispatch_read(user, buf, &mut self.io)
-        {
+        let result = match self.io.read(user, buf) {
             Ok(r) => r,
             Err(e) => {
                 if e.is_fatal_transport() && self.base.is_connected() {
@@ -648,7 +656,7 @@ impl PortDriver for DrvAsynSerialPort {
             &buf[..result.nbytes_transferred],
             "read"
         );
-        Ok(result.nbytes_transferred)
+        Ok((result.nbytes_transferred, result.eom_reason))
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -660,11 +668,7 @@ impl PortDriver for DrvAsynSerialPort {
             data,
             "write"
         );
-        match self
-            .base
-            .interpose_octet
-            .dispatch_write(user, data, &mut self.io)
-        {
+        match self.io.write(user, data) {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.is_fatal_transport() && self.base.is_connected() {
@@ -682,7 +686,7 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
-        self.base.interpose_octet.dispatch_flush(user, &mut self.io)
+        self.io.flush(user)
     }
 
     fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {

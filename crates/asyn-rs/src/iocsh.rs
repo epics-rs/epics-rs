@@ -1752,8 +1752,9 @@ mod tests {
             }
         }
 
-        /// Dispatches its octet write through the base's interpose stack, the
-        /// way every real driver does (`serial_port.rs::write_octet`).
+        /// The raw device below the port's interpose chain — the driver's own
+        /// `asynOctet`, which the manager's layers sit on top of
+        /// (asynManager.c:2190-2220). It does not run the chain: the port does.
         struct InterposedDriver {
             base: PortDriverBase,
             link: EchoingLink,
@@ -1765,10 +1766,16 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-                self.base
-                    .interpose_octet
-                    .dispatch_write(user, data, &mut self.link)
+            fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.link.write(user, data)
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+            ) -> AsynResult<(usize, EomReason)> {
+                let r = self.link.read(user, buf)?;
+                Ok((r.nbytes_transferred, r.eom_reason))
             }
         }
 
@@ -1873,10 +1880,8 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-                self.base
-                    .interpose_octet
-                    .dispatch_write(user, data, &mut self.link)
+            fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.link.write(user, data)
             }
         }
 

@@ -3109,6 +3109,87 @@ mod tests {
         );
     }
 
+    /// R15-34 — an ARRAY-SUBSCRIPT member (`a[0].x`) marks the enclosing
+    /// `StructureArray` field, `a`. pvxs assigns into the array ELEMENT and
+    /// `Value::mark` (`data.cpp:256-270`) walks the element's enclosing tops,
+    /// so the one bit that lands in the parent store is the array field's own;
+    /// `to_wire_valid` then serializes that whole field.
+    ///
+    /// The port marked `"a[0].x"`, and `marked_changed_bitset` builds its
+    /// candidate paths from `FieldDesc` names — it never descends a
+    /// `StructureArray` — so the path matched NOTHING: an empty wire bitset,
+    /// which `MonitorQueue::real` drops. Every monitor update for an array
+    /// member was silently discarded, and an all-array-member group delivered
+    /// nothing at all after the seed.
+    #[test]
+    fn array_subscript_member_marks_the_enclosing_array_field() {
+        use crate::qsrv::group_config::parse_group_config;
+        use epics_pva_rs::proto::BitSet;
+        use epics_pva_rs::pvdata::FieldDesc;
+        use epics_pva_rs::pvdata::ScalarType;
+
+        // All-array-member group (testqgroup `a[N].x` shape) plus a plain
+        // member, so the mixed case is covered by the same event.
+        let json = r#"{ "GRP": {
+            "a[0].x": { "+channel": "R:r0.VAL", "+type": "plain", "+trigger": "*" },
+            "a[1].x": { "+channel": "R:r1.VAL", "+type": "plain" },
+            "p":      { "+channel": "R:p.VAL",  "+type": "plain" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "a[0].x")
+            .expect("subscripted member");
+
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
+        else {
+            panic!("an array-member value event must mark leaves, not skip");
+        };
+        // Both subscripted members collapse onto the one array field; no
+        // subscripted path survives into the marked set.
+        assert!(
+            !v.iter().any(|p| p.contains('[')),
+            "a subscripted path addresses no bit in the root bitset: {v:?}"
+        );
+        assert_eq!(
+            v.iter().filter(|p| p.as_str() == "a").count(),
+            2,
+            "each array member marks the enclosing array field `a`: {v:?}"
+        );
+        assert!(
+            v.contains(&"p".to_string()),
+            "the co-triggered plain member still marks its own node: {v:?}"
+        );
+
+        // The mark now frames a real bit: { a: StructureArray{x}, p: Double }
+        // → bit 1 is `a`, bit 2 is `p`. A StructureArray occupies ONE bit
+        // (`FieldDesc::total_bits`), exactly as pvxs's parent store does.
+        let intro = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                (
+                    "a".into(),
+                    FieldDesc::StructureArray {
+                        struct_id: "structure".into(),
+                        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+                    },
+                ),
+                ("p".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let mask = BitSet::all_set(intro.total_bits());
+        let changed = epics_pva_rs::pvdata::encode::marked_wire_changed_bitset(&intro, &v, &mask);
+        assert_eq!(
+            changed.iter().collect::<Vec<usize>>(),
+            vec![1, 2],
+            "the array field's single bit is set (whole field serializes), \
+             plus the plain member's — pre-fix this bitset was empty and the \
+             post was dropped by the enqueue gate"
+        );
+    }
+
     /// the SELF-triggered member's leaves narrow to the
     /// event's own DBE classes, while every other triggered member keeps
     /// the fixed `Value | Alarm` refresh — pvxs `subscriptionValueCallback`

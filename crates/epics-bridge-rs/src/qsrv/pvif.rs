@@ -166,12 +166,37 @@ pub fn change_leaves(mapping: FieldMapping, change: EventMask) -> Vec<&'static s
 ///
 /// `prefix` is the mapped node's path in the served structure: a group
 /// member's `field_name`, or `""` for a single-record channel whose NT IS
-/// the root. An empty prefix with an empty leaf (a `Plain`/`Any` mapping
-/// at the root) yields no path — the root cannot be addressed by a field
-/// path — so callers that can hit that shape must fall back to the full
-/// mask rather than under-marking.
+/// the root. An empty prefix with an empty leaf (a `Plain`/`Any` mapping at
+/// the root) yields no path; the only mapping pvxs allows at the struct top
+/// is `+type:"meta"` (`groupconfigprocessor.cpp:224-231`), whose leaves are
+/// the nameable root `alarm` / `timeStamp`.
+///
+/// A prefix carrying an array SUBSCRIPT (`"a[0].x"`) resolves to the
+/// enclosing `StructureArray` field — here `"a"` — and to nothing below it.
+/// That is what the mark means on the wire: pvxs assigns into the array
+/// ELEMENT, and `Value::mark` (`data.cpp:256-270`) walks the element's
+/// enclosing tops, so the only bit that lands in the parent store is the
+/// array field's own (`store[a].valid = true`). One bit, and `to_wire_valid`
+/// serializes the whole array field. Bits inside an element are not
+/// addressable in the root bitset at all, which is why the mark cannot be
+/// `"a[0].x.value"`: [`marked_changed_bitset`](epics_pva_rs::pvdata::encode::marked_changed_bitset)
+/// builds its candidate paths from `FieldDesc` names and never descends a
+/// `StructureArray`, so a subscripted path matched nothing, framed an empty
+/// bitset, and every update for an array member was dropped by the enqueue
+/// gate.
 pub fn change_leaf_paths(prefix: &str, mapping: FieldMapping, change: EventMask) -> Vec<String> {
-    change_leaves(mapping, change)
+    let leaves = change_leaves(mapping, change);
+    // The member's change classes assign nothing (a Const/Structure/Proc
+    // member, a property event on a non-Scalar mapping): no mark, no post.
+    if leaves.is_empty() {
+        return Vec::new();
+    }
+    // Subscripted member: the enclosing array field is the whole mark,
+    // whatever the mapping would have contributed under it.
+    if let Some(array_field) = enclosing_array_field(prefix) {
+        return vec![array_field.to_string()];
+    }
+    leaves
         .into_iter()
         .filter_map(|suffix| match (prefix.is_empty(), suffix.is_empty()) {
             (true, true) => None,
@@ -180,6 +205,15 @@ pub fn change_leaf_paths(prefix: &str, mapping: FieldMapping, change: EventMask)
             (false, false) => Some(format!("{prefix}.{suffix}")),
         })
         .collect()
+}
+
+/// The `StructureArray` field a subscripted member path is nested in — the
+/// text before its FIRST `[`. `"a[0].x"` → `"a"`, `"a[0].b[1].c"` → `"a"`
+/// (marking propagates up through every enclosing top, and only the
+/// outermost array field has a bit in the root store). `None` for a path
+/// with no subscript.
+fn enclosing_array_field(path: &str) -> Option<&str> {
+    path.split_once('[').map(|(head, _)| head)
 }
 
 /// Resolve value-shape-dependent leaves in a marked set against the

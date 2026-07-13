@@ -340,22 +340,17 @@ impl Record for LongoutRecord {
         "longout"
     }
 
-    /// C `longoutRecord.c::init_record` applies a constant DOL to VAL once
-    /// via `recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val)`. The
-    /// framework gate (`processing.rs`) excludes a constant DOL from the
-    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the constant
-    /// must be seeded here or it would never reach VAL.
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                if let Ok(v) = s.trim().parse::<f64>() {
-                    self.val = v as i32;
-                }
-            }
-        }
-        Ok(())
+    /// C `longoutRecord.c:113-114`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the init-seed
+    /// owner is the only place the constant can reach VAL — and a record whose
+    /// VAL came from it is DEFINED.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
     }
 
     /// C `longoutRecord.c::convert` (lines 436-441): clamp VAL into the

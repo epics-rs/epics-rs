@@ -4867,6 +4867,44 @@ impl PvDatabase {
     }
 }
 
+/// Load a CONSTANT link's value into a field of `target` type, with C's
+/// constant-link conversion rules (`dbConstLink.c`'s `cvt_st_*` family). The
+/// number itself was already parsed by the one owner of "link text → number",
+/// [`crate::server::record::parse_c_double`] (hex included).
+fn constant_to_field_type(value: EpicsValue, target: DbFieldType, raw: &str) -> EpicsValue {
+    use DbFieldType as T;
+    // `cvt_st_st` is a plain `strncpy` of the link TEXT, so a stringout with
+    // `field(DOL,"1.50")` holds "1.50" — not the "1.5" an f64 round-trip would
+    // render (softIoc-verified).
+    if target == T::String {
+        return EpicsValue::String(PvString::from(raw));
+    }
+    let integral = matches!(
+        target,
+        T::Char
+            | T::UChar
+            | T::Short
+            | T::UShort
+            | T::Enum
+            | T::Long
+            | T::ULong
+            | T::Int64
+            | T::UInt64
+    );
+    // C truncates the parsed number into the (possibly unsigned) target with a
+    // plain integer cast, so `-1` into a DBF_USHORT is 65535. The generic
+    // float→unsigned conversion SATURATES (Rust `as`), which would make it 0 —
+    // go through the integer view instead.
+    if integral {
+        if let Some(v) = value.to_f64() {
+            if v.is_finite() {
+                return EpicsValue::Int64(v.trunc() as i64).convert_to(target);
+            }
+        }
+    }
+    value.convert_to(target)
+}
+
 /// The body of the init-seed owner, over a locked record — shared by
 /// [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
 pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
@@ -4901,6 +4939,10 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         let Some(value) = crate::server::recgbl::simm::constant_load_value(&parsed) else {
             continue;
         };
+        let raw = match &parsed {
+            crate::server::record::ParsedLink::Constant(s) => s.clone(),
+            _ => continue,
+        };
         // C loads into the target field's own DBF type
         // (`recGblInitConstantLink(plink, DBF_USHORT, &prec->seln)`), so coerce
         // through the field's descriptor before the put.
@@ -4911,13 +4953,40 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
             .find(|f| f.name == seed.target_field)
             .map(|f| f.dbf_type);
         let value = match target_type {
-            Some(t) => value.convert_to(t),
+            Some(t) => constant_to_field_type(value, t, &raw),
             None => value,
         };
-        if instance.record.put_field(seed.target_field, value).is_ok() && seed.clears_udf {
+        // bo loads into a temporary and stores the BOOLEAN of it
+        // (`boRecord.c:146-148`: `prec->val = !!ival`), so DOL="5" leaves VAL=1.
+        let value = if seed.normalize_bool {
+            EpicsValue::Enum(u16::from(value.to_f64().is_some_and(|v| v != 0.0)))
+        } else {
+            value
+        };
+        // C's UDF rule for a successful constant load is per record, and the two
+        // shapes differ only in the NaN case:
+        //   aoRecord.c:112-113 / dfanoutRecord.c:105-106 — `udf = isnan(val)`
+        //   longoutRecord.c:113 / mbboRecord.c:133 / int64outRecord.c:110 —
+        //                                            `udf = FALSE`
+        // A NaN cannot survive the conversion into an integer target, so the
+        // isnan test covers both: the value that reached the field is defined
+        // unless it is NaN.
+        let is_nan = value.to_f64().is_some_and(f64::is_nan);
+        if instance.record.put_field(seed.target_field, value).is_ok() && seed.clears_udf && !is_nan
+        {
             instance.common.udf = false;
         }
     }
+
+    // 3. C's `init_record` TAIL, which every record runs immediately AFTER its
+    //    `recGblInitConstantLink` calls (`aoRecord.c:156-161`: `oval = pval =
+    //    val; mlst = alst = lalm = val; oraw = rval; orbv = rbv`). It re-derives
+    //    the record's init-time tracking state from the value the seed just
+    //    loaded — a constant DOL of 5 leaves C's ao at OVAL=5, not 0
+    //    (softIoc-verified) — so it belongs to the seed owner, not to a caller
+    //    that may or may not remember it (the iocsh `dbLoadRecords` path did
+    //    not).
+    instance.record.seed_deadband_tracking();
 }
 
 impl PvDatabase {

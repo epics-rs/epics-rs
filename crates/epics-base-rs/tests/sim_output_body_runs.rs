@@ -42,12 +42,20 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
         .await
         .unwrap();
 
-    let mut ao = AoRecord::new(10.0); // VAL=10
+    let mut ao = AoRecord::new(0.0);
     ao.siml = "AOROC_SW".to_string();
     ao.siol = "AOROC_TGT".to_string();
     ao.oroc = 1.0; // rate limit: at most 1.0 EGU per cycle
-    // oval starts 0.0; sdly left at the default -1.0 (synchronous sim write).
+    // sdly left at the default -1.0 (synchronous sim write).
     db.add_record("AOROC", Box::new(ao)).await.unwrap();
+
+    // VAL=10 arrives as a PUT, not as the record's initial value: C's ao
+    // `init_record` tail seeds `oval = pval = val` (aoRecord.c:156, softIoc:
+    // `field(VAL,"10")` comes up with OVAL=10), so an initial VAL of 10 would
+    // leave nothing for OROC to rate-limit.
+    db.put_pv("AOROC.VAL", EpicsValue::Double(10.0))
+        .await
+        .unwrap();
 
     let mut v1 = HashSet::new();
     db.process_record_with_links("AOROC", &mut v1, 0)

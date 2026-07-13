@@ -400,7 +400,9 @@ impl Record for DfanoutRecord {
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
         vec![
             crate::server::record::ConstantInitLink::new("SELL", "SELN"),
-            crate::server::record::ConstantInitLink::new("DOL", "VAL"),
+            // C `dfanoutRecord.c:105-106`: a successful DOL load also DEFINES
+            // the record — `prec->udf = isnan(prec->val)`.
+            crate::server::record::ConstantInitLink::dol_to_val("DOL", "VAL"),
         ]
     }
 

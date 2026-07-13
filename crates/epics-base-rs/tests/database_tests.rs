@@ -9274,12 +9274,20 @@ async fn init_applies_constant_dol_across_record_types() {
         );
     }
 
-    // int64out: DBF_INT64.
+    // int64out: DBF_INT64. Seeded by the init-seed owner, like dfanout.
     let mut i64o = Int64outRecord::default();
     i64o.omsl = 1;
     i64o.dol = "42".to_string();
-    i64o.init_record(0).unwrap();
-    assert_eq!(i64o.val, 42, "int64out constant DOL → VAL=42");
+    db.add_record("I64_CONST", Box::new(i64o)).await.unwrap();
+    {
+        let rec = db.get_record("I64_CONST").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Int64(42)),
+            "int64out constant DOL → VAL=42"
+        );
+    }
 
     // lso: quoted long-string constant.
     let mut lso = LsoRecord::default();
@@ -9289,14 +9297,26 @@ async fn init_applies_constant_dol_across_record_types() {
     assert_eq!(lso.val.as_str_lossy(), "hello", "lso constant DOL → VAL");
     assert_eq!(lso.len, 6, "lso LEN = strlen+1 (C convention)");
 
-    // mbbo: constant DOL is the state index; convert() maps it to RVAL
-    // (no state table defined → RVAL == state index).
+    // mbbo: constant DOL is the state index; the init tail's convert() maps it
+    // to RVAL (no state table defined → RVAL == state index).
     let mut mb = MbboRecord::default();
     mb.omsl = 1;
     mb.dol = "2".to_string();
-    mb.init_record(0).unwrap();
-    assert_eq!(mb.val, 2, "mbbo constant DOL → VAL (state index) = 2");
-    assert_eq!(mb.rval, 2, "mbbo convert() maps state index → RVAL");
+    db.add_record("MBBO_CONST", Box::new(mb)).await.unwrap();
+    {
+        let rec = db.get_record("MBBO_CONST").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Enum(2)),
+            "mbbo constant DOL → VAL (state index) = 2"
+        );
+        assert_eq!(
+            inst.record.get_field("RVAL"),
+            Some(EpicsValue::ULong(2)),
+            "mbbo convert() maps state index → RVAL"
+        );
+    }
 
     // mbbo_direct: constant seeds VAL and the bit fields decompose from it
     // (5 = 0b101 → B0=1, B1=0, B2=1); UDF cleared.

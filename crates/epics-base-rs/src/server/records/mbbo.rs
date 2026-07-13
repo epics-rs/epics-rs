@@ -763,30 +763,36 @@ impl Record for MbboRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            // C `mbboRecord.c::init_record` applies a constant DOL to VAL
-            // (the state index) once via `recGblInitConstantLink(&prec->dol,
-            // DBF_USHORT, &prec->val)`. The framework gate (`processing.rs`)
-            // excludes a constant DOL from the per-cycle closed-loop fetch
-            // (C `!dbLinkIsConstant`), so it must be seeded here — before
-            // convert() maps the state index to RVAL.
-            if let crate::server::record::ParsedLink::Constant(s) =
-                crate::server::record::parse_link_v2(&self.dol)
-            {
-                if let Ok(v) = s.trim().parse::<f64>() {
-                    self.val = v as u16;
-                }
-            }
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
             self.compute_sdef();
-            self.convert();
-            self.mlst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-            self.orbv = self.rbv;
         }
         Ok(())
+    }
+
+    /// C `mbboRecord.c:133-134`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the init-seed
+    /// owner is the only place the constant state index can reach VAL — and a
+    /// record whose VAL came from it is DEFINED.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `mbboRecord.c:176-182` — the init tail, run right after the constant
+    /// load: `convert(prec)` maps the seeded state index to RVAL, then
+    /// `mlst = lalm = val; oraw = rval; orbv = rbv`.
+    fn seed_deadband_tracking(&mut self) {
+        self.convert();
+        self.mlst = self.val;
+        self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     /// C `mbboRecord.c::process` (line 217) calls `convert(prec)`

@@ -530,9 +530,11 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
     rec.put_field("ZRVL", EpicsValue::ULong(0x8000_0000))
         .unwrap();
     assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::ULong(0x8000_0000)));
-    // With a defined state table and VAL=0, convert() copies ZRVL into
-    // RVAL; the high bit must not be lost to sign.
+    // With a defined state table and VAL=0, the init tail's convert() copies
+    // ZRVL into RVAL (C `mbboRecord.c:177`, after the constant-DOL load); the
+    // high bit must not be lost to sign.
     rec.init_record(0).unwrap();
+    rec.seed_deadband_tracking();
     assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
 }
 

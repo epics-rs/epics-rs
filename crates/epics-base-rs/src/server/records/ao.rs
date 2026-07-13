@@ -510,19 +510,33 @@ static FIELDS: &[FieldDesc] = &[
     },
 ];
 
-/// Try to parse a DOL string as a constant value.
-/// Returns Some(f64) if it's a number, None if it's a link (PV name).
-fn dol_as_constant(dol: &str) -> Option<f64> {
-    let s = dol.trim();
-    if s.is_empty() {
-        return None;
-    }
-    s.parse::<f64>().ok()
-}
-
 impl Record for AoRecord {
     fn record_type(&self) -> &'static str {
         "ao"
+    }
+
+    /// C `aoRecord.c:112-113`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val))
+    ///      prec->udf = isnan(prec->val);`
+    /// — the constant DOL both seeds VAL and DEFINES the record. Declared for
+    /// the init-seed owner, which applies the isnan rule.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `aoRecord.c:156-161` — the init tail, run right after the constant
+    /// load: `oval = pval = val; mlst = alst = lalm = val; oraw = rval;
+    /// orbv = rbv`. softIoc with `field(DOL,"5")` reports OVAL=5 at init.
+    fn seed_deadband_tracking(&mut self) {
+        self.oval = self.val;
+        self.pval = self.val;
+        self.mlst = self.val;
+        self.alst = self.val;
+        self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     // C `aoRecord.c::process` IVOA=Set_output_to_IVOV (lines 207-213):
@@ -557,19 +571,6 @@ impl Record for AoRecord {
                 self.eslo = saved_eslo;
             }
 
-            // If DOL contains a constant value, use it as the initial VAL.
-            if let Some(v) = dol_as_constant(&self.dol) {
-                self.val = v;
-            }
-
-            // Initialize tracking fields from current val
-            self.oval = self.val;
-            self.pval = self.val;
-            self.mlst = self.val;
-            self.alst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-            self.orbv = self.rbv;
             self.init = true;
         }
         Ok(())

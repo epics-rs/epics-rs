@@ -31,6 +31,11 @@ pub struct ConstantInitLink {
     /// (calc/sub/sel/aSub/seq/fanout) do NOT clear UDF: they seed A..L, not
     /// VAL.
     pub clears_udf: bool,
+    /// Whether the loaded value is stored as its BOOLEAN — C `boRecord.c:146-148`
+    /// loads the constant into a temporary and stores `prec->val = !!ival`, so
+    /// `field(DOL,"5")` leaves a bo at VAL=1, not 5. The only seed whose stored
+    /// value differs from the loaded one.
+    pub normalize_bool: bool,
 }
 
 impl ConstantInitLink {
@@ -40,6 +45,7 @@ impl ConstantInitLink {
             link_field,
             target_field,
             clears_udf: false,
+            normalize_bool: false,
         }
     }
 
@@ -49,6 +55,18 @@ impl ConstantInitLink {
             link_field,
             target_field,
             clears_udf: true,
+            normalize_bool: false,
+        }
+    }
+
+    /// bo's DOL→VAL seed: `prec->val = !!ival; prec->udf = FALSE;`
+    /// (`boRecord.c:146-149`).
+    pub const fn dol_to_bool_val(link_field: &'static str, target_field: &'static str) -> Self {
+        Self {
+            link_field,
+            target_field,
+            clears_udf: true,
+            normalize_bool: true,
         }
     }
 }

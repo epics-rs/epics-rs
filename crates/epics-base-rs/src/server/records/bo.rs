@@ -111,40 +111,6 @@ impl BoRecord {
     }
 }
 
-/// Try to parse a DOL string as a constant value.
-///
-/// C `recGblInitConstantLink(&prec->dol, DBF_USHORT, …)` converts the
-/// constant link string with the field's type. Plain decimal, hex
-/// (`0x…`), negative (wraps mod 2^16) and floating-point (`1.0`)
-/// forms all convert to a `DBF_USHORT`. The naive `parse::<u16>()`
-/// rejected every one of those except a plain non-negative decimal.
-fn dol_as_constant(dol: &str) -> Option<u16> {
-    let s = dol.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Hex form (0x.. / -0x..).
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return u32::from_str_radix(hex, 16).ok().map(|v| v as u16);
-    }
-    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
-        return u32::from_str_radix(hex, 16)
-            .ok()
-            .map(|v| (v as i32).wrapping_neg() as u16);
-    }
-    // Decimal integer (handles negatives via wrap-around).
-    if let Ok(v) = s.parse::<i64>() {
-        return Some(v as u16);
-    }
-    // Floating-point constant — DBF_USHORT truncates toward zero.
-    if let Ok(v) = s.parse::<f64>() {
-        if v.is_finite() {
-            return Some(v as i64 as u16);
-        }
-    }
-    None
-}
-
 static FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
@@ -282,23 +248,27 @@ impl Record for BoRecord {
         self.put_field("VAL", EpicsValue::Enum(v))
     }
 
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // DOL constant initialization: normalize to 0/1 (like C: !!ival)
-            if let Some(v) = dol_as_constant(&self.dol) {
-                self.val = if v != 0 { 1 } else { 0 };
-            }
+    /// C `boRecord.c:146-149`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &ival)) {
+    ///      prec->val = !!ival; prec->udf = FALSE; }`
+    /// — the constant loads into a temporary and VAL takes its BOOLEAN, so
+    /// `field(DOL,"5")` leaves VAL=1. Declared for the init-seed owner, which
+    /// applies the `!!` and clears UDF.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_bool_val(
+            "DOL", "VAL",
+        )]
+    }
 
-            // Convert val to rval
-            self.val_to_rval();
-
-            // Initialize tracking fields
-            self.mlst = self.val;
-            self.lalm = self.val;
-            self.oraw = self.rval;
-            self.orbv = self.rbv;
-        }
-        Ok(())
+    /// C `boRecord.c:163-172` — the init tail, run right after the constant
+    /// load: convert VAL to RVAL through MASK, then
+    /// `mlst = lalm = val; oraw = rval; orbv = rbv`.
+    fn seed_deadband_tracking(&mut self) {
+        self.val_to_rval();
+        self.mlst = self.val;
+        self.lalm = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

@@ -284,11 +284,25 @@ pub enum EnvDoubleError {
 
 /// C `envGetDoubleConfigParam` (`envSubr.c:191-211`).
 ///
+/// A set-but-unparseable value prints C's stderr line
+///
+/// ```text
+/// Unable to find a real number in EPICS_CA_CONN_TMO=abc
+/// ```
+///
+/// (`envSubr.c:205-206`, `fprintf(stderr, ...)`) before reporting failure.
+/// C's callers then print their OWN named diagnostic on top of it — see
+/// `cac.cpp:192-193`, `udpiiu.cpp:86-89`, `online_notify.c:59-64` — so a
+/// bad `EPICS_CA_CONN_TMO` yields three lines, not one.
+///
 /// The caller supplies the default (C reads it from the compiled
-/// `ENV_PARAM` table) and, per C, its own extra diagnostic lines.
+/// `ENV_PARAM` table).
 pub fn env_double(name: &str) -> Result<f64, EnvDoubleError> {
     let raw = env_raw(name).ok_or(EnvDoubleError::Unset)?;
-    epics_parse_double(&raw).map_err(EnvDoubleError::Invalid)
+    epics_parse_double(&raw).map_err(|e| {
+        eprintln!("Unable to find a real number in {name}={raw}");
+        EnvDoubleError::Invalid(e)
+    })
 }
 
 /// Panic-free `f64` seconds → [`Duration`].

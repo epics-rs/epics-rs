@@ -30,6 +30,10 @@ pub struct CasUdpConfig {
     pub mcast_addrs: Vec<Ipv4Addr>,
 }
 
+/// C `online_notify.c:59` — the beacon period RSRV falls back to, and the
+/// number its diagnostic prints. Same 15 s as [`CasUdpConfig::default`].
+const DEFAULT_BEACON_PERIOD_SECS: f64 = 15.0;
+
 impl Default for CasUdpConfig {
     fn default() -> Self {
         Self {
@@ -251,11 +255,23 @@ pub fn from_env() -> CaResult<CasUdpConfig> {
     } else {
         "EPICS_CA_BEACON_PERIOD"
     };
-    if let Ok(period) = crate::estdlib::env_double(name) {
-        if period > 0.0 {
+    match crate::estdlib::env_double(name) {
+        Ok(period) if period > 0.0 => {
             cfg.beacon_period = crate::estdlib::duration_from_secs(period);
         }
-        // else: keep default (15s) — matches C's `maxPeriod <= 0.0` branch.
+        // Unset: C reads the compiled "15.0" default of the legacy var,
+        // silently. Keep the default period, print nothing.
+        Err(crate::estdlib::EnvDoubleError::Unset) => {}
+        // Parse failure OR `<= 0.0` — C `online_notify.c:58-64`. C names
+        // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
+        // fetched came from the deprecated var, so this does too.
+        _ => {
+            eprintln!("EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed");
+            eprintln!(
+                "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
+                DEFAULT_BEACON_PERIOD_SECS
+            );
+        }
     }
 
     Ok(cfg)

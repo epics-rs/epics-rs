@@ -637,6 +637,13 @@ impl CaClient {
                  ═══════════════════════════════════════════════════════════════════════"
             );
         }
+        // C `cac::cac` resolves EPICS_CA_CONN_TMO while constructing the
+        // context (`cac.cpp:188-194`), so a rejected value is diagnosed at
+        // startup even when no circuit ever forms. Resolve it here for the
+        // same reason — lazily resolving on the first circuit would swallow
+        // the diagnostic for a client that never connects to anything.
+        transport::prime_connection_timeout();
+
         // Run repeater registration in background — don't block client startup.
         epics_base_rs::runtime::task::spawn(async { repeater::ensure_repeater().await });
 
@@ -1427,9 +1434,12 @@ pub(crate) struct CachedRead {
 /// double — `epicsScanDouble` plus the saturating `Duration` conversion —
 /// so no environment string can panic a `put`.
 fn put_timeout() -> Duration {
-    crate::estdlib::env_double("EPICS_CA_PUT_TIMEOUT")
-        .map(crate::estdlib::duration_from_secs)
-        .unwrap_or(Duration::from_secs(30))
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        crate::estdlib::env_double("EPICS_CA_PUT_TIMEOUT")
+            .map(crate::estdlib::duration_from_secs)
+            .unwrap_or(Duration::from_secs(30))
+    })
 }
 
 fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {

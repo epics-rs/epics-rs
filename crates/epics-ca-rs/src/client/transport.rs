@@ -150,12 +150,45 @@ fn drained_socket_probe() -> OsRecvQueueProbe {
 /// (`crate::estdlib`), so `0x10` is 16 s and `1e400` is an ERANGE
 /// failure, and the conversion is the saturating one — an explicit
 /// `inf` is C's never-expiring deadline, not a panic.
+///
+/// Resolved ONCE per process, as C resolves it once in the `cac`
+/// constructor and stores it in `cac::connTMO`: re-reading `getenv` on
+/// every circuit would let the value drift mid-run and would repeat the
+/// diagnostic below on every reconnect. [`prime_connection_timeout`] does
+/// the resolution at client construction, where C does it.
 pub(crate) fn connection_timeout() -> Duration {
-    crate::estdlib::env_double("EPICS_CA_CONN_TMO")
-        .ok()
-        .filter(|v| *v > 0.0)
-        .map(crate::estdlib::duration_from_secs)
-        .unwrap_or(Duration::from_secs(30))
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(resolve_connection_timeout)
+}
+
+/// Resolve `EPICS_CA_CONN_TMO` now, so its diagnostic lands at context
+/// creation (C `cac.cpp:188-194`) rather than on the first circuit.
+pub(crate) fn prime_connection_timeout() {
+    let _ = connection_timeout();
+}
+
+/// The uncached resolution behind [`connection_timeout`].
+fn resolve_connection_timeout() -> Duration {
+    /// C `CA_CONN_VERIFY_PERIOD` (`cac.cpp:190`).
+    const DEFAULT_SECS: f64 = 30.0;
+    let secs = match crate::estdlib::env_double("EPICS_CA_CONN_TMO") {
+        Ok(v) => v,
+        // Unset: C reads the compiled "30.0" default string, silently.
+        Err(crate::estdlib::EnvDoubleError::Unset) => DEFAULT_SECS,
+        // C `cac::cac` (`cac.cpp:189-194`) — both lines, verbatim, on top
+        // of the "Unable to find a real number in ..." that
+        // `envGetDoubleConfigParam` already printed.
+        Err(crate::estdlib::EnvDoubleError::Invalid(_)) => {
+            eprintln!("EPICS \"EPICS_CA_CONN_TMO\" double fetch failed");
+            eprintln!("Defaulting \"EPICS_CA_CONN_TMO\" = {DEFAULT_SECS:.6}");
+            DEFAULT_SECS
+        }
+    };
+    if secs > 0.0 {
+        crate::estdlib::duration_from_secs(secs)
+    } else {
+        Duration::from_secs(30)
+    }
 }
 /// Legacy seconds accessor kept for call sites that need a coarse
 /// number (e.g. `tokio::time::sleep(Duration::from_secs(N))` over a
@@ -164,6 +197,21 @@ pub(crate) fn connection_timeout() -> Duration {
 fn echo_idle_secs() -> u64 {
     let d = connection_timeout();
     d.as_secs().max(1)
+}
+
+/// Cap on the client-side TLS handshake, `EPICS_CA_TLS_HANDSHAKE_TMO`
+/// (port-specific; libca has no TLS). Floored at 1 s, default 10 s.
+///
+/// Resolved once per process, like every other env-derived duration here.
+#[cfg(feature = "experimental-rust-tls")]
+fn tls_handshake_timeout() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        crate::estdlib::env_double("EPICS_CA_TLS_HANDSHAKE_TMO")
+            .ok()
+            .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
+            .unwrap_or(Duration::from_secs(10))
+    })
 }
 
 struct ServerConnection {
@@ -986,10 +1034,7 @@ async fn connect_server(
         // forever. Pairs with the existing TCP-connect timeout above.
         // 10s default — long enough for a normal cert exchange, short
         // enough to fall through to the next NAME_SERVER candidate.
-        let hs_timeout = crate::estdlib::env_double("EPICS_CA_TLS_HANDSHAKE_TMO")
-            .ok()
-            .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
-            .unwrap_or(Duration::from_secs(10));
+        let hs_timeout = tls_handshake_timeout();
         let tls_stream =
             match tokio::time::timeout(hs_timeout, connector.connect(server_name, stream)).await {
                 Ok(Ok(s)) => s,
@@ -4072,7 +4117,7 @@ mod conn_tmo_env_tests {
     //! Every row was probed against the compiled C `caget`: the values C
     //! accepts must yield a working timeout here (no panic), and the ones
     //! `epicsScanDouble` rejects must fall back to the 30 s default.
-    use super::connection_timeout;
+    use super::resolve_connection_timeout;
     use std::time::Duration;
 
     /// SAFETY: gated by `serial_test::serial`; restored before return.
@@ -4124,7 +4169,7 @@ mod conn_tmo_env_tests {
         for (raw, want) in cases {
             with_env(*raw, || {
                 assert_eq!(
-                    connection_timeout(),
+                    resolve_connection_timeout(),
                     *want,
                     "EPICS_CA_CONN_TMO={raw:?} must resolve to {want:?}"
                 );

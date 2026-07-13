@@ -43,6 +43,12 @@ fn max_accumulated() -> usize {
 /// unreliable) can set `EPICS_CAS_INACTIVITY_TMO` to a positive value;
 /// values < 30 are clamped to 30 to avoid pathological short timeouts.
 fn inactivity_timeout() -> Option<Duration> {
+    static RESOLVED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(resolve_inactivity_timeout)
+}
+
+/// The uncached resolution behind [`inactivity_timeout`].
+fn resolve_inactivity_timeout() -> Option<Duration> {
     crate::estdlib::env_double("EPICS_CAS_INACTIVITY_TMO")
         .ok()
         .filter(|v| *v > 0.0)
@@ -135,6 +141,14 @@ mod cap_parse_tests {
 /// SO_SNDTIMEO to 5 s; we honour the same default and let
 /// `EPICS_CAS_SEND_TMO` override.
 fn send_timeout() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(resolve_send_timeout)
+}
+
+/// The uncached resolution behind [`send_timeout`]. Resolving once per
+/// process keeps a rejected value from re-printing its diagnostic on every
+/// client connect.
+fn resolve_send_timeout() -> Duration {
     crate::estdlib::env_double("EPICS_CAS_SEND_TMO")
         .ok()
         .map(|v| crate::estdlib::duration_from_secs(v.max(0.1)))
@@ -148,10 +162,13 @@ fn send_timeout() -> Duration {
 /// 10 s, override via `EPICS_CAS_TLS_HANDSHAKE_TMO`. Floored at 1s.
 #[cfg(feature = "experimental-rust-tls")]
 fn tls_handshake_timeout() -> Duration {
-    crate::estdlib::env_double("EPICS_CAS_TLS_HANDSHAKE_TMO")
-        .ok()
-        .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
-        .unwrap_or(Duration::from_secs(10))
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        crate::estdlib::env_double("EPICS_CAS_TLS_HANDSHAKE_TMO")
+            .ok()
+            .map(|v| crate::estdlib::duration_from_secs(v.max(1.0)))
+            .unwrap_or(Duration::from_secs(10))
+    })
 }
 
 /// Connection lifecycle event broadcast by the TCP listener.
@@ -9257,7 +9274,7 @@ mod send_tmo_env_tests {
     //! `EPICS_CAS_SEND_TMO=inf` used to panic `send_timeout()` on the
     //! FIRST client connect, taking the whole server down — a remotely
     //! triggerable DoS on a misconfigured host.
-    use super::{inactivity_timeout, send_timeout};
+    use super::{resolve_inactivity_timeout, resolve_send_timeout};
     use std::time::Duration;
 
     /// SAFETY: gated by `serial_test::serial`; restored before return.
@@ -9302,7 +9319,7 @@ mod send_tmo_env_tests {
         for (raw, want) in cases {
             with_env("EPICS_CAS_SEND_TMO", *raw, || {
                 assert_eq!(
-                    send_timeout(),
+                    resolve_send_timeout(),
                     *want,
                     "EPICS_CAS_SEND_TMO={raw:?} must resolve to {want:?}"
                 );
@@ -9332,7 +9349,7 @@ mod send_tmo_env_tests {
         for (raw, want) in cases {
             with_env("EPICS_CAS_INACTIVITY_TMO", *raw, || {
                 assert_eq!(
-                    inactivity_timeout(),
+                    resolve_inactivity_timeout(),
                     *want,
                     "EPICS_CAS_INACTIVITY_TMO={raw:?} must resolve to {want:?}"
                 );

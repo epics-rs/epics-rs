@@ -843,6 +843,7 @@ impl PortActor {
             | RequestOp::DisableAddr
             | RequestOp::SetEnable { .. }
             | RequestOp::SetAutoConnect { .. }
+            | RequestOp::SetAutoConnectAddr { .. }
             | RequestOp::GetEnable
             | RequestOp::GetAutoConnect
             | RequestOp::GetConnected
@@ -1478,6 +1479,15 @@ impl PortActor {
                 // at asynManager.c:2310-2324 — fires
                 // `asynExceptionAutoConnect` unconditionally.
                 self.driver.base_mut().set_auto_connect(*yes);
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::SetAutoConnectAddr { yes } => {
+                // The device half of the same C call: `findDpCommon` hands
+                // autoConnectAsyn the DEVICE's dpCommon when the user names one
+                // on a multi-device port (asynManager.c:496-509, 2314).
+                self.driver
+                    .base_mut()
+                    .set_auto_connect_addr(user.addr, *yes);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetEnable => {

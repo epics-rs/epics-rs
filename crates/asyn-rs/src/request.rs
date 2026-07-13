@@ -136,6 +136,15 @@ pub enum RequestOp {
     SetAutoConnect {
         yes: bool,
     },
+    /// Enable / disable auto-connect for ONE device of a multi-device port —
+    /// the `user.addr` variant of [`RequestOp::SetAutoConnect`], symmetric with
+    /// [`RequestOp::EnableAddr`]. C reaches both through a single
+    /// `pasynManager->autoConnect`, which picks device-vs-port state via
+    /// `findDpCommon` (asynManager.c:496-509, 2314); the caller of the shell
+    /// command `asynAutoConnect portName addr yesNo` is what supplies the addr.
+    SetAutoConnectAddr {
+        yes: bool,
+    },
     /// Query int32 bounds (low, high).
     GetBoundsInt32,
     /// Query int64 bounds (low, high).

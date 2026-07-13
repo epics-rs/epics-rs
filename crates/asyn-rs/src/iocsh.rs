@@ -283,6 +283,56 @@ fn asyn_show_eos(
 /// only) and calls `PortDriver::report(level)`. C asyn's `asynReport`
 /// loops through `pasynManager`'s port list and calls each driver's
 /// `report` interface (`asynManager.c::asynReport`).
+/// `portName addr yesNo` — the argument list C gives both `asynEnable` and
+/// `asynAutoConnect` (asynShellCommands.c:944-948, 976-982).
+fn enable_style_args() -> Vec<ArgDesc> {
+    vec![
+        ArgDesc {
+            name: "portName",
+            arg_type: ArgType::String,
+            optional: false,
+        },
+        ArgDesc {
+            name: "addr",
+            arg_type: ArgType::Int,
+            optional: false,
+        },
+        ArgDesc {
+            name: "yesNo",
+            arg_type: ArgType::Int,
+            optional: false,
+        },
+    ]
+}
+
+/// C `findDpCommon` (asynManager.c:496-509): an operation lands on a DEVICE's
+/// state only when the port is multi-device and the caller named a device;
+/// otherwise it lands on the port itself. `asynEnable`/`asynAutoConnect` both
+/// go through it, so the rule lives in one place here too.
+fn addresses_a_device(handle: &crate::port_handle::PortHandle, addr: i32) -> bool {
+    addr >= 0 && handle.is_multi_device()
+}
+
+/// Resolve the `portName addr yesNo` triple both enable-style commands take.
+/// `None` means the error is already on the shell.
+fn shell_enable_target(
+    mgr: &Arc<PortManager>,
+    ctx: &CommandContext,
+    cmd: &str,
+    args: &[ArgValue],
+) -> Option<(crate::port_handle::PortHandle, i32, bool)> {
+    let port = arg_str(args, 0).filter(|s| !s.is_empty())?;
+    let addr = arg_int(args, 1).unwrap_or(0) as i32;
+    let yes = arg_int(args, 2).unwrap_or(0) != 0;
+    match mgr.find_port_handle(&port) {
+        Ok(handle) => Some((handle, addr, yes)),
+        Err(e) => {
+            ctx.println(&format!("{cmd}: {e}"));
+            None
+        }
+    }
+}
+
 fn report_ports(mgr: &Arc<PortManager>, level: i32, port: Option<&str>) {
     if let Some(name) = port {
         match mgr.find_runtime_handle(name) {
@@ -862,6 +912,59 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         ));
     }
 
+    // asynEnable portName addr yesNo --------------------------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynEnable",
+            enable_style_args(),
+            "asynEnable portName addr yesNo - enable (1) or disable (0) a port or one of its devices",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let (handle, addr, yes) = match shell_enable_target(&mgr_r, ctx, "asynEnable", args)
+                {
+                    Some(t) => t,
+                    None => return Ok(CommandOutcome::Continue),
+                };
+                let r = match (addresses_a_device(&handle, addr), yes) {
+                    (true, true) => handle.enable_addr_blocking(addr),
+                    (true, false) => handle.disable_addr_blocking(addr),
+                    (false, yes) => handle.set_enable_blocking(yes),
+                };
+                if let Err(e) = r {
+                    ctx.println(&format!("asynEnable: {e}"));
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // asynAutoConnect portName addr yesNo ---------------------------------
+    {
+        let mgr_r = mgr.clone();
+        out.push(CommandDef::new(
+            "asynAutoConnect",
+            enable_style_args(),
+            "asynAutoConnect portName addr yesNo - turn auto-connect on (1) or off (0) for a port \
+             or one of its devices",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let (handle, addr, yes) =
+                    match shell_enable_target(&mgr_r, ctx, "asynAutoConnect", args) {
+                        Some(t) => t,
+                        None => return Ok(CommandOutcome::Continue),
+                    };
+                let r = if addresses_a_device(&handle, addr) {
+                    handle.set_auto_connect_addr_blocking(addr, yes)
+                } else {
+                    handle.set_auto_connect_blocking(yes)
+                };
+                if let Err(e) = r {
+                    ctx.println(&format!("asynAutoConnect: {e}"));
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
     // Port-creation commands ----------------------------------------------
     // Part of the same set: a shell that can create a port must be able to
     // configure it in the next line of the same script.
@@ -1354,6 +1457,22 @@ mod tests {
         }
     }
 
+    impl DummyDriver {
+        /// A multi-device port — the other half of C's `findDpCommon` split.
+        fn multi_device(name: &str, max_addr: usize) -> Self {
+            let mut base = PortDriverBase::new(
+                name,
+                max_addr,
+                PortFlags {
+                    multi_device: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.create_param("VAL", ParamType::Int32).unwrap();
+            Self { base }
+        }
+    }
+
     fn fresh_mgr_with_port(name: &str) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr.register_port(DummyDriver::new(name)).unwrap();
@@ -1392,18 +1511,8 @@ mod tests {
         let mask = TraceMask::from_symbolic("ERROR+WARNING").unwrap();
         trace.set_trace_mask(Some("trace_mask_port"), mask);
 
-        // Verify the handler is wired (closure captures mgr; lookup
-        // succeeds) — we count one CommandDef per C-side function.
-        assert_eq!(
-            cmds.len(),
-            16,
-            "asyn iocsh command set: asynReport, asynSetOption, \
-             asynOctetSet{{Input,Output}}Eos, asynOctetGet{{Input,Output}}Eos, \
-             asynInterposeEcho, asynInterposeDelay, the four trace mutators, \
-             and the four port-creation commands (drvAsynIPPortConfigure, \
-             drvAsynIPServerPortConfigure, drvAsynSerialPortConfigure, \
-             prologixGPIBConfigure)"
-        );
+        // The registered set itself is guarded by
+        // `iocsh_registers_c_parity_commands`, which owns the list.
         assert!(set_trace_mask.args.len() == 3);
 
         // Verify announce fired.
@@ -1426,27 +1535,113 @@ mod tests {
     fn iocsh_registers_c_parity_commands() {
         let mgr = Arc::new(PortManager::new());
         let cmds = build_asyn_commands(mgr);
-        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
-        for expected in [
+        let mut names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        // The authoritative list — one entry per C `iocshRegister`. Adding a
+        // command means adding it here; a C command still missing is a gap this
+        // list names by its absence.
+        let mut expected = vec![
+            // asynShellCommands.c:1352-1378
             "asynReport",
             "asynSetOption",
-            "asynOctetSetInputEos",
-            "asynOctetSetOutputEos",
-            "asynInterposeEcho",
-            "asynInterposeDelay",
             "asynSetTraceMask",
             "asynSetTraceIOMask",
             "asynSetTraceInfoMask",
             "asynSetTraceFile",
+            "asynEnable",
+            "asynAutoConnect",
+            "asynOctetSetInputEos",
+            "asynOctetGetInputEos",
+            "asynOctetSetOutputEos",
+            "asynOctetGetOutputEos",
+            // interpose layers
+            "asynInterposeEcho",
+            "asynInterposeDelay",
+            // port creation
             "drvAsynIPPortConfigure",
+            "drvAsynIPServerPortConfigure",
             "drvAsynSerialPortConfigure",
             "prologixGPIBConfigure",
-        ] {
-            assert!(
-                names.contains(&expected),
-                "iocsh registration must include {expected}"
-            );
-        }
+        ];
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+    }
+
+    /// R19-116: `asynEnable` / `asynAutoConnect` exist on the shell, and they
+    /// pick port-level vs device-level state by C's `findDpCommon` rule
+    /// (asynManager.c:496-509) — a device only when the port is multi-device
+    /// AND the caller named one.
+    #[test]
+    fn iocsh_enable_and_autoconnect_follow_c_find_dp_common() {
+        let mgr = Arc::new(PortManager::new());
+        let _ = mgr.register_port(DummyDriver::new("edp_single")).unwrap();
+        let _ = mgr
+            .register_port(DummyDriver::multi_device("edp_multi", 2))
+            .unwrap();
+
+        let seen: Arc<Mutex<Vec<(String, AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        mgr.exception_manager().add_callback(move |ev| {
+            seen_cb
+                .lock()
+                .unwrap()
+                .push((ev.port_name.clone(), ev.exception, ev.addr));
+        });
+
+        let cmds = build_asyn_commands(mgr.clone());
+        let ctx = make_ctx();
+        let call = |name: &str, port: &str, addr: i64, yes: i64| {
+            cmds.iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"))
+                .handler
+                .call(
+                    &[
+                        ArgValue::String(port.into()),
+                        ArgValue::Int(addr),
+                        ArgValue::Int(yes),
+                    ],
+                    &ctx,
+                )
+                .unwrap();
+        };
+
+        let single = mgr.find_port_handle("edp_single").unwrap();
+        let multi = mgr.find_port_handle("edp_multi").unwrap();
+
+        // addr >= 0 on a SINGLE-device port is still the port: findDpCommon has
+        // no device to pick.
+        call("asynEnable", "edp_single", 0, 0);
+        assert!(!single.is_enabled_blocking().unwrap());
+
+        // addr >= 0 on a multi-device port is the device — the port itself must
+        // stay enabled.
+        call("asynEnable", "edp_multi", 1, 0);
+        assert!(multi.is_enabled_blocking().unwrap());
+        assert!(
+            seen.lock()
+                .unwrap()
+                .contains(&("edp_multi".to_string(), AsynException::Enable, 1)),
+            "the device-level enable must announce at its addr"
+        );
+
+        // addr < 0 is always the port.
+        call("asynEnable", "edp_multi", -1, 0);
+        assert!(!multi.is_enabled_blocking().unwrap());
+
+        // Same split for auto-connect.
+        call("asynAutoConnect", "edp_multi", 1, 0);
+        assert!(
+            multi.is_auto_connect_blocking().unwrap(),
+            "a device-addressed autoConnect must not touch the port's flag"
+        );
+        assert!(seen.lock().unwrap().contains(&(
+            "edp_multi".to_string(),
+            AsynException::AutoConnect,
+            1
+        )));
+        call("asynAutoConnect", "edp_multi", -1, 0);
+        assert!(!multi.is_auto_connect_blocking().unwrap());
     }
 
     /// `raw_from_escaped` decodes C-style escapes to raw bytes (parity with

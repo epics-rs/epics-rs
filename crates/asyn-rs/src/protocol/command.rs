@@ -105,6 +105,11 @@ pub enum PortCommand {
     SetAutoConnect {
         yes: bool,
     },
+    /// Per-device auto-connect toggle — the `addr` half of the same C call,
+    /// selected by `findDpCommon` (asynManager.c:496-509).
+    SetAutoConnectAddr {
+        yes: bool,
+    },
     GetBoundsInt32,
     GetBoundsInt64,
     /// Query whether the port is currently enabled.
@@ -230,6 +235,7 @@ mod tests {
             PortCommand::DisableAddr,
             PortCommand::SetEnable { yes: true },
             PortCommand::SetAutoConnect { yes: false },
+            PortCommand::SetAutoConnectAddr { yes: true },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
             PortCommand::GetEnable,

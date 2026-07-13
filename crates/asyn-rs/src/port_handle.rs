@@ -935,6 +935,16 @@ impl PortHandle {
         Ok(())
     }
 
+    /// Enable or disable auto-connect for ONE device of a multi-device port —
+    /// the addressed half of [`Self::set_auto_connect_blocking`], symmetric
+    /// with [`Self::enable_addr_blocking`]. C picks between the two inside
+    /// `pasynManager->autoConnect` via `findDpCommon` (asynManager.c:496-509).
+    pub fn set_auto_connect_addr_blocking(&self, addr: i32, yes: bool) -> AsynResult<()> {
+        let user = AsynUser::new(0).with_addr(addr);
+        self.submit_blocking(RequestOp::SetAutoConnectAddr { yes }, user)?;
+        Ok(())
+    }
+
     // --- Bounds convenience methods ---
 
     pub fn get_bounds_int32_blocking(&self, reason: usize, addr: i32) -> AsynResult<(i64, i64)> {

@@ -2365,8 +2365,10 @@ impl RecordInstance {
                 // them from `alarm_field_posts`. A second, change-detected copy
                 // here would double-post with a mask C never uses for them
                 // (`alarm_bits | DBE_VALUE | DBE_LOG` instead of C's DBE_VALUE
-                // on ACKS). UDF is separate: the framework posts it from its own
-                // undefined-value rule, not from recGblResetAlarms.
+                // on ACKS). UDF is excluded for the opposite reason: NO C
+                // `monitor()` posts it at all, so a processing cycle that
+                // redefines VAL must emit no `.UDF` event (a caput to `.UDF`
+                // still posts, through the generic put path).
                 || crate::server::recgbl::RECGBL_POSTED_ALARM_FIELDS.contains(&field.as_str())
                 || field == "UDF"
                 || event_posted.contains(&field.as_str())
@@ -2819,27 +2821,11 @@ impl RecordInstance {
             }
         }
 
-        // Post UDF on the snapshot whenever any monitor event fires this
-        // cycle, carrying the union of the cycle's posted classes —
-        // mirrors the two `processing.rs` UDF pushes. C
-        // `recGblResetAlarms` / `recGblCheckUDF` (recGbl.c) keep UDF
-        // current every process cycle, and `db_post_events` delivers
-        // `.UDF` alongside the record-wide post. `process_local` is the
-        // foreign-process path (`db.process_record`, e.g. QSRV
-        // group-process members); without this push a UDF change here is
-        // never delivered to `.UDF` subscribers — the `sub_updates` loop
-        // above deliberately excludes UDF to avoid a double-post, so the
-        // push must be here.
-        let cycle_mask = changed_fields
-            .iter()
-            .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-        if !cycle_mask.is_empty() {
-            changed_fields.push((
-                "UDF".to_string(),
-                EpicsValue::Char(if self.common.udf { 1 } else { 0 }),
-                cycle_mask,
-            ));
-        }
+        // No `.UDF` post — C `monitor()` posts UDF nowhere, and
+        // `recGblResetAlarms` (recGbl.c:204-216) posts only SEVR/STAT/AMSG/
+        // ACKS. A `.UDF` event exists only where C's generic `dbPut` posts
+        // the field it wrote (dbAccess.c:1420-1430) — i.e. a client caput to
+        // `.UDF` itself.
 
         Ok((ProcessSnapshot { changed_fields }, alarm_posts))
     }

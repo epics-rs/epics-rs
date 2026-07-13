@@ -3208,18 +3208,13 @@ impl PvDatabase {
             // below. The `CompleteAlarmOnly` break above uses the same helper,
             // so the alarm-post masks have a single owner.
             let alarm_posts = alarm_field_posts(&instance.common, &alarm_result);
-            // UDF rides along whenever any monitored post fired this
-            // cycle, carrying the union of the cycle's posted classes.
-            let cycle_mask = changed_fields
-                .iter()
-                .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-            if !cycle_mask.is_empty() {
-                changed_fields.push((
-                    "UDF".to_string(),
-                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-                    cycle_mask,
-                ));
-            }
+            // NO `.UDF` post. C `monitor()` never posts UDF, and neither does
+            // `recGblResetAlarms` (recGbl.c:204-216 posts SEVR/STAT/AMSG/ACKS
+            // only): `db_post_events(..., &prec->udf, ...)` appears nowhere in
+            // EPICS base or the modules. UDF reaches a `.UDF` subscriber only
+            // through the generic put path (C `dbPut` posts the field it
+            // wrote, dbAccess.c:1420-1430) — a processing cycle that redefines
+            // VAL emits no `.UDF` event.
             let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
 
             let flnk_name = if instance.record.should_fire_forward_link() {
@@ -4243,19 +4238,8 @@ impl PvDatabase {
                     changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
                 }
             }
-            // UDF rides along whenever any monitored post fired this
-            // cycle, carrying the union of the cycle's posted classes —
-            // same rule as the main process path.
-            let cycle_mask = changed_fields
-                .iter()
-                .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-            if !cycle_mask.is_empty() {
-                changed_fields.push((
-                    "UDF".to_string(),
-                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-                    cycle_mask,
-                ));
-            }
+            // No `.UDF` post — see the main process path (C posts UDF from no
+            // monitor() and from no recGblResetAlarms).
             let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
 
             let flnk_name = if instance.record.should_fire_forward_link() {
@@ -5495,16 +5479,8 @@ fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
             changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
         }
     }
-    let cycle_mask = changed_fields
-        .iter()
-        .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
-    if !cycle_mask.is_empty() {
-        changed_fields.push((
-            "UDF".to_string(),
-            EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-            cycle_mask,
-        ));
-    }
+    // No `.UDF` post — see the main process path (C posts UDF from no
+    // monitor() and from no recGblResetAlarms).
 
     let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
     instance.notify_from_snapshot(&snapshot);

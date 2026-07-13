@@ -1,6 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    AlarmSeverity, FieldDesc, ProcessAction, ProcessContext, ProcessOutcome, Record,
+    AlarmSeverity, FieldDesc, ParsedLink, ProcessAction, ProcessContext, ProcessOutcome, Record,
+    parse_link_v2, parse_output_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue};
 
@@ -36,12 +37,11 @@ pub struct TransformRecord {
     /// record, or a record that has never processed — and that window is what a
     /// `caget .LA` is FOR.
     ///
-    /// The port's change detection stays on the framework's `last_posted`
-    /// (`collect_subscriber_posts`), as before; these cells are the DB-visible
-    /// readback C exposes, committed at the same point C commits them, and they
-    /// feed nothing else. In particular they are NOT the conditional-calc gate:
-    /// C's `same` test (`:575`) reduces to `fresh_put` for the only channels it
-    /// can gate (see `process`).
+    /// Monitor posting stays on the framework's `last_posted`
+    /// (`collect_subscriber_posts`). These cells are C's OTHER use of `l*`:
+    /// they are the right-hand side of the `same` test that gates the
+    /// conditional calc (`:575`, see `process`), so they must be read there and
+    /// nowhere else derived.
     lvals: [f64; NUM_CHANNELS],
     pub calcs: [String; NUM_CHANNELS],
     compiled: [Option<CompiledExpr>; NUM_CHANNELS],
@@ -50,12 +50,12 @@ pub struct TransformRecord {
     pub copt: i16, // calc option: 0=Conditional (calc only an unlinked, unchanged channel), 1=Always. Gates CALC-eval, NOT the OUTx write.
     pub ivla: i16, // 0=Ignore error, 1=Do Nothing
     pub prec: i16,
-    /// Per-channel "value field A..P was written by a `put` since the
-    /// last `process()`" flags. synApps `transformRecord` does not
-    /// re-compute a channel whose value field was just `dbPut` this
-    /// cycle ("don't overwrite a fresh put"). Set by `put_field` for the
-    /// `A..P` value fields, cleared at the start of `process()`.
-    fresh_put: [bool; NUM_CHANNELS],
+    /// C's `map` bitmap (`transformRecord.c:423`, `:584`, `:600`, `:703`) — one
+    /// bit per channel, set by `special()` when a put lands on the value field
+    /// `A..P` itself while the record is not processing. It is ONE of the two
+    /// terms of C's `new_value`; the other is the `same` test against
+    /// [`Self::lvals`]. It is NOT a synonym for either.
+    map: [bool; NUM_CHANNELS],
     /// This cycle's pending input-link severity (`dbCommon.nsev`), pushed by
     /// the framework through [`Record::set_process_context`] before
     /// `process()` runs — C folds an MS-class link's severity into `nsev`
@@ -87,7 +87,7 @@ impl Default for TransformRecord {
             copt: 0,
             ivla: 0,
             prec: 0,
-            fresh_put: [false; NUM_CHANNELS],
+            map: [false; NUM_CHANNELS],
             nsev: AlarmSeverity::NoAlarm,
             calc_failed: false,
         }
@@ -155,6 +155,51 @@ impl TransformRecord {
             }
         }
         None
+    }
+
+    /// C's link classification, `plink->type == CONSTANT` — the ONE test every
+    /// one of this record's three link decisions is written in:
+    /// `no_inlink` (`transformRecord.c:571`), "has an input link" (`:535`),
+    /// "has an output link" (`:606`).
+    ///
+    /// A link field is CONSTANT when it is EMPTY *or* holds a literal number:
+    /// dbStatic gives `field(INPA,"5")` the type CONSTANT, not PV_LINK. Reading
+    /// the stored text's EMPTINESS instead (what the port did at all three
+    /// sites) makes a constant-seeded channel look link-driven — and in the
+    /// default Conditional mode its CLCx was then never evaluated at all:
+    /// `field(INPA,"2")` + `field(CLCA,"A+1")` sat at 2 forever.
+    fn link_is_constant(parsed: &ParsedLink) -> bool {
+        matches!(parsed, ParsedLink::None | ParsedLink::Constant(_))
+    }
+
+    /// C's `no_inlink` (`transformRecord.c:571`).
+    fn no_inlink(&self, i: usize) -> bool {
+        Self::link_is_constant(&parse_link_v2(&self.inp_links[i]))
+    }
+
+    /// C's `if (plink->type != CONSTANT)` on OUTx (`transformRecord.c:606`),
+    /// negated. An OUT field parses under the OUT modifier mask.
+    fn no_outlink(&self, i: usize) -> bool {
+        Self::link_is_constant(&parse_output_link_v2(&self.out_links[i]))
+    }
+
+    /// C's `same` test, `transformRecord.c:574-575`:
+    ///
+    /// ```c
+    /// pu = (int *)pval;  plu = (int *)plval;
+    /// same = (*pval==0. && *plval==0.) || ((pu[0] == plu[0]) && (pu[1] == plu[1]));
+    /// ```
+    ///
+    /// A BIT-PATTERN comparison, not `==`, with one exception carved out. The
+    /// two differ exactly where IEEE `==` is not reflexive-or-not-distinguishing:
+    ///   * `-0.0` vs `0.0` — different bits, and the `==0.` clause exists to
+    ///     call them the SAME anyway.
+    ///   * `NaN` vs the same `NaN` — `==` says different, the bits say same, and
+    ///     C takes the bits: a channel parked at NaN is not "new" every cycle.
+    ///
+    /// `f64::to_bits` is that `int[2]` view.
+    fn value_is_same(cur: f64, last: f64) -> bool {
+        (cur == 0.0 && last == 0.0) || cur.to_bits() == last.to_bits()
     }
 
     /// LA..LP — "Prev Value of A".."Prev Value of P"
@@ -647,30 +692,39 @@ impl Record for TransformRecord {
             return Ok(ProcessOutcome::complete_alarm_only());
         }
 
-        // Snapshot and clear the fresh-put flags for this cycle.
-        let fresh_put = std::mem::take(&mut self.fresh_put);
+        // Snapshot and clear C's `map` bitmap for this cycle (`:600` clears it
+        // after the calc loop; the IVLA abandon above returns before `:600`, so
+        // a mark set during an abandoned cycle SURVIVES into the next — hence
+        // the take sits below that return, not above it).
+        let map = std::mem::take(&mut self.map);
 
-        // Evaluate each calc expression A-P. synApps `transformRecord.c`
-        // (the `if (((no_inlink && !new_value) || copt==ALWAYS) &&
-        // postfix_ok)` gate) uses COPT to decide whether CLCx is
-        // EVALUATED — it does NOT gate the OUTx write below.
-        //   Conditional (COPT=0): compute a channel only when it has NO
-        //     input link AND was not freshly put (`no_inlink &&
-        //     !new_value`); a channel driven by its INPx link or by a
-        //     fresh `put` keeps that value instead of being overwritten
-        //     by its CLCx.
+        // Evaluate each calc expression A-P. synApps `transformRecord.c:584-591`:
+        //
+        //   new_value   = (!same || ((ptran->map & (1<<i)) != 0));
+        //   postfix_ok  = *pclcbuf && (*prpcbuf != BAD_EXPRESSION);
+        //   if (((no_inlink && !new_value) || ptran->copt==transformCOPT_ALWAYS)
+        //           && postfix_ok) { ... sCalcPerform ... }
+        //
+        // COPT decides whether CLCx is EVALUATED — it does NOT gate the OUTx
+        // write below.
+        //   Conditional (COPT=0): compute a channel only when it has NO input
+        //     link AND its value is NOT new. "New" is the union of two
+        //     independent facts, and BOTH are load-bearing:
+        //       - the `map` bit: a put landed on the value field itself, or
+        //       - `!same`: the channel's value differs from the LA..LP cell C's
+        //         `monitor()` left behind — which catches every write that does
+        //         NOT go through `special()`, notably the CONSTANT-INPx re-seed
+        //         (`:717`, R19-1) and a store opcode in a SIBLING channel's
+        //         expression (`CLCB="A:=A+1"` writes A through `&ptran->a`).
+        //     A channel holding such a value keeps it for one cycle instead of
+        //     being overwritten by its own CLCx.
         //   Always (COPT=1): compute whenever CLCx is valid, regardless.
-        // C's `new_value = !same || map_bit`; for a no-input channel the
-        // value changes between cycles only via a `put` (which also sets
-        // `map_bit` = our `fresh_put`; the framework's INPx propagation
-        // does NOT mark `fresh_put`), so `new_value` reduces to
-        // `fresh_put` and `no_inlink && !new_value` is exactly
-        // `no_inlink && !fresh_put`, needing no separate last-value
-        // tracking. For an input-linked channel `no_inlink` is false, so
-        // that term is false and `new_value` is unused.
+        // `postfix_ok` is the `if let Some(compiled)` below: `recompile` leaves
+        // `None` for both of C's failing halves — an empty CLCx (never compiled)
+        // and one `sCalcPostfix` rejected (BAD_EXPRESSION).
         for i in 0..NUM_CHANNELS {
-            let no_inlink = self.inp_links[i].is_empty();
-            let do_calc = (no_inlink && !fresh_put[i]) || self.copt == 1;
+            let new_value = !Self::value_is_same(self.vals[i], self.lvals[i]) || map[i];
+            let do_calc = (self.no_inlink(i) && !new_value) || self.copt == 1;
             if !do_calc {
                 continue;
             }
@@ -771,7 +825,7 @@ impl Record for TransformRecord {
         // here silently dropped it.
         let mut actions = Vec::new();
         for i in 0..NUM_CHANNELS {
-            if self.out_links[i].is_empty() {
+            if self.no_outlink(i) {
                 continue;
             }
             actions.push(ProcessAction::WriteDbLink {
@@ -898,27 +952,40 @@ impl Record for TransformRecord {
         Err(CaError::FieldNotFound(name.to_string()))
     }
 
-    /// S5 — mark a value channel (VAL / A..P) "freshly put" when it is
-    /// written by an *external* put. The framework calls `special(field,
-    /// true)` only on the CA / database-access put path
-    /// (`field_io.rs`); the multi-input-link propagation
-    /// (`processing.rs`) writes A..P via `put_field` directly *without*
-    /// `special()`, so input-linked channels are NOT marked fresh and
-    /// still re-compute from their CLCx every cycle. The next
-    /// `process()` skips re-computing a fresh-put channel so a CA put to
-    /// `transform.A` survives one cycle.
+    /// S5 — set C's `map` bit for a value channel `A..P` written by an
+    /// *external* put, so the next `process()` does not overwrite it with the
+    /// channel's own CLCx. The framework calls `special(field, true)` only on
+    /// the CA / database-access put path (`field_io.rs`); the
+    /// multi-input-link propagation (`processing.rs`) writes A..P via
+    /// `put_field` directly *without* `special()`, which is C's shape too — a
+    /// link-fed channel has `no_inlink == false` and is never gated by
+    /// `new_value` at all.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after {
-            // C `transformRecord.c:698-704` marks the "new value" bitmap only
-            // for a field in the `A..P` range (`i = fieldIndex -
-            // transformRecordA; if ((i >= 0) && (i < MAX_FIELDS))`). VAL sits
-            // below `transformRecordA`, so a put to VAL marks nothing — it is
-            // not a channel.
+            // C `transformRecord.c:698-704` marks the bitmap only for a field
+            // in the `A..P` range (`i = fieldIndex - transformRecordA; if ((i
+            // >= 0) && (i < MAX_FIELDS))`). VAL sits below `transformRecordA`,
+            // so a put to VAL marks nothing — it is not a channel.
             if let Some(i) = Self::channel_index(field) {
-                self.fresh_put[i] = true;
+                self.map[i] = true;
             }
         }
         Ok(())
+    }
+
+    /// C's `init_record` TAIL for this record: `*plvalue = *pvalue`
+    /// (`transformRecord.c:490`), run per channel after the CONSTANT-INPx seed
+    /// two lines earlier (`:445`). LA..LP is transform's tracking cell, and
+    /// this hook is the framework's owner of "re-derive init-time tracking
+    /// state from the value the seed just loaded" — it runs at the tail of
+    /// `seed_constant_links`, i.e. exactly where C's line sits.
+    ///
+    /// It is load-bearing, not cosmetic: `process` tests `same(vals, lvals)`.
+    /// Without this, `field(A,"5")` would leave LA=0, make A read "new" on the
+    /// very first cycle, and suppress the calc C runs. transform serves no
+    /// MLST/ALST/LALM, so there is nothing of the default's work to keep.
+    fn seed_deadband_tracking(&mut self) {
+        self.lvals = self.vals;
     }
 
     /// Adopt the framework's per-cycle `dbCommon` snapshot. `nsev` — this
@@ -953,7 +1020,7 @@ impl Record for TransformRecord {
     /// does it — the zero is what the calc loop and the OUTx write then see.
     fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
         for i in 0..NUM_CHANNELS {
-            if !self.inp_links[i].is_empty() && !resolved.contains(&INP_FIELD_NAMES[i]) {
+            if !self.no_inlink(i) && !resolved.contains(&INP_FIELD_NAMES[i]) {
                 self.vals[i] = 0.0;
             }
         }
@@ -1092,6 +1159,16 @@ mod tests {
     use super::*;
     use crate::server::record::CommonFields;
 
+    /// C's `init_record` tail, `*plvalue = *pvalue` (`transformRecord.c:490`).
+    /// The DB path runs it for every record (`seed_constant_links` ends in
+    /// `seed_deadband_tracking`); a record built field-by-field in a unit test
+    /// must run it too, or it enters its first `process()` with `LA..LP` at 0
+    /// while `A..P` hold their loaded values — i.e. as if every loaded field had
+    /// just been written, which suppresses the very calc C performs.
+    fn ioc_init(rec: &mut TransformRecord) {
+        rec.seed_deadband_tracking();
+    }
+
     /// An expression that compiles clean and FAILS at eval — C
     /// `sCalcPerform()` returning non-zero.
     ///
@@ -1224,6 +1301,7 @@ mod tests {
             .unwrap();
         rec.put_field("CLCC", EpicsValue::String("VAL+1".into()))
             .unwrap();
+        ioc_init(&mut rec);
 
         // Each CLCx evaluates against its own channel's value: a single
         // record-wide previous VAL (or a 0 seed) could not produce both.
@@ -1288,6 +1366,7 @@ mod tests {
         // CLCA has no valid calc (empty), CLCB evaluates
         rec.put_field("CLCB", EpicsValue::String("A+1".into()))
             .unwrap();
+        ioc_init(&mut rec);
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 10.0); // A unchanged
         assert_eq!(rec.vals[1], 11.0); // B = A+1 = 10+1 = 11

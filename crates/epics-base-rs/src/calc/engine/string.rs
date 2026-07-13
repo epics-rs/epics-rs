@@ -3,7 +3,7 @@ use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
 use super::random::local_random;
-use super::value::{ScalcString, StackValue};
+use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
 use super::{CompiledExpr, StringInputs};
 
 pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
@@ -264,11 +264,21 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                     stack.push(StackValue::Double(if a == 0.0 { 1.0 } else { 0.0 }));
                 }
 
-                // Bitwise. sCalc has no `d2i`: every operand takes a plain
-                // `(long)` cast (sCalcPerform.c:575-591, :623-631, :725-727),
-                // so these are 64-bit ops, not base's 32-bit ones. The shift
-                // count is not masked in C either — x86-64 `shl`/`sar` mask it
-                // to 6 bits for a 64-bit operand, which is the observable.
+                // Bitwise. sCalc has no `d2i`: the operands take plain C casts,
+                // and the WIDTH of that cast is not uniform — it depends on the
+                // operator AND on which evaluator C picked for this program:
+                //
+                //   op         no-string path        string path
+                //   & | ^      (long)  :575-591      (long)  :1119-1147
+                //   ~          (long)  :725-727      (int)   :1441-1444
+                //   >> <<      (long)  :623-631      (int)   :1270-1276
+                //
+                // That asymmetry is C's, not a typo to be tidied: the same
+                // `A>>B` really does shift 64-bit in one program and 32-bit in
+                // another, and the port applied `(long)` to all six everywhere.
+                // Neither shift count is masked in C — x86-64 masks it to 6 bits
+                // for a 64-bit operand and 5 for a 32-bit one, which is what
+                // `wrapping_shl` / `wrapping_shr` do at each width.
                 CoreOp::BitAnd => {
                     let (a, b) = pop2_f64(&mut stack)?;
                     stack.push(StackValue::Double((c_long(a) & c_long(b)) as f64));
@@ -283,15 +293,71 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 CoreOp::BitNot => {
                     let a = pop1_f64(&mut stack)?;
-                    stack.push(StackValue::Double(!c_long(a) as f64));
+                    stack.push(StackValue::Double(if string_path {
+                        !c_int(a) as f64
+                    } else {
+                        !c_long(a) as f64
+                    }));
                 }
-                CoreOp::Shl => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((c_long(a) << (c_long(b) & 63)) as f64));
-                }
-                CoreOp::Shr => {
-                    let (a, b) = pop2_f64(&mut stack)?;
-                    stack.push(StackValue::Double((c_long(a) >> (c_long(b) & 63)) as f64));
+                // `>>` and `<<` on the string path are TYPE-BRANCHED, on the LEFT
+                // operand (`sCalcPerform.c:1263-1294`):
+                //
+                // ```c
+                // ps1 = ps;  toDouble(ps1);
+                // j = myNINT(ps1->d);  j = myMIN(j, SCALC_STRING_SIZE);
+                // DEC(ps);
+                // if (isDouble(ps)) {              /* bit shift, 32-bit */
+                //     ps->d = (int)(ps->d) >> (int)(ps1->d);
+                // } else {                         /* CHARACTER shift    */
+                //     if (op == RIGHT_SHIFT) {
+                //         for (i=SCALC_STRING_SIZE-1; i>=0; i--)
+                //             ps->s[i] = (i>=j) ? ps->s[i-j] : ' ';
+                //         ps->s[SCALC_STRING_SIZE-1] = '\0';
+                //     } else {
+                //         if (j == SCALC_STRING_SIZE) ps->s[0] = '\0';
+                //         else for (i=0; i < SCALC_STRING_SIZE-j; i++)
+                //             ps->s[i] = ps->s[i+j];
+                //     }
+                // }
+                // ```
+                //
+                // So `"abc">>1` is `" abc"` — a STRING — where the port answered
+                // the double 0.0. The shift moves bytes in the 40-byte element:
+                // right fills the vacated head with SPACES and forces the last
+                // byte to NUL (so a full-width string loses its tail), left slides
+                // the bytes down and lets the NUL come with them. The count is
+                // ROUNDED (myNINT, so 0.6 shifts by 1) and clamped ABOVE at 40 —
+                // the two ops there are `j` (rounded/clamped, for the characters)
+                // and `(int)ps1->d` (truncated, for the bits): different operands,
+                // deliberately, and the port must not share one.
+                CoreOp::Shl | CoreOp::Shr => {
+                    let right = core == &CoreOp::Shr;
+                    let count = pop1(&mut stack)?.to_double();
+                    let subject = pop1(&mut stack)?;
+                    stack.push(match subject {
+                        StackValue::Str(s) if string_path => {
+                            StackValue::str(shift_chars(s.as_bytes(), count, right))
+                        }
+                        v => {
+                            let a = v.to_double();
+                            let out = if string_path {
+                                let (x, n) = (c_int(a), c_int(count) as u32);
+                                if right {
+                                    x.wrapping_shr(n) as f64
+                                } else {
+                                    x.wrapping_shl(n) as f64
+                                }
+                            } else {
+                                let (x, n) = (c_long(a), c_long(count) as u32);
+                                if right {
+                                    x.wrapping_shr(n) as f64
+                                } else {
+                                    x.wrapping_shl(n) as f64
+                                }
+                            };
+                            StackValue::Double(out)
+                        }
+                    });
                 }
                 // `>>>` (RIGHT_SHIFT_LOGIC) is a BASE opcode: sCalcPostfix has
                 // no such element, so a C sCalc expression can never contain
@@ -1569,6 +1635,61 @@ fn rfind_sub(h: &[u8], n: &[u8]) -> Option<usize> {
         return None;
     }
     h.windows(n.len()).rposition(|w| w == n)
+}
+
+/// C's CHARACTER shift — `RIGHT_SHIFT` / `LEFT_SHIFT` with a string left operand
+/// (`sCalcPerform.c:1277-1293`). It runs over the stack element's whole 40-byte
+/// buffer, not over the visible string, which is what makes it a shift and not a
+/// slice: bytes move, the head is space-filled, and the NUL travels with them.
+///
+/// ```c
+/// j = myNINT(ps1->d);  j = myMIN(j, SCALC_STRING_SIZE);
+/// if (right) {
+///     for (i = SCALC_STRING_SIZE-1; i >= 0; i--)
+///         ps->s[i] = (i >= j) ? ps->s[i-j] : ' ';
+///     ps->s[SCALC_STRING_SIZE-1] = '\0';
+/// } else if (j == SCALC_STRING_SIZE) {
+///     ps->s[0] = '\0';
+/// } else {
+///     for (i = 0; i < SCALC_STRING_SIZE-j; i++) ps->s[i] = ps->s[i+j];
+/// }
+/// ```
+///
+/// The buffer is modelled zero-padded, which is what `strncpy`/`strNcpy` leave
+/// behind on every path that fills a stack element from an argument or a result.
+///
+/// ONE documented deviation: C clamps `j` only from ABOVE. A NEGATIVE count makes
+/// both loops index outside the element (`ps->s[i-j]` with `i` at 39, `ps->s[i+j]`
+/// with `i` at 0) — an out-of-bounds read of whatever the neighbouring stack
+/// element holds, so compiled C has no defined answer to reproduce. The port
+/// clamps below at 0, which makes a negative count the identity — the same thing
+/// C does at exactly `j == 0`, and the only continuous choice.
+fn shift_chars(bytes: &[u8], count: f64, right: bool) -> Vec<u8> {
+    const N: usize = SCALC_STRING_SIZE;
+    // C's `j` is an `int`: `myNINT` casts, and `myMIN(j, 40)` clamps only above.
+    let j = c_int(my_nint(count)).clamp(0, N as i32) as usize;
+
+    let mut buf = [0u8; N];
+    for (slot, b) in buf.iter_mut().zip(bytes.iter().take(N)) {
+        *slot = *b;
+    }
+
+    let mut out = buf;
+    if right {
+        for i in (0..N).rev() {
+            out[i] = if i >= j { buf[i - j] } else { b' ' };
+        }
+        out[N - 1] = 0;
+    } else if j == N {
+        out[0] = 0;
+    } else {
+        // The tail `[N-j, N)` is NOT written by C's loop: those bytes keep the
+        // values they already had, which `out`'s copy of `buf` preserves.
+        out[..N - j].copy_from_slice(&buf[j..]);
+    }
+
+    let end = find_byte(&out, 0).unwrap_or(N);
+    out[..end].to_vec()
 }
 
 /// C `epicsStrnEscapedFromRaw` (epicsString.c:120), which is what

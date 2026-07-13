@@ -1235,3 +1235,327 @@ anything, so an upstream compiler upgrade or a new target silently changes store
 Proof: compiled softIoc on this host: `calcout` 3.0e9 → `-2147483648`; `aao` DOL
 `[1.7, 2.2, -3.9, 70000, 5, 6]` into an `FTVL=SHORT` waveform → `[1, 2, -3, 4464]`
 (fixer-f oracle probes, wave 15); port pinned by `c_cast::matches_compiled_c_x86_64`.
+
+---
+
+## Batch F — filed 2026-07-13 (Round 18 candidates, citations re-verified against the local trees)
+
+Twelve entries: the synApps calc engines (aCalc/sCalc, 7), base calc's dbd
+(1), pvxs (2), asyn (1), base histogram (1). Every `file:line` below was
+re-read in the local reference tree before filing; two of the Round-18
+candidate citations were corrected in the process (CBUG-F11's dispatch is
+`asynRecord.c:450-451`, not `:470`; CBUG-F4/F7 both live in
+`sCalcPerform.c`, not aCalc). Compiled proof where stated; otherwise the
+decisive code path is quoted.
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-F1 | calc (aCalc) | `INC` bounds check admits writes two elements past the runtime stack — SIGSEGV at legal compile depth | High | NOT-REPRODUCED |
+| CBUG-F2 | calc (aCalc) | `SUBRANGE`/`SUBARRAY` clamp the upper bound to `arraySize` *inclusive* — reads one past the buffer | Medium | NOT-REPRODUCED |
+| CBUG-F3 | calc (aCalc) | `DERIV` hard-codes a 5-point fit — fewer than 5 points reads out of bounds | Medium | NOT-REPRODUCED |
+| CBUG-F4 | calc (sCalc) | `SUBLAST` backward scan stops before offset 0 — a match at the string head is never found | Low | NOT-REPRODUCED |
+| CBUG-F5 | calc (sCalc) | `LITERAL_STRING` copy guard never increments its counter — a >39-char literal overruns the 40-byte cell | Medium | NOT-REPRODUCED |
+| CBUG-F6 | base calc | `INPM`..`INPU` declare `special(SPC_MOD)` that `special()` rejects — nine documented fields unwritable via CA | Medium | NOT-REPRODUCED |
+| CBUG-F7 | calc (sCalc) | unconditional debug `printf` in the `SUBLAST` scan loop | Low | NOT-REPRODUCED |
+| CBUG-F8 | calc (sCalc) | `CRC16`/`MODBUS` sign-extends payload bytes ≥ 0x80 — wire-incompatible with the Modbus standard | Medium | REPRODUCED |
+| CBUG-F9 | pvxs | process-only blocking PUT selects a `requestType` dbNotify never matches — silent no-op success | Medium | NOT-REPRODUCED |
+| CBUG-F10 | pvxs | UnionArray encode omits the selector its own decoder requires — a decoded UnionA cannot be re-serialized | Medium | NOT-REPRODUCED |
+| CBUG-F11 | asyn | `caput REC.TSIZ -1` suspends the put thread forever inside `callocMustSucceed`, holding the global trace mutex | High | NOT-REPRODUCED |
+| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly and `recGblResetAlarms` erases it — dead code | Low | REPRODUCED |
+
+### CBUG-F1: aCalc's `INC` bounds check admits writes two elements past the runtime stack — SIGSEGV at legal compile depth
+Bucket: NOT-REPRODUCED · Severity: High
+C: `calc/calcApp/src/aCalcPerform.c:85-96` (the `INC` macro), `:328`
+(`stack = calloc(ACALC_STACKSIZE, sizeof(stackElement))`), `:418`
+(`top = ps = &stack[1]`):
+```c
+#define INC(ps) {                           \
+    ++ps;                                   \
+    ...                                     \
+    if ((ps-top)>ACALC_STACKSIZE) {         \
+        printf("aCalcPerform:stack overflow\n"); ... return(-1); \
+    } else {                                \
+        (ps)->numEl = -1;                   \
+        (ps)->sourceDouble=-1;              \
+```
+`top` starts at `&stack[1]`, so element index = `(ps-top) + 1` and the last
+valid index is `ACALC_STACKSIZE-1`. The guard fails only at
+`ps-top > ACALC_STACKSIZE`, so it admits `ps-top == ACALC_STACKSIZE-1`
+(index `ACALC_STACKSIZE`, one past) and `ps-top == ACALC_STACKSIZE` (two
+past) — and the `else` arm *writes* `numEl`/`sourceDouble` through the
+out-of-bounds pointer before any later check can fire.
+Defect: off-by-two in the only stack bound the evaluator has. Multi-slot
+operators (`DERIV`/`NDERIV`/`FITPOLY` do two `INC`s per operand,
+`:976-985`) reach the overrun at expression depths the compiler accepts.
+Port: `crates/epics-base-rs/src/calc/engine/array.rs:1631-1634` — the
+stack is a growable `Vec<Cell>`; the compile-time ceiling lives in the
+flavour's `ElementTable` (`token.rs:651-653`, R18-3) and an accepted
+program cannot overrun at run time.
+Impact: an aCalc expression at legal compile depth corrupts the heap
+adjacent to the stack allocation or crashes the IOC. Round 18's
+category-A compiled harness confirmed the crash under ASAN (heap
+overflow at the `INC` write).
+Proof: guard arithmetic above; ASAN run recorded in the Round 18 filing
+(`doc/c-parity-review-2026-07-10.md`, category A).
+
+### CBUG-F2: aCalc `SUBRANGE` clamps its upper bound to `arraySize` inclusive — the copy reads one element past the buffer
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `aCalcPerform.c:1528-1540`:
+```c
+i = myMAX(myMIN(i,arraySize),0);
+j = myMIN(j,arraySize);              /* <-- arraySize itself is admitted */
+if (op == SUBRANGE) {
+    ...
+    for (k=0; i<=j; k++, i++) ps->a[k] = ps->a[i];   /* reads a[arraySize] */
+```
+`ps->a` holds `arraySize` doubles; a subscript reaching `arraySize` (e.g.
+`AA[3,N]` where `N` is the element count) reads one past the end.
+Defect: the clamp is off by one for the inclusive loop it feeds — `j`
+should cap at `arraySize-1`.
+Port: `crates/epics-base-rs/src/calc/engine/array.rs:794-812` — takes C's
+clamp verbatim (`subrange_bounds`, `mod.rs:205-208`) but the copy loop
+stops at the buffer edge (`src.get(s)` + `break`, deviation documented at
+`array.rs:800-805`); the window count still takes C's `1+j-i`.
+Impact: an out-of-bounds heap read on an ordinary subscript; under ASAN
+(or an unlucky allocation) the IOC crashes on a legal expression.
+Proof: clamp and loop quoted; the port comment marks the exact deviation.
+
+### CBUG-F3: `DERIV` hard-codes a 5-point fit — fewer than 5 array points reads out of bounds
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `calc/calcApp/src/calcUtil.c:71-75` — `deriv()` calls
+`nderiv(x, y, n, d, 2, work)`; `nderiv` (`:27-70`) sets `m = 2*npts+1 = 5`
+and immediately runs `fitpoly(x, y, m, ...)`, whose accumulation loop
+(`:279-289`, the cited `:281` is `beta[0] += y[i]`) reads `x[0..4]`/
+`y[0..4]` **regardless of `n`**. `nderiv` never compares `m` with `n`;
+`fitpoly`'s only guard is `n<3` on its *own* argument, which is always the
+constant 5 here. aCalc reaches it with `1+lastEl-firstEl` points
+(`aCalcPerform.c:976-985`), which a 2-element array makes 2.
+Defect: the window size is fixed at 5 while the caller's array can be
+smaller; the tail loop `lx[j] = x[(n-m)+j]` (`:60`) even indexes with a
+*negative* offset when `n < 5`.
+Port: `crates/epics-base-rs/src/calc/engine/array.rs:1198-1204` — the
+port's `nderiv` returns `None` for a window it cannot fit and the operator
+raises `CalcError::FitFailed` instead of reading out of bounds.
+Impact: `DERIV(AA)` on an array (or window) of fewer than 5 elements reads
+before/past the operand buffer — garbage derivative or a crash.
+Proof: call chain quoted; `n` is never checked against `m` anywhere in
+`nderiv`.
+
+### CBUG-F4: sCalc `SUBLAST` never matches at offset 0
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `sCalcPerform.c:996-1003` (the both-strings arm of `case SUB`):
+```c
+s1 = ps->s + strlen(ps->s) - strlen(ps1->s);
+for (s = NULL; (s == NULL) && (s1 > ps->s); s1--) {   /* stops BEFORE s1 == ps->s */
+    if (strncmp(s1, ps1->s, strlen(ps1->s))==0) s = s1;
+```
+The backward scan's condition `s1 > ps->s` excludes the string head, so a
+needle whose *last* (or only) occurrence starts at offset 0 is reported
+absent.
+Defect: boundary condition; `>=` was intended (the forward-scan `SUB` arm
+above has no such exclusion).
+Port: `crates/epics-base-rs/src/calc/engine/string.rs:789-810` +
+`rfind_sub` (`:1638-1646`) — `rposition` over all windows, offset 0
+included.
+Impact: `"abc" |- "abc"` (delete last occurrence) deletes nothing in C;
+any SUBLAST whose match sits at the head silently no-ops.
+Proof: loop condition quoted.
+
+### CBUG-F5: sCalc `LITERAL_STRING`'s copy guard never increments its counter — a >39-char literal overruns the 40-byte stack cell
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `sCalcPerform.c:1493-1498`:
+```c
+case LITERAL_STRING:
+    INC(ps);
+    ps->s = &(ps->local_string[0]);
+    s = ps->s;
+    for (i=0; (i<SCALC_STRING_SIZE-1) && *post; )
+        *s++ = (char)*post++;                /* <-- i is NEVER incremented */
+    *s = '\0';
+```
+`i` stays 0, so the bound `i < 39` is always true and the copy runs to the end
+of the literal — a literal longer than 39 characters writes past
+`local_string[40]` inside the stack element.
+Defect: the loop was written as a bounded copy and the bound is inert.
+Port: `crates/epics-base-rs/src/calc/engine/string.rs:618-625` →
+`StackValue::str` → `ScalcString::from_c` (`value.rs:155-162`) — the
+39-byte bound is structural at the one place string cells are built.
+Impact: a `.db`-authored expression with a long quoted literal corrupts
+the adjacent stack element (or, at the last slot, the allocation tail) on
+every evaluation. Reachable by anyone who can load a database.
+Proof: loop quoted — no `i++` exists on any path through it.
+
+### CBUG-F6: calc `INPM`..`INPU` declare `special(SPC_MOD)` that `special()` rejects — nine documented fields are unwritable via CA
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `epics-base modules/database/src/std/rec/calcRecord.dbd.pod:637-687` —
+`INPM`..`INPU` (nine link fields) each carry `special(SPC_MOD)`.
+`calcRecord.c`'s `special()` (the `static long special(DBADDR*, int)` body)
+handles `SPC_CALC` only and ends `recGblDbaddrError(S_db_badChoice, paddr,
+"calc::special - bad special value!"); return S_db_badChoice;`. `SPC_MOD`
+is `2` and is not `SPC_CALC`, so any `dbPutField` to those fields runs
+`special(after=TRUE)`, hits the fall-through, and returns
+`S_db_badChoice`.
+Defect: the dbd declares a `special` the record's `special()` does not
+implement. `INPA`..`INPL` (the first twelve) carry no `special` and write
+fine; only M..U were given the attribute.
+Port: `crates/epics-base-rs/src/server/records/calc.rs:758-770` — the
+port's `special()` acts only on `CALC` and returns `Ok(())` for every
+other field, so INPM..INPU accept writes. (The port declines to reproduce
+a self-inflicted `S_db_badChoice`: refusing a documented, ordinarily
+writable link field is a usability regression with no contract behind it.)
+Impact: on a C IOC, `caput CALC.INPM "other.VAL CP"` fails with
+`S_db_badChoice` ("bad special value"); the nine inputs M..U can only be
+set at `.db` load time. A parity-faithful port would inherit the same
+inability to re-point half a calc record's inputs at run time.
+Proof: dbd `special(SPC_MOD)` on M..U quoted; `special()` handles only
+`SPC_CALC` and returns `S_db_badChoice` otherwise.
+
+### CBUG-F7: sCalc `SUBLAST` scan contains an unconditional debug `printf`
+Bucket: NOT-REPRODUCED · Severity: Low
+C: `sCalcPerform.c:999` — inside the CBUG-F4 backward-scan loop:
+```c
+for (s = NULL; (s == NULL) && (s1 > ps->s); s1--) {
+    printf("comparing '%s' with '%s'\n", s1, ps1->s);   /* <-- unconditional */
+    if (strncmp(s1, ps1->s, strlen(ps1->s))==0) s = s1;
+```
+Every other diagnostic in the file is gated on `sCalcPerformDebug`; this
+one is not.
+Defect: a debug `printf` left in the shipped evaluation path — no debug
+gate, runs on every SUBLAST of two strings.
+Port: `crates/epics-base-rs/src/calc/engine/string.rs:789-810` — the
+SUBLAST arm emits nothing.
+Impact: an sCalc/scalcout record using `|-` on strings spams the IOC
+console once per compared suffix, per evaluation — console noise
+proportional to string length, on a normal scan.
+Proof: the `printf` at `:999` is inside the loop with no `if
+(sCalcPerformDebug)` guard.
+
+### CBUG-F8: sCalc `CRC16`/`MODBUS` sign-extends payload bytes ≥ 0x80 — wire-incompatible with the Modbus CRC standard
+Bucket: REPRODUCED · Severity: Medium
+C: `sCalcPerform.c:193-212` (the `CRC16` case). Payload is
+`char tranInput[40]` (signed on x86-64) folded into `unsigned int crc` via
+`crc ^= (unsigned int)tranInput[i]`; a byte ≥ 0x80 sign-extends to
+`0xFFFFFF80..`, polluting bits 16-31, and the eight `crc >>= 1` steps shift
+that back down. The commented-out predecessor at `:211` masks to the low
+byte, showing the low-byte XOR was intended.
+Defect: the standard Modbus CRC-16 XORs the *unsigned* byte; C's signed
+`char` makes every high byte wrong.
+Port: `crates/epics-base-rs/src/calc/engine/checksum.rs` (R18-6,
+`ee4f6bff`) — reproduces the 32-bit accumulator and the signed-`char`
+sign-extension deliberately, with the deviation-from-standard documented
+at the function. **Adjudicated REPRODUCE**: bug-for-bug parity with the
+compiled IOC is the contract on exactly the binary Modbus frames the
+operator uses; deviating to standard-correct would make the port
+wire-incompatible with every existing C IOC.
+Impact: `CRC16` of any payload containing a byte ≥ 0x80 differs from the
+Modbus standard — but agrees with the C IOC, which is the point. ASCII-only
+payloads are unaffected (`XOR8`/`LRC`/`AMODBUS` unaffected entirely).
+Proof (compiled C, this host): `CRC16("\x80")` → C `\x41\x1f`,
+standard-correct → `\xbe\xe0`; port matches C.
+
+### CBUG-F9: pvxs process-only blocking PUT selects a `requestType` `dbNotify` never matches — silent no-op success
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `pvxs/ioc/singlesource.cpp:364-368` sets
+`putOperationCache->notify.requestType = value["value"].isMarked(true,true)
+? putProcessRequest : processRequest;` — i.e. `processRequest` when the
+client marked no `value`. `epics-base modules/database/src/ioc/db/dbNotify.c`
+`processNotifyCommon` never acts on `processRequest`: `:207` inits
+`didPut=0`; the put branch (`:232-239`) tests only `putProcessRequest` /
+`putProcessGetRequest`; the process branch (`:242-250`) requires
+`processGetRequest`. So `didPut` stays 0, `doProcess` stays 0 — no put, no
+process, and the callback reports success.
+Defect: pvxs asks base to do a plain process via a request type base's
+notify state machine does not recognise; the operation silently does
+nothing.
+Port: the port's QSRV blocking PUT with an unmarked `value` (R18-56)
+**writes and processes** rather than no-opping — a deliberate deviation:
+the port declines to reproduce a silent no-op that looks like success.
+`crates/epics-bridge-rs/src/qsrv/channel.rs:360` and the group PUT
+classifier (`group.rs`, R17-37 `b831f62e`) own the marked/unmarked
+decision.
+Impact: on pvxs+base, a blocking PUT that marks no `value` field (a
+process-only request) returns success having done nothing — no record
+processing, no error. A parity-faithful port would swallow process-only
+PUTs the same way.
+Proof: `singlesource.cpp:364-368` quoted; the three `dbNotify.c` branches
+that never match `processRequest` quoted (`:207`, `:232-239`, `:242-250`).
+
+### CBUG-F10: pvxs UnionArray encode omits the selector its own decoder requires — a decoded UnionArray cannot be re-serialized
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `pvxs/src/dataencode.cpp:370-382` (encode `UnionA`) writes, per element,
+a presence byte (`uint8_t(elem ? 1 : 0)`) then `to_wire_full(buf, elem)` —
+**no selector index**. The decoder (`:630-659`) reads the presence byte
+then `from_wire(buf, select)` (a Selector) and rebuilds the element as the
+selected member's type. Encode writes each element through its own
+FieldDesc without emitting the selector the decoder then tries to read.
+Defect: encode and decode disagree on the wire shape of a UnionArray
+element — a value decoded from the wire cannot be re-encoded to the same
+bytes (the selector is lost / mis-framed on the round trip).
+Port: `crates/epics-pva-rs/src/pvdata/encode.rs:1049-1074` — the port emits
+`presence(0x01) + selector index + value` per element (and collapses an
+absent/invalid selector to `0x00`), which is a **self-consistent**
+encode/decode pair and the shape the port's decoder expects. The port is
+**correct**; do **not** "fix" it toward pvxs.
+Impact: a pvxs peer that decodes a UnionArray and re-serializes it emits a
+frame that does not round-trip; interop with the port on UnionArray fields
+depends on the port's (correct) framing, not pvxs's.
+Proof: pvxs encode `:370-382` (presence + `to_wire_full`, no selector) vs
+decode `:630-659` (presence + `Selector` read) quoted.
+
+### CBUG-F11: `caput REC.TSIZ -1` suspends the put thread forever inside `callocMustSucceed`, holding the global trace mutex
+Bucket: NOT-REPRODUCED · Severity: High
+C: `asyn/asyn/asynRecord/asynRecord.c:450-451` — the TSIZ special arm calls
+`pasynTrace->setTraceIOTruncateSize(pasynUser, pasynRec->tsiz)` with `tsiz`
+an `epicsInt32` (`:196`). `asynManager.c:2943-2959`
+(`setTraceIOTruncateSize`) takes `size_t size`; `-1` becomes
+`18446744073709551615`, passes `size > traceBufferSize`, and calls
+`callocMustSucceed(size, 1, ...)`. `libcom/src/misc/cantProceed.c:22-36`:
+`calloc` returns NULL for that size, so the `while ((mem = calloc(...)) ==
+NULL)` loop `errlogPrintf`s and calls `epicsThreadSuspendSelf()` — **inside
+the loop**, forever. The call happens under
+`epicsMutexMustLock(pasynBase->lockTrace)` (`:2948`), which is never
+released.
+Defect: a signed record field is passed to a `size_t` allocator with no
+range check, and the "must succeed" allocator's failure mode is permanent
+thread suspension while holding a global lock.
+Port: `crates/asyn-rs/src/...` (asynRecord port, R18-78) does
+`self.tsiz as usize` → `usize::MAX` → interpreted as "unlimited tracing";
+no allocation of that size is attempted, no thread suspends.
+Impact: `caput <asynRecord>.TSIZ -1` — a plausible operator typo — hangs
+the CA/dbPutField thread that serviced it *forever* and permanently holds
+`lockTrace`, so every subsequent trace-config operation on any asyn port
+blocks. Effective IOC-wide denial of the trace subsystem from one bad put.
+Proof: `epicsInt32 tsiz` (`:196`) → `size_t` param (`asynManager.c:2943`) →
+`callocMustSucceed(size,...)` (`:2949-2951`) → suspend-in-`while`-loop
+(`cantProceed.c:26-33`), all under `lockTrace` taken at `:2948` and never
+unlocked on this path.
+
+### CBUG-F12: base `histogram` `LLIM >= ULIM` alarm writes `stat`/`sevr` directly and `recGblResetAlarms` erases it in the same cycle — dead code
+Bucket: REPRODUCED · Severity: Low
+C: `epics-base modules/database/src/std/rec/histogramRecord.c:328-334`
+(`add_count`):
+```c
+if (prec->llim >= prec->ulim) {
+    if (prec->nsev < INVALID_ALARM) {
+        prec->stat = SOFT_ALARM;       /* writes stat/sevr, NOT nsta/nsev */
+        prec->sevr = INVALID_ALARM;
+        return -1;
+```
+It writes `stat`/`sevr` directly rather than `nsta`/`nsev` via
+`recGblSetSevr`. `process()` later calls `monitor()`, which runs
+`recGblResetAlarms()` in the same cycle; that copies `nsta/nsev → stat/sevr`,
+overwriting the direct write before any client can observe it.
+Defect: the alarm the author intended is unconditionally erased in the
+same process cycle — dead code. C's *intent* is to alarm; C's *behavior* is
+NO_ALARM.
+Port: `crates/epics-base-rs/src/server/records/histogram.rs` — never sets
+the `LLIM>=ULIM` alarm, so it coincidentally matches C's *behavior*
+(NO_ALARM). **REPRODUCE by matching behavior, not intent**: no port change
+is warranted; if upstream ever fixes this, the port will need the alarm
+added. Flagged so a future auditor reading `histogramRecord.c` does not
+re-derive it as a parity gap.
+Impact: a histogram with inverted limits (`LLIM=10, ULIM=5`) reports
+NO_ALARM on both the C IOC and the port; the "invalid limits" alarm the
+source appears to raise is never observable on either.
+Proof (compiled softIoc, this host): `LLIM=10 ULIM=5`, process → C reports
+`STAT=NO_ALARM SEVR=NO_ALARM`; port reports the same.

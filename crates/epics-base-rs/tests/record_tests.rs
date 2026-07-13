@@ -1704,9 +1704,7 @@ fn test_lcnt_zero_after_process() {
 #[test]
 fn test_lcnt_increments_on_reentrance() {
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.lcnt, 1);
     let _ = instance.process_local().unwrap();
@@ -1719,9 +1717,7 @@ fn test_lcnt_alarm_threshold() {
     // the attempt whose PRE-increment lcnt equals MAX_LOCK=10 — i.e.
     // the 11th consecutive reentrant attempt, not the 10th.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }
@@ -1750,9 +1746,7 @@ fn test_lcnt_alarm_posts_exactly_once() {
     // INVALID_ALARM` (dbAccess.c:545-547). The pre-fix guard re-posted
     // the unchanged SEVR/STAT/VAL on every attempt past the threshold.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
-    instance
-        .processing
-        .store(true, std::sync::atomic::Ordering::Release);
+    instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }

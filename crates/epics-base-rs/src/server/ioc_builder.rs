@@ -192,7 +192,8 @@ impl IocBuilder {
         // A build is a load plus C's `iocInit`: records are created here, and
         // the link-status classifications they issue are queued until
         // `db.ioc_init()` at the end runs them against the finished database.
-        db.begin_load();
+        db.begin_load()
+            .expect("a database created a line ago has not run iocInit");
 
         // Breakpoint-table registry (C `bptList`): merge every loaded
         // `breaktable(...)` into the database's shared registry (the single

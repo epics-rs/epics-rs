@@ -26,7 +26,7 @@ pub use menu_choices::{
 };
 pub use pini::PiniMode;
 pub(crate) use record_instance::value_as_dbr_string;
-pub use record_instance::{AlarmAck, DeferredNotifyPut, NotifyWaitSet, RecordInstance};
+pub use record_instance::{AlarmAck, DeferredNotifyPut, NotifyWaitSet, PactExit, RecordInstance};
 pub use record_trait::{
     ArrayMonitorPost, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride, InputFetchPolicy, LinkReadAs,

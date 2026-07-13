@@ -333,23 +333,58 @@ type RecordInit = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send 
 ///
 /// The boundary is `iocInit`, NOT a load group: gating on the load group left
 /// the multi-`dbLoadRecords` case every real `st.cmd` uses racing 9-in-15
-/// (R18-92). So the phase here is an ioc-lifecycle state, entered by the first
-/// load and left only by [`PvDatabase::ioc_init`]:
+/// (R18-92). So the phase here is an ioc-lifecycle state.
 ///
-/// * [`Loading`](Self::Loading) — records are still being created. A
-///   classification issued now is QUEUED, not run: a half-built database is
-///   never observed, because no classification code runs against one.
-/// * [`Complete`](Self::Complete) — the database is final (`iocInit` has run,
-///   or none was ever needed: a programmatically built or unit-test database
-///   loads nothing). A classification issued now runs immediately, which is
-///   also what a runtime re-point (`special()` on a link field) needs.
+/// # The lifecycle is ONE-WAY: `Unloaded → Loading → Running`
+///
+/// R18-92 modelled it with two states, `Loading` and `Complete`, where
+/// `Complete` meant BOTH "never loaded" and "iocInit has run" — so `begin_load`
+/// needed a `Complete → Loading` arm to open the phase at all, and that arm ran
+/// on a post-iocInit load too. One `dbLoadRecords` typed after `iocInit` then
+/// re-armed the queue that only `ioc_init` drains, and every later
+/// classification — including every runtime `special()` link re-point — was
+/// pushed into a `Vec` nothing polls (R19-62, measured: `iocInit;
+/// dbLoadRecords(b.db); dbpf CO.INPA "9.5"` froze `CO.INAV` at 0).
+///
+/// Splitting the two meanings is what closes it: `Loading` is now produced ONLY
+/// from `Unloaded`, so no function in the crate can transition backwards out of
+/// `Running`. The one-way-ness is a property of the transitions that exist, not
+/// of a runtime check.
 enum DbInitPhase {
+    /// No load has begun. `iocInit` is owed nothing, so a classification runs
+    /// immediately — a programmatically built or unit-test database.
+    Unloaded,
     /// Between the first `dbLoadRecords`/builder load and `iocInit`; holds the
-    /// classifications owed, in issue order.
+    /// classifications owed, in issue order. A half-built database is never
+    /// observed, because no classification code runs against one.
     Loading(Vec<RecordInit>),
-    /// The database is complete; classification runs against it directly.
-    Complete,
+    /// `iocInit` has run: the database is final and every link status is
+    /// classified. A classification issued now runs immediately, which is what a
+    /// runtime re-point (`special()` on a link field) needs. TERMINAL — nothing
+    /// re-opens the load phase.
+    Running,
 }
+
+/// [`PvDatabase::begin_load`] was called on a database whose `iocInit` has
+/// already run — C's `getIocState() != iocVoid` (R19-63).
+///
+/// The `Display` text is C's `errSymMsg(S_dbLib_postInitRecRegister)` verbatim
+/// (`dbStaticLib.h:269`), which is what `dbCreateRecord` prints:
+///
+/// ```text
+/// epics> dbCreateRecord(pdbbase,"ai","NEWREC")
+/// ERROR: 33554463 IOC already initialized - No new records can be added
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IocAlreadyInitialized;
+
+impl std::fmt::Display for IocAlreadyInitialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IOC already initialized - No new records can be added")
+    }
+}
+
+impl std::error::Error for IocAlreadyInitialized {}
 
 /// Which record kind a SELM link selection is being computed for.
 /// The Specified/Mask base differs between record types in C, so the
@@ -507,7 +542,7 @@ impl PvDatabase {
                 external_cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
-                init_phase: std::sync::Mutex::new(DbInitPhase::Complete),
+                init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -1080,16 +1115,40 @@ impl PvDatabase {
     /// Enter the LOAD phase: records are being created and the database is not
     /// yet the one C would classify links against. Called by every path that
     /// begins creating records for an IOC — an `IocBuilder` build, an iocsh
-    /// `dbLoadRecords`, `IocApp::run` — and idempotent, because an `st.cmd`
-    /// issues several loads and they are all one `iocInit` (R18-92).
+    /// `dbLoadRecords` / `dbCreateRecord`, `IocApp::run` — and idempotent within
+    /// the phase, because an `st.cmd` issues several loads and they are all one
+    /// `iocInit` (R18-92).
     ///
-    /// The phase is left ONLY by [`Self::ioc_init`]. A load that fails halfway
-    /// leaves it open, which strands nothing: a queued classification blocks no
-    /// caller, and it is dropped with the database.
-    pub fn begin_load(&self) {
+    /// # Refused once the IOC is running (R19-63)
+    ///
+    /// C admits no record creation after `iocInit`: `dbReadCOM`
+    /// (`dbLexRoutines.c:236`) fails every `.db`/`.dbd` read with `-2` once
+    /// `getIocState() != iocVoid`, and `dbCreateRecordCallFunc`
+    /// (`dbStaticIocRegister.c:288`) fails with `S_dbLib_postInitRecRegister`.
+    /// Asking to create records IS asking to enter the load phase, so the answer
+    /// lives here and is a `Result` the caller cannot ignore — a creator that
+    /// never asked cannot be written by accident, and one that asked cannot
+    /// proceed on a refusal.
+    ///
+    /// The phase is left ONLY by [`Self::ioc_init`], and once left it is
+    /// TERMINAL (R19-62): the queue is drained by exactly one `ioc_init`, so
+    /// nothing can be pushed into it afterwards and stranded. A load that fails
+    /// halfway leaves the phase open, which strands nothing: a queued
+    /// classification blocks no caller, and it is dropped with the database.
+    #[must_use = "C refuses a load after iocInit (dbReadCOM, dbLexRoutines.c:236); \
+                  the refusal must be reported and no record created"]
+    pub fn begin_load(&self) -> Result<(), IocAlreadyInitialized> {
         let mut phase = self.inner.init_phase.lock().unwrap();
-        if matches!(*phase, DbInitPhase::Complete) {
-            *phase = DbInitPhase::Loading(Vec::new());
+        match *phase {
+            // The only producer of `Loading`.
+            DbInitPhase::Unloaded => {
+                *phase = DbInitPhase::Loading(Vec::new());
+                Ok(())
+            }
+            // An `st.cmd` issues several loads; they are all one `iocInit`.
+            DbInitPhase::Loading(_) => Ok(()),
+            // Post-`iocInit`: terminal. Refused, as C refuses it.
+            DbInitPhase::Running => Err(IocAlreadyInitialized),
         }
     }
 
@@ -1098,9 +1157,9 @@ impl PvDatabase {
     ///
     /// During the LOAD phase the future is QUEUED for [`Self::ioc_init`]; a
     /// half-built database cannot be classified against because the code that
-    /// would do it has not been polled. Once the database is complete — after
-    /// `iocInit`, or on a database that never loaded — it is spawned at once,
-    /// which is what a runtime `special()` link re-point needs.
+    /// would do it has not been polled. Before any load, and once `iocInit` has
+    /// run, it is spawned at once — which is what a runtime `special()` link
+    /// re-point needs.
     pub(crate) fn schedule_record_init(
         &self,
         init: impl std::future::Future<Output = ()> + Send + 'static,
@@ -1108,7 +1167,7 @@ impl PvDatabase {
         let mut phase = self.inner.init_phase.lock().unwrap();
         match &mut *phase {
             DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
-            DbInitPhase::Complete => {
+            DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
                 tokio::spawn(init);
             }
@@ -1126,9 +1185,12 @@ impl PvDatabase {
     pub async fn ioc_init(&self) {
         let owed = {
             let mut phase = self.inner.init_phase.lock().unwrap();
-            match std::mem::replace(&mut *phase, DbInitPhase::Complete) {
+            match std::mem::replace(&mut *phase, DbInitPhase::Running) {
                 DbInitPhase::Loading(queued) => queued,
-                DbInitPhase::Complete => return,
+                // An IOC that loaded nothing (programmatic / unit-test database)
+                // still crosses the barrier: the phase becomes terminal.
+                DbInitPhase::Unloaded => return,
+                DbInitPhase::Running => return,
             }
         };
         // Sequential, in issue order: each classification is a short read of a

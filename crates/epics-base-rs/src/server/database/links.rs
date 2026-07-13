@@ -3,11 +3,36 @@ use std::sync::Arc;
 
 use crate::runtime::sync::RwLock;
 use crate::server::record::{AlarmSeverity, NotifyWaitSet, OutTarget, RecordInstance, ScanType};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::link_set::LinkDbfType;
 use super::processing::join_put_notify;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
+
+/// The string a `DBF_CHAR`/`DBF_UCHAR` source spells, for a reader that asked
+/// for [`LinkReadAs::CharArrayAsString`](crate::server::record::LinkReadAs) —
+/// C `dbGetLink(&dol, DBF_CHAR, &s, 0, &n_elements)` copying `n` bytes into the
+/// reader's char buffer, which every later `strcmp`/`atof` then reads as a C
+/// string (`sseqRecord.c:682-696`).
+///
+/// `max_elements` is the reader's own clamp (C `if (n_elements>40) n_elements=40`
+/// against its `char s[40]`). The bytes stop at the first NUL, which is where the
+/// C string ends; a scalar `CHAR` source contributes its single byte, exactly as
+/// C's `n_elements == 1` read does.
+fn char_bytes_as_string(value: &EpicsValue, max_elements: usize) -> Option<PvString> {
+    let bytes: &[u8] = match value {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => b,
+        EpicsValue::Char(b) | EpicsValue::UChar(b) => std::slice::from_ref(b),
+        // Not a char-class source after all (the metadata said it was): C would
+        // have copied raw bytes of whatever it found. There is no faithful
+        // rendering, so deliver nothing — the caller treats it as a failed read.
+        _ => return None,
+    };
+    let n = bytes.len().min(max_elements);
+    let text = &bytes[..n];
+    let end = text.iter().position(|&b| b == 0).unwrap_or(n);
+    Some(PvString::from_bytes(text[..end].to_vec()))
+}
 
 /// C `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:701`): the link set's cached
 /// remote type expressed as the DBF type a device support switches on.
@@ -388,6 +413,71 @@ impl PvDatabase {
             // `read_calc_link_with_time` for callers that need it.
             crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc).await,
         }
+    }
+
+    /// C `dbGetLink(plink, dbrType, ...)` — an input-link read for the DBR class
+    /// the READER asked for ([`LinkReadAs`]), not the source's native type.
+    ///
+    /// The typed READ seam, twin of the typed WRITE seam
+    /// ([`Record::typed_output_buffer`] + [`Self::resolve_out_target`]). C's
+    /// conversion happens at the SOURCE (`dbConvert.c`'s
+    /// `[field_type][dbrType]` table), which is why it belongs here and not at
+    /// the reader's `put_field`: only this side can reach the source record's
+    /// choice tables, so a `DBF_ENUM`/`DBF_MENU` source read as `DBR_STRING`
+    /// delivers its state LABEL (`sseqRecord.c:644-661`) where a native read
+    /// would hand over a bare index, and a `DBF_CHAR` array read as
+    /// `DBF_CHAR` delivers the bytes it spells (`:682-686`) where a native read
+    /// would hand over an array no numeric target can absorb.
+    pub(crate) async fn read_link_value_as(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        read_as: crate::server::record::LinkReadAs,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> Option<EpicsValue> {
+        use crate::server::record::LinkReadAs;
+        let value = self.read_link_value(link, visited, depth).await?;
+        match read_as {
+            LinkReadAs::Native => Some(value),
+            // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
+            // its element 0 (C asks for one element, so `dbGet` converts offset
+            // 0), the same rule the multi-input fetch applies.
+            LinkReadAs::Double => {
+                let scalar = if value.is_array() {
+                    value.first_element()?
+                } else {
+                    value
+                };
+                scalar.to_f64().map(EpicsValue::Double)
+            }
+            LinkReadAs::String => self
+                .dbr_string_of(link, &value)
+                .await
+                .map(EpicsValue::String),
+            LinkReadAs::CharArrayAsString { max_elements } => {
+                char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
+            }
+        }
+    }
+
+    /// The `DBR_STRING` form of a value just read from `link`: rendered by the
+    /// SOURCE record when the link is local (its choice tables are what turn an
+    /// `ENUM`/`MENU` index into a state label — C `getEnumString`), by the value
+    /// itself otherwise (an external link / constant / lnkCalc result carries no
+    /// reachable field metadata).
+    async fn dbr_string_of(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        value: &EpicsValue,
+    ) -> Option<PvString> {
+        if let crate::server::record::ParsedLink::Db(db) = link
+            && self.has_name_no_resolve(&db.record).await
+            && let Some(rec) = self.get_record(&db.record).await
+        {
+            let guard = rec.read().await;
+            return guard.field_as_dbr_string(&db.field);
+        }
+        crate::server::record::value_as_dbr_string(value)
     }
 
     /// Read a link's current value WITHOUT processing a Passive source —

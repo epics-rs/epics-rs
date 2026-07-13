@@ -3750,6 +3750,15 @@ impl PvDatabase {
     /// READER to the source's severity. That inheritance runs here too, through
     /// [`Database::input_link_inheritance`] — the same owner the multi-input
     /// fetch uses.
+    ///
+    /// The DBR class of the read is the RECORD's
+    /// ([`Record::input_link_read_as`], C's `dbGetLink` `dbrType` argument),
+    /// resolved from the SOURCE's metadata by the same owner the OUT side uses
+    /// ([`Self::resolve_out_target`]): a record that switches on the source's
+    /// DBF class (sseq `DOLn`, `sseqRecord.c:640-705`) gets the value C's
+    /// `dbGetLink` would deliver — an `ENUM`/`MENU` source's LABEL, a `CHAR`
+    /// array's bytes — instead of a native value it would have to guess at.
+    /// `None` from the record is C's `default: break`: no read, no alarm.
     async fn read_db_link_into_field(
         &self,
         rec: &Arc<crate::runtime::sync::RwLock<RecordInstance>>,
@@ -3777,7 +3786,23 @@ impl PvDatabase {
             return None;
         }
         let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
-        match self.read_link_value(&parsed, visited, depth).await {
+        // The source's DBF class + element count (C `dbGetLinkDBFtype` /
+        // `dbGetNelements` — the same lset accessors the OUT side asks of a
+        // destination), resolved with NO record lock held: a self-referencing
+        // link would otherwise re-enter this record's own gate.
+        let source = self.resolve_out_target(&parsed).await;
+        let read_as = {
+            let instance = rec.read().await;
+            instance.record.input_link_read_as(link_field, &source)
+        };
+        // C's `default:` arm — the record's switch has no case for this source
+        // class, so `dbGetLink` is never called: nothing is attempted, and the
+        // untouched `status` raises no link alarm.
+        let read_as = read_as?;
+        match self
+            .read_link_value_as(&parsed, read_as, visited, depth)
+            .await
+        {
             Some(value) => {
                 // C `dbDbGetValue` tail (dbDbLink.c:228-232): a healthy read
                 // folds the SOURCE's committed alarm into the READER per the
@@ -3789,7 +3814,20 @@ impl PvDatabase {
                         .await
                 };
                 let mut instance = rec.write().await;
-                let _ = instance.record.put_field_internal(target_field, value);
+                // A value the target field REJECTS is a failed read, not a
+                // silent no-op: C `dbGetLink`'s conversion failure comes back as
+                // a non-zero status and takes the `setLinkAlarm` path
+                // (`dbLink.c:316-323`) exactly like a dead target. Discarding it
+                // left the target field holding its previous value with no
+                // alarm to say so.
+                let stored = instance
+                    .record
+                    .put_field_internal(target_field, value)
+                    .is_ok();
+                if !stored {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, link_field);
+                    return Some(false);
+                }
                 if let Some((ms, alarm)) = inheritance {
                     super::links::inherit_sevr_msg(&mut instance.common, ms, &alarm);
                 }

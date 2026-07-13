@@ -431,6 +431,32 @@ pub(crate) struct DeadbandPost {
     pub field: Option<(String, EpicsValue)>,
 }
 
+/// A value's `DBR_STRING` form, for a source whose field metadata is NOT
+/// reachable (an external CA/PVA link, a constant, an lnkCalc result) — the
+/// fallback half of [`RecordInstance::field_as_dbr_string`], which is also the
+/// whole rule once the local choice table has had its say.
+///
+/// A pvalink NTEnum still resolves its label here: the carrier brings its own
+/// `choices` (pvxs `pvalink_lset.cpp:344-356` — a `DBR_STRING` target copies
+/// `choices[index]`). A bare `Enum` index from a link whose labels the port
+/// cannot reach falls back to its decimal form, like the CA `*_STRING` encoder.
+pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
+    match value {
+        EpicsValue::String(s) => Some(s.clone()),
+        EpicsValue::Enum(v) => Some(PvString::from(v.to_string())),
+        EpicsValue::EnumWithChoices { index, choices } => Some(
+            choices
+                .get(*index as usize)
+                .cloned()
+                .unwrap_or_else(|| PvString::from(index.to_string())),
+        ),
+        other => match other.clone().convert_to(DbFieldType::String) {
+            EpicsValue::String(s) => Some(s),
+            _ => None,
+        },
+    }
+}
+
 impl RecordInstance {
     pub fn new(name: String, record: impl Record) -> Self {
         Self::new_boxed(name, Box::new(record))
@@ -737,6 +763,53 @@ impl RecordInstance {
             DbFieldType::Short | DbFieldType::UShort => self.menu_choices_for(field).is_some(),
             _ => false,
         }
+    }
+
+    /// The field's value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it —
+    /// the SOURCE side of an input link read with
+    /// [`LinkReadAs::String`](super::record_trait::LinkReadAs::String).
+    ///
+    /// C converts at the source, through `dbConvert.c`'s
+    /// `[field_type][DBR_STRING]` table: a `DBF_ENUM` field goes through
+    /// `getEnumString` → the record's `get_enum_str` (mbbi's `ZRST`.., bi's
+    /// `ZNAM`/`ONAM`) and a `DBF_MENU` field through `getMenuString` → the
+    /// menu's choice string, i.e. the state LABEL in both cases, never the
+    /// index. Only the record holds those tables, so the render lives here with
+    /// the field metadata — the link-read owner has an index and nothing to
+    /// resolve it with.
+    ///
+    /// An index past the configured labels falls back to its decimal form, the
+    /// same rule the CA `*_STRING` encoder applies (`types/codec.rs::enum_label`).
+    pub(crate) fn field_as_dbr_string(&self, field: &str) -> Option<PvString> {
+        let value = self.resolve_field(field)?;
+        // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
+        // resolve through this record's label tables: the field's `menu()`
+        // choices, else the record's own enum states (the `get_enum_str` table
+        // the snapshot builder already assembles). A short field that is neither
+        // has no table and stays the plain number C converts it to.
+        let idx = match value {
+            EpicsValue::Enum(v) => Some(v),
+            EpicsValue::Short(v) => u16::try_from(v).ok(),
+            _ => None,
+        };
+        if let Some(idx) = idx {
+            if let Some(label) = self
+                .menu_choices_for(field)
+                .and_then(|c| c.get(idx as usize))
+            {
+                return Some(PvString::from(*label));
+            }
+            if matches!(value, EpicsValue::Enum(_))
+                && let Some(label) = self
+                    .cached_metadata()
+                    .enums
+                    .and_then(|e| e.strings.get(idx as usize).cloned())
+                && !label.is_empty()
+            {
+                return Some(label);
+            }
+        }
+        value_as_dbr_string(&value)
     }
 
     /// Promote a `DBF_MENU` field's value to its `DBR_ENUM` client form: a

@@ -5,8 +5,8 @@ use super::link_status::{
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, LinkType, OutTarget, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
-    parse_link_v2,
+    FieldDesc, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -47,6 +47,9 @@ const DOL_FIELDS: [&str; NUM_STEPS] = [
 ];
 const DO_FIELDS: [&str; NUM_STEPS] = [
     "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
+];
+const STR_FIELDS: [&str; NUM_STEPS] = [
+    "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
 ];
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
@@ -1183,6 +1186,70 @@ impl Record for SseqRecord {
     // multi-output block. The retired `dispatch_multi_output` `MultiOut::Sseq`
     // arm was the old all-at-once path and no longer exists.
 
+    /// C `processCallback`'s SOURCE switch (sseqRecord.c:640-705) — the read
+    /// twin of the destination switch below. The step reads `DOLn` with the DBR
+    /// class the SOURCE's DBF class asks for, never the source's native value:
+    ///
+    /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
+    ///   (:644-661) — `DBR_STRING` into `s`/`STRn`, then `dov = atof(s)`. For an
+    ///   `ENUM`/`MENU` source that is the state LABEL ("Busy"), so `DOn` becomes
+    ///   `atof("Busy") == 0`, NOT the state index. The seven classes are the same
+    ///   set [`OutTarget::puts_as_string`] reports for the destination switch.
+    /// - `DBF_SHORT`..`DBF_DOUBLE` (:663-680) — `DBR_DOUBLE` into `dov`/`DOn`,
+    ///   then `STRn` is re-rendered at the record's PREC.
+    /// - `DBF_CHAR`/`DBF_UCHAR` (:682-700) — `min(n_elements, 40)` bytes into the
+    ///   40-byte `s`, then `dov = atof(s)`. The long-string idiom; a scalar
+    ///   `CHAR` source contributes its one byte, as C's `n_elements == 1` read
+    ///   does.
+    /// - anything else (:703, `default: break`) — **no read at all**: a CONSTANT
+    ///   `DOLn` (C's `init_record` pins it to `DBF_NOACCESS`, :206, so the switch
+    ///   never matches again — the constant is seeded once, at init, see
+    ///   [`Self::constant_init_links`]), a source whose type does not resolve,
+    ///   and `DBF_INT64`/`DBF_UINT64`, which the switch has no case for.
+    ///
+    /// `SELL` is not part of this switch: C reads it with a FIXED
+    /// `dbGetLink(&pR->sell, DBF_USHORT, &pR->seln, 0, 0)` (:314-317), so it
+    /// keeps the framework's native read and `SELN`'s own put coercion.
+    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
+        let Some((_, "DOL")) = Self::step_index_from_suffix(link_field) else {
+            return Some(LinkReadAs::Native);
+        };
+        if source.puts_as_string {
+            return Some(LinkReadAs::String);
+        }
+        match source.field_type? {
+            DbFieldType::String | DbFieldType::Enum => Some(LinkReadAs::String),
+            DbFieldType::Char | DbFieldType::UChar => Some(LinkReadAs::CharArrayAsString {
+                // C `if (n_elements>40) n_elements=40` against `char s[40]`.
+                max_elements: source.element_count.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
+            }),
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(LinkReadAs::Double),
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+        }
+    }
+
+    /// C `init_record` (sseqRecord.c:203-207): a CONSTANT `DOLn` is loaded ONCE,
+    /// here — `recGblInitConstantLink(&dol, DBF_DOUBLE, &dov)` then
+    /// `(&dol, DBF_STRING, s)`, followed by the `s[0] ? dov = atof(s)` tail
+    /// (:243-245), whose net effect is the record's own `set_string` of the link
+    /// TEXT. Seeding `STRn` (not `DOn`) reproduces both halves: the string view
+    /// keeps the constant's raw text ("1.50" stays "1.50", not the PREC
+    /// rendering of 1.5) and the numeric view follows as `atof`.
+    ///
+    /// The per-cycle read never sees a constant again — C pins its
+    /// `dol_field_type` to `DBF_NOACCESS`, which falls to `processCallback`'s
+    /// `default: break` ([`Self::input_link_read_as`]).
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        (0..NUM_STEPS)
+            .map(|i| crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i]))
+            .collect()
+    }
+
     /// C `processCallback`'s destination switch (sseqRecord.c:706-793): the
     /// step forwards the view of its value that the `LNKn` TARGET's DBF class
     /// asks for, never the one its `DOLn` source happened to deliver.
@@ -1308,14 +1375,16 @@ impl Record for SseqRecord {
 
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         // The framework's typed link read (`ProcessAction::ReadDbLink` →
-        // `DOn`) delivers the `DOLn` target's NATIVE value here. C
-        // `processCallback` reads `DOLn` by `dol_field_type`: a string-class
-        // source is read with `DBR_STRING` and kept byte-exact in `s`/`STRn`
-        // (then `dov = atof(s)`), NOT collapsed to a double
-        // (sseqRecord.c:643-705). A *client* put to `DOn` (`put_field`) is a
-        // plain `DBF_DOUBLE` convert, so this string-preserving capture is
-        // internal-only. Which view then reaches `LNKn` is the DESTINATION's
-        // choice, not the source's — see `typed_output_buffer`.
+        // `DOn`) delivers what C's `dbGetLink` delivered for the class the
+        // step's `DOLn` SOURCE resolved to (see `input_link_read_as`): a
+        // `DBR_STRING` for the string-class and `CHAR`-array arms, a
+        // `DBR_DOUBLE` for the numeric one. Both land in the step's value pair
+        // through its two owners below — a string keeps its bytes and `dov`
+        // follows as `atof(s)`; a double re-renders `STRn` at PREC. A *client*
+        // put to `DOn` (`put_field`) is a plain `DBF_DOUBLE` convert, so this
+        // string-preserving capture is internal-only. Which view then reaches
+        // `LNKn` is the DESTINATION's choice, not the source's — see
+        // `typed_output_buffer`.
         if let Some((idx, "DO")) = Self::step_index_from_suffix(name) {
             match value {
                 // C `processCallback` string arm (:657-661): the bytes are kept

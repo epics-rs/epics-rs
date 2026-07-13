@@ -342,7 +342,9 @@ impl SwaitRecord {
         let link_gen = self.link_gen.clone();
         // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
         let token = link_gen.next();
-        tokio::spawn(async move {
+        let sched = handle.clone();
+        // Through the database's `iocInit` owner — see `schedule_record_init`.
+        sched.schedule_record_init(async move {
             // Let `add_record` finish registering this record before the init
             // post (this task may be spawned from `set_async_context`).
             tokio::task::yield_now().await;

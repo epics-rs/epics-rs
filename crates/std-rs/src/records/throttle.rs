@@ -214,7 +214,9 @@ impl ThrottleRecord {
         // Stamp this refresh so a later re-point (an OUT/SINP `special()`)
         // supersedes an init-time snapshot that finishes late.
         let token = link_gen.next();
-        tokio::spawn(async move {
+        let sched = handle.clone();
+        // Through the database's `iocInit` owner — see `schedule_record_init`.
+        sched.schedule_record_init(async move {
             // Let `add_record` finish registering before the init post —
             // this task may be spawned from `set_async_context`, which runs
             // just before the record is inserted into the map.

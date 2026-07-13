@@ -204,11 +204,19 @@ impl AsyncDbHandle {
         }
     }
 
-    /// Await the end of a database LOAD phase ([`PvDatabase::begin_load`]).
-    /// Returns immediately when no load is in progress or the database is gone.
-    pub async fn wait_for_load(&self) {
+    /// Schedule a record's link-status classification — see
+    /// [`PvDatabase::schedule_record_init`]. This is the ONE owner every
+    /// record's `refresh_link_status` goes through: during the LOAD phase the
+    /// classification is queued for `iocInit` (so it never reads a half-built
+    /// database, and its result is final when `iocInit` returns), and on a
+    /// complete database it is spawned at once. Dropped, unrun, if the database
+    /// is gone.
+    pub fn schedule_record_init(
+        &self,
+        init: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
         if let Some(db) = self.db() {
-            db.wait_for_load().await;
+            db.schedule_record_init(init);
         }
     }
 

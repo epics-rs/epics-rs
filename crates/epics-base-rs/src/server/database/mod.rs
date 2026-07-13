@@ -255,23 +255,10 @@ struct PvDatabaseInner {
     /// scan-index race, and lets `remove_*` purge dangling aliases
     /// without a second pass.
     registration_mutex: tokio::sync::Mutex<()>,
-    /// Open while a database LOAD is in progress — a `.db` file (or an
-    /// `IocBuilder`) is still creating records.
-    ///
-    /// C classifies a record's links in `init_record`, which `iocInit` runs
-    /// only AFTER every `dbLoadRecords` block has been read, so a link that
-    /// forward-references a record defined later in the file still resolves to
-    /// a LOCAL link. The port creates records one at a time, so a link-status
-    /// classification issued at creation would see a half-built database and
-    /// call the forward reference an external PV. This gate is the port's
-    /// `iocInit` boundary: the classification primitives
-    /// ([`crate::server::records::link_status::classify_link`] and
-    /// `classify_swait_pv`) await it, so every classification — whenever it was
-    /// issued — reads the COMPLETED database, deterministically and without a
-    /// timed re-poll.
-    loading: std::sync::atomic::AtomicUsize,
-    /// Woken when [`Self::loading`] drops back to zero.
-    load_done: tokio::sync::Notify,
+    /// The IOC lifecycle phase — the port's `iocInit` boundary. See
+    /// [`DbInitPhase`], [`PvDatabase::begin_load`],
+    /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
+    init_phase: std::sync::Mutex<DbInitPhase>,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
@@ -330,26 +317,38 @@ pub struct PvDatabase {
     inner: Arc<PvDatabaseInner>,
 }
 
-/// Holds the database's LOAD phase open — see [`PvDatabase::begin_load`].
-/// Dropping it closes this load and wakes everything waiting for the database
-/// to be complete, on every exit path (including an early `?` out of a failed
-/// `.db` load).
-pub struct DbLoadGuard {
-    inner: std::sync::Weak<PvDatabaseInner>,
-}
+/// A record initialisation owed to `iocInit` — the port's `init_record`
+/// tail. Built by a record's `refresh_link_status` and handed to
+/// [`PvDatabase::schedule_record_init`].
+type RecordInit = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
-impl Drop for DbLoadGuard {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.upgrade() {
-            if inner
-                .loading
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-                == 1
-            {
-                inner.load_done.notify_waiters();
-            }
-        }
-    }
+/// The IOC lifecycle phase, and with it the answer to "may a record's links be
+/// classified against the database as it stands right now?".
+///
+/// C runs `init_record` — where a record classifies its links (`checkLinks`,
+/// `dbNameToAddr`) — from `iocInit`, i.e. after EVERY `dbLoadRecords` block
+/// has been read. A forward reference across two `dbLoadRecords` calls in one
+/// `st.cmd` is therefore a LOCAL link, deterministically, and the classified
+/// value is final the moment `iocInit` returns (`dbgf` is refused before it).
+///
+/// The boundary is `iocInit`, NOT a load group: gating on the load group left
+/// the multi-`dbLoadRecords` case every real `st.cmd` uses racing 9-in-15
+/// (R18-92). So the phase here is an ioc-lifecycle state, entered by the first
+/// load and left only by [`PvDatabase::ioc_init`]:
+///
+/// * [`Loading`](Self::Loading) — records are still being created. A
+///   classification issued now is QUEUED, not run: a half-built database is
+///   never observed, because no classification code runs against one.
+/// * [`Complete`](Self::Complete) — the database is final (`iocInit` has run,
+///   or none was ever needed: a programmatically built or unit-test database
+///   loads nothing). A classification issued now runs immediately, which is
+///   also what a runtime re-point (`special()` on a link field) needs.
+enum DbInitPhase {
+    /// Between the first `dbLoadRecords`/builder load and `iocInit`; holds the
+    /// classifications owed, in issue order.
+    Loading(Vec<RecordInit>),
+    /// The database is complete; classification runs against it directly.
+    Complete,
 }
 
 /// Which record kind a SELM link selection is being computed for.
@@ -508,8 +507,7 @@ impl PvDatabase {
                 external_cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
-                loading: std::sync::atomic::AtomicUsize::new(0),
-                load_done: tokio::sync::Notify::new(),
+                init_phase: std::sync::Mutex::new(DbInitPhase::Complete),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -1079,50 +1077,64 @@ impl PvDatabase {
         self.inner.simple_pvs.write().await.remove(name)
     }
 
-    /// Open the database's LOAD phase — the port's `iocInit` boundary.
+    /// Enter the LOAD phase: records are being created and the database is not
+    /// yet the one C would classify links against. Called by every path that
+    /// begins creating records for an IOC — an `IocBuilder` build, an iocsh
+    /// `dbLoadRecords`, `IocApp::run` — and idempotent, because an `st.cmd`
+    /// issues several loads and they are all one `iocInit` (R18-92).
     ///
-    /// Every path that creates a GROUP of records (an `IocBuilder` build, an
-    /// iocsh `dbLoadRecords`) holds the returned guard for the whole group, so
-    /// a link-status classification issued by any record in it waits for the
-    /// last one: a `.db` file's forward reference classifies against the
-    /// finished database, exactly as C's `iocInit`-time `init_record` does.
-    /// Nested/concurrent loads are counted, and the guard releases on EVERY
-    /// exit path including an early `?` — the classification would otherwise
-    /// wait forever on a load that failed halfway.
-    #[must_use = "the load phase stays open until the guard is dropped"]
-    pub fn begin_load(&self) -> DbLoadGuard {
-        self.inner
-            .loading
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        DbLoadGuard {
-            inner: Arc::downgrade(&self.inner),
+    /// The phase is left ONLY by [`Self::ioc_init`]. A load that fails halfway
+    /// leaves it open, which strands nothing: a queued classification blocks no
+    /// caller, and it is dropped with the database.
+    pub fn begin_load(&self) {
+        let mut phase = self.inner.init_phase.lock().unwrap();
+        if matches!(*phase, DbInitPhase::Complete) {
+            *phase = DbInitPhase::Loading(Vec::new());
         }
     }
 
-    /// Await the end of the LOAD phase; returns immediately when no load is in
-    /// progress (a programmatically built database never opens one).
-    pub(crate) async fn wait_for_load(&self) {
-        loop {
-            if self
-                .inner
-                .loading
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-            {
-                return;
+    /// Schedule a record's link-status classification — the port's
+    /// `init_record` tail (C `checkLinks`).
+    ///
+    /// During the LOAD phase the future is QUEUED for [`Self::ioc_init`]; a
+    /// half-built database cannot be classified against because the code that
+    /// would do it has not been polled. Once the database is complete — after
+    /// `iocInit`, or on a database that never loaded — it is spawned at once,
+    /// which is what a runtime `special()` link re-point needs.
+    pub(crate) fn schedule_record_init(
+        &self,
+        init: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let mut phase = self.inner.init_phase.lock().unwrap();
+        match &mut *phase {
+            DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
+            DbInitPhase::Complete => {
+                drop(phase);
+                tokio::spawn(init);
             }
-            // Register for the wakeup BEFORE re-checking, so a load that ends
-            // between the check and the await cannot be missed.
-            let notified = self.inner.load_done.notified();
-            if self
-                .inner
-                .loading
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-            {
-                return;
+        }
+    }
+
+    /// The `iocInit` barrier: end the LOAD phase and run every classification
+    /// owed, to completion.
+    ///
+    /// After this returns the database is complete and every link status is
+    /// FINAL — C's guarantee, where `init_record` runs inside `iocInit` and a
+    /// `dbgf REC.INAV` right after it reads the classified value (before it, C
+    /// refuses `dbgf` outright). Idempotent: an `st.cmd` that spells `iocInit`
+    /// out and the `IocApp` that runs one anyway are the same single boundary.
+    pub async fn ioc_init(&self) {
+        let owed = {
+            let mut phase = self.inner.init_phase.lock().unwrap();
+            match std::mem::replace(&mut *phase, DbInitPhase::Complete) {
+                DbInitPhase::Loading(queued) => queued,
+                DbInitPhase::Complete => return,
             }
-            notified.await;
+        };
+        // Sequential, in issue order: each classification is a short read of a
+        // now-immutable record set, and C's `init_record` pass is a loop too.
+        for init in owed {
+            init.await;
         }
     }
 

@@ -189,11 +189,10 @@ impl IocBuilder {
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
         let db = Arc::new(PvDatabase::new());
 
-        // This whole build is ONE database load — C's `iocInit` classifies a
-        // record's links only after every record exists, so the link-status
-        // refreshes issued while records are being created wait for the guard
-        // to drop (at every exit path, including an early `?`).
-        let _load = db.begin_load();
+        // A build is a load plus C's `iocInit`: records are created here, and
+        // the link-status classifications they issue are queued until
+        // `db.ioc_init()` at the end runs them against the finished database.
+        db.begin_load();
 
         // Breakpoint-table registry (C `bptList`): merge every loaded
         // `breaktable(...)` into the database's shared registry (the single
@@ -451,6 +450,11 @@ impl IocBuilder {
         // from the I/O Intr wiring above. Shared with the IocApplication
         // iocInit path so both builders arm the enum callback identically.
         crate::server::ioc_app::setup_property_posts(db.clone()).await;
+
+        // 7. The `iocInit` barrier: every record exists, so run the link-status
+        // classifications queued during the load. Link status is FINAL when
+        // `build` returns, as it is when C's `iocInit` returns.
+        db.ioc_init().await;
 
         Ok((db, self.autosave_config))
     }

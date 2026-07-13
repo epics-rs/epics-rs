@@ -1103,6 +1103,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-oracle-rs"
+version = "0.23.0"
+dependencies = [
+ "clap",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "epics-pva-rs"
 version = "0.23.0"
 dependencies = [

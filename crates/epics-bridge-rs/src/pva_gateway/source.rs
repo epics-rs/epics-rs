@@ -109,18 +109,20 @@ fn mark_raw_body_local_overrun(
 }
 
 /// Lost-leaf paths to record in a cooked [`MonitorUpdate::overrun`] after a
-/// fanout broadcast lag — the decoded-path counterpart of
-/// [`mark_raw_body_local_overrun`]. The cooked gateway fanout re-encodes the
-/// whole value (changed = full selection mask) on every event, so a dropped
-/// intermediate may have moved any leaf; the surviving snapshot's changed
-/// leaves are therefore the value's own leaves. Returning the top-level
-/// field names lets the server's `overrun_bitset` expand them to every leaf
-/// (via `marked_changed_bitset`) and intersect down to the subscriber's
-/// request selection. Mirrors pva2pva unioning the surviving element's
-/// changed leaves into the overrun bitset on downstream overflow —
-/// `overrun |= changed & lastelem->changed`
-/// (epics-base/modules/pva2pva/p2pApp/moncache.cpp:160-168). A non-structure
-/// value (no gateway PV produces one) reports no overrun.
+/// fanout broadcast lag — the port's own loss accounting, mirroring pva2pva
+/// unioning the surviving element's changed leaves into the overrun bitset on
+/// downstream overflow (`overrun |= changed & lastelem->changed`,
+/// epics-base/modules/pva2pva/p2pApp/moncache.cpp:160-168). The cooked gateway
+/// fanout re-encodes the whole value (changed = full selection mask) on every
+/// event, so a dropped intermediate may have moved any leaf; the surviving
+/// snapshot's changed leaves are therefore the value's own leaves, named here
+/// as top-level fields. A non-structure value (no gateway PV produces one)
+/// reports no overrun.
+///
+/// Unlike [`mark_raw_body_local_overrun`], which writes into the raw body the
+/// forwarder puts on the wire, this set stays SERVER-SIDE: every cooked MONITOR
+/// DATA frame ends in a hard-empty overrun bitset, as pvxs's does
+/// (`servermon.cpp:174-176`). See `MonitorUpdate::overrun`.
 fn value_overrun_paths(value: &PvField) -> Vec<String> {
     match value {
         PvField::Structure(s) => s.fields.iter().map(|(k, _)| k.clone()).collect(),
@@ -1042,8 +1044,9 @@ impl GatewayChannelSource {
                         // After a lag, this surviving snapshot is the coalesced
                         // element pva2pva would deliver marked overrun
                         // (moncache.cpp:160-168). Record the lost leaves in the
-                        // cooked `overrun` set so the server encodes them into
-                        // the trailing overrun bitset of the next DATA frame. A
+                        // cooked `overrun` set — server-side accounting only:
+                        // the cooked DATA frame's trailing overrun bitset is
+                        // hard-empty, as pvxs's is (servermon.cpp:174-176). A
                         // type-change marker carries no value and is untouched.
                         if pending_overrun && !is_boundary {
                             update.overrun = value_overrun_paths(&update.value);
@@ -1059,12 +1062,13 @@ impl GatewayChannelSource {
                     // Drops under this receiver's backpressure. pva2pva enters
                     // overflow and ORs the overrun bitset (moncache.cpp:156-174)
                     // rather than silently swallowing the loss; the raw
-                    // forwarder mirrors this via `pending_overrun`. The cooked
-                    // path now does the same through `MonitorUpdate.overrun`
-                    // (the decoded-path counterpart of the trailing overrun
-                    // bitset), so a slow downstream client behind
-                    // EPICS_PVA_GW_RAW_FRAMES=NO is no longer served a
-                    // deceptively clean stream that hides the dropped events.
+                    // forwarder mirrors this on the wire via `pending_overrun` +
+                    // `mark_raw_body_local_overrun`. The cooked path records the
+                    // same loss in `MonitorUpdate.overrun`, but that set is
+                    // server-side only — the cooked wire frame keeps pvxs's
+                    // hard-empty overrun bitset, so a downstream client behind
+                    // EPICS_PVA_GW_RAW_FRAMES=NO does not see the overrun bits
+                    // the raw path would have carried.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         pending_overrun = true;
                         continue;
@@ -3118,12 +3122,14 @@ ASG(DEFAULT) {
         assert!(value_overrun_paths(&PvField::Scalar(ScalarValue::Double(1.0))).is_empty());
     }
 
-    /// Cooked/typed fanout parity with the raw path: when a subscriber's
-    /// broadcast receiver lags (its single-slot mpsc backpressure stalls the
-    /// forwarder while the upstream keeps producing), the next delivered
-    /// `MonitorUpdate` must carry the lost leaves in its `overrun` set — so a
-    /// slow downstream behind `EPICS_PVA_GW_RAW_FRAMES=NO` is not served a
-    /// deceptively clean stream (pva2pva moncache.cpp:160-168).
+    /// Cooked/typed fanout loss accounting: when a subscriber's broadcast
+    /// receiver lags (its single-slot mpsc backpressure stalls the forwarder
+    /// while the upstream keeps producing), the next delivered `MonitorUpdate`
+    /// must carry the lost leaves in its `overrun` set (pva2pva
+    /// moncache.cpp:160-168). Server-side accounting: the cooked DATA frame's
+    /// trailing overrun bitset stays hard-empty, as pvxs's is
+    /// (servermon.cpp:174-176) — only the raw forwarder puts overrun bits on
+    /// the wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cooked_fanout_marks_overrun_on_subscriber_lag() {
         let mut src = make_source();

@@ -242,6 +242,52 @@ enum OpenedMonitor {
     Db(super::group::AnyMonitor),
 }
 
+/// The leaves a QSRV read ASSIGNS into `value` — what the server frames as
+/// the GET reply's / monitor seed's changed-bitset (pvxs `to_wire_valid(R,
+/// value, &pvMask)`, `serverget.cpp:104`). `None` = "everything the request
+/// selected", for a natively-posted PVA PV whose snapshot is wholly assigned.
+///
+/// pvxs reads into a `cloneEmpty()`: `singleGet` (`singlesource.cpp:283`) and
+/// `getGroupField` (`groupsource.cpp:454-460`) both run `IOCSource::
+/// initialize` + `IOCSource::get(…, Everything, …)` per mapping, so only the
+/// leaves those two assign carry `valid`. [`super::pvif::read_leaf_paths`] is
+/// the single owner of that set; here it is composed per served channel:
+///
+/// * a GROUP adds `record._options.atomic`, which `onGet` assigns before the
+///   field loop (`groupsource.cpp:484`), and skips `Structure`/`Proc` members;
+/// * a SINGLE record is one root-level `Scalar` mapping — its NT IS the served
+///   structure.
+///
+/// `narrow_enum_value_leaves` then resolves the semantic `value` leaf against
+/// the concrete value, so an NTEnum marks `value.index` (assigned by
+/// `getScalarValue`) and leaves `value.choices` to the property set.
+async fn read_marks(
+    provider: &Arc<BridgeProvider>,
+    pva_pvs: &Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    name: &str,
+    value: &PvField,
+) -> Option<Vec<String>> {
+    if pva_pvs.read().await.contains_key(name) {
+        return None;
+    }
+    let paths = match provider.servable_group(name).await {
+        Some(def) => {
+            let mut paths = vec!["record._options.atomic".to_string()];
+            for m in &def.members {
+                paths.extend(super::pvif::read_leaf_paths(&m.field_name, m.mapping));
+            }
+            paths
+        }
+        // A single-record channel: the NT is the root, mapped as pvxs's
+        // `MappingInfo::Scalar` (value + alarm + timeStamp + properties).
+        None => super::pvif::read_leaf_paths("", super::FieldMapping::Scalar),
+    };
+    let PvField::Structure(root) = value else {
+        return Some(paths);
+    };
+    Some(super::pvif::narrow_enum_value_leaves(paths, root))
+}
+
 /// resolve a started monitor for a read-authorized PV.
 /// Factored out of `subscribe_checked` so `subscribe_checked_opts_marked`
 /// (which carries the `+trigger` marked set to the wire) reuses the
@@ -472,6 +518,27 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     None
                 }
             }
+        }
+    }
+
+    /// The framed read: the value from `get_value_checked` plus the
+    /// leaves QSRV actually assigned into it (`read_marks`). Without this
+    /// the GET reply, the PUT_GET readback and the monitor seed all framed
+    /// EVERY leaf the request selected — including the seven the port's NT
+    /// carries but pvxs's `getProperties` never assigns.
+    fn read_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<epics_pva_rs::server_native::source::SourceRead>> + Send
+    {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        async move {
+            let name = checked.pv_name().to_string();
+            let value = self.get_value_checked(checked, ctx).await?;
+            let marked = read_marks(&provider, &pva_pvs, &name, &value).await;
+            Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
         }
     }
 
@@ -814,6 +881,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     > + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
+        let provider_seed = self.provider.clone();
+        let pva_pvs_seed = self.pva_pvs.clone();
         async move {
             let opened =
                 open_monitor(provider, pva_pvs, checked.clone(), ctx.clone(), opts).await?;
@@ -822,7 +891,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     // Native-registered PVA PVs (NDPluginPva etc.) serve the
                     // GET seed and monitor frames from one cached snapshot, so
                     // their `record._options` already match — keep the GET seed.
-                    let initial = self.get_value_checked(checked, ctx).await;
+                    let initial = self.read_checked(checked, ctx).await;
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
                         updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
@@ -846,9 +915,23 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     // subscription is already armed (open_monitor started it),
                     // so any event between seed and stream is buffered in the
                     // monitor's fan-in channel rather than lost or doubled.
+                    //
+                    // The seed carries the leaves the read assigned, like any
+                    // other framed read — plus `record._options.queueSize`,
+                    // which `onSubscribe` assigns on the monitor's
+                    // `currentValue` and `onGet` does not
+                    // (`groupsource.cpp:401-405` vs `:484`).
+                    let name = checked.pv_name().to_string();
                     let initial = match monitor.seed().await {
-                        Some(v) => Some(v),
-                        None => self.get_value_checked(checked, ctx).await,
+                        Some(value) => {
+                            let mut marked =
+                                read_marks(&provider_seed, &pva_pvs_seed, &name, &value).await;
+                            if let Some(paths) = marked.as_mut() {
+                                paths.push("record._options.queueSize".to_string());
+                            }
+                            Some(epics_pva_rs::server_native::source::SourceRead { value, marked })
+                        }
+                        None => self.read_checked(checked, ctx).await,
                     };
                     // Capture the enable/disable handles before the monitor
                     // moves into its forward task; `Arc` so the gate closure
@@ -1033,19 +1116,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             });
             Some(rx)
         }
-    }
-
-    /// a QSRV *pure self-trigger* group monitor emits partial
-    /// updates — each event re-reads only the member whose record
-    /// processed, so the PVA server narrows the wire changed-bitset
-    /// by diffing consecutive snapshots. Returns `true` only for
-    /// groups whose every member uses the default `+trigger`
-    /// (self-trigger); single-record / native-PVA PVs and groups with
-    /// explicit `+trigger` members keep the full request mask.
-    fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let provider = self.provider.clone();
-        let name = name.to_string();
-        async move { provider.group_is_pure_self_trigger(&name).await }
     }
 }
 

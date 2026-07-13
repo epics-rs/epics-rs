@@ -1483,7 +1483,11 @@ impl super::source::ChannelSource for SharedSource {
                 }
             });
             Some(super::source::SubscriptionSeed {
-                initial,
+                // A SharedPV's stored Value is wholly assigned by `open()` /
+                // `post()`, so it declares no leaf subset — the server frames
+                // every leaf the request selected, as pvxs does for a
+                // fully-marked `Value`.
+                initial: initial.map(super::source::SourceRead::from),
                 updates: super::source::plain_monitor_updates(rx),
                 on_start: None,
             })

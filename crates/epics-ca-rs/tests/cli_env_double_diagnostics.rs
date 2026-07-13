@@ -22,7 +22,7 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// stderr of `caget-rs` for a PV that does not exist — the tool still
 /// builds its client, which is where both variables are resolved. `-w 0.1`
@@ -100,6 +100,32 @@ fn max_search_period_reject_prints_cs_lines() {
     }
 }
 
+/// C `getNTimers` (`udpiiu.cpp:96-111`): a period past the 18-rung search-timer
+/// ladder is named and clamped to `(1 << 17) * 32e-3` seconds. The compiled
+/// `caget` prints exactly these two lines for `=100000`.
+#[test]
+fn max_search_period_above_the_timer_ladder_is_named() {
+    let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "100000");
+    for line in [
+        "\"EPICS_CA_MAX_SEARCH_PERIOD\" out of range (high)",
+        "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 4194.304000 seconds",
+    ] {
+        assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}
+
+/// The rung below the boundary: `8388.607 < 0.032 * 2^18`, so the ladder still
+/// holds it and the compiled `caget` says nothing. One tick under the boundary
+/// must not gain a diagnostic C does not print.
+#[test]
+fn max_search_period_just_inside_the_ladder_is_silent() {
+    let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "8388.607");
+    assert!(
+        !err.contains("out of range"),
+        "8388.607 s fits C's 18-rung ladder; no diagnostic is due:\n{err}"
+    );
+}
+
 /// C `udpiiu.cpp:78-83`: a value under the 60 s lower limit is named and
 /// clamped, not silently raised.
 #[test]
@@ -111,4 +137,75 @@ fn max_search_period_below_lower_limit_is_named() {
     ] {
         assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
     }
+}
+
+/// R16-18: the beacon-period diagnostic is printed ONCE, as C prints it.
+///
+/// C reads `EPICS_CAS_BEACON_PERIOD` in the single beacon thread
+/// (`online_notify.c:52-64`), so the compiled `softIoc` prints one
+/// "float fetch failed" pair for a bad value. The port resolved the server's
+/// UDP config from three points in startup (`bind_tcp_listeners`,
+/// `bind_sockets`, `CaServer::run`) and so printed the pair three times.
+#[test]
+fn beacon_period_reject_is_diagnosed_once_per_process() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
+        .args(["--pv", "R16-18:PV:double:1.0"])
+        // Keep the IOC off the network: loopback interface, loopback beacon
+        // target, and a port the harness picks nothing else on.
+        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_SERVER_PORT", "0")
+        .env("EPICS_CAS_BEACON_PERIOD", "garbage")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn softioc-rs");
+
+    // Startup is what prints; give it room, then take the IOC down and read
+    // everything it wrote.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("wait softioc-rs");
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    for line in [
+        "Unable to find a real number in EPICS_CAS_BEACON_PERIOD=garbage",
+        "EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed",
+        "Setting \"EPICS_CAS_BEACON_PERIOD\" = 15.000000",
+    ] {
+        assert_eq!(
+            err.matches(line).count(),
+            1,
+            "{line:?} must appear exactly once (C prints it once); stderr:\n{err}"
+        );
+    }
+}
+
+/// R16-19: a non-positive `EPICS_CA_CONN_TMO` is refused, and SAID so.
+///
+/// This is the port's one documented deviation on this knob. C stores the raw
+/// value (`cac.cpp:188-194`) and its connection watchdog then fires on every
+/// check — the compiled `camonitor` wrote 177_182 stderr lines in 3 s with
+/// `=-5`. The port keeps the 30 s default instead, and tells the operator that
+/// the value they set is not the one in force. The test stays bounded: `caget`
+/// with `-w 0.1` never reaches a circuit, so nothing can flood.
+#[test]
+fn conn_tmo_non_positive_is_refused_out_loud() {
+    for value in ["-5", "0"] {
+        let err = caget_stderr("EPICS_CA_CONN_TMO", value);
+        assert!(
+            err.contains("\"EPICS_CA_CONN_TMO\"") && err.contains("not a positive period"),
+            "EPICS_CA_CONN_TMO={value} must be diagnosed, not silently overridden:\n{err}"
+        );
+    }
+}
+
+/// The flip side: a period C accepts and the port honours is silent.
+#[test]
+fn conn_tmo_positive_period_is_silent() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "10.5");
+    assert!(
+        !err.contains("not a positive period") && !err.contains("double fetch failed"),
+        "10.5 s is a valid period; no diagnostic is due:\n{err}"
+    );
 }

@@ -156,6 +156,35 @@ const MAX_SEARCH_PERIOD_DEFAULT_SECS: f64 = 300.0;
 /// `maxSearchPeriodLowerLimit = 60.0`).
 const MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS: f64 = 60.0;
 
+/// C `minRoundTripEstimate` (`epics-base:modules/ca/src/client/udpiiu.h:85`,
+/// `32e-3`) — the bottom rung of C's search-timer ladder, and the unit the
+/// upper bound below is expressed in.
+const MIN_ROUND_TRIP_ESTIMATE_SECS: f64 = 32e-3;
+
+/// C `channelNode::getMaxSearchTimerCount()`
+/// (`epics-base:modules/ca/src/client/nciu.cpp:606-611`): the channel-state
+/// enum holds `cs_searchReqPending0 .. cs_searchReqPending17`, so the ladder
+/// is 18 rungs and cannot express a period past
+/// `(1 << 17) * minRoundTripEstimate`.
+const MAX_SEARCH_TIMER_COUNT: u32 = 18;
+
+/// The period C's ladder tops out at: `(1 << (nTimers - 1)) * RTT`
+/// = `131072 * 0.032` = 4194.304 s. C prints exactly this figure when it
+/// clamps (`udpiiu.cpp:105-107`).
+fn max_search_period_upper_limit_secs() -> f64 {
+    f64::from(1u32 << (MAX_SEARCH_TIMER_COUNT - 1)) * MIN_ROUND_TRIP_ESTIMATE_SECS
+}
+
+/// C `getNTimers` (`epics-base:modules/ca/src/client/udpiiu.cpp:96-99`):
+/// `static_cast<unsigned>(1.0 + log(maxPeriod / minRoundTripEstimate) / log(2.0))`.
+///
+/// Written with the same `ln(x) / ln(2)` C uses rather than `log2`, which is a
+/// different libm routine and can land the boundary case on the other side of
+/// the truncation.
+fn search_timer_count(period_secs: f64) -> u32 {
+    (1.0 + (period_secs / MIN_ROUND_TRIP_ESTIMATE_SECS).ln() / std::f64::consts::LN_2) as u32
+}
+
 /// `EPICS_CA_MAX_SEARCH_PERIOD` resolution, faithful
 /// to C `udpiiu.cpp::getMaxPeriod` (`epics-base:modules/ca/src/client/udpiiu.cpp:68-94`):
 ///
@@ -202,6 +231,26 @@ fn resolve_max_search_period_secs() -> f64 {
         eprintln!("\"{NAME}\" out of range (low)");
         eprintln!("Setting \"{NAME}\" = {MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS:.6} seconds");
         return MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS;
+    }
+    // C's upper bound is not on the period: `getNTimers` (`udpiiu.cpp:96-111`)
+    // turns the period into a rung count on the RTT-doubling ladder and clamps
+    // THAT to 18, so a period the ladder cannot reach is refused with the
+    // "(high)" pair and the search cadence tops out at the 18th rung. Recompute
+    // the count with C's expression — `1.0 + log(period/RTT)/log(2.0)`,
+    // truncated by `static_cast<unsigned>` — rather than a threshold in
+    // seconds, so the boundary lands on the same side as C's for every input:
+    // 8388.607 passes, 8388.608 (== 0.032 * 2^18) clamps, verified against the
+    // compiled caget.
+    //
+    // The one deviation is `inf`, where C's cast is undefined and the compiled
+    // caget aborts in malloc with a nTimers of garbage size. Rust's `as u32`
+    // saturates, so an infinite period clamps to the same 4194.304 s any other
+    // out-of-range period gets.
+    if search_timer_count(v) > MAX_SEARCH_TIMER_COUNT {
+        let capped = max_search_period_upper_limit_secs();
+        eprintln!("\"{NAME}\" out of range (high)");
+        eprintln!("Setting \"{NAME}\" = {capped:.6} seconds");
+        return capped;
     }
     v
 }
@@ -1614,6 +1663,31 @@ fn build_search_payload(cid: u32, pv_name: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `getNTimers` (`udpiiu.cpp:96-111`) caps the search-timer ladder at 18
+    /// rungs, so the effective ceiling on `EPICS_CA_MAX_SEARCH_PERIOD` is
+    /// `(1 << 17) * 32e-3 == 4194.304 s` and the boundary sits at
+    /// `(1 << 18) * 32e-3 == 8388.608 s`. Every row here was run against the
+    /// compiled `caget`: 8388.607 is silent, 8388.608 prints the "(high)" pair.
+    #[test]
+    fn search_timer_ladder_bounds_the_max_search_period() {
+        assert_eq!(max_search_period_upper_limit_secs(), 4194.304);
+
+        // Inside the ladder: no clamp, no diagnostic.
+        for period in [60.0, 300.0, 4194.304, 8388.607] {
+            assert!(
+                search_timer_count(period) <= MAX_SEARCH_TIMER_COUNT,
+                "{period} s fits C's 18-rung ladder"
+            );
+        }
+        // Past it: C clamps and says so.
+        for period in [8388.608, 8389.0, 100_000.0, f64::INFINITY] {
+            assert!(
+                search_timer_count(period) > MAX_SEARCH_TIMER_COUNT,
+                "{period} s is past C's 18-rung ladder"
+            );
+        }
+    }
 
     fn schedule_initial(state: &mut SearchEngineState, cid: u32, pv_name: &str) {
         handle_request(

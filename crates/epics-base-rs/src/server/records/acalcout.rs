@@ -562,7 +562,10 @@ impl AcalcoutRecord {
             4 => self.pval != 0.0 && self.val == 0.0,      // Transition To Zero
             5 => self.pval == 0.0 && self.val != 0.0,      // Transition To Non-zero
             6 => false,                                    // Never
-            _ => true,
+            // C's `doOutput` is initialised to 0 (`aCalcoutRecord.c:283`) and
+            // only a case that fires sets it, so an index the switch does not
+            // name drives NO output — the same rule that makes `Never` a 0.
+            _ => false,
         }
     }
 

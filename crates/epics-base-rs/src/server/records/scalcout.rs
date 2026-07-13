@@ -225,15 +225,23 @@ impl ScalcoutRecord {
     /// (:379) and nothing else: SVAL does not take part, so a cycle that changed
     /// only the string result does NOT drive OUT on C, and a numeric change
     /// inside MDEL does not either.
+    ///
+    /// The switch DECIDES an output; it does not veto one. C's `doOutput` is
+    /// initialised to 0 (`sCalcoutRecord.c:326`) and only a case that fires sets
+    /// it — so `Never` (menu index 6, `sCalcoutRecord.dbd:17`) is
+    /// `doOutput = 0` (`:393-395`), and so is any index the switch does not name.
+    /// A catch-all of `true` here inverted `OOPT="Never"` outright: `CALC="7"`
+    /// wrote 7.0 to the OUT target every cycle where C writes nothing.
     fn should_output(&self) -> bool {
         match self.oopt {
-            0 => true,
-            1 => (self.pval - self.val).abs() > self.mdel,
-            2 => self.val == 0.0,
-            3 => self.val != 0.0,
-            4 => self.pval != 0.0 && self.val == 0.0,
-            5 => self.pval == 0.0 && self.val != 0.0,
-            _ => true,
+            0 => true,                                     // Every Time
+            1 => (self.pval - self.val).abs() > self.mdel, // On Change
+            2 => self.val == 0.0,                          // When Zero
+            3 => self.val != 0.0,                          // When Non-zero
+            4 => self.pval != 0.0 && self.val == 0.0,      // Transition To Zero
+            5 => self.pval == 0.0 && self.val != 0.0,      // Transition To Non-zero
+            6 => false,                                    // Never
+            _ => false,                                    // C's `doOutput = 0` init
         }
     }
 

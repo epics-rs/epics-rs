@@ -2057,16 +2057,13 @@ mod tests {
             "the waived request reaches the driver on the dead line"
         );
 
-        // ...and C's portThread then tries to bring the port up on it.
-        assert_eq!(
-            connect_calls.load(Ordering::SeqCst),
-            1,
-            "C portThread runs autoConnectDevice(pport,0) once the Connect \
-             queue has drained (asynManager.c:856-861)"
-        );
-
         // The follow-up read now finds a live port, which is the observable the
-        // operator cares about: the line is back without further traffic.
+        // operator cares about: the line is back without further traffic. The
+        // auto-connect runs on the actor's tail AFTER the waived request's
+        // reply (as C portThread does after the callback), so this probe's
+        // reply is also the sequencing barrier that orders the counter check
+        // below — the single-threaded actor cannot dequeue the probe before
+        // that tail has run.
         let probe = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let err = send_and_wait(&tx, RequestOp::Int32Read, probe);
         assert!(
@@ -2079,6 +2076,14 @@ mod tests {
             ),
             "the port is connected after the waived request, so nothing is \
              refused Disconnected: {err:?}"
+        );
+
+        // ...and C's portThread tried exactly one connect to get there.
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "C portThread runs autoConnectDevice(pport,0) once the Connect \
+             queue has drained (asynManager.c:856-861)"
         );
     }
 
@@ -2124,6 +2129,15 @@ mod tests {
 
         send_and_wait(&tx, RequestOp::Disconnect, AsynUser::default())
             .expect("an explicit disconnect succeeds");
+
+        // The auto-connect the Disconnect must NOT trigger runs on the actor's
+        // tail after the reply, so a probe is needed as a sequencing barrier
+        // before the counter can be trusted: its reply proves the tail ran.
+        // The probe itself is refused Disconnected through the same throttle
+        // (its Required-path attempt is inside the 2 s window), so it cannot
+        // perturb the counter.
+        let probe = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let _ = send_and_wait(&tx, RequestOp::Int32Read, probe);
 
         assert_eq!(
             connect_calls.load(Ordering::SeqCst),

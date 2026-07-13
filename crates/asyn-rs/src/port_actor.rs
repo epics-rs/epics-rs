@@ -1363,22 +1363,28 @@ impl PortActor {
             }
             RequestOp::PushEchoInterpose => {
                 // C `asynInterposeEcho` (asynInterposeEcho.c:165-190) pushes the
-                // layer onto the port's octet interface at any time after
-                // configure. The actor owns the driver, so the install lands
-                // between transfers instead of racing one.
-                self.driver.base_mut().install_octet_interpose(Box::new(
-                    crate::interpose::echo::EchoInterpose::new(),
-                ));
+                // layer onto the octet interface of the device its `addr`
+                // argument names (:176), at any time after configure. The actor
+                // owns the driver, so the install lands between transfers instead
+                // of racing one; the addr rides the request's own user, which is
+                // C's `pasynUser`-selects-the-device linkage.
+                self.driver.base_mut().install_octet_interpose_addr(
+                    user.addr,
+                    Box::new(crate::interpose::echo::EchoInterpose::new()),
+                );
                 Ok(RequestResult::write_ok())
             }
             RequestOp::PushDelayInterpose { delay } => {
                 // C `asynInterposeDelay` (asynInterposeDelay.c:176-215) pushes
-                // the per-character write delay onto the port's octet interface
-                // from the iocsh command (:221-234), after configure. Same
-                // actor-owned install point as the echo layer above.
-                self.driver.base_mut().install_octet_interpose(Box::new(
-                    crate::interpose::delay::DelayInterpose::new(*delay),
-                ));
+                // the per-character write delay onto the addressed device's octet
+                // interface from the iocsh command (:187,200,221-234). Same
+                // actor-owned install point, same per-device addr, as the echo
+                // layer above: `asynInterposeDelay("gpib",4,0.01)` slows device 4
+                // and leaves the rest of the bus at full speed.
+                self.driver.base_mut().install_octet_interpose_addr(
+                    user.addr,
+                    Box::new(crate::interpose::delay::DelayInterpose::new(*delay)),
+                );
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetConnected => {
@@ -3065,6 +3071,97 @@ mod tests {
         assert!(
             err.to_string().contains("port dev_gate not connected"),
             "got {err}"
+        );
+    }
+
+    /// R15-48: `asynInterposeDelay(port, addr, delay)` installs on the DEVICE the
+    /// addr names, so it slows that device and leaves the rest of the bus alone.
+    ///
+    /// C hands the iocsh `addr` to `interposeInterface` (asynInterposeDelay.c:187),
+    /// which lands the layer on the device's `dpCommon` (asynManager.c:2202-2206).
+    /// The Rust command parsed the addr and dropped it, and the stack was one
+    /// port-wide chain — so `asynInterposeDelay("gpib",4,0.01)` slowed every
+    /// device on the bus. This drives the whole path the operator does: the actor
+    /// op, the addr on its user, the stack, and a real write through it.
+    #[test]
+    fn a_delay_interpose_installed_on_one_device_does_not_slow_the_others() {
+        use crate::interpose::{OctetNext, OctetReadResult};
+
+        struct InterposeDriver {
+            base: PortDriverBase,
+        }
+        struct Sink;
+        impl OctetNext for Sink {
+            fn read(&mut self, _u: &AsynUser, _b: &mut [u8]) -> AsynResult<OctetReadResult> {
+                Ok(OctetReadResult {
+                    nbytes_transferred: 0,
+                    eom_reason: crate::interpose::EomReason::CNT,
+                })
+            }
+            fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self, _u: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+        impl PortDriver for InterposeDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.base
+                    .interpose_octet
+                    .dispatch_write(user, data, &mut Sink)
+            }
+        }
+
+        let base = PortDriverBase::new(
+            "gpib",
+            8,
+            PortFlags {
+                multi_device: true,
+                can_block: true,
+                ..PortFlags::default()
+            },
+        );
+        let tx = spawn_actor(InterposeDriver { base });
+
+        // asynInterposeDelay("gpib", 4, 0.02)
+        send_and_wait(
+            &tx,
+            RequestOp::PushDelayInterpose {
+                delay: Duration::from_millis(20),
+            },
+            AsynUser::new(0).with_addr(4),
+        )
+        .unwrap();
+
+        let write_to = |addr: i32| {
+            let started = Instant::now();
+            send_and_wait(
+                &tx,
+                RequestOp::OctetWrite {
+                    data: b"abcd".to_vec(),
+                },
+                AsynUser::new(0).with_addr(addr),
+            )
+            .unwrap();
+            started.elapsed()
+        };
+
+        // Device 4 pays the per-character delay: 4 bytes x 20 ms.
+        assert!(
+            write_to(4) >= Duration::from_millis(60),
+            "the addressed device must run the delay interpose"
+        );
+        // Device 2 — same bus, same port — does not.
+        assert!(
+            write_to(2) < Duration::from_millis(30),
+            "asynInterposeDelay on device 4 must not slow device 2"
         );
     }
 

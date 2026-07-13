@@ -544,8 +544,11 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // it. C reports "%s interposeInterface failed." and returns -1 when the
     // port is unknown (:180-184).
     //
-    // As with `asynOctetSetInputEos`, the interpose stack is port-wide, so the
-    // C `addr` is accepted for command-line compatibility but not routed.
+    // The `addr` names the DEVICE the layer lands on: C hands it to
+    // `interposeInterface` (:176), which puts the layer on that device's
+    // `dpCommon.interposeInterfaceList` (asynManager.c:2202-2206), and
+    // `findInterface` resolves a request device-first (:1493-1501). On a port that
+    // is not multi-device every addr resolves to the port itself.
     {
         let mgr_r = mgr.clone();
         out.push(CommandDef::new(
@@ -568,10 +571,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let port = arg_str(args, 0)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
-                let _addr = arg_int(args, 1).unwrap_or(0);
+                let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => {
-                        if let Err(e) = handle.push_echo_interpose_blocking() {
+                        if let Err(e) = handle.push_echo_interpose_blocking(addr) {
                             ctx.println(&format!("{port} interposeInterface failed: {e}"));
                         }
                     }
@@ -591,8 +594,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // "%s interposeInterface asynOctetType failed." and returns -1 when the
     // interposeInterface call fails (:186-190).
     //
-    // As with `asynInterposeEcho`, the Rust interpose stack is port-wide, so
-    // the C `addr` is accepted for command-line compatibility but not routed.
+    // As with `asynInterposeEcho`, the `addr` names the device the layer lands on
+    // (:187,200) — `asynInterposeDelay("gpib",4,0.01)` slows device 4 and leaves
+    // the rest of the bus at full speed.
     {
         let mgr_r = mgr.clone();
         out.push(CommandDef::new(
@@ -620,7 +624,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 let port = arg_str(args, 0)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "portName required".to_string())?;
-                let _addr = arg_int(args, 1).unwrap_or(0);
+                let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 // C takes the delay as a `double` seconds and stores it verbatim
                 // (`pvt->delay = delay`, asynInterposeDelay.c:214). iocsh can
                 // supply a negative or NaN one; `delay_from_secs` owns the
@@ -629,7 +633,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     crate::interpose::delay::delay_from_secs(arg_f64(args, 2).unwrap_or(0.0));
                 match mgr_r.find_port_handle(&port) {
                     Ok(handle) => {
-                        if let Err(e) = handle.push_delay_interpose_blocking(delay) {
+                        if let Err(e) = handle.push_delay_interpose_blocking(addr, delay) {
                             ctx.println(&format!(
                                 "{port} interposeInterface asynOctetType failed: {e}"
                             ));

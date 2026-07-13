@@ -1051,13 +1051,24 @@ impl PortDriverBase {
         }
     }
 
-    /// Push an interpose layer onto the octet I/O stack.
+    /// Push an interpose layer onto the **port's** octet I/O stack — C
+    /// `interposeInterface(portName, -1, ...)`, which every driver's own
+    /// configure-time install is (the layer serves every device on the port).
     ///
     /// **Concurrency**: requires `&mut self`, which means the caller must hold
     /// the port lock (`Arc<Mutex<dyn PortDriver>>`). This ensures
     /// interpose modifications are serialized with I/O dispatch.
     pub fn install_octet_interpose(&mut self, layer: Box<dyn OctetInterpose>) {
-        self.interpose_octet.install(layer);
+        self.install_octet_interpose_addr(crate::interpose::PORT_CHAIN, layer);
+    }
+
+    /// Push an interpose layer onto the stack of the device `addr` names — C
+    /// `interposeInterface(portName, addr, ...)` (asynManager.c:2190-2220), which
+    /// is what the `asynInterposeEcho` / `asynInterposeDelay` iocsh commands call
+    /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187,200). On a port that is
+    /// not multi-device every addr resolves to the port itself.
+    pub fn install_octet_interpose_addr(&mut self, addr: i32, layer: Box<dyn OctetInterpose>) {
+        self.interpose_octet.install(addr, layer);
     }
 
     /// Flush changed parameters as interrupt notifications.

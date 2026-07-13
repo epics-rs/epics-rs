@@ -1035,17 +1035,29 @@ impl PortHandle {
         Ok(())
     }
 
-    /// Install the echo interpose on the port (blocking) — C
-    /// `asynInterposeEcho(portName, addr)`.
-    pub fn push_echo_interpose_blocking(&self) -> AsynResult<()> {
-        self.submit_blocking(RequestOp::PushEchoInterpose, AsynUser::new(0))?;
+    /// Install the echo interpose on the device `addr` names (blocking) — C
+    /// `asynInterposeEcho(portName, addr)`, whose `addr` reaches
+    /// `interposeInterface` unchanged (asynInterposeEcho.c:176). The user carries
+    /// it, as it does in C: `interposeInterface` resolves the device from it.
+    pub fn push_echo_interpose_blocking(&self, addr: i32) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::PushEchoInterpose,
+            AsynUser::new(0).with_addr(addr),
+        )?;
         Ok(())
     }
 
-    /// Install the delay interpose on the port (blocking) — C
-    /// `asynInterposeDelay(portName, addr, delay)`.
-    pub fn push_delay_interpose_blocking(&self, delay: std::time::Duration) -> AsynResult<()> {
-        self.submit_blocking(RequestOp::PushDelayInterpose { delay }, AsynUser::new(0))?;
+    /// Install the delay interpose on the device `addr` names (blocking) — C
+    /// `asynInterposeDelay(portName, addr, delay)` (asynInterposeDelay.c:187,200).
+    pub fn push_delay_interpose_blocking(
+        &self,
+        addr: i32,
+        delay: std::time::Duration,
+    ) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::PushDelayInterpose { delay },
+            AsynUser::new(0).with_addr(addr),
+        )?;
         Ok(())
     }
 

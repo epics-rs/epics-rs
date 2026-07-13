@@ -1696,6 +1696,12 @@ struct MonitorQueue<'a> {
     intro: &'a FieldDesc,
     /// The op's pvRequest selection mask (`MonitorOp::pvMask`).
     mask: &'a BitSet,
+    /// The wire changed-bitset a `marked: None` post frames — pvxs's
+    /// fully-marked `Value` intersected with `pvMask`. It depends only on
+    /// `(intro, mask)`, so it is computed once here rather than per post.
+    /// Empty ⟺ the request selected no leaf, and then no unmarked post is
+    /// `real`.
+    unmarked_changed: BitSet,
 }
 
 impl<'a> MonitorQueue<'a> {
@@ -1706,6 +1712,7 @@ impl<'a> MonitorQueue<'a> {
             first: true,
             intro,
             mask,
+            unmarked_changed: crate::pvdata::encode::canonical_changed_bitset(intro, mask),
         }
     }
 
@@ -1737,27 +1744,34 @@ impl<'a> MonitorQueue<'a> {
     /// MONITOR FINISH) always queue; anything else must pass `testmask`
     /// (`pvrequest.cpp:73-92`) — at least one marked bit inside `pvMask`.
     ///
-    /// A source that marks nothing explicitly (`marked: None`) posts a value
-    /// the port treats as wholly changed, which is what pvxs's fully-marked
-    /// `Value` is: `testmask` finds a marked bit in any non-empty `pvMask`, so
-    /// it always passes. `request2mask` cannot produce an empty mask (it
-    /// throws instead), so there is no case where such a post is dropped.
+    /// `testmask` is a LEAF test, on both arms. It scans `store[idx].valid`,
+    /// and `Value::mark` (`data.cpp:256-270`) sets `valid` on the marked field
+    /// and on the *enclosing tops* of a struct-array element — never on a
+    /// parent `Struct` node. So a `pvMask` covering only structure bits can
+    /// never satisfy it, however much the source marked: `field(alarm.bogus)`
+    /// selects `{0, alarm}` (`request2mask` matches the existing `alarm`
+    /// struct, finds no `alarm.bogus`, and pre-sets the always-permitted bit
+    /// 0), and pvxs stays silent for the life of that subscription.
     ///
-    /// The gate is the frame's own changed-bitset
-    /// ([`crate::pvdata::encode::marked_wire_changed_bitset`], the same call
-    /// [`build_monitor_payload_marked`] frames with): pvxs's `testmask` scans
-    /// the `store[idx].valid` leaves, which are exactly the bits
-    /// `to_wire_valid` emits. Gating on the pre-canonical marked set would
-    /// admit a post on a STRUCTURE bit alone and then frame an empty
-    /// changed-bitset.
+    /// The gate is therefore the frame's own changed-bitset — the SAME value
+    /// the payload builder about to serialize this update computes, on either
+    /// arm ([`build_monitor_payload_marked`]'s `marked_wire_changed_bitset`
+    /// for a declared leaf set, [`build_monitor_payload`]'s
+    /// `canonical_changed_bitset` for a wholly-changed post). That makes
+    /// `gate == wire` an invariant: an admitted update always frames a
+    /// non-empty changed-bitset, and a leafless mask frames none because it
+    /// queues none.
     fn real(&self, ev: &crate::server_native::MonitorUpdate) -> bool {
         if self.first || ev.type_changed {
             return true;
         }
-        let Some(paths) = ev.marked.as_ref() else {
-            return true;
-        };
-        !crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask).is_empty()
+        match ev.marked.as_ref() {
+            Some(paths) => {
+                !crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask)
+                    .is_empty()
+            }
+            None => !self.unmarked_changed.is_empty(),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -8939,7 +8953,8 @@ mod tests {
         assert_eq!(tags(&q), vec![tag(0)], "only the seed is queued");
 
         // A source that marks nothing posts a wholly-changed value — pvxs's
-        // fully-marked Value, which `testmask` always passes.
+        // fully-marked Value — so it passes `testmask` for any mask that
+        // selects at least one LEAF. `field(value)` does.
         let mut q = MonitorQueue::new(4, &intro, &mask);
         q.seed(tag(0));
         assert!(
@@ -8949,7 +8964,7 @@ mod tests {
                 type_changed: false,
                 overrun: Vec::new(),
             }),
-            "an unmarked post is fully marked to pvxs and always passes testmask"
+            "an unmarked post is fully marked to pvxs; the mask selects a leaf"
         );
 
         // The terminal boundary is pvxs's null Value (`if(real || !val)`): it
@@ -9020,10 +9035,15 @@ mod tests {
     /// such a post and then frames an EMPTY changed-bitset at full event
     /// rate, where pvxs sends nothing at all.
     ///
-    /// Tested per boundary: mask with a structure bit but no leaf (drop, and
-    /// the frame that was avoided is provably empty), and the same marked
-    /// path against a mask that does select a leaf below it (admit, and the
-    /// frame carries exactly that leaf).
+    /// R15-32 extends this to the `marked: None` arm, which used to be waved
+    /// through unconditionally: `testmask` is a leaf test whatever the source
+    /// marked, so a leafless mask silences the subscription for a fully-marked
+    /// `Value` too.
+    ///
+    /// Tested per boundary, on BOTH arms (declared leaf set / no leaf set):
+    /// mask with a structure bit but no leaf (drop, and the frame that was
+    /// avoided is provably empty), and a mask that does select a leaf below it
+    /// (admit, and the frame carries exactly that leaf).
     #[test]
     fn monitor_queue_drops_a_post_whose_wire_bitset_would_be_empty() {
         // { value, timeStamp { secondsPastEpoch, nanoseconds } } — bits:
@@ -9108,7 +9128,7 @@ mod tests {
         let real = crate::pv_request::request_to_mask(&intro, Some(&request("secondsPastEpoch")))
             .expect("a matched leaf selects it");
         let mut q = MonitorQueue::new(4, &intro, &real);
-        q.seed(seed);
+        q.seed(seed.clone());
         assert!(
             q.push(post()),
             "a marked subtree with a selected leaf posts"
@@ -9122,6 +9142,45 @@ mod tests {
             changed.iter().collect::<Vec<usize>>(),
             vec![3],
             "the frame carries the one selected leaf, not the structure bit"
+        );
+
+        // R15-32 — the SAME boundary on the `marked: None` arm. pvxs's
+        // `testmask` is a leaf test whatever the source marked, so a leafless
+        // mask silences the subscription for a fully-marked Value too. The
+        // gate admitted every unmarked post, so `field(timeStamp.bogus)` drew
+        // full-rate DATA frames with an empty changed-bitset where pvxs sends
+        // nothing.
+        let unmarked = || crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(1)),
+            marked: None,
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let mut q = MonitorQueue::new(4, &intro, &bogus);
+        q.seed(seed.clone());
+        assert!(
+            !q.push(unmarked()),
+            "an unmarked post under a leafless mask frames no leaf — dropped"
+        );
+        assert!(
+            crate::pvdata::encode::canonical_changed_bitset(&intro, &bogus).is_empty(),
+            "the frame the gate refused would have had an empty changed-bitset"
+        );
+
+        // A mask that selects a leaf admits the same unmarked post, and the
+        // frame carries that leaf — gate and wire stay one computation.
+        let mut q = MonitorQueue::new(4, &intro, &real);
+        q.seed(seed);
+        assert!(
+            q.push(unmarked()),
+            "an unmarked post under a leafful mask is real"
+        );
+        assert_eq!(
+            crate::pvdata::encode::canonical_changed_bitset(&intro, &real)
+                .iter()
+                .collect::<Vec<usize>>(),
+            vec![3],
+            "the admitted frame carries exactly the selected leaf"
         );
     }
 

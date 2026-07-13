@@ -3197,11 +3197,12 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = mpsc::channel(256);
         let actor = PortActor::new(Box::new(TestDriver::new()), rx);
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, "test_asyn_rec".into(), interrupts);
+        let handle = PortHandle::new(tx, "test_asyn_rec".into(), interrupts, actor_id);
         let trace = Arc::new(TraceManager::new());
 
-        register_port("test_asyn_rec", handle, trace);
+        register_port("test_asyn_rec", handle, trace).unwrap();
 
         let entry = registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
@@ -3242,11 +3243,12 @@ mod tests {
             Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let mut handle = PortHandle::new(tx, port_name.into(), interrupts);
+        let mut handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
         handle.set_capabilities(true, 4);
         let trace = Arc::new(TraceManager::new());
-        register_port(port_name, handle, trace.clone());
+        register_port(port_name, handle, trace.clone()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -3304,15 +3306,16 @@ mod tests {
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
         let trace = Arc::new(TraceManager::new());
         // Non-default info mask set on the manager BEFORE the record connects.
         trace.set_trace_info_mask(
             Some(port_name),
             TraceInfoMask::SOURCE | TraceInfoMask::THREAD,
         );
-        register_port(port_name, handle, trace);
+        register_port(port_name, handle, trace).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -3359,14 +3362,15 @@ mod tests {
             Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
         let trace = Arc::new(TraceManager::new());
         // Wire the exception sink as a real IOC would (PortManager installs
         // it); without it the record's subscription is a no-op.
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         trace.set_trace_info_mask(Some(port_name), TraceInfoMask::TIME);
-        register_port(port_name, handle, trace.clone());
+        register_port(port_name, handle, trace.clone()).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -3445,9 +3449,10 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         // ASCII read: AINP gets the (lossy) text; BINP must stay untouched.
         let mut ascii = AsynRecord::default();
@@ -3543,9 +3548,10 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         // ASCII read failure: NORD/EOMR cleared to 0, AINP/TINP cleared to "",
         // and BINP (not the IFMT-selected field) left as it was — matching C,
@@ -3682,9 +3688,10 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         let mk = |iface: i32, tmod: TransferMode| {
             let mut rec = AsynRecord::default();
@@ -3790,9 +3797,10 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), interrupts);
-        register_port(port_name, handle, Arc::new(TraceManager::new()));
+        let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_id);
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
 
         let mut rec = AsynRecord::default();
         rec.port = port_name.to_string();
@@ -4004,12 +4012,18 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(16);
         let actor = PortActor::new(Box::new(ReadDriver { base }), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("asynio-test-actor".into())
             .spawn(move || actor.run())
             .unwrap();
 
-        let mut handle = PortHandle::new(tx, "ASYNIO".into(), Arc::new(InterruptManager::new(16)));
+        let mut handle = PortHandle::new(
+            tx,
+            "ASYNIO".into(),
+            Arc::new(InterruptManager::new(16)),
+            actor_id,
+        );
         handle.set_can_block(true);
         super::registry::PortEntry {
             handle,
@@ -4132,11 +4146,17 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(16);
         let actor = PortActor::new(Box::new(driver), rx);
+        let actor_id = actor.id();
         std::thread::Builder::new()
             .name("asynaqr-test-actor".into())
             .spawn(move || actor.run())
             .unwrap();
-        let mut handle = PortHandle::new(tx, "ASYNAQR".into(), Arc::new(InterruptManager::new(16)));
+        let mut handle = PortHandle::new(
+            tx,
+            "ASYNAQR".into(),
+            Arc::new(InterruptManager::new(16)),
+            actor_id,
+        );
         handle.set_can_block(true);
         let entry = super::registry::PortEntry {
             handle,
@@ -4239,8 +4259,14 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_id,
+        );
 
         // A trace manager with an exception sink so trace changes announce
         // (without it, `exception_manager()` is None and no callback registers).
@@ -4248,7 +4274,7 @@ mod tests {
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         // Known baseline mask, then register the port for the record to find.
         trace.set_trace_mask(Some(port_name), TraceMask::empty());
-        super::registry::register_port(port_name, handle, trace.clone());
+        super::registry::register_port(port_name, handle, trace.clone()).unwrap();
 
         // Build the record, hand it the database handle, and connect it —
         // connecting registers the trace exception callback with the same
@@ -4351,8 +4377,14 @@ mod tests {
             ))),
             rx,
         );
+        let actor_id = actor.id();
         std::thread::spawn(move || actor.run());
-        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_id,
+        );
 
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
@@ -4361,7 +4393,7 @@ mod tests {
         // `monitorStatus`): TMSK = ERROR, all IO bits clear.
         trace.set_trace_mask(Some(port_name), TraceMask::ERROR);
         trace.set_trace_io_mask(Some(port_name), TraceIoMask::empty());
-        super::registry::register_port(port_name, handle, trace.clone());
+        super::registry::register_port(port_name, handle, trace.clone()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "TRACE_POSTIFNEW_REC";

@@ -689,7 +689,15 @@ pub fn drv_asyn_ip_port_configure_command(trace: Arc<TraceManager>) -> CommandDe
                 };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
             // The registry above holds a live `PortHandle` for this port, which is
             // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
             drop(handle);
@@ -767,7 +775,15 @@ pub fn drv_asyn_serial_port_configure_command(trace: Arc<TraceManager>) -> Comma
                 };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
             // The registry above holds a live `PortHandle` for this port, which is
             // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
             drop(handle);
@@ -839,7 +855,15 @@ pub fn drv_asyn_prologix_port_configure_command(trace: Arc<TraceManager>) -> Com
             };
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
-            crate::asyn_record::register_port(&port, handle.port_handle().clone(), trace.clone());
+            if let Err(e) = crate::asyn_record::register_port(
+                &port,
+                handle.port_handle().clone(),
+                trace.clone(),
+            ) {
+                ctx.println(&format!("prologixGPIBConfigure: {e}"));
+                handle.shutdown();
+                return Ok(CommandOutcome::Continue);
+            }
             // The registry above holds a live `PortHandle` for this port, which is
             // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
             drop(handle);

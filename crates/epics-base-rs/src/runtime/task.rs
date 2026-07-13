@@ -1,9 +1,84 @@
 use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
+use tokio::runtime::RuntimeFlavor;
 use tokio::task::JoinHandle;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
 pub use tokio::time::interval;
+
+/// A synchronous caller asked to block on an async operation from a thread
+/// where blocking cannot be made sound: a **current-thread** tokio runtime.
+///
+/// Parking that thread stops every task on that runtime, including whichever
+/// one holds the state the awaited future is waiting for — so the block would
+/// never be woken. No blocking mechanism can fix this; the caller has to `await`
+/// the async operation instead of blocking on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotBlockable;
+
+impl std::fmt::Display for NotBlockable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot block a current-thread runtime")
+    }
+}
+
+impl std::error::Error for NotBlockable {}
+
+/// Drive `fut` to completion on this thread, parking between polls.
+///
+/// The future must only await runtime-agnostic primitives (`tokio::sync`
+/// locks/channels/notifies): nothing here drives a reactor or a timer wheel, so
+/// whoever wakes us must be running on some other thread.
+fn park_on<F: Future>(fut: F) -> F::Output {
+    struct ThreadWaker(std::thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let mut fut = std::pin::pin!(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+            return value;
+        }
+        std::thread::park();
+    }
+}
+
+/// Block the calling thread on `fut`, picking the mechanism that is sound for
+/// the thread we are actually on.
+///
+/// This is the single owner of "sync call over async state" in this crate; the
+/// three caller contexts are not interchangeable and picking one mechanism for
+/// all of them is what makes such bridges panic:
+///
+/// - **No runtime entered** (a plain `std::thread`, an iocsh thread) — park the
+///   thread. Nothing else runs here, so there is nothing to starve; the tasks
+///   that will wake us live on some other runtime's threads.
+/// - **Multi-thread runtime worker** — [`tokio::task::block_in_place`], which
+///   hands this worker's remaining tasks to a sibling before it is parked.
+/// - **Current-thread runtime** — [`Err(NotBlockable)`](NotBlockable). Parking
+///   the only thread of that runtime halts every task on it, including the one
+///   that would wake us. This is unsound for *any* blocking mechanism, so it is
+///   reported to the caller instead of being panicked on (today) or deadlocked
+///   on (the worse alternative).
+pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
+    match RuntimeHandle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            RuntimeFlavor::CurrentThread => Err(NotBlockable),
+            _ => Ok(tokio::task::block_in_place(|| handle.block_on(fut))),
+        },
+        Err(_) => Ok(park_on(fut)),
+    }
+}
 
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where

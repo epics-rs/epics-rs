@@ -985,6 +985,7 @@ dependencies = [
 name = "epics-base-rs"
 version = "0.23.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
@@ -1011,6 +1012,7 @@ name = "epics-bridge-rs"
 version = "0.23.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",

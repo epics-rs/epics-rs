@@ -73,7 +73,8 @@ fn configure_port_like_iocsh(name: &str) {
         name,
         runtime.port_handle().clone(),
         Arc::new(TraceManager::new()),
-    );
+    )
+    .expect("port name is free");
     // `runtime` (and the actor thread's JoinHandle) drop here — the only thing
     // still reaching this port is the registry's PortHandle.
 }
@@ -111,7 +112,8 @@ fn explicit_shutdown_still_stops_a_registered_port() {
         "explicit_shutdown_reg",
         runtime.port_handle().clone(),
         Arc::new(TraceManager::new()),
-    );
+    )
+    .expect("port name is free");
     let registry_handle: PortHandle = get_port("explicit_shutdown_reg").unwrap().handle.clone();
 
     // Alive before.

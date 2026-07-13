@@ -23,10 +23,15 @@ on:
     branches: [ "main" ]
   workflow_dispatch: {}
 
-# A new push to the same ref cancels the in-flight matrix.
+# A new push to the same PR branch cancels the in-flight matrix. On main,
+# never cancel: a `gh run rerun --failed` of an OLDER main run re-enters
+# this group and would cancel the in-progress run for the newer commit
+# (observed 2026-07-12: rerunning the run for a merge commit cancelled the
+# release-commit run that followed it). Main runs are rare enough that
+# letting them coexist costs less than losing head-of-main coverage.
 concurrency:
   group: cross-platform-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always

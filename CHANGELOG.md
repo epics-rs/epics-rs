@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### asyn-rs
+
+- **`PortHandle::submit_blocking` no longer panics inside the framework's own
+  runtimes.** It reached for `tokio::task::block_in_place`, which panics
+  unless the runtime is multi-threaded — but the port actor
+  (`PortActor::run_with_shutdown`) and every `ad-core` driver thread
+  (`ad_core_rs::runtime::run_thread_named`) build **current-thread** runtimes.
+  Any driver doing blocking device I/O from its own task therefore aborted
+  that thread on its first transfer: `can call blocking only when running on
+  the multi-threaded runtime`. Motor drivers escaped it only because
+  `#[epics_main]` happens to build a multi-threaded runtime.
+
+  The predicate "am I inside a runtime?" is replaced by the one that actually
+  decides whether blocking is safe: **"am I the thread that would have to
+  service this request?"**. Each port actor now carries an identity that it
+  publishes on its own thread, and every blocking entry point on `PortHandle`
+  (`submit_blocking`, `set_params_and_notify_blocking`,
+  `AsyncCompletionHandle::wait_blocking`, and so all of `SyncIOHandle`) goes
+  through a single gate:
+
+  - Called from the port's **own actor thread** — a `PortDriver` method
+    calling back into its own port — it returns an error naming the port.
+    Blocking there can never be woken: the actor is the thread that would have
+    to run the request it is waiting on.
+  - Called from **anywhere else** — a plain thread, a current-thread runtime,
+    a multi-threaded worker — it parks the caller on the actor's reply. The
+    actor owns its own OS thread, so the reply arrives regardless of what the
+    caller's runtime is doing.
+
+  **Behaviour change:** `set_params_and_notify_blocking` previously returned
+  an error whenever it was called from inside *any* tokio runtime. It now
+  succeeds there (which is what an acquisition task on an `ad-core` driver
+  thread needs) and errors only on the genuinely unserviceable case above.
+
 ## v0.23.0 — 2026-07-12
 
 Minor release. The workspace version is bumped to `0.23.0` and the internal

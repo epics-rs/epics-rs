@@ -1903,49 +1903,92 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
     // so when the server peeks via `try_recv_from` it finds the
     // queued short junk datagram while the prior SEARCH is still in
     // `current_buf`.
-    const N: u32 = 300;
-    let first_cid = 0xC000_0000u32;
-    for i in 0..N {
-        peer.send_to(&search_datagram(first_cid + i), server_addr)
-            .await
-            .expect("send SEARCH");
-        // 8-byte datagram: below the 16-byte CA header size.
-        peer.send_to(&[0u8; 8], server_addr)
-            .await
-            .expect("send short junk datagram");
-    }
-
-    // Collect every reply datagram for up to ~1.5s, walking each
-    // 16-byte header and counting SEARCH replies per echoed cid.
+    //
+    // UDP makes no delivery promise under this burst: 600 datagrams
+    // can overflow the server socket's kernel recv queue
+    // (net.core.rmem_default ≈ 212 KB < 600 × skb truesize) and the
+    // kernel legitimately drops the excess — that is loss, not the
+    // re-parse defect this test pins. Real CA clients retry SEARCH
+    // (`searchTimer`), so unanswered slots are retried with FRESH cids
+    // each round: a kernel-dropped request cannot fail the test, while
+    // any single cid answered twice (the actual R7 regression) still
+    // can, because no cid is ever sent twice.
+    const N: usize = 300;
+    let mut answered = [false; N];
+    let mut cid_to_slot: Map<u32, usize> = Map::new();
+    // Per-cid reply count, across every cid ever sent (dup check).
     let mut counts: Map<u32, u32> = Map::new();
+    let mut next_cid = 0xC000_0000u32;
     let mut rbuf = [0u8; 64 * 1024];
-    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
-    while std::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut rbuf)).await {
-            Ok(Ok((got, _from))) => {
-                let mut off = 0;
-                while off + CaHeader::SIZE <= got {
-                    let Ok(h) = CaHeader::from_bytes(&rbuf[off..off + CaHeader::SIZE]) else {
-                        break;
-                    };
-                    if h.cmmd == CA_PROTO_SEARCH {
-                        *counts.entry(h.available).or_insert(0) += 1;
-                    }
-                    off += CaHeader::SIZE + ((h.postsize as usize + 7) & !7);
-                }
+
+    'rounds: for _round in 0..5 {
+        for (slot, done) in answered.iter().enumerate() {
+            if *done {
+                continue;
             }
-            Ok(Err(e)) => panic!("peer recv error: {e}"),
-            Err(_) => {
-                if counts.len() as u32 >= N {
-                    break;
+            let cid = next_cid;
+            next_cid += 1;
+            cid_to_slot.insert(cid, slot);
+            peer.send_to(&search_datagram(cid), server_addr)
+                .await
+                .expect("send SEARCH");
+            // 8-byte datagram: below the 16-byte CA header size.
+            peer.send_to(&[0u8; 8], server_addr)
+                .await
+                .expect("send short junk datagram");
+        }
+
+        // Collect this round's replies for up to ~1.5s, walking each
+        // 16-byte header and counting SEARCH replies per echoed cid.
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut rbuf)).await
+            {
+                Ok(Ok((got, _from))) => {
+                    let mut off = 0;
+                    while off + CaHeader::SIZE <= got {
+                        let Ok(h) = CaHeader::from_bytes(&rbuf[off..off + CaHeader::SIZE]) else {
+                            break;
+                        };
+                        if h.cmmd == CA_PROTO_SEARCH {
+                            *counts.entry(h.available).or_insert(0) += 1;
+                            if let Some(&slot) = cid_to_slot.get(&h.available) {
+                                answered[slot] = true;
+                            }
+                        }
+                        off += CaHeader::SIZE + ((h.postsize as usize + 7) & !7);
+                    }
+                }
+                // C client parity (`udpiiu.cpp:420-426`): UDP recv errors
+                // `ECONNRESET` (Windows KB263823 — an earlier send drew an
+                // ICMP port-unreachable) and `ECONNREFUSED` (Linux
+                // equivalent) are ignored and receiving continues; libca
+                // never fails on them.
+                Ok(Err(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    continue;
+                }
+                Ok(Err(e)) => panic!("peer recv error: {e}"),
+                Err(_) => {
+                    if answered.iter().all(|&a| a) {
+                        break;
+                    }
                 }
             }
         }
+        if answered.iter().all(|&a| a) {
+            break 'rounds;
+        }
     }
 
-    // Every valid SEARCH cid must be answered exactly once. A cid
-    // answered twice means the server re-parsed a stale `current_buf`
-    // after draining a rejected short datagram.
+    // No cid may be answered more than once. A cid answered twice means
+    // the server re-parsed a stale `current_buf` after draining a
+    // rejected short datagram — every cid is sent exactly once, so
+    // retries cannot produce a legitimate duplicate.
     let duplicated: Vec<(u32, u32)> = counts
         .iter()
         .filter(|&(_, &c)| c > 1)
@@ -1958,12 +2001,15 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
         duplicated.len(),
         duplicated,
     );
+    // Every slot must be answered within the retry budget. Persistent
+    // non-answers (with retries absorbing kernel drops) mean the
+    // responder died or stopped serving — e.g. the pre-fix cast server
+    // exiting its recv loop on a transient UDP recv error.
+    let unanswered = answered.iter().filter(|&&a| !a).count();
     assert_eq!(
-        counts.len() as u32,
-        N,
-        "every valid SEARCH cid must be answered exactly once \
-         (got {} distinct cids, expected {N})",
-        counts.len(),
+        unanswered, 0,
+        "{unanswered} of {N} SEARCH slots never answered across 5 send \
+         rounds — responder lost or stopped serving"
     );
 }
 

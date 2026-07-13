@@ -136,6 +136,7 @@ pub fn create_port_runtime_boxed(
     // Actor channel
     let (tx, rx) = mpsc::channel(config.channel_capacity);
     let actor = PortActor::new(driver, rx);
+    let actor_id = actor.id();
 
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
@@ -154,7 +155,7 @@ pub fn create_port_runtime_boxed(
         })
         .expect("failed to spawn port runtime thread");
 
-    let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts);
+    let mut port_handle = PortHandle::new(tx, port_name.clone(), handle_interrupts, actor_id);
     port_handle.set_can_block(can_block);
     port_handle.set_capabilities(multi_device, max_addr);
     let client = InProcessClient::new(port_handle.clone());

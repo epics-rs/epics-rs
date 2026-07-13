@@ -7,6 +7,7 @@
 //! For `can_block=true` ports, the actor runs on `tokio::task::spawn_blocking`.
 //! For `can_block=false` ports, it runs on a normal `tokio::spawn` task.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -20,6 +21,60 @@ use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::user::AsynUser;
 
 static ACTOR_SEQ: AtomicU64 = AtomicU64::new(0);
+static ACTOR_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// Identity of a port actor.
+///
+/// Minted once per [`PortActor`] and carried by every
+/// [`PortHandle`](crate::port_handle::PortHandle) that targets it, so that a
+/// caller about to block can answer the one question that decides whether
+/// blocking is safe: *am I the thread that would have to service the request I
+/// am about to wait on?*
+///
+/// The actor publishes its own id on its thread for as long as it runs (see
+/// [`ActorScope`]); [`current_actor`] reads it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ActorId(u64);
+
+impl ActorId {
+    /// Mint a fresh identity, distinct from every other actor's.
+    ///
+    /// A handle whose actor is never spawned (some unit-test fixtures hold the
+    /// receiving end and run no actor loop) gets an id that is never published
+    /// on any thread — which is the truth: no thread is that port's actor, so
+    /// no caller can be it.
+    pub(crate) fn new() -> Self {
+        Self(ACTOR_IDS.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+}
+
+thread_local! {
+    /// The port actor running on this thread, if this thread is an actor thread.
+    static CURRENT_ACTOR: Cell<Option<ActorId>> = const { Cell::new(None) };
+}
+
+/// Publishes an actor's id on its own thread, and unpublishes it on every exit
+/// path (return, panic).
+struct ActorScope(Option<ActorId>);
+
+impl ActorScope {
+    fn enter(id: ActorId) -> Self {
+        Self(CURRENT_ACTOR.with(|cur| cur.replace(Some(id))))
+    }
+}
+
+impl Drop for ActorScope {
+    fn drop(&mut self) {
+        CURRENT_ACTOR.with(|cur| cur.set(self.0));
+    }
+}
+
+/// The port actor owning the calling thread, or `None` if the caller is not an
+/// actor thread (a device-support scan thread, an `ad-core` driver thread, a
+/// plain `std::thread`, a tokio worker).
+pub(crate) fn current_actor() -> Option<ActorId> {
+    CURRENT_ACTOR.with(|cur| cur.get())
+}
 
 /// Message sent from [`super::port_handle::PortHandle`] to the actor.
 pub(crate) struct ActorMessage {
@@ -93,6 +148,7 @@ impl PartialOrd for ActorMessage {
 
 /// The actor that exclusively owns a port driver instance.
 pub(crate) struct PortActor {
+    id: ActorId,
     driver: Box<dyn PortDriver>,
     rx: mpsc::Receiver<ActorMessage>,
     heap: BinaryHeap<ActorMessage>,
@@ -104,6 +160,7 @@ pub(crate) struct PortActor {
 impl PortActor {
     pub fn new(driver: Box<dyn PortDriver>, rx: mpsc::Receiver<ActorMessage>) -> Self {
         Self {
+            id: ActorId::new(),
             driver,
             rx,
             heap: BinaryHeap::new(),
@@ -112,10 +169,20 @@ impl PortActor {
         }
     }
 
+    /// This actor's identity. Hand it to every [`PortHandle`] built against
+    /// this actor's channel so blocking callers can detect a re-entrant call
+    /// from the actor's own thread.
+    ///
+    /// [`PortHandle`]: crate::port_handle::PortHandle
+    pub fn id(&self) -> ActorId {
+        self.id
+    }
+
     /// Run the actor loop. Returns when the channel is closed (all senders dropped).
     /// Calls `shutdown()` on the driver before returning.
     #[cfg(test)]
     pub fn run(mut self) {
+        let _scope = ActorScope::enter(self.id);
         loop {
             // Drain all pending messages into the heap
             self.drain_channel();
@@ -157,6 +224,15 @@ impl PortActor {
     /// "shut this port down" and killed ports that the registry still held a
     /// live `PortHandle` for.
     pub fn run_with_shutdown(mut self, mut shutdown_rx: mpsc::Receiver<()>) {
+        // Publish our identity for the whole life of the actor thread: every
+        // `PortDriver` method we dispatch below runs on this thread, so a
+        // driver that calls back into its own port through a `PortHandle` can
+        // be detected and refused instead of deadlocking on itself.
+        let _scope = ActorScope::enter(self.id);
+        // A *current-thread* runtime is deliberate: the actor owns its driver
+        // exclusively and dispatches serially (C asyn's per-port `portThread`).
+        // Nothing here may assume a multi-threaded runtime — see
+        // `PortHandle::block_on_reply`.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

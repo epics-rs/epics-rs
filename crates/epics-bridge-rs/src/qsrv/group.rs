@@ -793,7 +793,7 @@ impl GroupChannel {
     /// the group default. Used by `Channel::get` when the operation
     /// pvRequest carries `record._options.atomic`.
     pub(crate) async fn read_group_atomic(&self, atomic: bool) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name) {
+        if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
@@ -912,7 +912,7 @@ impl GroupChannel {
     /// Same access enforcement as [`read_group`].
     #[allow(dead_code)]
     async fn read_partial(&self, field_names: &[String]) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name) {
+        if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
@@ -1366,7 +1366,7 @@ impl GroupChannel {
         opts: super::channel::PutOptions,
         atomic_override: Option<bool>,
     ) -> BridgeResult<()> {
-        if !self.access.can_write(&self.def.name) {
+        if !self.access.can_write(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "write denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
@@ -1524,7 +1524,7 @@ impl GroupChannel {
                 // SecurityClient list as well.
                 continue;
             }
-            let grant = self.access.write_grant(&m.channel);
+            let grant = self.access.write_grant(&m.channel).await;
             if !grant.allowed {
                 return Err(BridgeError::PutRejected(format!(
                     "group {} PUT: member '{}' field '{}' write denied for \
@@ -1768,7 +1768,7 @@ impl super::provider::Channel for GroupChannel {
     }
 
     async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name) {
+        if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
@@ -1882,7 +1882,7 @@ impl super::provider::Channel for GroupChannel {
     async fn create_monitor(&self) -> BridgeResult<AnyMonitor> {
         // Read enforcement: deny monitor creation when the client lacks
         // read access. start() also re-checks defensively.
-        if !self.access.can_read(&self.def.name) {
+        if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
@@ -2336,7 +2336,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
         // Read enforcement: refuse to spin up upstream subscriptions
         // for a client that lacks read permission on this group.
-        if !self.access.can_read(&self.def.name) {
+        if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.user, self.access.host
@@ -4743,8 +4743,9 @@ mod tests {
 
         // Deny writes to member b's backing channel only.
         struct DenyChannel(&'static str);
+        #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+            async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
                 channel != self.0
             }
         }
@@ -4825,8 +4826,9 @@ mod tests {
 
         // Deny writes to the proc member's backing channel only.
         struct DenyChannel(&'static str);
+        #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+            async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
                 channel != self.0
             }
         }

@@ -4800,3 +4800,678 @@ failure names; bare runs only.
 **CBUG batch E** (`752797f9`, standalone catalogue): CBUG-E1 compress
 dbPut read-start slot (NOT-REPRODUCED, = R17-85), CBUG-E2 dbConvert
 bare-cast UB (REPRODUCED via types::c_cast).
+
+## Round 18 (2026-07-14) — audit after fix wave 15
+
+Six read-only opus auditors, /clear'd and re-briefed; every category
+verified its wave-15 commits and swept for new gaps. NOT convergence:
+**114 findings R18-1..114** (renumbered at consolidation — panels C/D/E/F
+collided; the mapping is recorded per category below). Highs: 24.
+
+**Wave-15 verification summary (consolidated):**
+- HOLD: bf677a8c, 061e9849, 2c04a643, a213af07, 1b237aea (residue
+  R18-23), 1d35eea7, 55960fd7, a81df980, 016a5774, 5dc96c18, 5c4a8498,
+  526726b9, 2644e581, 62429573, 65e24034, ddc899b2, cddea284, 22dd6403,
+  b0125fe3, 05268579, 7b600b1e, c078e93d, 043c11dd.
+- HOLD-with-residue: e74637d0 (R18-11 abort-on-failed-put missing),
+  aabdf2d8 (R18-30; R17-37 adjudicated REAL/Low), db9738f5
+  (R18-38..41), 6e73ac29 (R18-67 NUL truncation), c34591c2 (R18-90
+  rsrvCheckPut half, R18-104 ack guard), 25aa52f7 (R18-103 aSub SUBL),
+  51435dc8 (R18-114 record-local bare `as`), f6ce1657 (R18-107 MCNT),
+  531daed9.
+- **BROKEN: `c05a56f6`** (R17-32) — regression: its moncache.cpp:142
+  citation is the UPDATE path; pva2pva's seed (moncache.cpp:304-312)
+  sets the ROOT bit ("all changed"). The port moved away from the C++
+  gateway: a seed can now omit alarm/timeStamp. The no-data⟹no-seed
+  half is correct and stays.
+- **BROKEN: `52fe221b`** (R17-31) — introduced R18-26: group
+  `+type:"plain"` long-string members advertise Scalar(Byte) while the
+  value ships ScalarArray(bytes).
+- **BROKEN-incomplete: `dd5e0af3`** (R17-69) — R18-92: the guard's
+  boundary is one load group; C's is iocInit. Multi-`dbLoadRecords`
+  st.cmd still races 9-in-15 (worse than the original 1-in-20).
+
+**Adjudications made this round (main):**
+- Gateway monitor-seed parity target = **pva2pva** (the only C++
+  gateway, and what the commit itself cited). Wave-16 fix: seed with
+  the canonical full leaf bitset (the decodable equivalent of
+  pva2pva's root bit 0, which the port encoder cannot emit), keep
+  no-upstream-data ⟹ no seed frame.
+- R18-6 (sCalc CRC16 sign-extends bytes ≥0x80): fix to REPRODUCE
+  compiled-C x86-64 (HexSignificand / R17-79 precedent — wire
+  compatibility with existing C IOCs is the contract). CBUG batch-F
+  candidate. FLAGGED: this makes CRC16 diverge from the Modbus
+  standard on high bytes exactly as every C IOC does.
+- R17-37 (Meta +putorder): REAL, Low, fix per the auditor's minimal
+  classifier (changing = marked && put_order.is_some(); Write /
+  ProcessOnly / Skip) — closes R18-30 with it.
+- Three wave-14/15 "verified clean" entries are FALSE-CLEANS, reopened
+  with C transcripts: doc line 86 → R18-94, line 93 → R18-93, line 94
+  → R18-91 (.db lexer dbTranslateEscape).
+- Correction to the wave-15 dispositions above: the R17-1/R17-2 hashes
+  are swapped — `bf677a8c` is R17-2 (typed DOLn READ), `061e9849` is
+  R17-1 (prec as u16). The verdicts are unaffected.
+
+**Numbering map:** A R18-1..15 and B R18-16..23 as filed; C filed
+31..63 → R18-24..56 (−7); D filed 46..78 → R18-57..89 (+11); E filed
+61..75 → R18-90..104 (+29); F filed 76..85 → R18-105..114 (+29).
+Cross-references inside each category's text below are remapped.
+
+**CBUG batch-F candidates** (upstream C defects, to be filed in
+doc/upstream-c-bugs.md after citation verification): aCalc INC
+off-by-two SIGSEGV (aCalcPerform.c:89/979, ASAN-confirmed); SUBRANGE
+inclusive-bound heap overflow (:1534/1539); DERIV <5 points OOB
+(calcUtil.c:281); SUBLAST at offset 0 (:996-1003); string literal >39
+overrun (sCalcPerform.c:1497); calc INPM..INPU SPC_MOD self-reject;
+stray printf (sCalcPerform.c:999); CRC16 sign-extension (R18-6); pvxs
+process-only blocking PUT dead branch (singlesource.cpp:365 vs
+dbNotify.c:209-248); pvxs UnionArray decode/encode asymmetry
+(dataencode.cpp:370-382 vs :630-659 — port is CORRECT, do not "fix"
+toward pvxs); asynRecord TSIZ=-1 thread-suspend (asynRecord.c:470 +
+cantProceed.c:26-33); histogram LLIM>=ULIM alarm dead code
+(histogramRecord.c:329-335 direct stat/sevr write erased by
+recGblResetAlarms — port matches C's BEHAVIOR, not its intent).
+
+**Also recorded:** category A's compiled evidence is softIoc +
+standalone-compiled sCalc/aCalc/libCom harnesses (synApps calc is not
+built here); pvxs is not built here (C++ claims source-derived, flagged
+per finding); the wave-15 unnamed gateway flake did NOT reproduce in 5
+bare runs (stays open); F's two NOT-REAL adjudications recorded in its
+section (histogram LLIM/ULIM alarm, subArray UDF get_array_info).
+
+
+### Category A (calc/sseq) — R18-1..15, panel-original numbering kept
+
+All four panels verified. Writing up.
+
+---
+
+# ROUND 18 — Category A (calc/sseq engines)
+
+**Verdict up front:** all five wave-15 commits hold, but the round found **7 High** new defects, two of which are severe: the CALC assignment operator `:=` is a **silent no-op** in five records, and `OOPT="Never"` on scalcout drives the output link **every cycle** — the exact inverse of what it asks for.
+
+**Evidence provenance / limitation.** The synApps calc module is **not built** on this machine (no `lib/linux-x86_64`, no `O.linux-x86_64`), so I could not run a compiled sseq/scalcout/acalcout IOC. Compiled ground truth therefore comes from: `softIoc` for the base twins (`seq`, `calc`, `calcout`, `compress`), standalone-compiled `sCalcPerform.c`/`aCalcPerform.c`/`libCom` harnesses, and C source read directly. Port behavior was driven from a scratchpad crate with a path dependency on the repo (no repo file was modified).
+
+## Wave-15 verification
+
+| Commit | Verdict |
+|---|---|
+| `bf677a8c` (R17-2, typed DOLn READ) | **HOLD** — all four C switch arms map faithfully; a constant DOL resolves to `UNRESOLVED` → `field_type: None` → no read, C's `default: break` |
+| `061e9849` (R17-1, prec as u16) | **HOLD** — I re-ran the real sseq STRn site against compiled `cvtDoubleToString` over 9 values × 12 precisions (incl. −1, −2, −32768): **108/108 byte-exact** |
+| `2c04a643` (R17-4, writer-decided post) | **HOLD** — `mark_value_write` reproduces all four C call sites' masks and per-view change gates; `posts_direct` polarity is correct on both paths |
+| `e74637d0` (R17-3, ResolveOutTarget) | **HOLD-with-residue** — "no put ⟹ no wait" is structurally closed, but the *other* half of C's same switch is missing: a **failed** put-with-callback sets `pR->abort=1` in C (`sseqRecord.c:723/745/775`); the port has no abort-on-put-failure path at all → R18-11 |
+| `a213af07` (seam cleanup) | **HOLD** — zero orphans; `typed_output_buffer` has exactly one caller (`sseq.rs:699`); `input_link_read_as`/`set_resolved_out_target` have a default impl plus the single sseq override |
+
+Baseline is clean: `cargo nextest -p epics-base-rs` **2857/2857**, clippy clean. Every finding below is an uncovered gap, not a regression.
+
+## High
+
+**R18-1 — CALC's assignment operator `:=` is a silent no-op; A..U are never written back.** `calc.rs:781`, `calcout.rs:1081`/`:1103`, `scalcout.rs:183`, `swait.rs:246-249`, `transform.rs:710` vs `calcPerform.c:101-123` / `sCalcPerform.c:429-433` (`parg[op-STORE_A] = *pd--` mutates the **caller's** array; every record passes `&prec->a`). The port builds `NumericInputs::with_vars(self.get_vars())` — a *copy* — evaluates, and drops it. Compiled softIoc, `CALC="A:=A+1;A"`, 3 × PROC: C gives `VAL=1 A=1 / VAL=2 A=2 / VAL=3 A=3`. Port: `VAL=1 A=0` **forever**. calcout is worse — its OCAL pass builds a *second* fresh copy, so CALC's stores are invisible to OCAL in the same cycle where C shares one `&prec->a`. `acalcout.rs:543-545` (`apply_stores`) is the one record that gets it right, and is the shape the other five need.
+
+**R18-2 — constant links are re-delivered every cycle through the `ReadDbLink` executor; sseq fires the wrong step.** `links.rs:397` (`read_link_value`'s `Constant` arm → `constant_value()`), reached via `read_db_link_into_field` (`processing.rs:3846`) → `read_link_value_as` (`links.rs:431`). R16-77's fix landed on `read_link_with_alarm` (`links.rs:608-622`, which correctly classifies `Constant → NoData`) — **two readers, one classifier, and the executor path was never routed through it**. `links.rs:600-607`'s own comment ("the constant reaches the record exactly once, at init") is false on this path. sseq additionally never declares the `SELL → SELN` seed C does at `sseqRecord.c:189-192` (`constant_init_links`, `sseq.rs:1390-1394`, has only DOL→STR; dfanout declares `SELL` correctly). Compiled softIoc on the `seq` twin: `field(SELL,"3")` → fresh `SELN=3`, and after `caput SELN 5` + process it **stays 5**. Port: fresh `SELN=1`, and process **resets it to 3** → **step 3 fires where C fires step 5**. Same executor, same defect: compress with constant `INP=5` gives C `VAL=[0,0,0]`, port `[5.0,5.0,5.0]`. Also serves histogram `SVL` and waveform/subArray `INP`.
+
+**R18-3 — one hardcoded runtime-stack ceiling of 30 serves three different C limits.** `postfix.rs:868` (`if runtime_depth >= 30`) vs `postfix.h:31` `CALCPERFORM_STACK 80`, `sCalcPostfixPvt.h:21` `SCALC_STACKSIZE 30`, `aCalcPostfixPvt.h:22` `ACALC_STACKSIZE 20`. One shared `compile()` gates all three flavours. Correct for sCalc only, and it diverges in *opposite* directions for the other two. Compiled softIoc, a depth-35 numeric CALC: **C computes `VAL=35`; the port's `compile()` returns `Err(Overflow)`** — a database-load failure on an expression every C IOC accepts. Conversely acalcout accepts depths 20-29 that C rejects. Structural fix: carry the limit in the flavour's `ElementTable`, not as a literal in the shared compiler.
+
+**R18-4 — scalcout `OOPT="Never"` drives the OUT link on every cycle.** `scalcout.rs:210-220` — `should_output()` matches `0..=5` then `_ => true`; menu index 6 is `Never` (`sCalcoutRecord.dbd:17`) and falls into the catch-all. C `sCalcoutRecord.c:393-395`: `case scalcoutOOPT_Never: doOutput = 0;` (and `doOutput` is pre-initialised to 0, so C's unknown-OOPT case is also no-output). Probed end-to-end: `OOPT=Never`, `CALC="7"` → the port writes **7.0** to the OUT target; C writes nothing. Exact polarity inversion on a physical link. The two siblings get it right (`acalcout.rs:562` `6 => false`, `swait.rs:271` `_ => false`), which is why it survived.
+
+**R18-5 — scalcout has no alarm-limit surface at all.** `rg 'HIHI|HHSV|HYST|LALM' scalcout.rs` → **zero hits**; `record_instance.rs:488-503` does not list `scalcout` for the shared `AnalogAlarmConfig` slot. C `sCalcoutRecord.dbd:479-531,858` declares all ten (HIHI/LOLO/HIGH/LOW/HHSV/LLSV/HSV/LSV/HYST/LALM) and `sCalcoutRecord.c:371` calls `checkAlarms()` **before** the OOPT switch precisely so a limit excursion can drive IVOA. `caput scalc.HIHI 5` → `FieldNotFound`; a scalcout can never go MINOR/MAJOR on its result. acalcout implements the identical C ladder (`acalcout.rs:1624-1630`) — scalcout is the outlier.
+
+**R18-6 — CRC16/MODBUS: C sign-extends every byte ≥ 0x80; the port computes the standard CRC.** `checksum.rs:1-15` (XORs `byte as u16`) vs `sCalcPerform.c:193-212` — `char tranInput[40]` (signed on x86-64) into `unsigned int crc` via `crc ^= (unsigned int)tranInput[i]`, so a high byte pollutes bits 16-31 and the eight `crc >>= 1` steps shift that garbage back down. The commented-out predecessor at `:211` shows the author intended to mask to the low byte. Compiled: `CRC16("\x80")` → C `\x41\x1f`, port `\xbe\xe0`; ASCII-only payloads agree. **CBUG-candidate, and it needs a decision, not a silent choice**: the port is standards-correct and wire-incompatible with every existing C IOC on exactly the binary Modbus frames the operator exists for. `XOR8`/`LRC`/`AMODBUS` are unaffected.
+
+**R18-7 — `my_nint` drops C's `(int)` cast, so PRINTF and `$W` narrow at the wrong width — and the two call sites narrow *differently*.** `string.rs:1481-1483` returns `f64`; `:1358` then wraps (`as i64` → `as i32`) and `:1553` saturates (`as i32`). C `sCalcPerform.c:40`: `#define myNINT(a) ((int)(...))` — the narrowing is *inside* the macro. Compiled: `PRINTF("%d",3e9)` → C `-2147483648`, port `-1294967296`; `$W("%i",3e9)` puts C `\0\0\0\x80` on the wire against the port's `\xff\xff\xff\x7f` — bitwise opposites. This is erosion of R17-79's own owner: `types::c_cast` exists and `string.rs` already references it 7×, but `my_nint` bypasses it. Same-family site: `array.rs:1556-1560`.
+
+## Medium
+
+**R18-8 — sseq `WAITn` is served as DBR_SHORT; C is `DBF_MENU`.** `sseq.rs:1032` declares `DbFieldType::Short` while `menu_field_choices` (`:1774`) returns the 12 `sseqWAIT` labels, and `SELM`/`DOLnV`/`LNKnV` in the same record are correctly `Enum`. C `sseqRecord.dbd:102-104`. Probed: port serves `WAIT1` as `Short(0)`; C serves DBR_ENUM with `"NoWait"`. `caget` prints `0` vs `NoWait`, and DBR_GR_ENUM carries no strings.
+
+**R18-9 — sseq VAL is not posted on each completion.** C `asyncFinish` (`sseqRecord.c:583-586`) posts VAL unconditionally with `DBE_VALUE | recGblResetAlarms()` every cycle — this is the record's "sequence done" signal. VAL is a dummy that never changes, so the port's generic change loop suppresses it. Probed: 3 sequences → C 3 events, port **1**.
+
+**R18-10 — sseq serves no precision, so `DOn` renders at prec 6 on the wire.** `record_instance.rs:1020-1023` (`populate_display_info`) matches `ai|ao|calc|calcout|…` — sseq is absent, and it declares no `field_metadata_override`. `codec.rs:102-106` then falls back to `unwrap_or(6)`. C's sseq RSET exports `get_precision` (`sseqRecord.c:136`) returning `pR->prec`. With `PREC=2`, `caget -S sseq.DO1` of 1.23456789: C `1.23`, port `1.234568`. (STRn itself is correct — it goes through the fixed `cvt_double_to_string`.)
+
+**R18-11 — sseq never aborts on a failed put-with-completion.** C sets `pR->abort = 1`, posts it, and prints "Aborting" inside each `dbCaPutLinkCallback` failure branch (`sseqRecord.c:723`, `:745`, `:775`) — e.g. a connected CA target with no write access. `sseq.rs` writes `abort = 1` **nowhere**; `dispatch_waiting_step` (`:780-790`) treats a put that never issued as completion and runs the remaining steps. This is the residue of `e74637d0`: it closed "no put ⟹ no wait" but left "failed put ⟹ abort" open. (The no-wait `dbPutLink` path correctly ignores status, matching C.)
+
+**R18-12 — calcout `OOPT="On Change"` inverts the NaN case.** `calcout.rs:308` `(pval - val).abs() > mdel` vs `calcoutRecord.c:257` `doOutput = !(fabs(pval - val) <= mdel)`. Not the same predicate under NaN: C's `NaN <= mdel` is false → `!false` → **output**; the port's `NaN > mdel` is false → no output. Reachable on the first process (`pval=0`, `val=NaN`). The port's `// use MDEL like C` comment is a false parity claim.
+
+**R18-13 — calc's `init_record` seeds MLST/ALST/LALM from VAL; C's `calcRecord` does not.** `calc.rs:724-728` vs `calcRecord.c:98-111` — C's init does *only* `recGblInitConstantLink` × NARGS + `postfix()`; the seeding block exists in **calcout** only (`calcoutRecord.c:216-220`). Compiled: `record(calc){field(VAL,"5") field(MDEL,"0")}` → C `MLST=0 ALST=0 LALM=0`; port `5/5/5`. On the first process the port posts a VAL monitor C does not (C's `|0-0| <= 0` → no event).
+
+**R18-14 — seq `VAL` is served as DBR_ENUM, and `OLDN`/`PREC` are missing.** `seq.rs:30-31` (`#[field(type="Enum")] pub val: u16`) vs `seqRecord.dbd.pod:260` `field(VAL,DBF_LONG)` — compiled `caget -d` reports `DBF_LONG`. `OLDN` (`:293`) and `PREC` (`:297`) → **zero hits** in `seq.rs`; `caget TST:SEQ.OLDN` → `1` on C, `FieldNotFound` on the port. `OLDN` is not cosmetic — it is the latch that makes C post a SELN monitor only on change (`seqRecord.c:230-233`).
+
+**R18-15 — the sCalc `(int)`-cast / short-input family.** Three siblings of R18-7, all compiled-verified: SUBRANGE bounds cast `as i64` where C casts `(int)` (`string.rs:2077-2094` vs `sCalcPerform.c:1877` — `"hello"[3e9,2]` → C `hel`, port `''`); `SSCANF %Nc` with fewer than N chars left errors where C's libc `sscanf` returns the short string (`scanf.rs:268-275` vs `:1682-1685` — `$S("ab","%3c")` → C `ab`, port `PERFORM_ERR`); `BIN_READ` on a short frame errors where C `memcpy`s into the zero-filled tail (`string.rs:1582` vs `:1757-1795` — `$R("\x01\x00","%i")` → C `1`, port `PERFORM_ERR`, i.e. CALC_ALARM on a truncated binary reply).
+
+## Also confirmed (not in the top 15)
+
+transform accepts a client put to a linked A..P where C's `special()` `!after` arm rejects it (`transform.rs:902-913` vs `transformRecord.c:653-662`); the calc family never re-posts A..L on an alarm-mask cycle (C `calcRecord.c:417-420` `|| monitor_mask & DBE_ALARM`, four records, one rule); calcout is missing `POVL` (zero hits; C `:687-690` gates the OVAL post on it); transform is missing `MAP` and `CAV..CPV`; scalcout serves no link-status fields (INAV..OUTV); scalcout/acalcout/swait/transform publish no DBR_GR/CTRL metadata; acalcout's `NUSE` over-range put returns `Ok` where C returns `-1`; sseq's `WTGA`/`IXA` are read-only in the port but carry **no** `SPC_NOMOD` in C's dbd (upstream omission); sseq's step-activation filter tests emptiness, not constant-ness; `SUM`/`STD` over an empty window return `-0.0` (Rust's `Sum` folds from `-0.0`) where C seeds `+0.0`; `;` inside a conditional is rejected at compile (sCalc's `EXPR_TERMINATOR` has neither guard base `postfix.c` has).
+
+**CBUG-candidates** (upstream C defects; do **not** port): aCalc `INC` guard off-by-two → `DERIV`/`NDERIV` **SIGSEGV** at legal compile depth (ASAN-confirmed, `aCalcPerform.c:89/979`); SUBRANGE off-by-one heap overflow when the inclusive upper bound equals `arraySize` (`:1534/1539`); `DERIV` on < 5 points reads out of bounds (`calcUtil.c:281`); `SUBLAST` never matches at offset 0 (`:996-1003`); string literals > 39 chars overrun (`:1497` — the `i<39` guard never increments `i`); calc `INPM..INPU` carry `special(SPC_MOD)` that `special()` rejects, so `caput` errors; sseq `special()`'s DLYn arm quantizes DLY1 regardless of which DLYn was written — **already faithfully reproduced** in `sseq.rs:1205-1227`; plus a stray unconditional `printf` at `sCalcPerform.c:999`.
+
+**Doc nit (no action from me — read-only):** the wave-15 disposition list swaps the hashes for R17-1 and R17-2 relative to the commit messages (`bf677a8c` is R17-2, `061e9849` is R17-1).
+
+### Category B (CA tools/client transport) — R18-16..23, panel-original numbering kept
+
+## ROUND 18 — Category B (CA tools + client env/transport)
+
+Working tree clean, no repo file touched. Every claim below is a head-to-head run against `/home/stevek/work/epics-base/bin/linux-x86_64` (softIoc 7.0.10.1-DEV, caget/caput/camonitor/cainfo/caRepeater) on ports 15064/15065.
+
+**Headline:** both wave-15 commits hold. The tool *surface* is now extremely tight — 40+ head-to-head option/format/exit-code cases (incl. `-d DBR_STSACK_STRING`, `-d 99`, `-# -1`, `caput -a` count mismatches, enum-index overflow, usage/`-V`, `camonitor -t s|r|I`, `-m a`) came back byte-identical. The new gaps are all one layer down: the **client's address-list builder**, the **circuit-state machine**, and the **server's TCP bind fallback** — every one of them a *silent* deviation where C prints a diagnostic or changes channel state.
+
+---
+
+### R18-16 — `EPICS_CA_ADDR_LIST` / `EPICS_CA_NAME_SERVERS` duplicates are neither removed nor warned about — Medium
+**Rust** `client/mod.rs:4788-4830` (`parse_addr_list_with_hostnames`), `client/mod.rs:5342-5378` (`parse_nameserver_list`) — entries are pushed unconditionally; the only dedup (`!addrs.iter().any(…)`, `:4863-4890`) guards the *auto-broadcast* additions, never the user list.
+**C** `iocinf.cpp:227` `removeDuplicateAddresses(pList,&tmpList,0)` — `silent=0`, so `iocinf.cpp:123-126` prints `Warning: Duplicate EPICS CA Address list entry "127.0.0.1:15099" discarded` and drops it. `cac.cpp:259-260` applies the *same* pair to `EPICS_CA_NAME_SERVERS`.
+**Impact (measured, UDP sink counting datagrams over 1.5 s):**
+
+| | `EPICS_CA_ADDR_LIST="127.0.0.1:15099"` | `"127.0.0.1:15099 127.0.0.1:15099"` |
+|---|---|---|
+| C caget | 5 datagrams, no warning | 5 datagrams **+ warning** |
+| caget-rs | 1 datagram | **2 datagrams**, no warning |
+
+Every duplicate token multiplies search traffic for the life of the client, and the operator is never told. CBUG-candidate: no.
+
+### R18-17 — a bad `EPICS_CA_ADDR_LIST` / `NAME_SERVERS` token is dropped silently — Low
+**Rust** `client/mod.rs:4824-4826` (`tracing::debug!` "dropped unresolvable entry" — invisible without `RUST_LOG`), plus the two bare `continue`s at `:4791-4795` (unparsable port) and `mod.rs:5350-5353`.
+**C** `iocinf.cpp:70-74` — on `aToIPAddr` failure prints two stderr lines and continues with the rest of the list.
+**Live:** `EPICS_CA_ADDR_LIST="no.such.host.invalid 127.0.0.1:15064"` → C prints `../iocinf.cpp: Parsing 'EPICS_CA_ADDR_LIST'` + `\tBad internet address or host name: 'no.such.host.invalid'` then reads the PV; caget-rs reads the PV and says nothing. Same for `127.0.0.1:abc`. A typo'd IOC address in a site startup script is invisible in the port.
+
+### R18-18 — an unresponsive circuit never becomes a disconnect for the application — **High**
+**Rust** `client/mod.rs:4170-4222` → `disconnect_channels(…, DisconnectKind::Unresponsive, …)` → `mod.rs:4437` `conn_tx.send(kind.connection_event())` = `ConnectionEvent::Unresponsive` (`client/state.rs:82`), a port-only variant. Consumers match `Connected`/`Disconnected` and swallow the rest: `bin/camonitor-rs.rs:383-406` (`_ => {}`).
+**C** `nciu::unresponsiveCircuitNotify` (`nciu.cpp:161-181`) calls `notify().disconnectNotify()` — the **same CA_OP_CONN_DOWN callback as a real disconnect**; `tcpiiu::responsiveCircuitNotify` (`tcpiiu.cpp:861-882`) then re-`connect()`s each channel and re-issues its subscription, so the value is re-posted on recovery.
+**Live** (IOC `SIGSTOP`ped at T+2, thawed at T+15, `EPICS_CA_CONN_TMO=2`; both detect at T+7.0 — timing is exact):
+
+```
+C  camonitor:  T+7.0  TST:AO  ... *** disconnected     ← CONN_DOWN
+               T+15.0 TST:AO  <undefined> 0 UDF NO_ALARM  ← re-subscribed on recovery
+RS camonitor-rs: (no disconnect line, no recovery line — ever)
+```
+A GUI/archiver on the port shows a hung IOC as healthy and never re-syncs when it comes back. The machinery exists (`disconnect_channels`, the recovery re-read at `mod.rs:4224-4250`); the event is simply one the world doesn't listen for. Structural fix: an unresponsive circuit **is** a disconnect (C has no third state) — collapse `ConnectionEvent::Unresponsive` into `Disconnected` rather than teaching each consumer a fourth variant.
+
+### R18-19 — circuit loss raises no `CA.Client.Exception` at all — Medium
+**Rust:** no `dispatch_exception` on the circuit-gone path (`client/mod.rs:4144-4169`, `DisconnectKind::CircuitGone`).
+**C** `cac::destroyIIU` (`cac.cpp:1236-1240`): `genLocalExcep(ECA_DISCONN, hostNameTmp)` whenever a circuit with channels dies.
+**Live** (IOC killed under a monitor): C prints the full block — `Warning: "Virtual circuit disconnect" / Context: "localhost:15064" / Source File: ../cac.cpp line 1240`; the port prints nothing on the exception channel. Any library user with an exception handler installed (the C idiom for logging IOC loss) gets silence.
+
+### R18-20 — the unresponsive exception block: invented Context, missing `Source File` line — Low
+**Rust** `client/mod.rs:4188-4203`: `message: "circuit unresponsive: 127.0.0.1:15064 (matches libca ECA_UNRESPTMO)"`, `source: None`.
+**C** `tcpiiu.cpp:923-926`: context is the **resolved host name** (`getHostName` → `localhost:15064`), and `ca_client_context::vSignal` (`ca_client_context.cpp:388-391`) prints `Source File: ../tcpiiu.cpp line 925` because `genLocalExcep` always passes `__FILE__`/`__LINE__`.
+The port already has the right shape elsewhere (`LIBCA_WRITE_EXCEPTION_SITE`, `client/types.rs:648`, which reproduces `../oldChannelNotify.cpp line 159` byte-exactly). Two other sites carry `source: None`: `mod.rs:3751` (ECA_DBLCHNL), `mod.rs:4498` (server-initiated close).
+
+### R18-21 — camonitor-rs prints a stderr line for every non-normal subscription status; C prints nothing — Low
+**Rust** `bin/camonitor-rs.rs:493-495`: `Err(e) => eprintln!("{pv_name}: {e}")`; the ECA_DISCONN fan-out of R18-18/19 lands here as `TST:AI: server reported ECA status 0x00c0` (`epics-base-rs/src/error.rs:89`).
+**C** `camonitor.c:108-124`: `event_handler` stores `pv->status` and **prints only when `args.status == ECA_NORMAL`**.
+Every IOC restart under a `camonitor-rs` emits a line C never emits — same invented-stderr family as R10-17/R9-23, now on the monitor path.
+
+### R18-22 — the CA server's dynamic-TCP-port fallback is silent; C prints a five-line warning and exports `RSRV_SERVER_PORT` — Medium
+**Rust** `server/tcp.rs:965-974`: on `AddrInUse` the first interface silently rebinds to port 0. No log, no metric.
+**C** `caservertask.c:233-243` (`rsrv_grab_tcp` retries with a random port on EADDRINUSE/EACCES) + `caservertask.c:578-593`:
+```
+cas WARNING: Configured TCP port was unavailable.
+cas WARNING: Using dynamically assigned TCP port 42471,
+cas WARNING: but now two or more servers share the same UDP port.
+cas WARNING: Depending on your IP kernel this server may not be
+cas WARNING: reachable with UDP unicast (a host's IP in EPICS_CA_ADDR_LIST)
+```
+plus `epicsEnvSet("RSRV_SERVER_PORT", …)` — **absent from the whole Rust workspace** (grep: 0 hits).
+**Live:** second C softIoc on a taken port → the block above, TCP 42471. Second `softioc-rs --port 15064` → TCP 37437, library says nothing (only the binary's own info banner; an embedding IOC via `IocApplication` prints nothing at all). The exact condition C considers worth five lines of warning — two servers sharing a UDP port, unicast possibly unreachable — happens invisibly.
+
+### R18-23 — `runtime::net::pva_{server,broadcast}_port` were converted to C's **CA** port semantics, which pvxs does not have — Low (currently uncalled)
+`runtime/net.rs:101-108` now routes `EPICS_PVA_SERVER_PORT` / `EPICS_PVA_BROADCAST_PORT` through `env_inet_port`, i.e. the `IPPORT_USERRESERVED` (5000) floor + the `EPICS Environment "…" out of range` CA diagnostics. pvxs has neither: it parses via `parseTo<>` and treats `EPICS_PVA_SERVER_PORT=0` as a legitimate ephemeral-bind request (the port's own `epics-pva-rs/src/config/env.rs:657-670` implements exactly that, and `tests/parity/tls_interop.rs:305` relies on it). Under the new helper, `=0` would land on 5075 *and print two CA-style lines*. Harmless today — the two functions have **no callers** outside their own unit tests (all PVA code goes through `config::env`) — but they are a live trap for the next caller, and two strict `parse()` sites still bypass the PVA owner: `epics-bridge-rs/src/qsrv/pva_adapter.rs:1313` and `examples/qsrv-ioc/src/main.rs:49`.
+
+---
+
+## Per-commit verdicts
+
+**`1b237aea` (env_inet_port single owner) — HOLD-with-residue.**
+- Diagnostics byte-identical *and* line-count-identical to compiled caget on `abc` / `3000` / `70000` / `-1` / `""` / `"  5065"` / `"5070x"` for `EPICS_CA_SERVER_PORT`; same for `EPICS_CA_REPEATER_PORT` over a 6 s camonitor (2–3 lines, no per-attempt re-printing → the "resolve once" semantic change is real).
+- Semantic change 1 (CAS presence gate) **verified live against C rsrv**, not just read: `EPICS_CAS_SERVER_PORT=3000 EPICS_CA_SERVER_PORT=16064` → C softIoc listens on **5064** and prints the out-of-range pair; `softioc-rs` listens on **5064** and prints the identical pair. It does *not* fall through to 16064 in either. Matches `caservertask.c:491-508`.
+- Semantic change 2 (repeater port resolved once, `udpiiu.cpp:168`) — confirmed by the stable diagnostic count above.
+- No CA port resolution bypasses the owner (`rg` over `crates/`+`examples/`: the survivors are PVA vars and test-infra `set_var`s).
+- Residue: **R18-23** (PVA helpers took CA semantics).
+
+**`1d35eea7` (probe-then-rebind → `.port(0)`) — HOLD.**
+- `cargo nextest run -p epics-ca-rs`: **628/628 passed**, 0 skipped.
+- `cli_cainfo_host`'s changed assertion (`udp_port()` → `tcp_port()`) is **correct, not weakened**: C's `Host:` comes from `ca_host_name` → `nciu::getHostName` → the *circuit* peer, i.e. the TCP endpoint — verified live, compiled `cainfo TST:AI` prints `Host: localhost:15064` where 15064 is the TCP listener. The test still pins the exact port and still asserts the name is reverse-resolved (`assert_ne!(name, "127.0.0.1")`), so W10-B5's regression guard survives.
+- The deleted `sleep(200 ms)` calls were dead: `build()` binds before returning (`ca_server.rs:289-300`).
+- Note (not a break): `.port(0)` yields *different* UDP and TCP ephemerals, a topology C rsrv cannot produce (`ca_udp_port = ca_server_port`, `caservertask.c:499`). It is legal CA — the search reply carries the TCP port — and it is the documented `.tcp_port()` Rust extension, so the tests now exercise a superset of C's shapes rather than a divergent one.
+
+### Category C (PVA) — R18-24..56, renumbered from panel-original 31..63 (offset −7)
+
+All five panels are in and I've hand-verified every load-bearing claim against the C++. C1 is confirmed end-to-end: `conn.cpp:153` is a drain loop (`while(bev && remaining >= 8)`), so INIT and EXEC arriving in one TCP segment are dispatched in the same pass — the server is still `Creating` unless the Source connects inline, and any async source (gateway, un-`open()`ed `SharedPV`) hits `bev.reset()`.
+
+---
+
+# ROUND 18 — Category C (PVA client/server/gateway/qsrv)
+
+Read-only. No repo file created, edited, or deleted; working tree clean at `adbfea9d`. Reference: pvxs `1.5.1-42-gb568e93` (`/home/stevek/work/epics-modules/pvxs`) and — for the gateway, which pvxs does not have — **pva2pva** (`/home/stevek/work/epics-base/modules/pva2pva/p2pApp`), the C++ the wave-15 gateway commits actually cite.
+
+## Per-commit verdicts
+
+| Commit | Finding | Verdict |
+|---|---|---|
+| `c05a56f6` | R17-32 gateway monitor seed | **BROKEN — regression; needs disposition** |
+| `55960fd7` | R17-33 middleware forwarding | **HOLD** |
+| `52fe221b` | R17-31 Q:form long-string | **BROKEN — introduced R18-26** |
+| `aabdf2d8` | R17-35 group PUT leaf | **HOLD-with-residue** (R18-30; R17-37 still open) |
+| `db9738f5` | R17-34 effective TCP timeout | **HOLD-with-residue** (R18-38..48) |
+| `a81df980` | R17-36 echo cadence | **HOLD** |
+
+**`c05a56f6` is the headline.** Its cited authority is false: `moncache.cpp:142` is the *update* path (`*lastelem->changedBitSet = *update->changedBitSet` — an assignment, not a union). pva2pva's actual seed is `moncache.cpp:304-312`: `elem->pvStructurePtr->copy(*lval); elem->changedBitSet->set(0); // indicate all changed` — **the root bit**. The port cannot emit bit 0 (`pvdata/encode.rs:1374-1376`), so pre-fix it sent the canonical full leaf bitset, which a client decodes as the same thing. Post-fix it sends only the union of leaves upstream ever marked, which can omit `alarm`/`timeStamp` from the seed. The commit moved the port **away** from the only C++ gateway. The one half that is right: "no upstream data ⟹ no seed element" (`moncache.cpp:285` `havedata` + `:304`).
+
+**`52fe221b`** correctly added `NtType::LongString` to the NT owner, but the group `+type:"plain"` descriptor arm (`group.rs:1885-1887`) derives descriptors with a *local* `match nt_type` that has no `LongString` case → falls to `_ =>` → advertises `Scalar(Byte)` while the value path still ships `ScalarArray([Byte…])`. Its "single NT owner" claim is half-true: the owner decides the type, Plain still decides its own descriptor.
+
+**`a81df980` HOLD, both halves.** `enforce_timeout` (`env.rs:1404-1410`) reproduces all three pvxs rules incl. the `<2.0→2.0` floor; `echo_period_secs` = `clamp(1,15)` ≡ `max(1,min(15,·))` (`clientconn.cpp:163`); and the death criterion is right in kind — `hb_timeout = tcp_timeout`, matching pvxs's socket inactivity timeout, not a missed-echo count.
+
+## R17-37 — adjudicated: REAL, **Low** confirmed, reachable only by explicit `+putorder`
+
+The feared "putorder default = 0 ⟹ every group with a Meta member" blast radius is **false**: the default is `int64_t::min()`, the *not-putable* sentinel (`ioc/fieldconfig.h:37`), set only by the explicit key. pvxs behavior is real — `groupsource.cpp:554-570`: `putable = putOrder != min()`, `changing = marked && putable`, then `if(changing || info.type==Proc) doPostProcessing(...)`, while `IOCSource::put` returns immediately for Meta. No shipped or documented pvxs config has `+putorder` on a meta member (checked `test/image.{db,json}`, `ntenum.db`, `table.db`, `documentation/qgroup.rst`). One sharp edge if someone does add it to the usual *top-level* (`""`) meta member: `Field::findIn("")` returns the group **root**, and `isMarked(true,true)` on the root is true if any descendant is marked — so that one line makes pvxs process that record on **every** group PUT.
+
+**Minimal correct fix** — `group.rs:1626` (atomic) and `:1714` (non-atomic): stop fusing "has no writable leaf" with "does not participate". Reproduce C's two independent predicates in one classifier used by both loops — `changing = marked && put_order.is_some()`; then `Write` if a leaf exists, `ProcessOnly` if not, `ProcessOnly` for Proc, else `Skip` — with post-processing routed through one owner. That also closes R18-30.
+
+## Findings (R18-24 … R18-56 — I overran the allocated 15 slots; renumber as you see fit)
+
+**High**
+- **R18-24** — Client GET pipelines INIT+EXEC in one write; a pvxs server **hard-resets the whole circuit**. `client_native/ops_v2.rs:599-604` vs `serverget.cpp:429-434` (`state==Creating` → `bev.reset()`) + `conn.cpp:153` (one-pass drain loop). Any pvxs server whose Source connects asynchronously — a gateway, an un-`open()`ed `SharedPV` (`sharedpv.cpp:243`) — kills the TCP circuit and every channel on it, no MESSAGE, no status. MONITOR is correct (`ops_v2.rs:2644`); GET is the only pipelined site.
+- **R18-25** — One slow pipelined downstream **pauses the shared upstream monitor and permanently starves healthy co-subscribers**. `channel_cache.rs:206-208` counts *voting* ops; an op only becomes a voter by crossing LOW itself (`tcp.rs:1379-91`), so a fast/non-pipelined client never votes and can never resume it (`:226-234` ignores a non-voter's Resume). The in-code invariant at `:634-638` asserts the opposite of what the code does. pva2pva never throttles upstream (`moncache.cpp:133-174`: coalesce into the downstream's own `overflowElement`, bump `ndropped`).
+- **R18-26** — `+type:"plain"` long-string member: descriptor `Scalar(Byte)`, value `ScalarArray(bytes)` (regression of `52fe221b`). `group.rs:1885-87` / `:983-990` vs `groupconfigprocessor.cpp:886-895`. Structural fix: a **paired** bare-leaf owner in `pvif` (descriptor *and* value), not one added match arm — `build_field_desc_for_nt` is not a drop-in, it emits the full NT wrapper (`pvif.rs:939-947`).
+- **R18-27** — Gateway does not forward the upstream `Status` verbatim: `format!("PUT INIT failed: {:?}", init.status)` (`ops_v2.rs:1289`) puts a **Rust `Debug` dump on the PVA wire**; kind coerced to `Error`, `stack` dropped. pva2pva hands the downstream requester straight to the upstream channel (`channel.cpp:117-127`), making re-authoring structurally impossible.
+- **R18-28** — Gateway monitor seed under-marks vs pva2pva (the `c05a56f6` regression above).
+
+**Medium** — R18-29 downstream monitor dies silently when upstream is connected-but-idle (INIT OK, then no DATA/FINISH/error, forever; `channel_cache.rs:1101-12` → `source.rs:1021-30` → `tcp.rs:2124`; pva2pva keeps it alive, `moncache.cpp:284-313`) · R18-30 group `+type:"proc"` member processes unconditionally, C gates on `pfield==PROC || force || (pp && SCAN==Passive)` (`group.rs:1668-83`/`:1726-40` vs `iocsource.cpp:397-403`) · R18-31 no gateway loop guard; `ignore_addrs` has **zero** uses in `pva_gateway/`, default client searches UDP 5076 = its own server's port, and pva2pva *refuses to start* without separated ports (`gwmain.cpp:105-131`) · R18-32 client never sends `DESTROY_CHANNEL` (`client.cpp:151-186`) · R18-33 invented control opcodes 3/4 (PVA has only 0/1/2, `pvaproto.h:607-613`) · R18-34 every SEARCH sent twice per NIC (`255.255.255.255` + directed; pvxs emits only directed) · R18-35 cooked-path seed/broadcast duplicate delivery.
+
+**Low** — R18-36 MONITOR INIT *error* echoes `0x88` where pvxs derives `0x08` (`servermon.cpp:132-134` vs `serverget.cpp:84`; the port's own INIT-*success* path already forces `0x08`) · R18-37 type-cache exhaustion **panics** (`encode.rs:508`; only the gateway enables it, `gateway.rs:125`) · R18-38 server idle default 45 s vs pvxs 40 s (the owner never runs on the unset-env path) · R18-39 death detection quantized to the tick (client 45 s, server 60 s, vs pvxs's exact 40 s) · R18-40 `-v` prints the raw `CONN_TMO`, bypassing the owner · R18-41 no write-timeout twin; 5 s send timeout pvxs does not have · R18-42 `isArray` from value shape, not `dbChannelFinalElements` (NELM=1 waveform: pvxs `NTScalar`, port `NTScalarArray`) · R18-43 `Status` decode rejects codes pvxs accepts · R18-44 pvRequest `field` selector matches non-Struct members (`pvrequest.cpp:31`) · R18-45 UDP TX little-endian (pvxs is always BE) · R18-46 UDP RX enforces the Server bit (pvxs checks it TCP-only) · R18-47 truncated SEARCH_RESPONSE discards the whole reply · R18-48 search ladder one bucket late; poke costs 200 ms · R18-49 `tokio::interval` Burst catch-up → SEARCH burst pvxs cannot emit · R18-50 segment byte-order latched from first segment; handshake never reassembles (segmented `CONNECTION_VALIDATION` → silent `anonymous` downgrade) · R18-51 `ca` credential sent with a type-cache define + a Rust-only `groups` member · R18-52 process-global IOID counter (pvxs is per-connection) · R18-53 upstream monitor retained ~60 s after last unsubscribe (C tears down at once via `weak_value_map`) · R18-54 no per-downstream `ndropped`/queue stats (`server.cpp:298-305`) — the exact diagnostic needed to see R18-25 in the field · R18-55 multi-tenant search serializes N×5 s · R18-56 QSRV blocking PUT with unmarked `value` writes+processes where pvxs no-ops.
+
+**CBUG candidates** (bugs in the C++, not the port)
+- **CBUG-C1** — pvxs's process-only blocking PUT is a **dead branch in EPICS Base**. `singlesource.cpp:365` selects `processRequest` when `value["value"]` is unmarked, but `processRequest` is matched by *neither* branch in `processNotifyCommon` (`dbNotify.c:209` `didPut=0`; `:233` tests only `putProcessRequest`/`putProcessGetRequest`; `:248` requires `processGetRequest`) → `doProcess` stays 0 → no put, no process, silent success. (= R18-56's C side.)
+- **CBUG-C2** — pvxs cannot re-serialize a UnionArray it decoded: encode writes elements through their own FieldDesc (`dataencode.cpp:370-382`) but decode rebuilds them as the *selected member's* type (`:630-659`), so a decoded-then-re-encoded UnionA loses its selectors. The port is **correct**; do not "fix" it toward pvxs.
+
+## Negative space (checked, matches — worth knowing)
+Panel D reproduced **7/7** of pvxs's own `testxcode.cpp` byte vectors with the port's encoder, byte-identical (`value[]`, `structA`, `union`, `unionA`, `any`, `any-null`, `anyA`), and `total_bits()==11==desc->size()`. BitSet trailing-zero trim, Size/Selector varints, Status `0xFF` short form, introspection registry (0xFD/0xFE/0xFF, no-overwrite `or_insert`), monitor squash/overrun/`ackAt`, GET/PUT/RPC subcmd algebra, channel lifecycle, GET_FIELD, segmentation all match. **Flow control is dead protocol in pvxs** — `SetMarker`/`AckMarker` are never sent or acted on (`conn.cpp:189-193`) — so the port not implementing the ack window is *not* a divergence. `55960fd7` re-verified independently: 44/45 methods forwarded by all three layers, and `resolve_owner`'s non-forwarding is load-bearing (forwarding it would bind the bare source as owner and bypass ACL/ReadOnly/Audit on every later op).
+
+## Gate
+`-p epics-bridge-rs --features pva-gateway`, five consecutive **bare** runs (no pipe): **780/780 each, zero flakes**. The wave-15 "unnamed gateway flake" did not reproduce — it stays **open**, not closed.
+
+## Not verified
+pvxs is **not built on this machine** (no `lib/`, no `O.linux-*`; building needs EPICS Base + libevent, and the bundled libevent wants `autoreconf`, absent). Every C++ claim above is **source-derived, not executed** — I read each cited line myself, but R18-24's disconnect, R18-25's starvation, R18-27's wire text, and R18-34's duplicate datagrams deserve a live capture before the fixes land. R18-26 *was* reproduced, against the Rust side only.
+
+---
+
+Two decisions are yours, and both change what the doc should record:
+
+1. **R18-28 / `c05a56f6`: which C++ is the gateway's parity target for the monitor seed** — pva2pva (the only real C++ gateway, and what the commit itself cites; under this, revert/rework to seed a full mask) or pvxs `SharedPV` (whose `Value::assign` *does* accumulate a mark union, but which is not a gateway; under this, the code stands and the false citation + doc entry must be corrected)? My reading favors pva2pva for the gateway specifically — a gateway's contract is transparency to a pva2pva-compatible client.
+2. **`52fe221b` and `c05a56f6` are recorded in the doc as FIXED.** Both are BROKEN by this round. I'm read-only and will not touch `doc/c-parity-review-2026-07-10.md`.
+
+### Category D (asyn) — R18-57..89, renumbered from panel-original 46..78 (offset +11)
+
+The IP-server claim is confirmed: `accept_one` exists at ip_server_port.rs:818 and **every** caller is ≥1687 (inside `mod tests`); `drvAsynIPServerPortConfigure` is absent from iocsh entirely.
+
+---
+
+# ROUND 18 — Category D (asyn) — READ-ONLY audit
+
+**HEAD** `adbfea9d` · **C ref** `/home/stevek/work/epics-modules/asyn` @ `R4-45-19-ge2a281e2` · **libCom** compiled from `/home/stevek/work/epics-base` (Linux; the checked-in `lib/darwin-aarch64` binaries are useless here, so I built the oracle from source). Working tree clean — I edited nothing.
+
+**Headline: the four wave-15 commits all hold, but the trace subsystem they fix is dead code on any port a real IOC builds.** `base.trace` and `base.exception_sink` are injected at exactly one production site (`manager.rs:94-95`), and `drvAsynIPPortConfigure` / `drvAsynSerialPortConfigure` / `prologixGPIBConfigure` do not go through it.
+
+## Part 1 — wave-15 commit verdicts
+
+| Commit | Verdict |
+|---|---|
+| `016a5774` escaped_from_raw dstlen | **HOLD** |
+| `5dc96c18` destination-keyed escape | **HOLD** |
+| `6e73ac29` traceIOMask bitfield | **HOLD-with-residue** → R18-67 |
+| `5c4a8498` empty-string early return | **HOLD** |
+
+I compiled `epicsString.c` and re-ran every assertion in `escape.rs`. All eight match byte-for-byte: 200×CRLF→40 gives `ret=400 strlen=39` ending `\r\n\r\`; →10 gives `\r\n\r\n\`; `"a\tb"`→4 = `a\t`, →3 = `a\`; `"\xff"`→3 = `\x`; `epicsStrPrintEscaped("\0a",2)` returns 0 and prints nothing; `("a\0b",3)` prints `a\x00b`. The call-site buffer bounds are C's: `sizeof(tinp)`=40 (asynRecord.c:725/:1629), `EOS_SIZE`=10 (:68, :2005/:2012), echo `char[16]` (asynInterposeEcho.c:71-74), `cbuf[4*sizeof eos+2]`=42 (asynShellCommands.c:304). `ntranslate` (asynRecord.c:1629) only feeds a diagnostic string, so returning a `String` loses nothing. Grow-never-shrink is correct (`trace.rs:759`). `tracePvtInit` (asynManager.c:449-459) indeed never assigns `traceIOMask` → NODATA default confirmed, and I re-derived each of the three corrected tests against `traceVprintIOSource` — they encode C, not the port's old behavior.
+
+**The residue:** C's ASCII block is `fprintf(fp,"%.*s\n",(int)nBytes,buffer)`, and `%.*s` **stops at a NUL**. Compiled: payload `AB\0CD` (5 bytes) → C emits `AB`, `snprintf` returns 2. The port does `out.extend_from_slice(data)` (trace.rs:969) and emits all five bytes.
+
+## Part 2 — new findings
+
+### High
+- **R18-57 — `exception_sink` and `trace` are never injected into any iocsh-created port.** `manager.rs:94-95` is the only production site (`port.rs:3042+`/`port_handle.rs:1287+` are under `mod tests` at :2072/:1093). `iocsh.rs:958-966` (+:1046, :1126) calls `create_port_runtime` directly. `AsynUser::print_io` early-returns on `trace == None` (user.rs:247); `user_trace()` returns None when `base.trace` is None (port_actor.rs:1171-1177); drivers gate on `asyn_trace_io!(Some(self.base.trace), …)` (ip_port.rs:873, :1367). C: asynManager.c:611-637 fans out over a list that lives on the port and is always present. **Impact: on a port built by st.cmd, `asynSetTraceMask MYPORT -1 0x9` + `asynSetTraceIOMask MYPORT -1 ASCII` produces zero output, and no exception callback ever fires. R17-46/47/48/49 and R18-63..56 are all unobservable there.**
+- **R18-58 — the IP server port never accepts.** `accept_one` (ip_server_port.rs:818) has no caller outside `mod tests`; `drvAsynIPServerPortConfigure` is absent from iocsh (rg: zero hits). C starts `connectionListener` at configure (drvAsynIPServerPort.c:711-714) which loops on `epicsSocketAccept` (:326) and fires octet callbacks carrying the child port name (:374-383). Impact: a TCP client sits in the backlog until it times out while the port reports Connected.
+- **R18-59 — the octet read interrupt fan-out does not exist.** No driver calls any interrupt notify after a read (rg over `drivers/` + `port_actor.rs`: zero hits). C: `asynOctetBase.c:224-238` `readIt` → `callInterruptUsers(…, data, nbytes, eomReason)`, enabled by both stream drivers (drvAsynIPPort.c:1055, drvAsynSerialPort.c:1125). Impact: a `stringin`/`waveform` with `SCAN="I/O Intr"` on a serial or IP port never processes.
+- **R18-60 — the interpose chain is a per-driver opt-in, not a port property.** Only `ip_port.rs`, `serial_port.rs`, `serial_port_win32.rs` call `dispatch_read`/`dispatch_write`. C's `interposeInterface` is manager-level (asynManager.c:2190-2220). Sharpest instance: `ftdi.rs:155` installs an `EosInterpose` and FTDI never dispatches through the stack — its test at :276 asserts the interpose is *installed*, never that it *runs*. `asynInterposeEcho("PROLOGIX",0)` reports success and does nothing.
+- **R18-61 — a newly registered auto-connect port never connects until the first request.** `create_port_runtime_boxed` (runtime/port.rs:113-150) sends no Connect; `init_connected` (port.rs:384-389) arms no timer. C: `registerInterface(asynCommonType)` calls `initPortConnect` + `portConnectTimerCallback` (which queues at `asynQueuePriorityConnect`, :3259) + `waitConnect` (asynManager.c:2131-2136). Impact: `CNCT` reads 0 after `drvAsynIPPortConfigure` until traffic arrives; a port with no record traffic never comes up.
+- **R18-62 — `SO_REUSEPORT` is set after bind/connect.** ip_port.rs:1252-1264 (TCP), :1184-1201 (UDP, after `UdpSocket::bind` at :1171). C sets it on the fresh socket before bind (drvAsynIPPort.c:464-477). Impact: `udp&` with a local port — the whole point of the `&` suffix — fails `EADDRINUSE` where C binds.
+
+### Medium
+- **R18-63 — the trace config hierarchy is a lazy pull-fallback; C's is a per-`dpCommon` struct with push-down.** `tracePvtInit` is called for *every* port and device (asynManager.c:503, :528) and `findTracePvt`→`findDpCommon` (:534-551) selects one whole struct — no inheritance. Three proven symptoms (ran against the real `TraceManager`): (a) a port-level set never overwrites existing devices and announces once where C overwrites every device and announces per device plus once for the port (asynManager.c:2790-2800/:2833-2843/:2874-2884) — `asynSetTraceMask P 1 0x3f` then `P -1 0x1` leaves device 1 at 0x3f forever, with no way to quiet it; (b) a global set (`asynSetTraceMask "" -1 …`, iocsh.rs:678) leaks into every port, where C writes `pasynBase->trace`, which no port-attached user ever reads (asynShellCommands.c:651-660); (c) device config is honored on non-`ASYN_MULTIDEVICE` ports, where C's `findDpCommon` ignores it (`TraceManager` has no multi-device notion at all). The doc-comment at trace.rs:585-586 claiming C announces on the global path is false.
+- **R18-64 — the trace prefix matches C on no component and appends a token C never prints.** Observed: `1783941510.799 P:3 main IO_DEVICE read 2 bytes`; C emits `2026/07/13 … [P,3,0] [main,0x…,50] read 2 bytes`. TIME is raw epoch vs strftime `%Y/%m/%d %H:%M:%S.%03f` (:2984-2996); PORT is `P:3` vs `[%s,%d,%d]` with the reason (:3005-3023, and `getAddr` yields **-1** for a port-level user, :2004); THREAD drops the id+priority (:2969-2981); SOURCE skips `asynStripPath` (:479-487) so Rust's `file!()` full path is printed; the order is C's TIME/PORT/SOURCE/THREAD (:3136-3139) vs the port's TIME/PORT/THREAD/*mask-label*; and `mask_label` (trace.rs:927-943) has no C source at all.
+- **R18-65 — default `traceInfoMask` is `TIME|PORT`; C's is TIME alone.** trace.rs:341 (+ fallback :875) vs asynManager.c:455 — the only assignment in the whole C tree.
+- **R18-66 — `ASYN_TRACEINFO_SOURCE` is silently dropped on the `asynPrintIO` path.** `output_device_io` (trace.rs:566-582) takes no file/line; C's `traceVprintIOSource` prints it (:3138). Proven: SOURCE-only `asynPrintIO` emitted no `[file:line]`. All real device I/O loses it.
+- **R18-67 — ASCII trace block writes past an embedded NUL** (residue on `6e73ac29`; see Part 1).
+- **R18-68 — Connect/Disconnect queue at `Medium`, not `asynQueuePriorityConnect`.** The heap orders on `user.priority` (port_actor.rs:108, :170-175); `Medium` is `#[default]` (port.rs:106); `connect_blocking`/`disconnect_blocking` (port_handle.rs:1015/:1022) build `AsynUser::new(0)`. C drains the Connect queue first (asynManager.c:811-855). Impact: on a sustained High scan stream an operator's `CNCT=0` put starves indefinitely.
+- **R18-69 — the `lockPort`/`queueLockPort` family is absent; `SyncIOHandle` has no atomic writeRead** (found independently by two sweeps). sync_io.rs exposes only `read_octet`/`write_octet`; `RequestOp::OctetWriteRead` is reachable only from `adapter.rs`. C: asynOctetSyncIO.c:246-271 holds `queueLockPort` across flush+write+read. Impact: on a shared port another client's request interleaves and the reply is read by the wrong caller. (Corroborates the known multi-axis motor pattern.)
+- **R18-70 — `blockProcessCallback`'s device scope is unmodelled; every block is port-wide.** `RequestOp::BlockProcess` is a unit variant (request.rs:150), `blocked_by` is one port-wide holder (port_actor.rs:237). C keeps both `pport->pblockProcessHolder` and `pdpCommon->pblockProcessHolder` (asynManager.c:1692-1723) and devGpib uses the device form (devSupportGpib.c:1216). Impact: one GPIB address's SRQ transaction stalls every other address on the port.
+- **R18-71 — `setInputEos`/`setOutputEos` succeed silently where C returns `asynError`.** port.rs:1918-1956 caches and returns `Ok(())`; C swaps NULL EOS methods for Fail stubs (asynOctetBase.c:115-118) yielding `"<port> setInputEos not implemented"` (:370-380), and serial really does leave them NULL (`asynOctetMethods = { writeIt, readIt, flushIt }`, drvAsynSerialPort.c:1003). Impact: on a `noProcessEos` port an IEOS put reports success, reads back the terminator, and never terminates on it.
+
+### Overflow — real and verified, past the R18-71 slot the brief allotted (I am not dropping them to fit the range)
+**R18-72** serial has no `tcflush(TCOFLUSH)` on read/write timeout (serial_port.rs:293/:385/:420 vs drvAsynSerialPort.c:640-660) — the timed-out command keeps draining, prefixing the next one. Medium.
+**R18-73** FTDI/VXI-11 declare `asynOption` but validate nothing (ftdi.rs:197, vxi11.rs:276 → base default port.rs:1450-1470) vs drvAsynFTDIPort.cpp:142-231 / drvVxi11.c:1658-1699. Medium.
+**R18-74** USBTMC never puts TermChar on the wire (usbtmc.rs:105-117, `h[8..12]` hard-zeroed) vs drvAsynUSBTMC.c:863-866 — `IEOS` is dropped. Medium.
+**R18-75** VXI-11 multi-device gate narrower than C: an unrecognized `vxiName` becomes single-device (vxi11.rs:226) where C sets `ASYN_MULTIDEVICE` for anything not `inst*`/`com*` (drvVxi11.c:1754-1760). The unit test at :455 encodes the inverted rule. Medium.
+**R18-76** delay interpose has no `asynOption "delay"` interface, and zero delay collapses C's per-character writes into one (interpose/delay.rs:61 vs asynInterposeDelay.c:41-50/:134-172). Medium.
+**R18-77** exception fan-out is a flat global list, not C's per-`dpCommon` list (exception.rs:99-107 vs asynManager.c:611-625) — the structural reason R18-57 is invisible. Low-Medium.
+**R18-78** **CBUG-candidate.** `caput X.TSIZ -1`: C passes `epicsInt32` into a `size_t` (asynRecord.c:470) → 18446744073709551615 → the realloc branch (asynManager.c:2947-2951) → `calloc` returns NULL (verified) → `callocMustSucceed` errlogs and calls `epicsThreadSuspendSelf()` inside a `while` loop (cantProceed.c:26-33), **suspending the put thread forever**. The port does `self.tsiz as usize` (mod.rs:2244) → `usize::MAX` → silently unlimited tracing. Low.
+**R18-79** symbolic mask parse: C always applies the partial mask on a bad token and prefix-matches (`STARTSWITH`, asynShellCommands.c:668-706), so `"ERROR+BOGUS"` sets 0x1; the port returns `Err` and applies nothing, leaving the old mask. Low.
+**R18-80** `asynOctetBase`'s flush fallback (drain input at 0.05 s until a zero read, asynOctetBase.c:240-263) is unimplemented — `io_flush` defaults to `Ok(())` (port.rs:1884). Latent (no in-tree C driver leaves flush NULL). Low.
+**R18-81** `set_addr_connected` (port.rs:496-509) doesn't bump `number_connects` nor arm the port connect timer, where C's `exceptionConnect`/`exceptionDisconnect` do (asynManager.c:2158, :2181). Low.
+**R18-82** `blockProcessCallback` misses C's non-`ASYN_CANBLOCK` refusal (asynManager.c:1703-1709) and returns silent success on an unblock with nothing blocked (port_actor.rs:1552-1575 vs :1736-1741). Low.
+
+## Coverage gap — not covered
+
+**The asynRecord field-semantics sweep did not return before I finished.** `asynRecord.c`'s `process()`/`special()`/`monitorStatus()` state machine (TMOD modes, NRRD/NORD/NOWT/NAWT, IFACE dispatch, the SPC_MOD arm-by-arm comparison, the POST_IF_NEW set) is therefore **unaudited this round**, beyond the trace fields I covered myself (TFIL verified faithful; TSIZ → R18-78). That slice is still owed.
+
+## Bottom line
+
+The four commits are faithful C ports and I would merge all four — but `6e73ac29` carries the NUL residue (R18-67), and R18-57 means the "DEFAULT TRACE OUTPUT CHANGED" semantic in that commit is, on any port an st.cmd actually builds, a change to output nobody receives. **R18-57 should be fixed before any further trace work**, or the next round audits code that cannot run.
+
+---
+
+Both verified against C. Filing as an addendum — this closes the coverage gap I flagged.
+
+# ROUND 18 — ADDENDUM: asynRecord field semantics
+
+The fourth sweep returned after I filed. The gap I reported as "unaudited" is now closed. Two claims I verified against the C myself; the rest carry the sweep's evidence.
+
+### R18-83 — a BOUT array put never sets NOWT (`put_array_info` is missing) — **High** ✅ verified
+`asyn_record/mod.rs:3952-3954`: `"BOUT" => { self.bout = to_bytes(&value); }`. `self.nowt` is written at exactly two places (rg): `:3420` (the OMAX clamp) and `:3959` (an explicit NOWT put). C's `put_array_info` (asynRecord.c:983-993) does `if (fieldIndex == asynRecordBOUT) pasynRec->nowt = nNew;` — in C, **writing the array *is* how NOWT gets set**, because dbAccess calls `put_array_info(nNew)` on every array put, and `monitor()` then `POST_IF_NEW(nowt)`s it (:1022).
+
+Impact: `caput -a` of 120 bytes to BOUT with OMAX=1000 leaves NOWT at its stale value (default 80), and `octet_output_buffer` (mod.rs:3441-3446) sends `bout[..min(nowt, len)]` — **80 bytes on the wire where C sends 120**. NOWT/NAWT then read back a count unrelated to what was written. Not a framework limitation: `acalcout.rs:386-426` implements C's `put_array_info` inside `put_field`.
+
+### R18-84 — BOUT/BINP ignore C's `cvt_dbaddr`/`get_array_info` element counts — **Medium** ✅ verified
+C's `cvt_dbaddr` (asynRecord.c:941-948) sets `no_elements = omax` for BOUT and `imax` for BINP, so dbAccess **truncates any put to that bound**; `get_array_info` (:966-981) reads BOUT back as `nowt` elements, BINP as `nord`. The port stores a BOUT put whole (no OMAX truncation) and `get_field` returns the entire buffer (mod.rs:3826). With `OFMT=Hybrid` the payload is `translate_escape(bout[..first NUL])` with no OMAX bound, so the record can write **more bytes than OMAX** — C physically cannot (its `optr` is `omax` bytes and the put is truncated).
+
+### R18-85 — ERRS is `DBF_STRING` (40 B) where C is a 100-byte `DBF_CHAR` array — **Medium** ✅ verified
+`mod.rs:2037-2041`: `FieldDesc { name: "ERRS", dbf_type: DbFieldType::String, read_only: true }`. C: `ERR_SIZE 100` (:69) and `cvt_dbaddr` (:957-963) gives ERRS `no_elements = 100`, `field_type = DBF_CHAR`, `dbr_field_type = DBR_CHAR`, `special = SPC_NOMOD`. A CA client gets a 39-char-clipped `DBR_STRING` instead of a 100-element `DBR_CHAR` waveform — and the record's own texts routinely exceed 39 chars (`"Connect error, status=3, asynManager:connectDevice port XXX not found"` is 68). Type **and** element count differ from every existing asyn OPI.
+
+### R18-86 — `monitor()` never posts AINP/BINP/TINP unconditionally — **Medium**
+C's `monitor()` (asynRecord.c:1006-1030) `db_post_events`es AINP/BINP and TINP **unconditionally** for `TMOD == Read || Write_Read` (:1012-1019) — deliberately *not* through `POST_IF_NEW`, unlike the NRRD/NORD/NOWT/NAWT/EOMR group (:1020-1029). The port overrides neither `force_posted_fields()` nor `process_posted_fields()`, so it falls back to generic per-field change detection. Impact: a scanned record polling a device that answers the same string every scan gives one monitor per scan in C and **none** after the first in the port — archivers, `camonitor`, and SNL sequencers using the response as a poll heartbeat stall.
+
+### R18-87 — `TMOD = NoI/O` never enters the port queue — **Medium**
+`mod.rs:4692-4694` early-returns above the queue submit. C issues `queueRequest(…, asynQueuePriorityLow, QUEUE_TIMEOUT)` **unconditionally** in the `stateIdle` arm (:342-353); the TMOD test lives one level down in `asynCallbackProcess` (:824). A failed queueRequest → `reportError("queueRequest failed")` + `recGblSetSevr(STATE_ALARM, MINOR_ALARM)`. Impact: the standard "process with TMOD=NoI/O to nudge a reconnect / refresh status" idiom is a no-op — C's queue entry is what pokes `autoConnectDevice`. On a disconnected port C leaves STATE/MINOR + ERRS; the port stays NO_ALARM and silent.
+
+### R18-88 — `init_record` skips C's `OMAX/IMAX <= 0 → 40` fixup — **Low**
+C: `if(omax <= 0) omax = MAX_STRING_SIZE; if(imax <= 0) imax = MAX_STRING_SIZE;` (:289-291), before the buffers are allocated. The port's pass 0 (mod.rs:4139-4147) does nothing. A db setting `IMAX=0` yields `octet_buf_size = 0` — silent zero-length transfers where C uses 40-byte buffers.
+
+### R18-89 — a failed `asynDrvUser->create` zeroes the reason; C keeps the previous one — **Low**
+`mod.rs:3187-3193` sets `self.resolved_reason = 0` on error. C (:1248-1257) only calls `reportError` and assigns neither `pasynRec->reason` nor `pasynUser->reason`, so a REASON the operator set by hand survives. Impact: after a bad DRVINFO put, the port silently redirects every read/write to parameter 0 while REASON still displays the operator's value.
+
+---
+
+## Revised bottom line
+
+**33 findings this round (R18-57..R18-89), 7 High.** All four wave-15 commits still **HOLD** (`6e73ac29` **HOLD-with-residue** → R18-67). Nothing in the audit changed those verdicts.
+
+Two structural items dominate and should be sequenced first, because they gate the value of everything downstream:
+
+1. **R18-57** — `base.trace` / `base.exception_sink` are injected only in `manager.rs:94-95`, which the iocsh port-configure commands bypass. On any port an st.cmd actually builds, the entire trace and exception subsystem is inert. Fixing the trace *format* findings (R18-63..56, and R17-46..49 before them) buys nothing until this lands.
+2. **R18-83** — the missing `put_array_info` is a live data-corruption bug: a BOUT array put silently sends the wrong number of bytes to the device. It is the single most damaging finding of the round in terms of what a device actually receives, and it is a small, self-contained fix (the pattern already exists at `acalcout.rs:386-426`).
+
+The read-only constraint held throughout: working tree clean, no repo or doc file touched.
+
+### Category E (records/links/db core) — R18-90..104, renumbered from panel-original 61..75 (offset +29)
+
+I've verified everything. Here is my Round 18 report.
+
+---
+
+# ROUND 18 — Category E (records / links / db core)
+
+Read-only. Reference: `/home/stevek/work/epics-base` (softIoc 7.0.10.1-DEV, `bin/linux-x86_64`). Every decisive claim below is backed by a compiled-C transcript. 15 findings, R18-90..R18-104.
+
+## Headline
+
+`dd5e0af3` (R17-69) is **BROKEN — incomplete**. It closed the single-load-group case but not the multi-`dbLoadRecords` case every real `st.cmd` uses, where the classification now races at **9-in-15**, worse than the 1-in-20 R17-69 originally measured. Separately, **three entries in the doc's "verified clean" list are false-cleans** (lines 86, 93, 94) — I reopened all three with C transcripts.
+
+---
+
+## Findings
+
+**R18-90 — the SPC_NOMOD declaration reaches the `dbPut` gate but not `rsrvCheckPut`: the CA server advertises WRITE access on every dbCommon NOMOD field — Medium.**
+`c34591c2` extended `DBCOMMON_NOMOD` (field_io.rs:42-45) and `Record::field_no_mod` (R17-77), but C's declaration has **two** consumers and only one moved. `compute_access` (epics-ca-rs/src/server/tcp.rs:864-898) derives `is_ro` from `field_list().read_only` alone — and no record's `field_list` declares NAME/STAT/SEVR/ACKS/RPRO/…, nor is `field_no_mod` consulted. C: `rsrvCheckPut` (rsrv/camessage.c:2540-2551) `if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;` feeds the ACCESS_RIGHTS write bit (camessage.c:1123-1124) and both put paths (`:741`, `:1653`). Head-to-head, same `.db`:
+
+| channel | C | port |
+|---|---|---|
+| `N1.SEVR` | `Access: read, no write` | `Access: read, write` |
+| `CMP` (compress VAL, BALG=LIFO) | `read, no write` | `read, write` |
+
+C's `caput N1.SEVR 2` fails client-side with a clean `Write access denied`; the port sends the write, the gate refuses it server-side, and the client gets an async `CA.Client.Exception` dump instead. Data stays protected — but the wire bits are wrong on ~15 fields × every record, so medm/CSS enable the write widget. Structural fix: one `is_no_mod(instance, field)` owner consulted by both `check_no_mod` and `compute_access`.
+
+**R18-91 — the `.db` lexer never unescapes field/info values; C runs `dbTranslateEscape` on all of them — High. CBUG-free, port-side.**
+This refutes doc line 94 ("`.db` quoted-string lexing keeps escape bytes raw … the old `03-H-2`/`03-H-3` findings are closed"). That closure read the wrong lexer rule. C has **two** start conditions: record/alias **names** are `tokenSTRING` from `INITIAL` (dbLex.l:88-92 — quotes stripped, escapes kept raw), but field and info **values** are `jsonSTRING` from the `JSON` condition (dbYacc.y:256-267, dbLex.l:111-114) and keep their quotes — and the quotes are precisely the marker that translation is still owed. `dbLexRoutines.c:1398-1403` / `:1435-1440` then strip them and call `dbTranslateEscape(value, value)` (epicsString.c:41-47 → `epicsStrnRawFromEscaped`, :49-118) before `dbPutString`.
+
+Port: `read_quoted_string` (db_loader/mod.rs:828-899, emit-both-bytes at :858-871) is shared by names *and* values and never unescapes; nothing downstream rescues it (`rg unescape|raw_from_escaped` over the load path: no hits). The in-code comment at mod.rs:844-857 asserts the opposite, and two unit tests (`test_quoted_string_escape`, `test_quoted_string_keeps_escapes_raw`) pin the defect.
+
+I confirmed the C side myself. `record(stringin,"E2"){field(DESC,"hex\x41end")}` → `dbgf E2.DESC` = `"hexAend"`. `dbgf` *re-escapes* on print (dbTest.c:1007 `epicsStrnEscapedFromRaw`), so had C stored the backslashes it would have printed `hex\\x41end`. `\x41 → A` cannot be a print artifact.
+
+| `.db` source | C stores | port stores |
+|---|---|---|
+| `"a \"b\" c"` | `a "b" c` (9 B) | `a \"b\" c` (11 B) |
+| `"hex\x41end"` | `hexAend` | `hex\x41end` |
+| `"x\ty"` | `x`,TAB,`y` | `x`,`\`,`t`,`y` |
+
+Impact: DESC/EGU/stringout.VAL show literal backslashes to every client — and **link fields ride the same path**, so `field(OUT,"@drvUser(\"chan1\")")` reaches device support with backslashes still in it. The port also *accepts* two forms C rejects (raw control chars, `\ooo` octal — dbLex.l:23,25), so a `.db` C refuses to load starts up "fine" with wrong data. Structural fix: split the helper into `read_json_string` (unescapes) vs `read_quoted_string` (raw), mirroring C's two start conditions — do **not** unescape inside the shared helper, or names break. Adjacent same-defect site: iocsh `cmd_echo` (iocsh/core_commands.rs:46-63) vs C `libComRegister.c:84-91` (`dbTranslateEscape` before printf).
+
+**R18-92 — `dd5e0af3` does not close R17-69: a cross-`dbLoadRecords` forward reference still races, now 9-in-15 — High.**
+The guard's scope is one load *group* (`cmd_db_load_records` closure, iocsh/commands.rs:1026; `IocBuilder::build`, ioc_builder.rs:192). C's boundary is **iocInit** — `init_record` runs after *every* `dbLoadRecords` block. Probe (`a.db`: calcout `CO` with `INPA="LATER"`; `b.db`: `ai LATER`), settled read, 15 runs each:
+
+```
+C  softIoc  (dbLoadRecords a; dbLoadRecords b; iocInit)   → "Local PV" 15/15
+port iocsh  (dbLoadRecords a; dbLoadRecords b)            → 2 0 0 0 2 2 0 2 0 0 2 2 0 0 0
+                                                             (6× Local PV, 9× Ext PV NC)
+port iocsh  (single dbLoadRecords ab.db)                  → 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2  ✅
+```
+The commit message's "Forward references are deterministically Local; no sleeps, no re-poll" holds only within one group. `wait_for_load` (database/mod.rs:1093-1117) is a loop over a counter that returns to zero **between** files, so the woken task classifies against whichever prefix of the database happens to exist when it is next polled. The structural fix is an explicit iocInit barrier for classification, not a per-group counter.
+
+Sub-residue (Low, same commit): classification is an unsynchronized `tokio::spawn` (calcout.rs:391), so there is no point at which the port guarantees it is done. A `dbgf CO.INAV` issued immediately after `dbLoadRecords` returns reads the struct default **`Constant` (3)** — not even `Ext PV NC` — and converges to 2 seconds later. C's value is final when `iocInit` returns.
+
+**R18-93 — `processTarget` runs for non-Passive link targets: PUTF is propagated and RPRO is set — High.**
+Refutes doc line 93 ("`dbScanPassive`'s `pto->scan != 0 → no-op` gate" — claimed verified). C returns *before* `processTarget`: `dbDbLink.c:427-434` `if (pto->scan != 0) return 0;`. `processTarget` (`dbDbLink.c:474-489`) is the only link-side writer of PUTF/RPRO. The port applies the Passive gate only to the *process* call and mutates PUTF/RPRO above it — five cloned blocks: processing.rs:3636-3661, :4593-4615, :4731-4742; links.rs:1155-1180, :1988-2000. C probe: FLNK→`ASY` (calcout `SCAN="5 second" ODLY=4`, PACT=1) after `caput TRIG.PROC 1` → `ASY.RPRO=0`, exactly one process per scan. The port sets RPRO=1, so async completion fires an **extra unscheduled cycle** (extra device write, extra FLNK chain). Invariant to restore: *PUTF/RPRO are written only by `dbPutField`-on-PACT and by `processTarget`, and `processTarget` is reachable only for a Passive target or a `.PROC` write.* One `process_target()` owner with the gate inside it.
+
+**R18-94 — a DB link writing `TARGET.PROC` does not process a non-Passive target — Medium.**
+Refutes doc line 86. C `dbDbLink.c:387-389`: the `.PROC` arm has **no** scan test — `if (dbChannelField(chan) == &pdest->proc || (pvlMask & pvlOptPP && pdest->scan == 0))`. Port links.rs:1146-1180 recognizes `.PROC` but dispatches `if should_process && target_scan == ScanType::Passive`. C probe: `SRCO.OUT="TGT.PROC"`, `TGT` `SCAN="10 second"` → each `caput SRCO.PROC 1` advances TGT immediately (0→1→2). Port: no-op. The two put boundaries disagree with each other — the CA route *does* honour `.PROC` on any SCAN (field_io.rs:1109).
+
+**R18-95 — put-notify on a PACT record: the port writes the value immediately, sets RPRO, and completes the callback at the end of the in-flight cycle; C defers the whole put — High.**
+C `dbNotify.c:225-231` tests PACT **above** `putCallback` and returns having written nothing. Port field_io.rs:1197-1216 writes the field before any PACT test; `put_driven_process` (:1025-1041) then sets `rpro = true` and returns, and the wait-set `leave`s at the tail of the *in-flight* cycle (processing.rs:4670+), i.e. before the reprocess it just queued. C probe (`caput -c ASY.A 7` during a 4 s ODLY): A stays 5 for the whole async cycle, then VAL=7 A=7 on the restart, and only then does the callback return. The port applies `dbPutField` semantics to the `dbProcessNotify` path — breaking the contract sequencers rely on ("callback ⟹ the value has been processed").
+
+**R18-96 — stringin/stringout/lsi/lso post VAL on every process cycle; MPST/APST are dead fields — High.**
+`check_deadband_ext` (record_instance.rs:3214) bails to *post-everything* when `monitor_deadband_value().to_f64()` is `None` — which is every string record. C `stringinRecord.c:176-188` gates on `strncmp(oval, val)` and adds `DBE_VALUE`/`DBE_LOG` only for `MPST`/`APST == Always`; identical in `lsiRecord.c:205-224`, `lsoRecord.c`. The fields exist in the port (stringin.rs:103-108) and are read by no monitor path. C probe: stringin at `SCAN="1 second"`, VAL never written, `camonitor -m l` → **zero** events after the connect update; the port emits one per second per subscriber. Distinct from R15-76 (that was aai/aao/waveform, dropped at `.db` load; this is a different family and a different mechanism). Secondary: a numeric-*looking* string (`"12"`) falls into the analog deadband path, so `"12" → "12.0"` posts nothing where C's `strncmp` posts. `printfRecord` and `sub` A..L are correct — do not "fix" those.
+
+**R18-97 — ai/ao `SPC_LINCONV` rebases `EOFF = EGUL`; C does nothing, because no soft dset provides `special_linconv` — High.**
+I opened this one myself. C `aiRecord.c:182-200` (`aoRecord.c:249-267` identical): `prec->eoff = prec->egul;` sits **inside** `if ((prec->linr == menuConvertLINEAR) && pdset->special_linconv)`. `devAiSoftRaw.c:32-34` is `{{6, NULL, NULL, init_record, NULL}, read_ai, NULL}` — the trailing slot *is* `special_linconv`, and it is NULL. So on a base softIoc a put to LINR/EGUF/EGUL sets `init=TRUE` and touches nothing else. Port ai.rs:470-508 / ao.rs:767-800 do `if self.linr == 2 { self.eoff = self.egul; }` in all three arms, ungated. C probe (`DTYP="Raw Soft Channel"`, `INP="12"`, LINEAR): `caput T:AI.EGUL 7.25` → EOFF stays 0, VAL stays 12. Port → EOFF=7.25, VAL=19.25. An operator retuning the display range EGUL silently changes the conversion; on `ao` it moves the hardware output. The port's own test `egul_put_under_linear_rebases_eoff` pins the divergence.
+
+**R18-98 — alarm-only cycles never post the auxiliary fields C forces — Medium.**
+C re-posts *unchanged* aux fields when the monitor mask carries alarm bits: `calcRecord.c:417-421` (A..L, `monitor_mask | DBE_VALUE | DBE_LOG`), `mbbiDirectRecord.c:217-226` (B0..B1F), `aoRecord.c:535-538` (OVAL whenever `monitor_mask != 0`). The port posts unchanged fields only if listed in `force_posted_fields`/`alarm_cycle_monitored_fields` (record_instance.rs:2620-2665), and `alarm_cycle_monitored_fields` is implemented **only** by `acalcout.rs`. C probe: `camonitor T:C.A` across an HSV MINOR→MAJOR transition with A pinned at 3 → C emits `3 HIGH MAJOR`; the port emits nothing. OPI widgets bound to `.A`/`.B0`/`.OVAL` keep a stale alarm colour. (`subRecord.c` has no such clause — the port is right there.)
+
+**R18-99 — `caput REC.SCAN "I/O Intr"` bricks the record; C validates and reverts to Passive — Medium.**
+C `dbScan.c:265-300`: no `dset` or no `get_ioint_info` → `recGblRecordError` + `precord->scan = menuScanPassive`. Port record_instance.rs:1875-1887 stores SCAN unvalidated and scan_index.rs:22-80 inserts into the `IoIntr` bucket unconditionally; the only I/O-Intr wiring (`setup_io_intr`, ioc_app.rs:1217-1300) runs once at iocInit and is never revisited. C probe: `caput C.SCAN "I/O Intr"` on a soft calc → reads back `Passive` + `scanAdd: I/O Intr not valid (no DSET)`. On the port it reads back `I/O Intr` and the record **never processes again**.
+
+**R18-100 — TPRO: wrong stream, invented format, no lock-set propagation, no Disabled line — Low.**
+C `dbAccess.c:497` `ptrace = dbLockSetAddrTrace(precord)` — the flag lives on the **lock set**, so the whole downstream chain traces. Lines at `:541`/`:571`/`:609` are `printf` (stdout) with the CA client identity from `dbServerClient()`. Port processing.rs:2515-2524 / :1330-1338 `eprintln!("[TPRO] …")` per record, and the SDIS-disable bail prints nothing. C probe: `A.TPRO=1`, `A.FLNK=B`, `B.FLNK=C` → C traces A, B *and* C; the port traces A only.
+
+**R18-101 — ai/ao `.ORAW` advanced every cycle; C advances it only inside the `if (monitor_mask)` guard — Low.**
+C `aiRecord.c:459-465` (`aoRecord.c:539-542`). Port ai.rs:372 / ao.rs:252,:538 assign unconditionally at the tail of `process()`. With `MDEL=ADEL=1000` (mask == 0): C leaves ORAW=12 after RVAL moves to 500; the port reports 500. Field value only — the *posting* gate is correct.
+
+**R18-102 — ai/ao `.INIT` is inverted and served as DBF_CHAR; C is DBF_SHORT, 1 before the first process and 0 after — Low.**
+C `aiRecord.c:114` `init=TRUE` in `init_record`, `:452` `init=FALSE` at the end of `process`; dbd declares `DBF_SHORT special(SPC_NOMOD)`. Port ai.rs:97 starts `false`, :373 sets `true`, :402 serves `EpicsValue::Char`. Internally self-consistent (the polarity is inverted throughout, so SMOO priming still works) — only the exposed field is wrong, in both polarity and wire width.
+
+**R18-103 — the aSub SUBL read bypasses `fetch_link`, dropping MS inheritance — Low. (Residue of `25aa52f7`.)**
+processing.rs:1182 calls `read_link_with_alarm(...).0`, discarding the alarm. C `aSubRecord.c:256` is a plain `dbGetLink(&prec->subl, DBR_STRING, prec->snam, 0, 0)`, so it runs `dbDbGetValue`'s tail — `recGblInheritSevrMsg(pvlMask & pvlOptMsMode, …)` at dbDbLink.c:228-232. `field(SUBL,"SRC MS")` therefore inherits in C and not in the port. `fetch_link` is the owner for its six call sites; this is the seventh. (The swait DOL reads at processing.rs:3047 are **correct** — swait is synApps and reaches DOL through `recDynLink`, which has no inheritance tail.)
+
+**R18-104 — `put_alarm_ack_from_ca` lacks C's `field_type <= DBF_DEVICE` guard, and ACKT is coerced to a bool — Low.**
+C `dbAccess.c:1333-1335` dispatches `DBR_PUT_ACKT`/`ACKS` only when `field_type <= DBF_DEVICE`; a PUT_ACKS on a link-field channel falls to `S_db_badDbrtype`. field_io.rs:902-927 acks unconditionally. Separately, `put_ackt` (record_instance.rs) stores `value != 0` as a bool, where C stores the raw `epicsUInt16` (`ackt = *ptrans`), so a client sending ACKT=2 reads back 1 in the port and 2 in C. Behaviour downstream is identical (both truthy).
+
+---
+
+## Per-commit verdicts
+
+| commit | finding | verdict |
+|---|---|---|
+| `526726b9` | R17-61 parse_c_double | **HOLD** — `parse_c_double` is now a call to `runtime::stdlib::epics_parse_double`; classifier and constant loader share the one parse, as in C. |
+| `2644e581` | R17-63 per-record UDF | **HOLD** — oracle-matched: DF.UDF=1/SEVR=INVALID, HG.UDF=0, EV.UDF=1. |
+| `62429573` | R17-66 post-init UDF tail | **HOLD** — hook moved into `RecordInstance::run_init_passes` (record_instance.rs:580); all four creation paths call it (ioc_builder ×2, iocsh commands, `add_record`). MBD UDF=0/VAL=5, MBD0 UDF=1 — oracle-matched. |
+| `65e24034` | R17-65 lso/lsi dbLoadLinkLS | **HOLD** — `DOL="7"` → VAL=`""`, LEN=1, UDF=0 on both records, oracle-matched. |
+| `ddc899b2` | R17-67 add_record init passes | **HOLD** — AO1 `DOL="5"` closed-loop → UDF=0 / SEVR=INVALID / STAT=UDF, oracle-matched. |
+| `cddea284` | R17-68 quoted → PV link | **HOLD** — the classifier arm is right. Note it is fed corrupted text until R18-91 lands: with the lexer not unescaping, `field(INP,"\"hello\"")` reaches `parse_link_field` as `\"hello\"`, so the port's CA link carries a different PV name than C's `"hello"`. |
+| `c34591c2` | R17-62 SPC_NOMOD + ack | **HOLD-with-residue** — the NOMOD set matches C's client-visible dbCommon list exactly; all four put routes gate; `put_ackt`/`put_acks` reproduce `dbAccess.c:1285-1315` line for line, dispatched above the gate. Residue: **R18-90** (rsrvCheckPut half never moved), **R18-104** (ack type guard). |
+| `25aa52f7` | R17-64 MS on link READ | **HOLD-with-residue** — `fetch_link` takes the reading record and applies inheritance on all six call sites (SDIS, TSEL, SIML, SIOL ×2, SELL). Residue: **R18-103** (aSub SUBL). |
+| `dd5e0af3` | R17-69 DbLoadGuard | **BROKEN (incomplete)** — the RAII guard itself is sound (counted, `#[must_use]`, `Drop` fires on every exit path, `Weak` upgrade, no lock held across the await, no deadlock), and it closes the single-load-group case 15/15. But the boundary is the load *group*, not iocInit, so the multi-`dbLoadRecords` case every real `st.cmd` uses still races — **9 of 15 runs classify Ext PV NC where C is Local PV 15/15**. See **R18-92**. |
+
+## Merge-conflict resolutions — all three composed correctly
+
+- **`record/mod.rs`** (use-union): `AlarmAck` (from E) and `LinkReadAs` / `CyclePostMask` / `ArrayMonitorPost` (from F) all present in the re-export list.
+- **`field_io.rs`**: E's ACKT/ACKS put arms are gone (the names survive only inside `DBCOMMON_NOMOD` at :43), and F's `take_cycle_posted_fields` block is intact at :1333-1340. Both halves present, neither clobbered.
+- **`processing.rs`**: both SDIS (:1436-1440) and TSEL (:1599-1610) carry `fetch_link(&rec, …)` **and** `c_cast::f64_to_i16` — the 25aa52f7 and R17-79 halves composed rather than one overwriting the other.
+
+## Prior "verified clean" entries now refuted
+
+Doc lines **86** (`dbDbPutValue` → `processTarget` gating), **93** (`dbScanPassive`'s `pto->scan != 0` gate), and **94** (`.db` quoted-string escape lexing, closing `03-H-2`/`03-H-3`) were each certified against C but check only part of the C path. R18-93, R18-94 and R18-91 reopen them with transcripts.
+
+## No new CBUG candidates
+
+Nothing this round is a C-side defect; every divergence above is port-side.
+
+### Category F (arrays) — R18-105..114, renumbered from panel-original 76..85 (offset +29)
+
+All probing is done; the decode path confirms a `caput -a` of strings reaches `convert_to` as a `StringArray`, so the collapse site is the coercion owner, not the codec. Here is the Round-18 report.
+
+---
+
+# ROUND 18 — Category F (aai / aao / waveform / subArray / compress / histogram)
+
+Read-only audit. Ten new findings (R18-105..R18-114), two NOT-REAL adjudications, one CBUG candidate, and per-commit verdicts for the nine wave-15 category-F commits.
+
+All "Proof" entries below are head-to-head oracle runs: the same `.db` loaded into the C `softIoc` (`/home/stevek/work/epics-base/bin/linux-x86_64`) on one port and the port's `softioc-rs` on another, driven with the C `caput`/`caget`/`cainfo`/`camonitor` binaries so the client is identical on both sides.
+
+## Findings
+
+### R18-105: A DBR_STRING array put collapses to scalar 0.0 and destroys the array record
+**Severity:** High
+**Rust:** `crates/epics-base-rs/src/types/value.rs:850-862` (`as_f64_array` has no `StringArray` arm), falling through to the scalar tail at `:925-954` and `:1070+`
+**C:** `src/ioc/db/dbConvert.c` — the string→numeric array converters (`cvt_st_*` family), reached from `dbPut` for any `DBR_STRING` request with `nRequest > 1`
+**Impact:** `caput -a WF 3 7 8 9` on a numeric waveform is accepted with a success status and writes a single element `0.0`. The record's contents are destroyed and `NORD` is set to 1. Every client that puts arrays as strings (the default for `caput -a` without `-t`, and for shell/script clients that build values as text) silently corrupts array records instead of writing them. This is the worst finding in the round: it is a data-destroying silent failure on the most common array write path.
+**Proof:** Same `.db`, `caput -a WV 3 7 8 9`:
+- C: `WV.VAL = 7 8 9 0 0`, `NORD = 3`.
+- Port: `WV.VAL = 0 0 0 0 0`, `NORD = 1`, put returns success.
+
+The comment at `value.rs:952` ("StringArray falls through to the scalar path (its cross-type semantics are not numeric)") is the source of the bug: in C, string→numeric *is* an array conversion, element by element.
+
+### R18-106: compress ignores INP link connectivity — no LINK/INVALID alarm, and a constant INP is ingested every cycle
+**Severity:** High
+**Rust:** `crates/epics-base-rs/src/server/records/compress.rs:954-972` (`pre_process_actions` emits `ReadDbLink{INP→VAL}` whenever `!self.inp.is_empty()`, with no connectivity gate and no alarm on failure); `crates/epics-base-rs/src/server/database/links.rs:397` (`ParsedLink::Constant(_) => link.constant_value()` — a constant link delivers a value on every read)
+**C:** `modules/database/src/std/rec/compressRecord.c:320-340` — process() calls `dbIsLinkConnected(&prec->inp)`, and on a non-connected link raises `recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM)` and returns without ingesting anything.
+**Impact:** Two distinct divergences from one missing gate. An unset or disconnected `INP` leaves the record in `NO_ALARM` forever instead of latching `INVALID/LINK`, so operators lose the "my compression source is dead" signal entirely. And a *constant* `INP` (e.g. `field(INP,"5")`), which C treats as not-connected and refuses to sample, is ingested by the port on every single process — the compression buffer fills with a repeated constant and `NUSE` climbs, producing plausible-looking but fabricated data.
+**Proof:**
+- `INP=""`: C → `SEVR=INVALID, STAT=LINK`; port → `SEVR=NO_ALARM`.
+- `INP="5"`: C → `SEVR=INVALID, STAT=LINK`, `NUSE=0`, `VAL` all zeros; port → `SEVR=NO_ALARM`, `NUSE=1`, `VAL=[5]`.
+
+### R18-107: histogram has no `mcnt > mdel` monitor gate and never resets MCNT — MDEL is inert and MCNT grows without bound
+**Severity:** Medium-High
+**Rust:** `crates/epics-base-rs/src/server/records/histogram.rs:325-331` (`process()` is `add_count(); Ok(ProcessOutcome::complete())` with no gate), plus `crates/epics-base-rs/src/server/record/record_instance.rs:3187+` (`check_deadband_ext`: an array `VAL` has `to_f64() == None`, so the function returns `(true, true)` — always post)
+**C:** `modules/database/src/std/rec/histogramRecord.c:283-296` — `monitor()` posts `DBE_VALUE|DBE_LOG` on `VAL` only when `mcnt > mdel`, and **zeroes `mcnt` when it does**.
+**Impact:** `MDEL` is the histogram's only rate limiter for VAL monitors and it does nothing in the port: every process posts the full bin array to every subscriber. On a fast-signal histogram this is an unbounded monitor-traffic amplification (the exact thing MDEL exists to prevent). Separately, because nothing ever zeroes `MCNT` on the monitor path, `MCNT` is a monotonically growing counter rather than "counts since last posted VAL" — it is wrong as a readable field, and it perturbs the SDEL watchdog added in `f6ce1657`, which shares the same counter.
+**Proof:** `MDEL=3`, 8 processes:
+- C: 3 monitor events, `MCNT = 0` afterwards.
+- Port: 8 monitor events, `MCNT = 8`.
+
+### R18-108: the DBF_ULONG / DBF_SHORT field-type family was not widened after R17-84 — array bookkeeping fields are served as DBR_LONG
+**Severity:** Medium
+**Rust:** `crates/epics-base-rs/src/server/records/waveform.rs` (NELM, NORD, MALM, INDX declared `DbFieldType::Long`); `crates/epics-base-rs/src/server/records/compress.rs` (NSAM, N, OFF, NUSE, OUSE, INX declared `DbFieldType::Long`); `crates/epics-base-rs/src/server/records/histogram.rs` (MDEL, MCNT declared `DbFieldType::Long`)
+**C:** `waveformRecord.dbd.pod` (NELM, NORD, HASH = DBF_ULONG), `subArrayRecord.dbd.pod` (MALM, NELM, INDX = DBF_ULONG; NORD = DBF_LONG), `compressRecord.dbd.pod` (NSAM, N, OFF, NUSE, OUSE, INX = DBF_ULONG; INPN = DBF_LONG), `histogramRecord.dbd.pod` (MDEL, MCNT = DBF_SHORT); promotion table in `src/ioc/db/db_convert.h` (`DBR_ULONG` → `DBR_DOUBLE` on the CA wire)
+**Impact:** R17-84 fixed histogram `VAL` (ULong) but stopped there; the same DBF_ULONG declaration error is still present on ten sibling fields across four record types. C advertises these as `DBF_DOUBLE` to CA clients and `uint32` to PVA; the port advertises `DBF_LONG`. Clients that introspect native type (any generic display tool, archiver, or PVA client building a type-matched structure) get a different type from the port than from C, and a PVA client sees `int32` where the C IOC serves `uint32` — a real wire-type mismatch, not a cosmetic one. Values above 2^31 in these fields (legal for DBF_ULONG) are unrepresentable.
+**Proof:** `cainfo` on the same `.db`: `WF.NORD`, `WF.NELM`, `C1.NUSE` → C reports `DBF_DOUBLE`, port reports `DBF_LONG`. (The already-fixed `HG.VAL` correctly reports `DBF_DOUBLE` on both, confirming the diagnostic and confirming that `043c11dd` landed.)
+
+### R18-109: NORD is not posted on the CA/dbPut route — only on the internal put-and-post route
+**Severity:** Medium
+**Rust:** `crates/epics-base-rs/src/server/database/field_io.rs:654`, `:719`, `:747` (NORD posted, in `put_pv_and_post` only) vs `put_record_field_from_ca_inner` at `:1100-1350`, which posts the put field plus `monitor_side_effect_fields` plus `take_cycle_posted_fields`, but never NORD
+**C:** `modules/database/src/std/rec/waveformRecord.c:202-216` (`put_array_info` sets `nord` and the DB core posts it); the equivalent in `aaiRecord.c:232-245`, `aaoRecord.c:164-190`, `subArrayRecord.c:190-202`
+**Impact:** A client monitoring `WF.NORD` — the standard way to learn how many elements a producer actually wrote — sees nothing when the array is written over CA. The value is correct on a subsequent `caget`, so this is a lost-event bug, not a wrong-value bug, but for a slow-scanned or passive waveform the subscriber never learns the length changed. The asymmetry between the two put routes is the structural defect: `NORD` posting belongs to `put_array_info`, which every put route must reach.
+**Proof:** `camonitor WP.NORD` on a 10-second-SCAN waveform, then `caput -a WP 3 1 2 3`:
+- C: posts `NORD = 3` immediately.
+- Port: posts nothing (the value is right on the next `caget`).
+
+### R18-110: HASH is answered by `get_field` but is absent from every array `field_list` — writes are refused
+**Severity:** Low
+**Rust:** `crates/epics-base-rs/src/server/records/waveform.rs` — `get_field("HASH")` returns a `ULong`, but `HASH` appears in no `field_list()` for any `ArrayKind`
+**C:** `waveformRecord.dbd.pod` — `HASH` is `DBF_ULONG`, not `special(SPC_NOMOD)`, therefore writable
+**Impact:** `caput WF.HASH 7` is refused by the port and accepted by C (0 → 7). HASH is the field a client uses to seed or reset the array-change hash used by MPST/APST monitor filtering, so a client that manages hashing explicitly cannot do so against the port. Low because the read path works and few clients write HASH.
+**Proof:** `caput WF.HASH 7` → C: succeeds, `caget WF.HASH` = 7. Port: put rejected (field not found).
+
+### R18-111: subArray `field(NELM,"0")` is rejected at load; C accepts it
+**Severity:** Low
+**Rust:** `crates/epics-base-rs/src/server/records/waveform.rs` — `put_field("NELM")` rejects `n <= 0` with `InvalidValue`
+**C:** `subArrayRecord.dbd.pod` — `NELM` is `DBF_ULONG`, so 0 is a legal value; `subArrayRecord.c:95-105` (init) and `:176-188` (`get_array_info`) handle it by yielding an empty slice with the record left UDF.
+**Impact:** A `.db` that is legal against C fails to load against the port. C's behavior (empty subarray, UDF stays set) is well-defined; the port turns it into a hard configuration error. Low because `NELM=0` is an unusual configuration, but it is a load-time regression, which is the harshest failure mode for a database that works elsewhere.
+**Proof:** `.db` with `field(NELM,"0")` on a subArray: C loads and runs (`caget SA` → empty, `UDF=1`); port refuses the field value at load.
+
+### R18-112: the async `if (pact && prec->busy) return 0` gate is missing from waveform and subArray process
+**Severity:** Low
+**Rust:** `crates/epics-base-rs/src/server/records/waveform.rs` — `process()` has no `pact && busy` early return
+**C:** `modules/database/src/std/rec/waveformRecord.c:136-155` (`if (pact && prec->busy) return 0;` before the completion path), same shape in `subArrayRecord.c:126-161`
+**Impact:** For an asynchronous device support that sets `BUSY`, the completion callback re-entering `process()` while the device is still busy will run the completion path (post monitors, reset PACT) instead of returning immediately, so a record can complete a scan the device has not finished. Low **only** because the port ships no async array device support today — this is negative space that becomes a real bug the moment one is written. Filed so the gate lands with the feature rather than after it.
+**Proof:** Source-level; no oracle probe possible without an async device support on the Rust side. Marked as such deliberately rather than claiming a behavioral divergence I did not observe.
+
+### R18-113: histogram `CMD = Clear` does not clear UDF
+**Severity:** Low
+**Rust:** `crates/epics-base-rs/src/server/records/histogram.rs` — `clear_histogram()` zeroes the bins and sets `mcnt = mdel + 1`, but has no UDF write
+**C:** `modules/database/src/std/rec/histogramRecord.c:354-364` — `clear_histogram()` ends with `prec->udf = FALSE;`
+**Impact:** After `caput HG.CMD 1` (Clear) on a never-processed histogram, C reports a defined record (`UDF=0`, all-zero bins are a valid histogram); the port still reports `UDF=1`. A record with UDF set raises `UDF_ALARM` (INVALID) if `SCAN` is such that the UDF check runs, so a cleared-but-not-yet-processed histogram can sit in an alarm state on the port that it never enters on C.
+**Proof:** Fresh IOC, `caput HG.CMD 1`, `caget HG.UDF`: C → 0; port → 1.
+
+### R18-114: residue of `51435dc8` — record-level put arms still narrow double→int with bare `as`
+**Severity:** Low
+**Rust:** `crates/epics-base-rs/src/server/records/waveform.rs:1291-1295` (PREC: `to_f64() ... as i16`), `crates/epics-base-rs/src/server/records/compress.rs:896-901` (same shape)
+**C:** `src/ioc/db/dbConvert.c` — the `cvt_d_*` converters, whose out-of-range/NaN behavior is what `types::c_cast` was introduced to reproduce
+**Impact:** `51435dc8` routed the dbConvert-modelled sites through `c_cast`, but these two record-local put arms still use a bare Rust `as`, which saturates where C's compiled x86-64 conversion produces the indefinite value. Reachable only if a `Double` arrives at `put_field` without having passed through `convert_to` first; I could not construct such a path through the current CA or PVA put routes, so I am filing this as residue rather than as a live divergence. It is the exact shape the commit was meant to eliminate, and it will become live the first time a caller reaches `put_field` directly.
+**Proof:** Source-level; no reachable path found from the wire. Stated as unverified-live rather than claimed as observable.
+
+## NOT-REAL adjudications
+
+Both of these looked like solid findings from source-reading and both are refuted by the compiled C. Recording them so the next round does not re-derive them.
+
+**NOT-REAL: histogram `LLIM >= ULIM` should raise SOFT/INVALID.** `histogramRecord.c:329-335` does set an alarm inside `add_count()` when the limits are inverted — but it writes `prec->stat`/`prec->sevr` directly, not `nsta`/`nsev`, and `monitor()` calls `recGblResetAlarms()` in the *same* cycle, which overwrites them from `nsta`/`nsev`. The alarm never survives to be observable. Oracle: `LLIM=10, ULIM=5`, process → C reports `NO_ALARM`. The port reports `NO_ALARM` too, so the port matches C's actual behavior. **This is a CBUG candidate** (see below) — C's *intent* is clearly to alarm, and the port would be wrong to copy the intent instead of the behavior.
+
+**NOT-REAL: subArray `get_array_info` must return 0 elements while UDF.** `subArrayRecord.c:181-184` does contain `if (prec->udf) *no_elements = 0;`, and the port has no equivalent. But the gate is unobservable: `dbPut` clears UDF before the value is readable, and after any `process()` the invariant `udf ⟺ nord <= 0` already holds, so the UDF check and the NORD check can never disagree. Oracle: `caput -a SA2.VAL` → both C and the port report `NORD=5, UDF=0`; no sequence I could construct made C return 0 elements where the port returned more. Not a divergence.
+
+## CBUG candidate
+
+**CBUG (histogram):** `histogramRecord.c:329-335` writes `prec->stat` / `prec->sevr` directly in `add_count()` instead of going through `recGblSetSevr` (which writes `nsta`/`nsev`). Because `monitor()` runs `recGblResetAlarms()` later in the same process cycle, the `LLIM >= ULIM` alarm is unconditionally erased before any client can see it. The alarm is dead code in upstream C. The port coincidentally matches (it never sets the alarm at all), so **no port change is warranted** — but if upstream ever fixes this, the port will need the alarm added, and any future auditor reading `histogramRecord.c` will re-derive this as a parity gap. Flagging it so that does not happen.
+
+## Wave-15 commit verdicts
+
+| Commit | Verdict | Note |
+|---|---|---|
+| `22dd6403` (compress: one reset owner, all five SPC_RESET fields) | **HOLD** | `COMPRESS_SPC_RESET_FIELDS = ["RES","ALG","PBUF","BALG","N"]` matches `compressRecord.c:377-393`; `reset()` is the single owner and every SPC_RESET field routes through it. |
+| `b0125fe3` (`Record::field_no_mod` dynamic hook — LIFO VAL) | **HOLD** | The hook composes with the static `read_only` gate inside `field_io::check_no_mod` (`field_io.rs:81-98`), and **all four** put routes call it: `:363` (the QSRV/PVA pre-put gate — this is the one the task asked me to confirm), `:410` `put_pv_inner`, `:644` `put_pv_and_post`, `:1102` `put_record_field_from_ca_inner`. No put route bypasses the gate. |
+| `05268579` (histogram CSTA noMod) | **HOLD** | Matches `histogramRecord.dbd.pod`. |
+| `51435dc8` (`types::c_cast` compiled-x86-64 double→int narrowing) | **HOLD-with-residue** | Every dbConvert-modelled site routes through `c_cast`, including the SDIS/DISA site added at merge. Residue: two record-local put arms still use bare `as` — filed as **R18-114**. |
+| `f6ce1657` (histogram SDEL watchdog) | **HOLD-with-residue** | Arm / re-arm / disarm lifecycle in `processing.rs:838-914` is correct against `wdogCallback` (`histogramRecord.c:102-124`): generation-counter supersede, `watchdog_interval()` re-read each loop so `SDEL=0` disarms, empty `watchdog_fire()` re-arms without posting. Residue: the watchdog shares `MCNT` with the monitor path, and **R18-107** means `MCNT` is never zeroed there — so the watchdog's view of "counts since last post" is wrong even though its own lifecycle is right. Fixing R18-107 fixes this; no separate change needed. |
+| `531daed9` (compress OUSE/INPN) | **HOLD** | OUSE latch is owned solely by `monitor()`, matching `compressRecord.c:100-110`. The INPN capacity gap is the known-open R17-81 and is not re-filed. OUSE's *type* is wrong, but that is part of the R18-108 family, not a defect in this commit. |
+| `7b600b1e` (subArray BUSY) | **HOLD** | |
+| `c078e93d` (histogram INP not a channel) | **HOLD** | |
+| `043c11dd` (histogram VAL DBF_ULONG → PVA uint32[], CA DBR_DOUBLE) | **HOLD** | Confirmed by compiled `cainfo`: `HG.VAL` reports `DBF_DOUBLE` on both C and the port. This commit is also the reason R18-108 exists — it fixed one field of a ten-field family. |
+
+**Nothing is BROKEN.** Every wave-15 category-F fix does what it claims. The two residues both resolve into new findings rather than into rework of the original commits.
+
+## Ranking for the fix wave
+
+R18-105 first and alone: it is a silent data-destroying bug on the default `caput -a` path, and it lives in `EpicsValue::convert_to`, the single coercion owner — so the fix is one arm in `as_f64_array`, and the blast radius is every record type, not just arrays. R18-106 second (a fabricated-data bug plus a missing alarm). R18-107 third. R18-108 and R18-109 are each a *family* — R18-108 is ten sibling fields with one wrong declaration, R18-109 is a posting responsibility that belongs in `put_array_info` and is currently duplicated into one of two put routes — so each should be fixed structurally at the family level, not at the cited line.
+### Round 18 review log
+
+Thematic clusters: (1) **dead subsystems** — the asyn trace/exception
+sink is never injected on iocsh-built ports (R18-57), the IP server
+never accepts (R18-58), octet I/O-Intr fan-out absent (R18-59): whole
+C surfaces exist in the port but are unreachable from an st.cmd; (2)
+**two-consumer declarations, one moved** — SPC_NOMOD reached dbPut but
+not rsrvCheckPut/ACCESS_RIGHTS (R18-90), CALC := stores computed but
+dropped (R18-1), NORD posted on one put route (R18-109): the C
+declaration has N consumers and the port wired fewer; (3) **the
+constant-link executor split** — R18-2/R18-106 are the R16-77 fix
+landing on one of two readers; (4) **monitor-posting negative space**
+— MPST/APST dead (R18-96), alarm-cycle aux re-posts (R18-98),
+unconditional TINP posts (R18-86), histogram MDEL/MCNT (R18-107),
+sseq VAL-per-completion (R18-9): C's monitor() bodies encode per-record
+posting contracts the generic change loop cannot infer. Next-round
+leads: E's load-boundary redesign (R18-92) wants an explicit iocInit
+primitive; D ranks R18-57 before any further trace work.

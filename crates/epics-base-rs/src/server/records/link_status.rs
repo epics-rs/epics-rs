@@ -54,14 +54,26 @@ impl LinkStatusGen {
 pub const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 /// Link-status menu indices. Index 1 (`EXT`, external PV connected) is a
-/// valid menu value but is never *produced* by this port: epics-base-rs has
-/// no CA/PVA client to confirm a remote link is connected, so an external
-/// link always reports `EXT_NC` (see [`classify_link`]). The choice label is
-/// still served via [`LINK_STATUS_CHOICES`], so the `EXT` constant is
-/// intentionally omitted here — nothing emits it.
+/// valid menu value that this port never *produces*: epics-base-rs has no
+/// CA/PVA client to confirm a remote link is connected, so an external link
+/// always reports `EXT_NC` (see [`classify_link`]). It is still named here
+/// because a record reading the status back must treat BOTH external indices
+/// as C's `CA_LINK` (see [`link_is_external`]).
 pub const LINK_EXT_NC: i16 = 0; // external PV, not connected
+pub const LINK_EXT_OK: i16 = 1; // external PV, connected (never produced here)
 pub const LINK_LOC: i16 = 2; // local PV (this IOC's database)
 pub const LINK_CON: i16 = 3; // constant / unset link
+
+/// True iff a classified link status names an EXTERNAL PV — C's `CA_LINK`
+/// (`dbInitLink` classifies by LOCALITY: a name that is not a record of this
+/// IOC is reached over Channel Access). Both external menu indices count.
+///
+/// The classification is the caller's cached status: a record that has not
+/// been classified yet reads its default (`LINK_CON`), which is NOT external
+/// — a link is only a CA link once its status says so.
+pub fn link_is_external(status: i16) -> bool {
+    status == LINK_EXT_NC || status == LINK_EXT_OK
+}
 
 /// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1).
 /// Used for every constant, external, and unresolvable link. C

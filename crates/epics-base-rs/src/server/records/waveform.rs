@@ -1,7 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{
-    FieldDesc, MENU_YES_NO, ParsedLink, ProcessAction, Record, parse_link_v2,
-};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessAction, Record, parse_link_v2};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Which EPICS record-type name an [`ArrayRecord`] reports. The four
@@ -691,23 +689,16 @@ const MENU_OMSL_CLOSED_LOOP: i16 = 1;
 /// fetchable link? Used to gate the process-time fetch (`!isConst`), so a
 /// constant is never re-applied per cycle over a client caput.
 ///
-/// [`parse_link_v2`] classifies a *scalar* numeric / quoted-string / JSON
-/// constant as [`ParsedLink::Constant`], but NOT a whitespace-separated
-/// numeric array literal (`"1 2 3"`) — which the C db loader parses as a
-/// constant array (loaded once at init via `dbLoadLinkArray`). Recognise that
-/// array form here so a constant array DOL also yields no per-cycle fetch. An
-/// empty DOL has no source and is treated as constant (nothing to fetch).
+/// The classification is [`parse_link_v2`]'s alone — C's own
+/// `dbParseLink` (`dbStaticLib.c:2346-2357`) is the single classifier, and it
+/// calls a link constant iff the text is empty, parses whole as a double, or
+/// is bracketed (`[1, 2, 3]`). This helper used to ALSO accept a
+/// whitespace-separated numeric list (`"1 2 3"`) as a constant array; C does
+/// not — `epicsParseDouble` rejects the trailing garbage, so C makes that a
+/// PV_LINK to a record named `1`. An empty/unset link is constant
+/// (`dbLink.c:220`, whose `lset` is `dbConst_lset`).
 fn dol_is_constant(dol: &str) -> bool {
-    let trimmed = dol.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    if matches!(parse_link_v2(dol), ParsedLink::Constant(_)) {
-        return true;
-    }
-    trimmed
-        .split_whitespace()
-        .all(|tok| tok.parse::<f64>().is_ok())
+    crate::server::recgbl::simm::is_constant(&parse_link_v2(dol))
 }
 
 impl Record for WaveformRecord {
@@ -1160,11 +1151,9 @@ impl Record for WaveformRecord {
     /// over a client caput to VAL (C's `!dbLinkIsConstant` gate). Supervisory
     /// mode and the other three array kinds (no OMSL/DOL) return no actions.
     ///
-    /// Residual: the init-time constant-array load (`dbLoadLinkArray`, the
-    /// `init && isConst` arm) is not ported — this record has no array-literal
-    /// constant-link parser, so a `field(DOL,"1 2 3")` constant array is not
-    /// seeded into VAL at init. A non-constant closed_loop DOL (the common
-    /// tracking case) is fully covered.
+    /// Residual: the init-time constant-array load (`dbLoadLinkArray`, C's
+    /// `init && isConst` arm) is not applied here — it belongs to
+    /// `init_record`, not to the per-cycle hook.
     fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
         if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
             return Vec::new();

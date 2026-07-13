@@ -4778,6 +4778,59 @@ impl PvDatabase {
     ///
     /// Must be called once per record, after its fields are applied — the
     /// `init_record(1)` sites (`ioc_builder`, `dbLoadRecords`).
+    /// C `recGblInitConstantLink(&prec->inp, …, &prec->val)` /
+    /// `dbLoadLinkArray(&prec->inp, prec->ftvl, prec->bptr, &nRequest)` — the
+    /// ONE place a constant INP reaches a record.
+    ///
+    /// Every soft-channel INPUT device support runs this in its
+    /// `init_record`: `devAiSoft.c:44`, `devLiSoft.c`, `devBiSoft.c`,
+    /// `devI64inSoft.c`, `devMbbiSoft.c`, `devSiSoft.c`, `devEventSoft.c`
+    /// (scalars, via `recGblInitConstantLink`), and `devAaiSoft.c:57`,
+    /// `devWfSoft.c:42`, `devSASoft.c` (arrays, via `dbLoadLinkArray`). The
+    /// raw variants (`devAiSoftRaw.c`, `devBiSoftRaw.c`, `devMbbiSoftRaw.c`)
+    /// load into RVAL instead and let the record's own RVAL→VAL conversion
+    /// run — hence the `apply_raw_input` arm, the same sink the process-time
+    /// path uses for `Raw Soft Channel`.
+    ///
+    /// This is the other half of the rule
+    /// [`super::links::PvDatabase::read_link_value_soft`] enforces (a constant
+    /// delivers NOTHING at process): without the init load a `field(INP, "5")`
+    /// ai would never see 5 at all; without the process-time skip the constant
+    /// would clobber the record's VAL on every scan.
+    ///
+    /// Gated on soft DTYP because a hardware record's INP is a device ADDRESS,
+    /// not a value — C only ever loads it in soft dev support.
+    ///
+    /// Must be called once per record, after its fields are applied and both
+    /// `init_record` passes have run (the record needs its final NELM/FTVL
+    /// buffer before an array constant can land in it) — the `init_record(1)`
+    /// sites (`ioc_builder`, `dbLoadRecords`).
+    pub(crate) async fn rec_gbl_init_constant_inp(&self, rec: &Arc<RwLock<RecordInstance>>) {
+        let mut instance = rec.write().await;
+        if !crate::server::device_support::is_soft_dtyp(&instance.common.dtyp) {
+            return;
+        }
+        let inp = crate::server::record::parse_link_v2(&instance.common.inp);
+        let Some(value) = crate::server::recgbl::simm::constant_load_value(&inp) else {
+            return;
+        };
+        // Same sink the per-cycle soft-input apply uses, so the constant lands
+        // in the field the link would have written: RVAL for `Raw Soft
+        // Channel` (the record converts RVAL→VAL), VAL otherwise.
+        let is_raw_soft =
+            instance.common.dtyp == "Raw Soft Channel" && instance.record.accepts_raw_soft_input();
+        let loaded = if is_raw_soft {
+            instance.record.apply_raw_input(value).is_ok()
+        } else {
+            instance.record.set_val(value).is_ok()
+        };
+        // C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;` — a record
+        // whose value came from a constant link is DEFINED.
+        if loaded {
+            instance.common.udf = false;
+        }
+    }
+
     pub(crate) async fn rec_gbl_init_simm(&self, rec: &Arc<RwLock<RecordInstance>>) {
         let mut instance = rec.write().await;
         // No SIMM field -> no simulation block -> nothing to init.

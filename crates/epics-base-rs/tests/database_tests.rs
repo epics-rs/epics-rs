@@ -4625,25 +4625,63 @@ async fn test_udf_not_cleared_by_clears_udf_false() {
     assert!(rec.read().await.common.udf);
 }
 
+/// A constant INP link reaches VAL at INIT — `recGblInitConstantLink(&prec->inp,
+/// DBF_DOUBLE, &prec->val)` in `devAiSoft.c::init_record` (line 44) — and NOT at
+/// process: `read_ai`'s `dbGetLink` on a constant runs `dbConstGetValue`, which
+/// returns 0 having written nothing (`dbConstLink.c:219-225`). So the value must
+/// be there before the first process, and must not be re-applied by one.
+///
+/// The test used to build the record with a bare `add_record` (no init sequence
+/// at all) + a runtime `put_common_field("INP", ...)`, then assert the value
+/// appeared after `process` — which only passed because the process-time read
+/// re-delivered the constant every cycle, the R15-78 defect.
 #[tokio::test]
 async fn test_constant_inp_link() {
-    let db = PvDatabase::new();
-    db.add_record("AI_CONST", Box::new(AiRecord::new(0.0)))
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"record(ai, "AI_CONST") { field(INP, "3.15") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
         .await
         .unwrap();
-    if let Some(rec) = db.get_record("AI_CONST").await {
-        let mut inst = rec.write().await;
-        inst.put_common_field("INP", EpicsValue::String("3.15".into()))
-            .unwrap();
+
+    let init_val = db.get_pv("AI_CONST").await.unwrap();
+    match init_val {
+        EpicsValue::Double(v) => assert!(
+            (v - 3.15).abs() < 1e-10,
+            "constant INP must be loaded into VAL at init, got {v}"
+        ),
+        other => panic!("expected Double(3.15), got {other:?}"),
     }
+    assert!(
+        !db.get_record("AI_CONST")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .common
+            .udf,
+        "C: `if (recGblInitConstantLink(...)) prec->udf = FALSE;`"
+    );
+
+    // A client write is NOT clobbered by the next process — the constant is
+    // never re-read.
+    db.put_pv("AI_CONST", EpicsValue::Double(7.0))
+        .await
+        .unwrap();
     let mut visited = HashSet::new();
     db.process_record_with_links("AI_CONST", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("AI_CONST").await.unwrap();
-    match val {
-        EpicsValue::Double(v) => assert!((v - 3.15).abs() < 1e-10),
-        other => panic!("expected Double(3.15), got {:?}", other),
+    match db.get_pv("AI_CONST").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-10,
+            "a constant INP must not be re-applied at process, got {v}"
+        ),
+        other => panic!("expected Double(7.0), got {other:?}"),
     }
 }
 

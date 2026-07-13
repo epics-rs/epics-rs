@@ -335,6 +335,19 @@ impl IocBuilder {
                     eprintln!("post_init_finalize_undef failed for {}: {e}", def.name);
                 }
                 instance.common.udf = udf;
+
+                // C: a soft-channel INPUT dev support's `init_record` loads a
+                // CONSTANT INP into the record's value
+                // (`recGblInitConstantLink` / `dbLoadLinkArray`) — and it runs
+                // BEFORE the record seeds MLST/ALST/LALM from VAL (e.g.
+                // `aiRecord.c:114-127`: `pdset->common.init_record` first, then
+                // `prec->mlst = prec->val`). So this owner runs here, ahead of
+                // `seed_deadband_tracking`, or the first process would post a
+                // spurious monitor for a value that was there since init.
+                drop(instance);
+                db.rec_gbl_init_constant_inp(&rec_arc).await;
+                let mut instance = rec_arc.write().await;
+
                 // Seed MLST/ALST/LALM from val (after any UDF/bit fold that
                 // may have changed val) so the first process posts a monitor
                 // only on a real change (C init_record invariant).

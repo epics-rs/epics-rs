@@ -570,8 +570,9 @@ async fn run_connection_watcher(
 
 /// Apply one connection event to the live-connection `flag`, returning
 /// `true` iff this was a `Connected` transition (the caller then kicks
-/// off a metadata refetch). `Disconnected`/`Unresponsive` clear the
-/// flag; `AccessRightsChanged`/`NativeTypeChanged` leave it untouched.
+/// off a metadata refetch). `Disconnected` clears the flag — an echo
+/// timeout arrives as `Disconnected` too, exactly as `CA_OP_CONN_DOWN`
+/// does in C; `AccessRightsChanged`/`NativeTypeChanged` leave it untouched.
 /// Factored out of [`run_connection_watcher`] so the flag logic — the
 /// disconnect-tracking regression — is unit-testable without a live CA
 /// channel.
@@ -582,7 +583,7 @@ fn note_conn_event(evt: &crate::client::ConnectionEvent, flag: &AtomicBool) -> b
             flag.store(true, Ordering::Release);
             true
         }
-        ConnectionEvent::Disconnected | ConnectionEvent::Unresponsive => {
+        ConnectionEvent::Disconnected => {
             flag.store(false, Ordering::Release);
             false
         }
@@ -888,8 +889,10 @@ mod tests {
         assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
         assert!(connected.load(Ordering::Acquire));
 
-        // Unresponsive (TCP up, server hung) also clears it, no refetch.
-        assert!(!note_conn_event(&ConnectionEvent::Unresponsive, &connected));
+        // Echo timeout (TCP up, server hung) reaches the watcher as a plain
+        // `Disconnected` — C's `unresponsiveCircuitNotify` fires the same
+        // `CA_OP_CONN_DOWN` — so it clears the flag with no refetch.
+        assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
         assert!(!connected.load(Ordering::Acquire));
 
         // An access-rights change is neutral: it leaves the flag as-is

@@ -528,6 +528,14 @@ impl ReadWaiter {
 pub(crate) struct InFlightOps {
     pub(crate) reads: Arc<DashMap<u32, ReadWaiter>>,
     pub(crate) writes: Arc<DashMap<u32, (u32, WriteReplyTx)>>,
+    /// `ioid -> (cid, subid)` for the `READ_NOTIFY`s issued by the
+    /// circuit-recovery re-subscribe (C `tcpiiu::subscriptionUpdateRequest`,
+    /// `tcpiiu.cpp:1610-1643`). C sends that request under the
+    /// subscription's *own* id, so its reply lands on the subscription's
+    /// callback rather than on a get waiter. The port keeps the `ioid` and
+    /// `subid` spaces separate, so the reply's owner is recorded here and
+    /// the response dispatcher consults this map first.
+    pub(crate) sub_updates: Arc<DashMap<u32, (u32, u32)>>,
     /// monotonic `ioid` source owned by the same registry
     /// that holds the live ids. Keeping the counter here (rather than
     /// a process-global static) lets [`Self::alloc_ioid`] probe
@@ -543,6 +551,7 @@ impl InFlightOps {
         Self {
             reads: Arc::new(DashMap::new()),
             writes: Arc::new(DashMap::new()),
+            sub_updates: Arc::new(DashMap::new()),
             next_ioid: Arc::new(AtomicU32::new(1)),
         }
     }
@@ -557,8 +566,24 @@ impl InFlightOps {
     /// survivors.
     pub(crate) fn alloc_ioid(&self) -> u32 {
         crate::channel::alloc_nonzero_probe(&self.next_ioid, |v| {
-            self.reads.contains_key(&v) || self.writes.contains_key(&v)
+            self.reads.contains_key(&v)
+                || self.writes.contains_key(&v)
+                || self.sub_updates.contains_key(&v)
         })
+    }
+
+    /// Register the reply owner of a circuit-recovery subscription update.
+    /// Returns the `ioid` to put on the wire.
+    pub(crate) fn register_sub_update(&self, cid: u32, subid: u32) -> u32 {
+        let ioid = self.alloc_ioid();
+        self.sub_updates.insert(ioid, (cid, subid));
+        ioid
+    }
+
+    /// Claim the subscription a recovery `READ_NOTIFY` reply belongs to.
+    /// `None` for every ordinary get, which keeps the get path unchanged.
+    pub(crate) fn take_sub_update(&self, ioid: u32) -> Option<u32> {
+        self.sub_updates.remove(&ioid).map(|(_, (_, subid))| subid)
     }
 
     /// Test-only: seed the next-ioid counter to drive the wrap path

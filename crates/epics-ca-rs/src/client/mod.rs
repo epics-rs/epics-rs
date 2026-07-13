@@ -4268,12 +4268,25 @@ async fn run_coordinator(
                                                     peer_minor,
                                                 ) {
                                                     Ok(count) => {
+                                                        // C issues this
+                                                        // READ_NOTIFY under
+                                                        // the subscription's
+                                                        // own id
+                                                        // (`tcpiiu.cpp:1636-1641`)
+                                                        // so the reply reaches
+                                                        // the monitor
+                                                        // callback. The port's
+                                                        // ioid space is
+                                                        // separate, so record
+                                                        // the reply's owner.
+                                                        let ioid = in_flight
+                                                            .register_sub_update(cid, sub_id);
                                                         let _ = transport_tx.send(
                                                             TransportCommand::ReadNotify {
                                                                 sid: ch.sid,
                                                                 data_type,
                                                                 count,
-                                                                ioid: in_flight.alloc_ioid(),
+                                                                ioid,
                                                                 server_addr: addr,
                                                                 priority: ch.priority,
                                                             },
@@ -4324,18 +4337,21 @@ async fn run_coordinator(
 }
 
 /// Which way a channel leaves the connected set. The two variants differ
-/// only in the terminal [`ChannelState`], the snapshot treatment and the
-/// [`ConnectionEvent`] the subscriber sees — every other step of the
-/// transition is identical, which is exactly why they share
-/// [`disconnect_channels`].
+/// only in the terminal [`ChannelState`] and the snapshot treatment — i.e.
+/// in how the channel *recovers*. What the application sees is identical
+/// and deliberately so: C reaches `nciu::disconnectNotify` (`CA_OP_CONN_DOWN`)
+/// from both, so [`ConnectionEvent::Disconnected`] is the only event either
+/// path can emit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DisconnectKind {
     /// The circuit is gone: the socket closed (`TcpClosed`,
     /// C `tcpiiu::disconnectAllChannels`) or the server retired this cid
-    /// (`CA_PROTO_SERVER_DISCONN`, C `cac::disconnectChannel`).
+    /// (`CA_PROTO_SERVER_DISCONN`, C `cac::disconnectChannel`). Recovery is
+    /// a fresh search.
     CircuitGone,
     /// Echo timeout: the socket is still up but the peer is silent.
-    /// C `tcpiiu::unresponsiveCircuitNotify`.
+    /// C `tcpiiu::unresponsiveCircuitNotify`. Recovery is
+    /// `tcpiiu::responsiveCircuitNotify` on the same socket — no re-search.
     Unresponsive,
 }
 
@@ -4344,13 +4360,6 @@ impl DisconnectKind {
         match self {
             Self::CircuitGone => ChannelState::Disconnected,
             Self::Unresponsive => ChannelState::Unresponsive,
-        }
-    }
-
-    fn connection_event(self) -> ConnectionEvent {
-        match self {
-            Self::CircuitGone => ConnectionEvent::Disconnected,
-            Self::Unresponsive => ConnectionEvent::Unresponsive,
         }
     }
 }
@@ -4433,8 +4442,10 @@ fn disconnect_channels(
         }
         // Steps 3 and 4 — C `disconnectNotify` then
         // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
-        // order.
-        let _ = ch.conn_tx.send(kind.connection_event());
+        // order. Both kinds emit `Disconnected`: C has no third connection
+        // state, and an event only the port can emit is an event no
+        // consumer handles.
+        let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
         let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
             read: false,
             write: false,
@@ -4602,6 +4613,12 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
             let _ = sender.send(Err(CaError::Disconnected));
         }
     }
+    // The recovery re-reads of a channel that just left the connected set
+    // will never be answered; their ECA_DISCONN reaches the subscriber via
+    // `mark_disconnected`, so drop the records rather than leak them.
+    in_flight
+        .sub_updates
+        .retain(|_, (cid, _)| !cids.contains(cid));
 }
 
 /// Decide which operational circuits should receive a
@@ -6233,11 +6250,13 @@ mod disconnect_transition_tests {
         assert!(drain_events(&mut other_rx).is_empty());
     }
 
-    /// The echo-timeout path was already correct; it must stay correct now
-    /// that it shares the owner (terminal state `Unresponsive`, event
-    /// `Unresponsive`, same no-rights transition).
+    /// R18-18: the echo-timeout path keeps its own *internal* terminal state
+    /// (`Unresponsive` selects the re-subscribe-on-the-live-socket recovery),
+    /// but the application sees the ordinary `Disconnected`: C's
+    /// `nciu::unresponsiveCircuitNotify` (`nciu.cpp:170`) calls the same
+    /// `disconnectNotify()` — `CA_OP_CONN_DOWN` — as a socket close.
     #[tokio::test(flavor = "current_thread")]
-    async fn r8_17_unresponsive_keeps_its_own_state_and_event() {
+    async fn r18_18_unresponsive_is_a_disconnect_for_the_application() {
         let mut channels = HashMap::new();
         let (ch, mut conn_rx) = connected_channel(42, 0);
         channels.insert(42u32, ch);
@@ -6261,7 +6280,7 @@ mod disconnect_transition_tests {
         assert_eq!(
             drain_events(&mut conn_rx),
             vec![
-                ConnectionEvent::Unresponsive,
+                ConnectionEvent::Disconnected,
                 ConnectionEvent::AccessRightsChanged {
                     read: false,
                     write: false

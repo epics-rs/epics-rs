@@ -254,6 +254,41 @@ pub struct CaException {
 /// `Source File:`.
 pub(crate) const LIBCA_WRITE_EXCEPTION_SITE: (&str, u32) = ("../oldChannelNotify.cpp", 159);
 
+/// libca `cac::destroyIIU` (`cac.cpp:1236-1240`) — the `genLocalExcep` a
+/// virtual circuit raises when it dies with channels still on it.
+pub(crate) const LIBCA_CIRCUIT_DISCONNECT_SITE: (&str, u32) = ("../cac.cpp", 1240);
+
+/// The ECA_DISCONN block C prints when a circuit carrying channels dies.
+/// Verified byte-for-byte against compiled `camonitor` (7.0.10.1-DEV) with
+/// the IOC killed under it:
+///
+/// ```text
+/// CA.Client.Exception...............................................
+///     Warning: "Virtual circuit disconnect"
+///     Context: "localhost:15064"
+///     Source File: ../cac.cpp line 1240
+///     Current Time: Mon Jul 13 2026 20:57:51.950625115
+/// ..................................................................
+/// ```
+///
+/// The context is the *resolved* peer name (C `tcpiiu::getHostName`), not
+/// the dotted address, and it is the whole context — this is the plain
+/// (non-channel) `ca_client_context::exception` overload, so `data_type`
+/// stays `None` and the renderer prints `message` verbatim.
+pub(crate) fn circuit_disconnect_exception(server_addr: SocketAddr) -> CaException {
+    CaException {
+        kind: CaExceptionKind::ServerError,
+        message: crate::hostname::cached_name(server_addr),
+        server_addr: Some(server_addr),
+        pv_name: None,
+        status: Some(crate::protocol::ECA_DISCONN),
+        op: CaOp::Other,
+        data_type: None,
+        count: None,
+        source: Some(LIBCA_CIRCUIT_DISCONNECT_SITE),
+    }
+}
+
 /// Boxed handler. Returns `()`; logs are emitted regardless so a
 /// handler that panics or is slow can't suppress the existing
 /// tracing diagnostics.
@@ -689,6 +724,32 @@ mod default_exception_tests {
                 "    Context: \"op=1, channel=TST:LO, type=DBR_STRING, count=1, ctx=\"TST:LO\"\"\n",
                 "    Source File: ../oldChannelNotify.cpp line 159\n",
                 "    Current Time: Mon Jul 13 2026 09:25:31.803490065\n",
+                "..................................................................\n",
+            )
+        );
+    }
+
+    /// R18-19: byte-for-byte the block compiled `camonitor` (7.0.10.1-DEV)
+    /// wrote to stderr when its softIoc was killed under it. Pre-fix the
+    /// circuit-gone path raised no exception at all, so this shape had no
+    /// producer.
+    #[test]
+    fn a_dead_circuit_renders_c_s_eca_disconn_block() {
+        let addr: SocketAddr = "127.0.0.1:15064".parse().unwrap();
+        let mut exc = circuit_disconnect_exception(addr);
+        // `cached_name` resolves asynchronously; pin the name the live C run
+        // printed so the test asserts the block, not the resolver.
+        exc.message = "localhost:15064".to_string();
+        let got = render_default_exception(&exc, "Mon Jul 13 2026 20:57:51.950625115")
+            .expect("C prints a block when a circuit with channels dies");
+        assert_eq!(
+            got,
+            concat!(
+                "CA.Client.Exception...............................................\n",
+                "    Warning: \"Virtual circuit disconnect\"\n",
+                "    Context: \"localhost:15064\"\n",
+                "    Source File: ../cac.cpp line 1240\n",
+                "    Current Time: Mon Jul 13 2026 20:57:51.950625115\n",
                 "..................................................................\n",
             )
         );

@@ -4153,7 +4153,7 @@ async fn run_coordinator(
                         metrics::counter!("ca_client_tcp_closed_total", "server" => server_addr.to_string()).increment(1);
                         last_rx_at.remove(&circuit);
                         server_minor_version.remove(&circuit);
-                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots);
+                        handle_disconnect(&mut channels, &mut subscriptions, &mut server_channels, &search_tx, circuit, &diag, &in_flight, &snapshots, &exception_slot);
                     }
                     TransportEvent::ServerDisconnect { cid, server_addr } => {
                         handle_server_disconnect(
@@ -4521,9 +4521,26 @@ fn handle_disconnect(
     diag: &CaDiagnostics,
     in_flight: &types::InFlightOps,
     snapshots: &ChannelSnapshots,
+    exception_slot: &types::CaExceptionSlot,
 ) {
     let (server_addr, priority) = circuit;
     let now = std::time::Instant::now();
+
+    // C `cac::destroyIIU` (`cac.cpp:1236-1240`): a circuit that still carried
+    // channels when it died raises ECA_DISCONN on the global exception hook —
+    // and raises it *before* `disconnectAllChannels` (`cac.cpp:1251`), so a
+    // handler learns the circuit is gone ahead of the per-channel callbacks.
+    // It belongs here, in the circuit-gone owner, not at one call site: every
+    // path that destroys a circuit is a path C raises this on.
+    if server_channels
+        .get(&circuit)
+        .is_some_and(|cids| !cids.is_empty())
+    {
+        types::dispatch_exception(
+            exception_slot,
+            types::circuit_disconnect_exception(server_addr),
+        );
+    }
 
     // only channels on THIS circuit `(server_addr, priority)`
     // are torn down — a sibling circuit to the same server at another
@@ -6143,6 +6160,71 @@ mod disconnect_transition_tests {
         out
     }
 
+    /// R18-19: a circuit that dies with channels on it raises ECA_DISCONN on
+    /// the global exception hook — C `cac::destroyIIU` (`cac.cpp:1236-1240`),
+    /// gated on `iiu.channelCount()`. Pre-fix the circuit-gone path dispatched
+    /// no exception at all, so a handler installed the way C library users do
+    /// it (to log IOC loss) saw nothing. An empty circuit raises nothing, same
+    /// gate as C.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r18_19_circuit_death_raises_eca_disconn() {
+        for (channels_on_circuit, want) in [(1usize, 1usize), (0, 0)] {
+            let mut channels = HashMap::new();
+            let mut server_channels: HashMap<types::CircuitKey, HashSet<u32>> = HashMap::new();
+            if channels_on_circuit > 0 {
+                let (ch, _rx) = connected_channel(42, 0);
+                channels.insert(42u32, ch);
+                server_channels.insert((addr(), 0), HashSet::from([42u32]));
+            }
+            let mut subscriptions = SubscriptionRegistry::new();
+            let (search_tx, _search_rx) = mpsc::unbounded_channel();
+            let diag = CaDiagnostics::default();
+            let in_flight = types::InFlightOps::new();
+            let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
+
+            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, Option<(&str, u32)>)>>> =
+                Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let sink = raised.clone();
+            let slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+                move |exc: &types::CaException| {
+                    sink.lock()
+                        .push((exc.status.unwrap_or(0), exc.message.clone(), exc.source));
+                },
+            ))));
+
+            handle_disconnect(
+                &mut channels,
+                &mut subscriptions,
+                &mut server_channels,
+                &search_tx,
+                (addr(), 0),
+                &diag,
+                &in_flight,
+                &snapshots,
+                &slot,
+            );
+
+            let got = raised.lock().clone();
+            assert_eq!(
+                got.len(),
+                want,
+                "channels on circuit = {channels_on_circuit}: C gates the \
+                 genLocalExcep on `iiu.channelCount()`"
+            );
+            if let Some((status, ctx, source)) = got.first() {
+                assert_eq!(*status, crate::protocol::ECA_DISCONN);
+                // Context is the resolved peer name, not a port-invented
+                // sentence; `Source File:` is present because `genLocalExcep`
+                // always passes `__FILE__`/`__LINE__`.
+                assert!(
+                    !ctx.is_empty() && !ctx.contains("circuit"),
+                    "context: {ctx}"
+                );
+                assert_eq!(*source, Some(types::LIBCA_CIRCUIT_DISCONNECT_SITE));
+            }
+        }
+    }
+
     /// TCP circuit close (C `tcpiiu::disconnectAllChannels`,
     /// `tcpiiu.cpp:1848-1855`): the channel must drop to no-rights and the
     /// subscriber must see `AccessRightsChanged { false, false }` after
@@ -6169,6 +6251,7 @@ mod disconnect_transition_tests {
             &diag,
             &in_flight,
             &snapshots,
+            &types::CaExceptionSlot::default(),
         );
 
         let ch = channels.get(&42).expect("channel stays registered");
